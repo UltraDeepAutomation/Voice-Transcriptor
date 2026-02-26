@@ -41,7 +41,8 @@ from backend.transcribe import merge_channel_transcripts, transcribe_file
 
 UPLOADS_DIR = DATA_DIR / "uploads"
 RESULTS_DIR = DATA_DIR / "results"
-for d in (UPLOADS_DIR, RESULTS_DIR):
+LIVE_RECOVERY_DIR = DATA_DIR / "live_recovery"
+for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -52,6 +53,7 @@ MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 RATE_LIMIT_PER_MIN = 120
 WS_CONNECT_LIMIT_PER_MIN = 20
 RESULT_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_RESULT_RETENTION_SEC", "86400"))
+LIVE_RECOVERY_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", "86400"))
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 ALLOWED_REMOTE_PROVIDERS = {"fal", "openrouter"}
 ALLOWED_AUDIO_EXTS = {
@@ -63,6 +65,13 @@ ALLOWED_AUDIO_EXTS = {
     ".aac",
     ".mp4",
     ".webm",
+}
+
+COMMON_STOPWORDS = {
+    "и", "в", "на", "что", "как", "это", "я", "ты", "мы", "вы", "он", "она", "оно", "они",
+    "а", "но", "же", "ли", "не", "да", "нет", "к", "у", "по", "с", "со", "из", "от", "за",
+    "to", "the", "a", "an", "and", "or", "for", "of", "in", "on", "is", "it", "that", "this",
+    "i", "you", "we", "they", "he", "she", "be", "are", "was", "were", "do", "does", "did",
 }
 
 
@@ -148,6 +157,20 @@ def _cleanup_expired_files() -> None:
                 pass
 
 
+def _cleanup_live_recovery_files() -> None:
+    if LIVE_RECOVERY_RETENTION_SEC <= 0:
+        return
+    cutoff = time.time() - LIVE_RECOVERY_RETENTION_SEC
+    for p in LIVE_RECOVERY_DIR.glob("*"):
+        try:
+            if not p.is_file():
+                continue
+            if p.stat().st_mtime < cutoff:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 async def _require_api_auth(request: Request) -> None:
     if request.url.path == "/api/health":
         return
@@ -228,6 +251,44 @@ def _normalize_language(value: str) -> Optional[str]:
     return language
 
 
+def _is_broken_pipe_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 32:
+        return True
+    return "broken pipe" in msg or "errno 32" in msg
+
+
+def _transcribe_with_retry(
+    audio_path: str,
+    model: str,
+    *,
+    language: Optional[str],
+    word_timestamps: bool,
+    retries: int = 1,
+):
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return transcribe_file(
+                audio_path,
+                model,
+                language=language,
+                word_timestamps=word_timestamps,
+            )
+        except Exception as e:
+            last_exc = e
+            if not _is_broken_pipe_error(e) or attempt >= retries:
+                raise
+            # Short backoff before retrying transient pipe failures.
+            print(f"[transcribe retry] broken pipe on attempt {attempt + 1}, retrying...")
+            time.sleep(0.35)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("transcribe_with_retry failed without exception")
+
+
 def _validate_config_payload(payload: dict) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="invalid config")
@@ -306,8 +367,30 @@ def _recording_path_or_404(name: str) -> Path:
     return p
 
 
+def _extract_stats_text(content: str) -> str:
+    text = (content or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"(?:Original:|Transcription:)\s*(.*)", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return text
+
+
+def _tokenize_words(text: str) -> list[str]:
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]{2,}", (text or "").lower())
+    return [w for w in words if w not in COMMON_STOPWORDS]
+
+
+def _extract_meta_field(content: str, field: str) -> str:
+    pattern = rf"^{re.escape(field)}:\s*(.+)$"
+    m = re.search(pattern, content or "", flags=re.IGNORECASE | re.MULTILINE)
+    return (m.group(1).strip() if m else "")
+
+
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket):
+    _cleanup_live_recovery_files()
     token = (websocket.query_params.get("token") or "").strip()
     if token != API_TOKEN:
         await websocket.close(code=4401, reason="unauthorized")
@@ -325,19 +408,30 @@ async def ws_transcribe(websocket: WebSocket):
 
     session = LiveSession(model_name=model, language=lang_opt)
     stop = asyncio.Event()
+    started_at = datetime.now()
+    session_id = str(uuid.uuid4())
+    recovery_pcm_path = LIVE_RECOVERY_DIR / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}.pcm16"
+    recovery_meta_path = LIVE_RECOVERY_DIR / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}.json"
+    recovery_file = recovery_pcm_path.open("wb")
 
     chunk_count = 0
+    byte_count = 0
+    had_error = False
 
     async def receiver():
-        nonlocal chunk_count
+        nonlocal chunk_count, byte_count
         try:
             while not stop.is_set():
                 data = await websocket.receive_bytes()
                 chunk_count += 1
+                byte_count += len(data)
+                recovery_file.write(data)
                 await session.append_pcm16le(data)
         except WebSocketDisconnect:
             stop.set()
         except Exception as e:
+            nonlocal had_error
+            had_error = True
             print(f"[ws receiver] error: {e}")
             stop.set()
 
@@ -349,6 +443,8 @@ async def ws_transcribe(websocket: WebSocket):
                     await websocket.send_text(json.dumps(out, ensure_ascii=False))
                 await asyncio.sleep(0.2)
         except Exception as e:
+            nonlocal had_error
+            had_error = True
             print(f"[ws transcriber] error: {e}")
             stop.set()
 
@@ -365,6 +461,7 @@ async def ws_transcribe(websocket: WebSocket):
     except WebSocketDisconnect:
         stop.set()
     except Exception as e:
+        had_error = True
         stop.set()
         try:
             await websocket.send_text(
@@ -377,6 +474,41 @@ async def ws_transcribe(websocket: WebSocket):
         for t in (rx, tx):
             if not t.done():
                 t.cancel()
+        try:
+            recovery_file.flush()
+            recovery_file.close()
+        except Exception:
+            pass
+        # Keep only meaningful captures; remove tiny accidental openings.
+        try:
+            if byte_count < 32000:  # ~1s at 16kHz mono pcm16
+                recovery_pcm_path.unlink(missing_ok=True)
+                recovery_meta_path.unlink(missing_ok=True)
+            elif not had_error:
+                # Normal/healthy session: no need to keep raw audio.
+                recovery_pcm_path.unlink(missing_ok=True)
+                recovery_meta_path.unlink(missing_ok=True)
+            else:
+                recovery_meta_path.write_text(
+                    json.dumps(
+                        {
+                            "session_id": session_id,
+                            "started_at": started_at.isoformat(),
+                            "finished_at": datetime.now().isoformat(),
+                            "sample_rate": 16000,
+                            "format": "pcm16le_mono",
+                            "bytes": byte_count,
+                            "chunks": chunk_count,
+                            "model": model,
+                            "language": lang_opt or "auto",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
 
 
 @app.post("/api/jobs")
@@ -418,11 +550,11 @@ async def create_job(
             if split_stereo and ch1 and ch2:
                 temp_paths.extend([ch1, ch2])
                 jobs.set_progress(job_id, 0.2)
-                t1 = transcribe_file(
+                t1 = _transcribe_with_retry(
                     ch1, model, language=lang_opt, word_timestamps=word_timestamps
                 )
                 jobs.set_progress(job_id, 0.6)
-                t2 = transcribe_file(
+                t2 = _transcribe_with_retry(
                     ch2, model, language=lang_opt, word_timestamps=word_timestamps
                 )
                 jobs.set_progress(job_id, 0.9)
@@ -432,7 +564,7 @@ async def create_job(
                 mono_wav = str(RESULTS_DIR / f"{job_id}.mono16k.wav")
                 temp_paths.append(mono_wav)
                 ensure_wav_16k(str(upload_path), mono_wav, channels=1)
-                result = transcribe_file(
+                result = _transcribe_with_retry(
                     mono_wav, model, language=lang_opt, word_timestamps=word_timestamps
                 )
 
@@ -724,6 +856,59 @@ def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth))
         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
         "size_bytes": st.st_size,
         "content": p.read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+@app.get("/api/recordings/stats/summary")
+def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
+    d = _resolve_recordings_dir()
+    files = sorted(d.glob("*.txt"))
+    total_recordings = len(files)
+    total_words = 0
+    total_chars = 0
+    durations_sec: list[int] = []
+    word_freq: dict[str, int] = defaultdict(int)
+    providers: dict[str, int] = defaultdict(int)
+    languages: dict[str, int] = defaultdict(int)
+
+    for p in files:
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
+        language = _extract_meta_field(raw, "Language").lower() or "auto"
+        providers[provider] += 1
+        languages[language] += 1
+        text = _extract_stats_text(raw)
+        total_chars += len(text)
+        tokens = _tokenize_words(text)
+        total_words += len(tokens)
+        # Lightweight estimate: speech pace ~150 words/min.
+        dur = int(round((len(tokens) / 150.0) * 60.0)) if tokens else 0
+        durations_sec.append(dur)
+        for w in tokens:
+            word_freq[w] += 1
+
+    top_words = sorted(word_freq.items(), key=lambda kv: kv[1], reverse=True)[:12]
+    avg_duration_sec = int(round(sum(durations_sec) / len(durations_sec))) if durations_sec else 0
+    max_duration_sec = max(durations_sec) if durations_sec else 0
+    min_duration_sec = min(durations_sec) if durations_sec else 0
+    avg_words_per_recording = round(total_words / total_recordings, 1) if total_recordings else 0.0
+    avg_chars_per_recording = round(total_chars / total_recordings, 1) if total_recordings else 0.0
+
+    return {
+        "total_recordings": total_recordings,
+        "total_words": total_words,
+        "total_chars": total_chars,
+        "avg_words_per_recording": avg_words_per_recording,
+        "avg_chars_per_recording": avg_chars_per_recording,
+        "avg_duration_sec": avg_duration_sec,
+        "min_duration_sec": min_duration_sec,
+        "max_duration_sec": max_duration_sec,
+        "top_words": [{"word": w, "count": c} for w, c in top_words],
+        "providers": [{"name": k, "count": v} for k, v in sorted(providers.items(), key=lambda kv: kv[1], reverse=True)],
+        "languages": [{"name": k, "count": v} for k, v in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)],
     }
 
 

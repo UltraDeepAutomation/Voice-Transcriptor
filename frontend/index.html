@@ -77,6 +77,12 @@
             <div class="pane" id="livePane">
               <div class="pane-header">
                 <span class="pane-title">Live</span>
+                <div class="pane-actions">
+                  <label class="toggle-inline" title="Show live partial transcript while recording">
+                    <span>Live Preview</span>
+                    <input id="livePreviewToggle" type="checkbox" checked />
+                  </label>
+                </div>
               </div>
               <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
             </div>
@@ -134,15 +140,44 @@
             <div class="recordings-head-main">
               <h2>Saved Recordings</h2>
               <p class="hint" id="recordingsDirLabel">Directory: -</p>
+              <p class="hint" id="recordingsCountLabel">Total recordings: 0</p>
             </div>
-            <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button" aria-label="Refresh recordings">
-              <span class="refresh-ico" aria-hidden="true"></span>
-              <span>Refresh</span>
-            </button>
+            <div class="recordings-head-actions">
+              <button class="btn btn-ghost" id="recordingsStatsBtn" type="button" aria-label="Toggle stats">Stats</button>
+              <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button" aria-label="Refresh recordings">
+                <span class="refresh-ico" aria-hidden="true"></span>
+                <span>Refresh</span>
+              </button>
+            </div>
           </div>
           <div class="recordings-layout">
             <div class="recordings-list" id="recordingsList"></div>
             <div class="recordings-viewer">
+              <div class="recordings-stats" id="recordingsStatsPanel" hidden>
+                <div class="stats-grid">
+                  <div class="stats-card"><span class="stats-k">Recordings</span><span class="stats-v" id="statsTotal">0</span></div>
+                  <div class="stats-card"><span class="stats-k">Words</span><span class="stats-v" id="statsWords">0</span></div>
+                  <div class="stats-card"><span class="stats-k">Chars</span><span class="stats-v" id="statsChars">0</span></div>
+                  <div class="stats-card"><span class="stats-k">Words / Rec</span><span class="stats-v" id="statsWpr">0</span></div>
+                  <div class="stats-card"><span class="stats-k">Avg Duration</span><span class="stats-v" id="statsAvgDur">00:00</span></div>
+                  <div class="stats-card"><span class="stats-k">Min Duration</span><span class="stats-v" id="statsMinDur">00:00</span></div>
+                  <div class="stats-card"><span class="stats-k">Max Duration</span><span class="stats-v" id="statsMaxDur">00:00</span></div>
+                </div>
+                <div class="stats-split">
+                  <div class="stats-top">
+                    <span class="stats-k">Providers</span>
+                    <div class="top-words" id="statsProviders"></div>
+                  </div>
+                  <div class="stats-top">
+                    <span class="stats-k">Languages</span>
+                    <div class="top-words" id="statsLanguages"></div>
+                  </div>
+                </div>
+                <div class="stats-top">
+                  <span class="stats-k">Top Words</span>
+                  <div class="top-words" id="statsTopWords"></div>
+                </div>
+              </div>
               <div class="pane-header">
                 <span class="pane-title recording-title" id="recordingTitle">Select recording</span>
                 <div class="recording-header-actions">

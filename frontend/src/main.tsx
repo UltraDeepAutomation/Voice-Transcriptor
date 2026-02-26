@@ -37,6 +37,20 @@ interface RecordingItem {
   size_bytes: number;
 }
 
+interface RecordingsStats {
+  total_recordings: number;
+  total_words: number;
+  total_chars: number;
+  avg_words_per_recording: number;
+  avg_chars_per_recording: number;
+  avg_duration_sec: number;
+  min_duration_sec: number;
+  max_duration_sec: number;
+  top_words: Array<{ word: string; count: number }>;
+  providers: Array<{ name: string; count: number }>;
+  languages: Array<{ name: string; count: number }>;
+}
+
 declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
@@ -58,6 +72,10 @@ const fmtDateTime = (iso: string): string => {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso || "-";
   return d.toLocaleString();
+};
+const fmtDur = (sec: number): string => {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 };
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
@@ -513,6 +531,7 @@ $("pickRecordingsDirBtn").addEventListener("click", () =>
 
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";
+let recordingsStatsOpen = false;
 
 function updateRecordingCopyState(): void {
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
@@ -572,10 +591,12 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
   const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
   recordingItems = r.items || [];
   $("recordingsDirLabel").textContent = "Directory: " + (r.directory || "-");
+  $("recordingsCountLabel").textContent = `Total recordings: ${recordingItems.length}`;
   if (!keepSelection || !recordingItems.some((x) => x.name === selectedRecordingName)) {
     selectedRecordingName = recordingItems[0]?.name || "";
   }
   renderRecordingsList();
+  await loadRecordingsStats();
   if (selectedRecordingName) {
     await openRecording(selectedRecordingName);
   } else {
@@ -583,6 +604,62 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
     $("recordingMeta").textContent = "";
     $("recordingContent").textContent = "";
     updateRecordingCopyState();
+  }
+}
+
+async function loadRecordingsStats(): Promise<void> {
+  const s = await apiGet<RecordingsStats>("/api/recordings/stats/summary");
+  $("statsTotal").textContent = String(s.total_recordings || 0);
+  $("statsWords").textContent = String(s.total_words || 0);
+  $("statsChars").textContent = String(s.total_chars || 0);
+  $("statsWpr").textContent = String(s.avg_words_per_recording || 0);
+  $("statsAvgDur").textContent = fmtDur(s.avg_duration_sec || 0);
+  $("statsMinDur").textContent = fmtDur(s.min_duration_sec || 0);
+  $("statsMaxDur").textContent = fmtDur(s.max_duration_sec || 0);
+  const top = $("statsTopWords");
+  top.innerHTML = "";
+  if (!s.top_words?.length) {
+    const empty = document.createElement("span");
+    empty.className = "hint";
+    empty.textContent = "No word stats yet.";
+    top.appendChild(empty);
+    return;
+  }
+  s.top_words.forEach((w) => {
+    const chip = document.createElement("span");
+    chip.className = "word-chip";
+    chip.textContent = `${w.word} (${w.count})`;
+    top.appendChild(chip);
+  });
+
+  const providers = $("statsProviders");
+  providers.innerHTML = "";
+  (s.providers || []).slice(0, 8).forEach((p) => {
+    const chip = document.createElement("span");
+    chip.className = "word-chip";
+    chip.textContent = `${p.name} (${p.count})`;
+    providers.appendChild(chip);
+  });
+  if (!providers.children.length) {
+    const empty = document.createElement("span");
+    empty.className = "hint";
+    empty.textContent = "No provider data.";
+    providers.appendChild(empty);
+  }
+
+  const languages = $("statsLanguages");
+  languages.innerHTML = "";
+  (s.languages || []).slice(0, 8).forEach((l) => {
+    const chip = document.createElement("span");
+    chip.className = "word-chip";
+    chip.textContent = `${l.name} (${l.count})`;
+    languages.appendChild(chip);
+  });
+  if (!languages.children.length) {
+    const empty = document.createElement("span");
+    empty.className = "hint";
+    empty.textContent = "No language data.";
+    languages.appendChild(empty);
   }
 }
 
@@ -626,6 +703,11 @@ $("recordingsRefreshBtn").addEventListener("click", () =>
     updateRecordingCopyState();
   })
 );
+$("recordingsStatsBtn").addEventListener("click", () => {
+  recordingsStatsOpen = !recordingsStatsOpen;
+  $("recordingsStatsPanel").hidden = !recordingsStatsOpen;
+  ($("recordingsStatsBtn") as HTMLButtonElement).textContent = recordingsStatsOpen ? "Hide Stats" : "Stats";
+});
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 
 const autoToggle = $("autoTranscribeToggle") as HTMLInputElement;
@@ -633,9 +715,18 @@ autoToggle.checked = localStorage.getItem("transcriptor.autoTranscribe") !== "0"
 autoToggle.addEventListener("change", () => {
   localStorage.setItem("transcriptor.autoTranscribe", autoToggle.checked ? "1" : "0");
 });
+const livePreviewToggle = $("livePreviewToggle") as HTMLInputElement;
+livePreviewToggle.checked = localStorage.getItem("transcriptor.livePreview") !== "0";
+livePreviewToggle.addEventListener("change", () => {
+  localStorage.setItem("transcriptor.livePreview", livePreviewToggle.checked ? "1" : "0");
+});
 
 function shouldAutoTranscribe(): boolean {
   return autoToggle.checked && ($("mode") as HTMLSelectElement).value === "live";
+}
+
+function shouldLivePreview(): boolean {
+  return livePreviewToggle.checked && ($("mode") as HTMLSelectElement).value === "live";
 }
 
 let ws: WebSocket | null = null;
@@ -648,6 +739,7 @@ let timer: number | null = null;
 let startAt = 0;
 let chunks: Float32Array[] = [];
 let draftSaveTimer: number | null = null;
+let workletLastFrameAt = 0;
 
 function resetOutputs(): void {
   $("liveOutput").textContent = "";
@@ -678,6 +770,7 @@ async function startLive(): Promise<void> {
   if (isBusy) return;
   resetOutputs();
   chunks = [];
+  workletLastFrameAt = 0;
   setBusy(true);
   isRecording = true;
   setRecordButton(true);
@@ -698,47 +791,50 @@ async function startLive(): Promise<void> {
     $("timer").textContent = fmtTime((Date.now() - startAt) / 1000);
   }, 200);
 
-  ws = new WebSocket(
-    wsBase() +
-      "/ws/transcribe?" +
-      new URLSearchParams({
-        model: ($("model") as HTMLSelectElement).value,
-        language: ($("language") as HTMLSelectElement).value,
-        token: apiToken(),
-      })
-  );
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => setStatus("Recording");
-  ws.onerror = () => {
-    $("liveOutput").textContent += "\n[WebSocket error]";
-    setStatus("Error");
-  };
-  ws.onmessage = (ev: MessageEvent<string>) => {
-    let m: unknown;
-    try {
-      m = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    if (typeof m !== "object" || m === null) return;
-    const msg = m as { type?: unknown; error?: unknown; segments?: unknown };
-    if (msg.type === "error") {
-      $("liveOutput").textContent += `\n[${String(msg.error ?? "error")}]`;
-      setStatus("Error");
-      return;
-    }
-    if (msg.type === "segments" && Array.isArray(msg.segments)) {
-      const lines = msg.segments
-        .map((s) => (typeof s === "object" && s && "text" in s ? String((s as { text?: unknown }).text ?? "").trim() : ""))
-        .filter(Boolean);
-      if (lines.length) {
-        const cur = $("liveOutput").textContent || "";
-        $("liveOutput").textContent = cur + (cur ? "\n" : "") + lines.join("\n");
-        $("liveOutput").scrollTop = $("liveOutput").scrollHeight;
-        persistLiveDraft(true);
+  const enableLivePreview = shouldLivePreview();
+  if (enableLivePreview) {
+    ws = new WebSocket(
+      wsBase() +
+        "/ws/transcribe?" +
+        new URLSearchParams({
+          model: ($("model") as HTMLSelectElement).value,
+          language: ($("language") as HTMLSelectElement).value,
+          token: apiToken(),
+        })
+    );
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => setStatus("Recording");
+    ws.onerror = () => {
+      $("liveOutput").textContent += "\n[WebSocket error]";
+    };
+    ws.onmessage = (ev: MessageEvent<string>) => {
+      let m: unknown;
+      try {
+        m = JSON.parse(ev.data);
+      } catch {
+        return;
       }
-    }
-  };
+      if (typeof m !== "object" || m === null) return;
+      const msg = m as { type?: unknown; error?: unknown; segments?: unknown };
+      if (msg.type === "error") {
+        $("liveOutput").textContent += `\n[${String(msg.error ?? "error")}]`;
+        return;
+      }
+      if (msg.type === "segments" && Array.isArray(msg.segments)) {
+        const lines = msg.segments
+          .map((s) => (typeof s === "object" && s && "text" in s ? String((s as { text?: unknown }).text ?? "").trim() : ""))
+          .filter(Boolean);
+        if (lines.length) {
+          const cur = $("liveOutput").textContent || "";
+          $("liveOutput").textContent = cur + (cur ? "\n" : "") + lines.join("\n");
+          $("liveOutput").scrollTop = $("liveOutput").scrollHeight;
+          persistLiveDraft(true);
+        }
+      }
+    };
+  } else {
+    setStatus("Recording");
+  }
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -788,6 +884,7 @@ async function startLive(): Promise<void> {
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
       const input = ev.data;
       if (!(input instanceof Float32Array)) return;
+      workletLastFrameAt = Date.now();
       let sum = 0;
       for (let i = 0; i < input.length; i++) {
         const s = input[i];
@@ -795,9 +892,12 @@ async function startLive(): Promise<void> {
       }
       const rms = input.length ? Math.sqrt(sum / input.length) : 0;
       window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * 4));
-      if (!ws || ws.readyState !== WebSocket.OPEN || !ac) return;
+      if (!ac) return;
       const ds = downsample(input, ac.sampleRate, 16000);
       chunks.push(new Float32Array(ds));
+      // Keep local final-audio buffer independent from websocket health.
+      // This protects long recordings from losing tail chunks on WS hiccups.
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const pcm = new ArrayBuffer(ds.length * 2);
       const dv = new DataView(pcm);
       for (let i = 0; i < ds.length; i++) {
@@ -817,6 +917,15 @@ async function startLive(): Promise<void> {
   }
 }
 
+async function waitForWorkletDrain(maxWaitMs = 360, idleMs = 90): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < maxWaitMs) {
+    const last = workletLastFrameAt || 0;
+    if (!last || Date.now() - last >= idleMs) return;
+    await new Promise((r) => setTimeout(r, 24));
+  }
+}
+
 async function stopLive(enhance: boolean): Promise<void> {
   const sourceLiveText = ($("liveOutput").textContent || "").trim();
   const title = "Recording " + new Date().toLocaleString();
@@ -824,6 +933,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   const languageValue = ($("language") as HTMLSelectElement).value;
   const modelValue = ($("model") as HTMLSelectElement).value;
 
+  // Let the last worklet buffers arrive before disconnecting graph.
+  await waitForWorkletDrain();
   if (timer) {
     clearInterval(timer);
     timer = null;

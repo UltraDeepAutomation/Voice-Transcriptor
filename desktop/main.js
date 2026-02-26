@@ -47,6 +47,18 @@ function appendMainLog(message) {
   } catch {}
 }
 
+function logPasteTrace(step, details = {}) {
+  try {
+    appendMainLog(`[paste-trace] ${JSON.stringify({ step, ...details })}`);
+  } catch {}
+}
+
+function compactLogText(value, max = 180) {
+  const s = String(value || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}...`;
+}
+
 async function shouldBlockMainWindowPresentation() {
   if (overlayStopInFlight) return true;
   if (Date.now() < suppressMainWindowUntil) return true;
@@ -85,10 +97,9 @@ function createOverlayHtml() {
   <html>
     <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;">
       <div id="pill">
-        <canvas id="wave" width="56" height="20"></canvas>
-        <span id="label">RECORDING</span>
+        <canvas id="wave" width="54" height="16"></canvas>
         <span id="timer">00:00</span>
-        <button id="stopBtn" aria-label="Stop recording" title="Stop recording"></button>
+        <span id="stateIcon" aria-hidden="true"></span>
       </div>
       <style>
         #pill{
@@ -98,8 +109,8 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           justify-content:flex-start;
-          gap:8px;
-          padding:7px 9px;
+          gap:9px;
+          padding:6px 10px;
           border-radius:999px;
           border:1px solid rgba(255,255,255,.18);
           background:linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97));
@@ -109,45 +120,21 @@ function createOverlayHtml() {
         #wave{
           display:block;
           opacity:.95;
-          width:66px;
-          height:20px;
-          flex:0 0 66px;
+          width:54px;
+          height:16px;
+          flex:0 0 54px;
         }
-        #label{
-          font-size:9px;
-          color:rgba(255,255,255,.86);
-          letter-spacing:.14em;
-          text-transform:uppercase;
-          font-weight:700;
-          line-height:1;
-          white-space:nowrap;
-          width:44px;
-          text-align:center;
-          flex:0 0 44px;
-        }
-        #timer{
-          font-size:11px;
-          font-weight:800;
-          color:rgba(255,255,255,.96);
-          font-family:Menlo,ui-monospace,monospace;
-          min-width:42px;
-          text-align:center;
-          line-height:1;
-          flex:0 0 42px;
-        }
-        #stopBtn{
-          width:24px;
-          height:24px;
-          margin-left:0;
-          border:1px solid rgba(255,255,255,.28);
-          background:rgba(255,255,255,.1);
-          border-radius:999px;
-          padding:0;
-          cursor:pointer;
+        #stateIcon{
+          width:14px;
+          height:14px;
+          border-radius:50%;
           position:relative;
-          flex:0 0 auto;
+          display:inline-block;
+          flex:0 0 14px;
+          background:transparent;
+          animation:none;
         }
-        #stopBtn::before{
+        #stateIcon::before{
           content:"";
           position:absolute;
           left:50%;
@@ -155,27 +142,131 @@ function createOverlayHtml() {
           width:8px;
           height:8px;
           transform:translate(-50%,-50%);
-          border-radius:2px;
-          background:rgba(255,255,255,.92);
+          border-radius:50%;
+          background:rgba(180,180,180,.92);
+          box-shadow:0 0 0 0 rgba(180,180,180,0);
         }
-        #stopBtn:hover{background:rgba(255,255,255,.2)}
+        #stateIcon::after{
+          content:"";
+          position:absolute;
+          left:50%;
+          top:50%;
+          width:14px;
+          height:14px;
+          transform:translate(-50%,-50%);
+          border-radius:50%;
+          border:1px solid rgba(180,180,180,.2);
+          opacity:0;
+        }
+        #stateIcon.rec{
+          animation:none;
+        }
+        #stateIcon.rec::before{
+          background:rgba(255,92,92,.94);
+          border-radius:2px;
+          animation:coreBreathe 1.35s ease-in-out infinite;
+        }
+        #stateIcon.rec::after{
+          opacity:1;
+          border:1px solid rgba(255,92,92,.44);
+          animation:recHalo 1.35s ease-out infinite;
+        }
+        #stateIcon.transcribing::before{
+          background:rgba(114,174,255,.98);
+          box-shadow:0 0 8px rgba(114,174,255,.55);
+        }
+        #stateIcon.transcribing::after{
+          opacity:1;
+          border:1px solid rgba(114,174,255,.75);
+          border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
+          box-shadow:0 0 10px rgba(114,174,255,.36), inset 0 0 6px rgba(114,174,255,.28);
+          animation:transBlob 1.05s ease-in-out infinite;
+        }
+        #stateIcon.ok{
+          animation:none;
+        }
+        #stateIcon.ok::before{
+          background:rgba(112,210,136,.96);
+          box-shadow:0 0 8px rgba(112,210,136,.4);
+          animation:okBreathe .65s ease-out 1;
+        }
+        #stateIcon.ok::after{
+          opacity:1;
+          border:1px solid rgba(112,210,136,.35);
+          animation:okHalo .7s ease-out 1;
+        }
+        #stateIcon.fail{
+          animation:none;
+        }
+        #stateIcon.fail::before{
+          background:rgba(184,184,184,.95);
+        }
+        #stateIcon.fail::after{
+          opacity:0;
+        }
+        #timer{
+          font-size:10px;
+          font-weight:800;
+          color:rgba(255,255,255,.96);
+          font-family:Menlo,ui-monospace,monospace;
+          min-width:36px;
+          text-align:center;
+          line-height:1;
+          flex:0 0 36px;
+        }
+        @keyframes coreBreathe{
+          0%,100%{transform:translate(-50%,-50%) scale(1)}
+          50%{transform:translate(-50%,-50%) scale(1.1)}
+        }
+        @keyframes recHalo{
+          0%{transform:translate(-50%,-50%) scale(1); opacity:.9}
+          70%{transform:translate(-50%,-50%) scale(1.28); opacity:.16}
+          100%{transform:translate(-50%,-50%) scale(1.36); opacity:0}
+        }
+        @keyframes transBlob{
+          0%{
+            transform:translate(-50%,-50%) rotate(0deg) scale(1);
+            border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
+          }
+          33%{
+            transform:translate(-50%,-50%) rotate(40deg) scale(1.07);
+            border-radius:62% 38% 58% 42% / 40% 62% 38% 60%;
+          }
+          66%{
+            transform:translate(-50%,-50%) rotate(84deg) scale(1.02);
+            border-radius:46% 54% 40% 60% / 62% 36% 64% 38%;
+          }
+          100%{
+            transform:translate(-50%,-50%) rotate(125deg) scale(1);
+            border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
+          }
+        }
+        @keyframes okBreathe{
+          0%{transform:translate(-50%,-50%) scale(.86)}
+          100%{transform:translate(-50%,-50%) scale(1)}
+        }
+        @keyframes okHalo{
+          0%{transform:translate(-50%,-50%) scale(.92); opacity:.7}
+          100%{transform:translate(-50%,-50%) scale(1.2); opacity:0}
+        }
       </style>
       <script>
         let start = Date.now();
         const el = document.getElementById('timer');
         const cv = document.getElementById('wave');
         const ctx = cv.getContext('2d');
-        const label = document.getElementById('label');
-        const stopBtn = document.getElementById('stopBtn');
+        const stateIcon = document.getElementById('stateIcon');
         let timerId = null;
         const bars = [];
         let lastLevelAt = 0;
         let activeWave = true;
-        const bw = 3;
-        const gap = 2;
+        let waveMode = 'recording';
+        const bw = 1.4;
+        const gap = 1.0;
         const maxBars = Math.floor(cv.width / (bw + gap));
         window.setLevel = (lv) => {
-          const level = Math.max(0, Math.min(1, Number(lv) || 0));
+          const raw = Math.max(0, Math.min(1, Number(lv) || 0));
+          const level = Math.max(0, Math.min(1, Math.pow(raw, 0.72) * 1.45));
           lastLevelAt = Date.now();
           bars.push(level);
           while (bars.length > maxBars) bars.shift();
@@ -189,18 +280,19 @@ function createOverlayHtml() {
         window.setStatus = (s) => {
           const raw = String(s || '').trim().toLowerCase();
           activeWave = raw === 'starting' || raw === 'recording';
-          const map = {
-            'starting': 'REC',
-            'recording': 'REC',
-            'transcribing': 'TRS',
-            'paste sent': 'OK',
-            'paste failed': 'ERR',
-            'saved to app': 'SAVE',
-            'app loading': 'LOAD',
-            'app not ready': 'WAIT',
-            'no text': 'EMPTY'
-          };
-          label.textContent = (map[raw] || String(s || '').toUpperCase()).slice(0, 6);
+          waveMode = raw === 'transcribing' ? 'transcribing' : (activeWave ? 'recording' : 'idle');
+          stateIcon.className = '';
+          if (raw === 'starting' || raw === 'recording') {
+            stateIcon.classList.add('rec');
+          } else if (raw === 'transcribing') {
+            stateIcon.classList.add('transcribing');
+          } else if (raw === 'paste sent') {
+            stateIcon.classList.add('ok');
+          } else if (raw === 'paste failed' || raw === 'grant access' || raw === 'secure field' || raw === 'no text focus' || raw === 'clipboard error') {
+            stateIcon.classList.add('fail');
+          } else {
+            stateIcon.classList.add('fail');
+          }
         };
         window.setTimer = (t) => {
           const str = String(t || '').trim();
@@ -230,7 +322,13 @@ function createOverlayHtml() {
             if (x < 0) break;
             const h = Math.max(2, Math.min(cv.height - 2, v * (cv.height - 2)));
             const y = (cv.height - h) / 2;
-            ctx.fillStyle = activeWave ? 'rgba(255,77,77,.85)' : 'rgba(170,170,170,.62)';
+            if (waveMode === 'recording') {
+              ctx.fillStyle = 'rgba(255,77,77,.88)';
+            } else if (waveMode === 'transcribing') {
+              ctx.fillStyle = 'rgba(114,174,255,.92)';
+            } else {
+              ctx.fillStyle = 'rgba(170,170,170,.62)';
+            }
             ctx.fillRect(x, y, bw, h);
           }
         };
@@ -242,14 +340,13 @@ function createOverlayHtml() {
         };
         setInterval(() => {
           if (activeWave && Date.now() - lastLevelAt < 220) return;
-          const idle = activeWave ? (0.08 + Math.random() * 0.12) : (0.03 + Math.random() * 0.03);
+          const idle = activeWave
+            ? (0.08 + Math.random() * 0.12)
+            : (waveMode === 'transcribing' ? (0.07 + Math.random() * 0.11) : (0.03 + Math.random() * 0.03));
           bars.push(idle);
           while (bars.length > maxBars) bars.shift();
           render();
         }, 120);
-        stopBtn.addEventListener('click', () => {
-          document.title = '__overlay_stop__' + Date.now();
-        });
         tick();
         window.startTimer();
       </script>
@@ -260,8 +357,8 @@ function createOverlayHtml() {
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
-    width: 274,
-    height: 56,
+    width: 228,
+    height: 47,
     frame: false,
     transparent: true,
     resizable: false,
@@ -633,6 +730,16 @@ function looksLikeAutomationPermissionError(reason) {
   );
 }
 
+function overlayStatusForPasteFailure(reason) {
+  const r = String(reason || "").toLowerCase();
+  if (r.includes("no-accessibility")) return "Grant Access";
+  if (r.includes("secure-field")) return "Secure Field";
+  if (r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "No Text Focus";
+  if (r.includes("clipboard")) return "Clipboard Error";
+  if (looksLikeAutomationPermissionError(r)) return "Grant Access";
+  return "Paste Failed";
+}
+
 function openPrivacyAccessibilitySettings() {
   runCommand("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"], {
     timeoutMs: 5000
@@ -745,15 +852,41 @@ async function requestMacPastePermissionsOnce() {
 }
 
 async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
-  if (!text || !text.trim()) return { ok: false, reason: "empty-text" };
-  const escaped = escapeAppleScriptString(text);
+  if (!text || !text.trim()) {
+    logPasteTrace("start_skip", { reason: "empty-text" });
+    return { ok: false, reason: "empty-text", method: "none", verified: false };
+  }
+  let frontBefore = { name: "", pid: 0 };
+  try {
+    frontBefore = await getFrontmostAppInfo();
+  } catch {}
+  logPasteTrace("start", {
+    targetAppName: String(targetAppName || ""),
+    targetAppPid: Number(targetAppPid || 0),
+    frontBeforeName: frontBefore.name || "",
+    frontBeforePid: frontBefore.pid || 0,
+    textLen: String(text).length,
+  });
+  try {
+    clipboard.writeText(String(text));
+  } catch {
+    logPasteTrace("clipboard_write_failed", {});
+    return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
+  }
+  logPasteTrace("clipboard_write_ok", {});
   const escapedApp = escapeAppleScriptString(targetAppName);
   const pid = Number.parseInt(String(targetAppPid || 0), 10) || 0;
   const axInsertScript = `
-    set targetText to "${escaped}"
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set targetText to ""
+      try
+        set targetText to the clipboard as text
+      on error
+        return "ERR:clipboard-read"
+      end try
       set p to missing value
       if targetPid > 0 then
         if exists (first process whose unix id is targetPid) then
@@ -775,6 +908,17 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       on error
         return "ERR:no-focus"
       end try
+      set roleName to ""
+      set subroleName to ""
+      try
+        set roleName to role of focusedElement
+      end try
+      try
+        set subroleName to subrole of focusedElement
+      end try
+      if roleName is "AXSecureTextField" or subroleName is "AXSecureTextField" then
+        return "ERR:secure-field"
+      end if
       try
         set value of attribute "AXSelectedText" of focusedElement to targetText
         return "OK:ax-selected-text"
@@ -784,10 +928,16 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     end tell
   `;
   const pasteScript = `
-    set targetText to "${escaped}"
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set targetText to ""
+      try
+        set targetText to the clipboard as text
+      on error
+        return "ERR:clipboard-read"
+      end try
       if targetPid > 0 then
         if exists (first process whose unix id is targetPid) then
           set p to first process whose unix id is targetPid
@@ -825,10 +975,16 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     end tell
   `;
   const menuPasteScript = `
-    set targetText to "${escaped}"
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set targetText to ""
+      try
+        set targetText to the clipboard as text
+      on error
+        return "ERR:clipboard-read"
+      end try
       set p to missing value
       if targetPid > 0 then
         if exists (first process whose unix id is targetPid) then
@@ -856,10 +1012,16 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     end tell
   `;
   const keycodePasteScript = `
-    set targetText to "${escaped}"
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set targetText to ""
+      try
+        set targetText to the clipboard as text
+      on error
+        return "ERR:clipboard-read"
+      end try
       if targetPid > 0 then
         if exists (first process whose unix id is targetPid) then
           set p to first process whose unix id is targetPid
@@ -899,45 +1061,149 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
 
   let lastReason = "paste-no-attempt";
   const ax = await runCommand("osascript", ["-e", axInsertScript], { timeoutMs: 14000 });
+  logPasteTrace("ax_result", {
+    ok: !!ax.ok,
+    code: ax.code,
+    stdout: compactLogText(ax.stdout),
+    stderr: compactLogText(ax.stderr),
+  });
   if (ax.ok) {
     const axOut = (ax.stdout || "").trim();
-    if (axOut.startsWith("OK:")) return { ok: true, reason: axOut };
+    if (axOut.startsWith("OK:")) {
+      logPasteTrace("success", { method: "ax", reason: axOut });
+      return { ok: true, reason: axOut, method: "ax", verified: true };
+    }
     lastReason = axOut || lastReason;
   } else {
     lastReason = (ax.stderr || ax.stdout || "ax-insert-failed").trim();
   }
 
-  if (targetAppName || pid > 0) {
-    const menuPaste = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 14000 });
-    if (menuPaste.ok) {
-      const menuOut = (menuPaste.stdout || "").trim();
-      if (menuOut.startsWith("OK:")) return { ok: true, reason: menuOut };
-      lastReason = menuOut || lastReason;
-    } else {
-      lastReason = (menuPaste.stderr || menuPaste.stdout || lastReason).trim();
-    }
-  }
-
   for (let attempt = 0; attempt < 2; attempt++) {
+    logPasteTrace("fallback_attempt", { attempt: attempt + 1, method: "cmd_v_then_keycode" });
     const check = await runCommand("osascript", ["-e", pasteScript], { timeoutMs: 14000 });
+    logPasteTrace("cmdv_result", {
+      attempt: attempt + 1,
+      ok: !!check.ok,
+      code: check.code,
+      stdout: compactLogText(check.stdout),
+      stderr: compactLogText(check.stderr),
+    });
     if (check.ok) {
       const out = (check.stdout || "").trim();
-      if (out.startsWith("OK:")) return { ok: true, reason: out };
+      if (out.startsWith("OK:")) {
+        logPasteTrace("success", { method: "cmd_v", attempt: attempt + 1, reason: out });
+        return { ok: true, reason: out, method: "cmd_v", verified: false };
+      }
       lastReason = out || "paste-return-unknown";
     } else {
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
     const check2 = await runCommand("osascript", ["-e", keycodePasteScript], { timeoutMs: 14000 });
+    logPasteTrace("keycode_result", {
+      attempt: attempt + 1,
+      ok: !!check2.ok,
+      code: check2.code,
+      stdout: compactLogText(check2.stdout),
+      stderr: compactLogText(check2.stderr),
+    });
     if (check2.ok) {
       const out2 = (check2.stdout || "").trim();
-      if (out2.startsWith("OK:")) return { ok: true, reason: out2 };
+      if (out2.startsWith("OK:")) {
+        logPasteTrace("success", { method: "keycode", attempt: attempt + 1, reason: out2 });
+        return { ok: true, reason: out2, method: "keycode", verified: false };
+      }
       lastReason = out2 || lastReason;
     } else {
       lastReason = (check2.stderr || check2.stdout || lastReason).trim();
     }
     await sleep(100);
   }
-  return { ok: false, reason: lastReason };
+
+  if (targetAppName || pid > 0) {
+    const menuPaste = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 14000 });
+    logPasteTrace("menu_result", {
+      ok: !!menuPaste.ok,
+      code: menuPaste.code,
+      stdout: compactLogText(menuPaste.stdout),
+      stderr: compactLogText(menuPaste.stderr),
+    });
+    if (menuPaste.ok) {
+      const menuOut = (menuPaste.stdout || "").trim();
+      if (menuOut.startsWith("OK:")) {
+        logPasteTrace("success", { method: "menu", reason: menuOut, verified: false });
+        return { ok: true, reason: menuOut, method: "menu", verified: false };
+      }
+      lastReason = menuOut || lastReason;
+    } else {
+      lastReason = (menuPaste.stderr || menuPaste.stdout || lastReason).trim();
+    }
+  }
+
+  const typedInsertScript = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set targetText to ""
+      try
+        set targetText to the clipboard as text
+      on error
+        return "ERR:clipboard-read"
+      end try
+      if targetText is "" then return "ERR:empty-text"
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+          set frontmost of p to true
+          delay 0.18
+          tell p to keystroke targetText
+          delay 0.12
+          return "OK:typed-pid"
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+          tell p to set frontmost to true
+          delay 0.18
+          tell p to keystroke targetText
+          delay 0.12
+          return "OK:typed-app"
+        end if
+      end if
+      keystroke targetText
+      delay 0.12
+      return "OK:typed"
+    end tell
+  `;
+  if (String(text).length <= 1800) {
+    const typedInsert = await runCommand("osascript", ["-e", typedInsertScript], { timeoutMs: 14000 });
+    logPasteTrace("typed_result", {
+      ok: !!typedInsert.ok,
+      code: typedInsert.code,
+      stdout: compactLogText(typedInsert.stdout),
+      stderr: compactLogText(typedInsert.stderr),
+    });
+    if (typedInsert.ok) {
+      const typedOut = (typedInsert.stdout || "").trim();
+      if (typedOut.startsWith("OK:")) {
+        logPasteTrace("success", { method: "typed", reason: typedOut, verified: false });
+        return { ok: true, reason: typedOut, method: "typed", verified: false };
+      }
+      lastReason = typedOut || lastReason;
+    } else {
+      lastReason = (typedInsert.stderr || typedInsert.stdout || lastReason).trim();
+    }
+  }
+  let frontAfter = { name: "", pid: 0 };
+  try {
+    frontAfter = await getFrontmostAppInfo();
+  } catch {}
+  logPasteTrace("failed", {
+    reason: compactLogText(lastReason),
+    frontAfterName: frontAfter.name || "",
+    frontAfterPid: frontAfter.pid || 0,
+  });
+  return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
 async function handlePostStopFromShortcut(autoTranscribe) {
@@ -968,7 +1234,7 @@ async function handlePostStopFromShortcut(autoTranscribe) {
     } catch {}
     const pasted = await tryPasteToFocusedField(transcript, pasteTargetAppName, pasteTargetAppPid);
     appendMainLog(
-      `[paste-auto] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} reason="${pasted.reason || ""}" len=${transcript.length}`
+      `[paste-auto] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
     if (!pasted.ok) {
       console.log("[paste] not inserted:", pasted.reason || "unknown");
@@ -976,7 +1242,7 @@ async function handlePostStopFromShortcut(autoTranscribe) {
         openPrivacyAccessibilitySettings();
       }
     }
-    await setOverlayStatus(pasted.ok ? "Paste Sent" : "Paste Failed");
+    await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
   } else {
     await setOverlayStatus("Saved To App");
   }
@@ -1030,9 +1296,9 @@ async function pasteLatestTranscriptFromShortcut() {
 
     const pasted = await tryPasteToFocusedField(text, pasteTargetAppName, pasteTargetAppPid);
     appendMainLog(
-      `[paste-last] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} reason="${pasted.reason || ""}" len=${text.length}`
+      `[paste-last] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
-    await setOverlayStatus(pasted.ok ? "Paste Sent" : "Paste Failed");
+    await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
       console.log("[paste-last] failed:", pasted.reason || "unknown");
     }
@@ -1397,22 +1663,30 @@ app.whenReady().then(async () => {
   }
   tray = new Tray(nativeImage.createEmpty());
   tray.setTitle("●");
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      {
-        label: "Open Transcriptor",
-        click: () => {
-          ensureWindowVisible();
-        }
-      },
-      { type: "separator" },
-      {
-        label: "Quit",
-        click: () => app.quit()
+  const trayMenu = Menu.buildFromTemplate([
+    {
+      label: "Open Transcriptor",
+      click: () => {
+        ensureWindowVisible();
       }
-    ])
-  );
-  tray.on("click", () => ensureWindowVisible());
+    },
+    { type: "separator" },
+    {
+      label: "Quit",
+      click: () => app.quit()
+    }
+  ]);
+  tray.on("click", (event) => {
+    // macOS: Ctrl+left-click should behave as right-click.
+    if (event?.ctrlKey) {
+      tray?.popUpContextMenu(trayMenu);
+      return;
+    }
+    ensureWindowVisible();
+  });
+  tray.on("right-click", () => {
+    tray?.popUpContextMenu(trayMenu);
+  });
   const devKey = process.platform === "darwin" ? "Command+Shift+D" : "Control+Shift+D";
   const ok = globalShortcut.register(devKey, () => {
     if (!win?.webContents) return;
