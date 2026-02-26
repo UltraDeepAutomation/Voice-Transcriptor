@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog } = require("electron");
+const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard } = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
@@ -17,10 +17,12 @@ let shortcutToggleInFlight = false;
 let suppressActivateUntil = 0;
 let suppressActivateDuringOverlayFlow = false;
 let pasteTargetAppName = "";
+let pasteTargetAppPid = 0;
 let suppressMainWindowUntil = 0;
 let overlayStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
+let mainLogFilePath = "";
 
 const HOST = "127.0.0.1";
 const PORT = 8321;
@@ -36,7 +38,30 @@ app.on("second-instance", () => {
   ensureWindowVisible();
 });
 
+function appendMainLog(message) {
+  try {
+    if (!mainLogFilePath) {
+      mainLogFilePath = path.join(app.getPath("userData"), "main.log");
+    }
+    fs.appendFileSync(mainLogFilePath, `[${new Date().toISOString()}] ${message}\n`, "utf8");
+  } catch {}
+}
+
+async function shouldBlockMainWindowPresentation() {
+  if (overlayStopInFlight) return true;
+  if (Date.now() < suppressMainWindowUntil) return true;
+  if (suppressActivateDuringOverlayFlow) return true;
+  if (Date.now() < suppressActivateUntil) return true;
+  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return true;
+  try {
+    return await isRendererRecording();
+  } catch {
+    return false;
+  }
+}
+
 async function ensureWindowVisible() {
+  if (await shouldBlockMainWindowPresentation()) return;
   if (Date.now() < suppressMainWindowUntil) return;
   if (!win || win.isDestroyed()) {
     await createWindow();
@@ -60,7 +85,6 @@ function createOverlayHtml() {
   <html>
     <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;">
       <div id="pill">
-        <div id="dot"></div>
         <canvas id="wave" width="56" height="20"></canvas>
         <span id="label">RECORDING</span>
         <span id="timer">00:00</span>
@@ -74,20 +98,13 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           justify-content:flex-start;
-          gap:7px;
+          gap:8px;
           padding:7px 9px;
           border-radius:999px;
           border:1px solid rgba(255,255,255,.18);
           background:linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97));
           box-shadow:none;
           backdrop-filter:blur(8px) saturate(100%);
-        }
-        #dot{
-          width:10px;height:10px;border-radius:50%;
-          background:#ff4d4d;
-          box-shadow:none;
-          animation:pulse 1s ease-in-out infinite;
-          flex:0 0 auto;
         }
         #wave{
           display:block;
@@ -142,7 +159,6 @@ function createOverlayHtml() {
           background:rgba(255,255,255,.92);
         }
         #stopBtn:hover{background:rgba(255,255,255,.2)}
-        @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.18)}}
       </style>
       <script>
         let start = Date.now();
@@ -298,9 +314,12 @@ function positionOverlayWindow() {
 
 async function showRecordingOverlay() {
   suppressActivateDuringOverlayFlow = true;
-  const frontApp = await getFrontmostAppName();
-  if (frontApp && !/transcriptor/i.test(frontApp)) {
-    pasteTargetAppName = frontApp;
+  pasteTargetAppName = "";
+  pasteTargetAppPid = 0;
+  const front = await getFrontmostAppInfo();
+  if (front.name && !isBadActivationTarget(front.name)) {
+    pasteTargetAppName = front.name;
+    pasteTargetAppPid = front.pid;
   }
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
@@ -424,9 +443,12 @@ async function toggleRecordingFromShortcut() {
   if (shortcutToggleInFlight) return;
   shortcutToggleInFlight = true;
   try {
-    const frontApp = await getFrontmostAppName();
-    if (frontApp && !/transcriptor/i.test(frontApp)) {
-      pasteTargetAppName = frontApp;
+    pasteTargetAppName = "";
+    pasteTargetAppPid = 0;
+    const front = await getFrontmostAppInfo();
+    if (front.name && !isBadActivationTarget(front.name)) {
+      pasteTargetAppName = front.name;
+      pasteTargetAppPid = front.pid;
     }
     await ensureOverlayVisible({ status: "Starting", resetTimer: false, startTimer: false });
     await ensureBackgroundWindow();
@@ -531,9 +553,10 @@ async function queryRendererState() {
       (() => {
         const status = (document.getElementById('statusText')?.textContent || '').trim();
         const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
+        const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
         const busy = !!document.getElementById('btnStart')?.disabled;
         const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-        return { status, finalText, busy, progressVisible };
+        return { status, finalText, liveText, busy, progressVisible };
       })();
       `,
       true
@@ -586,6 +609,20 @@ function escapeAppleScriptString(s) {
   return String(s || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+function isBadActivationTarget(name) {
+  const n = String(name || "").trim().toLowerCase();
+  if (!n) return true;
+  return (
+    n === "electron" ||
+    n === "electron helper" ||
+    n.includes("electron helper") ||
+    n.includes("helper (renderer)") ||
+    n.includes("helper (gpu)") ||
+    n.includes("helper (plugin)") ||
+    n.includes("transcriptor")
+  );
+}
+
 function looksLikeAutomationPermissionError(reason) {
   const r = String(reason || "").toLowerCase();
   return (
@@ -618,9 +655,28 @@ async function getFrontmostAppName() {
   return (res.stdout || "").trim();
 }
 
+async function getFrontmostAppInfo() {
+  const script = `
+    tell application "System Events"
+      set p to first process whose frontmost is true
+      set n to name of p
+      set u to unix id of p
+      return (n as text) & "||" & (u as text)
+    end tell
+  `;
+  const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
+  if (!res.ok) return { name: "", pid: 0 };
+  const raw = String(res.stdout || "").trim();
+  const [name, pidText] = raw.split("||");
+  return {
+    name: String(name || "").trim(),
+    pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0
+  };
+}
+
 async function activateAppByName(name) {
   const appName = String(name || "").trim();
-  if (!appName) return false;
+  if (!appName || isBadActivationTarget(appName)) return false;
   const escaped = escapeAppleScriptString(appName);
   const res = await runCommand("osascript", ["-e", `tell application "${escaped}" to activate`], {
     timeoutMs: 5000
@@ -628,6 +684,23 @@ async function activateAppByName(name) {
   if (!res.ok) return false;
   await sleep(350);
   return true;
+}
+
+async function activateAppByPid(pid) {
+  const n = Number(pid || 0);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  const script = `
+    tell application "System Events"
+      if exists (first process whose unix id is ${Math.trunc(n)}) then
+        set frontmost of first process whose unix id is ${Math.trunc(n)} to true
+        return "1"
+      end if
+      return "0"
+    end tell
+  `;
+  const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
+  if (!res.ok) return false;
+  return String(res.stdout || "").trim() === "1";
 }
 
 async function requestMacPastePermissionsOnce() {
@@ -671,55 +744,198 @@ async function requestMacPastePermissionsOnce() {
   }
 }
 
-async function tryPasteToFocusedField(text, targetAppName = "") {
+async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
   if (!text || !text.trim()) return { ok: false, reason: "empty-text" };
   const escaped = escapeAppleScriptString(text);
   const escapedApp = escapeAppleScriptString(targetAppName);
-  const pasteToTargetProcessScript = `
+  const pid = Number.parseInt(String(targetAppPid || 0), 10) || 0;
+  const axInsertScript = `
     set targetText to "${escaped}"
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
-      set the clipboard to targetText
-      tell process "${escapedApp}"
-        set frontmost to true
-        delay 0.18
-        keystroke "v" using {command down}
-      end tell
-      delay 0.14
-      return "1"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then
+        set p to first process whose frontmost is true
+      end if
+      set frontmost of p to true
+      delay 0.12
+      set focusedElement to missing value
+      try
+        set focusedElement to value of attribute "AXFocusedUIElement" of p
+      on error
+        return "ERR:no-focus"
+      end try
+      try
+        set value of attribute "AXSelectedText" of focusedElement to targetText
+        return "OK:ax-selected-text"
+      on error
+      end try
+      return "ERR:ax-failed"
     end tell
   `;
-  const pasteToFrontmostScript = `
+  const pasteScript = `
     set targetText to "${escaped}"
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+          set frontmost of p to true
+          delay 0.20
+          set the clipboard to targetText
+          delay 0.12
+          tell p
+            keystroke "v" using {command down}
+          end tell
+          delay 0.16
+          return "OK:paste-pid"
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+          tell p
+            set frontmost to true
+          end tell
+          delay 0.20
+          set the clipboard to targetText
+          delay 0.12
+          tell p
+            keystroke "v" using {command down}
+          end tell
+          delay 0.16
+          return "OK:paste-app"
+        end if
+      end if
       set the clipboard to targetText
-      delay 0.22
+      delay 0.18
       keystroke "v" using {command down}
-      delay 0.16
-      return "1"
+      delay 0.18
+      return "OK:paste"
+    end tell
+  `;
+  const menuPasteScript = `
+    set targetText to "${escaped}"
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then
+        return "ERR:no-process"
+      end if
+      set frontmost of p to true
+      delay 0.18
+      set the clipboard to targetText
+      delay 0.12
+      try
+        click menu item "Paste" of menu "Edit" of menu bar item "Edit" of menu bar 1 of p
+        delay 0.16
+        return "OK:menu-paste"
+      on error errMsg
+        return "ERR:menu-paste:" & errMsg
+      end try
+    end tell
+  `;
+  const keycodePasteScript = `
+    set targetText to "${escaped}"
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+          set frontmost of p to true
+          delay 0.18
+          set the clipboard to targetText
+          delay 0.10
+          tell p
+            key code 9 using {command down}
+          end tell
+          delay 0.16
+          return "OK:keycode-pid"
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+          tell p
+            set frontmost to true
+          end tell
+          delay 0.18
+          set the clipboard to targetText
+          delay 0.10
+          tell p
+            key code 9 using {command down}
+          end tell
+          delay 0.16
+          return "OK:keycode-app"
+        end if
+      end if
+      set the clipboard to targetText
+      delay 0.18
+      key code 9 using {command down}
+      delay 0.18
+      return "OK:keycode"
     end tell
   `;
 
   let lastReason = "paste-no-attempt";
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (targetAppName) {
-      await activateAppByName(targetAppName);
-      await sleep(220 + attempt * 80);
-      const frontNow = await getFrontmostAppName();
-      if (!frontNow || frontNow !== targetAppName) {
-        lastReason = `frontmost-mismatch:${frontNow || "none"}`;
-        continue;
-      }
+  const ax = await runCommand("osascript", ["-e", axInsertScript], { timeoutMs: 14000 });
+  if (ax.ok) {
+    const axOut = (ax.stdout || "").trim();
+    if (axOut.startsWith("OK:")) return { ok: true, reason: axOut };
+    lastReason = axOut || lastReason;
+  } else {
+    lastReason = (ax.stderr || ax.stdout || "ax-insert-failed").trim();
+  }
+
+  if (targetAppName || pid > 0) {
+    const menuPaste = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 14000 });
+    if (menuPaste.ok) {
+      const menuOut = (menuPaste.stdout || "").trim();
+      if (menuOut.startsWith("OK:")) return { ok: true, reason: menuOut };
+      lastReason = menuOut || lastReason;
+    } else {
+      lastReason = (menuPaste.stderr || menuPaste.stdout || lastReason).trim();
     }
-    const script = targetAppName ? pasteToTargetProcessScript : pasteToFrontmostScript;
-    const check = await runCommand("osascript", ["-e", script], { timeoutMs: 14000 });
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const check = await runCommand("osascript", ["-e", pasteScript], { timeoutMs: 14000 });
     if (check.ok) {
       const out = (check.stdout || "").trim();
-      if (!out || out === "1") return { ok: true, reason: "" };
-      lastReason = out || "paste-return-0";
+      if (out.startsWith("OK:")) return { ok: true, reason: out };
+      lastReason = out || "paste-return-unknown";
     } else {
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
-    await sleep(150 + attempt * 60);
+    const check2 = await runCommand("osascript", ["-e", keycodePasteScript], { timeoutMs: 14000 });
+    if (check2.ok) {
+      const out2 = (check2.stdout || "").trim();
+      if (out2.startsWith("OK:")) return { ok: true, reason: out2 };
+      lastReason = out2 || lastReason;
+    } else {
+      lastReason = (check2.stderr || check2.stdout || lastReason).trim();
+    }
+    await sleep(100);
   }
   return { ok: false, reason: lastReason };
 }
@@ -736,6 +952,8 @@ async function handlePostStopFromShortcut(autoTranscribe) {
     }
     if (s.finalText && s.finalText.length > 0) {
       transcript = s.finalText;
+    } else if (!transcript && s.liveText && s.liveText.length > 0) {
+      transcript = s.liveText;
     }
     const doneLike = !s.busy && !s.progressVisible && (s.status === "Done" || s.status === "Error" || s.status === "Idle");
     if (doneLike) break;
@@ -745,16 +963,13 @@ async function handlePostStopFromShortcut(autoTranscribe) {
   if (transcript) {
     lastTranscriptText = transcript;
     saveLastTranscriptToDisk(transcript);
-    if (pasteTargetAppName) {
-      for (let i = 0; i < 3; i++) {
-        await activateAppByName(pasteTargetAppName);
-        const frontNow = await getFrontmostAppName();
-        if (frontNow && frontNow === pasteTargetAppName) break;
-        await sleep(180);
-      }
-      await sleep(220);
-    }
-    const pasted = await tryPasteToFocusedField(transcript, pasteTargetAppName);
+    try {
+      clipboard.writeText(transcript);
+    } catch {}
+    const pasted = await tryPasteToFocusedField(transcript, pasteTargetAppName, pasteTargetAppPid);
+    appendMainLog(
+      `[paste-auto] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} reason="${pasted.reason || ""}" len=${transcript.length}`
+    );
     if (!pasted.ok) {
       console.log("[paste] not inserted:", pasted.reason || "unknown");
       if (looksLikeAutomationPermissionError(pasted.reason)) {
@@ -766,12 +981,13 @@ async function handlePostStopFromShortcut(autoTranscribe) {
     await setOverlayStatus("Saved To App");
   }
   pasteTargetAppName = "";
+  pasteTargetAppPid = 0;
   setTimeout(() => hideRecordingOverlay(), 1500);
 }
 
 async function getLatestTranscriptText() {
   const s = await queryRendererState();
-  const current = String(s?.finalText || "").trim();
+  const current = String(s?.finalText || s?.liveText || "").trim();
   if (current) {
     lastTranscriptText = current;
     saveLastTranscriptToDisk(current);
@@ -790,9 +1006,12 @@ async function pasteLatestTranscriptFromShortcut() {
   if (pasteShortcutInFlight) return;
   pasteShortcutInFlight = true;
   try {
-    const frontApp = await getFrontmostAppName();
-    if (frontApp && !/transcriptor/i.test(frontApp)) {
-      pasteTargetAppName = frontApp;
+    pasteTargetAppName = "";
+    pasteTargetAppPid = 0;
+    const front = await getFrontmostAppInfo();
+    if (front.name && !isBadActivationTarget(front.name)) {
+      pasteTargetAppName = front.name;
+      pasteTargetAppPid = front.pid;
     }
     await ensureOverlayVisible({ status: "Pasting", resetTimer: false, startTimer: false });
     await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => {});
@@ -802,19 +1021,23 @@ async function pasteLatestTranscriptFromShortcut() {
       await setOverlayStatus("No Text");
       setTimeout(() => hideRecordingOverlay(), 1200);
       pasteTargetAppName = "";
+      pasteTargetAppPid = 0;
       return;
     }
+    try {
+      clipboard.writeText(text);
+    } catch {}
 
-    if (pasteTargetAppName) {
-      await activateAppByName(pasteTargetAppName);
-      await sleep(220);
-    }
-    const pasted = await tryPasteToFocusedField(text, pasteTargetAppName);
+    const pasted = await tryPasteToFocusedField(text, pasteTargetAppName, pasteTargetAppPid);
+    appendMainLog(
+      `[paste-last] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} reason="${pasted.reason || ""}" len=${text.length}`
+    );
     await setOverlayStatus(pasted.ok ? "Paste Sent" : "Paste Failed");
     if (!pasted.ok) {
       console.log("[paste-last] failed:", pasted.reason || "unknown");
     }
     pasteTargetAppName = "";
+    pasteTargetAppPid = 0;
     setTimeout(() => hideRecordingOverlay(), 1300);
   } finally {
     pasteShortcutInFlight = false;
@@ -995,12 +1218,14 @@ async function startBackend() {
 
   backend.on("exit", (code) => {
     console.log("[backend] exited with code", code);
+    appendMainLog(`[backend-exit] code=${code}`);
     backend = null;
   });
 
   backend.on("error", (err) => {
     backendBootError = err.message;
     console.log("[backend] spawn error:", err.message);
+    appendMainLog(`[backend-error] ${err.message}`);
   });
 }
 
@@ -1051,6 +1276,12 @@ async function createWindow(options = {}) {
     const trusted = url.startsWith(BASE_URL) || url.startsWith("about:blank");
     cb(trusted && permission === "media");
   });
+  win.webContents.on("render-process-gone", (_event, details) => {
+    appendMainLog(`[render-process-gone] reason=${details?.reason || "unknown"} exitCode=${details?.exitCode ?? ""}`);
+  });
+  win.webContents.on("did-fail-load", (_event, code, desc, url) => {
+    appendMainLog(`[did-fail-load] code=${code} desc=${desc} url=${url}`);
+  });
 
   win.on("close", (event) => {
     // Keep renderer warm on macOS so global-hotkey actions are instant and
@@ -1060,6 +1291,16 @@ async function createWindow(options = {}) {
       win.hide();
       return;
     }
+  });
+  win.on("show", () => {
+    isRendererRecording()
+      .then((recording) => {
+        if (!recording) return;
+        try {
+          win.hide();
+        } catch {}
+      })
+      .catch(() => {});
   });
 
   win.on("closed", () => {
@@ -1103,22 +1344,8 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("activate", () => {
-  if (overlayStopInFlight) {
-    return;
-  }
-  if (Date.now() < suppressMainWindowUntil) {
-    return;
-  }
-  if (suppressActivateDuringOverlayFlow) {
-    return;
-  }
-  if (Date.now() < suppressActivateUntil) {
-    return;
-  }
-  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) {
-    return;
-  }
+app.on("activate", async () => {
+  if (await shouldBlockMainWindowPresentation()) return;
   ensureWindowVisible();
 });
 
@@ -1153,6 +1380,14 @@ app.on("before-quit", () => {
 });
 
 app.whenReady().then(async () => {
+  process.on("uncaughtException", (err) => {
+    appendMainLog(`[uncaughtException] ${err?.stack || err?.message || String(err)}`);
+    console.error("[uncaughtException]", err);
+  });
+  process.on("unhandledRejection", (reason) => {
+    appendMainLog(`[unhandledRejection] ${String(reason)}`);
+    console.error("[unhandledRejection]", reason);
+  });
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
     app.setActivationPolicy("regular");
