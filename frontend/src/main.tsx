@@ -40,6 +40,7 @@ interface RecordingItem {
 declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
+    __transcriptorVuLevel?: number;
   }
 }
 
@@ -76,6 +77,7 @@ const ALLOWED_AUDIO_MIME = new Set([
   "audio/aac",
 ]);
 const ALLOWED_AUDIO_EXT = new Set(["wav", "mp3", "m4a", "flac", "ogg", "aac", "mp4", "webm"]);
+const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
 
 let isBusy = false;
 let isRecording = false;
@@ -378,13 +380,84 @@ let vu = 0;
 function setVU(rms: number): void {
   vu = vu * 0.7 + rms * 0.3;
   const pct = Math.min(100, vu * 400);
+  window.__transcriptorVuLevel = Math.max(0, Math.min(1, vu * 4));
   $("vuFill").style.width = pct + "%";
   $("vuFill").style.background = pct < 40 ? "#aaa" : pct < 70 ? "#888" : "#666";
 }
 
 function resetVU(): void {
   vu = 0;
+  window.__transcriptorVuLevel = 0;
   setVU(0);
+}
+
+function persistLiveDraft(recording: boolean): void {
+  try {
+    const liveText = ($("liveOutput").textContent || "").trim();
+    const finalText = ($("finalOutput").textContent || "").trim();
+    const timerText = ($("timer").textContent || "00:00").trim();
+    const title = "Recording " + new Date(startAt || Date.now()).toLocaleString();
+    const draft = {
+      started_at: startAt || Date.now(),
+      updated_at: Date.now(),
+      recording,
+      timer: timerText,
+      title,
+      source_text: liveText,
+      transcript_text: finalText,
+      provider: ($("providerSelect") as HTMLSelectElement).value || "local",
+      model: ($("model") as HTMLSelectElement).value,
+      language: ($("language") as HTMLSelectElement).value,
+    };
+    localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
+  } catch {}
+}
+
+function clearLiveDraft(): void {
+  try {
+    localStorage.removeItem(LIVE_DRAFT_KEY);
+  } catch {}
+}
+
+async function recoverLiveDraftIfAny(): Promise<void> {
+  let raw = "";
+  try {
+    raw = localStorage.getItem(LIVE_DRAFT_KEY) || "";
+  } catch {
+    return;
+  }
+  if (!raw) return;
+  try {
+    const draft = JSON.parse(raw) as {
+      title?: string;
+      source_text?: string;
+      transcript_text?: string;
+      provider?: string;
+      model?: string;
+      language?: string;
+      updated_at?: number;
+    };
+    const sourceText = String(draft.source_text || "").trim();
+    const transcriptText = String(draft.transcript_text || "").trim();
+    if (!sourceText && !transcriptText) {
+      clearLiveDraft();
+      return;
+    }
+    const stamp = Number(draft.updated_at || Date.now());
+    await saveRecordingText({
+      title: String(draft.title || "Recovered recording") + " (Recovered)",
+      sourceText,
+      transcriptText,
+      provider: String(draft.provider || "local"),
+      model: String(draft.model || "-"),
+      language: String(draft.language || "auto"),
+    });
+    $("finalOutput").textContent = transcriptText || sourceText;
+    setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
+    clearLiveDraft();
+  } catch {
+    // Keep draft for next startup attempt.
+  }
 }
 
 async function loadCfg(): Promise<void> {
@@ -574,6 +647,7 @@ let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
 let startAt = 0;
 let chunks: Float32Array[] = [];
+let draftSaveTimer: number | null = null;
 
 function resetOutputs(): void {
   $("liveOutput").textContent = "";
@@ -611,8 +685,15 @@ async function startLive(): Promise<void> {
   ($("btnStart") as HTMLButtonElement).disabled = false;
   (document.getElementById("btnStop") as HTMLButtonElement).disabled = false;
   setStatus("Starting");
+  window.__transcriptorVuLevel = 0;
 
   startAt = Date.now();
+  persistLiveDraft(true);
+  if (draftSaveTimer) {
+    clearInterval(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  draftSaveTimer = window.setInterval(() => persistLiveDraft(true), 1200);
   timer = window.setInterval(() => {
     $("timer").textContent = fmtTime((Date.now() - startAt) / 1000);
   }, 200);
@@ -654,6 +735,7 @@ async function startLive(): Promise<void> {
         const cur = $("liveOutput").textContent || "";
         $("liveOutput").textContent = cur + (cur ? "\n" : "") + lines.join("\n");
         $("liveOutput").scrollTop = $("liveOutput").scrollHeight;
+        persistLiveDraft(true);
       }
     }
   };
@@ -704,9 +786,16 @@ async function startLive(): Promise<void> {
     tick();
 
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN || !ac) return;
       const input = ev.data;
       if (!(input instanceof Float32Array)) return;
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) {
+        const s = input[i];
+        sum += s * s;
+      }
+      const rms = input.length ? Math.sqrt(sum / input.length) : 0;
+      window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * 4));
+      if (!ws || ws.readyState !== WebSocket.OPEN || !ac) return;
       const ds = downsample(input, ac.sampleRate, 16000);
       chunks.push(new Float32Array(ds));
       const pcm = new ArrayBuffer(ds.length * 2);
@@ -739,6 +828,11 @@ async function stopLive(enhance: boolean): Promise<void> {
     clearInterval(timer);
     timer = null;
   }
+  if (draftSaveTimer) {
+    clearInterval(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  persistLiveDraft(false);
   if (waveAnimId) {
     cancelAnimationFrame(waveAnimId);
     waveAnimId = 0;
@@ -788,6 +882,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         language: languageValue,
       });
     } catch {}
+    clearLiveDraft();
     setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
     setStatus("Idle");
@@ -806,6 +901,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         language: languageValue,
       });
     } catch {}
+    clearLiveDraft();
     setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
     setStatus("Idle");
@@ -872,6 +968,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     } catch {}
   } finally {
     pollAbortController = null;
+    clearLiveDraft();
     setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
   }
@@ -1000,6 +1097,7 @@ window.addEventListener("transcriptor-hotkey-toggle", () => {
 void loadCfg();
 void loadMics(false);
 void loadRecordings(false).catch(() => {});
+void recoverLiveDraftIfAny();
 draw();
 syncMode();
 setStatus("Idle");

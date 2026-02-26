@@ -19,10 +19,13 @@ let suppressActivateDuringOverlayFlow = false;
 let pasteTargetAppName = "";
 let suppressMainWindowUntil = 0;
 let overlayStopInFlight = false;
+let pasteShortcutInFlight = false;
+let lastTranscriptText = "";
 
 const HOST = "127.0.0.1";
 const PORT = 8321;
 const BASE_URL = `http://${HOST}:${PORT}`;
+const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -70,51 +73,62 @@ function createOverlayHtml() {
           margin-top: 6px;
           display:flex;
           align-items:center;
-          gap:9px;
-          padding:8px 12px;
+          justify-content:flex-start;
+          gap:7px;
+          padding:7px 9px;
           border-radius:999px;
-          border:1px solid rgba(255,255,255,.16);
-          background:linear-gradient(180deg,rgba(34,34,34,.98),rgba(26,26,26,.98));
-          box-shadow:0 16px 34px rgba(0,0,0,.38), inset 0 1px 0 rgba(255,255,255,.06);
-          backdrop-filter:blur(14px) saturate(130%);
+          border:1px solid rgba(255,255,255,.18);
+          background:linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97));
+          box-shadow:none;
+          backdrop-filter:blur(8px) saturate(100%);
         }
         #dot{
-          width:9px;height:9px;border-radius:50%;
+          width:10px;height:10px;border-radius:50%;
           background:#ff4d4d;
-          box-shadow:0 0 12px rgba(255,77,77,.72),0 0 20px rgba(255,77,77,.34);
+          box-shadow:none;
           animation:pulse 1s ease-in-out infinite;
           flex:0 0 auto;
         }
-        #wave{display:block;opacity:.95}
+        #wave{
+          display:block;
+          opacity:.95;
+          width:66px;
+          height:20px;
+          flex:0 0 66px;
+        }
         #label{
-          font-size:10px;
+          font-size:9px;
           color:rgba(255,255,255,.86);
-          letter-spacing:.12em;
+          letter-spacing:.14em;
           text-transform:uppercase;
-          font-weight:650;
+          font-weight:700;
           line-height:1;
           white-space:nowrap;
+          width:44px;
+          text-align:center;
+          flex:0 0 44px;
         }
         #timer{
           font-size:11px;
-          font-weight:700;
+          font-weight:800;
           color:rgba(255,255,255,.96);
           font-family:Menlo,ui-monospace,monospace;
-          min-width:40px;
-          text-align:right;
+          min-width:42px;
+          text-align:center;
           line-height:1;
-          margin-left:4px;
+          flex:0 0 42px;
         }
         #stopBtn{
           width:24px;
           height:24px;
-          margin-left:2px;
-          border:1px solid rgba(255,255,255,.24);
+          margin-left:0;
+          border:1px solid rgba(255,255,255,.28);
           background:rgba(255,255,255,.1);
           border-radius:999px;
           padding:0;
           cursor:pointer;
           position:relative;
+          flex:0 0 auto;
         }
         #stopBtn::before{
           content:"";
@@ -127,7 +141,7 @@ function createOverlayHtml() {
           border-radius:2px;
           background:rgba(255,255,255,.92);
         }
-        #stopBtn:hover{background:rgba(255,255,255,.16)}
+        #stopBtn:hover{background:rgba(255,255,255,.2)}
         @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.18)}}
       </style>
       <script>
@@ -139,17 +153,38 @@ function createOverlayHtml() {
         const stopBtn = document.getElementById('stopBtn');
         let timerId = null;
         const bars = [];
+        let lastLevelAt = 0;
+        let activeWave = true;
         const bw = 3;
         const gap = 2;
         const maxBars = Math.floor(cv.width / (bw + gap));
         window.setLevel = (lv) => {
           const level = Math.max(0, Math.min(1, Number(lv) || 0));
+          lastLevelAt = Date.now();
           bars.push(level);
           while (bars.length > maxBars) bars.shift();
           render();
         };
+        window.resetWave = () => {
+          bars.length = 0;
+          lastLevelAt = 0;
+          render();
+        };
         window.setStatus = (s) => {
-          label.textContent = String(s || '').toUpperCase();
+          const raw = String(s || '').trim().toLowerCase();
+          activeWave = raw === 'starting' || raw === 'recording';
+          const map = {
+            'starting': 'REC',
+            'recording': 'REC',
+            'transcribing': 'TRS',
+            'paste sent': 'OK',
+            'paste failed': 'ERR',
+            'saved to app': 'SAVE',
+            'app loading': 'LOAD',
+            'app not ready': 'WAIT',
+            'no text': 'EMPTY'
+          };
+          label.textContent = (map[raw] || String(s || '').toUpperCase()).slice(0, 6);
         };
         window.setTimer = (t) => {
           const str = String(t || '').trim();
@@ -179,7 +214,7 @@ function createOverlayHtml() {
             if (x < 0) break;
             const h = Math.max(2, Math.min(cv.height - 2, v * (cv.height - 2)));
             const y = (cv.height - h) / 2;
-            ctx.fillStyle = 'rgba(255,77,77,.85)';
+            ctx.fillStyle = activeWave ? 'rgba(255,77,77,.85)' : 'rgba(170,170,170,.62)';
             ctx.fillRect(x, y, bw, h);
           }
         };
@@ -189,6 +224,13 @@ function createOverlayHtml() {
           const ss = String(s % 60).padStart(2, '0');
           el.textContent = mm + ':' + ss;
         };
+        setInterval(() => {
+          if (activeWave && Date.now() - lastLevelAt < 220) return;
+          const idle = activeWave ? (0.08 + Math.random() * 0.12) : (0.03 + Math.random() * 0.03);
+          bars.push(idle);
+          while (bars.length > maxBars) bars.shift();
+          render();
+        }, 120);
         stopBtn.addEventListener('click', () => {
           document.title = '__overlay_stop__' + Date.now();
         });
@@ -202,8 +244,8 @@ function createOverlayHtml() {
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
-    width: 300,
-    height: 62,
+    width: 274,
+    height: 56,
     frame: false,
     transparent: true,
     resizable: false,
@@ -268,7 +310,7 @@ async function showRecordingOverlay() {
   }
   try {
     await ow.webContents.executeJavaScript(
-      `window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus("Recording");`,
+      `window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus("Recording");`,
       true
     );
   } catch {}
@@ -282,7 +324,7 @@ async function showRecordingOverlay() {
     if (!win || win.isDestroyed() || !win.webContents) return;
     win.webContents
       .executeJavaScript(
-        `(() => { const f=document.getElementById('vuFill'); return f ? (parseFloat(f.style.width||'0')/100) : 0; })();`,
+        `(() => { const lv = Number(window.__transcriptorVuLevel || 0); return Number.isFinite(lv) ? lv : 0; })();`,
         true
       )
       .then((lv) => {
@@ -505,6 +547,41 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getLastTranscriptPath() {
+  try {
+    return path.join(app.getPath("userData"), LAST_TRANSCRIPT_FILE);
+  } catch {
+    return "";
+  }
+}
+
+function loadLastTranscriptFromDisk() {
+  const p = getLastTranscriptPath();
+  if (!p || !fs.existsSync(p)) return "";
+  try {
+    const raw = fs.readFileSync(p, "utf8");
+    const parsed = JSON.parse(raw);
+    return String(parsed?.text || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveLastTranscriptToDisk(text) {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return;
+  const p = getLastTranscriptPath();
+  if (!p) return;
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(
+      p,
+      JSON.stringify({ text: cleaned, updated_at: new Date().toISOString() }, null, 2),
+      "utf8"
+    );
+  } catch {}
+}
+
 function escapeAppleScriptString(s) {
   return String(s || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
@@ -594,73 +671,55 @@ async function requestMacPastePermissionsOnce() {
   }
 }
 
-async function tryPasteToFocusedField(text) {
+async function tryPasteToFocusedField(text, targetAppName = "") {
   if (!text || !text.trim()) return { ok: false, reason: "empty-text" };
   const escaped = escapeAppleScriptString(text);
-  const axSetValueScript = `
-    set targetText to "${escaped}"
-    tell application "System Events"
-      set frontProc to first process whose frontmost is true
-      try
-        set focusedElement to value of attribute "AXFocusedUIElement" of frontProc
-      on error
-        return "0"
-      end try
-      set oldValue to ""
-      try
-        set oldValue to (value of attribute "AXValue" of focusedElement) as text
-      end try
-      try
-        set value of attribute "AXValue" of focusedElement to (oldValue & targetText)
-        return "1"
-      on error
-        return "0"
-      end try
-    end tell
-  `;
-  const pasteScript = `
+  const escapedApp = escapeAppleScriptString(targetAppName);
+  const pasteToTargetProcessScript = `
     set targetText to "${escaped}"
     tell application "System Events"
       set the clipboard to targetText
-      delay 0.20
+      tell process "${escapedApp}"
+        set frontmost to true
+        delay 0.18
+        keystroke "v" using {command down}
+      end tell
+      delay 0.14
+      return "1"
+    end tell
+  `;
+  const pasteToFrontmostScript = `
+    set targetText to "${escaped}"
+    tell application "System Events"
+      set the clipboard to targetText
+      delay 0.22
       keystroke "v" using {command down}
-      delay 0.25
+      delay 0.16
       return "1"
     end tell
   `;
-  const keycodePasteScript = `
-    set targetText to "${escaped}"
-    tell application "System Events"
-      set the clipboard to targetText
-      delay 0.20
-      key code 9 using {command down}
-      delay 0.25
-      return "1"
-    end tell
-  `;
-  const typeScript = `
-    set targetText to "${escaped}"
-    tell application "System Events"
-      keystroke targetText
-      return "1"
-    end tell
-  `;
-
-  const scripts = [axSetValueScript];
-  scripts.push(pasteScript, keycodePasteScript, typeScript);
 
   let lastReason = "paste-no-attempt";
-  for (const script of scripts) {
-    const check = await runCommand("osascript", ["-e", script], { timeoutMs: 14000 });
-    if (!check.ok) {
-      lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
-      await sleep(90);
-      continue;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (targetAppName) {
+      await activateAppByName(targetAppName);
+      await sleep(220 + attempt * 80);
+      const frontNow = await getFrontmostAppName();
+      if (!frontNow || frontNow !== targetAppName) {
+        lastReason = `frontmost-mismatch:${frontNow || "none"}`;
+        continue;
+      }
     }
-    const out = (check.stdout || "").trim();
-    if (out === "1") return { ok: true, reason: "" };
-    lastReason = out || "paste-return-0";
-    await sleep(90);
+    const script = targetAppName ? pasteToTargetProcessScript : pasteToFrontmostScript;
+    const check = await runCommand("osascript", ["-e", script], { timeoutMs: 14000 });
+    if (check.ok) {
+      const out = (check.stdout || "").trim();
+      if (!out || out === "1") return { ok: true, reason: "" };
+      lastReason = out || "paste-return-0";
+    } else {
+      lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
+    }
+    await sleep(150 + attempt * 60);
   }
   return { ok: false, reason: lastReason };
 }
@@ -684,6 +743,8 @@ async function handlePostStopFromShortcut(autoTranscribe) {
   }
 
   if (transcript) {
+    lastTranscriptText = transcript;
+    saveLastTranscriptToDisk(transcript);
     if (pasteTargetAppName) {
       for (let i = 0; i < 3; i++) {
         await activateAppByName(pasteTargetAppName);
@@ -693,7 +754,7 @@ async function handlePostStopFromShortcut(autoTranscribe) {
       }
       await sleep(220);
     }
-    const pasted = await tryPasteToFocusedField(transcript);
+    const pasted = await tryPasteToFocusedField(transcript, pasteTargetAppName);
     if (!pasted.ok) {
       console.log("[paste] not inserted:", pasted.reason || "unknown");
       if (looksLikeAutomationPermissionError(pasted.reason)) {
@@ -706,6 +767,58 @@ async function handlePostStopFromShortcut(autoTranscribe) {
   }
   pasteTargetAppName = "";
   setTimeout(() => hideRecordingOverlay(), 1500);
+}
+
+async function getLatestTranscriptText() {
+  const s = await queryRendererState();
+  const current = String(s?.finalText || "").trim();
+  if (current) {
+    lastTranscriptText = current;
+    saveLastTranscriptToDisk(current);
+    return current;
+  }
+  if (lastTranscriptText) return lastTranscriptText;
+  const disk = loadLastTranscriptFromDisk();
+  if (disk) {
+    lastTranscriptText = disk;
+    return disk;
+  }
+  return "";
+}
+
+async function pasteLatestTranscriptFromShortcut() {
+  if (pasteShortcutInFlight) return;
+  pasteShortcutInFlight = true;
+  try {
+    const frontApp = await getFrontmostAppName();
+    if (frontApp && !/transcriptor/i.test(frontApp)) {
+      pasteTargetAppName = frontApp;
+    }
+    await ensureOverlayVisible({ status: "Pasting", resetTimer: false, startTimer: false });
+    await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => {});
+
+    const text = await getLatestTranscriptText();
+    if (!text) {
+      await setOverlayStatus("No Text");
+      setTimeout(() => hideRecordingOverlay(), 1200);
+      pasteTargetAppName = "";
+      return;
+    }
+
+    if (pasteTargetAppName) {
+      await activateAppByName(pasteTargetAppName);
+      await sleep(220);
+    }
+    const pasted = await tryPasteToFocusedField(text, pasteTargetAppName);
+    await setOverlayStatus(pasted.ok ? "Paste Sent" : "Paste Failed");
+    if (!pasted.ok) {
+      console.log("[paste-last] failed:", pasted.reason || "unknown");
+    }
+    pasteTargetAppName = "";
+    setTimeout(() => hideRecordingOverlay(), 1300);
+  } finally {
+    pasteShortcutInFlight = false;
+  }
 }
 
 function escapeHtml(text) {
@@ -1040,6 +1153,7 @@ app.on("before-quit", () => {
 });
 
 app.whenReady().then(async () => {
+  lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
     app.setActivationPolicy("regular");
   }
@@ -1083,6 +1197,16 @@ app.whenReady().then(async () => {
   });
   if (!hotkeyOk) {
     console.log("[app] failed to register recording shortcut:", recordHotkey);
+  }
+  const pasteLastHotkey = process.platform === "darwin" ? "Alt+Shift+7" : "Alt+Shift+7";
+  const pasteLastHotkeyOk = globalShortcut.register(pasteLastHotkey, () => {
+    pasteLatestTranscriptFromShortcut().catch((e) => {
+      console.log("[shortcut] paste-last failed:", e?.message || e);
+      hideRecordingOverlay();
+    });
+  });
+  if (!pasteLastHotkeyOk) {
+    console.log("[app] failed to register paste-last shortcut:", pasteLastHotkey);
   }
 
   await requestMacPastePermissionsOnce();
