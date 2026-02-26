@@ -447,10 +447,6 @@ async function toggleRecordingFromShortcut() {
 async function stopRecordingFromOverlay() {
   suppressActivateUntil = Date.now() + 2500;
   suppressMainWindowUntil = Date.now() + 10000;
-  const frontApp = await getFrontmostAppName();
-  if (frontApp && !/transcriptor/i.test(frontApp)) {
-    pasteTargetAppName = frontApp;
-  }
   await ensureBackgroundWindow();
   if (!win || win.isDestroyed() || !win.webContents) return;
   if (win.isVisible()) win.hide();
@@ -689,7 +685,13 @@ async function handlePostStopFromShortcut(autoTranscribe) {
 
   if (transcript) {
     if (pasteTargetAppName) {
-      await activateAppByName(pasteTargetAppName);
+      for (let i = 0; i < 3; i++) {
+        await activateAppByName(pasteTargetAppName);
+        const frontNow = await getFrontmostAppName();
+        if (frontNow && frontNow === pasteTargetAppName) break;
+        await sleep(180);
+      }
+      await sleep(220);
     }
     const pasted = await tryPasteToFocusedField(transcript);
     if (!pasted.ok) {
