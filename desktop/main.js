@@ -23,6 +23,7 @@ let overlayStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
 let mainLogFilePath = "";
+let traceCounter = 0;
 
 const HOST = "127.0.0.1";
 const PORT = 8321;
@@ -57,6 +58,52 @@ function compactLogText(value, max = 180) {
   const s = String(value || "").replace(/\s+/g, " ").trim();
   if (s.length <= max) return s;
   return `${s.slice(0, max)}...`;
+}
+
+function textDigest(input) {
+  const str = String(input || "");
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i += 1) {
+    h ^= str.charCodeAt(i);
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function createTrace(scope, seed = {}) {
+  const id = `${scope}-${Date.now()}-${(++traceCounter % 100000).toString().padStart(5, "0")}`;
+  const ctx = { id, scope, startedAt: Date.now(), step: 0 };
+  appendMainLog(`[trace-start] ${JSON.stringify({ id, scope, ...seed })}`);
+  return ctx;
+}
+
+function traceStep(ctx, stage, details = {}) {
+  if (!ctx) return;
+  ctx.step += 1;
+  appendMainLog(
+    `[trace] ${JSON.stringify({
+      id: ctx.id,
+      scope: ctx.scope,
+      step: ctx.step,
+      ms: Date.now() - ctx.startedAt,
+      stage,
+      ...details,
+    })}`
+  );
+}
+
+function traceEnd(ctx, status = "done", details = {}) {
+  if (!ctx) return;
+  appendMainLog(
+    `[trace-end] ${JSON.stringify({
+      id: ctx.id,
+      scope: ctx.scope,
+      status,
+      totalMs: Date.now() - ctx.startedAt,
+      steps: ctx.step,
+      ...details,
+    })}`
+  );
 }
 
 async function shouldBlockMainWindowPresentation() {
@@ -257,6 +304,7 @@ function createOverlayHtml() {
         const ctx = cv.getContext('2d');
         const stateIcon = document.getElementById('stateIcon');
         let timerId = null;
+        let audioCtx = null;
         const bars = [];
         let lastLevelAt = 0;
         let activeWave = true;
@@ -307,6 +355,33 @@ function createOverlayHtml() {
         window.startTimer = () => {
           if (timerId) clearInterval(timerId);
           timerId = setInterval(tick, 200);
+        };
+        window.playCue = (kind) => {
+          try {
+            if (!audioCtx) {
+              const AC = window.AudioContext || window.webkitAudioContext;
+              if (!AC) return;
+              audioCtx = new AC();
+            }
+            if (audioCtx.state === 'suspended') {
+              audioCtx.resume().catch(() => {});
+            }
+            const now = audioCtx.currentTime;
+            const dur = kind === 'stop' ? 0.09 : 0.075;
+            const base = kind === 'stop' ? 560 : 760;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(base, now);
+            osc.frequency.exponentialRampToValueAtTime(kind === 'stop' ? 420 : 980, now + dur);
+            gain.gain.setValueAtTime(0.0001, now);
+            gain.gain.exponentialRampToValueAtTime(kind === 'stop' ? 0.055 : 0.04, now + 0.012);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(now);
+            osc.stop(now + dur + 0.01);
+          } catch {}
         };
         window.stopTimer = () => {
           if (timerId) {
@@ -431,6 +506,7 @@ async function showRecordingOverlay() {
     );
   } catch {}
   ow.showInactive();
+  await playOverlayCue("start");
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
@@ -502,6 +578,20 @@ async function setOverlayStatus(text) {
   } catch {}
 }
 
+async function playOverlayCue(kind = "start") {
+  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
+  const cue = kind === "stop" ? "stop" : "start";
+  try {
+    await overlayWin.webContents.executeJavaScript(
+      `window.playCue && window.playCue(${JSON.stringify(cue)});`,
+      true
+    );
+    appendMainLog(`[overlay-cue] kind=${cue}`);
+  } catch (e) {
+    appendMainLog(`[overlay-cue-error] kind=${cue} err=${compactLogText(e?.message || e)}`);
+  }
+}
+
 async function isRendererRecording() {
   if (!win || win.isDestroyed() || !win.webContents) return false;
   try {
@@ -538,27 +628,37 @@ async function waitForRendererUiReady(timeoutMs = 8000) {
 
 async function toggleRecordingFromShortcut() {
   if (shortcutToggleInFlight) return;
+  const trace = createTrace("toggle_hotkey", {});
   shortcutToggleInFlight = true;
   try {
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
     const front = await getFrontmostAppInfo();
+    traceStep(trace, "front_before", {
+      name: front.name || "",
+      pid: front.pid || 0,
+    });
     if (front.name && !isBadActivationTarget(front.name)) {
       pasteTargetAppName = front.name;
       pasteTargetAppPid = front.pid;
     }
     await ensureOverlayVisible({ status: "Starting", resetTimer: false, startTimer: false });
+    traceStep(trace, "overlay_visible", { status: "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
+      traceStep(trace, "app_not_ready", {});
       await setOverlayStatus("App Not Ready");
       setTimeout(() => hideRecordingOverlay(), 1200);
+      traceEnd(trace, "failed", { reason: "window-not-ready" });
       return;
     }
 
     const ready = await waitForRendererUiReady();
+    traceStep(trace, "renderer_ready_check", { ready: !!ready });
     if (!ready) {
       await setOverlayStatus("App Loading");
       setTimeout(() => hideRecordingOverlay(), 1300);
+      traceEnd(trace, "failed", { reason: "renderer-not-ready" });
       return;
     }
 
@@ -578,13 +678,17 @@ async function toggleRecordingFromShortcut() {
     );
 
     if (!result?.ok) {
+      traceStep(trace, "renderer_toggle_failed", { result: result || null });
       await setOverlayStatus("App Loading");
       setTimeout(() => hideRecordingOverlay(), 1300);
+      traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
       return;
     }
 
     if (result.recording) {
+      traceStep(trace, "recording_started", { auto: !!result.auto, timerText: result.timerText || "" });
       await showRecordingOverlay();
+      traceEnd(trace, "recording-started", {});
       return;
     }
 
@@ -594,12 +698,17 @@ async function toggleRecordingFromShortcut() {
     }
     await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => {});
     if (result.auto) {
+      traceStep(trace, "recording_stopped", { autoTranscribe: true, timerText: result.timerText || "" });
+      await playOverlayCue("stop");
       await setOverlayStatus("Transcribing");
       await handlePostStopFromShortcut(true);
     } else {
+      traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
+      await playOverlayCue("stop");
       await setOverlayStatus("Saved To App");
       setTimeout(() => hideRecordingOverlay(), 1400);
     }
+    traceEnd(trace, "done", {});
   } finally {
     shortcutToggleInFlight = false;
   }
@@ -634,6 +743,7 @@ async function stopRecordingFromOverlay() {
   await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => {});
 
   if (result?.ok) {
+    await playOverlayCue("stop");
     await setOverlayStatus("Transcribing");
     await handlePostStopFromShortcut(true);
   } else {
@@ -852,14 +962,27 @@ async function requestMacPastePermissionsOnce() {
 }
 
 async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
+  const trace = createTrace("paste", {
+    targetAppName: String(targetAppName || ""),
+    targetAppPid: Number(targetAppPid || 0),
+    textLen: String(text || "").length,
+    textDigest: textDigest(text),
+    textPreview: compactLogText(text, 120),
+  });
   if (!text || !text.trim()) {
+    traceStep(trace, "input_rejected", { reason: "empty-text" });
     logPasteTrace("start_skip", { reason: "empty-text" });
+    traceEnd(trace, "failed", { reason: "empty-text" });
     return { ok: false, reason: "empty-text", method: "none", verified: false };
   }
   let frontBefore = { name: "", pid: 0 };
   try {
     frontBefore = await getFrontmostAppInfo();
   } catch {}
+  traceStep(trace, "front_before", {
+    frontBeforeName: frontBefore.name || "",
+    frontBeforePid: frontBefore.pid || 0,
+  });
   logPasteTrace("start", {
     targetAppName: String(targetAppName || ""),
     targetAppPid: Number(targetAppPid || 0),
@@ -870,9 +993,12 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   try {
     clipboard.writeText(String(text));
   } catch {
+    traceStep(trace, "clipboard_write_failed", {});
     logPasteTrace("clipboard_write_failed", {});
+    traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
     return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
   }
+  traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
   const escapedApp = escapeAppleScriptString(targetAppName);
   const pid = Number.parseInt(String(targetAppPid || 0), 10) || 0;
@@ -1060,7 +1186,17 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   `;
 
   let lastReason = "paste-no-attempt";
+  traceStep(trace, "method_begin", { method: "ax" });
+  const axStarted = Date.now();
   const ax = await runCommand("osascript", ["-e", axInsertScript], { timeoutMs: 14000 });
+  traceStep(trace, "method_result", {
+    method: "ax",
+    ms: Date.now() - axStarted,
+    ok: !!ax.ok,
+    code: ax.code,
+    stdout: compactLogText(ax.stdout),
+    stderr: compactLogText(ax.stderr),
+  });
   logPasteTrace("ax_result", {
     ok: !!ax.ok,
     code: ax.code,
@@ -1071,6 +1207,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     const axOut = (ax.stdout || "").trim();
     if (axOut.startsWith("OK:")) {
       logPasteTrace("success", { method: "ax", reason: axOut });
+      traceEnd(trace, "success", { method: "ax", reason: axOut, verified: true });
       return { ok: true, reason: axOut, method: "ax", verified: true };
     }
     lastReason = axOut || lastReason;
@@ -1080,7 +1217,18 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
 
   for (let attempt = 0; attempt < 2; attempt++) {
     logPasteTrace("fallback_attempt", { attempt: attempt + 1, method: "cmd_v_then_keycode" });
+    traceStep(trace, "method_begin", { method: "cmd_v", attempt: attempt + 1 });
+    const cmdStarted = Date.now();
     const check = await runCommand("osascript", ["-e", pasteScript], { timeoutMs: 14000 });
+    traceStep(trace, "method_result", {
+      method: "cmd_v",
+      attempt: attempt + 1,
+      ms: Date.now() - cmdStarted,
+      ok: !!check.ok,
+      code: check.code,
+      stdout: compactLogText(check.stdout),
+      stderr: compactLogText(check.stderr),
+    });
     logPasteTrace("cmdv_result", {
       attempt: attempt + 1,
       ok: !!check.ok,
@@ -1092,13 +1240,25 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       const out = (check.stdout || "").trim();
       if (out.startsWith("OK:")) {
         logPasteTrace("success", { method: "cmd_v", attempt: attempt + 1, reason: out });
+        traceEnd(trace, "success", { method: "cmd_v", attempt: attempt + 1, reason: out, verified: false });
         return { ok: true, reason: out, method: "cmd_v", verified: false };
       }
       lastReason = out || "paste-return-unknown";
     } else {
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
+    traceStep(trace, "method_begin", { method: "keycode", attempt: attempt + 1 });
+    const keyStarted = Date.now();
     const check2 = await runCommand("osascript", ["-e", keycodePasteScript], { timeoutMs: 14000 });
+    traceStep(trace, "method_result", {
+      method: "keycode",
+      attempt: attempt + 1,
+      ms: Date.now() - keyStarted,
+      ok: !!check2.ok,
+      code: check2.code,
+      stdout: compactLogText(check2.stdout),
+      stderr: compactLogText(check2.stderr),
+    });
     logPasteTrace("keycode_result", {
       attempt: attempt + 1,
       ok: !!check2.ok,
@@ -1110,6 +1270,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       const out2 = (check2.stdout || "").trim();
       if (out2.startsWith("OK:")) {
         logPasteTrace("success", { method: "keycode", attempt: attempt + 1, reason: out2 });
+        traceEnd(trace, "success", { method: "keycode", attempt: attempt + 1, reason: out2, verified: false });
         return { ok: true, reason: out2, method: "keycode", verified: false };
       }
       lastReason = out2 || lastReason;
@@ -1120,7 +1281,17 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   }
 
   if (targetAppName || pid > 0) {
+    traceStep(trace, "method_begin", { method: "menu" });
+    const menuStarted = Date.now();
     const menuPaste = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 14000 });
+    traceStep(trace, "method_result", {
+      method: "menu",
+      ms: Date.now() - menuStarted,
+      ok: !!menuPaste.ok,
+      code: menuPaste.code,
+      stdout: compactLogText(menuPaste.stdout),
+      stderr: compactLogText(menuPaste.stderr),
+    });
     logPasteTrace("menu_result", {
       ok: !!menuPaste.ok,
       code: menuPaste.code,
@@ -1131,6 +1302,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       const menuOut = (menuPaste.stdout || "").trim();
       if (menuOut.startsWith("OK:")) {
         logPasteTrace("success", { method: "menu", reason: menuOut, verified: false });
+        traceEnd(trace, "success", { method: "menu", reason: menuOut, verified: false });
         return { ok: true, reason: menuOut, method: "menu", verified: false };
       }
       lastReason = menuOut || lastReason;
@@ -1176,7 +1348,17 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     end tell
   `;
   if (String(text).length <= 1800) {
+    traceStep(trace, "method_begin", { method: "typed", len: String(text).length });
+    const typedStarted = Date.now();
     const typedInsert = await runCommand("osascript", ["-e", typedInsertScript], { timeoutMs: 14000 });
+    traceStep(trace, "method_result", {
+      method: "typed",
+      ms: Date.now() - typedStarted,
+      ok: !!typedInsert.ok,
+      code: typedInsert.code,
+      stdout: compactLogText(typedInsert.stdout),
+      stderr: compactLogText(typedInsert.stderr),
+    });
     logPasteTrace("typed_result", {
       ok: !!typedInsert.ok,
       code: typedInsert.code,
@@ -1187,32 +1369,55 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       const typedOut = (typedInsert.stdout || "").trim();
       if (typedOut.startsWith("OK:")) {
         logPasteTrace("success", { method: "typed", reason: typedOut, verified: false });
+        traceEnd(trace, "success", { method: "typed", reason: typedOut, verified: false });
         return { ok: true, reason: typedOut, method: "typed", verified: false };
       }
       lastReason = typedOut || lastReason;
     } else {
       lastReason = (typedInsert.stderr || typedInsert.stdout || lastReason).trim();
     }
+  } else {
+    traceStep(trace, "method_skipped", {
+      method: "typed",
+      reason: "text-too-long",
+      len: String(text).length,
+      limit: 1800,
+    });
   }
   let frontAfter = { name: "", pid: 0 };
   try {
     frontAfter = await getFrontmostAppInfo();
   } catch {}
+  traceStep(trace, "front_after", {
+    frontAfterName: frontAfter.name || "",
+    frontAfterPid: frontAfter.pid || 0,
+  });
   logPasteTrace("failed", {
     reason: compactLogText(lastReason),
     frontAfterName: frontAfter.name || "",
     frontAfterPid: frontAfter.pid || 0,
   });
+  traceEnd(trace, "failed", {
+    reason: compactLogText(lastReason),
+    finalMethod: "failed",
+  });
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
 async function handlePostStopFromShortcut(autoTranscribe) {
-  if (!autoTranscribe) return;
+  const trace = createTrace("post_stop", { autoTranscribe: !!autoTranscribe });
+  if (!autoTranscribe) {
+    traceEnd(trace, "skipped", { reason: "autoTranscribe-disabled" });
+    return;
+  }
   const deadline = Date.now() + 120000;
   let transcript = "";
+  let pollCount = 0;
   while (Date.now() < deadline) {
+    pollCount += 1;
     const s = await queryRendererState();
     if (!s) {
+      traceStep(trace, "poll_empty_state", { pollCount });
       await sleep(300);
       continue;
     }
@@ -1222,17 +1427,37 @@ async function handlePostStopFromShortcut(autoTranscribe) {
       transcript = s.liveText;
     }
     const doneLike = !s.busy && !s.progressVisible && (s.status === "Done" || s.status === "Error" || s.status === "Idle");
+    traceStep(trace, "poll_state", {
+      pollCount,
+      status: s.status || "",
+      busy: !!s.busy,
+      progressVisible: !!s.progressVisible,
+      finalLen: String(s.finalText || "").length,
+      liveLen: String(s.liveText || "").length,
+      doneLike,
+    });
     if (doneLike) break;
     await sleep(320);
   }
 
   if (transcript) {
+    traceStep(trace, "transcript_ready", {
+      len: transcript.length,
+      digest: textDigest(transcript),
+      preview: compactLogText(transcript, 140),
+    });
     lastTranscriptText = transcript;
     saveLastTranscriptToDisk(transcript);
     try {
       clipboard.writeText(transcript);
     } catch {}
     const pasted = await tryPasteToFocusedField(transcript, pasteTargetAppName, pasteTargetAppPid);
+    traceStep(trace, "paste_result", {
+      ok: !!pasted.ok,
+      method: pasted.method || "unknown",
+      verified: !!pasted.verified,
+      reason: compactLogText(pasted.reason || ""),
+    });
     appendMainLog(
       `[paste-auto] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
@@ -1244,11 +1469,13 @@ async function handlePostStopFromShortcut(autoTranscribe) {
     }
     await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
   } else {
+    traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
     await setOverlayStatus("Saved To App");
   }
   pasteTargetAppName = "";
   pasteTargetAppPid = 0;
   setTimeout(() => hideRecordingOverlay(), 1500);
+  traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
 }
 
 async function getLatestTranscriptText() {
@@ -1270,11 +1497,16 @@ async function getLatestTranscriptText() {
 
 async function pasteLatestTranscriptFromShortcut() {
   if (pasteShortcutInFlight) return;
+  const trace = createTrace("paste_last", {});
   pasteShortcutInFlight = true;
   try {
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
     const front = await getFrontmostAppInfo();
+    traceStep(trace, "front_before", {
+      name: front.name || "",
+      pid: front.pid || 0,
+    });
     if (front.name && !isBadActivationTarget(front.name)) {
       pasteTargetAppName = front.name;
       pasteTargetAppPid = front.pid;
@@ -1284,17 +1516,29 @@ async function pasteLatestTranscriptFromShortcut() {
 
     const text = await getLatestTranscriptText();
     if (!text) {
+      traceStep(trace, "no_text_available", {});
       await setOverlayStatus("No Text");
       setTimeout(() => hideRecordingOverlay(), 1200);
       pasteTargetAppName = "";
       pasteTargetAppPid = 0;
       return;
     }
+    traceStep(trace, "text_ready", {
+      len: text.length,
+      digest: textDigest(text),
+      preview: compactLogText(text, 140),
+    });
     try {
       clipboard.writeText(text);
     } catch {}
 
     const pasted = await tryPasteToFocusedField(text, pasteTargetAppName, pasteTargetAppPid);
+    traceStep(trace, "paste_result", {
+      ok: !!pasted.ok,
+      method: pasted.method || "unknown",
+      verified: !!pasted.verified,
+      reason: compactLogText(pasted.reason || ""),
+    });
     appendMainLog(
       `[paste-last] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
@@ -1307,6 +1551,7 @@ async function pasteLatestTranscriptFromShortcut() {
     setTimeout(() => hideRecordingOverlay(), 1300);
   } finally {
     pasteShortcutInFlight = false;
+    traceEnd(trace, "done", {});
   }
 }
 
