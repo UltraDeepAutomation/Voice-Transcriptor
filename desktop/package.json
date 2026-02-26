@@ -1,0 +1,52 @@
+{
+  "name": "transcriptor",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "NODE_ENV=development electron .",
+    "build:frontend": "npm --prefix ../frontend run build",
+    "dist": "npm run build:frontend && electron-builder --mac --dir --x64 --arm64",
+    "dist:dmg": "electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "electron": "30.5.1",
+    "electron-builder": "24.13.3"
+  },
+  "build": {
+    "appId": "local.transcriptor.app",
+    "productName": "Transcriptor",
+    "files": [
+      "main.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend",
+        "filter": ["**/*", "!**/*.map"]
+      },
+      {
+        "from": "../data",
+        "to": "data",
+        "filter": ["config.json"]
+      },
+      {
+        "from": "../requirements.txt",
+        "to": "requirements.txt"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        { "target": "dir", "arch": ["arm64", "x64"] }
+      ]
+    }
+  }
+}

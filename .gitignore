@@ -1,0 +1,58 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.python-version
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Node / Frontend / Desktop
+node_modules/
+frontend/node_modules/
+desktop/node_modules/
+frontend/dist/
+desktop/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime data / logs / temp
+data/*.log
+data/*.pid
+data/api_token.txt
+data/uploads/
+data/results/
+*.log
+*.pid
+tmp/
+temp/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Build artifacts
+*.tgz
+*.zip
+*.dmg
+*.app
