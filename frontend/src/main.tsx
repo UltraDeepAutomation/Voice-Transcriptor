@@ -55,6 +55,9 @@ declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
     __transcriptorVuLevel?: number;
+    __transcriptorIsRecording?: boolean;
+    __transcriptorLastFinishedText?: string;
+    __transcriptorLastFinishedAt?: number;
   }
 }
 
@@ -163,7 +166,7 @@ async function parseError(r: Response): Promise<string> {
   } catch {
     try {
       details = await r.text();
-    } catch {}
+    } catch { }
   }
   return details || `HTTP ${r.status}`;
 }
@@ -261,10 +264,6 @@ async function localJob(
 function resolveFastLocalLanguage(language: string): string {
   const raw = String(language || "").trim();
   if (raw && raw.toLowerCase() !== "auto") return raw;
-  const nav = String(navigator.language || "").toLowerCase();
-  if (nav.startsWith("ru")) return "ru";
-  if (nav.startsWith("uk")) return "uk";
-  if (nav.startsWith("be")) return "be";
   return "auto";
 }
 
@@ -455,13 +454,13 @@ function persistLiveDraft(recording: boolean): void {
       language: ($("language") as HTMLSelectElement).value,
     };
     localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
-  } catch {}
+  } catch { }
 }
 
 function clearLiveDraft(): void {
   try {
     localStorage.removeItem(LIVE_DRAFT_KEY);
-  } catch {}
+  } catch { }
 }
 
 async function recoverLiveDraftIfAny(): Promise<void> {
@@ -806,6 +805,9 @@ async function startLive(): Promise<void> {
   workletLastFrameAt = 0;
   setBusy(true);
   isRecording = true;
+  window.__transcriptorIsRecording = true;
+  window.__transcriptorLastFinishedText = "";
+  window.__transcriptorLastFinishedAt = 0;
   setRecordButton(true);
   // Keep single mic button interactive while recording.
   ($("btnStart") as HTMLButtonElement).disabled = false;
@@ -828,12 +830,12 @@ async function startLive(): Promise<void> {
   if (enableLivePreview) {
     ws = new WebSocket(
       wsBase() +
-        "/ws/transcribe?" +
-        new URLSearchParams({
-          model: ($("model") as HTMLSelectElement).value,
-          language: ($("language") as HTMLSelectElement).value,
-          token: apiToken(),
-        })
+      "/ws/transcribe?" +
+      new URLSearchParams({
+        model: ($("model") as HTMLSelectElement).value,
+        language: ($("language") as HTMLSelectElement).value,
+        token: apiToken(),
+      })
     );
     ws.binaryType = "arraybuffer";
     ws.onopen = () => setStatus("Recording");
@@ -939,7 +941,7 @@ async function startLive(): Promise<void> {
       }
       try {
         ws.send(pcm);
-      } catch {}
+      } catch { }
     };
 
     src.connect(workletNode);
@@ -986,29 +988,30 @@ async function stopLive(enhance: boolean): Promise<void> {
       workletNode.disconnect();
       workletNode.port.onmessage = null;
     }
-  } catch {}
+  } catch { }
   try {
     if (analyser) analyser.disconnect();
-  } catch {}
+  } catch { }
   try {
     if (src) src.disconnect();
-  } catch {}
+  } catch { }
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
-  } catch {}
+  } catch { }
   stream = null;
   try {
     if (ac) await ac.close();
-  } catch {}
+  } catch { }
   ac = null;
   workletNode = null;
   src = null;
   analyser = null;
   try {
     if (ws) ws.close();
-  } catch {}
+  } catch { }
   ws = null;
   isRecording = false;
+  window.__transcriptorIsRecording = false;
   setRecordButton(false);
   waveFrameCount = 0;
   waveBars = [];
@@ -1025,7 +1028,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch {}
+    } catch { }
     clearLiveDraft();
     setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
@@ -1044,7 +1047,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch {}
+    } catch { }
     clearLiveDraft();
     setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
@@ -1069,17 +1072,17 @@ async function stopLive(enhance: boolean): Promise<void> {
     const create =
       provider === "local"
         ? await localJob(file, {
-            language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
-            model: ($("model") as HTMLSelectElement).value,
-            splitStereo: false,
-            // Live hotkey flow never needs per-word timestamps; disabling speeds up local decoding.
-            wordTimestamps: false,
-          })
+          language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
+          model: ($("model") as HTMLSelectElement).value,
+          splitStereo: false,
+          // Live hotkey flow never needs per-word timestamps; disabling speeds up local decoding.
+          wordTimestamps: false,
+        })
         : await remoteJob(file, {
-            provider,
-            language: ($("language") as HTMLSelectElement).value,
-            diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-          });
+          provider,
+          language: ($("language") as HTMLSelectElement).value,
+          diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+        });
 
     const { job_id } = create;
     const j = await pollJob(job_id, pollAbortController.signal, (job) => {
@@ -1096,7 +1099,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch {}
+    } catch { }
   } catch (e) {
     $("progressRow").hidden = true;
     $("finalOutput").textContent = (e as Error).message;
@@ -1110,13 +1113,17 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch {}
+    } catch { }
   } finally {
     pollAbortController = null;
     clearLiveDraft();
     setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
   }
+  // Signal desktop main process that transcription is complete with final text.
+  const _finishedText = ($("finalOutput").textContent || $("liveOutput").textContent || "").trim();
+  window.__transcriptorLastFinishedText = _finishedText;
+  window.__transcriptorLastFinishedAt = Date.now();
 }
 
 function setSelectedFile(file: File | null): void {
@@ -1239,10 +1246,17 @@ window.addEventListener("transcriptor-hotkey-toggle", () => {
   }
 });
 
+// Dedicated stop event for overlay stop — avoids dual-path race.
+window.addEventListener("transcriptor-hotkey-stop", () => {
+  if (isRecording) {
+    void stopLive(shouldAutoTranscribe());
+  }
+});
+
 void loadCfg();
 initLanguagePreference();
 void loadMics(false);
-void loadRecordings(false).catch(() => {});
+void loadRecordings(false).catch(() => { });
 void recoverLiveDraftIfAny();
 draw();
 syncMode();
