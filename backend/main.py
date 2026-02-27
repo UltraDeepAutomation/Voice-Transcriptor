@@ -890,7 +890,7 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         for w in tokens:
             word_freq[w] += 1
 
-    top_words = sorted(word_freq.items(), key=lambda kv: kv[1], reverse=True)[:12]
+    top_words = sorted(word_freq.items(), key=lambda kv: kv[1], reverse=True)[:25]
     avg_duration_sec = int(round(sum(durations_sec) / len(durations_sec))) if durations_sec else 0
     max_duration_sec = max(durations_sec) if durations_sec else 0
     min_duration_sec = min(durations_sec) if durations_sec else 0

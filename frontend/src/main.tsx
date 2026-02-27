@@ -82,6 +82,7 @@ const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "
 const MAX_FILE_BYTES = 500 * 1024 * 1024;
 const MAX_JOB_WAIT_MS = 45 * 60 * 1000;
 const MIC_STORAGE_KEY = "transcriptor.selectedMicId";
+const LANGUAGE_STORAGE_KEY = "transcriptor.language";
 const ALLOWED_AUDIO_MIME = new Set([
   "audio/wav",
   "audio/x-wav",
@@ -111,6 +112,22 @@ const apiToken = (): string => {
 };
 
 const authHeaders = (): HeadersInit => ({ "X-Api-Token": apiToken() });
+
+function initLanguagePreference(): void {
+  const sel = $("language") as HTMLSelectElement;
+  const saved = localStorage.getItem(LANGUAGE_STORAGE_KEY) || "";
+  if (saved && Array.from(sel.options).some((o) => o.value === saved)) {
+    sel.value = saved;
+  } else if (sel.value === "auto") {
+    const nav = String(navigator.language || "").toLowerCase();
+    if (nav.startsWith("ru")) {
+      sel.value = "ru";
+    }
+  }
+  sel.addEventListener("change", () => {
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, sel.value || "auto");
+  });
+}
 
 function setBusy(nextBusy: boolean): void {
   isBusy = !!nextBusy;
@@ -241,9 +258,19 @@ async function localJob(
   return (await r.json()) as { job_id: string };
 }
 
+function resolveFastLocalLanguage(language: string): string {
+  const raw = String(language || "").trim();
+  if (raw && raw.toLowerCase() !== "auto") return raw;
+  const nav = String(navigator.language || "").toLowerCase();
+  if (nav.startsWith("ru")) return "ru";
+  if (nav.startsWith("uk")) return "uk";
+  if (nav.startsWith("be")) return "be";
+  return "auto";
+}
+
 async function pollJob(jobId: string, signal: AbortSignal, cb?: (j: JobResponse) => void): Promise<JobResponse> {
   const started = Date.now();
-  let waitMs = 1000;
+  let waitMs = 320;
   while (true) {
     if (signal.aborted) {
       throw new Error("Request canceled");
@@ -255,7 +282,7 @@ async function pollJob(jobId: string, signal: AbortSignal, cb?: (j: JobResponse)
     cb && cb(j);
     if (j.status === "done" || j.status === "error") return j;
     await new Promise((r) => setTimeout(r, waitMs));
-    waitMs = Math.min(8000, Math.round(waitMs * 1.4));
+    waitMs = Math.min(1200, Math.round(waitMs * 1.18));
   }
 }
 
@@ -531,7 +558,12 @@ $("pickRecordingsDirBtn").addEventListener("click", () =>
 
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";
-let recordingsStatsOpen = false;
+let recordingsStatsOpen = true;
+
+function syncRecordingsStatsVisibility(): void {
+  $("recordingsStatsPanel").hidden = !recordingsStatsOpen;
+  ($("recordingsStatsBtn") as HTMLButtonElement).textContent = recordingsStatsOpen ? "Hide Stats" : "Stats";
+}
 
 function updateRecordingCopyState(): void {
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
@@ -705,10 +737,11 @@ $("recordingsRefreshBtn").addEventListener("click", () =>
 );
 $("recordingsStatsBtn").addEventListener("click", () => {
   recordingsStatsOpen = !recordingsStatsOpen;
-  $("recordingsStatsPanel").hidden = !recordingsStatsOpen;
-  ($("recordingsStatsBtn") as HTMLButtonElement).textContent = recordingsStatsOpen ? "Hide Stats" : "Stats";
+  syncRecordingsStatsVisibility();
 });
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
+
+syncRecordingsStatsVisibility();
 
 const autoToggle = $("autoTranscribeToggle") as HTMLInputElement;
 autoToggle.checked = localStorage.getItem("transcriptor.autoTranscribe") !== "0";
@@ -1036,10 +1069,11 @@ async function stopLive(enhance: boolean): Promise<void> {
     const create =
       provider === "local"
         ? await localJob(file, {
-            language: ($("language") as HTMLSelectElement).value,
+            language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
             model: ($("model") as HTMLSelectElement).value,
             splitStereo: false,
-            wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
+            // Live hotkey flow never needs per-word timestamps; disabling speeds up local decoding.
+            wordTimestamps: false,
           })
         : await remoteJob(file, {
             provider,
@@ -1129,7 +1163,7 @@ async function transcribeSelectedFile(): Promise<void> {
     let create: { job_id: string };
     if (provider === "local") {
       create = await localJob(selectedFile, {
-        language: ($("language") as HTMLSelectElement).value,
+        language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
         model: ($("model") as HTMLSelectElement).value,
         splitStereo: ($("splitStereoCheck") as HTMLInputElement).checked,
         wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
@@ -1206,6 +1240,7 @@ window.addEventListener("transcriptor-hotkey-toggle", () => {
 });
 
 void loadCfg();
+initLanguagePreference();
 void loadMics(false);
 void loadRecordings(false).catch(() => {});
 void recoverLiveDraftIfAny();

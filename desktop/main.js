@@ -489,9 +489,9 @@ async function showRecordingOverlay() {
   pasteTargetAppName = "";
   pasteTargetAppPid = 0;
   const front = await getFrontmostAppInfo();
-  if (front.name && !isBadActivationTarget(front.name)) {
-    pasteTargetAppName = front.name;
-    pasteTargetAppPid = front.pid;
+  if (shouldUsePasteTarget(front)) {
+    pasteTargetAppName = front.name || "";
+    pasteTargetAppPid = front.pid || 0;
   }
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
@@ -638,9 +638,9 @@ async function toggleRecordingFromShortcut() {
       name: front.name || "",
       pid: front.pid || 0,
     });
-    if (front.name && !isBadActivationTarget(front.name)) {
-      pasteTargetAppName = front.name;
-      pasteTargetAppPid = front.pid;
+    if (shouldUsePasteTarget(front)) {
+      pasteTargetAppName = front.name || "";
+      pasteTargetAppPid = front.pid || 0;
     }
     await ensureOverlayVisible({ status: "Starting", resetTimer: false, startTimer: false });
     traceStep(trace, "overlay_visible", { status: "Starting" });
@@ -830,6 +830,15 @@ function isBadActivationTarget(name) {
   );
 }
 
+function shouldUsePasteTarget(front) {
+  const pid = Number(front?.pid || 0);
+  const name = String(front?.name || "").trim().toLowerCase();
+  if (pid > 0 && pid === process.pid) return false;
+  if (name.includes("transcriptor")) return false;
+  if (!name && pid <= 0) return false;
+  return true;
+}
+
 function looksLikeAutomationPermissionError(reason) {
   const r = String(reason || "").toLowerCase();
   return (
@@ -962,9 +971,13 @@ async function requestMacPastePermissionsOnce() {
 }
 
 async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
+  const originalTargetName = String(targetAppName || "").trim();
+  const originalTargetPid = Number(targetAppPid || 0);
+  let effectiveTargetName = originalTargetName;
+  let effectiveTargetPid = originalTargetPid;
   const trace = createTrace("paste", {
-    targetAppName: String(targetAppName || ""),
-    targetAppPid: Number(targetAppPid || 0),
+    targetAppName: originalTargetName,
+    targetAppPid: originalTargetPid,
     textLen: String(text || "").length,
     textDigest: textDigest(text),
     textPreview: compactLogText(text, 120),
@@ -983,9 +996,49 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     frontBeforeName: frontBefore.name || "",
     frontBeforePid: frontBefore.pid || 0,
   });
+  const targetLooksGenericElectron = /^electron$/i.test(effectiveTargetName);
+  if (targetLooksGenericElectron && shouldUsePasteTarget(frontBefore)) {
+    effectiveTargetName = String(frontBefore.name || "").trim();
+    effectiveTargetPid = Number(frontBefore.pid || 0);
+    traceStep(trace, "target_normalized_from_front", {
+      fromName: originalTargetName,
+      fromPid: originalTargetPid,
+      toName: effectiveTargetName,
+      toPid: effectiveTargetPid,
+      reason: "generic-electron-target",
+    });
+  } else if (targetLooksGenericElectron) {
+    // Avoid routing by generic app name when we don't have a safe concrete pid.
+    effectiveTargetName = "";
+    traceStep(trace, "target_name_cleared", {
+      fromName: originalTargetName,
+      reason: "generic-electron-without-safe-front",
+    });
+  }
+  const targetHint = `${effectiveTargetName} ${String(frontBefore.name || "")}`.toLowerCase();
+  const genericElectronTarget = /^electron$/i.test(effectiveTargetName);
+  if (genericElectronTarget) {
+    // For Electron-based third-party apps, process-level targeting can hit the shell process
+    // instead of the real focused webview/editor. Force global frontmost route.
+    traceStep(trace, "target_route_override", {
+      fromName: effectiveTargetName,
+      fromPid: effectiveTargetPid,
+      toName: "",
+      toPid: 0,
+      reason: "generic-electron-use-frontmost-global",
+    });
+    effectiveTargetName = "";
+    effectiveTargetPid = 0;
+  }
+  const preferTypedFirst =
+    targetHint.includes("codex") ||
+    targetHint.includes("obsidian") ||
+    targetHint.includes("chatgpt") ||
+    genericElectronTarget;
+  traceStep(trace, "paste_strategy", { preferTypedFirst, targetHint: compactLogText(targetHint, 80) });
   logPasteTrace("start", {
-    targetAppName: String(targetAppName || ""),
-    targetAppPid: Number(targetAppPid || 0),
+    targetAppName: effectiveTargetName,
+    targetAppPid: effectiveTargetPid,
     frontBeforeName: frontBefore.name || "",
     frontBeforePid: frontBefore.pid || 0,
     textLen: String(text).length,
@@ -1000,8 +1053,8 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
-  const escapedApp = escapeAppleScriptString(targetAppName);
-  const pid = Number.parseInt(String(targetAppPid || 0), 10) || 0;
+  const escapedApp = escapeAppleScriptString(effectiveTargetName);
+  const pid = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
   const axInsertScript = `
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
@@ -1184,6 +1237,84 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       return "OK:keycode"
     end tell
   `;
+  const typedInsertScript = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set targetText to ""
+      try
+        set targetText to the clipboard as text
+      on error
+        return "ERR:clipboard-read"
+      end try
+      if targetText is "" then return "ERR:empty-text"
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+          set frontmost of p to true
+          delay 0.18
+          tell p to keystroke targetText
+          delay 0.12
+          return "OK:typed-pid"
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+          tell p to set frontmost to true
+          delay 0.18
+          tell p to keystroke targetText
+          delay 0.12
+          return "OK:typed-app"
+        end if
+      end if
+      keystroke targetText
+      delay 0.12
+      return "OK:typed"
+    end tell
+  `;
+
+  const runTypedInsert = async (stageLabel = "typed") => {
+    if (String(text).length > 1800) {
+      traceStep(trace, "method_skipped", {
+        method: stageLabel,
+        reason: "text-too-long",
+        len: String(text).length,
+        limit: 1800,
+      });
+      return null;
+    }
+    traceStep(trace, "method_begin", { method: stageLabel, len: String(text).length });
+    const typedStarted = Date.now();
+    const typedInsert = await runCommand("osascript", ["-e", typedInsertScript], { timeoutMs: 14000 });
+    traceStep(trace, "method_result", {
+      method: stageLabel,
+      ms: Date.now() - typedStarted,
+      ok: !!typedInsert.ok,
+      code: typedInsert.code,
+      stdout: compactLogText(typedInsert.stdout),
+      stderr: compactLogText(typedInsert.stderr),
+    });
+    logPasteTrace("typed_result", {
+      stage: stageLabel,
+      ok: !!typedInsert.ok,
+      code: typedInsert.code,
+      stdout: compactLogText(typedInsert.stdout),
+      stderr: compactLogText(typedInsert.stderr),
+    });
+    if (typedInsert.ok) {
+      const typedOut = (typedInsert.stdout || "").trim();
+      if (typedOut.startsWith("OK:")) {
+        logPasteTrace("success", { method: stageLabel, reason: typedOut, verified: false });
+        traceEnd(trace, "success", { method: stageLabel, reason: typedOut, verified: false });
+        return { ok: true, reason: typedOut, method: "typed", verified: false };
+      }
+      lastReason = typedOut || lastReason;
+      return null;
+    }
+    lastReason = (typedInsert.stderr || typedInsert.stdout || lastReason).trim();
+    return null;
+  };
 
   let lastReason = "paste-no-attempt";
   traceStep(trace, "method_begin", { method: "ax" });
@@ -1213,6 +1344,11 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     lastReason = axOut || lastReason;
   } else {
     lastReason = (ax.stderr || ax.stdout || "ax-insert-failed").trim();
+  }
+
+  if (preferTypedFirst) {
+    const typedPreferred = await runTypedInsert("typed_preferred");
+    if (typedPreferred) return typedPreferred;
   }
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1311,79 +1447,8 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     }
   }
 
-  const typedInsertScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set targetText to ""
-      try
-        set targetText to the clipboard as text
-      on error
-        return "ERR:clipboard-read"
-      end try
-      if targetText is "" then return "ERR:empty-text"
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-          set frontmost of p to true
-          delay 0.18
-          tell p to keystroke targetText
-          delay 0.12
-          return "OK:typed-pid"
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-          tell p to set frontmost to true
-          delay 0.18
-          tell p to keystroke targetText
-          delay 0.12
-          return "OK:typed-app"
-        end if
-      end if
-      keystroke targetText
-      delay 0.12
-      return "OK:typed"
-    end tell
-  `;
-  if (String(text).length <= 1800) {
-    traceStep(trace, "method_begin", { method: "typed", len: String(text).length });
-    const typedStarted = Date.now();
-    const typedInsert = await runCommand("osascript", ["-e", typedInsertScript], { timeoutMs: 14000 });
-    traceStep(trace, "method_result", {
-      method: "typed",
-      ms: Date.now() - typedStarted,
-      ok: !!typedInsert.ok,
-      code: typedInsert.code,
-      stdout: compactLogText(typedInsert.stdout),
-      stderr: compactLogText(typedInsert.stderr),
-    });
-    logPasteTrace("typed_result", {
-      ok: !!typedInsert.ok,
-      code: typedInsert.code,
-      stdout: compactLogText(typedInsert.stdout),
-      stderr: compactLogText(typedInsert.stderr),
-    });
-    if (typedInsert.ok) {
-      const typedOut = (typedInsert.stdout || "").trim();
-      if (typedOut.startsWith("OK:")) {
-        logPasteTrace("success", { method: "typed", reason: typedOut, verified: false });
-        traceEnd(trace, "success", { method: "typed", reason: typedOut, verified: false });
-        return { ok: true, reason: typedOut, method: "typed", verified: false };
-      }
-      lastReason = typedOut || lastReason;
-    } else {
-      lastReason = (typedInsert.stderr || typedInsert.stdout || lastReason).trim();
-    }
-  } else {
-    traceStep(trace, "method_skipped", {
-      method: "typed",
-      reason: "text-too-long",
-      len: String(text).length,
-      limit: 1800,
-    });
-  }
+  const typedFallback = await runTypedInsert("typed_fallback");
+  if (typedFallback) return typedFallback;
   let frontAfter = { name: "", pid: 0 };
   try {
     frontAfter = await getFrontmostAppInfo();
@@ -1507,9 +1572,9 @@ async function pasteLatestTranscriptFromShortcut() {
       name: front.name || "",
       pid: front.pid || 0,
     });
-    if (front.name && !isBadActivationTarget(front.name)) {
-      pasteTargetAppName = front.name;
-      pasteTargetAppPid = front.pid;
+    if (shouldUsePasteTarget(front)) {
+      pasteTargetAppName = front.name || "";
+      pasteTargetAppPid = front.pid || 0;
     }
     await ensureOverlayVisible({ status: "Pasting", resetTimer: false, startTimer: false });
     await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => {});
