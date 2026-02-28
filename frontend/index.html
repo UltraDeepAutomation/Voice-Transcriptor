@@ -20,6 +20,10 @@
           <div class="window-topbar-inner">
             <span class="window-title">Transcriptor</span>
             <span class="window-view" id="windowViewLabel">Record</span>
+            <span class="net-pill" id="netPill" title="Internet connection status">
+              <span class="net-dot" id="netDot"></span>
+              <span class="net-text" id="netText">Offline</span>
+            </span>
           </div>
         </div>
 
@@ -66,6 +70,18 @@
               </div>
 
               <div id="vuFill" hidden></div>
+              <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
+                <label class="quick-field">
+                  <span class="quick-lbl">Provider</span>
+                  <select id="quickProviderSelect">
+                    <option value="local">Local (Whisper)</option>
+                    <option value="fal">fal.ai</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="">None</option>
+                  </select>
+                </label>
+              </div>
+              <button class="btn quick-settings-btn" id="quickSettingsToggle" type="button" aria-label="Toggle quick settings" aria-pressed="false"></button>
               <canvas class="mini-wave" id="waveCanvas" width="240" height="44"></canvas>
 
               <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
@@ -101,7 +117,11 @@
                     <option value="openrouter">OpenRouter</option>
                     <option value="">None</option>
                   </select>
-                  <label class="check-inline"><input type="checkbox" id="diarizeCheck" checked /> <span>Speakers</span></label>
+                  <select id="remoteModelSelect" title="Remote model" hidden>
+                    <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
+                    <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
+                  </select>
+                  <label class="check-inline"><input type="checkbox" id="diarizeCheck" /> <span>Speakers</span></label>
                 </div>
               </div>
 
@@ -132,6 +152,23 @@
                 <a class="link-btn" id="dlJson" href="#">JSON</a>
               </div>
             </div>
+            <div class="pane" id="upscalePane">
+              <div class="pane-header">
+                <span class="pane-title">Upscale</span>
+                <div class="pane-actions">
+                  <label class="toggle-inline" title="Improve transcript before paste/save">
+                    <span>Enable</span>
+                    <input id="upscaleToggle" type="checkbox" />
+                  </label>
+                  <div class="upscale-preset-wrap" id="upscalePresetWrap">
+                    <select id="upscalePresetSelect" title="Upscale preset"></select>
+                    <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button" aria-label="Delete preset" title="Delete preset">×</button>
+                  </div>
+                  <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset" title="Add preset">+</button>
+                </div>
+              </div>
+              <pre class="out" id="upscaleOutput" data-placeholder="Upscaled text will appear here..."></pre>
+            </div>
           </div>
         </section>
 
@@ -143,7 +180,7 @@
               <p class="hint" id="recordingsCountLabel">Total recordings: 0</p>
             </div>
             <div class="recordings-head-actions">
-              <button class="btn btn-ghost" id="recordingsStatsBtn" type="button" aria-label="Toggle stats">Stats</button>
+              <button class="btn ui-toggle-btn" id="recordingsStatsBtn" type="button" aria-label="Toggle stats">Stats</button>
               <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button" aria-label="Refresh recordings">
                 <span class="refresh-ico" aria-hidden="true"></span>
                 <span>Refresh</span>
@@ -197,6 +234,7 @@
             <div class="card">
               <h2>API Keys</h2>
               <p class="hint">Stored locally on this Mac</p>
+              <p class="hint" id="configPathLabel">Config: -</p>
               <div class="field-stack">
                 <label class="field"><span class="lbl">fal.ai</span><input id="falKey" type="password" placeholder="FAL_KEY" /></label>
                 <label class="field"><span class="lbl">OpenRouter</span><input id="orKey" type="password" placeholder="OPENROUTER_API_KEY" /></label>
@@ -211,8 +249,8 @@
             <div class="card">
               <h2>Defaults</h2>
               <div class="field-stack">
-                <label class="check-inline"><input type="checkbox" id="diarizeDefault" checked /> <span>Diarization</span></label>
-                <label class="field"><span class="lbl">Chunk</span><select id="chunkSelect"><option>segment</option><option>word</option><option>none</option></select></label>
+                <label class="check-inline"><input type="checkbox" id="diarizeDefault" /> <span>Diarization</span></label>
+                <label class="field"><span class="lbl">Chunk</span><select id="chunkSelect"><option>none</option><option>segment</option><option>word</option></select></label>
               </div>
             </div>
             <div class="card">
@@ -231,6 +269,25 @@
           </div>
         </section>
       </main>
+    </div>
+
+    <div class="modal-backdrop" id="upscalePresetModal" hidden>
+      <div class="modal-card">
+        <h3>New Upscale Preset</h3>
+        <label class="field">
+          <span class="lbl">Name</span>
+          <input id="upscalePresetNameInput" type="text" maxlength="60" placeholder="My Preset" />
+        </label>
+        <label class="field">
+          <span class="lbl">Instruction</span>
+          <textarea id="upscalePresetInstructionInput" rows="7" placeholder="System instruction for transcript improvement"></textarea>
+        </label>
+        <p class="hint" id="upscalePresetMsg"></p>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="upscalePresetSaveBtn" type="button">Save Preset</button>
+          <button class="btn btn-ghost" id="upscalePresetCancelBtn" type="button">Cancel</button>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="/src/main.tsx"></script>

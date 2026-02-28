@@ -10,8 +10,9 @@ import subprocess
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from fastapi import (
     Body,
@@ -29,13 +30,13 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.audio import AudioError, ensure_wav_16k, split_channels
-from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
+from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
 from backend.live import LiveSession
 from backend.jobs import JobStore
 from backend.remote_fal import RemoteError as FalRemoteError
 from backend.remote_fal import fal_whisper_transcribe
 from backend.remote_openrouter import RemoteError as OrRemoteError
-from backend.remote_openrouter import openrouter_transcribe
+from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
 from backend.transcribe import merge_channel_transcripts, transcribe_file
 
 
@@ -70,8 +71,54 @@ ALLOWED_AUDIO_EXTS = {
 COMMON_STOPWORDS = {
     "и", "в", "на", "что", "как", "это", "я", "ты", "мы", "вы", "он", "она", "оно", "они",
     "а", "но", "же", "ли", "не", "да", "нет", "к", "у", "по", "с", "со", "из", "от", "за",
+    "вот", "то", "все", "меня", "там", "есть", "так", "ну", "нас", "чтобы", "когда", "сейчас",
+    "очень", "нужно", "сделать", "почему", "если", "еще", "вообще", "просто", "быть", "давай",
+    "какой", "грамотно", "только", "тебе", "типа", "нормально", "или", "для", "до", "уже",
+    "потому", "потом", "значит", "короче", "прям", "тут", "мне", "его", "ее", "их", "вас",
+    "вам", "нам", "там", "здесь", "где", "куда", "откуда", "зачем", "почему", "поэтому",
+    "чтоб", "будет", "был", "была", "были", "тоже", "может", "надо", "один", "два", "три",
     "to", "the", "a", "an", "and", "or", "for", "of", "in", "on", "is", "it", "that", "this",
     "i", "you", "we", "they", "he", "she", "be", "are", "was", "were", "do", "does", "did",
+}
+
+UPSCALE_PRESETS = {"clean", "business", "concise", "formal"}
+UPSCALE_PRESETS_DIR = DATA_DIR / "upscale_presets"
+UPSCALE_MAX_CUSTOM_PRESETS = 3
+UPSCALE_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
+    "clean": {
+        "name": "Clean",
+        "instruction": (
+            "Improve transcript readability: fix punctuation and grammar, remove fillers and stutters, "
+            "preserve full meaning. Keep output in the same language as input. "
+            "Return only final improved transcript text. No quotes, no comments, no markdown."
+        ),
+    },
+    "business": {
+        "name": "Business",
+        "instruction": (
+            "Rewrite transcript into clear business style: concise, professional, structured, grammar-correct. "
+            "Keep all essential facts. Keep output in the same language as input. "
+            "Return only final improved transcript text. No quotes, no comments, no markdown."
+        ),
+    },
+    "concise": {
+        "name": "Concise",
+        "instruction": (
+            "Rewrite transcript into concise form: remove repetitions and noise, keep key meaning. "
+            "Keep output in the same language as input. "
+            "Return only final improved transcript text. No quotes, no comments, no markdown."
+        ),
+    },
+    "formal": {
+        "name": "Formal",
+        "instruction": (
+            "Rewrite transcript in formal polished tone with correct punctuation and grammar. "
+            "Keep output in the same language as input. "
+            "Return only final improved transcript text. No quotes, no comments, no markdown."
+        ),
+    },
 }
 
 
@@ -172,7 +219,7 @@ def _cleanup_live_recovery_files() -> None:
 
 
 async def _require_api_auth(request: Request) -> None:
-    if request.url.path == "/api/health":
+    if request.url.path in {"/api/health", "/api/network"}:
         return
     provided = (request.headers.get("x-api-token") or "").strip()
     if not provided or provided != API_TOKEN:
@@ -209,6 +256,31 @@ def index():
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/api/network")
+def network_status(_auth: None = Depends(_require_api_auth)):
+    probes = (
+        "https://openrouter.ai",
+        "https://www.google.com/generate_204",
+        "https://www.cloudflare.com/cdn-cgi/trace",
+    )
+    best_latency_ms: Optional[int] = None
+    online = False
+    for url in probes:
+        started = time.perf_counter()
+        try:
+            with urlopen(url, timeout=2.5) as resp:
+                code = getattr(resp, "status", 200) or 200
+                ok = int(code) < 500
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            if ok:
+                online = True
+                if best_latency_ms is None or elapsed_ms < best_latency_ms:
+                    best_latency_ms = elapsed_ms
+        except Exception:
+            continue
+    return {"online": online, "latency_ms": best_latency_ms if online else None}
 
 
 async def _save_upload_file(upload: UploadFile, target: Path) -> int:
@@ -386,6 +458,116 @@ def _extract_meta_field(content: str, field: str) -> str:
     pattern = rf"^{re.escape(field)}:\s*(.+)$"
     m = re.search(pattern, content or "", flags=re.IGNORECASE | re.MULTILINE)
     return (m.group(1).strip() if m else "")
+
+
+def _upscale_instruction(preset: str) -> str:
+    p = (preset or "clean").strip().lower()
+    if p == "business":
+        return (
+            "Rewrite transcript into clear business style. Keep key facts, remove filler words, "
+            "fix grammar and punctuation."
+        )
+    if p == "concise":
+        return (
+            "Rewrite transcript into concise compact style. Keep only important points, "
+            "remove repetitions and fillers."
+        )
+    if p == "formal":
+        return (
+            "Rewrite transcript into formal polished style. Keep structure and meaning, "
+            "fix grammar and punctuation."
+        )
+    return (
+        "Clean transcript text: fix punctuation and grammar, remove stutters/fillers, "
+        "keep original meaning and language."
+    )
+
+
+def _upscale_preset_path(preset_id: str) -> Path:
+    raw = (preset_id or "").strip()
+    if not UPSCALE_PRESET_ID_RE.fullmatch(raw):
+        raise HTTPException(status_code=400, detail="invalid preset id")
+    return UPSCALE_PRESETS_DIR / f"{raw}.json"
+
+
+def _write_upscale_preset(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ensure_builtin_upscale_presets() -> None:
+    UPSCALE_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    for pid, meta in BUILTIN_UPSCALE_PRESETS.items():
+        path = UPSCALE_PRESETS_DIR / f"builtin_{pid}.json"
+        payload = {
+            "id": f"builtin_{pid}",
+            "name": meta["name"],
+            "instruction": meta["instruction"],
+            "builtin": True,
+        }
+        if not path.exists():
+            _write_upscale_preset(path, payload)
+            continue
+        try:
+            cur = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(cur, dict):
+                _write_upscale_preset(path, payload)
+                continue
+            # Keep default instruction fresh while preserving schema.
+            if (
+                str(cur.get("name") or "").strip() != payload["name"]
+                or str(cur.get("instruction") or "").strip() != payload["instruction"]
+                or bool(cur.get("builtin")) is not True
+            ):
+                _write_upscale_preset(path, payload)
+        except Exception:
+            _write_upscale_preset(path, payload)
+
+
+def _load_upscale_preset(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        pid = str(raw.get("id") or "").strip()
+        name = str(raw.get("name") or "").strip()
+        instruction = str(raw.get("instruction") or "").strip()
+        if not pid or not name or not instruction:
+            return None
+        return {
+            "id": pid,
+            "name": name,
+            "instruction": instruction,
+            "builtin": bool(raw.get("builtin")),
+        }
+    except Exception:
+        return None
+
+
+def _list_upscale_presets() -> list[dict[str, Any]]:
+    _ensure_builtin_upscale_presets()
+    items: list[dict[str, Any]] = []
+    for p in sorted(UPSCALE_PRESETS_DIR.glob("*.json")):
+        item = _load_upscale_preset(p)
+        if not item:
+            continue
+        items.append(item)
+    builtins = [x for x in items if x.get("builtin")]
+    customs = [x for x in items if not x.get("builtin")]
+    builtins.sort(key=lambda x: str(x.get("name") or "").lower())
+    customs.sort(key=lambda x: str(x.get("name") or "").lower())
+    return builtins + customs
+
+
+def _resolve_upscale_preset(preset_id: str) -> dict[str, Any]:
+    pid = (preset_id or "").strip()
+    path = _upscale_preset_path(pid)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="upscale preset not found")
+    item = _load_upscale_preset(path)
+    if not item:
+        raise HTTPException(status_code=500, detail="invalid upscale preset file")
+    return item
 
 
 @app.websocket("/ws/transcribe")
@@ -634,7 +816,7 @@ async def create_remote_job(
     file: UploadFile = File(...),
     provider: str = Form(""),
     language: str = Form("auto"),
-    diarize: bool = Form(True),
+    diarize: bool = Form(False),
     num_speakers: str = Form(""),
     openrouter_model: str = Form(""),
 ):
@@ -689,9 +871,9 @@ async def create_remote_job(
                     language=lang_opt,
                     diarize=bool(diarize)
                     if diarize is not None
-                    else bool(pref.get("diarize", True)),
+                    else bool(pref.get("diarize", False)),
                     num_speakers=ns,
-                    chunk_level=pref.get("chunk_level") or "segment",
+                    chunk_level=pref.get("chunk_level") or "none",
                     timeout_sec=600,
                 )
                 text = _format_fal_transcript(out)
@@ -752,6 +934,110 @@ async def create_remote_job(
     return {"job_id": job_id}
 
 
+@app.post("/api/upscale")
+def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > 120_000:
+        raise HTTPException(status_code=400, detail="text is too long")
+    _ensure_builtin_upscale_presets()
+    preset_id = str(payload.get("preset_id") or "").strip()
+    if not preset_id:
+        legacy = str(payload.get("preset") or "clean").strip().lower()
+        if legacy not in UPSCALE_PRESETS:
+            raise HTTPException(status_code=400, detail="unsupported upscale preset")
+        preset_id = f"builtin_{legacy}"
+    preset = _resolve_upscale_preset(preset_id)
+
+    cfg = load_config()
+    providers = cfg.get("providers") or {}
+    prefs = cfg.get("preferences") or {}
+    key = ((providers.get("openrouter") or {}).get("key") or "").strip()
+    model = str((payload.get("model") or (prefs.get("openrouter") or {}).get("model") or "google/gemini-2.5-flash")).strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="OpenRouter key is not configured")
+    instruction = str(preset.get("instruction") or "").strip()
+    try:
+        out = openrouter_upscale_text(
+            api_key=key,
+            model=model,
+            text=text,
+            instruction=instruction,
+        )
+    except OrRemoteError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {
+        "ok": True,
+        "preset_id": preset.get("id"),
+        "preset_name": preset.get("name"),
+        "model": model,
+        "text": (out.get("text") or "").strip(),
+    }
+
+
+@app.get("/api/upscale/presets")
+def list_upscale_presets(_auth: None = Depends(_require_api_auth)):
+    items = _list_upscale_presets()
+    return {
+        "items": [
+            {
+                "id": x["id"],
+                "name": x["name"],
+                "builtin": bool(x["builtin"]),
+            }
+            for x in items
+        ]
+    }
+
+
+@app.post("/api/upscale/presets")
+def create_upscale_preset(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+    _ensure_builtin_upscale_presets()
+    name = str(payload.get("name") or "").strip()
+    instruction = str(payload.get("instruction") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="preset name is required")
+    if not instruction:
+        raise HTTPException(status_code=400, detail="preset instruction is required")
+
+    custom_count = 0
+    for item in _list_upscale_presets():
+        if not bool(item.get("builtin")):
+            custom_count += 1
+    if custom_count >= UPSCALE_MAX_CUSTOM_PRESETS:
+        raise HTTPException(status_code=400, detail=f"maximum {UPSCALE_MAX_CUSTOM_PRESETS} custom presets")
+
+    base_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not base_slug:
+        base_slug = "custom"
+    preset_id = f"custom_{base_slug}"
+    suffix = 2
+    while (_upscale_preset_path(preset_id)).exists():
+        preset_id = f"custom_{base_slug}_{suffix}"
+        suffix += 1
+
+    payload_out = {
+        "id": preset_id,
+        "name": name[:60],
+        "instruction": instruction,
+        "builtin": False,
+    }
+    _write_upscale_preset(_upscale_preset_path(preset_id), payload_out)
+    return {"ok": True, "item": {"id": payload_out["id"], "name": payload_out["name"], "builtin": False}}
+
+
+@app.delete("/api/upscale/presets/{preset_id}")
+def delete_upscale_preset(preset_id: str, _auth: None = Depends(_require_api_auth)):
+    _ensure_builtin_upscale_presets()
+    item = _resolve_upscale_preset(preset_id)
+    if bool(item.get("builtin")):
+        raise HTTPException(status_code=400, detail="built-in presets cannot be deleted")
+    p = _upscale_preset_path(preset_id)
+    p.unlink(missing_ok=True)
+    return {"ok": True}
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str, _auth: None = Depends(_require_api_auth)):
     _cleanup_expired_files()
@@ -785,7 +1071,9 @@ def download(job_id: str, kind: str, _auth: None = Depends(_require_api_auth)):
 
 @app.get("/api/config")
 def get_config(_auth: None = Depends(_require_api_auth)):
-    return redact_config(load_config())
+    cfg = redact_config(load_config())
+    cfg["_meta"] = {"config_path": str(CONFIG_PATH)}
+    return cfg
 
 
 @app.post("/api/config")
@@ -917,6 +1205,7 @@ def save_recording(
     payload: dict = Body(...),
     _auth: None = Depends(_require_api_auth),
 ):
+    existing_name = os.path.basename(str(payload.get("name") or "").strip())
     title = _sanitize_name(str(payload.get("title") or "recording"))
     source_text = str(payload.get("source_text") or "").strip()
     transcript_text = str(payload.get("transcript_text") or "").strip()
@@ -940,6 +1229,11 @@ def save_recording(
         lines.extend(["Transcription:", transcript_text, ""])
 
     target_dir = _resolve_recordings_dir()
-    out = target_dir / _recording_filename(title)
+    if existing_name:
+        if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
+            raise HTTPException(status_code=400, detail="invalid recording name")
+        out = target_dir / existing_name
+    else:
+        out = target_dir / _recording_filename(title)
     out.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
     return {"ok": True, "name": out.name, "path": str(out)}

@@ -84,3 +84,52 @@ def openrouter_transcribe(
     except Exception:
         text = str(js)
     return {"text": text, "raw": js}
+
+
+def openrouter_upscale_text(
+    *, api_key: str, model: str, text: str, instruction: str
+) -> Dict[str, Any]:
+    key = (api_key or "").strip()
+    if not key:
+        raise RemoteError("OpenRouter key is not configured")
+
+    source_text = (text or "").strip()
+    if not source_text:
+        raise RemoteError("empty text for upscale")
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "model": model or "google/gemini-2.5-flash",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You improve transcript text quality. Preserve meaning and language. "
+                    "Return only final polished text without explanations."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"{instruction}\n\nText:\n{source_text}",
+            },
+        ],
+        "temperature": 0.15,
+        "stream": False,
+    }
+    r = _request_with_retry("POST", url, headers=headers, json=payload, timeout=120)
+    if r.status_code >= 400:
+        raise RemoteError(f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}")
+    js = r.json()
+
+    out_text = ""
+    try:
+        out_text = (js["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        out_text = ""
+    if not out_text:
+        raise RemoteError("openrouter upscale returned empty text")
+    return {"text": out_text, "raw": js}

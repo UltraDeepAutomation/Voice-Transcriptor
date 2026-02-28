@@ -19,16 +19,24 @@ let suppressActivateDuringOverlayFlow = false;
 let pasteTargetAppName = "";
 let pasteTargetAppPid = 0;
 let suppressMainWindowUntil = 0;
+let manualWindowRevealUntil = 0;
 let overlayStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
+let overlayQuickSettingsOpen = false;
+let overlayQuickProvider = "local";
+let overlayQuickModel = "small";
+let postStopQueue = [];
+let postStopWorkerRunning = false;
+let pendingTranscriptionCount = 0;
 
 const HOST = "127.0.0.1";
 const PORT = 8321;
 const BASE_URL = `http://${HOST}:${PORT}`;
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
+const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -36,7 +44,7 @@ if (!singleInstanceLock) {
 }
 
 app.on("second-instance", () => {
-  ensureWindowVisible();
+  ensureWindowVisible({ manual: true });
 });
 
 function appendMainLog(message) {
@@ -106,12 +114,14 @@ function traceEnd(ctx, status = "done", details = {}) {
   );
 }
 
-async function shouldBlockMainWindowPresentation() {
+async function shouldBlockMainWindowPresentation(options = {}) {
+  const allowDuringRecording = !!options.allowDuringRecording;
   if (overlayStopInFlight) return true;
   if (Date.now() < suppressMainWindowUntil) return true;
   if (suppressActivateDuringOverlayFlow) return true;
   if (Date.now() < suppressActivateUntil) return true;
   if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return true;
+  if (allowDuringRecording) return false;
   try {
     return await isRendererRecording();
   } catch {
@@ -119,12 +129,16 @@ async function shouldBlockMainWindowPresentation() {
   }
 }
 
-async function ensureWindowVisible() {
-  if (await shouldBlockMainWindowPresentation()) return;
+async function ensureWindowVisible(options = {}) {
+  const manual = !!options.manual;
+  if (await shouldBlockMainWindowPresentation({ allowDuringRecording: manual })) return;
   if (Date.now() < suppressMainWindowUntil) return;
   if (!win || win.isDestroyed()) {
     await createWindow();
     return;
+  }
+  if (manual) {
+    manualWindowRevealUntil = Date.now() + 4000;
   }
   if (win.isMinimized()) win.restore();
   if (!win.isVisible()) win.show();
@@ -139,30 +153,273 @@ function getRepoRoot() {
   return path.join(__dirname, "..");
 }
 
+function normalizeProviderChoice(value) {
+  const v = String(value || "").trim();
+  if (v === "local" || v === "fal" || v === "openrouter" || v === "") return v;
+  return "local";
+}
+
+function normalizeLocalModelChoice(value) {
+  const v = String(value || "").trim();
+  const allowed = new Set(LOCAL_MODELS);
+  return allowed.has(v) ? v : "small";
+}
+
+async function getRendererProviderChoice() {
+  if (!win || win.isDestroyed() || !win.webContents) return "local";
+  try {
+    const v = await win.webContents.executeJavaScript(
+      `(() => String((document.getElementById('providerSelect')?.value || 'local')).trim())();`,
+      true
+    );
+    return normalizeProviderChoice(v);
+  } catch {
+    return "local";
+  }
+}
+
+async function getRendererLocalModelChoice() {
+  if (!win || win.isDestroyed() || !win.webContents) return "small";
+  try {
+    const v = await win.webContents.executeJavaScript(
+      `(() => String((document.getElementById('model')?.value || 'small')).trim())();`,
+      true
+    );
+    return normalizeLocalModelChoice(v);
+  } catch {
+    return "small";
+  }
+}
+
+async function getRendererModelContext() {
+  if (!win || win.isDestroyed() || !win.webContents) {
+    return { provider: "local", model: "small", models: [...LOCAL_MODELS] };
+  }
+  try {
+    const state = await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const provider = String((document.getElementById('providerSelect')?.value || 'local')).trim();
+        const modelSel = document.getElementById('model');
+        const remoteSel = document.getElementById('remoteModelSelect');
+        const orModel = document.getElementById('orModel');
+        const localModel = String(modelSel?.value || 'small').trim();
+        const remoteModel = String(remoteSel?.value || orModel?.value || '').trim();
+        const localOptions = Array.from(modelSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
+        const remoteOptions = Array.from(remoteSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
+        const models = provider === 'local'
+          ? (localOptions.length ? localOptions : ${JSON.stringify(LOCAL_MODELS)})
+          : (remoteOptions.length ? remoteOptions : (remoteModel ? [remoteModel] : (provider === 'fal' ? ['fal-ai/whisper'] : [])));
+        const model = provider === 'local' ? localModel : remoteModel;
+        return { provider, model, models };
+      })();
+      `,
+      true
+    );
+    return {
+      provider: normalizeProviderChoice(state?.provider),
+      model: String(state?.model || "").trim() || "small",
+      models: Array.isArray(state?.models) ? state.models.map((x) => String(x || "").trim()).filter(Boolean) : [...LOCAL_MODELS],
+    };
+  } catch {
+    return { provider: "local", model: "small", models: [...LOCAL_MODELS] };
+  }
+}
+
+async function getRendererQuickSettingsOpen() {
+  if (!win || win.isDestroyed() || !win.webContents) return false;
+  try {
+    const open = await win.webContents.executeJavaScript(
+      `(() => { const p = document.getElementById('quickSettingsPanel'); return !!(p && !p.hidden); })();`,
+      true
+    );
+    return !!open;
+  } catch {
+    return false;
+  }
+}
+
+async function setRendererProviderChoice(provider) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const normalized = normalizeProviderChoice(provider);
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const target = ${JSON.stringify(normalized)};
+        const main = document.getElementById('providerSelect');
+        const quick = document.getElementById('quickProviderSelect');
+        if (main && main.value !== target) {
+          main.value = target;
+          main.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        if (quick && quick.value !== target) {
+          quick.value = target;
+          quick.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
+async function setRendererLocalModelChoice(model) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const normalized = normalizeLocalModelChoice(model);
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const target = ${JSON.stringify(normalized)};
+        const sel = document.getElementById('model');
+        if (sel && sel.value !== target) {
+          sel.value = target;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
+async function setRendererModelChoice(provider, model) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const p = normalizeProviderChoice(provider);
+  const target = String(model || "").trim();
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const provider = ${JSON.stringify(p)};
+        const model = ${JSON.stringify(target)};
+        const localSel = document.getElementById('model');
+        const remoteSel = document.getElementById('remoteModelSelect');
+        const orModel = document.getElementById('orModel');
+        const hasOpt = (sel, val) => Array.from(sel?.options || []).some((o) => String(o.value || '') === val);
+        if (provider === 'local') {
+          if (localSel && model && hasOpt(localSel, model) && localSel.value !== model) {
+            localSel.value = model;
+            localSel.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          return true;
+        }
+        if (remoteSel && model) {
+          if (!hasOpt(remoteSel, model)) {
+            const opt = document.createElement('option');
+            opt.value = model;
+            opt.textContent = model;
+            remoteSel.appendChild(opt);
+          }
+          if (remoteSel.value !== model) {
+            remoteSel.value = model;
+            remoteSel.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        if (orModel && model && orModel.value !== model) {
+          orModel.value = model;
+          orModel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
 function createOverlayHtml() {
   return `
   <html>
-    <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;">
+    <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;display:flex;justify-content:center;">
+      <div id="stack">
+      <div id="queuePill">
+        <canvas id="queueWave" width="54" height="12"></canvas>
+        <span id="queueTimer">00:00</span>
+      </div>
       <div id="pill">
-        <canvas id="wave" width="54" height="16"></canvas>
-        <span id="timer">00:00</span>
-        <span id="stateIcon" aria-hidden="true"></span>
+        <div id="quickPanel">
+          <select id="quickProvider">
+            <option value="local">Local</option>
+            <option value="fal">fal.ai</option>
+            <option value="openrouter">OpenRouter</option>
+          </select>
+          <select id="quickModel" title="Model"></select>
+        </div>
+        <div id="core">
+          <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
+          <canvas id="wave" width="54" height="16"></canvas>
+          <span id="timer">00:00</span>
+          <span id="stateIcon" aria-hidden="true"></span>
+        </div>
+      </div>
       </div>
       <style>
+        #stack{
+          display:flex;
+          flex-direction:column;
+          align-items:center;
+          gap:4px;
+          margin:2px auto 0;
+        }
         #pill{
           width: fit-content;
-          margin: 0 auto;
-          margin-top: 6px;
+          margin: 0;
           display:flex;
           align-items:center;
           justify-content:flex-start;
-          gap:9px;
-          padding:6px 10px;
+          gap:6px;
+          padding:6px 8px;
           border-radius:999px;
           border:1px solid rgba(255,255,255,.18);
           background:linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97));
           box-shadow:none;
           backdrop-filter:blur(8px) saturate(100%);
+        }
+        #core{
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          gap:9px;
+        }
+        #queuePill{
+          width:132px;
+          height:18px;
+          padding:2px 8px;
+          border-radius:999px;
+          border:1px solid rgba(255,255,255,.16);
+          background:linear-gradient(180deg,rgba(38,38,38,.95),rgba(20,20,20,.95));
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          opacity:0;
+          pointer-events:none;
+          transform:translateY(-3px) scale(0.98);
+          transition:opacity .18s ease, transform .22s ease;
+        }
+        #queuePill.on{
+          opacity:1;
+          transform:translateY(0) scale(1);
+        }
+        #queueWave{
+          width:54px;
+          height:12px;
+          display:block;
+          opacity:.95;
+          flex:0 0 54px;
+        }
+        #queueTimer{
+          font-size:9px;
+          font-weight:700;
+          color:rgba(214,214,214,.9);
+          font-family:Menlo,ui-monospace,monospace;
+          min-width:30px;
+          text-align:right;
+          line-height:1;
+          flex:0 0 30px;
         }
         #wave{
           display:block;
@@ -170,6 +427,91 @@ function createOverlayHtml() {
           width:54px;
           height:16px;
           flex:0 0 54px;
+        }
+        #quickPanel{
+          display:flex;
+          align-items:center;
+          gap:4px;
+          max-width:196px;
+          min-width:0;
+          opacity:1;
+          overflow:hidden;
+          transition:max-width .22s ease, opacity .18s ease, margin-right .22s ease, transform .22s ease;
+          transform:translateX(0);
+          margin-right:0;
+        }
+        #pill.qs-closed #quickPanel{
+          max-width:0;
+          opacity:0;
+          margin-right:-6px;
+          transform:translateX(8px);
+          pointer-events:none;
+        }
+        #quickProvider{
+          appearance:none;
+          border:1px solid rgba(255,255,255,.2);
+          border-radius:999px;
+          background:rgba(34,34,34,.95);
+          color:rgba(236,236,236,.96);
+          height:22px;
+          padding:0 24px 0 10px;
+          font-size:10px;
+          font-weight:600;
+          max-width:88px;
+          min-width:88px;
+          background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+          background-repeat:no-repeat;
+          background-position:right 8px center;
+          outline:none;
+        }
+        #quickModel{
+          appearance:none;
+          border:1px solid rgba(255,255,255,.2);
+          border-radius:999px;
+          background:rgba(34,34,34,.95);
+          color:rgba(236,236,236,.96);
+          height:22px;
+          padding:0 24px 0 10px;
+          font-size:10px;
+          font-weight:600;
+          max-width:96px;
+          min-width:96px;
+          background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+          background-repeat:no-repeat;
+          background-position:right 8px center;
+          outline:none;
+        }
+        #gearBtn{
+          appearance:none;
+          border:1px solid rgba(255,255,255,.22);
+          border-radius:999px;
+          background:rgba(44,44,44,.95);
+          width:22px;
+          height:22px;
+          padding:0;
+          position:relative;
+          flex:0 0 22px;
+          cursor:pointer;
+        }
+        #gearBtn::before{
+          content:"";
+          position:absolute;
+          left:50%;
+          top:50%;
+          width:11px;
+          height:11px;
+          transform:translate(-50%,-50%);
+          background-repeat:no-repeat;
+          background-position:center;
+          background-size:11px 11px;
+          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
+        }
+        #gearBtn.on{
+          border-color:rgba(255,255,255,.34);
+          background:rgba(68,68,68,.95);
+        }
+        #gearBtn.on::before{
+          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(236,236,236,0.95)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(236,236,236,0.95)' stroke-width='1.4'/%3E%3C/svg%3E");
         }
         #stateIcon{
           width:14px;
@@ -302,23 +644,79 @@ function createOverlayHtml() {
         const el = document.getElementById('timer');
         const cv = document.getElementById('wave');
         const ctx = cv.getContext('2d');
+        const qPill = document.getElementById('queuePill');
+        const qCv = document.getElementById('queueWave');
+        const qCtx = qCv.getContext('2d');
+        const qTimer = document.getElementById('queueTimer');
+        const pill = document.getElementById('pill');
         const stateIcon = document.getElementById('stateIcon');
+        const gearBtn = document.getElementById('gearBtn');
+        const quickPanel = document.getElementById('quickPanel');
+        const quickProvider = document.getElementById('quickProvider');
+        const quickModel = document.getElementById('quickModel');
         let timerId = null;
+        let queueTimerId = null;
         let audioCtx = null;
         const bars = [];
+        const queueBars = [];
         let lastLevelAt = 0;
+        let lastQueueLevelAt = 0;
         let activeWave = true;
+        let queueVisible = false;
+        let queueStart = Date.now();
         let waveMode = 'recording';
         const bw = 1.4;
         const gap = 1.0;
         const maxBars = Math.floor(cv.width / (bw + gap));
+        const qBw = 1.2;
+        const qGap = 0.8;
+        const qMaxBars = Math.floor(qCv.width / (qBw + qGap));
         window.setLevel = (lv) => {
+          if (waveMode === 'transcribing') return;
           const raw = Math.max(0, Math.min(1, Number(lv) || 0));
           const level = Math.max(0, Math.min(1, Math.pow(raw, 0.72) * 1.45));
           lastLevelAt = Date.now();
           bars.push(level);
           while (bars.length > maxBars) bars.shift();
           render();
+        };
+        window.setQueueLevel = (lv) => {
+          const raw = Math.max(0, Math.min(1, Number(lv) || 0));
+          const level = Math.max(0, Math.min(1, Math.pow(raw, 0.7) * 1.55));
+          lastQueueLevelAt = Date.now();
+          queueBars.push(level);
+          while (queueBars.length > qMaxBars) queueBars.shift();
+          renderQueue();
+        };
+        window.setQueueVisible = (show) => {
+          const prev = queueVisible;
+          queueVisible = !!show;
+          qPill.classList.toggle('on', queueVisible);
+          if (queueVisible && !prev) {
+            queueStart = Date.now();
+            qTimer.textContent = '00:00';
+            if (queueTimerId) clearInterval(queueTimerId);
+            queueTimerId = setInterval(() => {
+              const s = Math.max(0, Math.floor((Date.now() - queueStart) / 1000));
+              const mm = String(Math.floor(s / 60)).padStart(2, '0');
+              const ss = String(s % 60).padStart(2, '0');
+              qTimer.textContent = mm + ':' + ss;
+            }, 200);
+          }
+          if (!queueVisible) {
+            queueBars.length = 0;
+            renderQueue();
+            qTimer.textContent = '00:00';
+            if (queueTimerId) {
+              clearInterval(queueTimerId);
+              queueTimerId = null;
+            }
+          }
+        };
+        window.resetQueueWave = () => {
+          queueBars.length = 0;
+          lastQueueLevelAt = 0;
+          renderQueue();
         };
         window.resetWave = () => {
           bars.length = 0;
@@ -342,6 +740,64 @@ function createOverlayHtml() {
             stateIcon.classList.add('fail');
           }
         };
+        const normalizeProvider = (v) => {
+          const raw = String(v || '').trim();
+          if (raw === 'local' || raw === 'fal' || raw === 'openrouter') return raw;
+          return 'local';
+        };
+        const shortModel = (v) => {
+          const s = String(v || '').trim();
+          return s.length > 10 ? (s.slice(0, 10) + '…') : s;
+        };
+        window.setQuickOpen = (open) => {
+          const on = !!open;
+          pill.classList.toggle('qs-open', on);
+          pill.classList.toggle('qs-closed', !on);
+          gearBtn.classList.toggle('on', on);
+        };
+        window.setProvider = (provider) => {
+          const v = normalizeProvider(provider);
+          if (quickProvider.value !== v) quickProvider.value = v;
+        };
+        window.setModelOptions = (provider, models, selected) => {
+          const p = normalizeProvider(provider);
+          const list = Array.isArray(models) ? models.map((m) => String(m || '').trim()).filter(Boolean) : [];
+          const current = String(selected || '').trim();
+          quickModel.innerHTML = '';
+          const vals = list.length ? list : (p === 'local' ? ['tiny','base','small','medium','large-v3'] : []);
+          vals.forEach((m) => {
+            const opt = document.createElement('option');
+            opt.value = m;
+            opt.textContent = shortModel(m);
+            opt.title = m;
+            quickModel.appendChild(opt);
+          });
+          quickModel.disabled = vals.length === 0;
+          if (!vals.length) return;
+          const next = vals.includes(current) ? current : vals[0];
+          quickModel.value = next;
+        };
+        window.setModel = (model) => {
+          const raw = String(model || '').trim();
+          if (!raw) return;
+          if (!Array.from(quickModel.options).some((o) => o.value === raw)) return;
+          if (quickModel.value !== raw) quickModel.value = raw;
+        };
+        gearBtn.addEventListener('click', () => {
+          const next = !pill.classList.contains('qs-open');
+          window.setQuickOpen(next);
+          document.title = '__overlay_settings__' + (next ? '1' : '0');
+        });
+        quickProvider.addEventListener('change', () => {
+          const v = normalizeProvider(quickProvider.value);
+          quickProvider.value = v;
+          document.title = '__overlay_provider__' + encodeURIComponent(v);
+        });
+        quickModel.addEventListener('change', () => {
+          const v = String(quickModel.value || '').trim();
+          quickModel.value = v;
+          document.title = '__overlay_model__' + encodeURIComponent(v);
+        });
         window.setTimer = (t) => {
           const str = String(t || '').trim();
           if (/^\\d{2}:\\d{2}$/.test(str)) {
@@ -407,6 +863,18 @@ function createOverlayHtml() {
             ctx.fillRect(x, y, bw, h);
           }
         };
+        const renderQueue = () => {
+          qCtx.clearRect(0, 0, qCv.width, qCv.height);
+          for (let i = 0; i < queueBars.length; i++) {
+            const v = queueBars[queueBars.length - 1 - i];
+            const x = qCv.width - (i + 1) * (qBw + qGap);
+            if (x < 0) break;
+            const h = Math.max(2, Math.min(qCv.height - 1, v * (qCv.height - 1)));
+            const y = (qCv.height - h) / 2;
+            qCtx.fillStyle = 'rgba(98,216,132,.94)';
+            qCtx.fillRect(x, y, qBw, h);
+          }
+        };
         const tick = () => {
           const s = Math.max(0, Math.floor((Date.now() - start) / 1000));
           const mm = String(Math.floor(s / 60)).padStart(2, '0');
@@ -417,13 +885,25 @@ function createOverlayHtml() {
           if (activeWave && Date.now() - lastLevelAt < 220) return;
           const idle = activeWave
             ? (0.08 + Math.random() * 0.12)
-            : (waveMode === 'transcribing' ? (0.07 + Math.random() * 0.11) : (0.03 + Math.random() * 0.03));
+            : (waveMode === 'transcribing' ? 0.055 : (0.03 + Math.random() * 0.03));
           bars.push(idle);
           while (bars.length > maxBars) bars.shift();
           render();
         }, 120);
+        setInterval(() => {
+          if (!queueVisible) return;
+          if (Date.now() - lastQueueLevelAt < 220) return;
+          queueBars.push(0.05 + Math.random() * 0.06);
+          while (queueBars.length > qMaxBars) queueBars.shift();
+          renderQueue();
+        }, 120);
         tick();
         window.startTimer();
+        window.setQuickOpen(false);
+        window.setProvider('local');
+        window.setModelOptions('local', ['tiny','base','small','medium','large-v3'], 'small');
+        window.setModel('small');
+        window.setQueueVisible(false);
       </script>
     </body>
   </html>`;
@@ -432,8 +912,8 @@ function createOverlayHtml() {
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
-    width: 228,
-    height: 47,
+    width: 520,
+    height: 74,
     frame: false,
     transparent: true,
     resizable: false,
@@ -453,21 +933,53 @@ function ensureOverlayWindow() {
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   overlayWin.setAlwaysOnTop(true, "screen-saver");
   overlayWin.on("page-title-updated", (event, title) => {
-    if (!String(title || "").startsWith("__overlay_stop__")) return;
+    const raw = String(title || "");
+    if (!raw.startsWith("__overlay_")) return;
     event.preventDefault();
-    overlayStopInFlight = true;
-    suppressActivateDuringOverlayFlow = true;
-    suppressMainWindowUntil = Date.now() + 15000;
-    if (win && !win.isDestroyed() && win.isVisible()) {
-      try {
-        win.hide();
-      } catch { }
+    if (raw.startsWith("__overlay_stop__")) {
+      overlayStopInFlight = true;
+      suppressActivateDuringOverlayFlow = true;
+      suppressMainWindowUntil = Date.now() + 15000;
+      if (win && !win.isDestroyed() && win.isVisible()) {
+        try {
+          win.hide();
+        } catch { }
+      }
+      stopRecordingFromOverlay().catch((e) => {
+        console.log("[overlay] stop failed:", e?.message || e);
+        overlayStopInFlight = false;
+        hideRecordingOverlay();
+      });
+      return;
     }
-    stopRecordingFromOverlay().catch((e) => {
-      console.log("[overlay] stop failed:", e?.message || e);
-      overlayStopInFlight = false;
-      hideRecordingOverlay();
-    });
+    if (raw.startsWith("__overlay_settings__")) {
+      overlayQuickSettingsOpen = raw.endsWith("1");
+      return;
+    }
+    if (raw.startsWith("__overlay_provider__")) {
+      const v = normalizeProviderChoice(decodeURIComponent(raw.replace("__overlay_provider__", "")));
+      overlayQuickProvider = v;
+      void (async () => {
+        await setRendererProviderChoice(v);
+        const ctx = await getRendererModelContext();
+        overlayQuickProvider = ctx.provider;
+        overlayQuickModel = ctx.model;
+        if (overlayWin && !overlayWin.isDestroyed()) {
+          await overlayWin.webContents.executeJavaScript(
+            `window.setProvider && window.setProvider(${JSON.stringify(ctx.provider)}); window.setModelOptions && window.setModelOptions(${JSON.stringify(ctx.provider)}, ${JSON.stringify(ctx.models)}, ${JSON.stringify(ctx.model)}); window.setModel && window.setModel(${JSON.stringify(ctx.model)});`,
+            true
+          ).catch(() => {});
+        }
+      })();
+      return;
+    }
+    if (raw.startsWith("__overlay_model__")) {
+      const v = String(decodeURIComponent(raw.replace("__overlay_model__", "")) || "").trim();
+      overlayQuickModel = v;
+      void setRendererModelChoice(overlayQuickProvider, v);
+      return;
+    }
+    if (raw.startsWith("__overlay_layout__")) return;
   });
   overlayWin.on("closed", () => {
     overlayWin = null;
@@ -482,6 +994,18 @@ function positionOverlayWindow() {
   const x = Math.round(wa.x + (wa.width - w) / 2);
   const y = Math.round(wa.y + wa.height - h - 10);
   overlayWin.setPosition(x, y, false);
+}
+
+async function syncOverlayQueueVisual(recordingHint = null) {
+  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
+  const isRec = typeof recordingHint === "boolean" ? recordingHint : await isRendererRecording();
+  const showQueue = pendingTranscriptionCount > 0 && !!isRec;
+  try {
+    await overlayWin.webContents.executeJavaScript(
+      `window.setQueueVisible && window.setQueueVisible(${showQueue ? "true" : "false"});`,
+      true
+    );
+  } catch { }
 }
 
 async function showRecordingOverlay() {
@@ -499,12 +1023,22 @@ async function showRecordingOverlay() {
     await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
     overlayLoaded = true;
   }
+  const modelCtx = await getRendererModelContext();
+  overlayQuickProvider = modelCtx.provider;
+  overlayQuickModel = modelCtx.model;
+  overlayQuickSettingsOpen = await getRendererQuickSettingsOpen();
+  const hasQueuedTranscriptions = pendingTranscriptionCount > 0;
   try {
     await ow.webContents.executeJavaScript(
-      `window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus("Recording");`,
+      `window.setProvider && window.setProvider(${JSON.stringify(overlayQuickProvider)}); window.setModelOptions && window.setModelOptions(${JSON.stringify(overlayQuickProvider)}, ${JSON.stringify(modelCtx.models)}, ${JSON.stringify(overlayQuickModel)}); window.setModel && window.setModel(${JSON.stringify(overlayQuickModel)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
       true
     );
   } catch { }
+  try {
+    ow.setSize(560, 74, false);
+    positionOverlayWindow();
+  } catch {}
+  await syncOverlayQueueVisual(true);
   ow.showInactive();
   await playOverlayCue("start");
   if (overlayWaveMonitor) {
@@ -521,7 +1055,11 @@ async function showRecordingOverlay() {
       )
       .then((lv) => {
         if (!overlayWin || overlayWin.isDestroyed()) return;
-        overlayWin.webContents.executeJavaScript(`window.setLevel(${Math.max(0, Math.min(1, Number(lv) || 0))});`, true).catch(() => { });
+        const safeLevel = Math.max(0, Math.min(1, Number(lv) || 0));
+        overlayWin.webContents.executeJavaScript(
+          `window.setLevel(${safeLevel}); window.setQueueLevel && window.setQueueLevel(${safeLevel});`,
+          true
+        ).catch(() => { });
       })
       .catch(() => { });
   }, 120);
@@ -536,6 +1074,19 @@ async function ensureOverlayVisible(options = {}) {
     await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
     overlayLoaded = true;
   }
+  try {
+    const modelCtx = await getRendererModelContext();
+    overlayQuickProvider = modelCtx.provider;
+    overlayQuickModel = modelCtx.model;
+    await ow.webContents.executeJavaScript(
+      `window.setProvider && window.setProvider(${JSON.stringify(overlayQuickProvider)}); window.setModelOptions && window.setModelOptions(${JSON.stringify(overlayQuickProvider)}, ${JSON.stringify(modelCtx.models)}, ${JSON.stringify(overlayQuickModel)}); window.setModel && window.setModel(${JSON.stringify(overlayQuickModel)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
+      true
+    );
+  } catch {}
+  try {
+    ow.setSize(560, 74, false);
+    positionOverlayWindow();
+  } catch {}
   const jsParts = [];
   if (resetTimer) jsParts.push("window.resetTimer && window.resetTimer();");
   if (startTimer) jsParts.push("window.startTimer && window.startTimer();");
@@ -545,6 +1096,7 @@ async function ensureOverlayVisible(options = {}) {
       await ow.webContents.executeJavaScript(jsParts.join(" "), true);
     } catch { }
   }
+  await syncOverlayQueueVisual();
   ow.showInactive();
 }
 
@@ -559,6 +1111,9 @@ async function setOverlayTimer(text) {
 
 function hideRecordingOverlay() {
   if (!overlayWin || overlayWin.isDestroyed()) return;
+  if (overlayLoaded) {
+    overlayWin.webContents.executeJavaScript(`window.setQueueVisible && window.setQueueVisible(false);`, true).catch(() => { });
+  }
   overlayWin.hide();
   overlayStopInFlight = false;
   suppressActivateDuringOverlayFlow = false;
@@ -642,7 +1197,7 @@ async function toggleRecordingFromShortcut() {
       pasteTargetAppName = front.name || "";
       pasteTargetAppPid = front.pid || 0;
     }
-    await ensureOverlayVisible({ status: "Starting", resetTimer: false, startTimer: false });
+    await ensureOverlayVisible({ status: pendingTranscriptionCount > 0 ? null : "Starting", resetTimer: false, startTimer: false });
     traceStep(trace, "overlay_visible", { status: "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
@@ -666,10 +1221,11 @@ async function toggleRecordingFromShortcut() {
       `
       (() => {
         const isRec = !!(window.__transcriptorIsRecording);
+        const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
         const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
         const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
         window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
-        return { ok: true, recording: !isRec, auto, timerText };
+        return { ok: true, recording: !isRec, auto, timerText, recordingId };
       })();
       `,
       true
@@ -699,7 +1255,16 @@ async function toggleRecordingFromShortcut() {
       traceStep(trace, "recording_stopped", { autoTranscribe: true, timerText: result.timerText || "" });
       await playOverlayCue("stop");
       await setOverlayStatus("Transcribing");
-      await handlePostStopFromShortcut(true);
+      enqueuePostStopTask({
+        autoTranscribe: true,
+        stopRequestedAt: Date.now(),
+        recordingId: Number(result.recordingId || 0),
+        targetName: pasteTargetAppName,
+        targetPid: pasteTargetAppPid,
+      });
+      pasteTargetAppName = "";
+      pasteTargetAppPid = 0;
+      await syncOverlayQueueVisual(false);
     } else {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       await playOverlayCue("stop");
@@ -723,11 +1288,12 @@ async function stopRecordingFromOverlay() {
     `
     (() => {
       const isRec = !!(window.__transcriptorIsRecording);
+      const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
       const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
-      if (!isRec) return { ok: false, recording: false, timerText };
+      if (!isRec) return { ok: false, recording: false, timerText, recordingId };
       // Use dedicated stop event — avoids dual-path race with btnStop.click().
       window.dispatchEvent(new Event('transcriptor-hotkey-stop'));
-      return { ok: true, recording: false, timerText };
+      return { ok: true, recording: false, timerText, recordingId };
     })();
     `,
     true
@@ -742,7 +1308,16 @@ async function stopRecordingFromOverlay() {
   if (result?.ok) {
     await playOverlayCue("stop");
     await setOverlayStatus("Transcribing");
-    await handlePostStopFromShortcut(true);
+    enqueuePostStopTask({
+      autoTranscribe: true,
+      stopRequestedAt: Date.now(),
+      recordingId: Number(result.recordingId || 0),
+      targetName: pasteTargetAppName,
+      targetPid: pasteTargetAppPid,
+    });
+    pasteTargetAppName = "";
+    pasteTargetAppPid = 0;
+    await syncOverlayQueueVisual(false);
   } else {
     await setOverlayStatus("Saved To App");
     setTimeout(() => hideRecordingOverlay(), 1400);
@@ -1097,19 +1672,9 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       if roleName is "AXSecureTextField" or subroleName is "AXSecureTextField" then
         return "ERR:secure-field"
       end if
-      try
-        set value of attribute "AXSelectedText" of focusedElement to targetText
-        return "OK:ax-selected-text"
-      on error
-      end try
-      try
-        set curVal to value of attribute "AXValue" of focusedElement
-        if curVal is missing value then set curVal to ""
-        set value of attribute "AXValue" of focusedElement to (curVal & targetText)
-        return "OK:ax-value"
-      on error
-      end try
-      return "ERR:ax-failed"
+      -- No AX write (AXSelectedText/AXValue) — causes destructive 'select all'
+      -- side-effect on some apps when the write fails mid-operation.
+      return "ERR:ax-skipped"
     end tell
   `;
   const pasteScript = `
@@ -1280,6 +1845,97 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     end tell
   `;
 
+  const textLen = String(text || "").length;
+  const isLongText = textLen > 800;
+
+  // ── Direct paste scripts: activate target + Cmd+V ──
+  // These do NOT read/write the clipboard in AppleScript.
+  // The clipboard is already set by Electron's clipboard.writeText().
+  // This eliminates truncation/failure with long text.
+  const directPasteScript = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then
+        set p to first process whose frontmost is true
+      end if
+      set frontmost of p to true
+      delay 0.35
+      tell p
+        key code 9 using {command down}
+      end tell
+      delay 0.25
+      return "OK:direct-paste"
+    end tell
+  `;
+  const directKeycodePasteScript = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then
+        set p to first process whose frontmost is true
+      end if
+      set frontmost of p to true
+      delay 0.35
+      tell p
+        key code 9 using {command down}
+      end tell
+      delay 0.25
+      return "OK:direct-keycode"
+    end tell
+  `;
+  const directMenuPasteScript = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      else if targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then
+        return "ERR:no-process"
+      end if
+      set frontmost of p to true
+      delay 0.30
+      try
+        click menu item "Paste" of menu "Edit" of menu bar item "Edit" of menu bar 1 of p
+        delay 0.20
+        return "OK:menu-paste"
+      on error errMsg
+        return "ERR:menu-paste:" & errMsg
+      end try
+    end tell
+  `;
+
   const runTypedInsert = async (stageLabel = "typed") => {
     if (String(text).length > 1800) {
       traceStep(trace, "method_skipped", {
@@ -1323,18 +1979,20 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   };
 
   let lastReason = "paste-no-attempt";
-  traceStep(trace, "method_begin", { method: "ax" });
+
+  // ── AX pre-check: detect secure fields (no destructive writes) ──
+  traceStep(trace, "method_begin", { method: "ax-check" });
   const axStarted = Date.now();
-  const ax = await runCommand("osascript", ["-e", axInsertScript], { timeoutMs: 14000 });
+  const ax = await runCommand("osascript", ["-e", axInsertScript], { timeoutMs: 8000 });
   traceStep(trace, "method_result", {
-    method: "ax",
+    method: "ax-check",
     ms: Date.now() - axStarted,
     ok: !!ax.ok,
     code: ax.code,
     stdout: compactLogText(ax.stdout),
     stderr: compactLogText(ax.stderr),
   });
-  logPasteTrace("ax_result", {
+  logPasteTrace("ax_check_result", {
     ok: !!ax.ok,
     code: ax.code,
     stdout: compactLogText(ax.stdout),
@@ -1342,23 +2000,30 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   });
   if (ax.ok) {
     const axOut = (ax.stdout || "").trim();
-    if (axOut.startsWith("OK:")) {
-      logPasteTrace("success", { method: "ax", reason: axOut });
-      traceEnd(trace, "success", { method: "ax", reason: axOut, verified: true });
-      return { ok: true, reason: axOut, method: "ax", verified: true };
+    if (axOut === "ERR:secure-field") {
+      traceEnd(trace, "failed", { reason: "secure-field" });
+      if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+      return { ok: false, reason: "secure-field", method: "ax-check", verified: false };
     }
-    lastReason = axOut || lastReason;
-  } else {
-    lastReason = (ax.stderr || ax.stdout || "ax-insert-failed").trim();
+    if (axOut === "ERR:no-accessibility") {
+      lastReason = "no-accessibility";
+      traceStep(trace, "ax_no_access", {});
+    }
   }
 
+  // ── Direct paste: Cmd+V without AppleScript clipboard round-trip ──
+  // Clipboard is already set by Electron. Just activate target + Cmd+V.
   for (let attempt = 0; attempt < 2; attempt++) {
-    logPasteTrace("fallback_attempt", { attempt: attempt + 1, method: "cmd_v_then_keycode" });
-    traceStep(trace, "method_begin", { method: "cmd_v", attempt: attempt + 1 });
+    // Re-ensure clipboard is intact (in case AX attempt cleared it).
+    try { clipboard.writeText(String(text)); } catch { }
+    await sleep(50);
+
+    logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "direct_paste" });
+    traceStep(trace, "method_begin", { method: "direct_paste", attempt: attempt + 1 });
     const cmdStarted = Date.now();
-    const check = await runCommand("osascript", ["-e", pasteScript], { timeoutMs: 14000 });
+    const check = await runCommand("osascript", ["-e", directPasteScript], { timeoutMs: 14000 });
     traceStep(trace, "method_result", {
-      method: "cmd_v",
+      method: "direct_paste",
       attempt: attempt + 1,
       ms: Date.now() - cmdStarted,
       ok: !!check.ok,
@@ -1366,7 +2031,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       stdout: compactLogText(check.stdout),
       stderr: compactLogText(check.stderr),
     });
-    logPasteTrace("cmdv_result", {
+    logPasteTrace("direct_paste_result", {
       attempt: attempt + 1,
       ok: !!check.ok,
       code: check.code,
@@ -1376,19 +2041,23 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     if (check.ok) {
       const out = (check.stdout || "").trim();
       if (out.startsWith("OK:")) {
-        logPasteTrace("success", { method: "cmd_v", attempt: attempt + 1, reason: out });
-        traceEnd(trace, "success", { method: "cmd_v", attempt: attempt + 1, reason: out, verified: false });
-        return { ok: true, reason: out, method: "cmd_v", verified: false };
+        logPasteTrace("success", { method: "direct_paste", attempt: attempt + 1, reason: out });
+        traceEnd(trace, "success", { method: "direct_paste", attempt: attempt + 1, reason: out, verified: false });
+        return { ok: true, reason: out, method: "direct_paste", verified: false };
       }
       lastReason = out || "paste-return-unknown";
     } else {
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
-    traceStep(trace, "method_begin", { method: "keycode", attempt: attempt + 1 });
+
+    // Fallback: try key code 9 (V keycode) instead of keystroke.
+    try { clipboard.writeText(String(text)); } catch { }
+    await sleep(30);
+    traceStep(trace, "method_begin", { method: "direct_keycode", attempt: attempt + 1 });
     const keyStarted = Date.now();
-    const check2 = await runCommand("osascript", ["-e", keycodePasteScript], { timeoutMs: 14000 });
+    const check2 = await runCommand("osascript", ["-e", directKeycodePasteScript], { timeoutMs: 14000 });
     traceStep(trace, "method_result", {
-      method: "keycode",
+      method: "direct_keycode",
       attempt: attempt + 1,
       ms: Date.now() - keyStarted,
       ok: !!check2.ok,
@@ -1396,7 +2065,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       stdout: compactLogText(check2.stdout),
       stderr: compactLogText(check2.stderr),
     });
-    logPasteTrace("keycode_result", {
+    logPasteTrace("direct_keycode_result", {
       attempt: attempt + 1,
       ok: !!check2.ok,
       code: check2.code,
@@ -1406,21 +2075,24 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     if (check2.ok) {
       const out2 = (check2.stdout || "").trim();
       if (out2.startsWith("OK:")) {
-        logPasteTrace("success", { method: "keycode", attempt: attempt + 1, reason: out2 });
-        traceEnd(trace, "success", { method: "keycode", attempt: attempt + 1, reason: out2, verified: false });
-        return { ok: true, reason: out2, method: "keycode", verified: false };
+        logPasteTrace("success", { method: "direct_keycode", attempt: attempt + 1, reason: out2 });
+        traceEnd(trace, "success", { method: "direct_keycode", attempt: attempt + 1, reason: out2, verified: false });
+        return { ok: true, reason: out2, method: "direct_keycode", verified: false };
       }
       lastReason = out2 || lastReason;
     } else {
       lastReason = (check2.stderr || check2.stdout || lastReason).trim();
     }
-    await sleep(100);
+    await sleep(120);
   }
 
-  if (targetAppName || pid > 0) {
+  // ── Menu paste fallback (Edit > Paste) ──
+  if (effectiveTargetName || pid > 0) {
+    try { clipboard.writeText(String(text)); } catch { }
+    await sleep(30);
     traceStep(trace, "method_begin", { method: "menu" });
     const menuStarted = Date.now();
-    const menuPaste = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 14000 });
+    const menuPaste = await runCommand("osascript", ["-e", directMenuPasteScript], { timeoutMs: 14000 });
     traceStep(trace, "method_result", {
       method: "menu",
       ms: Date.now() - menuStarted,
@@ -1448,6 +2120,40 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     }
   }
 
+  // ── Global keycode fallback: no process targeting ──
+  // Just sends key code 9 (Cmd+V) to whatever is frontmost.
+  try { clipboard.writeText(String(text)); } catch { }
+  await sleep(50);
+  traceStep(trace, "method_begin", { method: "global_keycode" });
+  const globalStarted = Date.now();
+  const globalPaste = await runCommand("osascript", ["-e",
+    `tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      key code 9 using {command down}
+      delay 0.20
+      return "OK:global-keycode"
+    end tell`
+  ], { timeoutMs: 8000 });
+  traceStep(trace, "method_result", {
+    method: "global_keycode",
+    ms: Date.now() - globalStarted,
+    ok: !!globalPaste.ok,
+    code: globalPaste.code,
+    stdout: compactLogText(globalPaste.stdout),
+    stderr: compactLogText(globalPaste.stderr),
+  });
+  if (globalPaste.ok) {
+    const globalOut = (globalPaste.stdout || "").trim();
+    if (globalOut.startsWith("OK:")) {
+      logPasteTrace("success", { method: "global_keycode", reason: globalOut, verified: false });
+      traceEnd(trace, "success", { method: "global_keycode", reason: globalOut, verified: false });
+      return { ok: true, reason: globalOut, method: "global_keycode", verified: false };
+    }
+    lastReason = globalOut || lastReason;
+  } else {
+    lastReason = (globalPaste.stderr || globalPaste.stdout || lastReason).trim();
+  }
+
   let frontAfter = { name: "", pid: 0 };
   try {
     frontAfter = await getFrontmostAppInfo();
@@ -1472,18 +2178,57 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
-async function handlePostStopFromShortcut(autoTranscribe) {
-  const trace = createTrace("post_stop", { autoTranscribe: !!autoTranscribe });
-  if (!autoTranscribe) {
-    traceEnd(trace, "skipped", { reason: "autoTranscribe-disabled" });
-    return;
+function enqueuePostStopTask(options = {}) {
+  const task = {
+    autoTranscribe: !!options.autoTranscribe,
+    stopRequestedAt: Number(options.stopRequestedAt || Date.now()),
+    recordingId: Number(options.recordingId || 0),
+    targetName: String(options.targetName || ""),
+    targetPid: Number(options.targetPid || 0),
+  };
+  if (!task.autoTranscribe) return;
+  postStopQueue.push(task);
+  pendingTranscriptionCount += 1;
+  appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} target="${task.targetName}" pid=${task.targetPid}`);
+  void runPostStopQueue();
+}
+
+async function runPostStopQueue() {
+  if (postStopWorkerRunning) return;
+  postStopWorkerRunning = true;
+  try {
+    while (postStopQueue.length > 0) {
+      const task = postStopQueue.shift();
+      if (!task) continue;
+      await processPostStopTask(task);
+      pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
+      const isRec = await isRendererRecording();
+      await syncOverlayQueueVisual(isRec);
+      if (!isRec) {
+        if (pendingTranscriptionCount > 0) {
+          await setOverlayStatus("Transcribing");
+        } else {
+          setTimeout(() => hideRecordingOverlay(), 1400);
+        }
+      } else if (pendingTranscriptionCount === 0) {
+        await overlayWin?.webContents.executeJavaScript(
+          `window.setStatus && window.setStatus("Recording"); window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer();`,
+          true
+        ).catch(() => {});
+      }
+    }
+  } finally {
+    postStopWorkerRunning = false;
   }
+}
+
+async function processPostStopTask(task) {
+  const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
   const deadline = Date.now() + 120000;
   let transcript = "";
   let pollCount = 0;
-  const stopRequestedAt = Date.now();
+  const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
 
-  // Wait for renderer's __transcriptorLastFinishedAt signal (set after stopLive completes).
   while (Date.now() < deadline) {
     pollCount += 1;
     if (!win || win.isDestroyed() || !win.webContents) {
@@ -1491,13 +2236,13 @@ async function handlePostStopFromShortcut(autoTranscribe) {
       await sleep(300);
       continue;
     }
-
     let state = null;
     try {
       state = await win.webContents.executeJavaScript(
         `
         (() => {
           const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
+          const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
           const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
           const isRec = !!(window.__transcriptorIsRecording);
           const status = (document.getElementById('statusText')?.textContent || '').trim();
@@ -1505,7 +2250,7 @@ async function handlePostStopFromShortcut(autoTranscribe) {
           const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
           const busy = !!document.getElementById('btnStart')?.disabled;
           const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-          return { finishedAt, finishedText, isRec, status, finalText, liveText, busy, progressVisible };
+          return { finishedAt, finishedRecordingId, finishedText, isRec, status, finalText, liveText, busy, progressVisible };
         })();
         `,
         true
@@ -1515,47 +2260,47 @@ async function handlePostStopFromShortcut(autoTranscribe) {
       await sleep(300);
       continue;
     }
-
     if (!state) {
       traceStep(trace, "poll_empty_state", { pollCount });
       await sleep(300);
       continue;
     }
-
-    // Primary signal: renderer set __transcriptorLastFinishedAt after stopLive completed.
-    if (state.finishedAt > stopRequestedAt) {
+    const readyByRecording = task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId;
+    const readyByTime = task.recordingId <= 0 && state.finishedAt > stopRequestedAt;
+    if (readyByRecording || readyByTime) {
       transcript = state.finishedText || state.finalText || state.liveText || "";
       traceStep(trace, "signal_ready", {
         pollCount,
         finishedAt: state.finishedAt,
+        finishedRecordingId: Number(state.finishedRecordingId || 0),
+        expectedRecordingId: task.recordingId || 0,
         delay: state.finishedAt - stopRequestedAt,
         textLen: transcript.length,
       });
       break;
     }
-
-    // Fallback: if finalText appeared and status is terminal, accept it.
     if (state.finalText && state.finalText.length > 0) {
       transcript = state.finalText;
+      if (!state.isRec) {
+        traceStep(trace, "final_text_early_ready", {
+          pollCount,
+          textLen: transcript.length,
+          status: state.status || "",
+          busy: !!state.busy,
+          progressVisible: !!state.progressVisible,
+        });
+        break;
+      }
     } else if (!transcript && state.liveText && state.liveText.length > 0) {
       transcript = state.liveText;
     }
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
       (state.status === "Done" || state.status === "Error" || state.status === "Idle");
-    traceStep(trace, "poll_state", {
-      pollCount,
-      status: state.status || "",
-      busy: !!state.busy,
-      isRec: !!state.isRec,
-      progressVisible: !!state.progressVisible,
-      finalLen: String(state.finalText || "").length,
-      liveLen: String(state.liveText || "").length,
-      doneLike,
-    });
     if (doneLike) break;
-    await sleep(320);
+    await sleep(140);
   }
 
+  let overlayStatus = "Saved To App";
   if (transcript) {
     traceStep(trace, "transcript_ready", {
       len: transcript.length,
@@ -1568,16 +2313,13 @@ async function handlePostStopFromShortcut(autoTranscribe) {
       clipboard.writeText(transcript);
     } catch { }
 
-    // BUG-8 fix: Re-check frontmost app at paste time if saved target is stale.
-    let effectiveTargetName = pasteTargetAppName;
-    let effectiveTargetPid = pasteTargetAppPid;
+    let effectiveTargetName = task.targetName || "";
+    let effectiveTargetPid = Number(task.targetPid || 0);
     try {
       const currentFront = await getFrontmostAppInfo();
       const currentName = String(currentFront.name || "").trim();
       const currentPid = Number(currentFront.pid || 0);
-      // If original target process is gone, use current frontmost.
       if (effectiveTargetPid > 0 && currentPid > 0 && currentPid !== effectiveTargetPid) {
-        // Verify original target is still running.
         const stillRunning = await activateAppByPid(effectiveTargetPid);
         if (!stillRunning && shouldUsePasteTarget(currentFront)) {
           traceStep(trace, "target_refreshed", {
@@ -1605,20 +2347,18 @@ async function handlePostStopFromShortcut(autoTranscribe) {
     appendMainLog(
       `[paste-auto] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
-    if (!pasted.ok) {
-      console.log("[paste] not inserted:", pasted.reason || "unknown");
-      if (looksLikeAutomationPermissionError(pasted.reason)) {
-        openPrivacyAccessibilitySettings();
-      }
+    if (!pasted.ok && looksLikeAutomationPermissionError(pasted.reason)) {
+      openPrivacyAccessibilitySettings();
     }
-    await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
+    overlayStatus = pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason);
   } else {
     traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
-    await setOverlayStatus("Saved To App");
   }
-  pasteTargetAppName = "";
-  pasteTargetAppPid = 0;
-  setTimeout(() => hideRecordingOverlay(), 1500);
+
+  const isRecNow = await isRendererRecording();
+  if (!isRecNow) {
+    await setOverlayStatus(overlayStatus);
+  }
   traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
 }
 
@@ -1951,6 +2691,7 @@ async function createWindow(options = {}) {
     isRendererRecording()
       .then((recording) => {
         if (!recording) return;
+        if (Date.now() < manualWindowRevealUntil) return;
         try {
           win.hide();
         } catch { }
@@ -2000,8 +2741,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", async () => {
-  if (await shouldBlockMainWindowPresentation()) return;
-  ensureWindowVisible();
+  ensureWindowVisible({ manual: true });
 });
 
 app.on("before-quit", () => {
@@ -2056,7 +2796,7 @@ app.whenReady().then(async () => {
     {
       label: "Open Transcriptor",
       click: () => {
-        ensureWindowVisible();
+        ensureWindowVisible({ manual: true });
       }
     },
     { type: "separator" },
@@ -2071,7 +2811,7 @@ app.whenReady().then(async () => {
       tray?.popUpContextMenu(trayMenu);
       return;
     }
-    ensureWindowVisible();
+    ensureWindowVisible({ manual: true });
   });
   tray.on("right-click", () => {
     tray?.popUpContextMenu(trayMenu);

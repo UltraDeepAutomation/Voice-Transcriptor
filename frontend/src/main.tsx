@@ -17,16 +17,37 @@ interface JobResponse {
   result_files: Record<string, string> | null;
 }
 
+interface NetworkStatusResponse {
+  online: boolean;
+  latency_ms: number | null;
+  backend_ok?: boolean;
+}
+
 interface AppConfig {
   providers?: {
     fal?: { key?: string };
     openrouter?: { key?: string };
+  };
+  _meta?: {
+    config_path?: string;
   };
   preferences?: {
     remote_provider?: string;
     recordings_dir?: string;
     fal?: { diarize?: boolean; num_speakers?: number | null; chunk_level?: string; task?: string };
     openrouter?: { model?: string };
+    ui?: {
+      mode?: string;
+      provider?: string;
+      language?: string;
+      local_model?: string;
+      mic_id?: string;
+      auto_transcribe?: boolean;
+      live_preview?: boolean;
+      quick_settings_open?: boolean;
+      upscale_enabled?: boolean;
+      upscale_preset?: string;
+    };
   };
 }
 
@@ -51,6 +72,12 @@ interface RecordingsStats {
   languages: Array<{ name: string; count: number }>;
 }
 
+interface UpscalePresetItem {
+  id: string;
+  name: string;
+  builtin: boolean;
+}
+
 declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
@@ -58,6 +85,8 @@ declare global {
     __transcriptorIsRecording?: boolean;
     __transcriptorLastFinishedText?: string;
     __transcriptorLastFinishedAt?: number;
+    __transcriptorCurrentRecordingId?: number;
+    __transcriptorLastFinishedRecordingId?: number;
   }
 }
 
@@ -84,8 +113,6 @@ const fmtDur = (sec: number): string => {
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 const MAX_FILE_BYTES = 500 * 1024 * 1024;
 const MAX_JOB_WAIT_MS = 45 * 60 * 1000;
-const MIC_STORAGE_KEY = "transcriptor.selectedMicId";
-const LANGUAGE_STORAGE_KEY = "transcriptor.language";
 const ALLOWED_AUDIO_MIME = new Set([
   "audio/wav",
   "audio/x-wav",
@@ -100,11 +127,17 @@ const ALLOWED_AUDIO_MIME = new Set([
 ]);
 const ALLOWED_AUDIO_EXT = new Set(["wav", "mp3", "m4a", "flac", "ogg", "aac", "mp4", "webm"]);
 const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
+const OPENROUTER_AUDIO_MODELS = ["google/gemini-2.5-flash", "openai/gpt-4o-audio-preview"];
 
 let isBusy = false;
 let isRecording = false;
 let selectedFile: File | null = null;
 let pollAbortController: AbortController | null = null;
+let uiPrefSaveTimer: number | null = null;
+let suppressUiPrefAutosave = false;
+let preferredMicId = "";
+let upscalePresets: UpscalePresetItem[] = [];
+let pendingUpscalePresetId = "";
 
 const apiToken = (): string => {
   const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
@@ -116,25 +149,9 @@ const apiToken = (): string => {
 
 const authHeaders = (): HeadersInit => ({ "X-Api-Token": apiToken() });
 
-function initLanguagePreference(): void {
-  const sel = $("language") as HTMLSelectElement;
-  const saved = localStorage.getItem(LANGUAGE_STORAGE_KEY) || "";
-  if (saved && Array.from(sel.options).some((o) => o.value === saved)) {
-    sel.value = saved;
-  } else if (sel.value === "auto") {
-    const nav = String(navigator.language || "").toLowerCase();
-    if (nav.startsWith("ru")) {
-      sel.value = "ru";
-    }
-  }
-  sel.addEventListener("change", () => {
-    localStorage.setItem(LANGUAGE_STORAGE_KEY, sel.value || "auto");
-  });
-}
-
 function setBusy(nextBusy: boolean): void {
   isBusy = !!nextBusy;
-  ["btnStart", "btnStop", "btnTranscribeFile", "pickFileBtn", "mode", "providerSelect"].forEach((id) => {
+  ["btnStart", "btnStop", "btnTranscribeFile", "pickFileBtn", "mode", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn"].forEach((id) => {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
@@ -235,12 +252,62 @@ function encodeWav(float32: Float32Array, sr: number): Blob {
   return new Blob([buf], { type: "audio/wav" });
 }
 
-async function remoteJob(file: File, opts: { provider: Provider; language: string; diarize: boolean }): Promise<{ job_id: string }> {
+function getRemoteModelValue(provider: Provider): string {
+  if (provider === "openrouter") {
+    const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
+    if (v) return v;
+    return "google/gemini-2.5-flash";
+  }
+  if (provider === "fal") return "fal-ai/whisper";
+  return ($("model") as HTMLSelectElement).value || "small";
+}
+
+function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
+  const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const sel = $("remoteModelSelect") as HTMLSelectElement;
+  if (provider === "local" || !provider) {
+    sel.hidden = true;
+    return;
+  }
+  if (provider === "fal") {
+    sel.hidden = false;
+    sel.innerHTML = "";
+    const falOpt = document.createElement("option");
+    falOpt.value = "fal-ai/whisper";
+    falOpt.textContent = "fal-ai/whisper";
+    sel.appendChild(falOpt);
+    sel.value = "fal-ai/whisper";
+    return;
+  }
+  const preferred =
+    (defaultOpenrouterModel || "").trim() ||
+    (($("orModel") as HTMLInputElement)?.value || "").trim() ||
+    OPENROUTER_AUDIO_MODELS[0];
+  const models = new Set<string>(OPENROUTER_AUDIO_MODELS);
+  if (preferred) models.add(preferred);
+  sel.hidden = false;
+  sel.innerHTML = "";
+  Array.from(models).forEach((model) => {
+    const opt = document.createElement("option");
+    opt.value = model;
+    opt.textContent = model;
+    sel.appendChild(opt);
+  });
+  sel.value = preferred;
+}
+
+async function remoteJob(
+  file: File,
+  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
+): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("provider", opts.provider || "fal");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
+  if (opts.provider === "openrouter") {
+    fd.set("openrouter_model", (opts.openrouterModel || "").trim());
+  }
   const r = await fetch("/api/remote/jobs", { method: "POST", body: fd, headers: authHeaders() });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as { job_id: string };
@@ -267,9 +334,15 @@ function resolveFastLocalLanguage(language: string): string {
   return "auto";
 }
 
+function resolveFastLiveLocalModel(model: string): string {
+  const raw = String(model || "").trim() || "small";
+  if (raw === "medium" || raw === "large-v3") return "small";
+  return raw;
+}
+
 async function pollJob(jobId: string, signal: AbortSignal, cb?: (j: JobResponse) => void): Promise<JobResponse> {
   const started = Date.now();
-  let waitMs = 320;
+  let waitMs = 180;
   while (true) {
     if (signal.aborted) {
       throw new Error("Request canceled");
@@ -281,7 +354,7 @@ async function pollJob(jobId: string, signal: AbortSignal, cb?: (j: JobResponse)
     cb && cb(j);
     if (j.status === "done" || j.status === "error") return j;
     await new Promise((r) => setTimeout(r, waitMs));
-    waitMs = Math.min(1200, Math.round(waitMs * 1.18));
+    waitMs = Math.min(700, Math.round(waitMs * 1.16));
   }
 }
 
@@ -303,6 +376,36 @@ function syncMode(): void {
   }
   if (live) {
     setSelectedFile(null);
+  }
+}
+
+function setNetworkState(online: boolean, latencyMs: number | null = null): void {
+  const dot = $("netDot");
+  const text = $("netText");
+  dot.className = "net-dot" + (online ? " online" : " offline");
+  text.textContent = online ? "Online" : "Offline";
+  const pill = $("netPill");
+  if (!online) {
+    pill.setAttribute("title", "Internet unavailable");
+    return;
+  }
+  pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
+}
+
+async function refreshNetworkState(): Promise<void> {
+  try {
+    const health = await fetch("/api/health");
+    if (!health.ok) throw new Error(`health ${health.status}`);
+    // /api/network is public for UI indicator; token issues should not force Offline.
+    const netResp = await fetch("/api/network");
+    if (!netResp.ok) {
+      setNetworkState(true, null);
+      return;
+    }
+    const s = (await netResp.json()) as NetworkStatusResponse;
+    setNetworkState(true, s.latency_ms ?? null);
+  } catch {
+    setNetworkState(false, null);
   }
 }
 
@@ -334,7 +437,6 @@ async function loadMics(forceReload = false): Promise<void> {
     }
     const devs = await navigator.mediaDevices.enumerateDevices();
     const curVal = sel.value;
-    const savedVal = localStorage.getItem(MIC_STORAGE_KEY) || "";
     sel.innerHTML = '<option value="">Default</option>';
     const mics = devs.filter((d) => d.kind === "audioinput");
     if (mics.length === 0) {
@@ -347,11 +449,9 @@ async function loadMics(forceReload = false): Promise<void> {
         sel.appendChild(o);
       });
     }
-    const nextVal = curVal || savedVal;
+    const nextVal = curVal || preferredMicId || "";
     if (nextVal && Array.from(sel.options).some((o) => o.value === nextVal)) {
       sel.value = nextVal;
-    } else if (savedVal) {
-      localStorage.removeItem(MIC_STORAGE_KEY);
     }
   } catch (e) {
     console.error("Error loading microphones:", e);
@@ -360,11 +460,6 @@ async function loadMics(forceReload = false): Promise<void> {
 }
 
 ($("micSelect") as HTMLSelectElement).onclick = () => void loadMics(true);
-($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
-  const v = ($("micSelect") as HTMLSelectElement).value || "";
-  if (v) localStorage.setItem(MIC_STORAGE_KEY, v);
-  else localStorage.removeItem(MIC_STORAGE_KEY);
-});
 
 const canvas = $("waveCanvas") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
@@ -450,7 +545,7 @@ function persistLiveDraft(recording: boolean): void {
       source_text: liveText,
       transcript_text: finalText,
       provider: ($("providerSelect") as HTMLSelectElement).value || "local",
-      model: ($("model") as HTMLSelectElement).value,
+      model: getRemoteModelValue((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
       language: ($("language") as HTMLSelectElement).value,
     };
     localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
@@ -504,7 +599,143 @@ async function recoverLiveDraftIfAny(): Promise<void> {
   }
 }
 
+function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
+  return {
+    mode: (($("mode") as HTMLSelectElement).value || "live").trim(),
+    provider: (($("providerSelect") as HTMLSelectElement).value || "local").trim(),
+    language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+    local_model: (($("model") as HTMLSelectElement).value || "small").trim(),
+    mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+    auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
+    live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
+    quick_settings_open: !$("quickSettingsPanel").hidden,
+    upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
+    upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "clean").trim(),
+  };
+}
+
+function shouldUpscale(): boolean {
+  return !!($("upscaleToggle") as HTMLInputElement).checked;
+}
+
+function upscalePresetId(): string {
+  return (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim();
+}
+
+function selectedUpscalePreset(): UpscalePresetItem | undefined {
+  const id = upscalePresetId();
+  return upscalePresets.find((x) => x.id === id);
+}
+
+function syncUpscalePresetControls(): void {
+  const delBtn = $("upscalePresetDeleteBtn") as HTMLButtonElement;
+  const canDelete = !!(selectedUpscalePreset() && !selectedUpscalePreset()!.builtin);
+  delBtn.disabled = !canDelete;
+  delBtn.classList.toggle("can-delete", canDelete);
+}
+
+async function loadUpscalePresets(preferredId = ""): Promise<void> {
+  const sel = $("upscalePresetSelect") as HTMLSelectElement;
+  const prev = preferredId || sel.value || pendingUpscalePresetId || "";
+  const r = await apiGet<{ items: UpscalePresetItem[] }>("/api/upscale/presets");
+  upscalePresets = Array.isArray(r.items) ? r.items : [];
+  sel.innerHTML = "";
+  if (!upscalePresets.length) {
+    const o = document.createElement("option");
+    o.value = "builtin_clean";
+    o.textContent = "Clean";
+    sel.appendChild(o);
+    upscalePresets = [{ id: "builtin_clean", name: "Clean", builtin: true }];
+  } else {
+    upscalePresets.forEach((item) => {
+      const o = document.createElement("option");
+      o.value = item.id;
+      o.textContent = item.name;
+      sel.appendChild(o);
+    });
+  }
+  const next = upscalePresets.some((x) => x.id === prev) ? prev : (upscalePresets[0]?.id || "builtin_clean");
+  sel.value = next;
+  pendingUpscalePresetId = "";
+  const addBtn = $("upscalePresetAddBtn") as HTMLButtonElement;
+  const customCount = upscalePresets.filter((x) => !x.builtin).length;
+  addBtn.disabled = customCount >= 3;
+  syncUpscalePresetControls();
+}
+
+function openUpscalePresetModal(): void {
+  const modal = $("upscalePresetModal");
+  const name = $("upscalePresetNameInput") as HTMLInputElement;
+  const instruction = $("upscalePresetInstructionInput") as HTMLTextAreaElement;
+  $("upscalePresetMsg").textContent = "";
+  name.value = "";
+  instruction.value =
+    "Improve transcript quality: keep same language as input, preserve meaning, fix punctuation and grammar. Return only final transcript text without quotes.";
+  modal.hidden = false;
+  name.focus();
+}
+
+function closeUpscalePresetModal(): void {
+  $("upscalePresetModal").hidden = true;
+}
+
+async function runUpscaleIfEnabled(text: string): Promise<string> {
+  const input = String(text || "").trim();
+  if (!input) return "";
+  if (!shouldUpscale()) {
+    $("upscaleOutput").textContent = "";
+    return input;
+  }
+  setStatus("Upscaling");
+  $("upscaleOutput").textContent = "Upscaling...";
+  const remoteModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
+  try {
+    const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", {
+      text: input,
+      preset_id: upscalePresetId(),
+      model: remoteModel || undefined,
+    });
+    const out = String(r.text || "").trim();
+    if (!out) throw new Error("Upscale returned empty text");
+    $("upscaleOutput").textContent = out;
+    setStatus("Done");
+    return out;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
+    $("upscaleOutput").textContent = `Upscale failed: ${msg}\n\nUsing original transcript.`;
+    setStatus("Done");
+    return input;
+  }
+}
+
+function queueUiPreferencesSave(): void {
+  if (suppressUiPrefAutosave) return;
+  if (uiPrefSaveTimer) {
+    clearTimeout(uiPrefSaveTimer);
+    uiPrefSaveTimer = null;
+  }
+  uiPrefSaveTimer = window.setTimeout(() => {
+    uiPrefSaveTimer = null;
+    const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
+    const remoteProvider = provider === "fal" || provider === "openrouter" ? provider : "fal";
+    const openrouterModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
+    void apiPost<{ ok: boolean }>("/api/config", {
+      preferences: {
+        recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
+        remote_provider: remoteProvider,
+        fal: {
+          diarize: ($("diarizeDefault") as HTMLInputElement).checked,
+          chunk_level: ($("chunkSelect") as HTMLSelectElement).value,
+        },
+        openrouter: { model: openrouterModel || "google/gemini-2.5-flash" },
+        ui: collectUiPreferences(),
+      },
+    }).catch(() => {});
+  }, 260);
+}
+
 async function loadCfg(): Promise<void> {
+  suppressUiPrefAutosave = true;
   try {
     const cfg = await apiGet<AppConfig>("/api/config");
     const falK = ((cfg.providers || {}).fal || {}).key;
@@ -513,13 +744,55 @@ async function loadCfg(): Promise<void> {
     ($("orKey") as HTMLInputElement).placeholder = orK ? "(saved)" : "OPENROUTER_API_KEY";
     ($("falKey") as HTMLInputElement).value = "";
     ($("orKey") as HTMLInputElement).value = "";
-    ($("orModel") as HTMLInputElement).value = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
+    $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
+    const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
+    ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     ($("recordingsDirInput") as HTMLInputElement).value = (cfg.preferences || {}).recordings_dir || "";
-    ($("diarizeDefault") as HTMLInputElement).checked = (cfg.preferences || {}).fal?.diarize !== false;
-    ($("chunkSelect") as HTMLSelectElement).value = (cfg.preferences || {}).fal?.chunk_level || "segment";
+    ($("diarizeDefault") as HTMLInputElement).checked = (cfg.preferences || {}).fal?.diarize === true;
+    ($("chunkSelect") as HTMLSelectElement).value = (cfg.preferences || {}).fal?.chunk_level || "none";
+    const ui = (cfg.preferences || {}).ui || {};
+    const languageSel = $("language") as HTMLSelectElement;
+    const providerSel = $("providerSelect") as HTMLSelectElement;
+    const quickProviderSel = $("quickProviderSelect") as HTMLSelectElement;
+    const modelSel = $("model") as HTMLSelectElement;
+    const modeSel = $("mode") as HTMLSelectElement;
+    if (ui.mode && Array.from(modeSel.options).some((o) => o.value === ui.mode)) {
+      modeSel.value = ui.mode;
+      syncMode();
+    }
+    if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
+      languageSel.value = ui.language;
+    }
+    const providerCandidate = String(ui.provider || "").trim();
+    if (providerCandidate && Array.from(providerSel.options).some((o) => o.value === providerCandidate)) {
+      providerSel.value = providerCandidate;
+    }
+    quickProviderSel.value = providerSel.value;
+    if (ui.local_model && Array.from(modelSel.options).some((o) => o.value === ui.local_model)) {
+      modelSel.value = ui.local_model;
+    }
+    const auto = $("autoTranscribeToggle") as HTMLInputElement;
+    const livePreview = $("livePreviewToggle") as HTMLInputElement;
+    auto.checked = ui.auto_transcribe !== false;
+    livePreview.checked = ui.live_preview !== false;
+    const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
+    const upscalePresetSel = $("upscalePresetSelect") as HTMLSelectElement;
+    upscaleToggle.checked = ui.upscale_enabled === true;
+    if (ui.upscale_preset && Array.from(upscalePresetSel.options).some((o) => o.value === ui.upscale_preset)) {
+      upscalePresetSel.value = ui.upscale_preset;
+    }
+    preferredMicId = String(ui.mic_id || "").trim();
+    syncRemoteModelOptions(cfgOpenrouterModel);
+    const remoteSel = $("remoteModelSelect") as HTMLSelectElement;
+    if (providerSel.value === "openrouter" && cfgOpenrouterModel) {
+      remoteSel.value = cfgOpenrouterModel;
+    }
+    syncQuickSettingsVisibility(ui.quick_settings_open === true);
     $("cfgMsg").textContent = "Loaded";
   } catch {
     $("cfgMsg").textContent = "Error loading config";
+  } finally {
+    suppressUiPrefAutosave = false;
   }
 }
 
@@ -531,9 +804,11 @@ async function saveCfg(): Promise<void> {
       openrouter: { key: ($("orKey") as HTMLInputElement).value.trim() },
     },
     preferences: {
+      remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "fal").trim() || "fal"),
       recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
       fal: { diarize: ($("diarizeDefault") as HTMLInputElement).checked, chunk_level: ($("chunkSelect") as HTMLSelectElement).value },
       openrouter: { model: ($("orModel") as HTMLInputElement).value.trim() },
+      ui: collectUiPreferences(),
     },
   };
   await apiPost<{ ok: boolean }>("/api/config", cfg);
@@ -545,10 +820,21 @@ async function saveCfg(): Promise<void> {
 
 $("saveBtn").addEventListener("click", () => void saveCfg().catch((e: Error) => ($("cfgMsg").textContent = e.message)));
 $("reloadBtn").addEventListener("click", () => void loadCfg().catch((e: Error) => ($("cfgMsg").textContent = e.message)));
+($("mode") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("diarizeDefault") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("chunkSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("upscalePresetSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("orModel") as HTMLInputElement).addEventListener("change", () => {
+  syncRemoteModelOptions(($("orModel") as HTMLInputElement).value.trim());
+  queueUiPreferencesSave();
+});
 $("pickRecordingsDirBtn").addEventListener("click", () =>
   void apiPost<{ path: string }>("/api/recordings/pick-folder", {})
     .then((r) => {
       ($("recordingsDirInput") as HTMLInputElement).value = r.path || "";
+      queueUiPreferencesSave();
     })
     .catch((e: Error) => {
       $("cfgMsg").textContent = e.message;
@@ -561,7 +847,12 @@ let recordingsStatsOpen = true;
 
 function syncRecordingsStatsVisibility(): void {
   $("recordingsStatsPanel").hidden = !recordingsStatsOpen;
-  ($("recordingsStatsBtn") as HTMLButtonElement).textContent = recordingsStatsOpen ? "Hide Stats" : "Stats";
+  const btn = $("recordingsStatsBtn") as HTMLButtonElement;
+  if (recordingsStatsOpen) {
+    btn.classList.add("active");
+  } else {
+    btn.classList.remove("active");
+  }
 }
 
 function updateRecordingCopyState(): void {
@@ -743,14 +1034,12 @@ $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 syncRecordingsStatsVisibility();
 
 const autoToggle = $("autoTranscribeToggle") as HTMLInputElement;
-autoToggle.checked = localStorage.getItem("transcriptor.autoTranscribe") !== "0";
 autoToggle.addEventListener("change", () => {
-  localStorage.setItem("transcriptor.autoTranscribe", autoToggle.checked ? "1" : "0");
+  queueUiPreferencesSave();
 });
 const livePreviewToggle = $("livePreviewToggle") as HTMLInputElement;
-livePreviewToggle.checked = localStorage.getItem("transcriptor.livePreview") !== "0";
 livePreviewToggle.addEventListener("change", () => {
-  localStorage.setItem("transcriptor.livePreview", livePreviewToggle.checked ? "1" : "0");
+  queueUiPreferencesSave();
 });
 
 function shouldAutoTranscribe(): boolean {
@@ -760,6 +1049,53 @@ function shouldAutoTranscribe(): boolean {
 function shouldLivePreview(): boolean {
   return livePreviewToggle.checked && ($("mode") as HTMLSelectElement).value === "live";
 }
+
+($("providerSelect") as HTMLSelectElement).addEventListener("change", () => {
+  const main = $("providerSelect") as HTMLSelectElement;
+  const quick = $("quickProviderSelect") as HTMLSelectElement;
+  if (quick.value !== main.value) quick.value = main.value;
+  syncRemoteModelOptions();
+  queueUiPreferencesSave();
+});
+($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
+  const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
+  if (v) ($("orModel") as HTMLInputElement).value = v;
+  queueUiPreferencesSave();
+});
+($("quickProviderSelect") as HTMLSelectElement).addEventListener("change", () => {
+  const quick = $("quickProviderSelect") as HTMLSelectElement;
+  const main = $("providerSelect") as HTMLSelectElement;
+  if (main.value !== quick.value) {
+    main.value = quick.value;
+    main.dispatchEvent(new Event("change"));
+  }
+});
+
+function syncQuickSettingsVisibility(open: boolean): void {
+  const panel = $("quickSettingsPanel");
+  const btn = $("quickSettingsToggle") as HTMLButtonElement;
+  panel.hidden = !open;
+  btn.classList.toggle("active", open);
+  btn.setAttribute("aria-pressed", open ? "true" : "false");
+}
+
+function initQuickControls(): void {
+  const main = $("providerSelect") as HTMLSelectElement;
+  const quick = $("quickProviderSelect") as HTMLSelectElement;
+  quick.value = main.value;
+  syncRemoteModelOptions();
+  syncQuickSettingsVisibility(false);
+
+  ($("quickSettingsToggle") as HTMLButtonElement).addEventListener("click", () => {
+    const next = $("quickSettingsPanel").hidden;
+    syncQuickSettingsVisibility(next);
+    queueUiPreferencesSave();
+  });
+}
+
+($("language") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("model") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("micSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
 
 let ws: WebSocket | null = null;
 let ac: AudioContext | null = null;
@@ -772,10 +1108,13 @@ let startAt = 0;
 let chunks: Float32Array[] = [];
 let draftSaveTimer: number | null = null;
 let workletLastFrameAt = 0;
+let liveRecordingSeq = 0;
+let currentRecordingId = 0;
 
 function resetOutputs(): void {
   $("liveOutput").textContent = "";
   $("finalOutput").textContent = "";
+  $("upscaleOutput").textContent = "";
   $("timer").textContent = "00:00";
   $("progressRow").hidden = true;
   $("downloadRow").hidden = true;
@@ -805,9 +1144,12 @@ async function startLive(): Promise<void> {
   workletLastFrameAt = 0;
   setBusy(true);
   isRecording = true;
+  currentRecordingId = ++liveRecordingSeq;
   window.__transcriptorIsRecording = true;
   window.__transcriptorLastFinishedText = "";
   window.__transcriptorLastFinishedAt = 0;
+  window.__transcriptorCurrentRecordingId = currentRecordingId;
+  window.__transcriptorLastFinishedRecordingId = 0;
   setRecordButton(true);
   // Keep single mic button interactive while recording.
   ($("btnStart") as HTMLButtonElement).disabled = false;
@@ -832,7 +1174,7 @@ async function startLive(): Promise<void> {
       wsBase() +
       "/ws/transcribe?" +
       new URLSearchParams({
-        model: ($("model") as HTMLSelectElement).value,
+        model: resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value),
         language: ($("language") as HTMLSelectElement).value,
         token: apiToken(),
       })
@@ -962,11 +1304,15 @@ async function waitForWorkletDrain(maxWaitMs = 360, idleMs = 90): Promise<void> 
 }
 
 async function stopLive(enhance: boolean): Promise<void> {
+  const recordingId = currentRecordingId;
   const sourceLiveText = ($("liveOutput").textContent || "").trim();
   const title = "Recording " + new Date().toLocaleString();
   const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const languageValue = ($("language") as HTMLSelectElement).value;
-  const modelValue = ($("model") as HTMLSelectElement).value;
+  const modelValue =
+    providerValue === "local"
+      ? resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value)
+      : getRemoteModelValue(providerValue);
 
   // Let the last worklet buffers arrive before disconnecting graph.
   await waitForWorkletDrain();
@@ -1011,7 +1357,9 @@ async function stopLive(enhance: boolean): Promise<void> {
   } catch { }
   ws = null;
   isRecording = false;
+  currentRecordingId = 0;
   window.__transcriptorIsRecording = false;
+  window.__transcriptorCurrentRecordingId = 0;
   setRecordButton(false);
   waveFrameCount = 0;
   waveBars = [];
@@ -1057,9 +1405,10 @@ async function stopLive(enhance: boolean): Promise<void> {
 
   setStatus("Processing");
   $("progressRow").hidden = false;
+  // Allow next hotkey/session to start while this recording is transcribing.
+  setBusy(false);
   try {
-    pollAbortController?.abort();
-    pollAbortController = new AbortController();
+    const localAbortController = new AbortController();
     const total = chunks.reduce((a, c) => a + c.length, 0);
     const merged = new Float32Array(total);
     let off = 0;
@@ -1073,7 +1422,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       provider === "local"
         ? await localJob(file, {
           language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
-          model: ($("model") as HTMLSelectElement).value,
+          model: resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value),
           splitStereo: false,
           // Live hotkey flow never needs per-word timestamps; disabling speeds up local decoding.
           wordTimestamps: false,
@@ -1082,19 +1431,32 @@ async function stopLive(enhance: boolean): Promise<void> {
           provider,
           language: ($("language") as HTMLSelectElement).value,
           diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+          openrouterModel: getRemoteModelValue(provider),
         });
 
     const { job_id } = create;
-    const j = await pollJob(job_id, pollAbortController.signal, (job) => {
+    const j = await pollJob(job_id, localAbortController.signal, (job) => {
       $("progressFill").style.width = Math.round((job.progress || 0) * 100) + "%";
       $("progressText").textContent = Math.round((job.progress || 0) * 100) + "%";
     });
     applyJobResult(j);
+    const transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
+    const transcriptFinal = transcriptRaw ? await runUpscaleIfEnabled(transcriptRaw) : "";
+    if (transcriptFinal) {
+      $("finalOutput").textContent = transcriptFinal;
+    }
+    // Signal readiness for global hotkey flow immediately after final text is available.
+    const earlyFinishedText = (($("finalOutput").textContent || "").trim() || sourceLiveText || "").trim();
+    if (earlyFinishedText) {
+      window.__transcriptorLastFinishedText = earlyFinishedText;
+      window.__transcriptorLastFinishedAt = Date.now();
+      window.__transcriptorLastFinishedRecordingId = recordingId;
+    }
     try {
       await saveRecordingText({
         title,
         sourceText: sourceLiveText,
-        transcriptText: typeof j.result?.text === "string" ? j.result.text : "",
+        transcriptText: transcriptFinal || transcriptRaw,
         provider,
         model: modelValue,
         language: languageValue,
@@ -1115,15 +1477,14 @@ async function stopLive(enhance: boolean): Promise<void> {
       });
     } catch { }
   } finally {
-    pollAbortController = null;
     clearLiveDraft();
-    setBusy(false);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
   }
   // Signal desktop main process that transcription is complete with final text.
   const _finishedText = ($("finalOutput").textContent || $("liveOutput").textContent || "").trim();
   window.__transcriptorLastFinishedText = _finishedText;
   window.__transcriptorLastFinishedAt = Date.now();
+  window.__transcriptorLastFinishedRecordingId = recordingId;
 }
 
 function setSelectedFile(file: File | null): void {
@@ -1180,6 +1541,7 @@ async function transcribeSelectedFile(): Promise<void> {
         provider,
         language: ($("language") as HTMLSelectElement).value,
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+        openrouterModel: getRemoteModelValue(provider),
       });
     }
 
@@ -1188,6 +1550,11 @@ async function transcribeSelectedFile(): Promise<void> {
       $("progressText").textContent = Math.round((job.progress || 0) * 100) + "%";
     });
     applyJobResult(j);
+    const transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
+    const transcriptFinal = transcriptRaw ? await runUpscaleIfEnabled(transcriptRaw) : "";
+    if (transcriptFinal) {
+      $("finalOutput").textContent = transcriptFinal;
+    }
   } catch (e) {
     $("progressRow").hidden = true;
     $("finalOutput").textContent = (e as Error).message;
@@ -1253,9 +1620,13 @@ window.addEventListener("transcriptor-hotkey-stop", () => {
   }
 });
 
-void loadCfg();
-initLanguagePreference();
-void loadMics(false);
+void loadCfg().then(() => loadMics(false));
+initQuickControls();
+syncRemoteModelOptions();
+void refreshNetworkState();
+window.setInterval(() => void refreshNetworkState(), 10000);
+window.addEventListener("online", () => void refreshNetworkState());
+window.addEventListener("offline", () => void refreshNetworkState());
 void loadRecordings(false).catch(() => { });
 void recoverLiveDraftIfAny();
 draw();

@@ -10,6 +10,21 @@ _MODEL_LOCK = threading.Lock()
 _MODEL_CACHE: Dict[str, WhisperModel] = {}
 
 
+def _is_empty_sequence_transcribe_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return "empty sequence" in msg and "max()" in msg
+
+
+def _empty_transcribe_result(duration: float = 0.0) -> Dict[str, Any]:
+    return {
+        "language": None,
+        "language_probability": 0.0,
+        "duration": float(duration or 0.0),
+        "segments": [],
+        "text": "",
+    }
+
+
 def _model(model_name: str) -> WhisperModel:
     # CPU default tuned for typical laptops.
     with _MODEL_LOCK:
@@ -39,14 +54,20 @@ def transcribe_audio(
         audio_16k_mono = audio_16k_mono[:, 0]
 
     model = _model(model_name)
-    segments, info = model.transcribe(
-        audio_16k_mono,
-        language=language or None,
-        vad_filter=vad_filter,
-        word_timestamps=word_timestamps,
-        beam_size=beam_size,
-        best_of=best_of,
-    )
+    try:
+        segments, info = model.transcribe(
+            audio_16k_mono,
+            language=language or None,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps,
+            beam_size=beam_size,
+            best_of=best_of,
+        )
+    except Exception as e:
+        if _is_empty_sequence_transcribe_error(e):
+            duration = float(audio_16k_mono.shape[0]) / 16000.0 if audio_16k_mono is not None else 0.0
+            return _empty_transcribe_result(duration)
+        raise
 
     out_segments: List[Dict[str, Any]] = []
     text_parts: List[str] = []
@@ -93,12 +114,19 @@ def transcribe_file(
         raise FileNotFoundError(path_wav_16k_mono)
 
     model = _model(model_name)
-    segments, info = model.transcribe(
-        path_wav_16k_mono,
-        language=language or None,
-        vad_filter=vad_filter,
-        word_timestamps=word_timestamps,
-    )
+    if os.path.getsize(path_wav_16k_mono) <= 64:
+        return _empty_transcribe_result(0.0)
+    try:
+        segments, info = model.transcribe(
+            path_wav_16k_mono,
+            language=language or None,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps,
+        )
+    except Exception as e:
+        if _is_empty_sequence_transcribe_error(e):
+            return _empty_transcribe_result(0.0)
+        raise
 
     out_segments: List[Dict[str, Any]] = []
     text_parts: List[str] = []
