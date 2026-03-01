@@ -465,7 +465,7 @@ async function loadMics(forceReload = false): Promise<void> {
   } catch (e) {
     console.error("Error loading microphones:", e);
     const sel = $("micSelect") as HTMLSelectElement;
-    if (!sel.options.length) {
+    if (forceReload || !sel.options.length || /loading/i.test(sel.value || "")) {
       sel.innerHTML = '<option value="">Permission denied</option>';
     }
   }
@@ -1182,12 +1182,18 @@ let ac: AudioContext | null = null;
 let stream: MediaStream | null = null;
 let analyser: AnalyserNode | null = null;
 let workletNode: AudioWorkletNode | null = null;
+let scriptNode: ScriptProcessorNode | null = null;
+let scriptSinkGain: GainNode | null = null;
 let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
 let startAt = 0;
 let chunks: Float32Array[] = [];
 let draftSaveTimer: number | null = null;
 let workletLastFrameAt = 0;
+let fallbackCaptureTimer: number | null = null;
+let captureFrameCount = 0;
+let captureRmsAccum = 0;
+let capturePeakMax = 0;
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 
@@ -1231,6 +1237,37 @@ function applyJobResult(j: JobResponse): void {
   setStatus("Error");
 }
 
+function pushCapturedFrame(input: Float32Array): void {
+  if (!(input instanceof Float32Array) || !input.length) return;
+  workletLastFrameAt = Date.now();
+  let sum = 0;
+  let peak = 0;
+  for (let i = 0; i < input.length; i++) {
+    const s = input[i];
+    sum += s * s;
+    const a = Math.abs(s);
+    if (a > peak) peak = a;
+  }
+  const rms = Math.sqrt(sum / input.length);
+  captureFrameCount += 1;
+  captureRmsAccum += rms;
+  if (peak > capturePeakMax) capturePeakMax = peak;
+  window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * 4));
+  if (!ac) return;
+  const ds = downsample(input, ac.sampleRate, 16000);
+  chunks.push(new Float32Array(ds));
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const pcm = new ArrayBuffer(ds.length * 2);
+  const dv = new DataView(pcm);
+  for (let i = 0; i < ds.length; i++) {
+    const x = Math.max(-1, Math.min(1, ds[i]));
+    dv.setInt16(i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+  }
+  try {
+    ws.send(pcm);
+  } catch { }
+}
+
 function micErrorTag(e: unknown): string {
   const err = e as { name?: unknown; message?: unknown };
   const name = String(err?.name || "").trim();
@@ -1238,42 +1275,14 @@ function micErrorTag(e: unknown): string {
   return [name, msg].filter(Boolean).join(": ");
 }
 
-function hasLiveAudioTrack(s: MediaStream | null): boolean {
-  if (!s) return false;
-  const tracks = s.getAudioTracks();
-  return tracks.some((t) => t.readyState === "live");
-}
-
-async function acquireMicStream(deviceId: string): Promise<{ stream: MediaStream; usedFallback: boolean }> {
-  const id = String(deviceId || "").trim();
-  const attempts: MediaStreamConstraints[] = id
-    ? [
-        { audio: { deviceId: { exact: id } } },
-        { audio: { deviceId: { ideal: id } } },
-        { audio: true },
-      ]
-    : [{ audio: true }];
-  let lastErr: unknown = null;
-  for (let i = 0; i < attempts.length; i++) {
-    try {
-      const s = await navigator.mediaDevices.getUserMedia(attempts[i]);
-      if (hasLiveAudioTrack(s)) {
-        return { stream: s, usedFallback: i > 0 };
-      }
-      s.getTracks().forEach((t) => t.stop());
-      lastErr = new Error("No live audio track in stream");
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error("Unable to open microphone");
-}
-
 async function startLive(): Promise<void> {
   if (isBusy) return;
   resetOutputs();
   chunks = [];
   workletLastFrameAt = 0;
+  captureFrameCount = 0;
+  captureRmsAccum = 0;
+  capturePeakMax = 0;
   setBusy(true);
   isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
@@ -1349,16 +1358,23 @@ async function startLive(): Promise<void> {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }
-    await loadMics(false);
+    await loadMics(true);
     const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
-    const picked = await acquireMicStream(devId);
-    stream = picked.stream;
-    if (picked.usedFallback && devId) {
-      try {
-        const sel = $("micSelect") as HTMLSelectElement;
-        sel.value = "";
-        queueUiPreferencesSave();
-      } catch { }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(devId ? { audio: { deviceId: { exact: devId } } } : { audio: true });
+    } catch (e) {
+      const msg = String((e as Error)?.message || e || "").toLowerCase();
+      const recoverable =
+        msg.includes("overconstrained") ||
+        msg.includes("notfound") ||
+        msg.includes("device") ||
+        msg.includes("constraint");
+      if (!recoverable) throw e;
+      // Selected mic could disappear after reconnect/sleep. Use system default fallback.
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
+      throw new Error("Microphone stream is not live");
     }
     ac = new AudioContext();
     if (ac.state !== "running") {
@@ -1405,33 +1421,39 @@ async function startLive(): Promise<void> {
 
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
       const input = ev.data;
-      if (!(input instanceof Float32Array)) return;
-      workletLastFrameAt = Date.now();
-      let sum = 0;
-      for (let i = 0; i < input.length; i++) {
-        const s = input[i];
-        sum += s * s;
-      }
-      const rms = input.length ? Math.sqrt(sum / input.length) : 0;
-      window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * 4));
-      if (!ac) return;
-      const ds = downsample(input, ac.sampleRate, 16000);
-      chunks.push(new Float32Array(ds));
-      // Keep local final-audio buffer independent from websocket health.
-      // This protects long recordings from losing tail chunks on WS hiccups.
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const pcm = new ArrayBuffer(ds.length * 2);
-      const dv = new DataView(pcm);
-      for (let i = 0; i < ds.length; i++) {
-        const x = Math.max(-1, Math.min(1, ds[i]));
-        dv.setInt16(i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
-      }
-      try {
-        ws.send(pcm);
-      } catch { }
+      pushCapturedFrame(input);
     };
 
     src.connect(workletNode);
+
+    // Enterprise fallback: if AudioWorklet path is silent/stalled on this host,
+    // switch to ScriptProcessor capture so recording still works.
+    if (fallbackCaptureTimer) {
+      clearTimeout(fallbackCaptureTimer);
+      fallbackCaptureTimer = null;
+    }
+    fallbackCaptureTimer = window.setTimeout(() => {
+      if (!ac || !src || !isRecording) return;
+      const noFrames = captureFrameCount < 3;
+      if (!noFrames) return;
+      try {
+        scriptNode = ac.createScriptProcessor(4096, 1, 1);
+        scriptSinkGain = ac.createGain();
+        scriptSinkGain.gain.value = 0;
+        scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
+          const ch = ev.inputBuffer.getChannelData(0);
+          if (!ch || !ch.length) return;
+          pushCapturedFrame(new Float32Array(ch));
+        };
+        src.connect(scriptNode);
+        scriptNode.connect(scriptSinkGain);
+        scriptSinkGain.connect(ac.destination);
+        const cur = $("liveOutput").textContent || "";
+        if (!cur.includes("[Mic fallback engaged]")) {
+          $("liveOutput").textContent = (cur ? `${cur}\n` : "") + "[Mic fallback engaged]";
+        }
+      } catch { }
+    }, 1300);
   } catch (e) {
     $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
     await stopLive(false);
@@ -1458,6 +1480,11 @@ async function stopLive(enhance: boolean): Promise<void> {
     providerValue === "local"
       ? resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value)
       : getRemoteModelValue(providerValue);
+  const avgCaptureRms = captureFrameCount > 0 ? captureRmsAccum / captureFrameCount : 0;
+  const noLiveText = !sourceLiveText;
+  const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
+  const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.006 && capturePeakMax < 0.08;
+  const silentCapture = captureFrameCount < 6 || hardSilence || likelySilenceWithoutPreview;
 
   // Let the last worklet buffers arrive before disconnecting graph.
   await waitForWorkletDrain();
@@ -1474,11 +1501,24 @@ async function stopLive(enhance: boolean): Promise<void> {
     cancelAnimationFrame(waveAnimId);
     waveAnimId = 0;
   }
+  if (fallbackCaptureTimer) {
+    clearTimeout(fallbackCaptureTimer);
+    fallbackCaptureTimer = null;
+  }
   try {
     if (workletNode) {
       workletNode.disconnect();
       workletNode.port.onmessage = null;
     }
+  } catch { }
+  try {
+    if (scriptNode) {
+      scriptNode.disconnect();
+      scriptNode.onaudioprocess = null;
+    }
+  } catch { }
+  try {
+    if (scriptSinkGain) scriptSinkGain.disconnect();
   } catch { }
   try {
     if (analyser) analyser.disconnect();
@@ -1495,6 +1535,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   } catch { }
   ac = null;
   workletNode = null;
+  scriptNode = null;
+  scriptSinkGain = null;
   src = null;
   analyser = null;
   try {
@@ -1510,6 +1552,26 @@ async function stopLive(enhance: boolean): Promise<void> {
   waveBars = [];
   draw();
   resetVU();
+
+  if (silentCapture) {
+    $("finalOutput").textContent = "[ Silence ]";
+    setStatus("Done");
+    try {
+      await saveRecordingText({
+        title,
+        sourceText: sourceLiveText,
+        transcriptText: "[ Silence ]",
+        provider: providerValue,
+        model: modelValue,
+        language: languageValue,
+      });
+    } catch { }
+    clearLiveDraft();
+    setBusy(false);
+    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    publishFinishedRecording(recordingId, "[ Silence ]");
+    return;
+  }
 
   if (!enhance || chunks.length === 0) {
     try {

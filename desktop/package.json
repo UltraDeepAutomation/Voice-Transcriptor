@@ -44,6 +44,8 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "hardenedRuntime": false,
+      "identity": null,
       "target": [
         { "target": "dir", "arch": ["arm64", "x64"] }
       ]

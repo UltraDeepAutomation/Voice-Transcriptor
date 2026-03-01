@@ -36,6 +36,7 @@ let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
+let micPermissionChecked = false;
 
 const HOST = "127.0.0.1";
 let PORT = 8321;
@@ -1298,6 +1299,7 @@ async function toggleRecordingFromShortcut() {
   const trace = createTrace("toggle_hotkey", {});
   shortcutToggleInFlight = true;
   try {
+    await requestMacMicrophonePermissionOnce();
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
     const front = await getFrontmostAppInfo();
@@ -1652,6 +1654,42 @@ async function requestMacPastePermissionsOnce() {
     openPrivacyAccessibilitySettings();
     setTimeout(() => openPrivacyAutomationSettings(), 350);
   }
+}
+
+async function requestMacMicrophonePermissionOnce() {
+  if (process.platform !== "darwin") return true;
+  if (micPermissionChecked) {
+    try {
+      return systemPreferences.getMediaAccessStatus("microphone") === "granted";
+    } catch {
+      return true;
+    }
+  }
+  micPermissionChecked = true;
+  let status = "unknown";
+  try {
+    status = String(systemPreferences.getMediaAccessStatus("microphone") || "unknown");
+  } catch { }
+  if (status === "granted") return true;
+  try {
+    const granted = await systemPreferences.askForMediaAccess("microphone");
+    if (granted) return true;
+  } catch { }
+  const res = await dialog.showMessageBox({
+    type: "warning",
+    buttons: ["Open Microphone Settings", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    title: "Microphone Access Required",
+    message: "Transcriptor needs microphone permission to record audio.",
+    detail: "Enable Transcriptor in System Settings -> Privacy & Security -> Microphone.",
+  });
+  if (res.response === 0) {
+    runCommand("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"], {
+      timeoutMs: 5000
+    }).catch(() => { });
+  }
+  return false;
 }
 
 async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
@@ -2884,10 +2922,20 @@ async function createWindow(options = {}) {
     }
   });
 
+  const mediaPermissions = new Set(["media", "microphone", "audioCapture", "videoCapture"]);
   win.webContents.session.setPermissionRequestHandler((wc, permission, cb) => {
-    const url = wc.getURL() || "";
-    const trusted = url.startsWith(BASE_URL) || url.startsWith("about:blank");
-    cb(trusted && permission === "media");
+    const perm = String(permission || "");
+    const url = wc?.getURL?.() || "";
+    const allow = mediaPermissions.has(perm);
+    appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${url}`);
+    cb(allow);
+  });
+  win.webContents.session.setPermissionCheckHandler((wc, permission) => {
+    const perm = String(permission || "");
+    const url = wc?.getURL?.() || "";
+    const allow = mediaPermissions.has(perm);
+    appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${url}`);
+    return allow;
   });
   win.webContents.on("render-process-gone", (_event, details) => {
     appendMainLog(`[render-process-gone] reason=${details?.reason || "unknown"} exitCode=${details?.exitCode ?? ""}`);
@@ -3075,6 +3123,7 @@ app.whenReady().then(async () => {
   await requestMacPastePermissionsOnce();
   await startBackend();
   await ensureWindowVisible();
+  await requestMacMicrophonePermissionOnce();
 
   // Preload overlay once to avoid first-use delay after hotkey.
   try {

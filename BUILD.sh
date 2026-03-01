@@ -57,8 +57,6 @@ fi
 echo "Installing to $INSTALL_ROOT..."
 cp -R "$APP_PATH" "$INSTALL_ROOT/"
 
-chmod -R 755 "$TARGET_APP"
-
 echo "=== Done! ==="
 echo "Installed app: $TARGET_APP"
 echo "You can now open Transcriptor from Dock/Applications"
