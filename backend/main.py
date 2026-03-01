@@ -613,6 +613,10 @@ async def ws_transcribe(websocket: WebSocket):
             stop.set()
         except Exception as e:
             nonlocal had_error
+            if _is_broken_pipe_error(e):
+                print(f"[ws receiver] transient broken pipe: {e}")
+                stop.set()
+                return
             had_error = True
             print(f"[ws receiver] error: {e}")
             stop.set()
@@ -626,6 +630,10 @@ async def ws_transcribe(websocket: WebSocket):
                 await asyncio.sleep(0.2)
         except Exception as e:
             nonlocal had_error
+            if _is_broken_pipe_error(e):
+                print(f"[ws transcriber] transient broken pipe: {e}")
+                stop.set()
+                return
             had_error = True
             print(f"[ws transcriber] error: {e}")
             stop.set()
@@ -643,14 +651,19 @@ async def ws_transcribe(websocket: WebSocket):
     except WebSocketDisconnect:
         stop.set()
     except Exception as e:
-        had_error = True
-        stop.set()
-        try:
-            await websocket.send_text(
-                json.dumps({"type": "error", "error": str(e)}, ensure_ascii=False)
-            )
-        except Exception:
-            pass
+        if _is_broken_pipe_error(e):
+            print(f"[ws] transient broken pipe: {e}")
+            had_error = False
+            stop.set()
+        else:
+            had_error = True
+            stop.set()
+            try:
+                await websocket.send_text(
+                    json.dumps({"type": "error", "error": str(e)}, ensure_ascii=False)
+                )
+            except Exception:
+                pass
     finally:
         stop.set()
         for t in (rx, tx):
@@ -958,20 +971,46 @@ def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require_api_a
     if not key:
         raise HTTPException(status_code=400, detail="OpenRouter key is not configured")
     instruction = str(preset.get("instruction") or "").strip()
+    candidates: list[str] = []
+    for m in [
+        model,
+        str((prefs.get("openrouter") or {}).get("model") or "").strip(),
+        "google/gemini-2.5-flash",
+        "openai/gpt-4o-mini",
+    ]:
+        mm = str(m or "").strip()
+        if mm and mm not in candidates:
+            candidates.append(mm)
+    used_model = candidates[0] if candidates else model
+    out: Optional[dict[str, Any]] = None
+    last_err: Optional[Exception] = None
     try:
-        out = openrouter_upscale_text(
-            api_key=key,
-            model=model,
-            text=text,
-            instruction=instruction,
-        )
+        for cand in candidates:
+            used_model = cand
+            try:
+                out = openrouter_upscale_text(
+                    api_key=key,
+                    model=cand,
+                    text=text,
+                    instruction=instruction,
+                )
+                break
+            except OrRemoteError as e:
+                last_err = e
+                msg = str(e)
+                # Retry with fallback models only for invalid/non-existing model issues.
+                if ("HTTP 404" in msg) or ("not found" in msg.lower()):
+                    continue
+                raise
+        if out is None:
+            raise last_err or RuntimeError("upscale failed")
     except OrRemoteError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return {
         "ok": True,
         "preset_id": preset.get("id"),
         "preset_name": preset.get("name"),
-        "model": model,
+        "model": used_model,
         "text": (out.get("text") or "").strip(),
     }
 

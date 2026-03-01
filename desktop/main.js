@@ -1,6 +1,7 @@
 const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard } = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
+const net = require("net");
 const path = require("path");
 const fs = require("fs");
 
@@ -28,13 +29,17 @@ let traceCounter = 0;
 let overlayQuickSettingsOpen = false;
 let overlayQuickProvider = "local";
 let overlayQuickModel = "small";
+let overlayQuickUpscalePreset = "builtin_clean";
+let overlayQuickUpscaleEnabled = false;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
+let backendRestartTimer = null;
+let backendRestartAttempts = 0;
 
 const HOST = "127.0.0.1";
-const PORT = 8321;
-const BASE_URL = `http://${HOST}:${PORT}`;
+let PORT = 8321;
+let BASE_URL = `http://${HOST}:${PORT}`;
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 
@@ -239,6 +244,82 @@ async function getRendererQuickSettingsOpen() {
   }
 }
 
+async function getRendererUpscalePresetContext() {
+  if (!win || win.isDestroyed() || !win.webContents) {
+    return { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
+  }
+  try {
+    const out = await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const sel = document.getElementById('upscalePresetSelect');
+        const en = document.getElementById('upscaleToggle');
+        const selected = String(sel?.value || 'builtin_clean').trim();
+        const enabled = !!(en && en.checked);
+        const presets = Array.from(sel?.options || []).map((o) => ({
+          id: String(o.value || '').trim(),
+          name: String(o.textContent || o.value || '').trim(),
+        })).filter((x) => x.id);
+        return { selected, enabled, presets };
+      })();
+      `,
+      true
+    );
+    const presets = Array.isArray(out?.presets) ? out.presets : [];
+    const selected = String(out?.selected || "builtin_clean").trim() || "builtin_clean";
+    const enabled = !!out?.enabled;
+    return { selected, enabled, presets: presets.length ? presets : [{ id: "builtin_clean", name: "Clean" }] };
+  } catch {
+    return { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
+  }
+}
+
+async function setRendererUpscalePresetChoice(presetId) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const target = String(presetId || "").trim();
+  if (!target) return;
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const target = ${JSON.stringify(target)};
+        const sel = document.getElementById('upscalePresetSelect');
+        if (!sel) return false;
+        if (!Array.from(sel.options || []).some((o) => String(o.value || '') === target)) return false;
+        if (sel.value !== target) {
+          sel.value = target;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
+async function setRendererUpscaleEnabledChoice(enabled) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const target = !!enabled;
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const target = ${target ? "true" : "false"};
+        const el = document.getElementById('upscaleToggle');
+        if (!el) return false;
+        if (!!el.checked !== target) {
+          el.checked = target;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
 async function setRendererProviderChoice(provider) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const normalized = normalizeProviderChoice(provider);
@@ -342,12 +423,11 @@ function createOverlayHtml() {
       </div>
       <div id="pill">
         <div id="quickPanel">
-          <select id="quickProvider">
-            <option value="local">Local</option>
-            <option value="fal">fal.ai</option>
-            <option value="openrouter">OpenRouter</option>
-          </select>
-          <select id="quickModel" title="Model"></select>
+          <label id="quickUpscaleToggleWrap" title="Enable upscale">
+            <span id="quickUpscaleToggleLabel">Upscale</span>
+            <input id="quickUpscaleToggle" type="checkbox" />
+          </label>
+          <select id="quickUpscale" title="Upscale preset"></select>
         </div>
         <div id="core">
           <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
@@ -432,7 +512,7 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           gap:4px;
-          max-width:196px;
+          max-width:230px;
           min-width:0;
           opacity:1;
           overflow:hidden;
@@ -447,35 +527,67 @@ function createOverlayHtml() {
           transform:translateX(8px);
           pointer-events:none;
         }
-        #quickProvider{
-          appearance:none;
-          border:1px solid rgba(255,255,255,.2);
-          border-radius:999px;
-          background:rgba(34,34,34,.95);
-          color:rgba(236,236,236,.96);
+        #quickUpscaleToggleWrap{
+          display:inline-flex;
+          align-items:center;
+          gap:6px;
+          padding:0 8px;
           height:22px;
-          padding:0 24px 0 10px;
+          border-radius:999px;
+          border:1px solid rgba(196,148,230,.28);
+          background:rgba(56,46,72,.38);
+          color:rgba(226,226,226,.92);
           font-size:10px;
-          font-weight:600;
-          max-width:88px;
-          min-width:88px;
-          background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-          background-repeat:no-repeat;
-          background-position:right 8px center;
-          outline:none;
+          font-weight:650;
+          white-space:nowrap;
         }
-        #quickModel{
+        #quickUpscaleToggleLabel{
+          font-size:10px;
+          line-height:1;
+          letter-spacing:.01em;
+        }
+        #quickUpscaleToggle{
           appearance:none;
-          border:1px solid rgba(255,255,255,.2);
+          width:28px;
+          height:16px;
           border-radius:999px;
-          background:rgba(34,34,34,.95);
+          border:1px solid rgba(255,255,255,.2);
+          background:rgba(44,44,44,.92);
+          position:relative;
+          outline:none;
+          cursor:pointer;
+        }
+        #quickUpscaleToggle::before{
+          content:"";
+          position:absolute;
+          left:2px;
+          top:2px;
+          width:10px;
+          height:10px;
+          border-radius:999px;
+          background:rgba(212,212,212,.95);
+          transition:transform .14s ease;
+        }
+        #quickUpscaleToggle:checked{
+          background:rgba(142,84,226,.62);
+          border-color:rgba(176,128,236,.74);
+        }
+        #quickUpscaleToggle:checked::before{
+          transform:translateX(12px);
+          background:#fff;
+        }
+        #quickUpscale{
+          appearance:none;
+          border:1px solid rgba(196,148,230,.34);
+          border-radius:999px;
+          background:rgba(72,52,92,.5);
           color:rgba(236,236,236,.96);
           height:22px;
           padding:0 24px 0 10px;
           font-size:10px;
           font-weight:600;
-          max-width:96px;
-          min-width:96px;
+          max-width:110px;
+          min-width:110px;
           background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
           background-repeat:no-repeat;
           background-position:right 8px center;
@@ -574,6 +686,17 @@ function createOverlayHtml() {
         #stateIcon.ok{
           animation:none;
         }
+        #stateIcon.upscaling::before{
+          background:rgba(173,112,255,.98);
+          box-shadow:0 0 8px rgba(173,112,255,.5);
+        }
+        #stateIcon.upscaling::after{
+          opacity:1;
+          border:1px solid rgba(173,112,255,.72);
+          border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
+          box-shadow:0 0 10px rgba(173,112,255,.34), inset 0 0 6px rgba(173,112,255,.26);
+          animation:transBlob 1.05s ease-in-out infinite;
+        }
         #stateIcon.ok::before{
           background:rgba(112,210,136,.96);
           box-shadow:0 0 8px rgba(112,210,136,.4);
@@ -652,8 +775,8 @@ function createOverlayHtml() {
         const stateIcon = document.getElementById('stateIcon');
         const gearBtn = document.getElementById('gearBtn');
         const quickPanel = document.getElementById('quickPanel');
-        const quickProvider = document.getElementById('quickProvider');
-        const quickModel = document.getElementById('quickModel');
+        const quickUpscaleToggle = document.getElementById('quickUpscaleToggle');
+        const quickUpscale = document.getElementById('quickUpscale');
         let timerId = null;
         let queueTimerId = null;
         let audioCtx = null;
@@ -726,12 +849,14 @@ function createOverlayHtml() {
         window.setStatus = (s) => {
           const raw = String(s || '').trim().toLowerCase();
           activeWave = raw === 'starting' || raw === 'recording';
-          waveMode = raw === 'transcribing' ? 'transcribing' : (activeWave ? 'recording' : 'idle');
+          waveMode = raw === 'transcribing' ? 'transcribing' : (raw === 'upscaling' ? 'upscaling' : (activeWave ? 'recording' : 'idle'));
           stateIcon.className = '';
           if (raw === 'starting' || raw === 'recording') {
             stateIcon.classList.add('rec');
           } else if (raw === 'transcribing') {
             stateIcon.classList.add('transcribing');
+          } else if (raw === 'upscaling') {
+            stateIcon.classList.add('upscaling');
           } else if (raw === 'paste sent') {
             stateIcon.classList.add('ok');
           } else if (raw === 'paste failed' || raw === 'grant access' || raw === 'secure field' || raw === 'no text focus' || raw === 'clipboard error') {
@@ -740,63 +865,59 @@ function createOverlayHtml() {
             stateIcon.classList.add('fail');
           }
         };
-        const normalizeProvider = (v) => {
-          const raw = String(v || '').trim();
-          if (raw === 'local' || raw === 'fal' || raw === 'openrouter') return raw;
-          return 'local';
-        };
-        const shortModel = (v) => {
-          const s = String(v || '').trim();
-          return s.length > 10 ? (s.slice(0, 10) + '…') : s;
-        };
         window.setQuickOpen = (open) => {
           const on = !!open;
           pill.classList.toggle('qs-open', on);
           pill.classList.toggle('qs-closed', !on);
           gearBtn.classList.toggle('on', on);
         };
-        window.setProvider = (provider) => {
-          const v = normalizeProvider(provider);
-          if (quickProvider.value !== v) quickProvider.value = v;
+        window.setUpscaleEnabled = (enabled) => {
+          const on = !!enabled;
+          if (quickUpscaleToggle.checked !== on) quickUpscaleToggle.checked = on;
         };
-        window.setModelOptions = (provider, models, selected) => {
-          const p = normalizeProvider(provider);
-          const list = Array.isArray(models) ? models.map((m) => String(m || '').trim()).filter(Boolean) : [];
-          const current = String(selected || '').trim();
-          quickModel.innerHTML = '';
-          const vals = list.length ? list : (p === 'local' ? ['tiny','base','small','medium','large-v3'] : []);
-          vals.forEach((m) => {
+        window.setUpscaleOptions = (items, selected) => {
+          const list = Array.isArray(items) ? items : [];
+          quickUpscale.innerHTML = '';
+          list.forEach((it) => {
+            const id = String((it && it.id) || '').trim();
+            if (!id) return;
+            const name = String((it && it.name) || id).trim();
             const opt = document.createElement('option');
-            opt.value = m;
-            opt.textContent = shortModel(m);
-            opt.title = m;
-            quickModel.appendChild(opt);
+            opt.value = id;
+            opt.textContent = name.length > 10 ? (name.slice(0, 10) + '…') : name;
+            opt.title = name;
+            quickUpscale.appendChild(opt);
           });
-          quickModel.disabled = vals.length === 0;
-          if (!vals.length) return;
-          const next = vals.includes(current) ? current : vals[0];
-          quickModel.value = next;
+          if (!quickUpscale.options.length) {
+            const opt = document.createElement('option');
+            opt.value = 'builtin_clean';
+            opt.textContent = 'Clean';
+            quickUpscale.appendChild(opt);
+          }
+          const next = String(selected || '').trim();
+          if (next && Array.from(quickUpscale.options).some((o) => o.value === next)) {
+            quickUpscale.value = next;
+          }
         };
-        window.setModel = (model) => {
-          const raw = String(model || '').trim();
-          if (!raw) return;
-          if (!Array.from(quickModel.options).some((o) => o.value === raw)) return;
-          if (quickModel.value !== raw) quickModel.value = raw;
+        window.setUpscale = (presetId) => {
+          const v = String(presetId || '').trim();
+          if (!v) return;
+          if (!Array.from(quickUpscale.options).some((o) => o.value === v)) return;
+          if (quickUpscale.value !== v) quickUpscale.value = v;
         };
         gearBtn.addEventListener('click', () => {
           const next = !pill.classList.contains('qs-open');
           window.setQuickOpen(next);
           document.title = '__overlay_settings__' + (next ? '1' : '0');
         });
-        quickProvider.addEventListener('change', () => {
-          const v = normalizeProvider(quickProvider.value);
-          quickProvider.value = v;
-          document.title = '__overlay_provider__' + encodeURIComponent(v);
+        quickUpscaleToggle.addEventListener('change', () => {
+          document.title = '__overlay_upscale_enabled__' + (quickUpscaleToggle.checked ? '1' : '0');
         });
-        quickModel.addEventListener('change', () => {
-          const v = String(quickModel.value || '').trim();
-          quickModel.value = v;
-          document.title = '__overlay_model__' + encodeURIComponent(v);
+        quickUpscale.addEventListener('change', () => {
+          const v = String(quickUpscale.value || '').trim();
+          if (!v) return;
+          quickUpscale.value = v;
+          document.title = '__overlay_upscale__' + encodeURIComponent(v);
         });
         window.setTimer = (t) => {
           const str = String(t || '').trim();
@@ -857,6 +978,8 @@ function createOverlayHtml() {
               ctx.fillStyle = 'rgba(255,77,77,.88)';
             } else if (waveMode === 'transcribing') {
               ctx.fillStyle = 'rgba(114,174,255,.92)';
+            } else if (waveMode === 'upscaling') {
+              ctx.fillStyle = 'rgba(173,112,255,.92)';
             } else {
               ctx.fillStyle = 'rgba(170,170,170,.62)';
             }
@@ -885,7 +1008,7 @@ function createOverlayHtml() {
           if (activeWave && Date.now() - lastLevelAt < 220) return;
           const idle = activeWave
             ? (0.08 + Math.random() * 0.12)
-            : (waveMode === 'transcribing' ? 0.055 : (0.03 + Math.random() * 0.03));
+            : ((waveMode === 'transcribing' || waveMode === 'upscaling') ? 0.055 : (0.03 + Math.random() * 0.03));
           bars.push(idle);
           while (bars.length > maxBars) bars.shift();
           render();
@@ -900,9 +1023,9 @@ function createOverlayHtml() {
         tick();
         window.startTimer();
         window.setQuickOpen(false);
-        window.setProvider('local');
-        window.setModelOptions('local', ['tiny','base','small','medium','large-v3'], 'small');
-        window.setModel('small');
+        window.setUpscaleEnabled(false);
+        window.setUpscaleOptions([{ id: 'builtin_clean', name: 'Clean' }], 'builtin_clean');
+        window.setUpscale('builtin_clean');
         window.setQueueVisible(false);
       </script>
     </body>
@@ -956,27 +1079,16 @@ function ensureOverlayWindow() {
       overlayQuickSettingsOpen = raw.endsWith("1");
       return;
     }
-    if (raw.startsWith("__overlay_provider__")) {
-      const v = normalizeProviderChoice(decodeURIComponent(raw.replace("__overlay_provider__", "")));
-      overlayQuickProvider = v;
-      void (async () => {
-        await setRendererProviderChoice(v);
-        const ctx = await getRendererModelContext();
-        overlayQuickProvider = ctx.provider;
-        overlayQuickModel = ctx.model;
-        if (overlayWin && !overlayWin.isDestroyed()) {
-          await overlayWin.webContents.executeJavaScript(
-            `window.setProvider && window.setProvider(${JSON.stringify(ctx.provider)}); window.setModelOptions && window.setModelOptions(${JSON.stringify(ctx.provider)}, ${JSON.stringify(ctx.models)}, ${JSON.stringify(ctx.model)}); window.setModel && window.setModel(${JSON.stringify(ctx.model)});`,
-            true
-          ).catch(() => {});
-        }
-      })();
+    if (raw.startsWith("__overlay_upscale_enabled__")) {
+      const v = raw.endsWith("1");
+      overlayQuickUpscaleEnabled = !!v;
+      void setRendererUpscaleEnabledChoice(v);
       return;
     }
-    if (raw.startsWith("__overlay_model__")) {
-      const v = String(decodeURIComponent(raw.replace("__overlay_model__", "")) || "").trim();
-      overlayQuickModel = v;
-      void setRendererModelChoice(overlayQuickProvider, v);
+    if (raw.startsWith("__overlay_upscale__")) {
+      const v = String(decodeURIComponent(raw.replace("__overlay_upscale__", "")) || "").trim();
+      overlayQuickUpscalePreset = v;
+      void setRendererUpscalePresetChoice(v);
       return;
     }
     if (raw.startsWith("__overlay_layout__")) return;
@@ -1023,14 +1135,14 @@ async function showRecordingOverlay() {
     await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
     overlayLoaded = true;
   }
-  const modelCtx = await getRendererModelContext();
-  overlayQuickProvider = modelCtx.provider;
-  overlayQuickModel = modelCtx.model;
+  const upscaleCtx = await getRendererUpscalePresetContext();
+  overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
+  overlayQuickUpscalePreset = upscaleCtx.selected;
   overlayQuickSettingsOpen = await getRendererQuickSettingsOpen();
   const hasQueuedTranscriptions = pendingTranscriptionCount > 0;
   try {
     await ow.webContents.executeJavaScript(
-      `window.setProvider && window.setProvider(${JSON.stringify(overlayQuickProvider)}); window.setModelOptions && window.setModelOptions(${JSON.stringify(overlayQuickProvider)}, ${JSON.stringify(modelCtx.models)}, ${JSON.stringify(overlayQuickModel)}); window.setModel && window.setModel(${JSON.stringify(overlayQuickModel)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
+      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
       true
     );
   } catch { }
@@ -1075,11 +1187,11 @@ async function ensureOverlayVisible(options = {}) {
     overlayLoaded = true;
   }
   try {
-    const modelCtx = await getRendererModelContext();
-    overlayQuickProvider = modelCtx.provider;
-    overlayQuickModel = modelCtx.model;
+    const upscaleCtx = await getRendererUpscalePresetContext();
+    overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
+    overlayQuickUpscalePreset = upscaleCtx.selected;
     await ow.webContents.executeJavaScript(
-      `window.setProvider && window.setProvider(${JSON.stringify(overlayQuickProvider)}); window.setModelOptions && window.setModelOptions(${JSON.stringify(overlayQuickProvider)}, ${JSON.stringify(modelCtx.models)}, ${JSON.stringify(overlayQuickModel)}); window.setModel && window.setModel(${JSON.stringify(overlayQuickModel)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
+      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
       true
     );
   } catch {}
@@ -2228,6 +2340,7 @@ async function processPostStopTask(task) {
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
+  let overlayPhase = "";
 
   while (Date.now() < deadline) {
     pollCount += 1;
@@ -2244,13 +2357,23 @@ async function processPostStopTask(task) {
           const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
           const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
           const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
+          const finishedRecords = Array.isArray(window.__transcriptorFinishedRecords)
+            ? window.__transcriptorFinishedRecords
+              .map((x) => ({
+                recordingId: Number((x && x.recordingId) || 0),
+                finishedAt: Number((x && x.finishedAt) || 0),
+                text: String((x && x.text) || '').trim(),
+              }))
+              .filter((x) => x.recordingId > 0 && x.finishedAt > 0 && x.text.length > 0)
+              .slice(-30)
+            : [];
           const isRec = !!(window.__transcriptorIsRecording);
           const status = (document.getElementById('statusText')?.textContent || '').trim();
           const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
           const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
           const busy = !!document.getElementById('btnStart')?.disabled;
           const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-          return { finishedAt, finishedRecordingId, finishedText, isRec, status, finalText, liveText, busy, progressVisible };
+          return { finishedAt, finishedRecordingId, finishedText, finishedRecords, isRec, status, finalText, liveText, busy, progressVisible };
         })();
         `,
         true
@@ -2265,33 +2388,58 @@ async function processPostStopTask(task) {
       await sleep(300);
       continue;
     }
-    const readyByRecording = task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId;
-    const readyByTime = task.recordingId <= 0 && state.finishedAt > stopRequestedAt;
+    const statusLower = String(state.status || "").trim().toLowerCase();
+    if (!state.isRec) {
+      if (statusLower === "upscaling" && overlayPhase !== "upscaling") {
+        await setOverlayStatus("Upscaling");
+        overlayPhase = "upscaling";
+      } else if ((statusLower === "processing" || statusLower === "transcribing") && overlayPhase !== "transcribing") {
+        await setOverlayStatus("Transcribing");
+        overlayPhase = "transcribing";
+      }
+    }
+    const finishedRecords = Array.isArray(state.finishedRecords) ? state.finishedRecords : [];
+    const byRecording = task.recordingId > 0
+      ? finishedRecords.find((x) => Number(x?.recordingId || 0) === task.recordingId)
+      : null;
+    const byTime = task.recordingId <= 0
+      ? [...finishedRecords]
+        .filter((x) => Number(x?.finishedAt || 0) > stopRequestedAt)
+        .sort((a, b) => Number(b?.finishedAt || 0) - Number(a?.finishedAt || 0))[0]
+      : null;
+    const readyByRecording = !!byRecording || (task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId);
+    const readyByTime = !!byTime || (task.recordingId <= 0 && state.finishedAt > stopRequestedAt);
     if (readyByRecording || readyByTime) {
-      transcript = state.finishedText || state.finalText || state.liveText || "";
+      transcript = String(byRecording?.text || byTime?.text || state.finishedText || state.finalText || state.liveText || "").trim();
       traceStep(trace, "signal_ready", {
         pollCount,
-        finishedAt: state.finishedAt,
-        finishedRecordingId: Number(state.finishedRecordingId || 0),
+        finishedAt: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0),
+        finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || 0),
         expectedRecordingId: task.recordingId || 0,
-        delay: state.finishedAt - stopRequestedAt,
+        delay: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0) - stopRequestedAt,
         textLen: transcript.length,
       });
       break;
     }
-    if (state.finalText && state.finalText.length > 0) {
-      transcript = state.finalText;
-      if (!state.isRec) {
-        traceStep(trace, "final_text_early_ready", {
-          pollCount,
-          textLen: transcript.length,
-          status: state.status || "",
-          busy: !!state.busy,
-          progressVisible: !!state.progressVisible,
-        });
-        break;
-      }
-    } else if (!transcript && state.liveText && state.liveText.length > 0) {
+    const canUseUnscopedFinalText =
+      task.recordingId <= 0 &&
+      !state.isRec &&
+      !state.busy &&
+      !state.progressVisible &&
+      (statusLower === "done" || statusLower === "idle") &&
+      !!(state.finalText && String(state.finalText).trim());
+    if (canUseUnscopedFinalText) {
+      transcript = String(state.finalText || "").trim();
+      traceStep(trace, "final_text_fallback_ready", {
+        pollCount,
+        textLen: transcript.length,
+        status: state.status || "",
+        busy: !!state.busy,
+        progressVisible: !!state.progressVisible,
+      });
+      break;
+    }
+    if (!transcript && state.liveText && state.liveText.length > 0) {
       transcript = state.liveText;
     }
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
@@ -2512,6 +2660,45 @@ function runCommand(cmd, args, options = {}) {
   });
 }
 
+function canBindPort(host, port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    const done = (ok) => {
+      try {
+        srv.close();
+      } catch { }
+      resolve(ok);
+    };
+    srv.once("error", () => done(false));
+    srv.once("listening", () => done(true));
+    try {
+      srv.listen(port, host);
+    } catch {
+      done(false);
+    }
+  });
+}
+
+async function pickBackendPort(host, preferred = 8321) {
+  const start = Number(preferred || 8321);
+  for (let p = start; p < start + 24; p += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await canBindPort(host, p)) return p;
+  }
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, host, () => {
+      const addr = srv.address();
+      const port = addr && typeof addr === "object" ? Number(addr.port || 0) : 0;
+      try {
+        srv.close();
+      } catch { }
+      resolve(port || start);
+    });
+    srv.once("error", () => resolve(start));
+  });
+}
+
 async function resolvePython(repoRoot) {
   const candidates = getPythonCandidates(repoRoot);
   for (const py of candidates) {
@@ -2594,6 +2781,11 @@ async function startBackend() {
     return;
   }
 
+  const preferredPort = Number(process.env.TRANSCRIPTOR_PORT || 8321) || 8321;
+  PORT = await pickBackendPort(HOST, preferredPort);
+  BASE_URL = `http://${HOST}:${PORT}`;
+  appendMainLog(`[backend-start] python="${python}" host=${HOST} port=${PORT} repo="${repoRoot}"`);
+
   const args = [
     "-m", "uvicorn",
     "backend.main:app",
@@ -2608,13 +2800,39 @@ async function startBackend() {
     env: { ...process.env, PYTHONUNBUFFERED: "1" }
   });
 
-  backend.stdout.on("data", (d) => console.log("[backend stdout]", d.toString()));
-  backend.stderr.on("data", (d) => console.log("[backend stderr]", d.toString()));
+  backend.stdout.on("data", (d) => {
+    const msg = d.toString();
+    console.log("[backend stdout]", msg);
+    appendMainLog(`[backend-stdout] ${compactLogText(msg, 1400)}`);
+  });
+  backend.stderr.on("data", (d) => {
+    const msg = d.toString();
+    console.log("[backend stderr]", msg);
+    appendMainLog(`[backend-stderr] ${compactLogText(msg, 1400)}`);
+  });
 
   backend.on("exit", (code) => {
     console.log("[backend] exited with code", code);
     appendMainLog(`[backend-exit] code=${code}`);
     backend = null;
+    if (!isQuitting && Number(code || 0) !== 0) {
+      if (backendRestartTimer) {
+        clearTimeout(backendRestartTimer);
+        backendRestartTimer = null;
+      }
+      const attempt = Math.min(backendRestartAttempts + 1, 8);
+      backendRestartAttempts = attempt;
+      const delay = Math.min(800 * attempt, 5000);
+      appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
+      backendRestartTimer = setTimeout(() => {
+        backendRestartTimer = null;
+        startBackend()
+          .then(() => appendMainLog("[backend-restart] attempted"))
+          .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`));
+      }, delay);
+    } else if (Number(code || 0) === 0) {
+      backendRestartAttempts = 0;
+    }
   });
 
   backend.on("error", (err) => {
@@ -2649,7 +2867,7 @@ function waitForHttp(url, timeoutMs) {
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
   win = new BrowserWindow({
-    width: 1100,
+    width: 1240,
     height: 760,
     minWidth: 960,
     minHeight: 680,
@@ -2705,6 +2923,9 @@ async function createWindow(options = {}) {
 
   const url = `${BASE_URL}/`;
   try {
+    if (!backend) {
+      await startBackend();
+    }
     await waitForHttp(`${BASE_URL}/api/health`, 20000);
     await win.loadURL(url);
     if (showWindow) {
@@ -2771,6 +2992,10 @@ app.on("before-quit", () => {
     try {
       backend.kill();
     } catch { }
+  }
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
   }
 });
 

@@ -91,37 +91,47 @@
 
           <div class="split">
             <div class="pane" id="livePane">
-              <div class="pane-header">
-                <span class="pane-title">Live</span>
-                <div class="pane-actions">
-                  <label class="toggle-inline" title="Show live partial transcript while recording">
-                    <span>Live Preview</span>
-                    <input id="livePreviewToggle" type="checkbox" checked />
-                  </label>
+              <div class="pane-header pane-header-2row">
+                <div class="pane-head-row pane-head-row-top">
+                  <span class="pane-title">Live Preview</span>
+                  <div class="pane-actions">
+                    <label class="toggle-inline" title="Show live partial transcript while recording">
+                      <input id="livePreviewToggle" type="checkbox" checked />
+                    </label>
+                  </div>
                 </div>
+                <div class="pane-head-row pane-head-row-bottom"></div>
               </div>
               <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
             </div>
             <div class="split-gap" id="splitGap"></div>
             <div class="pane" id="resultPane">
-              <div class="pane-header">
-                <span class="pane-title">Result</span>
-                <div class="pane-actions">
-                  <label class="toggle-inline" title="Auto transcribe after stopping recording">
-                    <span>Auto Transcribe</span>
-                    <input id="autoTranscribeToggle" type="checkbox" checked />
-                  </label>
-                  <select id="providerSelect">
-                    <option value="local">Local (Whisper)</option>
-                    <option value="fal">fal.ai</option>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="">None</option>
-                  </select>
-                  <select id="remoteModelSelect" title="Remote model" hidden>
-                    <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
-                    <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
-                  </select>
-                  <label class="check-inline"><input type="checkbox" id="diarizeCheck" /> <span>Speakers</span></label>
+              <div class="pane-header pane-header-2row">
+                <div class="pane-head-row pane-head-row-top">
+                  <span class="pane-title">Transcribe</span>
+                  <div class="pane-actions">
+                    <label class="toggle-inline" title="Auto transcribe after stopping recording">
+                      <input id="autoTranscribeToggle" type="checkbox" checked />
+                    </label>
+                  </div>
+                </div>
+                <div class="pane-head-row pane-head-row-bottom">
+                  <div class="pane-actions">
+                    <select id="providerSelect">
+                      <option value="local">Local (Whisper)</option>
+                      <option value="fal">fal.ai</option>
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="">None</option>
+                    </select>
+                    <select id="remoteModelSelect" title="Remote model" hidden>
+                      <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
+                      <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
+                    </select>
+                    <label class="check-inline"><input type="checkbox" id="diarizeCheck" /> <span>Speakers</span></label>
+                    <button class="icon-btn" id="resultCopyBtn" type="button" aria-label="Copy result text" title="Copy result">
+                      <span class="copy-ico" aria-hidden="true"></span>
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -153,18 +163,26 @@
               </div>
             </div>
             <div class="pane" id="upscalePane">
-              <div class="pane-header">
-                <span class="pane-title">Upscale</span>
-                <div class="pane-actions">
-                  <label class="toggle-inline" title="Improve transcript before paste/save">
-                    <span>Enable</span>
-                    <input id="upscaleToggle" type="checkbox" />
-                  </label>
-                  <div class="upscale-preset-wrap" id="upscalePresetWrap">
-                    <select id="upscalePresetSelect" title="Upscale preset"></select>
-                    <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button" aria-label="Delete preset" title="Delete preset">×</button>
+              <div class="pane-header pane-header-2row">
+                <div class="pane-head-row pane-head-row-top">
+                  <span class="pane-title">Upscale</span>
+                  <div class="pane-actions">
+                    <label class="toggle-inline" title="Improve transcript before paste/save">
+                      <input id="upscaleToggle" type="checkbox" />
+                    </label>
                   </div>
-                  <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset" title="Add preset">+</button>
+                </div>
+                <div class="pane-head-row pane-head-row-bottom">
+                  <div class="pane-actions">
+                    <div class="upscale-preset-wrap" id="upscalePresetWrap">
+                      <select id="upscalePresetSelect" title="Upscale preset"></select>
+                      <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button" aria-label="Delete preset" title="Delete preset">×</button>
+                    </div>
+                    <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset" title="Add preset">+</button>
+                    <button class="icon-btn" id="upscaleCopyBtn" type="button" aria-label="Copy upscale text" title="Copy upscale">
+                      <span class="copy-ico" aria-hidden="true"></span>
+                    </button>
+                  </div>
                 </div>
               </div>
               <pre class="out" id="upscaleOutput" data-placeholder="Upscaled text will appear here..."></pre>

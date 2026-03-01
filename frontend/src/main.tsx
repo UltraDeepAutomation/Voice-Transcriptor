@@ -78,6 +78,12 @@ interface UpscalePresetItem {
   builtin: boolean;
 }
 
+interface FinishedRecordingEntry {
+  recordingId: number;
+  finishedAt: number;
+  text: string;
+}
+
 declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
@@ -87,6 +93,7 @@ declare global {
     __transcriptorLastFinishedAt?: number;
     __transcriptorCurrentRecordingId?: number;
     __transcriptorLastFinishedRecordingId?: number;
+    __transcriptorFinishedRecords?: FinishedRecordingEntry[];
   }
 }
 
@@ -171,18 +178,20 @@ function setStatus(st: string): void {
 }
 
 async function parseError(r: Response): Promise<string> {
-  let details = `${r.status}`;
+  let details = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
   try {
     const j: unknown = await r.json();
     if (typeof j === "object" && j && "detail" in j) {
       const detail = (j as { detail?: unknown }).detail;
-      details = typeof detail === "string" ? detail : JSON.stringify(j);
+      const raw = typeof detail === "string" ? detail : JSON.stringify(j);
+      details = `${details}: ${raw}`;
     } else {
-      details = JSON.stringify(j);
+      details = `${details}: ${JSON.stringify(j)}`;
     }
   } catch {
     try {
-      details = await r.text();
+      const txt = await r.text();
+      if (txt && txt.trim()) details = `${details}: ${txt.trim()}`;
     } catch { }
   }
   return details || `HTTP ${r.status}`;
@@ -455,7 +464,10 @@ async function loadMics(forceReload = false): Promise<void> {
     }
   } catch (e) {
     console.error("Error loading microphones:", e);
-    ($("micSelect") as HTMLSelectElement).innerHTML = '<option value="">Permission denied</option>';
+    const sel = $("micSelect") as HTMLSelectElement;
+    if (!sel.options.length) {
+      sel.innerHTML = '<option value="">Permission denied</option>';
+    }
   }
 }
 
@@ -610,7 +622,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
     quick_settings_open: !$("quickSettingsPanel").hidden,
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
-    upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "clean").trim(),
+    upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
   };
 }
 
@@ -776,21 +788,22 @@ async function loadCfg(): Promise<void> {
     auto.checked = ui.auto_transcribe !== false;
     livePreview.checked = ui.live_preview !== false;
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
-    const upscalePresetSel = $("upscalePresetSelect") as HTMLSelectElement;
     upscaleToggle.checked = ui.upscale_enabled === true;
-    if (ui.upscale_preset && Array.from(upscalePresetSel.options).some((o) => o.value === ui.upscale_preset)) {
-      upscalePresetSel.value = ui.upscale_preset;
-    }
+    pendingUpscalePresetId = String(ui.upscale_preset || "").trim();
     preferredMicId = String(ui.mic_id || "").trim();
     syncRemoteModelOptions(cfgOpenrouterModel);
     const remoteSel = $("remoteModelSelect") as HTMLSelectElement;
     if (providerSel.value === "openrouter" && cfgOpenrouterModel) {
       remoteSel.value = cfgOpenrouterModel;
     }
+    await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
     $("cfgMsg").textContent = "Loaded";
   } catch {
     $("cfgMsg").textContent = "Error loading config";
+    try {
+      await loadUpscalePresets("builtin_clean");
+    } catch { }
   } finally {
     suppressUiPrefAutosave = false;
   }
@@ -825,7 +838,54 @@ $("reloadBtn").addEventListener("click", () => void loadCfg().catch((e: Error) =
 ($("diarizeDefault") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("chunkSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("upscalePresetSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("upscalePresetSelect") as HTMLSelectElement).addEventListener("change", () => {
+  syncUpscalePresetControls();
+  queueUiPreferencesSave();
+});
+($("upscalePresetAddBtn") as HTMLButtonElement).addEventListener("click", () => openUpscalePresetModal());
+($("upscalePresetCancelBtn") as HTMLButtonElement).addEventListener("click", () => closeUpscalePresetModal());
+($("upscalePresetModal") as HTMLDivElement).addEventListener("click", (e) => {
+  if (e.target === $("upscalePresetModal")) closeUpscalePresetModal();
+});
+($("upscalePresetSaveBtn") as HTMLButtonElement).addEventListener("click", () => {
+  const name = (($("upscalePresetNameInput") as HTMLInputElement).value || "").trim();
+  const instruction = (($("upscalePresetInstructionInput") as HTMLTextAreaElement).value || "").trim();
+  const msg = $("upscalePresetMsg");
+  if (!name) {
+    msg.textContent = "Preset name is required.";
+    return;
+  }
+  if (!instruction) {
+    msg.textContent = "Instruction is required.";
+    return;
+  }
+  msg.textContent = "Saving...";
+  void apiPost<{ ok: boolean; item: UpscalePresetItem }>("/api/upscale/presets", { name, instruction })
+    .then(async (r) => {
+      closeUpscalePresetModal();
+      await loadUpscalePresets(r.item?.id || "");
+      queueUiPreferencesSave();
+    })
+    .catch((e: Error) => {
+      msg.textContent = e.message;
+    });
+});
+($("upscalePresetDeleteBtn") as HTMLButtonElement).addEventListener("click", () => {
+  const cur = selectedUpscalePreset();
+  if (!cur || cur.builtin) return;
+  void fetch(`/api/upscale/presets/${encodeURIComponent(cur.id)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  })
+    .then(async (r) => {
+      if (!r.ok) throw new Error(await parseError(r));
+      await loadUpscalePresets("");
+      queueUiPreferencesSave();
+    })
+    .catch((e: Error) => {
+      $("upscaleOutput").textContent = `Preset delete failed: ${e.message}`;
+    });
+});
 ($("orModel") as HTMLInputElement).addEventListener("change", () => {
   syncRemoteModelOptions(($("orModel") as HTMLInputElement).value.trim());
   queueUiPreferencesSave();
@@ -885,6 +945,24 @@ async function copyRecordingText(): Promise<void> {
     btn.setAttribute("aria-label", prevLabel);
     btn.title = "Copy";
   }, 900);
+}
+
+async function copyTextContent(text: string): Promise<void> {
+  const value = String(text || "").trim();
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
 }
 
 function renderRecordingsList(): void {
@@ -1030,6 +1108,8 @@ $("recordingsStatsBtn").addEventListener("click", () => {
   syncRecordingsStatsVisibility();
 });
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
+$("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || ""));
+$("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || ""));
 
 syncRecordingsStatsVisibility();
 
@@ -1111,6 +1191,20 @@ let workletLastFrameAt = 0;
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 
+function publishFinishedRecording(recordingId: number, text: string): void {
+  const rid = Math.max(0, Number(recordingId || 0));
+  const payload = String(text || "").trim();
+  if (!rid || !payload) return;
+  const finishedAt = Date.now();
+  window.__transcriptorLastFinishedText = payload;
+  window.__transcriptorLastFinishedAt = finishedAt;
+  window.__transcriptorLastFinishedRecordingId = rid;
+  const list = Array.isArray(window.__transcriptorFinishedRecords) ? window.__transcriptorFinishedRecords.slice() : [];
+  const next = list.filter((x) => Number(x?.recordingId || 0) !== rid);
+  next.push({ recordingId: rid, finishedAt, text: payload });
+  window.__transcriptorFinishedRecords = next.slice(-30);
+}
+
 function resetOutputs(): void {
   $("liveOutput").textContent = "";
   $("finalOutput").textContent = "";
@@ -1135,6 +1229,44 @@ function applyJobResult(j: JobResponse): void {
   }
   $("finalOutput").textContent = j.error || "Error";
   setStatus("Error");
+}
+
+function micErrorTag(e: unknown): string {
+  const err = e as { name?: unknown; message?: unknown };
+  const name = String(err?.name || "").trim();
+  const msg = String(err?.message || "").trim();
+  return [name, msg].filter(Boolean).join(": ");
+}
+
+function hasLiveAudioTrack(s: MediaStream | null): boolean {
+  if (!s) return false;
+  const tracks = s.getAudioTracks();
+  return tracks.some((t) => t.readyState === "live");
+}
+
+async function acquireMicStream(deviceId: string): Promise<{ stream: MediaStream; usedFallback: boolean }> {
+  const id = String(deviceId || "").trim();
+  const attempts: MediaStreamConstraints[] = id
+    ? [
+        { audio: { deviceId: { exact: id } } },
+        { audio: { deviceId: { ideal: id } } },
+        { audio: true },
+      ]
+    : [{ audio: true }];
+  let lastErr: unknown = null;
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia(attempts[i]);
+      if (hasLiveAudioTrack(s)) {
+        return { stream: s, usedFallback: i > 0 };
+      }
+      s.getTracks().forEach((t) => t.stop());
+      lastErr = new Error("No live audio track in stream");
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Unable to open microphone");
 }
 
 async function startLive(): Promise<void> {
@@ -1217,10 +1349,23 @@ async function startLive(): Promise<void> {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }
-    await loadMics(true);
-    const devId = ($("micSelect") as HTMLSelectElement).value;
-    stream = await navigator.mediaDevices.getUserMedia(devId ? { audio: { deviceId: { exact: devId } } } : { audio: true });
+    await loadMics(false);
+    const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+    const picked = await acquireMicStream(devId);
+    stream = picked.stream;
+    if (picked.usedFallback && devId) {
+      try {
+        const sel = $("micSelect") as HTMLSelectElement;
+        sel.value = "";
+        queueUiPreferencesSave();
+      } catch { }
+    }
     ac = new AudioContext();
+    if (ac.state !== "running") {
+      try {
+        await ac.resume();
+      } catch { }
+    }
     src = ac.createMediaStreamSource(stream);
     analyser = ac.createAnalyser();
     analyser.fftSize = 2048;
@@ -1288,7 +1433,7 @@ async function startLive(): Promise<void> {
 
     src.connect(workletNode);
   } catch (e) {
-    $("liveOutput").textContent = (e as Error).message;
+    $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
     await stopLive(false);
     setStatus("Error");
   }
@@ -1448,9 +1593,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     // Signal readiness for global hotkey flow immediately after final text is available.
     const earlyFinishedText = (($("finalOutput").textContent || "").trim() || sourceLiveText || "").trim();
     if (earlyFinishedText) {
-      window.__transcriptorLastFinishedText = earlyFinishedText;
-      window.__transcriptorLastFinishedAt = Date.now();
-      window.__transcriptorLastFinishedRecordingId = recordingId;
+      publishFinishedRecording(recordingId, earlyFinishedText);
     }
     try {
       await saveRecordingText({
@@ -1482,9 +1625,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
   // Signal desktop main process that transcription is complete with final text.
   const _finishedText = ($("finalOutput").textContent || $("liveOutput").textContent || "").trim();
-  window.__transcriptorLastFinishedText = _finishedText;
-  window.__transcriptorLastFinishedAt = Date.now();
-  window.__transcriptorLastFinishedRecordingId = recordingId;
+  publishFinishedRecording(recordingId, _finishedText);
 }
 
 function setSelectedFile(file: File | null): void {
