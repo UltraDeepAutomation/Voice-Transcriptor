@@ -31,6 +31,10 @@ let overlayQuickProvider = "local";
 let overlayQuickModel = "small";
 let overlayQuickUpscalePreset = "builtin_clean";
 let overlayQuickUpscaleEnabled = false;
+let overlayQuickAutoSend = false;
+let overlayQuickAutoSendInitialized = false;
+let overlayQuickSettingsInitialized = false;
+let lastOverlayUiInteractionAt = 0;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
@@ -122,11 +126,15 @@ function traceEnd(ctx, status = "done", details = {}) {
 
 async function shouldBlockMainWindowPresentation(options = {}) {
   const allowDuringRecording = !!options.allowDuringRecording;
+  const force = !!options.force;
   if (overlayStopInFlight) return true;
-  if (Date.now() < suppressMainWindowUntil) return true;
-  if (suppressActivateDuringOverlayFlow) return true;
+  if (force) return false;
+  if (!allowDuringRecording && Date.now() < suppressMainWindowUntil) return true;
   if (Date.now() < suppressActivateUntil) return true;
-  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return true;
+  if (!allowDuringRecording) {
+    if (suppressActivateDuringOverlayFlow) return true;
+    if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return true;
+  }
   if (allowDuringRecording) return false;
   try {
     return await isRendererRecording();
@@ -137,8 +145,9 @@ async function shouldBlockMainWindowPresentation(options = {}) {
 
 async function ensureWindowVisible(options = {}) {
   const manual = !!options.manual;
-  if (await shouldBlockMainWindowPresentation({ allowDuringRecording: manual })) return;
-  if (Date.now() < suppressMainWindowUntil) return;
+  const force = !!options.force;
+  if (await shouldBlockMainWindowPresentation({ allowDuringRecording: manual, force })) return;
+  if (!force && Date.now() < suppressMainWindowUntil) return;
   if (!win || win.isDestroyed()) {
     await createWindow();
     return;
@@ -233,7 +242,7 @@ async function getRendererModelContext() {
 }
 
 async function getRendererQuickSettingsOpen() {
-  if (!win || win.isDestroyed() || !win.webContents) return false;
+  if (!win || win.isDestroyed() || !win.webContents) return null;
   try {
     const open = await win.webContents.executeJavaScript(
       `(() => { const p = document.getElementById('quickSettingsPanel'); return !!(p && !p.hidden); })();`,
@@ -241,7 +250,7 @@ async function getRendererQuickSettingsOpen() {
     );
     return !!open;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -272,6 +281,24 @@ async function getRendererUpscalePresetContext() {
     return { selected, enabled, presets: presets.length ? presets : [{ id: "builtin_clean", name: "Clean" }] };
   } catch {
     return { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
+  }
+}
+
+async function getRendererAutoSendEnterEnabled() {
+  if (!win || win.isDestroyed() || !win.webContents) return false;
+  try {
+    const out = await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const btn = document.getElementById('autoSendEnterToggle');
+        return !!(btn && btn.classList.contains('active'));
+      })();
+      `,
+      true
+    );
+    return !!out;
+  } catch {
+    return false;
   }
 }
 
@@ -313,6 +340,49 @@ async function setRendererUpscaleEnabledChoice(enabled) {
           el.checked = target;
           el.dispatchEvent(new Event('change', { bubbles: true }));
         }
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
+async function setRendererQuickSettingsOpenChoice(open) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const target = !!open;
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const target = ${target ? "true" : "false"};
+        if (typeof window.__transcriptorSetQuickSettingsOpen === 'function') {
+          return !!window.__transcriptorSetQuickSettingsOpen(target);
+        }
+        const panel = document.getElementById('quickSettingsPanel');
+        const btn = document.getElementById('quickSettingsToggle');
+        if (!panel || !btn) return false;
+        const isOpen = !panel.hidden;
+        if (isOpen !== target) btn.click();
+        return true;
+      })();
+      `,
+      true
+    );
+  } catch {}
+}
+
+async function setRendererAutoSendEnterChoice(enabled) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const target = !!enabled;
+  try {
+    await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const btn = document.getElementById('autoSendEnterToggle');
+        if (!btn) return false;
+        const isOn = btn.classList.contains('active');
+        if (isOn !== ${target ? "true" : "false"}) btn.click();
         return true;
       })();
       `,
@@ -424,11 +494,12 @@ function createOverlayHtml() {
       </div>
       <div id="pill">
         <div id="quickPanel">
-          <label id="quickUpscaleToggleWrap" title="Enable upscale">
-            <span id="quickUpscaleToggleLabel">Upscale</span>
+          <div id="quickUpscaleCapsule" title="Upscale settings">
             <input id="quickUpscaleToggle" type="checkbox" />
-          </label>
-          <select id="quickUpscale" title="Upscale preset"></select>
+            <span id="quickUpscaleOffLabel">Upscale</span>
+            <select id="quickUpscale" title="Upscale preset"></select>
+          </div>
+          <button id="quickSendEnterBtn" aria-label="Auto send after paste" title="Auto send after paste"></button>
         </div>
         <div id="core">
           <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
@@ -528,24 +599,19 @@ function createOverlayHtml() {
           transform:translateX(8px);
           pointer-events:none;
         }
-        #quickUpscaleToggleWrap{
+        #quickUpscaleCapsule{
           display:inline-flex;
           align-items:center;
           gap:6px;
-          padding:0 8px;
+          padding:0 5px 0 3px;
           height:22px;
           border-radius:999px;
           border:1px solid rgba(196,148,230,.28);
           background:rgba(56,46,72,.38);
           color:rgba(226,226,226,.92);
-          font-size:10px;
-          font-weight:650;
           white-space:nowrap;
-        }
-        #quickUpscaleToggleLabel{
-          font-size:10px;
-          line-height:1;
-          letter-spacing:.01em;
+          min-width:0;
+          width:auto;
         }
         #quickUpscaleToggle{
           appearance:none;
@@ -577,22 +643,66 @@ function createOverlayHtml() {
           transform:translateX(12px);
           background:#fff;
         }
+        #quickUpscaleOffLabel{
+          font-size:10px;
+          font-weight:650;
+          letter-spacing:.01em;
+          opacity:.92;
+        }
         #quickUpscale{
           appearance:none;
-          border:1px solid rgba(196,148,230,.34);
+          border:1px solid rgba(196,148,230,.28);
           border-radius:999px;
-          background:rgba(72,52,92,.5);
+          background:rgba(72,52,92,.32);
           color:rgba(236,236,236,.96);
-          height:22px;
-          padding:0 24px 0 10px;
+          height:18px;
+          padding:0 20px 0 8px;
           font-size:10px;
           font-weight:600;
-          max-width:110px;
-          min-width:110px;
+          max-width:94px;
+          min-width:94px;
           background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
           background-repeat:no-repeat;
-          background-position:right 8px center;
+          background-position:right 6px center;
           outline:none;
+        }
+        #quickUpscaleCapsule.up-off #quickUpscale{
+          display:none;
+        }
+        #quickUpscaleCapsule.up-on #quickUpscaleOffLabel{
+          display:none;
+        }
+        #quickSendEnterBtn{
+          appearance:none;
+          border:1px solid rgba(255,255,255,.22);
+          border-radius:999px;
+          background:rgba(44,44,44,.95);
+          width:20px;
+          height:20px;
+          padding:0;
+          position:relative;
+          flex:0 0 20px;
+          cursor:pointer;
+        }
+        #quickSendEnterBtn::before{
+          content:"";
+          position:absolute;
+          left:50%;
+          top:50%;
+          width:11px;
+          height:11px;
+          transform:translate(-50%,-50%);
+          background-repeat:no-repeat;
+          background-position:center;
+          background-size:11px 11px;
+          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='rgba(184,184,184,0.95)' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M8.9 4.8L12 8L8.9 11.2' stroke='rgba(184,184,184,0.95)' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+        }
+        #quickSendEnterBtn.on{
+          border-color:rgba(108,176,128,.8);
+          background:rgba(66,116,82,.56);
+        }
+        #quickSendEnterBtn.on::before{
+          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='rgba(210,248,220,0.96)' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M8.9 4.8L12 8L8.9 11.2' stroke='rgba(210,248,220,0.96)' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
         }
         #gearBtn{
           appearance:none;
@@ -776,8 +886,10 @@ function createOverlayHtml() {
         const stateIcon = document.getElementById('stateIcon');
         const gearBtn = document.getElementById('gearBtn');
         const quickPanel = document.getElementById('quickPanel');
+        const quickUpscaleCapsule = document.getElementById('quickUpscaleCapsule');
         const quickUpscaleToggle = document.getElementById('quickUpscaleToggle');
         const quickUpscale = document.getElementById('quickUpscale');
+        const quickSendEnterBtn = document.getElementById('quickSendEnterBtn');
         let timerId = null;
         let queueTimerId = null;
         let audioCtx = null;
@@ -858,7 +970,7 @@ function createOverlayHtml() {
             stateIcon.classList.add('transcribing');
           } else if (raw === 'upscaling') {
             stateIcon.classList.add('upscaling');
-          } else if (raw === 'paste sent') {
+          } else if (raw === 'paste sent' || raw === 'done' || raw === 'saved to app') {
             stateIcon.classList.add('ok');
           } else if (raw === 'paste failed' || raw === 'grant access' || raw === 'secure field' || raw === 'no text focus' || raw === 'clipboard error') {
             stateIcon.classList.add('fail');
@@ -875,6 +987,8 @@ function createOverlayHtml() {
         window.setUpscaleEnabled = (enabled) => {
           const on = !!enabled;
           if (quickUpscaleToggle.checked !== on) quickUpscaleToggle.checked = on;
+          quickUpscaleCapsule.classList.toggle('up-on', on);
+          quickUpscaleCapsule.classList.toggle('up-off', !on);
         };
         window.setUpscaleOptions = (items, selected) => {
           const list = Array.isArray(items) ? items : [];
@@ -906,12 +1020,18 @@ function createOverlayHtml() {
           if (!Array.from(quickUpscale.options).some((o) => o.value === v)) return;
           if (quickUpscale.value !== v) quickUpscale.value = v;
         };
+        window.setAutoSendEnabled = (enabled) => {
+          const on = !!enabled;
+          quickSendEnterBtn.classList.toggle('on', on);
+          quickSendEnterBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        };
         gearBtn.addEventListener('click', () => {
           const next = !pill.classList.contains('qs-open');
           window.setQuickOpen(next);
           document.title = '__overlay_settings__' + (next ? '1' : '0');
         });
         quickUpscaleToggle.addEventListener('change', () => {
+          window.setUpscaleEnabled(quickUpscaleToggle.checked);
           document.title = '__overlay_upscale_enabled__' + (quickUpscaleToggle.checked ? '1' : '0');
         });
         quickUpscale.addEventListener('change', () => {
@@ -919,6 +1039,11 @@ function createOverlayHtml() {
           if (!v) return;
           quickUpscale.value = v;
           document.title = '__overlay_upscale__' + encodeURIComponent(v);
+        });
+        quickSendEnterBtn.addEventListener('click', () => {
+          const next = !quickSendEnterBtn.classList.contains('on');
+          window.setAutoSendEnabled(next);
+          document.title = '__overlay_autosend__' + (next ? '1' : '0');
         });
         window.setTimer = (t) => {
           const str = String(t || '').trim();
@@ -1027,6 +1152,7 @@ function createOverlayHtml() {
         window.setUpscaleEnabled(false);
         window.setUpscaleOptions([{ id: 'builtin_clean', name: 'Clean' }], 'builtin_clean');
         window.setUpscale('builtin_clean');
+        window.setAutoSendEnabled(false);
         window.setQueueVisible(false);
       </script>
     </body>
@@ -1078,18 +1204,42 @@ function ensureOverlayWindow() {
     }
     if (raw.startsWith("__overlay_settings__")) {
       overlayQuickSettingsOpen = raw.endsWith("1");
+      overlayQuickSettingsInitialized = true;
+      lastOverlayUiInteractionAt = Date.now();
+      suppressActivateUntil = Date.now() + 1600;
+      suppressMainWindowUntil = Date.now() + 1600;
+      if (win && !win.isDestroyed() && win.isVisible()) {
+        try { win.hide(); } catch {}
+      }
+      void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
       return;
     }
     if (raw.startsWith("__overlay_upscale_enabled__")) {
       const v = raw.endsWith("1");
       overlayQuickUpscaleEnabled = !!v;
+      lastOverlayUiInteractionAt = Date.now();
+      suppressActivateUntil = Date.now() + 1200;
+      suppressMainWindowUntil = Date.now() + 1200;
       void setRendererUpscaleEnabledChoice(v);
       return;
     }
     if (raw.startsWith("__overlay_upscale__")) {
       const v = String(decodeURIComponent(raw.replace("__overlay_upscale__", "")) || "").trim();
       overlayQuickUpscalePreset = v;
+      lastOverlayUiInteractionAt = Date.now();
+      suppressActivateUntil = Date.now() + 1200;
+      suppressMainWindowUntil = Date.now() + 1200;
       void setRendererUpscalePresetChoice(v);
+      return;
+    }
+    if (raw.startsWith("__overlay_autosend__")) {
+      const v = raw.endsWith("1");
+      overlayQuickAutoSend = !!v;
+      overlayQuickAutoSendInitialized = true;
+      lastOverlayUiInteractionAt = Date.now();
+      suppressActivateUntil = Date.now() + 1200;
+      suppressMainWindowUntil = Date.now() + 1200;
+      void setRendererAutoSendEnterChoice(v);
       return;
     }
     if (raw.startsWith("__overlay_layout__")) return;
@@ -1139,11 +1289,21 @@ async function showRecordingOverlay() {
   const upscaleCtx = await getRendererUpscalePresetContext();
   overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
   overlayQuickUpscalePreset = upscaleCtx.selected;
-  overlayQuickSettingsOpen = await getRendererQuickSettingsOpen();
+  if (!overlayQuickAutoSendInitialized) {
+    overlayQuickAutoSend = await getRendererAutoSendEnterEnabled();
+    overlayQuickAutoSendInitialized = true;
+  }
+  if (!overlayQuickSettingsInitialized) {
+    const rendererQuickOpen = await getRendererQuickSettingsOpen();
+    if (rendererQuickOpen !== null) {
+      overlayQuickSettingsOpen = rendererQuickOpen;
+      overlayQuickSettingsInitialized = true;
+    }
+  }
   const hasQueuedTranscriptions = pendingTranscriptionCount > 0;
   try {
     await ow.webContents.executeJavaScript(
-      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
+      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
       true
     );
   } catch { }
@@ -1191,8 +1351,19 @@ async function ensureOverlayVisible(options = {}) {
     const upscaleCtx = await getRendererUpscalePresetContext();
     overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
     overlayQuickUpscalePreset = upscaleCtx.selected;
+    if (!overlayQuickAutoSendInitialized) {
+      overlayQuickAutoSend = await getRendererAutoSendEnterEnabled();
+      overlayQuickAutoSendInitialized = true;
+    }
+    if (!overlayQuickSettingsInitialized) {
+      const rendererQuickOpen = await getRendererQuickSettingsOpen();
+      if (rendererQuickOpen !== null) {
+        overlayQuickSettingsOpen = rendererQuickOpen;
+        overlayQuickSettingsInitialized = true;
+      }
+    }
     await ow.webContents.executeJavaScript(
-      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
+      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
       true
     );
   } catch {}
@@ -1299,7 +1470,6 @@ async function toggleRecordingFromShortcut() {
   const trace = createTrace("toggle_hotkey", {});
   shortcutToggleInFlight = true;
   try {
-    await requestMacMicrophonePermissionOnce();
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
     const front = await getFrontmostAppInfo();
@@ -1313,6 +1483,14 @@ async function toggleRecordingFromShortcut() {
     }
     await ensureOverlayVisible({ status: pendingTranscriptionCount > 0 ? null : "Starting", resetTimer: false, startTimer: false });
     traceStep(trace, "overlay_visible", { status: "Starting" });
+    const micGranted = await requestMacMicrophonePermissionOnce();
+    if (!micGranted) {
+      traceStep(trace, "mic_permission_denied", {});
+      await setOverlayStatus("Grant Access");
+      setTimeout(() => hideRecordingOverlay(), 1200);
+      traceEnd(trace, "failed", { reason: "mic-permission-denied" });
+      return;
+    }
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
@@ -1337,9 +1515,10 @@ async function toggleRecordingFromShortcut() {
         const isRec = !!(window.__transcriptorIsRecording);
         const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
         const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
+        const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
         const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
         window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
-        return { ok: true, recording: !isRec, auto, timerText, recordingId };
+        return { ok: true, recording: !isRec, auto, autoSendEnter, timerText, recordingId };
       })();
       `,
       true
@@ -1371,6 +1550,7 @@ async function toggleRecordingFromShortcut() {
       await setOverlayStatus("Transcribing");
       enqueuePostStopTask({
         autoTranscribe: true,
+        autoSendEnter: !!result.autoSendEnter,
         stopRequestedAt: Date.now(),
         recordingId: Number(result.recordingId || 0),
         targetName: pasteTargetAppName,
@@ -1404,10 +1584,11 @@ async function stopRecordingFromOverlay() {
       const isRec = !!(window.__transcriptorIsRecording);
       const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
       const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
-      if (!isRec) return { ok: false, recording: false, timerText, recordingId };
+      const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
+      if (!isRec) return { ok: false, recording: false, timerText, recordingId, autoSendEnter };
       // Use dedicated stop event — avoids dual-path race with btnStop.click().
       window.dispatchEvent(new Event('transcriptor-hotkey-stop'));
-      return { ok: true, recording: false, timerText, recordingId };
+      return { ok: true, recording: false, timerText, recordingId, autoSendEnter };
     })();
     `,
     true
@@ -1424,6 +1605,7 @@ async function stopRecordingFromOverlay() {
     await setOverlayStatus("Transcribing");
     enqueuePostStopTask({
       autoTranscribe: true,
+      autoSendEnter: !!result.autoSendEnter,
       stopRequestedAt: Date.now(),
       recordingId: Number(result.recordingId || 0),
       targetName: pasteTargetAppName,
@@ -2328,9 +2510,42 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
+async function sendCommandEnterToFocusedApp(targetAppName = "", targetAppPid = 0) {
+  const targetName = String(targetAppName || "").trim();
+  const targetPid = Number(targetAppPid || 0);
+  if (targetPid > 0) {
+    await activateAppByPid(targetPid);
+    await sleep(110);
+  } else if (targetName && !isBadActivationTarget(targetName)) {
+    await activateAppByName(targetName);
+    await sleep(110);
+  }
+  const primary = `
+    tell application "System Events"
+      keystroke return using command down
+    end tell
+  `;
+  const res1 = await runCommand("osascript", ["-e", primary], { timeoutMs: 5000 });
+  if (res1.ok) {
+    return { ok: true, reason: "cmd-return-sent" };
+  }
+  const fallback = `
+    tell application "System Events"
+      key code 36 using command down
+    end tell
+  `;
+  const res2 = await runCommand("osascript", ["-e", fallback], { timeoutMs: 5000 });
+  if (res2.ok) {
+    return { ok: true, reason: "cmd-enter-keycode-sent" };
+  }
+  const reason = String(res2.stderr || res2.stdout || res1.stderr || res1.stdout || "cmd-enter-failed").trim();
+  return { ok: false, reason };
+}
+
 function enqueuePostStopTask(options = {}) {
   const task = {
     autoTranscribe: !!options.autoTranscribe,
+    autoSendEnter: !!options.autoSendEnter,
     stopRequestedAt: Number(options.stopRequestedAt || Date.now()),
     recordingId: Number(options.recordingId || 0),
     targetName: String(options.targetName || ""),
@@ -2384,7 +2599,7 @@ async function processPostStopTask(task) {
     pollCount += 1;
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "poll_window_lost", { pollCount });
-      await sleep(300);
+      await sleep(70);
       continue;
     }
     let state = null;
@@ -2418,12 +2633,12 @@ async function processPostStopTask(task) {
       );
     } catch {
       traceStep(trace, "poll_js_error", { pollCount });
-      await sleep(300);
+      await sleep(70);
       continue;
     }
     if (!state) {
       traceStep(trace, "poll_empty_state", { pollCount });
-      await sleep(300);
+      await sleep(70);
       continue;
     }
     const statusLower = String(state.status || "").trim().toLowerCase();
@@ -2483,7 +2698,7 @@ async function processPostStopTask(task) {
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
       (state.status === "Done" || state.status === "Error" || state.status === "Idle");
     if (doneLike) break;
-    await sleep(140);
+    await sleep(55);
   }
 
   let overlayStatus = "Saved To App";
@@ -2533,7 +2748,21 @@ async function processPostStopTask(task) {
     appendMainLog(
       `[paste-auto] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
-    if (!pasted.ok && looksLikeAutomationPermissionError(pasted.reason)) {
+    if (pasted.ok && task.autoSendEnter) {
+      await sleep(1000);
+      const sent = await sendCommandEnterToFocusedApp(effectiveTargetName, effectiveTargetPid);
+      traceStep(trace, "cmd_enter_result", {
+        ok: !!sent.ok,
+        reason: compactLogText(sent.reason || ""),
+      });
+      appendMainLog(
+        `[cmd-enter] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
+      );
+      if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
+        openPrivacyAccessibilitySettings();
+      }
+    }
+  if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
       openPrivacyAccessibilitySettings();
     }
     overlayStatus = pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason);
@@ -2614,6 +2843,9 @@ async function pasteLatestTranscriptFromShortcut() {
     );
     await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
+      if (String(pasted.reason || "").includes("no-accessibility")) {
+        openPrivacyAccessibilitySettings();
+      }
       console.log("[paste-last] failed:", pasted.reason || "unknown");
     }
     pasteTargetAppName = "";
@@ -3010,7 +3242,9 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", async () => {
-  ensureWindowVisible({ manual: true });
+  // Ignore synthetic activation pulses produced by immediate overlay interactions.
+  if (Date.now() - lastOverlayUiInteractionAt < 700) return;
+  ensureWindowVisible({ manual: true, force: true });
 });
 
 app.on("before-quit", () => {
@@ -3069,7 +3303,7 @@ app.whenReady().then(async () => {
     {
       label: "Open Transcriptor",
       click: () => {
-        ensureWindowVisible({ manual: true });
+        ensureWindowVisible({ manual: true, force: true });
       }
     },
     { type: "separator" },
@@ -3084,19 +3318,21 @@ app.whenReady().then(async () => {
       tray?.popUpContextMenu(trayMenu);
       return;
     }
-    ensureWindowVisible({ manual: true });
+    ensureWindowVisible({ manual: true, force: true });
   });
   tray.on("right-click", () => {
     tray?.popUpContextMenu(trayMenu);
   });
-  const devKey = process.platform === "darwin" ? "Command+Shift+D" : "Control+Shift+D";
-  const ok = globalShortcut.register(devKey, () => {
-    if (!win?.webContents) return;
-    if (win.webContents.isDevToolsOpened()) win.webContents.closeDevTools();
-    else win.webContents.openDevTools();
-  });
-  if (!ok) {
-    console.log("[app] failed to register devtools shortcut");
+  if (!app.isPackaged) {
+    const devKey = process.platform === "darwin" ? "Command+Shift+D" : "Control+Shift+D";
+    const ok = globalShortcut.register(devKey, () => {
+      if (!win?.webContents) return;
+      if (win.webContents.isDevToolsOpened()) win.webContents.closeDevTools();
+      else win.webContents.openDevTools();
+    });
+    if (!ok) {
+      console.log("[app] failed to register devtools shortcut");
+    }
   }
 
   const recordHotkey = process.platform === "darwin" ? "Alt+Left" : "Alt+Left";

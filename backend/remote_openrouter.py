@@ -20,7 +20,8 @@ def _request_with_retry(method: str, url: str, retries: int = 3, **kwargs):
             last_err = e
             if attempt == retries - 1:
                 break
-            time.sleep(0.8 * (attempt + 1))
+            # First retry is fast (0.3s), subsequent retries use longer backoff.
+            time.sleep(0.3 if attempt == 0 else 0.8 * attempt)
     raise RemoteError(f"network error: {last_err}")
 
 
@@ -56,7 +57,8 @@ def openrouter_transcribe(
                 "content": [
                     {
                         "type": "text",
-                        "text": "Transcribe this audio. If possible, label speakers as Speaker 1/2/etc.",
+                        # Keep prompt minimal for lower latency and avoid extra formatting work.
+                        "text": "Transcribe audio exactly. Return only transcript text.",
                     },
                     {
                         "type": "input_audio",
@@ -66,6 +68,7 @@ def openrouter_transcribe(
             }
         ],
         "stream": False,
+        "temperature": 0.0,
     }
 
     r = _request_with_retry("POST", url, headers=headers, json=payload, timeout=180)

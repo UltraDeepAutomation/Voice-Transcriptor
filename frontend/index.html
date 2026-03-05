@@ -47,16 +47,6 @@
                 </select>
               </div>
               <div class="field">
-                <span class="lbl">Model</span>
-                <select id="model">
-                  <option value="tiny">tiny</option>
-                  <option value="base">base</option>
-                  <option value="small" selected>small</option>
-                  <option value="medium">medium</option>
-                  <option value="large-v3">large-v3</option>
-                </select>
-              </div>
-              <div class="field">
                 <span class="lbl">Mic</span>
                 <select id="micSelect"><option value="">Select mic</option></select>
               </div>
@@ -100,7 +90,17 @@
                     </label>
                   </div>
                 </div>
-                <div class="pane-head-row pane-head-row-bottom"></div>
+                <div class="pane-head-row pane-head-row-bottom">
+                  <div class="pane-actions">
+                    <select id="model">
+                      <option value="tiny">tiny</option>
+                      <option value="base">base</option>
+                      <option value="small" selected>small</option>
+                      <option value="medium">medium</option>
+                      <option value="large-v3">large-v3</option>
+                    </select>
+                  </div>
+                </div>
               </div>
               <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
             </div>
@@ -108,7 +108,7 @@
             <div class="pane" id="resultPane">
               <div class="pane-header pane-header-2row">
                 <div class="pane-head-row pane-head-row-top">
-                  <span class="pane-title">Transcribe</span>
+                  <span class="pane-title">Transcribe <span class="pane-latency" id="transcribeLatency">--</span></span>
                   <div class="pane-actions">
                     <label class="toggle-inline" title="Auto transcribe after stopping recording">
                       <input id="autoTranscribeToggle" type="checkbox" checked />
@@ -124,6 +124,7 @@
                       <option value="">None</option>
                     </select>
                     <select id="remoteModelSelect" title="Remote model" hidden>
+                      <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
                       <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
                       <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
                     </select>
@@ -165,7 +166,7 @@
             <div class="pane" id="upscalePane">
               <div class="pane-header pane-header-2row">
                 <div class="pane-head-row pane-head-row-top">
-                  <span class="pane-title">Upscale</span>
+                  <span class="pane-title">Upscale <span class="pane-latency" id="upscaleLatency">--</span></span>
                   <div class="pane-actions">
                     <label class="toggle-inline" title="Improve transcript before paste/save">
                       <input id="upscaleToggle" type="checkbox" />
@@ -178,7 +179,13 @@
                       <select id="upscalePresetSelect" title="Upscale preset"></select>
                       <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button" aria-label="Delete preset" title="Delete preset">×</button>
                     </div>
+                    <button class="icon-btn" id="upscalePresetEditBtn" type="button" aria-label="Edit preset prompt" title="Edit preset prompt">
+                      <span class="gear-ico" aria-hidden="true"></span>
+                    </button>
                     <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset" title="Add preset">+</button>
+                    <button class="icon-btn send-enter-btn" id="autoSendEnterToggle" type="button" aria-label="Auto send after paste" aria-pressed="false" title="Auto send after paste: OFF">
+                      <span class="send-enter-ico" aria-hidden="true"></span>
+                    </button>
                     <button class="icon-btn" id="upscaleCopyBtn" type="button" aria-label="Copy upscale text" title="Copy upscale">
                       <span class="copy-ico" aria-hidden="true"></span>
                     </button>
@@ -304,6 +311,27 @@
         <div class="btn-row">
           <button class="btn btn-primary" id="upscalePresetSaveBtn" type="button">Save Preset</button>
           <button class="btn btn-ghost" id="upscalePresetCancelBtn" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="upscalePromptModal" hidden>
+      <div class="modal-card">
+        <h3>Preset Prompt</h3>
+        <label class="modal-field">
+          <span>Name</span>
+          <input id="upscalePromptPresetName" type="text" readonly />
+          <input id="upscalePromptPresetId" type="hidden" />
+        </label>
+        <label class="modal-field">
+          <span>Instruction</span>
+          <textarea id="upscalePromptInstructionInput" rows="8" placeholder="Instruction for this preset"></textarea>
+        </label>
+        <p class="hint" id="upscalePromptMsg"></p>
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="upscalePromptSaveBtn" type="button">Save</button>
+          <button class="btn btn-ghost" id="upscalePromptDefaultBtn" type="button">Set Default</button>
+          <button class="btn btn-ghost" id="upscalePromptCancelBtn" type="button">Cancel</button>
         </div>
       </div>
     </div>

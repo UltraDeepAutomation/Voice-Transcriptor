@@ -81,7 +81,7 @@ COMMON_STOPWORDS = {
     "i", "you", "we", "they", "he", "she", "be", "are", "was", "were", "do", "does", "did",
 }
 
-UPSCALE_PRESETS = {"clean", "business", "concise", "formal"}
+UPSCALE_PRESETS = {"clean", "business", "ai_code"}
 UPSCALE_PRESETS_DIR = DATA_DIR / "upscale_presets"
 UPSCALE_MAX_CUSTOM_PRESETS = 3
 UPSCALE_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -103,18 +103,16 @@ BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
             "Return only final improved transcript text. No quotes, no comments, no markdown."
         ),
     },
-    "concise": {
-        "name": "Concise",
+    "ai_code": {
+        "name": "AI & Code",
         "instruction": (
-            "Rewrite transcript into concise form: remove repetitions and noise, keep key meaning. "
-            "Keep output in the same language as input. "
-            "Return only final improved transcript text. No quotes, no comments, no markdown."
-        ),
-    },
-    "formal": {
-        "name": "Formal",
-        "instruction": (
-            "Rewrite transcript in formal polished tone with correct punctuation and grammar. "
+            "Improve transcript quality for software engineering context. Remove filler words, stutters, interjections, "
+            "and speech noise. Preserve all technical terms exactly: frameworks, libraries, APIs, SDKs, model names, "
+            "product names, file paths, commands, code tokens, identifiers, acronyms, and versions. "
+            "Do not simplify, replace, or transliterate programming terminology. Do not translate code, commands, "
+            "or proper technical names. Keep variable/function/class names exactly as spoken if recognizable. "
+            "Preserve keywords like Upscale/Upskill exactly as spoken. Keep full meaning and original sequence. "
+            "Structure output into readable short paragraphs and clean sentence boundaries without adding new facts. "
             "Keep output in the same language as input. "
             "Return only final improved transcript text. No quotes, no comments, no markdown."
         ),
@@ -477,6 +475,11 @@ def _upscale_instruction(preset: str) -> str:
             "Rewrite transcript into formal polished style. Keep structure and meaning, "
             "fix grammar and punctuation."
         )
+    if p in {"ai_code", "code", "programming"}:
+        return (
+            "Improve transcript for software engineering context. Preserve technical terms, commands, "
+            "identifiers, and model/tool names exactly; fix punctuation and grammar."
+        )
     return (
         "Clean transcript text: fix punctuation and grammar, remove stutters/fillers, "
         "keep original meaning and language."
@@ -497,12 +500,26 @@ def _write_upscale_preset(path: Path, payload: dict[str, Any]) -> None:
 
 def _ensure_builtin_upscale_presets() -> None:
     UPSCALE_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    # Remove deprecated builtin presets that are no longer supported.
+    for p in UPSCALE_PRESETS_DIR.glob("builtin_*.json"):
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            pid = str(raw.get("id") or p.stem).strip()
+            if not pid.startswith("builtin_"):
+                continue
+            short = pid.removeprefix("builtin_")
+            if short not in BUILTIN_UPSCALE_PRESETS:
+                p.unlink(missing_ok=True)
+        except Exception:
+            # Keep file if unreadable; it will be ignored later.
+            pass
     for pid, meta in BUILTIN_UPSCALE_PRESETS.items():
         path = UPSCALE_PRESETS_DIR / f"builtin_{pid}.json"
         payload = {
             "id": f"builtin_{pid}",
             "name": meta["name"],
             "instruction": meta["instruction"],
+            "default_instruction": meta["instruction"],
             "builtin": True,
         }
         if not path.exists():
@@ -513,13 +530,22 @@ def _ensure_builtin_upscale_presets() -> None:
             if not isinstance(cur, dict):
                 _write_upscale_preset(path, payload)
                 continue
-            # Keep default instruction fresh while preserving schema.
+            current_instruction = str(cur.get("instruction") or "").strip() or payload["instruction"]
+            next_payload = {
+                "id": payload["id"],
+                "name": payload["name"],
+                "instruction": current_instruction,
+                "default_instruction": payload["default_instruction"],
+                "builtin": True,
+            }
             if (
-                str(cur.get("name") or "").strip() != payload["name"]
-                or str(cur.get("instruction") or "").strip() != payload["instruction"]
+                str(cur.get("id") or "").strip() != next_payload["id"]
+                or str(cur.get("name") or "").strip() != next_payload["name"]
+                or str(cur.get("instruction") or "").strip() != next_payload["instruction"]
+                or str(cur.get("default_instruction") or "").strip() != next_payload["default_instruction"]
                 or bool(cur.get("builtin")) is not True
             ):
-                _write_upscale_preset(path, payload)
+                _write_upscale_preset(path, next_payload)
         except Exception:
             _write_upscale_preset(path, payload)
 
@@ -534,10 +560,12 @@ def _load_upscale_preset(path: Path) -> Optional[dict[str, Any]]:
         instruction = str(raw.get("instruction") or "").strip()
         if not pid or not name or not instruction:
             return None
+        default_instruction = str(raw.get("default_instruction") or "").strip() or instruction
         return {
             "id": pid,
             "name": name,
             "instruction": instruction,
+            "default_instruction": default_instruction,
             "builtin": bool(raw.get("builtin")),
         }
     except Exception:
@@ -733,16 +761,18 @@ async def create_job(
         temp_paths = []
         try:
             jobs.set_running(job_id)
-            # Convert to 16k wav; prefer stereo so we can split for calls.
-            wav_path = str(RESULTS_DIR / f"{job_id}.16k.wav")
-            temp_paths.append(wav_path)
-            ensure_wav_16k(
-                str(upload_path), wav_path, channels=2 if split_stereo else 1
-            )
-            jobs.set_progress(job_id, 0.15)
+            if split_stereo:
+                # Split flow: decode once to stereo, then run per-channel transcription.
+                wav_path = str(RESULTS_DIR / f"{job_id}.16k.wav")
+                temp_paths.append(wav_path)
+                ensure_wav_16k(str(upload_path), wav_path, channels=2)
+                jobs.set_progress(job_id, 0.15)
+                ch1, ch2 = split_channels(wav_path)
+            else:
+                ch1, ch2 = (None, None)
+                jobs.set_progress(job_id, 0.15)
 
-            ch1, ch2 = split_channels(wav_path) if split_stereo else (None, None)
-            if split_stereo and ch1 and ch2:
+            if ch1 and ch2:
                 temp_paths.extend([ch1, ch2])
                 jobs.set_progress(job_id, 0.2)
                 t1 = _transcribe_with_retry(
@@ -758,6 +788,7 @@ async def create_job(
                 jobs.set_progress(job_id, 0.25)
                 mono_wav = str(RESULTS_DIR / f"{job_id}.mono16k.wav")
                 temp_paths.append(mono_wav)
+                # Fast path: single mono conversion for default/local live flow.
                 ensure_wav_16k(str(upload_path), mono_wav, channels=1)
                 result = _transcribe_with_retry(
                     mono_wav, model, language=lang_opt, word_timestamps=word_timestamps
@@ -823,6 +854,78 @@ def _format_fal_transcript(result: dict) -> str:
     return "\n".join(lines).strip() or (result.get("text") or "").strip()
 
 
+def _run_remote_transcribe_once(
+    *,
+    provider_norm: str,
+    upload_path: Path,
+    orig_name: str,
+    language: Optional[str],
+    diarize: bool,
+    num_speakers: str,
+    openrouter_model: str,
+) -> dict[str, Any]:
+    cfg = load_config()
+    prov = (
+        provider_norm
+        or cfg.get("preferences", {}).get("remote_provider")
+        or "fal"
+    ).strip()
+
+    audio_bytes = upload_path.read_bytes()
+    if prov == "fal":
+        fal_key = ((cfg.get("providers") or {}).get("fal") or {}).get("key") or ""
+        pref = (cfg.get("preferences") or {}).get("fal") or {}
+        ns = None
+        if num_speakers.strip():
+            try:
+                ns = int(num_speakers.strip())
+            except Exception:
+                ns = None
+        if ns is None:
+            ns = pref.get("num_speakers")
+
+        out = fal_whisper_transcribe(
+            fal_key=fal_key,
+            audio_bytes=audio_bytes,
+            filename=orig_name,
+            task=pref.get("task") or "transcribe",
+            language=language,
+            diarize=bool(diarize)
+            if diarize is not None
+            else bool(pref.get("diarize", False)),
+            num_speakers=ns,
+            chunk_level=pref.get("chunk_level") or "none",
+            timeout_sec=600,
+        )
+        text = _format_fal_transcript(out)
+        return {
+            "provider": "fal",
+            "text": text,
+            "raw": out,
+        }
+
+    if prov == "openrouter":
+        or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
+        pref = (cfg.get("preferences") or {}).get("openrouter") or {}
+        model = (
+            openrouter_model or pref.get("model") or "google/gemini-2.5-flash"
+        ).strip()
+        out = openrouter_transcribe(
+            api_key=or_key,
+            model=model,
+            audio_bytes=audio_bytes,
+            filename=orig_name,
+        )
+        return {
+            "provider": "openrouter",
+            "model": model,
+            "text": (out.get("text") or "").strip(),
+            "raw": out.get("raw"),
+        }
+
+    raise Exception(f"Unknown provider: {prov}")
+
+
 @app.post("/api/remote/jobs")
 async def create_remote_job(
     _auth: None = Depends(_require_api_auth),
@@ -852,71 +955,16 @@ async def create_remote_job(
         try:
             jobs.set_running(job_id)
             jobs.set_progress(job_id, 0.05)
-
-            cfg = load_config()
-            prov = (
-                provider_norm
-                or cfg.get("preferences", {}).get("remote_provider")
-                or "fal"
-            ).strip()
-
-            audio_bytes = upload_path.read_bytes()
             jobs.set_progress(job_id, 0.15)
-            if prov == "fal":
-                fal_key = ((cfg.get("providers") or {}).get("fal") or {}).get(
-                    "key"
-                ) or ""
-                pref = (cfg.get("preferences") or {}).get("fal") or {}
-                ns = None
-                if num_speakers.strip():
-                    try:
-                        ns = int(num_speakers.strip())
-                    except Exception:
-                        ns = None
-                if ns is None:
-                    ns = pref.get("num_speakers")
-
-                out = fal_whisper_transcribe(
-                    fal_key=fal_key,
-                    audio_bytes=audio_bytes,
-                    filename=orig_name,
-                    task=pref.get("task") or "transcribe",
-                    language=lang_opt,
-                    diarize=bool(diarize)
-                    if diarize is not None
-                    else bool(pref.get("diarize", False)),
-                    num_speakers=ns,
-                    chunk_level=pref.get("chunk_level") or "none",
-                    timeout_sec=600,
-                )
-                text = _format_fal_transcript(out)
-                result = {
-                    "provider": "fal",
-                    "text": text,
-                    "raw": out,
-                }
-            elif prov == "openrouter":
-                or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get(
-                    "key"
-                ) or ""
-                pref = (cfg.get("preferences") or {}).get("openrouter") or {}
-                model = (
-                    openrouter_model or pref.get("model") or "google/gemini-2.5-flash"
-                ).strip()
-                out = openrouter_transcribe(
-                    api_key=or_key,
-                    model=model,
-                    audio_bytes=audio_bytes,
-                    filename=orig_name,
-                )
-                result = {
-                    "provider": "openrouter",
-                    "model": model,
-                    "text": (out.get("text") or "").strip(),
-                    "raw": out.get("raw"),
-                }
-            else:
-                raise Exception(f"Unknown provider: {prov}")
+            result = _run_remote_transcribe_once(
+                provider_norm=provider_norm,
+                upload_path=upload_path,
+                orig_name=orig_name,
+                language=lang_opt,
+                diarize=diarize,
+                num_speakers=num_speakers,
+                openrouter_model=openrouter_model,
+            )
 
             jobs.set_progress(job_id, 0.95)
             result_json_path = RESULTS_DIR / f"{job_id}.remote.json"
@@ -945,6 +993,48 @@ async def create_remote_job(
 
     jobs.submit(run)
     return {"job_id": job_id}
+
+
+@app.post("/api/remote/transcribe-sync")
+async def remote_transcribe_sync(
+    _auth: None = Depends(_require_api_auth),
+    file: UploadFile = File(...),
+    provider: str = Form(""),
+    language: str = Form("auto"),
+    diarize: bool = Form(False),
+    num_speakers: str = Form(""),
+    openrouter_model: str = Form(""),
+):
+    _cleanup_expired_files()
+    provider_norm = (provider or "").strip()
+    if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
+        raise HTTPException(status_code=400, detail="unsupported provider")
+
+    orig_name = _normalize_filename(file.filename or "audio.wav")
+    _validate_audio_filename(orig_name)
+    upload_path = UPLOADS_DIR / f"sync-{uuid.uuid4()}.{orig_name}"
+    await _save_upload_file(file, upload_path)
+    lang_opt = _normalize_language(language)
+    try:
+        result = _run_remote_transcribe_once(
+            provider_norm=provider_norm,
+            upload_path=upload_path,
+            orig_name=orig_name,
+            language=lang_opt,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            openrouter_model=openrouter_model,
+        )
+        return {"ok": True, "result": result}
+    except (FalRemoteError, OrRemoteError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Remote transcription failed: {e}")
+    finally:
+        try:
+            os.remove(upload_path)
+        except Exception:
+            pass
 
 
 @app.post("/api/upscale")
@@ -1024,6 +1114,8 @@ def list_upscale_presets(_auth: None = Depends(_require_api_auth)):
                 "id": x["id"],
                 "name": x["name"],
                 "builtin": bool(x["builtin"]),
+                "instruction": str(x.get("instruction") or ""),
+                "default_instruction": str(x.get("default_instruction") or x.get("instruction") or ""),
             }
             for x in items
         ]
@@ -1060,10 +1152,56 @@ def create_upscale_preset(payload: dict = Body(...), _auth: None = Depends(_requ
         "id": preset_id,
         "name": name[:60],
         "instruction": instruction,
+        "default_instruction": instruction,
         "builtin": False,
     }
     _write_upscale_preset(_upscale_preset_path(preset_id), payload_out)
-    return {"ok": True, "item": {"id": payload_out["id"], "name": payload_out["name"], "builtin": False}}
+    return {
+        "ok": True,
+        "item": {
+            "id": payload_out["id"],
+            "name": payload_out["name"],
+            "builtin": False,
+            "instruction": payload_out["instruction"],
+            "default_instruction": payload_out["default_instruction"],
+        },
+    }
+
+
+@app.put("/api/upscale/presets/{preset_id}")
+def update_upscale_preset(preset_id: str, payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+    _ensure_builtin_upscale_presets()
+    item = _resolve_upscale_preset(preset_id)
+    instruction = str(payload.get("instruction") or "").strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="preset instruction is required")
+    next_payload = {
+        "id": item["id"],
+        "name": str(item.get("name") or "").strip()[:60],
+        "instruction": instruction,
+        "default_instruction": str(item.get("default_instruction") or item.get("instruction") or instruction).strip() or instruction,
+        "builtin": bool(item.get("builtin")),
+    }
+    _write_upscale_preset(_upscale_preset_path(item["id"]), next_payload)
+    return {"ok": True, "item": next_payload}
+
+
+@app.post("/api/upscale/presets/{preset_id}/reset-default")
+def reset_upscale_preset_default(preset_id: str, _auth: None = Depends(_require_api_auth)):
+    _ensure_builtin_upscale_presets()
+    item = _resolve_upscale_preset(preset_id)
+    default_instruction = str(item.get("default_instruction") or item.get("instruction") or "").strip()
+    if not default_instruction:
+        raise HTTPException(status_code=500, detail="preset default instruction is empty")
+    next_payload = {
+        "id": item["id"],
+        "name": str(item.get("name") or "").strip()[:60],
+        "instruction": default_instruction,
+        "default_instruction": default_instruction,
+        "builtin": bool(item.get("builtin")),
+    }
+    _write_upscale_preset(_upscale_preset_path(item["id"]), next_payload)
+    return {"ok": True, "item": next_payload}
 
 
 @app.delete("/api/upscale/presets/{preset_id}")

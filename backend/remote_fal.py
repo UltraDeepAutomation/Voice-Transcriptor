@@ -20,7 +20,8 @@ def _request_with_retry(method: str, url: str, retries: int = 3, **kwargs):
             last_err = e
             if attempt == retries - 1:
                 break
-            time.sleep(0.8 * (attempt + 1))
+            # First retry is fast (0.3s), subsequent retries use longer backoff.
+            time.sleep(0.3 if attempt == 0 else 0.8 * attempt)
     raise RemoteError(f"network error: {last_err}")
 
 
