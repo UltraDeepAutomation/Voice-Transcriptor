@@ -1,6 +1,6 @@
 import "./styles.css";
 
-type Provider = "local" | "fal" | "openrouter" | "groq";
+type Provider = "local" | "fal" | "openrouter" | "groq" | "deepgram";
 type JobStatus = "queued" | "running" | "done" | "error";
 
 interface JobResultPayload {
@@ -28,6 +28,7 @@ interface AppConfig {
     fal?: { key?: string };
     openrouter?: { key?: string };
     groq?: { key?: string };
+    deepgram?: { key?: string };
   };
   _meta?: {
     config_path?: string;
@@ -305,6 +306,7 @@ function getRemoteModelValue(provider: Provider): string {
   }
   if (provider === "fal") return "fal-ai/whisper";
   if (provider === "groq") return "whisper-large-v3-turbo";
+  if (provider === "deepgram") return "nova-3";
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
@@ -323,6 +325,30 @@ function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
     falOpt.textContent = "fal-ai/whisper";
     sel.appendChild(falOpt);
     sel.value = "fal-ai/whisper";
+    return;
+  }
+  if (provider === "groq") {
+    sel.hidden = false;
+    sel.innerHTML = "";
+    for (const m of ["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"]) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      sel.appendChild(o);
+    }
+    sel.value = "whisper-large-v3-turbo";
+    return;
+  }
+  if (provider === "deepgram") {
+    sel.hidden = false;
+    sel.innerHTML = "";
+    for (const m of ["nova-3", "nova-2", "whisper-large"]) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      sel.appendChild(o);
+    }
+    sel.value = "nova-3";
     return;
   }
   const preferred =
@@ -855,12 +881,15 @@ async function loadCfg(): Promise<void> {
     const falK = ((cfg.providers || {}).fal || {}).key;
     const orK = ((cfg.providers || {}).openrouter || {}).key;
     const groqK = ((cfg.providers || {}).groq || {}).key;
+    const dgK = ((cfg.providers || {}).deepgram || {}).key;
     ($("falKey") as HTMLInputElement).placeholder = falK ? "(saved)" : "FAL_KEY";
     ($("orKey") as HTMLInputElement).placeholder = orK ? "(saved)" : "OPENROUTER_API_KEY";
     ($("groqKey") as HTMLInputElement).placeholder = groqK ? "(saved)" : "GROQ_API_KEY";
+    ($("deepgramKey") as HTMLInputElement).placeholder = dgK ? "(saved)" : "DEEPGRAM_API_KEY";
     ($("falKey") as HTMLInputElement).value = "";
     ($("orKey") as HTMLInputElement).value = "";
     ($("groqKey") as HTMLInputElement).value = "";
+    ($("deepgramKey") as HTMLInputElement).value = "";
     $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
@@ -922,6 +951,7 @@ async function saveCfg(): Promise<void> {
       fal: { key: ($("falKey") as HTMLInputElement).value.trim() },
       openrouter: { key: ($("orKey") as HTMLInputElement).value.trim() },
       groq: { key: ($("groqKey") as HTMLInputElement).value.trim() },
+      deepgram: { key: ($("deepgramKey") as HTMLInputElement).value.trim() },
     },
     preferences: {
       remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "fal").trim() || "fal"),
@@ -935,6 +965,7 @@ async function saveCfg(): Promise<void> {
   ($("falKey") as HTMLInputElement).value = "";
   ($("orKey") as HTMLInputElement).value = "";
   ($("groqKey") as HTMLInputElement).value = "";
+  ($("deepgramKey") as HTMLInputElement).value = "";
   await loadCfg();
   $("cfgMsg").textContent = "Saved";
 }
@@ -1380,6 +1411,65 @@ let capturePeakMax = 0;
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 
+// ── Chunked transcription pipeline ──────────────────────────────────────────
+// During recording with a remote provider, we send audio in ~8 second chunks
+// for parallel transcription. By the time the user stops, ~90% of text is ready.
+const CHUNK_INTERVAL_MS = 8_000;
+let chunkTimer: number | null = null;
+let chunkTranscriptions: string[] = [];  // ordered partial results
+let chunkLastSentSamples = 0;             // how many samples already sent
+let chunkPendingCount = 0;                // in-flight requests
+
+function chunkTranscribeSchedulerTick(): void {
+  const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const effectiveProvider = resolveEffectiveProvider(providerValue);
+  if (effectiveProvider === "local" || !effectiveProvider || !isRecording) return;
+  // Count total samples accumulated
+  let totalSamples = 0;
+  for (const c of chunks) totalSamples += c.length;
+  // Only send if we have at least 1 second of new audio (16000 samples)
+  const newSamples = totalSamples - chunkLastSentSamples;
+  if (newSamples < 16000) return;
+  // Extract only the new audio since last send
+  const allMerged = new Float32Array(totalSamples);
+  let off = 0;
+  for (const c of chunks) { allMerged.set(c, off); off += c.length; }
+  const newAudio = allMerged.slice(chunkLastSentSamples);
+  const chunkIndex = chunkTranscriptions.length;
+  chunkTranscriptions.push("");  // placeholder
+  chunkLastSentSamples = totalSamples;
+  chunkPendingCount++;
+  // Fire-and-forget background transcription
+  const audioBlob = encodeCompactWav(newAudio, 16000, 8000);
+  const file = new File([audioBlob], `chunk-${chunkIndex}.wav`, { type: audioBlob.type });
+  remoteJobSync(file, {
+    provider: effectiveProvider,
+    language: ($("language") as HTMLSelectElement).value,
+    diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+    openrouterModel: getRemoteModelValue(effectiveProvider),
+  }).then((r) => {
+    chunkTranscriptions[chunkIndex] = r.text;
+    chunkPendingCount--;
+  }).catch(() => {
+    chunkPendingCount--;
+  });
+}
+
+function startChunkScheduler(): void {
+  stopChunkScheduler();
+  chunkTranscriptions = [];
+  chunkLastSentSamples = 0;
+  chunkPendingCount = 0;
+  const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const effectiveProvider = resolveEffectiveProvider(providerValue);
+  if (effectiveProvider === "local" || !effectiveProvider) return;
+  chunkTimer = window.setInterval(chunkTranscribeSchedulerTick, CHUNK_INTERVAL_MS);
+}
+
+function stopChunkScheduler(): void {
+  if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
+}
+
 function publishFinishedRecording(recordingId: number, text: string): void {
   const rid = Math.max(0, Number(recordingId || 0));
   const payload = String(text || "").trim();
@@ -1471,6 +1561,7 @@ async function startLive(): Promise<void> {
   setBusy(true);
   isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
+  startChunkScheduler();
   window.__transcriptorIsRecording = true;
   window.__transcriptorLastFinishedText = "";
   window.__transcriptorLastFinishedAt = 0;
@@ -1672,6 +1763,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.006 && capturePeakMax < 0.08;
   const silentCapture = captureFrameCount < 6 || hardSilence || likelySilenceWithoutPreview;
 
+  stopChunkScheduler();
   // Let the last worklet buffers arrive before disconnecting graph.
   await waitForWorkletDrain();
   if (timer) {
@@ -1843,15 +1935,63 @@ async function stopLive(enhance: boolean): Promise<void> {
       applyJobResult(j);
       transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
     } else {
-      $("progressFill").style.width = "65%";
-      $("progressText").textContent = "65%";
-      const syncOut = await remoteJobSync(file, {
-        provider,
-        language: ($("language") as HTMLSelectElement).value,
-        diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-        openrouterModel: getRemoteModelValue(provider),
-      });
-      transcriptRaw = String(syncOut.text || "").trim();
+      // Remote provider — use chunked transcription if chunks were pre-transcribed.
+      const hasPreTranscribed = chunkTranscriptions.length > 0;
+      let tailText = "";
+
+      // Transcribe the remaining tail audio (samples not yet sent by the scheduler).
+      let totalSamples = 0;
+      for (const c of chunks) totalSamples += c.length;
+      const remainingSamples = totalSamples - chunkLastSentSamples;
+      if (remainingSamples > 1600) { // at least 0.1 second of audio
+        const allMerged = new Float32Array(totalSamples);
+        let mOff = 0;
+        for (const c of chunks) { allMerged.set(c, mOff); mOff += c.length; }
+        const tailAudio = allMerged.slice(chunkLastSentSamples);
+        const tailBlob = encodeCompactWav(tailAudio, 16000, 8000);
+        const tailFile = new File([tailBlob], `tail-${Date.now()}.wav`, { type: tailBlob.type });
+        try {
+          const tailResult = await remoteJobSync(tailFile, {
+            provider,
+            language: ($("language") as HTMLSelectElement).value,
+            diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+            openrouterModel: getRemoteModelValue(provider),
+          });
+          tailText = String(tailResult.text || "").trim();
+        } catch { }
+      }
+
+      // Wait for any in-flight chunk transcriptions to finish (max 8s).
+      if (chunkPendingCount > 0) {
+        const deadline = Date.now() + 8000;
+        while (chunkPendingCount > 0 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+
+      if (hasPreTranscribed) {
+        // Merge all chunk results + tail.
+        const parts = [...chunkTranscriptions.filter(Boolean)];
+        if (tailText) parts.push(tailText);
+        transcriptRaw = parts.join(" ").trim();
+      } else {
+        // No chunks were pre-transcribed (recording was too short) — use tail result.
+        if (tailText) {
+          transcriptRaw = tailText;
+        } else {
+          // Fallback: send entire recording.
+          $("progressFill").style.width = "65%";
+          $("progressText").textContent = "65%";
+          const syncOut = await remoteJobSync(file, {
+            provider,
+            language: ($("language") as HTMLSelectElement).value,
+            diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+            openrouterModel: getRemoteModelValue(provider),
+          });
+          transcriptRaw = String(syncOut.text || "").trim();
+        }
+      }
+
       $("finalOutput").textContent = transcriptRaw;
       $("progressFill").style.width = "100%";
       $("progressText").textContent = "100%";

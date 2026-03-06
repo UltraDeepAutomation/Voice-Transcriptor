@@ -555,12 +555,9 @@ function createOverlayHtml() {
           justify-content:space-between;
           opacity:0;
           pointer-events:none;
-          transform:translateY(-3px) scale(0.98);
-          transition:opacity .18s ease, transform .22s ease;
         }
         #queuePill.on{
           opacity:1;
-          transform:translateY(0) scale(1);
         }
         #queueWave{
           width:54px;
@@ -594,15 +591,11 @@ function createOverlayHtml() {
           min-width:0;
           opacity:1;
           overflow:hidden;
-          transition:max-width .22s ease, opacity .18s ease, margin-right .22s ease, transform .22s ease;
-          transform:translateX(0);
-          margin-right:0;
         }
         #pill.qs-closed #quickPanel{
           max-width:0;
           opacity:0;
           margin-right:-6px;
-          transform:translateX(8px);
           pointer-events:none;
         }
         #quickUpscaleCapsule{

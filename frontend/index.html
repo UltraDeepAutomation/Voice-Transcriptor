@@ -69,7 +69,8 @@
                 <span class="quick-lbl">Provider</span>
                 <select id="quickProviderSelect">
                   <option value="local">Local (Whisper)</option>
-                  <option value="groq">Groq (Fastest)</option>
+                  <option value="deepgram">Deepgram (Fastest)</option>
+                  <option value="groq">Groq</option>
                   <option value="fal">fal.ai</option>
                   <option value="openrouter">OpenRouter</option>
                   <option value="">None</option>
@@ -125,7 +126,8 @@
                 <div class="pane-actions">
                   <select id="providerSelect">
                     <option value="local">Local (Whisper)</option>
-                    <option value="groq">Groq (Fastest)</option>
+                    <option value="deepgram">Deepgram (Fastest)</option>
+                    <option value="groq">Groq</option>
                     <option value="fal">fal.ai</option>
                     <option value="openrouter">OpenRouter</option>
                     <option value="">None</option>
@@ -297,6 +299,8 @@
             <p class="hint">Stored locally on this Mac</p>
             <p class="hint" id="configPathLabel">Config: -</p>
             <div class="field-stack">
+              <label class="field"><span class="lbl">Deepgram</span><input id="deepgramKey" type="password"
+                  placeholder="DEEPGRAM_API_KEY" /></label>
               <label class="field"><span class="lbl">Groq</span><input id="groqKey" type="password"
                   placeholder="GROQ_API_KEY" /></label>
               <label class="field"><span class="lbl">fal.ai</span><input id="falKey" type="password"
