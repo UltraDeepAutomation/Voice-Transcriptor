@@ -341,7 +341,14 @@ def _is_broken_pipe_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, OSError) and getattr(exc, "errno", None) == 32:
         return True
-    return "broken pipe" in msg or "errno 32" in msg
+    if "broken pipe" in msg or "errno 32" in msg:
+        return True
+    # Harmless race on websocket shutdown: sender tries to push after close.
+    if "unexpected asgi message 'websocket.send'" in msg:
+        return True
+    if "after sending 'websocket.close'" in msg:
+        return True
+    return False
 
 
 def _transcribe_with_retry(

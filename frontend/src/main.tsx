@@ -93,6 +93,8 @@ declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
     __transcriptorVuLevel?: number;
+    __transcriptorRmsLevel?: number;
+    __transcriptorLastFrameAt?: number;
     __transcriptorIsRecording?: boolean;
     __transcriptorLastFinishedText?: string;
     __transcriptorLastFinishedAt?: number;
@@ -729,6 +731,7 @@ function draw(): void {
 
 let vu = 0;
 function setVU(rms: number): void {
+  window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(rms) ? rms : 0);
   vu = vu * 0.7 + rms * 0.3;
   const pct = Math.min(100, vu * 400);
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, vu * UI_TOKENS.capture.vuAmplify));
@@ -738,6 +741,7 @@ function setVU(rms: number): void {
 
 function resetVU(): void {
   vu = 0;
+  window.__transcriptorRmsLevel = 0;
   window.__transcriptorVuLevel = 0;
   setVU(0);
 }
@@ -1588,6 +1592,13 @@ function stopChunkScheduler(): void {
 function publishFinishedRecording(recordingId: number, text: string): void {
   const rid = Math.max(0, Number(recordingId || 0));
   const payload = String(text || "").trim();
+  const lower = payload.toLowerCase();
+  const invalid =
+    !payload ||
+    lower === "error" ||
+    lower === "[websocket error]" ||
+    lower.startsWith("http ");
+  if (invalid) return;
   if (!rid || !payload) return;
   const finishedAt = Date.now();
   window.__transcriptorLastFinishedText = payload;
@@ -1630,6 +1641,7 @@ function applyJobResult(j: JobResponse): void {
 function pushCapturedFrame(input: Float32Array): void {
   if (!(input instanceof Float32Array) || !input.length) return;
   workletLastFrameAt = Date.now();
+  window.__transcriptorLastFrameAt = workletLastFrameAt;
   let sum = 0;
   let peak = 0;
   for (let i = 0; i < input.length; i++) {
@@ -1680,6 +1692,7 @@ async function startLive(): Promise<void> {
   currentRecordingId = ++liveRecordingSeq;
   startChunkScheduler();
   window.__transcriptorIsRecording = true;
+  window.__transcriptorLastFrameAt = Date.now();
   window.__transcriptorLastFinishedText = "";
   window.__transcriptorLastFinishedAt = 0;
   window.__transcriptorCurrentRecordingId = currentRecordingId;
@@ -1690,6 +1703,8 @@ async function startLive(): Promise<void> {
   (document.getElementById("btnStop") as HTMLButtonElement).disabled = false;
   setStatus("Starting");
   window.__transcriptorVuLevel = 0;
+  window.__transcriptorRmsLevel = 0;
+  window.__transcriptorLastFrameAt = 0;
 
   startAt = Date.now();
   persistLiveDraft(true);
@@ -1870,6 +1885,8 @@ async function waitForWorkletDrain(
 async function stopLive(enhance: boolean): Promise<void> {
   const recordingId = currentRecordingId;
   const sourceLiveText = ($("liveOutput").textContent || "").trim();
+  const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
+  const recordedSec = recordedMs / 1000;
   const title = "Recording " + new Date().toLocaleString();
   const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const languageValue = ($("language") as HTMLSelectElement).value;
@@ -1881,8 +1898,12 @@ async function stopLive(enhance: boolean): Promise<void> {
   const avgCaptureRms = captureFrameCount > 0 ? captureRmsAccum / captureFrameCount : 0;
   const noLiveText = !sourceLiveText;
   const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
-  const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.006 && capturePeakMax < 0.08;
-  const silentCapture = captureFrameCount < 6 || hardSilence || likelySilenceWithoutPreview;
+  const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.003 && capturePeakMax < 0.045;
+  const tooShortToTrust = recordedSec < 1.25;
+  const silentCapture =
+    captureFrameCount < 6 ||
+    (tooShortToTrust && hardSilence) ||
+    (tooShortToTrust && likelySilenceWithoutPreview);
 
   stopChunkScheduler();
   // Let the last worklet buffers arrive before disconnecting graph.
@@ -1947,6 +1968,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   autoStopTriggered = false;
   currentRecordingId = 0;
   window.__transcriptorIsRecording = false;
+  window.__transcriptorRmsLevel = 0;
+  window.__transcriptorLastFrameAt = 0;
   window.__transcriptorCurrentRecordingId = 0;
   setRecordButton(false);
   waveFrameCount = 0;

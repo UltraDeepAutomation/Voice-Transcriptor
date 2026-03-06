@@ -34,6 +34,14 @@ let overlayQuickUpscaleEnabled = false;
 let overlayQuickAutoSend = false;
 let overlayQuickAutoSendInitialized = false;
 let overlayQuickSettingsInitialized = false;
+let overlaySilenceStartedAt = 0;
+let overlayAutoStopConfig = { enabled: false, seconds: 2, thresholdDb: -42 };
+let overlayAutoStopUiActive = false;
+let overlayAutoStopConfigRefreshAt = 0;
+let overlayRecordingStartedAt = 0;
+let overlaySeenAudioFrames = false;
+let overlaySpeechRecoveryStartedAt = 0;
+let overlayAutoStopYellowSince = 0;
 let lastOverlayUiInteractionAt = 0;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
@@ -41,7 +49,7 @@ let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
 let micPermissionChecked = false;
-const OVERLAY_FIXED_HEIGHT = 62;
+const OVERLAY_FIXED_HEIGHT = 96;
 
 const HOST = "127.0.0.1";
 let PORT = 8321;
@@ -51,14 +59,14 @@ const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
     collapsedWidth: 320,
-    expandedWidth: 374,
+    expandedWidth: 320,
     height: 47,
     bottomOffset: 10,
   }),
   pill: Object.freeze({
     marginTop: 6,
     gap: 9,
-    padY: 6,
+    padY: 7,
     padX: 10,
     borderRadius: 999,
     border: "1px solid rgba(255,255,255,.18)",
@@ -124,6 +132,15 @@ function textDigest(input) {
     h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function isMeaningfulTranscriptText(value) {
+  const txt = String(value || "").trim();
+  if (!txt) return false;
+  const lower = txt.toLowerCase();
+  if (lower === "error" || lower === "[websocket error]" || lower === "[silence]") return false;
+  if (lower.startsWith("http ") || lower.startsWith("network error")) return false;
+  return true;
 }
 
 function createTrace(scope, seed = {}) {
@@ -348,6 +365,37 @@ async function getRendererAutoSendEnterEnabled() {
   }
 }
 
+async function getRendererAutoStopSilenceConfig() {
+  if (!win || win.isDestroyed() || !win.webContents) {
+    return { enabled: false, seconds: 2, thresholdDb: -42 };
+  }
+  try {
+    const out = await win.webContents.executeJavaScript(
+      `
+      (() => {
+        const enabledEl = document.getElementById('autoStopSilenceEnabled');
+        const secEl = document.getElementById('autoStopSilenceSeconds');
+        const dbEl = document.getElementById('autoStopSilenceDb');
+        const enabled = !!(enabledEl && enabledEl.checked);
+        const secRaw = Number(secEl ? secEl.value : 2);
+        const dbRaw = Number(dbEl ? dbEl.value : -42);
+        const seconds = Math.min(120, Math.max(1, Number.isFinite(secRaw) ? Math.round(secRaw) : 2));
+        const thresholdDb = Math.min(-10, Math.max(-80, Number.isFinite(dbRaw) ? Math.round(dbRaw) : -42));
+        return { enabled, seconds, thresholdDb };
+      })();
+      `,
+      true
+    );
+    return {
+      enabled: !!out?.enabled,
+      seconds: Number.isFinite(Number(out?.seconds)) ? Number(out.seconds) : 2,
+      thresholdDb: Number.isFinite(Number(out?.thresholdDb)) ? Number(out.thresholdDb) : -42,
+    };
+  } catch {
+    return { enabled: false, seconds: 2, thresholdDb: -42 };
+  }
+}
+
 async function setRendererUpscalePresetChoice(presetId) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const target = String(presetId || "").trim();
@@ -539,20 +587,24 @@ function createOverlayHtml() {
         <canvas id="queueWave" width="${t.wave.width}" height="12"></canvas>
         <span id="queueTimer">00:00</span>
       </div>
-      <div id="pill">
-        <div id="quickPanel">
-          <div id="quickUpscaleCapsule" title="Upscale settings">
-            <input id="quickUpscaleToggle" type="checkbox" />
-            <span id="quickUpscaleOffLabel">Upscale</span>
-            <div id="quickUpscaleDrop">
-              <button id="quickUpscaleBtn" type="button" aria-label="Upscale preset">
-                <span id="quickUpscaleBtnText">Clean</span>
-              </button>
-              <div id="quickUpscaleMenu"></div>
+      <div id="settingsSlot">
+        <div id="settingsPill">
+          <div id="quickPanel">
+            <div id="quickUpscaleCapsule" title="Upscale settings">
+              <input id="quickUpscaleToggle" type="checkbox" />
+              <span id="quickUpscaleOffLabel">Upscale</span>
+              <div id="quickUpscaleDrop">
+                <button id="quickUpscaleBtn" type="button" aria-label="Upscale preset">
+                  <span id="quickUpscaleBtnText">Clean</span>
+                </button>
+                <div id="quickUpscaleMenu"></div>
+              </div>
             </div>
+            <button id="quickSendEnterBtn" aria-label="Auto send after paste" title="Auto send after paste"></button>
           </div>
-          <button id="quickSendEnterBtn" aria-label="Auto send after paste" title="Auto send after paste"></button>
         </div>
+      </div>
+      <div id="pill">
         <div id="core">
           <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
           <canvas id="wave" width="${t.wave.width}" height="${t.wave.height}"></canvas>
@@ -606,6 +658,31 @@ function createOverlayHtml() {
         #queuePill.on{
           opacity:1;
         }
+        #settingsSlot{
+          width:100%;
+          height:34px;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          margin-bottom:2px;
+        }
+        #settingsPill{
+          width:fit-content;
+          min-height:22px;
+          padding:6px 8px;
+          border-radius:999px;
+          border:1px solid #333;
+          background:#161616;
+          opacity:0;
+          pointer-events:none;
+          transform:translateY(-5px) scale(.985);
+          transition:opacity .12s ease, transform .12s ease;
+        }
+        #settingsSlot.on #settingsPill{
+          opacity:1;
+          pointer-events:auto;
+          transform:translateY(-2px) scale(1);
+        }
         #queueWave{
           width:${t.wave.width}px;
           height:12px;
@@ -636,15 +713,8 @@ function createOverlayHtml() {
           gap:4px;
           max-width:230px;
           min-width:0;
-          opacity:1;
           overflow:hidden;
           flex:0 0 auto;
-        }
-        #pill.qs-closed #quickPanel{
-          display:none;
-          width:0;
-          opacity:0;
-          pointer-events:none;
         }
         #quickUpscaleCapsule{
           display:inline-flex;
@@ -912,6 +982,15 @@ function createOverlayHtml() {
           box-shadow:0 0 10px rgba(173,112,255,.34), inset 0 0 6px rgba(173,112,255,.26);
           animation:transBlob 1.05s ease-in-out infinite;
         }
+        #stateIcon.autostop::before{
+          background:rgba(255,196,74,.98);
+          box-shadow:0 0 8px rgba(255,196,74,.46);
+        }
+        #stateIcon.autostop::after{
+          opacity:1;
+          border:1px solid rgba(255,196,74,.66);
+          animation:okHalo .8s ease-out infinite;
+        }
         #stateIcon.ok::before{
           background:rgba(112,210,136,.96);
           box-shadow:0 0 8px rgba(112,210,136,.4);
@@ -986,6 +1065,7 @@ function createOverlayHtml() {
         const qCv = document.getElementById('queueWave');
         const qCtx = qCv.getContext('2d');
         const qTimer = document.getElementById('queueTimer');
+        const settingsSlot = document.getElementById('settingsSlot');
         const pill = document.getElementById('pill');
         const stateIcon = document.getElementById('stateIcon');
         const gearBtn = document.getElementById('gearBtn');
@@ -1085,8 +1165,14 @@ function createOverlayHtml() {
         };
         window.setStatus = (s) => {
           const raw = String(s || '').trim().toLowerCase();
-          activeWave = raw === 'starting' || raw === 'recording';
-          waveMode = raw === 'transcribing' ? 'transcribing' : (raw === 'upscaling' ? 'upscaling' : (activeWave ? 'recording' : 'idle'));
+          activeWave = raw === 'starting' || raw === 'recording' || raw === 'auto stop';
+          waveMode = raw === 'transcribing'
+            ? 'transcribing'
+            : (raw === 'upscaling'
+              ? 'upscaling'
+              : (raw === 'auto stop'
+                ? 'autostop'
+                : (activeWave ? 'recording' : 'idle')));
           stateIcon.className = '';
           if (raw === 'starting' || raw === 'recording') {
             stateIcon.classList.add('rec');
@@ -1094,6 +1180,8 @@ function createOverlayHtml() {
             stateIcon.classList.add('transcribing');
           } else if (raw === 'upscaling') {
             stateIcon.classList.add('upscaling');
+          } else if (raw === 'auto stop') {
+            stateIcon.classList.add('autostop');
           } else if (raw === 'paste sent' || raw === 'pasted' || raw === 'sent' || raw === 'done' || raw === 'saved to app') {
             stateIcon.classList.add('ok');
           } else if (raw === 'paste failed' || raw === 'grant access' || raw === 'secure field' || raw === 'no text focus' || raw === 'clipboard error') {
@@ -1104,8 +1192,7 @@ function createOverlayHtml() {
         };
         window.setQuickOpen = (open) => {
           const on = !!open;
-          pill.classList.toggle('qs-open', on);
-          pill.classList.toggle('qs-closed', !on);
+          settingsSlot.classList.toggle('on', on);
           gearBtn.classList.toggle('on', on);
         };
         window.setUpscaleEnabled = (enabled) => {
@@ -1143,7 +1230,7 @@ function createOverlayHtml() {
           quickSendEnterBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
         };
         gearBtn.addEventListener('click', () => {
-          const next = !pill.classList.contains('qs-open');
+          const next = !settingsSlot.classList.contains('on');
           window.setQuickOpen(next);
           document.title = '__overlay_settings__' + (next ? '1' : '0');
         });
@@ -1219,6 +1306,8 @@ function createOverlayHtml() {
             const y = (waveH - h) / 2;
             if (waveMode === 'recording') {
               ctx.fillStyle = 'rgba(255,77,77,.88)';
+            } else if (waveMode === 'autostop') {
+              ctx.fillStyle = 'rgba(255,196,74,.92)';
             } else if (waveMode === 'transcribing') {
               ctx.fillStyle = 'rgba(114,174,255,.92)';
             } else if (waveMode === 'upscaling') {
@@ -1454,8 +1543,13 @@ async function syncOverlayQueueVisual(recordingHint = null) {
 
 async function showRecordingOverlay() {
   suppressActivateDuringOverlayFlow = true;
-  // Always start a new recording with a stable collapsed capsule layout.
-  overlayQuickSettingsOpen = false;
+  // Preserve user's last quick-settings open/closed choice across runs.
+  overlaySilenceStartedAt = 0;
+  overlayAutoStopConfigRefreshAt = 0;
+  overlayRecordingStartedAt = Date.now();
+  overlaySeenAudioFrames = false;
+  overlaySpeechRecoveryStartedAt = 0;
+  overlayAutoStopYellowSince = 0;
   pasteTargetAppName = "";
   pasteTargetAppPid = 0;
   const front = await getFrontmostAppInfo();
@@ -1476,6 +1570,8 @@ async function showRecordingOverlay() {
     overlayQuickAutoSend = await getRendererAutoSendEnterEnabled();
     overlayQuickAutoSendInitialized = true;
   }
+    overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
+    overlayAutoStopUiActive = false;
   if (!overlayQuickSettingsInitialized) {
     const rendererQuickOpen = await getRendererQuickSettingsOpen();
     if (rendererQuickOpen !== null) {
@@ -1505,12 +1601,100 @@ async function showRecordingOverlay() {
     if (!win || win.isDestroyed() || !win.webContents) return;
     win.webContents
       .executeJavaScript(
-        `(() => { const lv = Number(window.__transcriptorVuLevel || 0); return Number.isFinite(lv) ? lv : 0; })();`,
+        `(() => {
+          const vu = Number(window.__transcriptorVuLevel || 0);
+          const rms = Number(window.__transcriptorRmsLevel || 0);
+          const lastFrameAt = Number(window.__transcriptorLastFrameAt || 0);
+          const isRec = !!window.__transcriptorIsRecording;
+          return {
+            vu: Number.isFinite(vu) ? vu : 0,
+            rms: Number.isFinite(rms) ? rms : 0,
+            lastFrameAt: Number.isFinite(lastFrameAt) ? lastFrameAt : 0,
+            isRec
+          };
+        })();`,
         true
       )
-      .then((lv) => {
+      .then((state) => {
         if (!overlayWin || overlayWin.isDestroyed()) return;
-        const safeLevel = Math.max(0, Math.min(1, Number(lv) || 0));
+        const safeLevel = Math.max(0, Math.min(1, Number(state?.vu) || 0));
+        const safeRms = Math.max(0, Number(state?.rms) || 0);
+        const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
+        const isRec = !!state?.isRec;
+        const cfg = overlayAutoStopConfig || { enabled: false, seconds: 2, thresholdDb: -42 };
+        const now = Date.now();
+        if (safeLastFrameAt > 0) overlaySeenAudioFrames = true;
+        if (now - overlayAutoStopConfigRefreshAt > 1200) {
+          overlayAutoStopConfigRefreshAt = now;
+          getRendererAutoStopSilenceConfig().then((nextCfg) => {
+            overlayAutoStopConfig = nextCfg;
+          }).catch(() => { });
+        }
+        if (!isRec || !cfg.enabled || overlayStopInFlight) {
+          overlaySilenceStartedAt = 0;
+          overlaySpeechRecoveryStartedAt = 0;
+          overlayAutoStopYellowSince = 0;
+          if (overlayAutoStopUiActive) {
+            overlayAutoStopUiActive = false;
+            overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Recording");`, true).catch(() => { });
+          }
+        } else {
+          const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
+          const warmupMs = 1200;
+          if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
+            overlaySilenceStartedAt = 0;
+            overlaySpeechRecoveryStartedAt = 0;
+            overlayAutoStopYellowSince = 0;
+            if (overlayAutoStopUiActive) {
+              overlayAutoStopUiActive = false;
+              overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Recording");`, true).catch(() => { });
+            }
+            overlayWin.webContents.executeJavaScript(
+              `window.setLevel(${safeLevel}); window.setQueueLevel && window.setQueueLevel(${safeLevel});`,
+              true
+            ).catch(() => { });
+            return;
+          }
+          const silentByDb = safeRms <= thresholdRms;
+          const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 1400;
+          const consideredSilent = silentByDb || staleAudioFrames;
+          if (!consideredSilent) {
+            overlaySilenceStartedAt = 0;
+            overlaySpeechRecoveryStartedAt = 0;
+            overlayAutoStopYellowSince = 0;
+            if (overlayAutoStopUiActive) {
+              overlayAutoStopUiActive = false;
+              overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Recording");`, true).catch(() => { });
+            }
+          } else if (!overlaySilenceStartedAt) {
+            overlaySilenceStartedAt = now;
+            overlaySpeechRecoveryStartedAt = 0;
+            overlayAutoStopYellowSince = 0;
+          } else {
+            overlaySpeechRecoveryStartedAt = 0;
+            const silentElapsed = now - overlaySilenceStartedAt;
+            const armYellowAfterMs = Number(cfg.seconds) * 1000;
+            const yellowLeadMs = 500;
+            if (!overlayAutoStopUiActive && silentElapsed >= armYellowAfterMs) {
+              overlayAutoStopUiActive = true;
+              overlayAutoStopYellowSince = now;
+              overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Auto stop");`, true).catch(() => { });
+            }
+            if (overlayAutoStopUiActive && overlayAutoStopYellowSince > 0 && (now - overlayAutoStopYellowSince) >= yellowLeadMs) {
+            overlaySilenceStartedAt = 0;
+            overlayAutoStopUiActive = false;
+            overlaySpeechRecoveryStartedAt = 0;
+            overlayAutoStopYellowSince = 0;
+            overlayStopInFlight = true;
+            appendMainLog(`[overlay-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
+            stopRecordingFromOverlay().catch((e) => {
+              appendMainLog(`[overlay-autostop-error] ${compactLogText(e?.message || e)}`);
+              overlayStopInFlight = false;
+              hideRecordingOverlay();
+            });
+            }
+          }
+        }
         overlayWin.webContents.executeJavaScript(
           `window.setLevel(${safeLevel}); window.setQueueLevel && window.setQueueLevel(${safeLevel});`,
           true
@@ -1581,6 +1765,13 @@ function hideRecordingOverlay() {
   }
   overlayWin.hide();
   overlayStopInFlight = false;
+  overlaySilenceStartedAt = 0;
+  overlayAutoStopConfigRefreshAt = 0;
+  overlayRecordingStartedAt = 0;
+  overlaySeenAudioFrames = false;
+  overlaySpeechRecoveryStartedAt = 0;
+  overlayAutoStopYellowSince = 0;
+  overlayAutoStopUiActive = false;
   suppressActivateDuringOverlayFlow = false;
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
@@ -2485,6 +2676,16 @@ async function processPostStopTask(task) {
     const readyByTime = !!byTime || (task.recordingId <= 0 && state.finishedAt > stopRequestedAt);
     if (readyByRecording || readyByTime) {
       transcript = String(byRecording?.text || byTime?.text || state.finishedText || state.finalText || state.liveText || "").trim();
+      if (!isMeaningfulTranscriptText(transcript)) {
+        traceStep(trace, "signal_ready_ignored_non_transcript", {
+          pollCount,
+          textLen: transcript.length,
+          preview: compactLogText(transcript, 80),
+        });
+        transcript = "";
+        await sleep(30);
+        continue;
+      }
       traceStep(trace, "signal_ready", {
         pollCount,
         finishedAt: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0),
@@ -2503,6 +2704,11 @@ async function processPostStopTask(task) {
       !!(state.finalText && String(state.finalText).trim());
     if (canUseUnscopedFinalText) {
       transcript = String(state.finalText || "").trim();
+      if (!isMeaningfulTranscriptText(transcript)) {
+        transcript = "";
+        await sleep(30);
+        continue;
+      }
       traceStep(trace, "final_text_fallback_ready", {
         pollCount,
         textLen: transcript.length,
@@ -2520,6 +2726,11 @@ async function processPostStopTask(task) {
       !!(state.finalText && String(state.finalText).trim());
     if (canUseFinalTextFallback) {
       transcript = String(state.finalText || "").trim();
+      if (!isMeaningfulTranscriptText(transcript)) {
+        transcript = "";
+        await sleep(30);
+        continue;
+      }
       traceStep(trace, "final_text_recording_fallback", {
         pollCount,
         textLen: transcript.length,
