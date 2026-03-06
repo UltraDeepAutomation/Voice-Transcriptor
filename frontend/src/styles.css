@@ -221,6 +221,14 @@ select {
   background-position: right 10px center;
 }
 
+#remoteModelSelect,
+#providerSelect {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 select:focus,
 input:focus {
   border-color: #5f5f5f;
@@ -1035,17 +1043,17 @@ input:focus {
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
-  gap: 6px;
+  gap: 4px;
 }
 
 .stats-card {
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 6px;
   background: #1f1f1f;
-  padding: 6px 8px;
+  padding: 4px 6px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .stats-k {
@@ -1067,36 +1075,36 @@ input:focus {
 
 .stats-top {
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 6px;
   background: #1f1f1f;
-  padding: 6px 8px;
+  padding: 4px 6px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .stats-top .stats-k {
-  min-width: 65px;
+  min-width: 60px;
 }
 
 .stats-split {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 6px;
+  gap: 4px;
 }
 
 .top-words {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px;
 }
 
 .word-chip {
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 3px;
   background: #252525;
-  padding: 2px 6px;
-  font-size: 10px;
+  padding: 1px 4px;
+  font-size: 9px;
   font-weight: 500;
   color: var(--text-2);
 }

@@ -521,8 +521,6 @@ function createOverlayHtml() {
           align-items:center;
           gap:4px;
           margin:2px auto 0;
-          transform:scale(0.9);
-          transform-origin:top center;
         }
         #pill{
           width: fit-content;
@@ -533,8 +531,8 @@ function createOverlayHtml() {
           gap:6px;
           padding:6px 8px;
           border-radius:999px;
-          border:1px solid rgba(255,255,255,.2);
-          background:#1b1b1b;
+          border:1px solid #333;
+          background:#161616;
           box-shadow:none;
         }
         #core{
@@ -548,8 +546,8 @@ function createOverlayHtml() {
           height:18px;
           padding:2px 8px;
           border-radius:999px;
-          border:1px solid rgba(255,255,255,.16);
-          background:#191919;
+          border:1px solid #2e2e2e;
+          background:#141414;
           display:flex;
           align-items:center;
           justify-content:space-between;
@@ -569,7 +567,7 @@ function createOverlayHtml() {
         #queueTimer{
           font-size:9px;
           font-weight:700;
-          color:rgba(214,214,214,.9);
+          color:#d0d0d0;
           font-family:Menlo,ui-monospace,monospace;
           min-width:30px;
           text-align:right;
@@ -605,9 +603,9 @@ function createOverlayHtml() {
           padding:0 5px 0 3px;
           height:22px;
           border-radius:999px;
-          border:1px solid rgba(196,148,230,.28);
-          background:rgba(56,46,72,.38);
-          color:rgba(226,226,226,.92);
+          border:1px solid #3d2e52;
+          background:#2a2234;
+          color:#e0e0e0;
           white-space:nowrap;
           min-width:0;
           width:auto;
@@ -617,8 +615,8 @@ function createOverlayHtml() {
           width:28px;
           height:16px;
           border-radius:999px;
-          border:1px solid rgba(255,255,255,.2);
-          background:rgba(44,44,44,.92);
+          border:1px solid #333;
+          background:#2a2a2a;
           position:relative;
           outline:none;
           cursor:pointer;
@@ -631,12 +629,12 @@ function createOverlayHtml() {
           width:10px;
           height:10px;
           border-radius:999px;
-          background:rgba(212,212,212,.95);
+          background:#d2d2d2;
           transition:transform .14s ease;
         }
         #quickUpscaleToggle:checked{
-          background:rgba(142,84,226,.62);
-          border-color:rgba(176,128,236,.74);
+          background:#5a36a0;
+          border-color:#7a50c8;
         }
         #quickUpscaleToggle:checked::before{
           transform:translateX(12px);
@@ -653,10 +651,10 @@ function createOverlayHtml() {
         }
         #quickUpscaleBtn{
           appearance:none;
-          border:1px solid rgba(196,148,230,.28);
+          border:1px solid #3d2e52;
           border-radius:999px;
-          background:rgba(72,52,92,.32);
-          color:rgba(236,236,236,.96);
+          background:#2a2234;
+          color:#eaeaea;
           height:18px;
           padding:0 18px 0 8px;
           font-size:10px;
@@ -691,9 +689,9 @@ function createOverlayHtml() {
           left:0;
           top:22px;
           min-width:100%;
-          border:1px solid rgba(196,148,230,.3);
+          border:1px solid #3d2e52;
           border-radius:10px;
-          background:#211c26;
+          background:#1e1a24;
           display:none;
           z-index:5;
           max-height:160px;
@@ -711,16 +709,16 @@ function createOverlayHtml() {
           height:22px;
           padding:0 8px;
           text-align:left;
-          color:rgba(238,238,238,.95);
+          color:#eaeaea;
           background:transparent;
           font-size:10px;
           cursor:pointer;
         }
         .quickUpscaleItem:hover{
-          background:rgba(255,255,255,.1);
+          background:#2e2e2e;
         }
         .quickUpscaleItem.active{
-          background:rgba(176,128,236,.28);
+          background:#3a2a52;
         }
         #quickUpscaleCapsule.up-off #quickUpscaleDrop{
           display:none;
@@ -730,9 +728,9 @@ function createOverlayHtml() {
         }
         #quickSendEnterBtn{
           appearance:none;
-          border:1px solid rgba(255,255,255,.22);
+          border:1px solid #333;
           border-radius:999px;
-          background:rgba(44,44,44,.95);
+          background:#2a2a2a;
           width:20px;
           height:20px;
           padding:0;
@@ -754,17 +752,17 @@ function createOverlayHtml() {
           background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='rgba(184,184,184,0.95)' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M8.9 4.8L12 8L8.9 11.2' stroke='rgba(184,184,184,0.95)' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
         }
         #quickSendEnterBtn.on{
-          border-color:rgba(108,176,128,.8);
-          background:rgba(66,116,82,.56);
+          border-color:#4a8a5a;
+          background:#2e5c3a;
         }
         #quickSendEnterBtn.on::before{
           background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='rgba(210,248,220,0.96)' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M8.9 4.8L12 8L8.9 11.2' stroke='rgba(210,248,220,0.96)' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
         }
         #gearBtn{
           appearance:none;
-          border:1px solid rgba(255,255,255,.22);
+          border:1px solid #333;
           border-radius:999px;
-          background:rgba(44,44,44,.95);
+          background:#2a2a2a;
           width:22px;
           height:22px;
           padding:0;
@@ -786,8 +784,8 @@ function createOverlayHtml() {
           background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
         }
         #gearBtn.on{
-          border-color:rgba(255,255,255,.34);
-          background:rgba(68,68,68,.95);
+          border-color:#444;
+          background:#3a3a3a;
         }
         #gearBtn.on::before{
           background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(236,236,236,0.95)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(236,236,236,0.95)' stroke-width='1.4'/%3E%3C/svg%3E");
@@ -1278,7 +1276,7 @@ function ensureOverlayWindow() {
     width: 320,
     height: 48,
     frame: false,
-    transparent: true,
+    transparent: false,
     resizable: false,
     movable: false,
     focusable: false,
@@ -1286,7 +1284,7 @@ function ensureOverlayWindow() {
     show: false,
     hasShadow: false,
     alwaysOnTop: true,
-    backgroundColor: "#00000000",
+    backgroundColor: "#141414",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false
@@ -2103,403 +2101,79 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
-  const escapedApp = escapeAppleScriptString(effectiveTargetName);
-  const pid = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
-  const axInsertScript = `
+  const robustPasteScript = `
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
     tell application "System Events"
       if UI elements enabled is false then return "ERR:no-accessibility"
-      set targetText to ""
-      try
-        set targetText to the clipboard as text
-      on error
-        return "ERR:clipboard-read"
-      end try
       set p to missing value
+      
+      -- Priority 1: Target by exact Unix PID
       if targetPid > 0 then
         if exists (first process whose unix id is targetPid) then
           set p to first process whose unix id is targetPid
         end if
-      else if targetApp is not "" then
+      end if
+      
+      -- Priority 2: Target by exact App Name
+      if p is missing value and targetApp is not "" then
         if exists process targetApp then
           set p to process targetApp
         end if
       end if
+      
+      -- Priority 3: Target whatever is frontmost right now
       if p is missing value then
         set p to first process whose frontmost is true
       end if
+      
+      if p is missing value then return "ERR:no-process"
+      
+      -- Bring to front (critical for paste)
       set frontmost of p to true
-      delay 0.35
-      set focusedElement to missing value
+      delay 0.25
+      
+      -- Check for secure fields (passwords) to avoid pasting sensitive clips blindly
       try
         set focusedElement to value of attribute "AXFocusedUIElement" of p
-      on error
-        return "ERR:no-focus"
-      end try
-      set roleName to ""
-      set subroleName to ""
-      try
         set roleName to role of focusedElement
-      end try
-      try
         set subroleName to subrole of focusedElement
+        if roleName is "AXSecureTextField" or subroleName is "AXSecureTextField" then
+          return "ERR:secure-field"
+        end if
       end try
-      if roleName is "AXSecureTextField" or subroleName is "AXSecureTextField" then
-        return "ERR:secure-field"
-      end if
-      -- No AX write (AXSelectedText/AXValue) — causes destructive 'select all'
-      -- side-effect on some apps when the write fails mid-operation.
-      return "ERR:ax-skipped"
-    end tell
-  `;
-  const pasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set targetText to ""
-      try
-        set targetText to the clipboard as text
-      on error
-        return "ERR:clipboard-read"
-      end try
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-          set frontmost of p to true
-          delay 0.20
-          set the clipboard to targetText
-          delay 0.12
-          tell p
-            keystroke "v" using {command down}
-          end tell
-          delay 0.16
-          return "OK:paste-pid"
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-          tell p
-            set frontmost to true
-          end tell
-          delay 0.20
-          set the clipboard to targetText
-          delay 0.12
-          tell p
-            keystroke "v" using {command down}
-          end tell
-          delay 0.16
-          return "OK:paste-app"
-        end if
-      end if
-      set the clipboard to targetText
-      delay 0.18
-      keystroke "v" using {command down}
-      delay 0.18
-      return "OK:paste"
-    end tell
-  `;
-  const menuPasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set targetText to ""
-      try
-        set targetText to the clipboard as text
-      on error
-        return "ERR:clipboard-read"
-      end try
-      set p to missing value
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-        end if
-      end if
-      if p is missing value then
-        return "ERR:no-process"
-      end if
-      set frontmost of p to true
-      delay 0.18
-      set the clipboard to targetText
-      delay 0.12
-      try
-        click menu item "Paste" of menu "Edit" of menu bar item "Edit" of menu bar 1 of p
-        delay 0.16
-        return "OK:menu-paste"
-      on error errMsg
-        return "ERR:menu-paste:" & errMsg
-      end try
-    end tell
-  `;
-  const keycodePasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set targetText to ""
-      try
-        set targetText to the clipboard as text
-      on error
-        return "ERR:clipboard-read"
-      end try
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-          set frontmost of p to true
-          delay 0.18
-          set the clipboard to targetText
-          delay 0.10
-          tell p
-            key code 9 using {command down}
-          end tell
-          delay 0.16
-          return "OK:keycode-pid"
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-          tell p
-            set frontmost to true
-          end tell
-          delay 0.18
-          set the clipboard to targetText
-          delay 0.10
-          tell p
-            key code 9 using {command down}
-          end tell
-          delay 0.16
-          return "OK:keycode-app"
-        end if
-      end if
-      set the clipboard to targetText
-      delay 0.18
-      key code 9 using {command down}
-      delay 0.18
-      return "OK:keycode"
-    end tell
-  `;
-  const typedInsertScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set targetText to ""
-      try
-        set targetText to the clipboard as text
-      on error
-        return "ERR:clipboard-read"
-      end try
-      if targetText is "" then return "ERR:empty-text"
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-          set frontmost of p to true
-          delay 0.18
-          tell p to keystroke targetText
-          delay 0.12
-          return "OK:typed-pid"
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-          tell p to set frontmost to true
-          delay 0.18
-          tell p to keystroke targetText
-          delay 0.12
-          return "OK:typed-app"
-        end if
-      end if
-      keystroke targetText
-      delay 0.12
-      return "OK:typed"
+      
+      -- Perform physical V key press (key code 9) + Cmd
+      -- This bypasses keyboard layout issues (like Russian "м") where keystroke "v" fails
+      tell p
+        key code 9 using {command down}
+      end tell
+      
+      delay 0.20
+      return "OK:robust-paste"
     end tell
   `;
 
   const textLen = String(text || "").length;
-  const isLongText = textLen > 800;
-
-  // ── Direct paste scripts: activate target + Cmd+V ──
-  // These do NOT read/write the clipboard in AppleScript.
-  // The clipboard is already set by Electron's clipboard.writeText().
-  // This eliminates truncation/failure with long text.
-  const directPasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set p to missing value
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-        end if
-      end if
-      if p is missing value then
-        set p to first process whose frontmost is true
-      end if
-      set frontmost of p to true
-      delay 0.35
-      tell p
-        key code 9 using {command down}
-      end tell
-      delay 0.25
-      return "OK:direct-paste"
-    end tell
-  `;
-  const directKeycodePasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set p to missing value
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-        end if
-      end if
-      if p is missing value then
-        set p to first process whose frontmost is true
-      end if
-      set frontmost of p to true
-      delay 0.35
-      tell p
-        key code 9 using {command down}
-      end tell
-      delay 0.25
-      return "OK:direct-keycode"
-    end tell
-  `;
-  const directMenuPasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set p to missing value
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-        end if
-      else if targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-        end if
-      end if
-      if p is missing value then
-        return "ERR:no-process"
-      end if
-      set frontmost of p to true
-      delay 0.30
-      try
-        click menu item "Paste" of menu "Edit" of menu bar item "Edit" of menu bar 1 of p
-        delay 0.20
-        return "OK:menu-paste"
-      on error errMsg
-        return "ERR:menu-paste:" & errMsg
-      end try
-    end tell
-  `;
-
-  const runTypedInsert = async (stageLabel = "typed") => {
-    if (String(text).length > 1800) {
-      traceStep(trace, "method_skipped", {
-        method: stageLabel,
-        reason: "text-too-long",
-        len: String(text).length,
-        limit: 1800,
-      });
-      return null;
-    }
-    traceStep(trace, "method_begin", { method: stageLabel, len: String(text).length });
-    const typedStarted = Date.now();
-    const typedInsert = await runCommand("osascript", ["-e", typedInsertScript], { timeoutMs: 14000 });
-    traceStep(trace, "method_result", {
-      method: stageLabel,
-      ms: Date.now() - typedStarted,
-      ok: !!typedInsert.ok,
-      code: typedInsert.code,
-      stdout: compactLogText(typedInsert.stdout),
-      stderr: compactLogText(typedInsert.stderr),
-    });
-    logPasteTrace("typed_result", {
-      stage: stageLabel,
-      ok: !!typedInsert.ok,
-      code: typedInsert.code,
-      stdout: compactLogText(typedInsert.stdout),
-      stderr: compactLogText(typedInsert.stderr),
-    });
-    if (typedInsert.ok) {
-      const typedOut = (typedInsert.stdout || "").trim();
-      if (typedOut.startsWith("OK:")) {
-        logPasteTrace("success", { method: stageLabel, reason: typedOut, verified: false });
-        traceEnd(trace, "success", { method: stageLabel, reason: typedOut, verified: false });
-        return { ok: true, reason: typedOut, method: "typed", verified: false };
-      }
-      lastReason = typedOut || lastReason;
-      return null;
-    }
-    lastReason = (typedInsert.stderr || typedInsert.stdout || lastReason).trim();
-    return null;
-  };
 
   let lastReason = "paste-no-attempt";
 
-  // ── AX pre-check: detect secure fields (no destructive writes) ──
-  traceStep(trace, "method_begin", { method: "ax-check" });
-  const axStarted = Date.now();
-  const ax = await runCommand("osascript", ["-e", axInsertScript], { timeoutMs: 8000 });
-  traceStep(trace, "method_result", {
-    method: "ax-check",
-    ms: Date.now() - axStarted,
-    ok: !!ax.ok,
-    code: ax.code,
-    stdout: compactLogText(ax.stdout),
-    stderr: compactLogText(ax.stderr),
-  });
-  logPasteTrace("ax_check_result", {
-    ok: !!ax.ok,
-    code: ax.code,
-    stdout: compactLogText(ax.stdout),
-    stderr: compactLogText(ax.stderr),
-  });
-  if (ax.ok) {
-    const axOut = (ax.stdout || "").trim();
-    if (axOut === "ERR:secure-field") {
-      traceEnd(trace, "failed", { reason: "secure-field" });
-      if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
-      return { ok: false, reason: "secure-field", method: "ax-check", verified: false };
-    }
-    if (axOut === "ERR:no-accessibility") {
-      lastReason = "no-accessibility";
-      traceStep(trace, "ax_no_access", {});
-    }
-  }
-
-  // ── Direct paste: Cmd+V without AppleScript clipboard round-trip ──
-  // Clipboard is already set by Electron. Just activate target + Cmd+V.
+  // ── Enterprise Paste Logic ──
+  // Clipboard is already populated synchronously via Electron before we get here.
+  // We simply invoke the robust layout-agnostic Cmd+V via AppleScript 'key code 9'.
   for (let attempt = 0; attempt < 2; attempt++) {
-    // Re-ensure clipboard is intact (in case AX attempt cleared it).
+    // Refresh clipboard just in case OS flushed it
     try { clipboard.writeText(String(text)); } catch { }
-    await sleep(50);
+    await sleep(40);
 
-    logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "direct_paste" });
-    traceStep(trace, "method_begin", { method: "direct_paste", attempt: attempt + 1 });
+    logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "robust_paste" });
+    traceStep(trace, "method_begin", { method: "robust_paste", attempt: attempt + 1 });
+
     const cmdStarted = Date.now();
-    const check = await runCommand("osascript", ["-e", directPasteScript], { timeoutMs: 14000 });
+    const check = await runCommand("osascript", ["-e", robustPasteScript], { timeoutMs: 14000 });
+
     traceStep(trace, "method_result", {
-      method: "direct_paste",
+      method: "robust_paste",
       attempt: attempt + 1,
       ms: Date.now() - cmdStarted,
       ok: !!check.ok,
@@ -2507,129 +2181,41 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       stdout: compactLogText(check.stdout),
       stderr: compactLogText(check.stderr),
     });
-    logPasteTrace("direct_paste_result", {
+    logPasteTrace("robust_paste_result", {
       attempt: attempt + 1,
       ok: !!check.ok,
       code: check.code,
       stdout: compactLogText(check.stdout),
       stderr: compactLogText(check.stderr),
     });
+
     if (check.ok) {
       const out = (check.stdout || "").trim();
       if (out.startsWith("OK:")) {
-        logPasteTrace("success", { method: "direct_paste", attempt: attempt + 1, reason: out });
-        traceEnd(trace, "success", { method: "direct_paste", attempt: attempt + 1, reason: out, verified: false });
-        return { ok: true, reason: out, method: "direct_paste", verified: false };
+        logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out });
+        traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: false });
+        // Restore previous clipboard cleanly since paste was successful
+        setTimeout(() => {
+          if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+        }, 1200);
+        return { ok: true, reason: out, method: "robust_paste", verified: false };
       }
-      lastReason = out || "paste-return-unknown";
+      if (out === "ERR:secure-field") {
+        traceEnd(trace, "failed", { reason: "secure-field" });
+        if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+        return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
+      }
+      if (out === "ERR:no-accessibility") {
+        lastReason = "no-accessibility";
+      } else {
+        lastReason = out || "paste-return-unknown";
+      }
     } else {
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
-
-    // Fallback: try key code 9 (V keycode) instead of keystroke.
-    try { clipboard.writeText(String(text)); } catch { }
-    await sleep(30);
-    traceStep(trace, "method_begin", { method: "direct_keycode", attempt: attempt + 1 });
-    const keyStarted = Date.now();
-    const check2 = await runCommand("osascript", ["-e", directKeycodePasteScript], { timeoutMs: 14000 });
-    traceStep(trace, "method_result", {
-      method: "direct_keycode",
-      attempt: attempt + 1,
-      ms: Date.now() - keyStarted,
-      ok: !!check2.ok,
-      code: check2.code,
-      stdout: compactLogText(check2.stdout),
-      stderr: compactLogText(check2.stderr),
-    });
-    logPasteTrace("direct_keycode_result", {
-      attempt: attempt + 1,
-      ok: !!check2.ok,
-      code: check2.code,
-      stdout: compactLogText(check2.stdout),
-      stderr: compactLogText(check2.stderr),
-    });
-    if (check2.ok) {
-      const out2 = (check2.stdout || "").trim();
-      if (out2.startsWith("OK:")) {
-        logPasteTrace("success", { method: "direct_keycode", attempt: attempt + 1, reason: out2 });
-        traceEnd(trace, "success", { method: "direct_keycode", attempt: attempt + 1, reason: out2, verified: false });
-        return { ok: true, reason: out2, method: "direct_keycode", verified: false };
-      }
-      lastReason = out2 || lastReason;
-    } else {
-      lastReason = (check2.stderr || check2.stdout || lastReason).trim();
-    }
-    await sleep(120);
   }
 
-  // ── Menu paste fallback (Edit > Paste) ──
-  if (effectiveTargetName || pid > 0) {
-    try { clipboard.writeText(String(text)); } catch { }
-    await sleep(30);
-    traceStep(trace, "method_begin", { method: "menu" });
-    const menuStarted = Date.now();
-    const menuPaste = await runCommand("osascript", ["-e", directMenuPasteScript], { timeoutMs: 14000 });
-    traceStep(trace, "method_result", {
-      method: "menu",
-      ms: Date.now() - menuStarted,
-      ok: !!menuPaste.ok,
-      code: menuPaste.code,
-      stdout: compactLogText(menuPaste.stdout),
-      stderr: compactLogText(menuPaste.stderr),
-    });
-    logPasteTrace("menu_result", {
-      ok: !!menuPaste.ok,
-      code: menuPaste.code,
-      stdout: compactLogText(menuPaste.stdout),
-      stderr: compactLogText(menuPaste.stderr),
-    });
-    if (menuPaste.ok) {
-      const menuOut = (menuPaste.stdout || "").trim();
-      if (menuOut.startsWith("OK:")) {
-        logPasteTrace("success", { method: "menu", reason: menuOut, verified: false });
-        traceEnd(trace, "success", { method: "menu", reason: menuOut, verified: false });
-        return { ok: true, reason: menuOut, method: "menu", verified: false };
-      }
-      lastReason = menuOut || lastReason;
-    } else {
-      lastReason = (menuPaste.stderr || menuPaste.stdout || lastReason).trim();
-    }
-  }
-
-  // ── Global keycode fallback: no process targeting ──
-  // Just sends key code 9 (Cmd+V) to whatever is frontmost.
-  try { clipboard.writeText(String(text)); } catch { }
-  await sleep(50);
-  traceStep(trace, "method_begin", { method: "global_keycode" });
-  const globalStarted = Date.now();
-  const globalPaste = await runCommand("osascript", ["-e",
-    `tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      key code 9 using {command down}
-      delay 0.20
-      return "OK:global-keycode"
-    end tell`
-  ], { timeoutMs: 8000 });
-  traceStep(trace, "method_result", {
-    method: "global_keycode",
-    ms: Date.now() - globalStarted,
-    ok: !!globalPaste.ok,
-    code: globalPaste.code,
-    stdout: compactLogText(globalPaste.stdout),
-    stderr: compactLogText(globalPaste.stderr),
-  });
-  if (globalPaste.ok) {
-    const globalOut = (globalPaste.stdout || "").trim();
-    if (globalOut.startsWith("OK:")) {
-      logPasteTrace("success", { method: "global_keycode", reason: globalOut, verified: false });
-      traceEnd(trace, "success", { method: "global_keycode", reason: globalOut, verified: false });
-      return { ok: true, reason: globalOut, method: "global_keycode", verified: false };
-    }
-    lastReason = globalOut || lastReason;
-  } else {
-    lastReason = (globalPaste.stderr || globalPaste.stdout || lastReason).trim();
-  }
-
+  // Exhausted all robust attempts
   let frontAfter = { name: "", pid: 0 };
   try {
     frontAfter = await getFrontmostAppInfo();
@@ -3386,15 +2972,10 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", async () => {
-  // Block activation pulses triggered by overlay UI interactions (IPC calls to renderer
-  // can cause macOS to fire activate events). Use a generous window to cover the
-  // full IPC round-trip and any delayed activation.
-  if (Date.now() - lastOverlayUiInteractionAt < 2500) return;
-  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return;
-  if (Date.now() < suppressMainWindowUntil) return;
-  if (Date.now() < suppressActivateUntil) return;
-  if (suppressActivateDuringOverlayFlow) return;
-  ensureWindowVisible({ manual: true });
+  // Ignore synthetic activation pulses right after capsule interactions,
+  // but allow explicit Dock/Menu activation even while recording/transcribing.
+  if (Date.now() - lastOverlayUiInteractionAt < 1300) return;
+  ensureWindowVisible({ manual: true, force: true });
 });
 
 app.on("before-quit", () => {
