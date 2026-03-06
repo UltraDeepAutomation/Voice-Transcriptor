@@ -51,7 +51,7 @@ let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
 let micPermissionChecked = false;
-const OVERLAY_FIXED_HEIGHT = 120;
+const OVERLAY_FIXED_HEIGHT = 150;
 
 const HOST = "127.0.0.1";
 let PORT = 8321;
@@ -592,7 +592,13 @@ function createOverlayHtml() {
       <div id="settingsSlot">
         <div id="settingsPill">
           <div id="quickPanel">
-            <div class="qRow">
+            <div id="quickAutoStopCapsule" title="Auto stop on silence">
+              <input id="quickAutoStopToggle" type="checkbox" />
+              <span class="capsuleLabel">Stop</span>
+              <label id="quickAutoStopSecsLabel">
+                <input id="quickAutoStopSecs" type="number" min="1" max="30" step="1" value="2" />
+              </label>
+            </div>
             <div id="quickUpscaleCapsule" title="Upscale settings">
               <input id="quickUpscaleToggle" type="checkbox" />
               <span id="quickUpscaleOffLabel">Upscale</span>
@@ -603,20 +609,9 @@ function createOverlayHtml() {
                 <div id="quickUpscaleMenu"></div>
               </div>
             </div>
-            <button id="quickSendEnterBtn" aria-label="Auto send after paste" title="Auto send after paste"></button>
-            </div>
-            <div class="qRow">
-              <div id="quickAutoStopCapsule">
-                <label id="quickAutoStopLabel" title="Auto stop on silence">
-                  <input id="quickAutoStopToggle" type="checkbox" />
-                  <span class="toggleDot"></span>
-                  <span class="toggleText">Stop</span>
-                </label>
-                <label id="quickAutoStopSecsLabel" title="Seconds of silence">
-                  <input id="quickAutoStopSecs" type="number" min="1" max="30" step="1" value="2" />
-                  <span class="secsUnit">s</span>
-                </label>
-              </div>
+            <div id="quickAutoSendCapsule" title="Auto send after paste">
+              <input id="quickAutoSendToggle" type="checkbox" />
+              <span class="capsuleLabel">Send</span>
             </div>
           </div>
         </div>
@@ -682,12 +677,12 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           justify-content:center;
-          margin-bottom:2px;
+          margin-bottom:16px;
         }
         #settingsPill{
           width:fit-content;
           min-height:22px;
-          padding:5px 8px;
+          padding:8px;
           border-radius:14px;
           border:1px solid #333;
           background:#161616;
@@ -728,141 +723,44 @@ function createOverlayHtml() {
         #quickPanel{
           display:flex;
           flex-direction:column;
-          align-items:center;
-          gap:5px;
-          max-width:230px;
+          align-items:flex-start;
+          gap:4px;
           min-width:0;
-          overflow:hidden;
+          overflow:visible;
           flex:0 0 auto;
         }
-        .qRow{
-          display:flex;
-          align-items:center;
-          gap:4px;
-          width:100%;
-          justify-content:center;
-        }
-        #quickAutoStopCapsule{
+        /* ── Shared capsule base ── */
+        #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule{
           display:inline-flex;
           align-items:center;
-          gap:4px;
-          padding:0 5px 0 3px;
+          gap:5px;
+          padding:0 6px 0 3px;
           height:22px;
           border-radius:999px;
-          border:1px solid #333;
-          background:#222;
-          color:#d0d0d0;
           white-space:nowrap;
           min-width:0;
         }
-        #quickAutoStopLabel{
-          display:inline-flex;
-          align-items:center;
-          gap:3px;
-          cursor:pointer;
+        .capsuleLabel{
           font-size:10px;
-          font-weight:600;
-          user-select:none;
-          -webkit-user-select:none;
+          font-weight:650;
+          letter-spacing:.01em;
+          opacity:.92;
         }
-        #quickAutoStopToggle{
-          appearance:none;
-          width:26px;
-          height:14px;
-          border-radius:999px;
-          border:1px solid #444;
-          background:#333;
-          position:relative;
-          outline:none;
-          cursor:pointer;
-          flex:0 0 26px;
-          transition:background .15s ease, border-color .15s ease;
-        }
-        #quickAutoStopToggle::before{
-          content:"";
-          position:absolute;
-          top:1px;
-          left:1px;
-          width:10px;
-          height:10px;
-          border-radius:50%;
-          background:#888;
-          transition:transform .15s ease, background .15s ease;
-        }
-        #quickAutoStopToggle:checked{
-          background:#2e5c3a;
-          border-color:#4a8a5a;
-        }
-        #quickAutoStopToggle:checked::before{
-          transform:translateX(12px);
-          background:#90e0a0;
-        }
-        .toggleText{
-          font-size:10px;
-          font-weight:600;
-          color:#bbb;
-        }
-        #quickAutoStopSecsLabel{
-          display:inline-flex;
-          align-items:center;
-          gap:1px;
-          margin-left:2px;
-        }
-        #quickAutoStopSecs{
-          appearance:none;
-          -moz-appearance:textfield;
-          width:24px;
-          height:18px;
-          border:1px solid #444;
-          border-radius:6px;
-          background:#2a2a2a;
-          color:#e0e0e0;
-          font-size:10px;
-          font-weight:700;
-          text-align:center;
-          padding:0 1px;
-          outline:none;
-          font-family:Menlo,ui-monospace,monospace;
-        }
-        #quickAutoStopSecs::-webkit-inner-spin-button,
-        #quickAutoStopSecs::-webkit-outer-spin-button{
-          appearance:none;
-          margin:0;
-        }
-        #quickAutoStopSecs:focus{
-          border-color:#5a5a5a;
-        }
-        .secsUnit{
-          font-size:9px;
-          font-weight:600;
-          color:#888;
-        }
-        #quickUpscaleCapsule{
-          display:inline-flex;
-          align-items:center;
-          gap:6px;
-          padding:0 5px 0 3px;
-          height:22px;
-          border-radius:999px;
-          border:1px solid #3d2e52;
-          background:#2a2234;
-          color:#e0e0e0;
-          white-space:nowrap;
-          min-width:0;
-          width:auto;
-        }
-        #quickUpscaleToggle{
+        /* ── Shared toggle base ── */
+        #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle{
           appearance:none;
           width:28px;
           height:16px;
           border-radius:999px;
-          border:1px solid #333;
+          border:1px solid #444;
           background:#2a2a2a;
           position:relative;
           outline:none;
           cursor:pointer;
+          flex:0 0 28px;
+          transition:background .14s ease, border-color .14s ease;
         }
-        #quickUpscaleToggle::before{
+        #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before{
           content:"";
           position:absolute;
           left:2px;
@@ -871,7 +769,13 @@ function createOverlayHtml() {
           height:10px;
           border-radius:999px;
           background:#d2d2d2;
-          transition:transform .14s ease;
+          transition:transform .14s ease, background .14s ease;
+        }
+        /* ── Upscale: PURPLE accent ── */
+        #quickUpscaleCapsule{
+          border:1px solid #3d2e52;
+          background:#2a2234;
+          color:#e0e0e0;
         }
         #quickUpscaleToggle:checked{
           background:#5a36a0;
@@ -887,6 +791,70 @@ function createOverlayHtml() {
           letter-spacing:.01em;
           opacity:.92;
         }
+        /* ── AutoSend: GREEN accent ── */
+        #quickAutoSendCapsule{
+          border:1px solid #2e4a35;
+          background:#1e2e22;
+          color:#d0e8d4;
+        }
+        #quickAutoSendToggle:checked{
+          background:#2e5c3a;
+          border-color:#4a8a5a;
+        }
+        #quickAutoSendToggle:checked::before{
+          transform:translateX(12px);
+          background:#90e0a0;
+        }
+        /* ── AutoStop: YELLOW/AMBER accent ── */
+        #quickAutoStopCapsule{
+          border:1px solid #4a4428;
+          background:#2a2818;
+          color:#e0dcc0;
+        }
+        #quickAutoStopToggle:checked{
+          background:#5c5020;
+          border-color:#8a7a3a;
+        }
+        #quickAutoStopToggle:checked::before{
+          transform:translateX(12px);
+          background:#e8d860;
+        }
+        #quickAutoStopSecsLabel{
+          display:inline-flex;
+          align-items:center;
+          gap:1px;
+          margin-left:0;
+        }
+        #quickAutoStopSecs{
+          appearance:none;
+          -moz-appearance:textfield;
+          width:24px;
+          height:18px;
+          border:1px solid #4a4428;
+          border-radius:6px;
+          background:#2a2818;
+          color:#e0dcc0;
+          font-size:10px;
+          font-weight:700;
+          text-align:center;
+          padding:0 1px;
+          outline:none;
+          font-family:Menlo,ui-monospace,monospace;
+        }
+        #quickAutoStopSecs::-webkit-inner-spin-button,
+        #quickAutoStopSecs::-webkit-outer-spin-button{
+          appearance:none;
+          margin:0;
+        }
+        #quickAutoStopSecs:focus{
+          border-color:#8a7a3a;
+        }
+        .secsUnit{
+          font-size:9px;
+          font-weight:600;
+          color:#8a8a60;
+        }
+        /* ── Upscale dropdown ── */
         #quickUpscaleDrop{
           position:relative;
         }
@@ -967,38 +935,7 @@ function createOverlayHtml() {
         #quickUpscaleCapsule.up-on #quickUpscaleOffLabel{
           display:none;
         }
-        #quickSendEnterBtn{
-          appearance:none;
-          border:1px solid #333;
-          border-radius:999px;
-          background:#2a2a2a;
-          width:20px;
-          height:20px;
-          padding:0;
-          position:relative;
-          flex:0 0 20px;
-          cursor:pointer;
-        }
-        #quickSendEnterBtn::before{
-          content:"";
-          position:absolute;
-          left:50%;
-          top:50%;
-          width:11px;
-          height:11px;
-          transform:translate(-50%,-50%);
-          background-repeat:no-repeat;
-          background-position:center;
-          background-size:11px 11px;
-          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='rgba(184,184,184,0.95)' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M8.9 4.8L12 8L8.9 11.2' stroke='rgba(184,184,184,0.95)' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-        }
-        #quickSendEnterBtn.on{
-          border-color:#4a8a5a;
-          background:#2e5c3a;
-        }
-        #quickSendEnterBtn.on::before{
-          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='rgba(210,248,220,0.96)' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M8.9 4.8L12 8L8.9 11.2' stroke='rgba(210,248,220,0.96)' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-        }
+        /* quickSendEnterBtn removed — replaced by #quickAutoSendCapsule */
         #gearBtn{
           appearance:none;
           border:1px solid #333;
@@ -1196,7 +1133,7 @@ function createOverlayHtml() {
         const quickUpscaleBtn = document.getElementById('quickUpscaleBtn');
         const quickUpscaleBtnText = document.getElementById('quickUpscaleBtnText');
         const quickUpscaleMenu = document.getElementById('quickUpscaleMenu');
-        const quickSendEnterBtn = document.getElementById('quickSendEnterBtn');
+        const quickAutoSendToggle = document.getElementById('quickAutoSendToggle');
         let quickUpscaleOptions = [];
         let quickUpscaleSelected = 'builtin_clean';
         let timerId = null;
@@ -1347,8 +1284,7 @@ function createOverlayHtml() {
         };
         window.setAutoSendEnabled = (enabled) => {
           const on = !!enabled;
-          quickSendEnterBtn.classList.toggle('on', on);
-          quickSendEnterBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+          if (quickAutoSendToggle.checked !== on) quickAutoSendToggle.checked = on;
         };
         gearBtn.addEventListener('click', () => {
           const next = !settingsSlot.classList.contains('on');
@@ -1364,9 +1300,8 @@ function createOverlayHtml() {
           quickUpscaleMenu.classList.toggle('open');
         });
         document.addEventListener('click', () => quickUpscaleMenu.classList.remove('open'));
-        quickSendEnterBtn.addEventListener('click', () => {
-          const next = !quickSendEnterBtn.classList.contains('on');
-          window.setAutoSendEnabled(next);
+        quickAutoSendToggle.addEventListener('change', () => {
+          const next = quickAutoSendToggle.checked;
           document.title = '__overlay_autosend__' + (next ? '1' : '0');
         });
         const quickAutoStopToggle = document.getElementById('quickAutoStopToggle');
