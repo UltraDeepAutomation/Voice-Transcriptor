@@ -1,341 +1,388 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Transcriptor</title>
-  </head>
-  <body>
-    <div class="shell">
-      <nav class="sidebar">
-        <div class="sb-nav">
-          <button class="sb-item active" data-view="record">Record</button>
-          <button class="sb-item" data-view="recordings">Recordings</button>
-          <button class="sb-item" data-view="settings">Settings</button>
-        </div>
-      </nav>
 
-      <main class="content">
-        <div class="window-topbar">
-          <div class="window-topbar-inner">
-            <span class="window-title">Transcriptor</span>
-            <span class="window-view" id="windowViewLabel">Record</span>
-            <span class="net-pill" id="netPill" title="Internet connection status">
-              <span class="net-dot" id="netDot"></span>
-              <span class="net-text" id="netText">Offline</span>
-            </span>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transcriptor</title>
+</head>
+
+<body>
+  <div class="shell">
+    <nav class="sidebar">
+      <div class="sb-nav">
+        <button class="sb-item active" data-view="record">Record</button>
+        <button class="sb-item" data-view="recordings">Recordings</button>
+        <button class="sb-item" data-view="settings">Settings</button>
+      </div>
+    </nav>
+
+    <main class="content">
+      <div class="window-topbar">
+        <div class="window-topbar-inner">
+          <span class="window-title">Transcriptor</span>
+          <span class="window-view" id="windowViewLabel">Record</span>
+          <span class="net-pill" id="netPill" title="Internet connection status">
+            <span class="net-dot" id="netDot"></span>
+            <span class="net-text" id="netText">Offline</span>
+          </span>
+        </div>
+      </div>
+
+      <section class="view" data-view="record">
+        <div class="topbar">
+          <div class="topbar-fields">
+            <div class="field">
+              <span class="lbl">Mode</span>
+              <select id="mode">
+                <option value="live">Live</option>
+                <option value="remote">Remote</option>
+              </select>
+              <span class="hint" id="modeHint">Live mode: fast local stream.</span>
+            </div>
+            <div class="field">
+              <span class="lbl">Lang</span>
+              <select id="language">
+                <option value="auto">Auto</option>
+                <option value="ru">RU</option>
+                <option value="en">EN</option>
+              </select>
+            </div>
+            <div class="field">
+              <span class="lbl">Mic</span>
+              <select id="micSelect">
+                <option value="">Select mic</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="ctrl-group">
+            <div class="status-pill">
+              <div class="status-dot" id="statusDot"></div>
+              <span class="status-text" id="statusText">Idle</span>
+              <span class="timer" id="timer">00:00</span>
+            </div>
+
+            <div id="vuFill" hidden></div>
+            <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
+              <label class="quick-field">
+                <span class="quick-lbl">Provider</span>
+                <select id="quickProviderSelect">
+                  <option value="local">Local (Whisper)</option>
+                  <option value="groq">Groq (Fastest)</option>
+                  <option value="fal">fal.ai</option>
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="">None</option>
+                </select>
+              </label>
+            </div>
+            <button class="btn quick-settings-btn" id="quickSettingsToggle" type="button"
+              aria-label="Toggle quick settings" aria-pressed="false"></button>
+            <canvas class="mini-wave" id="waveCanvas" width="240" height="44"></canvas>
+
+            <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
+            <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
           </div>
         </div>
 
-        <section class="view" data-view="record">
-          <div class="topbar">
-            <div class="topbar-fields">
-              <div class="field">
-                <span class="lbl">Mode</span>
-                <select id="mode">
-                  <option value="live">Live</option>
-                  <option value="remote">Remote</option>
-                </select>
-                <span class="hint" id="modeHint">Live mode: fast local stream.</span>
+        <div class="split">
+          <div class="pane" id="livePane">
+            <div class="pane-header pane-header-2row">
+              <div class="pane-head-row pane-head-row-top">
+                <span class="pane-title">Live Preview</span>
+                <div class="pane-actions">
+                  <label class="toggle-inline" title="Show live partial transcript while recording">
+                    <input id="livePreviewToggle" type="checkbox" checked />
+                  </label>
+                </div>
               </div>
-              <div class="field">
-                <span class="lbl">Lang</span>
-                <select id="language">
-                  <option value="auto">Auto</option>
-                  <option value="ru">RU</option>
-                  <option value="en">EN</option>
-                </select>
-              </div>
-              <div class="field">
-                <span class="lbl">Mic</span>
-                <select id="micSelect"><option value="">Select mic</option></select>
+              <div class="pane-head-row pane-head-row-bottom">
+                <div class="pane-actions">
+                  <select id="model">
+                    <option value="tiny">tiny</option>
+                    <option value="base">base</option>
+                    <option value="small" selected>small</option>
+                    <option value="medium">medium</option>
+                    <option value="large-v3">large-v3</option>
+                  </select>
+                </div>
               </div>
             </div>
-
-            <div class="ctrl-group">
-              <div class="status-pill">
-                <div class="status-dot" id="statusDot"></div>
-                <span class="status-text" id="statusText">Idle</span>
-                <span class="timer" id="timer">00:00</span>
+            <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
+          </div>
+          <div class="split-gap" id="splitGap"></div>
+          <div class="pane" id="resultPane">
+            <div class="pane-header pane-header-2row">
+              <div class="pane-head-row pane-head-row-top">
+                <span class="pane-title">Transcribe <span class="pane-latency" id="transcribeLatency">--</span></span>
+                <div class="pane-actions">
+                  <label class="toggle-inline" title="Auto transcribe after stopping recording">
+                    <input id="autoTranscribeToggle" type="checkbox" checked />
+                  </label>
+                </div>
               </div>
-
-              <div id="vuFill" hidden></div>
-              <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
-                <label class="quick-field">
-                  <span class="quick-lbl">Provider</span>
-                  <select id="quickProviderSelect">
+              <div class="pane-head-row pane-head-row-bottom">
+                <div class="pane-actions">
+                  <select id="providerSelect">
                     <option value="local">Local (Whisper)</option>
+                    <option value="groq">Groq (Fastest)</option>
                     <option value="fal">fal.ai</option>
                     <option value="openrouter">OpenRouter</option>
                     <option value="">None</option>
                   </select>
-                </label>
-              </div>
-              <button class="btn quick-settings-btn" id="quickSettingsToggle" type="button" aria-label="Toggle quick settings" aria-pressed="false"></button>
-              <canvas class="mini-wave" id="waveCanvas" width="240" height="44"></canvas>
-
-              <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
-              <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
-            </div>
-          </div>
-
-          <div class="split">
-            <div class="pane" id="livePane">
-              <div class="pane-header pane-header-2row">
-                <div class="pane-head-row pane-head-row-top">
-                  <span class="pane-title">Live Preview</span>
-                  <div class="pane-actions">
-                    <label class="toggle-inline" title="Show live partial transcript while recording">
-                      <input id="livePreviewToggle" type="checkbox" checked />
-                    </label>
-                  </div>
-                </div>
-                <div class="pane-head-row pane-head-row-bottom">
-                  <div class="pane-actions">
-                    <select id="model">
-                      <option value="tiny">tiny</option>
-                      <option value="base">base</option>
-                      <option value="small" selected>small</option>
-                      <option value="medium">medium</option>
-                      <option value="large-v3">large-v3</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-              <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
-            </div>
-            <div class="split-gap" id="splitGap"></div>
-            <div class="pane" id="resultPane">
-              <div class="pane-header pane-header-2row">
-                <div class="pane-head-row pane-head-row-top">
-                  <span class="pane-title">Transcribe <span class="pane-latency" id="transcribeLatency">--</span></span>
-                  <div class="pane-actions">
-                    <label class="toggle-inline" title="Auto transcribe after stopping recording">
-                      <input id="autoTranscribeToggle" type="checkbox" checked />
-                    </label>
-                  </div>
-                </div>
-                <div class="pane-head-row pane-head-row-bottom">
-                  <div class="pane-actions">
-                    <select id="providerSelect">
-                      <option value="local">Local (Whisper)</option>
-                      <option value="fal">fal.ai</option>
-                      <option value="openrouter">OpenRouter</option>
-                      <option value="">None</option>
-                    </select>
-                    <select id="remoteModelSelect" title="Remote model" hidden>
-                      <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
-                      <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
-                      <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
-                    </select>
-                    <label class="check-inline"><input type="checkbox" id="diarizeCheck" /> <span>Speakers</span></label>
-                    <button class="icon-btn" id="resultCopyBtn" type="button" aria-label="Copy result text" title="Copy result">
-                      <span class="copy-ico" aria-hidden="true"></span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div class="upload-panel" id="uploadPanel" hidden>
-                <div class="upload-drop" id="uploadDrop">
-                  <p class="upload-title">Drop audio file here</p>
-                  <p class="upload-sub">or click to choose WAV/MP3/M4A/FLAC</p>
-                  <input id="fileInput" type="file" accept="audio/*" hidden />
-                  <button class="btn btn-ghost" id="pickFileBtn" type="button">Choose File</button>
-                </div>
-                <div class="upload-meta">
-                  <span id="fileName">No file selected</span>
-                  <label class="check-inline"><input type="checkbox" id="splitStereoCheck" checked /> <span>Split stereo</span></label>
-                  <label class="check-inline"><input type="checkbox" id="wordTsCheck" /> <span>Word timestamps</span></label>
-                  <button class="btn btn-primary" id="btnTranscribeFile" type="button">Transcribe File</button>
-                </div>
-              </div>
-
-              <div class="progress-row" id="progressRow" hidden>
-                <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-                <span class="progress-text" id="progressText">0%</span>
-              </div>
-
-              <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
-
-              <div class="pane-footer" id="downloadRow" hidden>
-                <a class="link-btn" id="dlTxt" href="#">TXT</a>
-                <a class="link-btn" id="dlJson" href="#">JSON</a>
-              </div>
-            </div>
-            <div class="pane" id="upscalePane">
-              <div class="pane-header pane-header-2row">
-                <div class="pane-head-row pane-head-row-top">
-                  <span class="pane-title">Upscale <span class="pane-latency" id="upscaleLatency">--</span></span>
-                  <div class="pane-actions">
-                    <label class="toggle-inline" title="Improve transcript before paste/save">
-                      <input id="upscaleToggle" type="checkbox" />
-                    </label>
-                  </div>
-                </div>
-                <div class="pane-head-row pane-head-row-bottom">
-                  <div class="pane-actions">
-                    <div class="upscale-preset-wrap" id="upscalePresetWrap">
-                      <select id="upscalePresetSelect" title="Upscale preset"></select>
-                      <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button" aria-label="Delete preset" title="Delete preset">×</button>
-                    </div>
-                    <button class="icon-btn" id="upscalePresetEditBtn" type="button" aria-label="Edit preset prompt" title="Edit preset prompt">
+                  <select id="remoteModelSelect" title="Remote model" hidden>
+                    <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
+                    <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
+                    <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
+                  </select>
+                  <div class="transcribe-settings-wrap">
+                    <button class="icon-btn" id="transcribeSettingsBtn" type="button" aria-label="Transcribe settings"
+                      title="Settings">
                       <span class="gear-ico" aria-hidden="true"></span>
                     </button>
-                    <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset" title="Add preset">+</button>
-                    <button class="icon-btn send-enter-btn" id="autoSendEnterToggle" type="button" aria-label="Auto send after paste" aria-pressed="false" title="Auto send after paste: OFF">
-                      <span class="send-enter-ico" aria-hidden="true"></span>
-                    </button>
-                    <button class="icon-btn" id="upscaleCopyBtn" type="button" aria-label="Copy upscale text" title="Copy upscale">
-                      <span class="copy-ico" aria-hidden="true"></span>
-                    </button>
+                    <div class="transcribe-settings-popup" id="transcribeSettingsPopup" hidden>
+                      <label class="popup-check"><input type="checkbox" id="diarizeCheck" /> <span>Speaker
+                          diarization</span></label>
+                    </div>
                   </div>
-                </div>
-              </div>
-              <pre class="out" id="upscaleOutput" data-placeholder="Upscaled text will appear here..."></pre>
-            </div>
-          </div>
-        </section>
-
-        <section class="view" data-view="recordings" hidden>
-          <div class="recordings-head">
-            <div class="recordings-head-main">
-              <h2>Saved Recordings</h2>
-              <p class="hint" id="recordingsDirLabel">Directory: -</p>
-              <p class="hint" id="recordingsCountLabel">Total recordings: 0</p>
-            </div>
-            <div class="recordings-head-actions">
-              <button class="btn ui-toggle-btn" id="recordingsStatsBtn" type="button" aria-label="Toggle stats">Stats</button>
-              <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button" aria-label="Refresh recordings">
-                <span class="refresh-ico" aria-hidden="true"></span>
-                <span>Refresh</span>
-              </button>
-            </div>
-          </div>
-          <div class="recordings-layout">
-            <div class="recordings-list" id="recordingsList"></div>
-            <div class="recordings-viewer">
-              <div class="recordings-stats" id="recordingsStatsPanel" hidden>
-                <div class="stats-grid">
-                  <div class="stats-card"><span class="stats-k">Recordings</span><span class="stats-v" id="statsTotal">0</span></div>
-                  <div class="stats-card"><span class="stats-k">Words</span><span class="stats-v" id="statsWords">0</span></div>
-                  <div class="stats-card"><span class="stats-k">Chars</span><span class="stats-v" id="statsChars">0</span></div>
-                  <div class="stats-card"><span class="stats-k">Words / Rec</span><span class="stats-v" id="statsWpr">0</span></div>
-                  <div class="stats-card"><span class="stats-k">Avg Duration</span><span class="stats-v" id="statsAvgDur">00:00</span></div>
-                  <div class="stats-card"><span class="stats-k">Min Duration</span><span class="stats-v" id="statsMinDur">00:00</span></div>
-                  <div class="stats-card"><span class="stats-k">Max Duration</span><span class="stats-v" id="statsMaxDur">00:00</span></div>
-                </div>
-                <div class="stats-split">
-                  <div class="stats-top">
-                    <span class="stats-k">Providers</span>
-                    <div class="top-words" id="statsProviders"></div>
-                  </div>
-                  <div class="stats-top">
-                    <span class="stats-k">Languages</span>
-                    <div class="top-words" id="statsLanguages"></div>
-                  </div>
-                </div>
-                <div class="stats-top">
-                  <span class="stats-k">Top Words</span>
-                  <div class="top-words" id="statsTopWords"></div>
-                </div>
-              </div>
-              <div class="pane-header">
-                <span class="pane-title recording-title" id="recordingTitle">Select recording</span>
-                <div class="recording-header-actions">
-                  <span class="pane-badge" id="recordingMeta"></span>
-                  <button class="icon-btn" id="recordingCopyBtn" type="button" aria-label="Copy recording text" title="Copy">
+                  <button class="icon-btn" id="resultCopyBtn" type="button" aria-label="Copy result text"
+                    title="Copy result">
                     <span class="copy-ico" aria-hidden="true"></span>
                   </button>
                 </div>
               </div>
-              <pre class="out" id="recordingContent" data-placeholder="Choose a recording from the left list..."></pre>
+            </div>
+
+            <div class="upload-panel" id="uploadPanel" hidden>
+              <div class="upload-drop" id="uploadDrop">
+                <p class="upload-title">Drop audio file here</p>
+                <p class="upload-sub">or click to choose WAV/MP3/M4A/FLAC</p>
+                <input id="fileInput" type="file" accept="audio/*" hidden />
+                <button class="btn btn-ghost" id="pickFileBtn" type="button">Choose File</button>
+              </div>
+              <div class="upload-meta">
+                <span id="fileName">No file selected</span>
+                <label class="check-inline"><input type="checkbox" id="splitStereoCheck" checked /> <span>Split
+                    stereo</span></label>
+                <label class="check-inline"><input type="checkbox" id="wordTsCheck" /> <span>Word
+                    timestamps</span></label>
+                <button class="btn btn-primary" id="btnTranscribeFile" type="button">Transcribe File</button>
+              </div>
+            </div>
+
+            <div class="progress-row" id="progressRow" hidden>
+              <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+              </div>
+              <span class="progress-text" id="progressText">0%</span>
+            </div>
+
+            <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
+
+            <div class="pane-footer" id="downloadRow" hidden>
+              <a class="link-btn" id="dlTxt" href="#">TXT</a>
+              <a class="link-btn" id="dlJson" href="#">JSON</a>
             </div>
           </div>
-        </section>
+          <div class="pane" id="upscalePane">
+            <div class="pane-header pane-header-2row">
+              <div class="pane-head-row pane-head-row-top">
+                <span class="pane-title">Upscale <span class="pane-latency" id="upscaleLatency">--</span></span>
+                <div class="pane-actions">
+                  <label class="toggle-inline" title="Improve transcript before paste/save">
+                    <input id="upscaleToggle" type="checkbox" />
+                  </label>
+                </div>
+              </div>
+              <div class="pane-head-row pane-head-row-bottom">
+                <div class="pane-actions">
+                  <div class="upscale-preset-wrap" id="upscalePresetWrap">
+                    <select id="upscalePresetSelect" title="Upscale preset"></select>
+                    <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button"
+                      aria-label="Delete preset" title="Delete preset">×</button>
+                  </div>
+                  <button class="icon-btn" id="upscalePresetEditBtn" type="button" aria-label="Edit preset prompt"
+                    title="Edit preset prompt">
+                    <span class="gear-ico" aria-hidden="true"></span>
+                  </button>
+                  <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset"
+                    title="Add preset">+</button>
+                  <button class="icon-btn send-enter-btn" id="autoSendEnterToggle" type="button"
+                    aria-label="Auto send after paste" aria-pressed="false" title="Auto send after paste: OFF">
+                    <span class="send-enter-ico" aria-hidden="true"></span>
+                  </button>
+                  <button class="icon-btn" id="upscaleCopyBtn" type="button" aria-label="Copy upscale text"
+                    title="Copy upscale">
+                    <span class="copy-ico" aria-hidden="true"></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <pre class="out" id="upscaleOutput" data-placeholder="Upscaled text will appear here..."></pre>
+          </div>
+        </div>
+      </section>
 
-        <section class="view" data-view="settings" hidden>
-          <div class="settings">
-            <div class="card">
-              <h2>API Keys</h2>
-              <p class="hint">Stored locally on this Mac</p>
-              <p class="hint" id="configPathLabel">Config: -</p>
-              <div class="field-stack">
-                <label class="field"><span class="lbl">fal.ai</span><input id="falKey" type="password" placeholder="FAL_KEY" /></label>
-                <label class="field"><span class="lbl">OpenRouter</span><input id="orKey" type="password" placeholder="OPENROUTER_API_KEY" /></label>
-                <label class="field"><span class="lbl">Model</span><input id="orModel" type="text" placeholder="google/gemini-2.5-flash" /></label>
+      <section class="view" data-view="recordings" hidden>
+        <div class="recordings-head">
+          <div class="recordings-head-main">
+            <h2>Saved Recordings</h2>
+            <p class="hint" id="recordingsDirLabel">Directory: -</p>
+            <p class="hint" id="recordingsCountLabel">Total recordings: 0</p>
+          </div>
+          <div class="recordings-head-actions">
+            <button class="btn ui-toggle-btn" id="recordingsStatsBtn" type="button"
+              aria-label="Toggle stats">Stats</button>
+            <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button"
+              aria-label="Refresh recordings">
+              <span class="refresh-ico" aria-hidden="true"></span>
+              <span>Refresh</span>
+            </button>
+          </div>
+        </div>
+        <div class="recordings-layout">
+          <div class="recordings-list" id="recordingsList"></div>
+          <div class="recordings-viewer">
+            <div class="recordings-stats" id="recordingsStatsPanel" hidden>
+              <div class="stats-grid">
+                <div class="stats-card"><span class="stats-k">Recordings</span><span class="stats-v"
+                    id="statsTotal">0</span></div>
+                <div class="stats-card"><span class="stats-k">Words</span><span class="stats-v" id="statsWords">0</span>
+                </div>
+                <div class="stats-card"><span class="stats-k">Chars</span><span class="stats-v" id="statsChars">0</span>
+                </div>
+                <div class="stats-card"><span class="stats-k">Words / Rec</span><span class="stats-v"
+                    id="statsWpr">0</span></div>
+                <div class="stats-card"><span class="stats-k">Avg Duration</span><span class="stats-v"
+                    id="statsAvgDur">00:00</span></div>
+                <div class="stats-card"><span class="stats-k">Min Duration</span><span class="stats-v"
+                    id="statsMinDur">00:00</span></div>
+                <div class="stats-card"><span class="stats-k">Max Duration</span><span class="stats-v"
+                    id="statsMaxDur">00:00</span></div>
               </div>
-              <div class="btn-row">
-                <button class="btn btn-primary" id="saveBtn">Save</button>
-                <button class="btn btn-ghost" id="reloadBtn">Reload</button>
+              <div class="stats-split">
+                <div class="stats-top">
+                  <span class="stats-k">Providers</span>
+                  <div class="top-words" id="statsProviders"></div>
+                </div>
+                <div class="stats-top">
+                  <span class="stats-k">Languages</span>
+                  <div class="top-words" id="statsLanguages"></div>
+                </div>
               </div>
-              <p id="cfgMsg"></p>
+              <div class="stats-top">
+                <span class="stats-k">Top Words</span>
+                <div class="top-words" id="statsTopWords"></div>
+              </div>
             </div>
-            <div class="card">
-              <h2>Defaults</h2>
-              <div class="field-stack">
-                <label class="check-inline"><input type="checkbox" id="diarizeDefault" /> <span>Diarization</span></label>
-                <label class="field"><span class="lbl">Chunk</span><select id="chunkSelect"><option>none</option><option>segment</option><option>word</option></select></label>
+            <div class="pane-header">
+              <span class="pane-title recording-title" id="recordingTitle">Select recording</span>
+              <div class="recording-header-actions">
+                <span class="pane-badge" id="recordingMeta"></span>
+                <button class="icon-btn" id="recordingCopyBtn" type="button" aria-label="Copy recording text"
+                  title="Copy">
+                  <span class="copy-ico" aria-hidden="true"></span>
+                </button>
               </div>
             </div>
-            <div class="card">
-              <h2>Recordings</h2>
-              <p class="hint">All text recordings are stored here.</p>
-              <div class="field-stack">
-                <label class="field">
-                  <span class="lbl">Folder</span>
-                  <input id="recordingsDirInput" type="text" placeholder="/Users/.../Recordings" />
-                </label>
-              </div>
-              <div class="btn-row">
-                <button class="btn btn-ghost" id="pickRecordingsDirBtn" type="button">Choose Folder</button>
-              </div>
+            <pre class="out" id="recordingContent" data-placeholder="Choose a recording from the left list..."></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="settings" hidden>
+        <div class="settings">
+          <div class="card">
+            <h2>API Keys</h2>
+            <p class="hint">Stored locally on this Mac</p>
+            <p class="hint" id="configPathLabel">Config: -</p>
+            <div class="field-stack">
+              <label class="field"><span class="lbl">Groq</span><input id="groqKey" type="password"
+                  placeholder="GROQ_API_KEY" /></label>
+              <label class="field"><span class="lbl">fal.ai</span><input id="falKey" type="password"
+                  placeholder="FAL_KEY" /></label>
+              <label class="field"><span class="lbl">OpenRouter</span><input id="orKey" type="password"
+                  placeholder="OPENROUTER_API_KEY" /></label>
+              <label class="field"><span class="lbl">Model</span><input id="orModel" type="text"
+                  placeholder="google/gemini-2.5-flash" /></label>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-primary" id="saveBtn">Save</button>
+              <button class="btn btn-ghost" id="reloadBtn">Reload</button>
+            </div>
+            <p id="cfgMsg"></p>
+          </div>
+          <div class="card">
+            <h2>Defaults</h2>
+            <div class="field-stack">
+              <label class="check-inline"><input type="checkbox" id="diarizeDefault" /> <span>Diarization</span></label>
+              <label class="field"><span class="lbl">Chunk</span><select id="chunkSelect">
+                  <option>none</option>
+                  <option>segment</option>
+                  <option>word</option>
+                </select></label>
             </div>
           </div>
-        </section>
-      </main>
-    </div>
-
-    <div class="modal-backdrop" id="upscalePresetModal" hidden>
-      <div class="modal-card">
-        <h3>New Upscale Preset</h3>
-        <label class="field">
-          <span class="lbl">Name</span>
-          <input id="upscalePresetNameInput" type="text" maxlength="60" placeholder="My Preset" />
-        </label>
-        <label class="field">
-          <span class="lbl">Instruction</span>
-          <textarea id="upscalePresetInstructionInput" rows="7" placeholder="System instruction for transcript improvement"></textarea>
-        </label>
-        <p class="hint" id="upscalePresetMsg"></p>
-        <div class="btn-row">
-          <button class="btn btn-primary" id="upscalePresetSaveBtn" type="button">Save Preset</button>
-          <button class="btn btn-ghost" id="upscalePresetCancelBtn" type="button">Cancel</button>
+          <div class="card">
+            <h2>Recordings</h2>
+            <p class="hint">All text recordings are stored here.</p>
+            <div class="field-stack">
+              <label class="field">
+                <span class="lbl">Folder</span>
+                <input id="recordingsDirInput" type="text" placeholder="/Users/.../Recordings" />
+              </label>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-ghost" id="pickRecordingsDirBtn" type="button">Choose Folder</button>
+            </div>
+          </div>
         </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="upscalePresetModal" hidden>
+    <div class="modal-card">
+      <h3>New Upscale Preset</h3>
+      <label class="field">
+        <span class="lbl">Name</span>
+        <input id="upscalePresetNameInput" type="text" maxlength="60" placeholder="My Preset" />
+      </label>
+      <label class="field">
+        <span class="lbl">Instruction</span>
+        <textarea id="upscalePresetInstructionInput" rows="7"
+          placeholder="System instruction for transcript improvement"></textarea>
+      </label>
+      <p class="hint" id="upscalePresetMsg"></p>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="upscalePresetSaveBtn" type="button">Save Preset</button>
+        <button class="btn btn-ghost" id="upscalePresetCancelBtn" type="button">Cancel</button>
       </div>
     </div>
+  </div>
 
-    <div class="modal-backdrop" id="upscalePromptModal" hidden>
-      <div class="modal-card">
-        <h3>Preset Prompt</h3>
-        <label class="modal-field">
-          <span>Name</span>
-          <input id="upscalePromptPresetName" type="text" readonly />
-          <input id="upscalePromptPresetId" type="hidden" />
-        </label>
-        <label class="modal-field">
-          <span>Instruction</span>
-          <textarea id="upscalePromptInstructionInput" rows="8" placeholder="Instruction for this preset"></textarea>
-        </label>
-        <p class="hint" id="upscalePromptMsg"></p>
-        <div class="modal-actions">
-          <button class="btn btn-primary" id="upscalePromptSaveBtn" type="button">Save</button>
-          <button class="btn btn-ghost" id="upscalePromptDefaultBtn" type="button">Set Default</button>
-          <button class="btn btn-ghost" id="upscalePromptCancelBtn" type="button">Cancel</button>
-        </div>
+  <div class="modal-backdrop" id="upscalePromptModal" hidden>
+    <div class="modal-card">
+      <h3>Preset Prompt</h3>
+      <label class="modal-field">
+        <span>Name</span>
+        <input id="upscalePromptPresetName" type="text" readonly />
+        <input id="upscalePromptPresetId" type="hidden" />
+      </label>
+      <label class="modal-field">
+        <span>Instruction</span>
+        <textarea id="upscalePromptInstructionInput" rows="8" placeholder="Instruction for this preset"></textarea>
+      </label>
+      <p class="hint" id="upscalePromptMsg"></p>
+      <div class="modal-actions">
+        <button class="btn btn-primary" id="upscalePromptSaveBtn" type="button">Save</button>
+        <button class="btn btn-ghost" id="upscalePromptDefaultBtn" type="button">Set Default</button>
+        <button class="btn btn-ghost" id="upscalePromptCancelBtn" type="button">Cancel</button>
       </div>
     </div>
+  </div>
 
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+
 </html>

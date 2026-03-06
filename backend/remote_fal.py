@@ -106,7 +106,7 @@ def fal_whisper_transcribe(
         status = st.get("status")
         if status == "COMPLETED":
             break
-        time.sleep(0.8 if status == "IN_PROGRESS" else 1.2)
+        time.sleep(0.4 if status == "IN_PROGRESS" else 1.0)
 
     out = _request_with_retry(
         "GET", result_url, headers={"Authorization": headers["Authorization"]}, timeout=60

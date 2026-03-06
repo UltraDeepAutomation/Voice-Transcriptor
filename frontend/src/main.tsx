@@ -1,6 +1,6 @@
 import "./styles.css";
 
-type Provider = "local" | "fal" | "openrouter";
+type Provider = "local" | "fal" | "openrouter" | "groq";
 type JobStatus = "queued" | "running" | "done" | "error";
 
 interface JobResultPayload {
@@ -27,6 +27,7 @@ interface AppConfig {
   providers?: {
     fal?: { key?: string };
     openrouter?: { key?: string };
+    groq?: { key?: string };
   };
   _meta?: {
     config_path?: string;
@@ -286,78 +287,14 @@ function encodeWav(float32: Float32Array, sr: number): Blob {
 }
 
 /**
- * Encode Float32 PCM → OGG Opus via MediaRecorder (browser-native).
- * This produces a ~5-8× smaller payload than WAV, dramatically reducing
- * upload time for remote providers (OpenRouter, fal).
- * Returns null if the browser does not support OGG Opus MediaRecorder.
+ * Encode Float32 PCM → compact WAV at a lower sample rate for remote providers.
+ * Downsamples 16kHz → 8kHz to halve the payload size. This is instant (pure math)
+ * unlike MediaRecorder which requires real-time playback duration.
+ * 8kHz mono is the telephony standard and all speech recognition APIs accept it.
  */
-async function encodeOggOpus(float32: Float32Array, sr: number): Promise<Blob | null> {
-  try {
-    // Check if MediaRecorder can produce audio/ogg; opus
-    const mimeType = MediaRecorder.isTypeSupported("audio/ogg; codecs=opus")
-      ? "audio/ogg; codecs=opus"
-      : MediaRecorder.isTypeSupported("audio/webm; codecs=opus")
-        ? "audio/webm; codecs=opus"
-        : null;
-    if (!mimeType) return null;
-
-    // Create an offline AudioContext to feed PCM into MediaRecorder via a MediaStreamDestination.
-    const offCtx = new OfflineAudioContext(1, float32.length, sr);
-    const buf = offCtx.createBuffer(1, float32.length, sr);
-    buf.getChannelData(0).set(float32);
-    const src = offCtx.createBufferSource();
-    src.buffer = buf;
-
-    // We need a real-time context for MediaStreamDestination.
-    const rtCtx = new AudioContext({ sampleRate: sr });
-    const dest = rtCtx.createMediaStreamDestination();
-    const rtBuf = rtCtx.createBuffer(1, float32.length, sr);
-    rtBuf.getChannelData(0).set(float32);
-    const rtSrc = rtCtx.createBufferSource();
-    rtSrc.buffer = rtBuf;
-    rtSrc.connect(dest);
-
-    const recorder = new MediaRecorder(dest.stream, {
-      mimeType,
-      audioBitsPerSecond: 32000,
-    });
-    const parts: BlobPart[] = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) parts.push(e.data);
-    };
-
-    const done = new Promise<Blob>((resolve, reject) => {
-      recorder.onstop = () => {
-        try { rtCtx.close(); } catch { /* ignore */ }
-        if (parts.length === 0) {
-          reject(new Error("no data from MediaRecorder"));
-          return;
-        }
-        const ext = mimeType.includes("ogg") ? "audio/ogg" : "audio/webm";
-        resolve(new Blob(parts, { type: ext }));
-      };
-      recorder.onerror = (ev) => {
-        try { rtCtx.close(); } catch { /* ignore */ }
-        reject((ev as any).error || new Error("MediaRecorder error"));
-      };
-    });
-
-    recorder.start();
-    rtSrc.start(0);
-
-    // Stop recorder after audio duration + small buffer.
-    const durationMs = (float32.length / sr) * 1000;
-    await new Promise((r) => setTimeout(r, durationMs + 150));
-    if (recorder.state === "recording") {
-      recorder.stop();
-    }
-    rtSrc.stop();
-
-    return await done;
-  } catch (e) {
-    console.warn("[encodeOggOpus] fallback to WAV:", e);
-    return null;
-  }
+function encodeCompactWav(float32: Float32Array, inputSr: number, outputSr: number = 8000): Blob {
+  const resampled = inputSr === outputSr ? float32 : downsample(float32, inputSr, outputSr);
+  return encodeWav(resampled, outputSr);
 }
 
 function getRemoteModelValue(provider: Provider): string {
@@ -367,6 +304,7 @@ function getRemoteModelValue(provider: Provider): string {
     return "google/gemini-2.5-flash";
   }
   if (provider === "fal") return "fal-ai/whisper";
+  if (provider === "groq") return "whisper-large-v3-turbo";
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
@@ -916,10 +854,13 @@ async function loadCfg(): Promise<void> {
     const cfg = await apiGet<AppConfig>("/api/config");
     const falK = ((cfg.providers || {}).fal || {}).key;
     const orK = ((cfg.providers || {}).openrouter || {}).key;
+    const groqK = ((cfg.providers || {}).groq || {}).key;
     ($("falKey") as HTMLInputElement).placeholder = falK ? "(saved)" : "FAL_KEY";
     ($("orKey") as HTMLInputElement).placeholder = orK ? "(saved)" : "OPENROUTER_API_KEY";
+    ($("groqKey") as HTMLInputElement).placeholder = groqK ? "(saved)" : "GROQ_API_KEY";
     ($("falKey") as HTMLInputElement).value = "";
     ($("orKey") as HTMLInputElement).value = "";
+    ($("groqKey") as HTMLInputElement).value = "";
     $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
@@ -980,6 +921,7 @@ async function saveCfg(): Promise<void> {
     providers: {
       fal: { key: ($("falKey") as HTMLInputElement).value.trim() },
       openrouter: { key: ($("orKey") as HTMLInputElement).value.trim() },
+      groq: { key: ($("groqKey") as HTMLInputElement).value.trim() },
     },
     preferences: {
       remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "fal").trim() || "fal"),
@@ -992,6 +934,7 @@ async function saveCfg(): Promise<void> {
   await apiPost<{ ok: boolean }>("/api/config", cfg);
   ($("falKey") as HTMLInputElement).value = "";
   ($("orKey") as HTMLInputElement).value = "";
+  ($("groqKey") as HTMLInputElement).value = "";
   await loadCfg();
   $("cfgMsg").textContent = "Saved";
 }
@@ -1311,7 +1254,8 @@ async function saveRecordingText(opts: {
     model: opts.model,
     language: opts.language,
   });
-  await loadRecordings(true);
+  // Fire-and-forget: don't block critical path for recordings list reload.
+  loadRecordings(true).catch(() => { });
 }
 
 $("recordingsRefreshBtn").addEventListener("click", () =>
@@ -1327,6 +1271,19 @@ $("recordingsStatsBtn").addEventListener("click", () => {
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 $("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || ""));
 $("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || ""));
+
+// ── Transcribe settings gear popup ──
+const transcribeSettingsBtn = $("transcribeSettingsBtn") as HTMLButtonElement;
+const transcribeSettingsPopup = $("transcribeSettingsPopup") as HTMLElement;
+transcribeSettingsBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  transcribeSettingsPopup.hidden = !transcribeSettingsPopup.hidden;
+});
+document.addEventListener("click", (e) => {
+  if (!transcribeSettingsPopup.hidden && !transcribeSettingsPopup.contains(e.target as Node) && e.target !== transcribeSettingsBtn) {
+    transcribeSettingsPopup.hidden = true;
+  }
+});
 
 syncRecordingsStatsVisibility();
 
@@ -1760,7 +1717,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   } catch { }
   stream = null;
   try {
-    if (ac) await ac.close();
+    if (ac) ac.close().catch(() => { });
   } catch { }
   ac = null;
   workletNode = null;
@@ -1857,20 +1814,13 @@ async function stopLive(enhance: boolean): Promise<void> {
       merged.set(c, off);
       off += c.length;
     });
-    // For remote providers, try OGG Opus encoding first (5-8× smaller payload).
-    // For local, always use WAV (faster-whisper expects raw PCM).
+    // For remote providers, use compact WAV (8kHz) — halves payload instantly.
+    // For local, use full 16kHz WAV (faster-whisper expects higher quality).
     let audioBlob: Blob;
     let audioName: string;
     if (provider !== "local") {
-      const ogg = await encodeOggOpus(merged, 16000);
-      if (ogg) {
-        const ext = ogg.type.includes("ogg") ? "ogg" : "webm";
-        audioBlob = ogg;
-        audioName = `live-${Date.now()}.${ext}`;
-      } else {
-        audioBlob = encodeWav(merged, 16000);
-        audioName = `live-${Date.now()}.wav`;
-      }
+      audioBlob = encodeCompactWav(merged, 16000, 8000);
+      audioName = `live-${Date.now()}.wav`;
     } else {
       audioBlob = encodeWav(merged, 16000);
       audioName = `live-${Date.now()}.wav`;
@@ -1909,15 +1859,17 @@ async function stopLive(enhance: boolean): Promise<void> {
       setStatus("Done");
     }
     let transcriptForPaste = "";
+    // Publish raw transcript immediately so paste can happen without waiting for upscale.
     if (transcriptRaw) {
       $("finalOutput").textContent = transcriptRaw;
+      publishFinishedRecording(recordingId, transcriptRaw);
       transcriptForPaste = await runUpscaleIfEnabled(transcriptRaw);
+      // If upscale changed the text, publish the upgraded version.
+      if (transcriptForPaste && transcriptForPaste !== transcriptRaw) {
+        publishFinishedRecording(recordingId, transcriptForPaste);
+      }
     }
-    // Signal readiness for global hotkey flow immediately after final text is available.
-    const earlyFinishedText = (transcriptForPaste || transcriptRaw || sourceLiveText || "").trim();
-    if (earlyFinishedText) {
-      publishFinishedRecording(recordingId, earlyFinishedText);
-    }
+    // saveRecordingText is non-blocking for recordings list reload.
     try {
       await saveRecordingText({
         title,

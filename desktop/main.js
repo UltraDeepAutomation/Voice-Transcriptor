@@ -62,7 +62,7 @@ function appendMainLog(message) {
     if (!mainLogFilePath) {
       mainLogFilePath = path.join(app.getPath("userData"), "main.log");
     }
-    fs.appendFileSync(mainLogFilePath, `[${new Date().toISOString()}] ${message}\n`, "utf8");
+    fs.appendFile(mainLogFilePath, `[${new Date().toISOString()}] ${message}\n`, "utf8", () => { });
   } catch { }
 }
 
@@ -323,7 +323,7 @@ async function setRendererUpscalePresetChoice(presetId) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 async function setRendererUpscaleEnabledChoice(enabled) {
@@ -345,7 +345,7 @@ async function setRendererUpscaleEnabledChoice(enabled) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 async function setRendererQuickSettingsOpenChoice(open) {
@@ -369,7 +369,7 @@ async function setRendererQuickSettingsOpenChoice(open) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 async function setRendererAutoSendEnterChoice(enabled) {
@@ -388,7 +388,7 @@ async function setRendererAutoSendEnterChoice(enabled) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 async function setRendererProviderChoice(provider) {
@@ -414,7 +414,7 @@ async function setRendererProviderChoice(provider) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 async function setRendererLocalModelChoice(model) {
@@ -435,7 +435,7 @@ async function setRendererLocalModelChoice(model) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 async function setRendererModelChoice(provider, model) {
@@ -480,7 +480,7 @@ async function setRendererModelChoice(provider, model) {
       `,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 function createOverlayHtml() {
@@ -516,6 +516,8 @@ function createOverlayHtml() {
           align-items:center;
           gap:4px;
           margin:2px auto 0;
+          transform:scale(0.9);
+          transform-origin:top center;
         }
         #pill{
           width: fit-content;
@@ -1154,6 +1156,31 @@ function createOverlayHtml() {
         window.setUpscale('builtin_clean');
         window.setAutoSendEnabled(false);
         window.setQueueVisible(false);
+
+        // Dynamic sizing: report actual pill dimensions so main.js can resize the window tightly.
+        const reportLayout = () => {
+          const stack = document.getElementById('stack');
+          if (!stack) return;
+          const rect = stack.getBoundingClientRect();
+          const w = Math.ceil(rect.width);
+          const h = Math.ceil(rect.height);
+          if (w > 10 && h > 10) {
+            document.title = '__overlay_layout__' + w + 'x' + h;
+          }
+        };
+        const layoutObserver = new ResizeObserver(reportLayout);
+        layoutObserver.observe(document.getElementById('stack'));
+        setTimeout(reportLayout, 60);
+
+        // Mouse enter/leave: toggle click interception on the capsule.
+        // When mouse is over the pill, we capture events; otherwise pass through.
+        const stackEl = document.getElementById('stack');
+        stackEl.addEventListener('mouseenter', () => {
+          document.title = '__overlay_mouse_enter__';
+        });
+        stackEl.addEventListener('mouseleave', () => {
+          document.title = '__overlay_mouse_leave__';
+        });
       </script>
     </body>
   </html>`;
@@ -1162,8 +1189,8 @@ function createOverlayHtml() {
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
-    width: 520,
-    height: 74,
+    width: 320,
+    height: 48,
     frame: false,
     transparent: true,
     resizable: false,
@@ -1179,7 +1206,9 @@ function ensureOverlayWindow() {
       nodeIntegration: false
     }
   });
-  overlayWin.setIgnoreMouseEvents(false);
+  // Allow clicks to pass through transparent regions around the capsule pill.
+  // The overlay HTML reports mouse enter/leave on the pill so we toggle this.
+  overlayWin.setIgnoreMouseEvents(true, { forward: true });
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   overlayWin.setAlwaysOnTop(true, "screen-saver");
   overlayWin.on("page-title-updated", (event, title) => {
@@ -1206,10 +1235,10 @@ function ensureOverlayWindow() {
       overlayQuickSettingsOpen = raw.endsWith("1");
       overlayQuickSettingsInitialized = true;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 1600;
-      suppressMainWindowUntil = Date.now() + 1600;
+      suppressActivateUntil = Date.now() + 3000;
+      suppressMainWindowUntil = Date.now() + 3000;
       if (win && !win.isDestroyed() && win.isVisible()) {
-        try { win.hide(); } catch {}
+        try { win.hide(); } catch { }
       }
       void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
       return;
@@ -1218,8 +1247,8 @@ function ensureOverlayWindow() {
       const v = raw.endsWith("1");
       overlayQuickUpscaleEnabled = !!v;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 1200;
-      suppressMainWindowUntil = Date.now() + 1200;
+      suppressActivateUntil = Date.now() + 3000;
+      suppressMainWindowUntil = Date.now() + 3000;
       void setRendererUpscaleEnabledChoice(v);
       return;
     }
@@ -1227,8 +1256,8 @@ function ensureOverlayWindow() {
       const v = String(decodeURIComponent(raw.replace("__overlay_upscale__", "")) || "").trim();
       overlayQuickUpscalePreset = v;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 1200;
-      suppressMainWindowUntil = Date.now() + 1200;
+      suppressActivateUntil = Date.now() + 3000;
+      suppressMainWindowUntil = Date.now() + 3000;
       void setRendererUpscalePresetChoice(v);
       return;
     }
@@ -1237,12 +1266,41 @@ function ensureOverlayWindow() {
       overlayQuickAutoSend = !!v;
       overlayQuickAutoSendInitialized = true;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 1200;
-      suppressMainWindowUntil = Date.now() + 1200;
+      suppressActivateUntil = Date.now() + 3000;
+      suppressMainWindowUntil = Date.now() + 3000;
       void setRendererAutoSendEnterChoice(v);
       return;
     }
-    if (raw.startsWith("__overlay_layout__")) return;
+    if (raw.startsWith("__overlay_layout__")) {
+      // Dynamic capsule resize: overlay reports its actual pill size.
+      try {
+        const parts = raw.replace("__overlay_layout__", "").split("x");
+        const w = parseInt(parts[0], 10);
+        const h = parseInt(parts[1], 10);
+        if (w > 40 && h > 20 && w < 900 && h < 300 && overlayWin && !overlayWin.isDestroyed()) {
+          // Add a small margin so the pill isn't clipped.
+          const newW = w + 16;
+          const newH = h + 12;
+          overlayWin.setSize(newW, newH, false);
+          positionOverlayWindow();
+        }
+      } catch { }
+      return;
+    }
+    if (raw === "__overlay_mouse_enter__") {
+      // Mouse entered the pill — capture mouse events.
+      if (overlayWin && !overlayWin.isDestroyed()) {
+        overlayWin.setIgnoreMouseEvents(false);
+      }
+      return;
+    }
+    if (raw === "__overlay_mouse_leave__") {
+      // Mouse left the pill — pass clicks through to desktop.
+      if (overlayWin && !overlayWin.isDestroyed()) {
+        overlayWin.setIgnoreMouseEvents(true, { forward: true });
+      }
+      return;
+    }
   });
   overlayWin.on("closed", () => {
     overlayWin = null;
@@ -1308,9 +1366,9 @@ async function showRecordingOverlay() {
     );
   } catch { }
   try {
-    ow.setSize(560, 74, false);
+    ow.setSize(320, 48, false);
     positionOverlayWindow();
-  } catch {}
+  } catch { }
   await syncOverlayQueueVisual(true);
   ow.showInactive();
   await playOverlayCue("start");
@@ -1366,11 +1424,11 @@ async function ensureOverlayVisible(options = {}) {
       `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
       true
     );
-  } catch {}
+  } catch { }
   try {
-    ow.setSize(560, 74, false);
+    ow.setSize(320, 48, false);
     positionOverlayWindow();
-  } catch {}
+  } catch { }
   const jsParts = [];
   if (resetTimer) jsParts.push("window.resetTimer && window.resetTimer();");
   if (startTimer) jsParts.push("window.startTimer && window.startTimer();");
@@ -2579,7 +2637,7 @@ async function runPostStopQueue() {
         await overlayWin?.webContents.executeJavaScript(
           `window.setStatus && window.setStatus("Recording"); window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer();`,
           true
-        ).catch(() => {});
+        ).catch(() => { });
       }
     }
   } finally {
@@ -2698,7 +2756,7 @@ async function processPostStopTask(task) {
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
       (state.status === "Done" || state.status === "Error" || state.status === "Idle");
     if (doneLike) break;
-    await sleep(55);
+    await sleep(30);
   }
 
   let overlayStatus = "Saved To App";
@@ -2749,7 +2807,7 @@ async function processPostStopTask(task) {
       `[paste-auto] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
     if (pasted.ok && task.autoSendEnter) {
-      await sleep(1000);
+      await sleep(400);
       const sent = await sendCommandEnterToFocusedApp(effectiveTargetName, effectiveTargetPid);
       traceStep(trace, "cmd_enter_result", {
         ok: !!sent.ok,
@@ -2762,7 +2820,7 @@ async function processPostStopTask(task) {
         openPrivacyAccessibilitySettings();
       }
     }
-  if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
+    if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
       openPrivacyAccessibilitySettings();
     }
     overlayStatus = pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason);
@@ -3242,9 +3300,15 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", async () => {
-  // Ignore synthetic activation pulses produced by immediate overlay interactions.
-  if (Date.now() - lastOverlayUiInteractionAt < 700) return;
-  ensureWindowVisible({ manual: true, force: true });
+  // Block activation pulses triggered by overlay UI interactions (IPC calls to renderer
+  // can cause macOS to fire activate events). Use a generous window to cover the
+  // full IPC round-trip and any delayed activation.
+  if (Date.now() - lastOverlayUiInteractionAt < 2500) return;
+  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return;
+  if (Date.now() < suppressMainWindowUntil) return;
+  if (Date.now() < suppressActivateUntil) return;
+  if (suppressActivateDuringOverlayFlow) return;
+  ensureWindowVisible({ manual: true });
 });
 
 app.on("before-quit", () => {

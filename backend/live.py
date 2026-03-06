@@ -105,19 +105,24 @@ class LiveSession:
             offset_sec = (total_samples - int(audio_window.shape[0])) / float(sr)
             self._last_transcribe_sec = total_sec
 
-        # Transcribe outside the lock (CPU heavy)
+        # Transcribe outside the lock — offload CPU-heavy inference to thread pool
+        # so the event loop stays responsive for WS I/O.
         try:
             print(
                 f"[live] transcribing {audio_window.shape[0]} samples ({audio_window.shape[0] / sr:.2f}s)"
             )
-            result = transcribe_audio(
-                audio_window,
-                self.model_name,
-                language=self.language,
-                vad_filter=True,
-                word_timestamps=False,
-                beam_size=1,
-                best_of=1,
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: transcribe_audio(
+                    audio_window,
+                    self.model_name,
+                    language=self.language,
+                    vad_filter=True,
+                    word_timestamps=False,
+                    beam_size=1,
+                    best_of=1,
+                ),
             )
             print(
                 f"[live] transcribe result: {len(result.get('segments', []))} segments"

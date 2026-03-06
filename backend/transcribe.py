@@ -109,6 +109,8 @@ def transcribe_file(
     language: Optional[str] = None,
     vad_filter: bool = True,
     word_timestamps: bool = False,
+    beam_size: int = 1,
+    best_of: int = 1,
 ) -> Dict[str, Any]:
     if not os.path.exists(path_wav_16k_mono):
         raise FileNotFoundError(path_wav_16k_mono)
@@ -122,6 +124,8 @@ def transcribe_file(
             language=language or None,
             vad_filter=vad_filter,
             word_timestamps=word_timestamps,
+            beam_size=beam_size,
+            best_of=best_of,
         )
     except Exception as e:
         if _is_empty_sequence_transcribe_error(e):

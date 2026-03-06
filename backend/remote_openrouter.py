@@ -71,7 +71,7 @@ def openrouter_transcribe(
         "temperature": 0.0,
     }
 
-    r = _request_with_retry("POST", url, headers=headers, json=payload, timeout=180)
+    r = _request_with_retry("POST", url, headers=headers, json=payload, timeout=60)
     if r.status_code >= 400:
         error_text = r.text[:400]
         if "input_audio" in error_text.lower() or "image" in error_text.lower():

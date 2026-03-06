@@ -35,6 +35,8 @@ from backend.live import LiveSession
 from backend.jobs import JobStore
 from backend.remote_fal import RemoteError as FalRemoteError
 from backend.remote_fal import fal_whisper_transcribe
+from backend.remote_groq import RemoteError as GroqRemoteError
+from backend.remote_groq import groq_transcribe
 from backend.remote_openrouter import RemoteError as OrRemoteError
 from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
 from backend.transcribe import merge_channel_transcripts, transcribe_file
@@ -56,7 +58,7 @@ WS_CONNECT_LIMIT_PER_MIN = 20
 RESULT_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_RESULT_RETENTION_SEC", "86400"))
 LIVE_RECOVERY_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", "86400"))
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
-ALLOWED_REMOTE_PROVIDERS = {"fal", "openrouter"}
+ALLOWED_REMOTE_PROVIDERS = {"fal", "openrouter", "groq"}
 ALLOWED_AUDIO_EXTS = {
     ".wav",
     ".mp3",
@@ -186,10 +188,19 @@ def _touch_rate_limit(bucket: dict[str, deque[float]], key: str, limit_per_min: 
         return True
 
 
+_last_cleanup_expired_at = 0.0
+_last_cleanup_recovery_at = 0.0
+_CLEANUP_DEBOUNCE_SEC = 60.0
+
+
 def _cleanup_expired_files() -> None:
+    global _last_cleanup_expired_at
     if RESULT_RETENTION_SEC <= 0:
         return
     now = time.time()
+    if now - _last_cleanup_expired_at < _CLEANUP_DEBOUNCE_SEC:
+        return
+    _last_cleanup_expired_at = now
     cutoff = now - RESULT_RETENTION_SEC
     for base in (RESULTS_DIR, UPLOADS_DIR):
         for p in base.glob("*"):
@@ -203,9 +214,14 @@ def _cleanup_expired_files() -> None:
 
 
 def _cleanup_live_recovery_files() -> None:
+    global _last_cleanup_recovery_at
     if LIVE_RECOVERY_RETENTION_SEC <= 0:
         return
-    cutoff = time.time() - LIVE_RECOVERY_RETENTION_SEC
+    now = time.time()
+    if now - _last_cleanup_recovery_at < _CLEANUP_DEBOUNCE_SEC:
+        return
+    _last_cleanup_recovery_at = now
+    cutoff = now - LIVE_RECOVERY_RETENTION_SEC
     for p in LIVE_RECOVERY_DIR.glob("*"):
         try:
             if not p.is_file():
@@ -374,7 +390,17 @@ def _validate_config_payload(payload: dict) -> None:
             raise HTTPException(status_code=400, detail="recordings_dir must be a string")
 
 
+_rec_dir_cache: Optional[Path] = None
+_rec_dir_cache_at = 0.0
+_REC_DIR_CACHE_TTL = 10.0
+
+
 def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
+    global _rec_dir_cache, _rec_dir_cache_at
+    now = time.time()
+    if _rec_dir_cache is not None and (now - _rec_dir_cache_at) < _REC_DIR_CACHE_TTL and cfg is None:
+        return _rec_dir_cache
+
     cfg = cfg or load_config()
     prefs = cfg.get("preferences") or {}
     custom = (prefs.get("recordings_dir") or "").strip()
@@ -410,10 +436,16 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                 save_config(cfg)
             except Exception:
                 pass
+            _rec_dir_cache = default_dir
+            _rec_dir_cache_at = now
             return default_dir
 
         p.mkdir(parents=True, exist_ok=True)
+        _rec_dir_cache = p
+        _rec_dir_cache_at = now
         return p
+    _rec_dir_cache = default_dir
+    _rec_dir_cache_at = now
     return default_dir
 
 
@@ -857,21 +889,25 @@ def _format_fal_transcript(result: dict) -> str:
 def _run_remote_transcribe_once(
     *,
     provider_norm: str,
-    upload_path: Path,
+    upload_path: Optional[Path] = None,
+    audio_bytes: Optional[bytes] = None,
     orig_name: str,
     language: Optional[str],
     diarize: bool,
     num_speakers: str,
     openrouter_model: str,
+    cfg: Optional[dict] = None,
 ) -> dict[str, Any]:
-    cfg = load_config()
+    if cfg is None:
+        cfg = load_config()
     prov = (
         provider_norm
         or cfg.get("preferences", {}).get("remote_provider")
         or "fal"
     ).strip()
 
-    audio_bytes = upload_path.read_bytes()
+    if audio_bytes is None and upload_path is not None:
+        audio_bytes = upload_path.read_bytes()
     if prov == "fal":
         fal_key = ((cfg.get("providers") or {}).get("fal") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("fal") or {}
@@ -918,6 +954,26 @@ def _run_remote_transcribe_once(
         )
         return {
             "provider": "openrouter",
+            "model": model,
+            "text": (out.get("text") or "").strip(),
+            "raw": out.get("raw"),
+        }
+
+    if prov == "groq":
+        groq_key = ((cfg.get("providers") or {}).get("groq") or {}).get("key") or ""
+        pref = (cfg.get("preferences") or {}).get("groq") or {}
+        model = (
+            openrouter_model or pref.get("model") or "whisper-large-v3-turbo"
+        ).strip()
+        out = groq_transcribe(
+            api_key=groq_key,
+            audio_bytes=audio_bytes,
+            filename=orig_name,
+            model=model,
+            language=language,
+        )
+        return {
+            "provider": "groq",
             "model": model,
             "text": (out.get("text") or "").strip(),
             "raw": out.get("raw"),
@@ -981,7 +1037,7 @@ async def create_remote_job(
                     "txt": str(result_txt_path),
                 },
             )
-        except (FalRemoteError, OrRemoteError) as e:
+        except (FalRemoteError, OrRemoteError, GroqRemoteError) as e:
             jobs.set_error(job_id, str(e))
         except Exception as e:
             jobs.set_error(job_id, f"Remote transcription failed: {e}")
@@ -1005,40 +1061,36 @@ async def remote_transcribe_sync(
     num_speakers: str = Form(""),
     openrouter_model: str = Form(""),
 ):
-    _cleanup_expired_files()
     provider_norm = (provider or "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
         raise HTTPException(status_code=400, detail="unsupported provider")
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
-    upload_path = UPLOADS_DIR / f"sync-{uuid.uuid4()}.{orig_name}"
-    await _save_upload_file(file, upload_path)
+    # Read audio bytes directly into memory — skip disk I/O for speed.
+    audio_bytes = await file.read()
     lang_opt = _normalize_language(language)
+    cfg = load_config()
     try:
         result = _run_remote_transcribe_once(
             provider_norm=provider_norm,
-            upload_path=upload_path,
+            audio_bytes=audio_bytes,
             orig_name=orig_name,
             language=lang_opt,
             diarize=diarize,
             num_speakers=num_speakers,
             openrouter_model=openrouter_model,
+            cfg=cfg,
         )
         return {"ok": True, "result": result}
-    except (FalRemoteError, OrRemoteError) as e:
+    except (FalRemoteError, OrRemoteError, GroqRemoteError) as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Remote transcription failed: {e}")
-    finally:
-        try:
-            os.remove(upload_path)
-        except Exception:
-            pass
 
 
 @app.post("/api/upscale")
-def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -1074,15 +1126,19 @@ def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require_api_a
     used_model = candidates[0] if candidates else model
     out: Optional[dict[str, Any]] = None
     last_err: Optional[Exception] = None
+    loop = asyncio.get_event_loop()
     try:
         for cand in candidates:
             used_model = cand
             try:
-                out = openrouter_upscale_text(
-                    api_key=key,
-                    model=cand,
-                    text=text,
-                    instruction=instruction,
+                out = await loop.run_in_executor(
+                    None,
+                    lambda c=cand: openrouter_upscale_text(
+                        api_key=key,
+                        model=c,
+                        text=text,
+                        instruction=instruction,
+                    ),
                 )
                 break
             except OrRemoteError as e:
@@ -1324,9 +1380,34 @@ def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth))
     }
 
 
+_stats_cache: Optional[dict] = None
+_stats_cache_at = 0.0
+_stats_cache_key: Optional[tuple] = None
+_STATS_CACHE_TTL = 30.0
+
+
 @app.get("/api/recordings/stats/summary")
 def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
+    global _stats_cache, _stats_cache_at, _stats_cache_key
     d = _resolve_recordings_dir()
+    now = time.time()
+
+    # Build a lightweight cache key: dir mtime + file count
+    try:
+        dir_mtime = d.stat().st_mtime
+        file_count = sum(1 for _ in d.glob("*.txt"))
+    except Exception:
+        dir_mtime = 0.0
+        file_count = -1
+    cache_key = (str(d), dir_mtime, file_count)
+
+    if (
+        _stats_cache is not None
+        and _stats_cache_key == cache_key
+        and (now - _stats_cache_at) < _STATS_CACHE_TTL
+    ):
+        return _stats_cache
+
     files = sorted(d.glob("*.txt"))
     total_recordings = len(files)
     total_words = 0
@@ -1362,7 +1443,7 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
     avg_words_per_recording = round(total_words / total_recordings, 1) if total_recordings else 0.0
     avg_chars_per_recording = round(total_chars / total_recordings, 1) if total_recordings else 0.0
 
-    return {
+    result = {
         "total_recordings": total_recordings,
         "total_words": total_words,
         "total_chars": total_chars,
@@ -1375,6 +1456,10 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         "providers": [{"name": k, "count": v} for k, v in sorted(providers.items(), key=lambda kv: kv[1], reverse=True)],
         "languages": [{"name": k, "count": v} for k, v in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)],
     }
+    _stats_cache = result
+    _stats_cache_at = now
+    _stats_cache_key = cache_key
+    return result
 
 
 @app.post("/api/recordings/save")

@@ -18,9 +18,23 @@ def _has_ffmpeg() -> bool:
 def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     """Ensure 16k WAV PCM output using ffmpeg when needed.
 
-    If ffmpeg isn't available, only accepts a WAV already at 16k and the requested channel count.
+    Fast-path: if input is already a WAV at 16kHz with the right channel count,
+    skip ffmpeg entirely (saves ~200-500ms subprocess overhead).
     """
     ext = os.path.splitext(path_in)[1].lower()
+
+    # Fast-path: check if WAV is already in the right format.
+    if ext == ".wav":
+        try:
+            info = sf.info(path_in)
+            if info.samplerate == 16000 and info.channels == channels and info.subtype == "PCM_16":
+                # Already perfect — just copy (or symlink) to output path.
+                if os.path.abspath(path_in) != os.path.abspath(path_out):
+                    shutil.copyfile(path_in, path_out)
+                return path_out
+        except Exception:
+            pass  # Fall through to ffmpeg conversion
+
     if _has_ffmpeg():
         cmd = [
             "ffmpeg",
