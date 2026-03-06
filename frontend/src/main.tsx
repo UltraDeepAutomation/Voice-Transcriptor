@@ -1419,19 +1419,25 @@ async function loadRecordingsStats(): Promise<void> {
 
   const providers = $("statsProviders");
   providers.innerHTML = "";
-  const providerItems = (s.providers || [])
-    .filter((p) => {
-      const n = String(p.name || "").trim().toLowerCase();
-      return n !== "fal" && n !== "fal.ai" && n !== "falai";
+  const providerTotals = new Map<string, number>();
+  (s.providers || []).forEach((p) => {
+    const key = String(p.name || "").trim().toLowerCase();
+    if (!key || key === "fal" || key === "fal.ai" || key === "falai") return;
+    providerTotals.set(key, (providerTotals.get(key) || 0) + Number(p.count || 0));
+  });
+  ["local", "openrouter", "deepgram"].forEach((key) => {
+    if (!providerTotals.has(key)) providerTotals.set(key, 0);
+  });
+  const providerItems = Array.from(providerTotals.entries())
+    .sort((a, b) => {
+      const order = ["local", "openrouter", "deepgram"];
+      const ia = order.indexOf(a[0]);
+      const ib = order.indexOf(b[0]);
+      if (ia !== -1 || ib !== -1) return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+      return b[1] - a[1];
     })
-    .slice(0, 8);
-  if (!providerItems.length) {
-    providerItems.push(
-      { name: "local", count: 0 },
-      { name: "openrouter", count: 0 },
-      { name: "deepgram", count: 0 }
-    );
-  }
+    .slice(0, 10)
+    .map(([name, count]) => ({ name, count }));
   providerItems.forEach((p) => {
     const chip = document.createElement("span");
     chip.className = "word-chip";
@@ -1441,10 +1447,21 @@ async function loadRecordingsStats(): Promise<void> {
 
   const languages = $("statsLanguages");
   languages.innerHTML = "";
-  const languageItems = (s.languages || []).slice(0, 8);
-  if (!languageItems.length) {
-    languageItems.push({ name: "auto", count: 0 });
-  }
+  const languageTotals = new Map<string, number>();
+  (s.languages || []).forEach((l) => {
+    const key = String(l.name || "").trim().toLowerCase();
+    if (!key) return;
+    languageTotals.set(key, (languageTotals.get(key) || 0) + Number(l.count || 0));
+  });
+  if (!languageTotals.has("auto")) languageTotals.set("auto", 0);
+  const languageItems = Array.from(languageTotals.entries())
+    .sort((a, b) => {
+      if (a[0] === "auto") return -1;
+      if (b[0] === "auto") return 1;
+      return b[1] - a[1];
+    })
+    .slice(0, 8)
+    .map(([name, count]) => ({ name, count }));
   languageItems.forEach((l) => {
     const chip = document.createElement("span");
     chip.className = "word-chip";

@@ -209,10 +209,10 @@ body {
 
 .topbar-row {
   display: grid;
-  grid-template-columns: 180px 180px 180px minmax(220px, 1fr) 56px;
+  grid-template-columns: 152px 152px 176px 220px 48px;
   align-items: start;
   gap: var(--space-2);
-  min-width: 0;
+  min-width: 780px;
   -webkit-app-region: no-drag;
 }
 
@@ -221,6 +221,7 @@ body {
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-2);
+  padding-bottom: 0;
   min-width: 0;
 }
 
@@ -281,7 +282,7 @@ input:focus {
 
 .top-item-stop {
   align-items: stretch;
-  width: 56px;
+  width: 48px;
 }
 
 .topbar .top-item select,
@@ -292,7 +293,9 @@ input:focus {
 }
 
 .topbar .top-item select {
-  padding: 7px 30px 7px 10px;
+  margin: 0;
+  padding: 6px 28px 6px 9px;
+  font-size: 11px;
 }
 
 .topbar .status-pill {
@@ -1370,6 +1373,10 @@ input:focus {
   font-size: 12px;
 }
 
+.settings input[type="number"] {
+  width: 100%;
+}
+
 .settings .field .lbl {
   margin-bottom: var(--space-1);
 }
@@ -1425,6 +1432,10 @@ input:focus {
   margin-top: var(--space-3);
 }
 
+.settings .btn-row {
+  margin-top: var(--space-2);
+}
+
 .settings-toggle {
   margin-bottom: var(--space-2);
   justify-content: space-between;
@@ -1449,7 +1460,7 @@ canvas,
   }
 
   .topbar-row {
-    min-width: 760px;
+    min-width: 780px;
   }
 
   .settings {
@@ -1463,7 +1474,7 @@ canvas,
   }
 
   .topbar-row {
-    min-width: 760px;
+    min-width: 780px;
   }
 
   .split {
