@@ -407,6 +407,49 @@ async function remoteJobSync(
   };
 }
 
+function isTransientRemoteNetworkError(err: unknown): boolean {
+  const msg = String((err as Error)?.message || err || "").toLowerCase();
+  return (
+    msg.includes("bad gateway") ||
+    msg.includes("httpsconnectionpool") ||
+    msg.includes("failed to establish a new connection") ||
+    msg.includes("nodename nor servname provided") ||
+    msg.includes("name or service not known") ||
+    msg.includes("temporary failure in name resolution") ||
+    msg.includes("network error") ||
+    msg.includes("connection error") ||
+    msg.includes("timed out")
+  );
+}
+
+async function remoteJobSyncWithFallback(
+  file: File,
+  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
+): Promise<{ text: string; provider: string; model?: string }> {
+  const preferred = opts.provider;
+  const candidates: Provider[] = preferred === "deepgram"
+    ? ["deepgram", "openrouter", "groq", "fal"]
+    : [preferred];
+  let lastErr: unknown = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const p = candidates[i];
+    try {
+      return await remoteJobSync(file, {
+        provider: p,
+        language: opts.language,
+        diarize: opts.diarize,
+        openrouterModel: opts.openrouterModel,
+      });
+    } catch (e) {
+      lastErr = e;
+      if (!isTransientRemoteNetworkError(e) || i === candidates.length - 1) {
+        throw e;
+      }
+    }
+  }
+  throw (lastErr || new Error("Remote transcription failed"));
+}
+
 async function localJob(
   file: File,
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean }
@@ -1951,7 +1994,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         const tailBlob = encodeCompactWav(tailAudio, 16000, 8000);
         const tailFile = new File([tailBlob], `tail-${Date.now()}.wav`, { type: tailBlob.type });
         try {
-          const tailResult = await remoteJobSync(tailFile, {
+          const tailResult = await remoteJobSyncWithFallback(tailFile, {
             provider,
             language: ($("language") as HTMLSelectElement).value,
             diarize: ($("diarizeCheck") as HTMLInputElement).checked,
@@ -1982,7 +2025,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           // Fallback: send entire recording.
           $("progressFill").style.width = "65%";
           $("progressText").textContent = "65%";
-          const syncOut = await remoteJobSync(file, {
+          const syncOut = await remoteJobSyncWithFallback(file, {
             provider,
             language: ($("language") as HTMLSelectElement).value,
             diarize: ($("diarizeCheck") as HTMLInputElement).checked,
@@ -2101,7 +2144,7 @@ async function transcribeSelectedFile(): Promise<void> {
         wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
       });
     } else {
-      const syncOut = await remoteJobSync(selectedFile, {
+      const syncOut = await remoteJobSyncWithFallback(selectedFile, {
         provider,
         language: ($("language") as HTMLSelectElement).value,
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,

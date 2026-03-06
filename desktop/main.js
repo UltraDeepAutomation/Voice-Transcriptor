@@ -41,6 +41,7 @@ let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
 let micPermissionChecked = false;
+const OVERLAY_FIXED_HEIGHT = 62;
 
 const HOST = "127.0.0.1";
 let PORT = 8321;
@@ -1274,9 +1275,9 @@ function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
     width: 320,
-    height: 48,
+    height: OVERLAY_FIXED_HEIGHT,
     frame: false,
-    transparent: false,
+    transparent: true,
     resizable: false,
     movable: false,
     focusable: false,
@@ -1284,7 +1285,7 @@ function ensureOverlayWindow() {
     show: false,
     hasShadow: false,
     alwaysOnTop: true,
-    backgroundColor: "#141414",
+    backgroundColor: "#00000000",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false
@@ -1361,11 +1362,11 @@ function ensureOverlayWindow() {
         const parts = raw.replace("__overlay_layout__", "").split("x");
         const w = parseInt(parts[0], 10);
         const h = parseInt(parts[1], 10);
-        if (w > 40 && h > 20 && w < 900 && h < 300 && overlayWin && !overlayWin.isDestroyed()) {
-          // Add a small margin so the pill isn't clipped.
-          const newW = w + 16;
-          const newH = h + 12;
-          overlayWin.setSize(newW, newH, false);
+        if (w > 40 && h > 20 && w < 900 && h < 500 && overlayWin && !overlayWin.isDestroyed()) {
+          // Keep overlay vertically stable. Only width may adapt; height is fixed
+          // to eliminate up/down jumps when queue/settings appear.
+          const newW = Math.max(180, Math.min(760, w + 16));
+          overlayWin.setSize(newW, OVERLAY_FIXED_HEIGHT, false);
           positionOverlayWindow();
         }
       } catch { }
@@ -1450,7 +1451,7 @@ async function showRecordingOverlay() {
     );
   } catch { }
   try {
-    ow.setSize(320, 48, false);
+    ow.setSize(320, OVERLAY_FIXED_HEIGHT, false);
     positionOverlayWindow();
   } catch { }
   await syncOverlayQueueVisual(true);
@@ -1510,7 +1511,7 @@ async function ensureOverlayVisible(options = {}) {
     );
   } catch { }
   try {
-    ow.setSize(320, 48, false);
+    ow.setSize(320, OVERLAY_FIXED_HEIGHT, false);
     positionOverlayWindow();
   } catch { }
   const jsParts = [];
@@ -2295,7 +2296,12 @@ async function runPostStopQueue() {
     while (postStopQueue.length > 0) {
       const task = postStopQueue.shift();
       if (!task) continue;
-      await processPostStopTask(task);
+      try {
+        await processPostStopTask(task);
+      } catch (e) {
+        appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
+        await setOverlayStatus("Saved To App");
+      }
       pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       const isRec = await isRendererRecording();
       await syncOverlayQueueVisual(isRec);
@@ -2319,7 +2325,7 @@ async function runPostStopQueue() {
 
 async function processPostStopTask(task) {
   const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
-  const deadline = Date.now() + 120000;
+  const deadline = Date.now() + 45000;
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
@@ -2405,7 +2411,6 @@ async function processPostStopTask(task) {
       break;
     }
     const canUseUnscopedFinalText =
-      task.recordingId <= 0 &&
       !state.isRec &&
       !state.busy &&
       !state.progressVisible &&
@@ -2419,6 +2424,22 @@ async function processPostStopTask(task) {
         status: state.status || "",
         busy: !!state.busy,
         progressVisible: !!state.progressVisible,
+      });
+      break;
+    }
+    const canUseFinalTextFallback =
+      !state.isRec &&
+      !state.busy &&
+      !state.progressVisible &&
+      pollCount >= 3 &&
+      !!(state.finalText && String(state.finalText).trim());
+    if (canUseFinalTextFallback) {
+      transcript = String(state.finalText || "").trim();
+      traceStep(trace, "final_text_recording_fallback", {
+        pollCount,
+        textLen: transcript.length,
+        status: state.status || "",
+        expectedRecordingId: task.recordingId || 0,
       });
       break;
     }
