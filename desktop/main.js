@@ -84,9 +84,6 @@ const OVERLAY_TOKENS = Object.freeze({
     size: 14,
     dotSize: 8,
   }),
-  quickPanel: Object.freeze({
-    width: 138,
-  }),
 });
 
 const singleInstanceLock = app.requestSingleInstanceLock();
@@ -637,10 +634,11 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           gap:4px;
-          width:${t.quickPanel.width}px;
+          max-width:230px;
           min-width:0;
           opacity:1;
           overflow:hidden;
+          flex:0 0 auto;
         }
         #pill.qs-closed #quickPanel{
           display:none;
