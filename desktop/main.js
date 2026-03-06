@@ -2140,6 +2140,8 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
+  const escapedApp = escapeAppleScriptString(effectiveTargetName);
+  const pid = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
   const robustPasteScript = `
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
