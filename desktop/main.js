@@ -2170,19 +2170,11 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       
       if p is missing value then return "ERR:no-process"
       
-      -- Bring to front (critical for paste)
+      -- Fast path: bring target to front and send physical Cmd+V keycode.
+      -- Avoid AXFocusedUIElement probing here because some apps block this call
+      -- for several seconds and it makes the overlay look "stuck on transcribing".
       set frontmost of p to true
-      delay 0.25
-      
-      -- Check for secure fields (passwords) to avoid pasting sensitive clips blindly
-      try
-        set focusedElement to value of attribute "AXFocusedUIElement" of p
-        set roleName to role of focusedElement
-        set subroleName to subrole of focusedElement
-        if roleName is "AXSecureTextField" or subroleName is "AXSecureTextField" then
-          return "ERR:secure-field"
-        end if
-      end try
+      delay 0.08
       
       -- Perform physical V key press (key code 9) + Cmd
       -- This bypasses keyboard layout issues (like Russian "м") where keystroke "v" fails
@@ -2190,7 +2182,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         key code 9 using {command down}
       end tell
       
-      delay 0.20
+      delay 0.10
       return "OK:robust-paste"
     end tell
   `;
@@ -2205,13 +2197,13 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   for (let attempt = 0; attempt < 3; attempt++) {
     // Refresh clipboard just in case OS flushed it
     try { clipboard.writeText(String(text)); } catch { }
-    await sleep(80 + attempt * 70);
+    await sleep(45 + attempt * 40);
 
     logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "robust_paste" });
     traceStep(trace, "method_begin", { method: "robust_paste", attempt: attempt + 1 });
 
     const cmdStarted = Date.now();
-    const check = await runCommand("osascript", ["-e", robustPasteScript], { timeoutMs: 14000 });
+    const check = await runCommand("osascript", ["-e", robustPasteScript], { timeoutMs: 3200 });
 
     traceStep(trace, "method_result", {
       method: "robust_paste",
@@ -2288,7 +2280,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       end try
     end tell
   `;
-  const menuRes = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 12000 });
+  const menuRes = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 4500 });
   traceStep(trace, "menu_paste_result", {
     ok: !!menuRes.ok,
     code: menuRes.code,
