@@ -131,6 +131,48 @@ const fmtMs = (ms: number): string => {
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 const MAX_FILE_BYTES = 500 * 1024 * 1024;
 const MAX_JOB_WAIT_MS = 45 * 60 * 1000;
+const AUDIO_TOKENS = {
+  liveSampleRateHz: 16_000,
+  compactSampleRateHz: 8_000,
+} as const;
+const UI_TOKENS = {
+  polling: {
+    initialWaitMs: 180,
+    maxWaitMs: 700,
+    growth: 1.16,
+    fastInitialWaitMs: 50,
+    fastMaxWaitMs: 180,
+    fastGrowth: 1.06,
+    remoteChunkSettleWaitMs: 200,
+    remoteChunkSettleTimeoutMs: 8_000,
+  },
+  draft: {
+    autosaveIntervalMs: 1_200,
+  },
+  timer: {
+    tickMs: 200,
+  },
+  network: {
+    refreshIntervalMs: 10_000,
+  },
+  settings: {
+    saveDebounceMs: 260,
+  },
+  capture: {
+    fallbackInitDelayMs: 1_300,
+    chunkIntervalMs: 8_000,
+    chunkMinNewSamples: AUDIO_TOKENS.liveSampleRateHz, // 1 sec @ live sample rate
+    tailMinSamples: Math.floor(AUDIO_TOKENS.liveSampleRateHz / 10), // 0.1 sec @ live sample rate
+    vuAmplify: 4,
+    waveformMixRms: 6.6,
+    waveformMixPeak: 0.45,
+  },
+  drain: {
+    maxWaitMs: 180,
+    idleMs: 45,
+    pollStepMs: 24,
+  },
+} as const;
 const ALLOWED_AUDIO_MIME = new Set([
   "audio/wav",
   "audio/x-wav",
@@ -293,7 +335,11 @@ function encodeWav(float32: Float32Array, sr: number): Blob {
  * unlike MediaRecorder which requires real-time playback duration.
  * 8kHz mono is the telephony standard and all speech recognition APIs accept it.
  */
-function encodeCompactWav(float32: Float32Array, inputSr: number, outputSr: number = 8000): Blob {
+function encodeCompactWav(
+  float32: Float32Array,
+  inputSr: number,
+  outputSr: number = AUDIO_TOKENS.compactSampleRateHz
+): Blob {
   const resampled = inputSr === outputSr ? float32 : downsample(float32, inputSr, outputSr);
   return encodeWav(resampled, outputSr);
 }
@@ -484,9 +530,9 @@ async function pollJob(
   opts?: { initialWaitMs?: number; maxWaitMs?: number; growth?: number }
 ): Promise<JobResponse> {
   const started = Date.now();
-  let waitMs = Math.max(20, Math.floor(Number(opts?.initialWaitMs ?? 180)));
-  const maxWaitMs = Math.max(waitMs, Math.floor(Number(opts?.maxWaitMs ?? 700)));
-  const growth = Math.max(1.01, Number(opts?.growth ?? 1.16));
+  let waitMs = Math.max(20, Math.floor(Number(opts?.initialWaitMs ?? UI_TOKENS.polling.initialWaitMs)));
+  const maxWaitMs = Math.max(waitMs, Math.floor(Number(opts?.maxWaitMs ?? UI_TOKENS.polling.maxWaitMs)));
+  const growth = Math.max(1.01, Number(opts?.growth ?? UI_TOKENS.polling.growth));
   while (true) {
     if (signal.aborted) {
       throw new Error("Request canceled");
@@ -673,7 +719,7 @@ let vu = 0;
 function setVU(rms: number): void {
   vu = vu * 0.7 + rms * 0.3;
   const pct = Math.min(100, vu * 400);
-  window.__transcriptorVuLevel = Math.max(0, Math.min(1, vu * 4));
+  window.__transcriptorVuLevel = Math.max(0, Math.min(1, vu * UI_TOKENS.capture.vuAmplify));
   $("vuFill").style.width = pct + "%";
   $("vuFill").style.background = pct < 40 ? "#aaa" : pct < 70 ? "#888" : "#666";
 }
@@ -914,7 +960,7 @@ function queueUiPreferencesSave(): void {
         ui: collectUiPreferences(),
       },
     }).catch(() => { });
-  }, 260);
+  }, UI_TOKENS.settings.saveDebounceMs);
 }
 
 async function loadCfg(): Promise<void> {
@@ -1455,11 +1501,11 @@ let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 
 // ── Chunked transcription pipeline ──────────────────────────────────────────
-// During recording with a remote provider, we send audio in ~8 second chunks
+// During recording with a remote provider, we send audio in fixed-size chunks
 // for parallel transcription. By the time the user stops, ~90% of text is ready.
-const CHUNK_INTERVAL_MS = 8_000;
 let chunkTimer: number | null = null;
 let chunkTranscriptions: string[] = [];  // ordered partial results
+let chunkStates: Array<"pending" | "done" | "failed"> = [];
 let chunkLastSentSamples = 0;             // how many samples already sent
 let chunkPendingCount = 0;                // in-flight requests
 
@@ -1472,7 +1518,7 @@ function chunkTranscribeSchedulerTick(): void {
   for (const c of chunks) totalSamples += c.length;
   // Only send if we have at least 1 second of new audio (16000 samples)
   const newSamples = totalSamples - chunkLastSentSamples;
-  if (newSamples < 16000) return;
+  if (newSamples < UI_TOKENS.capture.chunkMinNewSamples) return;
   // Extract only the new audio since last send
   const allMerged = new Float32Array(totalSamples);
   let off = 0;
@@ -1480,10 +1526,11 @@ function chunkTranscribeSchedulerTick(): void {
   const newAudio = allMerged.slice(chunkLastSentSamples);
   const chunkIndex = chunkTranscriptions.length;
   chunkTranscriptions.push("");  // placeholder
+  chunkStates.push("pending");
   chunkLastSentSamples = totalSamples;
   chunkPendingCount++;
   // Fire-and-forget background transcription
-  const audioBlob = encodeCompactWav(newAudio, 16000, 8000);
+  const audioBlob = encodeCompactWav(newAudio, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
   const file = new File([audioBlob], `chunk-${chunkIndex}.wav`, { type: audioBlob.type });
   remoteJobSync(file, {
     provider: effectiveProvider,
@@ -1492,8 +1539,10 @@ function chunkTranscribeSchedulerTick(): void {
     openrouterModel: getRemoteModelValue(effectiveProvider),
   }).then((r) => {
     chunkTranscriptions[chunkIndex] = r.text;
+    chunkStates[chunkIndex] = "done";
     chunkPendingCount--;
   }).catch(() => {
+    chunkStates[chunkIndex] = "failed";
     chunkPendingCount--;
   });
 }
@@ -1501,12 +1550,13 @@ function chunkTranscribeSchedulerTick(): void {
 function startChunkScheduler(): void {
   stopChunkScheduler();
   chunkTranscriptions = [];
+  chunkStates = [];
   chunkLastSentSamples = 0;
   chunkPendingCount = 0;
   const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const effectiveProvider = resolveEffectiveProvider(providerValue);
   if (effectiveProvider === "local" || !effectiveProvider) return;
-  chunkTimer = window.setInterval(chunkTranscribeSchedulerTick, CHUNK_INTERVAL_MS);
+  chunkTimer = window.setInterval(chunkTranscribeSchedulerTick, UI_TOKENS.capture.chunkIntervalMs);
 }
 
 function stopChunkScheduler(): void {
@@ -1570,9 +1620,9 @@ function pushCapturedFrame(input: Float32Array): void {
   captureFrameCount += 1;
   captureRmsAccum += rms;
   if (peak > capturePeakMax) capturePeakMax = peak;
-  window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * 4));
+  window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
-  const ds = downsample(input, ac.sampleRate, 16000);
+  const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
   chunks.push(new Float32Array(ds));
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const pcm = new ArrayBuffer(ds.length * 2);
@@ -1623,10 +1673,10 @@ async function startLive(): Promise<void> {
     clearInterval(draftSaveTimer);
     draftSaveTimer = null;
   }
-  draftSaveTimer = window.setInterval(() => persistLiveDraft(true), 1200);
+  draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
   timer = window.setInterval(() => {
     $("timer").textContent = fmtTime((Date.now() - startAt) / 1000);
-  }, 200);
+  }, UI_TOKENS.timer.tickMs);
 
   const enableLivePreview = shouldLivePreview();
   if (enableLivePreview) {
@@ -1729,7 +1779,7 @@ async function startLive(): Promise<void> {
 
       waveFrameCount += 1;
       if (waveFrameCount % WAVE_PUSH_EVERY_FRAMES === 0) {
-        const level = Math.min(1, rms * 6.6 + peak * 0.45);
+        const level = Math.min(1, rms * UI_TOKENS.capture.waveformMixRms + peak * UI_TOKENS.capture.waveformMixPeak);
         waveBars.push(level);
         if (waveBars.length > maxBars) waveBars = waveBars.slice(-maxBars);
       }
@@ -1772,7 +1822,7 @@ async function startLive(): Promise<void> {
           $("liveOutput").textContent = (cur ? `${cur}\n` : "") + "[Mic fallback engaged]";
         }
       } catch { }
-    }, 1300);
+    }, UI_TOKENS.capture.fallbackInitDelayMs);
   } catch (e) {
     $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
     await stopLive(false);
@@ -1780,12 +1830,15 @@ async function startLive(): Promise<void> {
   }
 }
 
-async function waitForWorkletDrain(maxWaitMs = 180, idleMs = 45): Promise<void> {
+async function waitForWorkletDrain(
+  maxWaitMs = UI_TOKENS.drain.maxWaitMs,
+  idleMs = UI_TOKENS.drain.idleMs
+): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < maxWaitMs) {
     const last = workletLastFrameAt || 0;
     if (!last || Date.now() - last >= idleMs) return;
-    await new Promise((r) => setTimeout(r, 24));
+    await new Promise((r) => setTimeout(r, UI_TOKENS.drain.pollStepMs));
   }
 }
 
@@ -1954,10 +2007,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     let audioBlob: Blob;
     let audioName: string;
     if (provider !== "local") {
-      audioBlob = encodeCompactWav(merged, 16000, 8000);
+      audioBlob = encodeCompactWav(merged, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
       audioName = `live-${Date.now()}.wav`;
     } else {
-      audioBlob = encodeWav(merged, 16000);
+      audioBlob = encodeWav(merged, AUDIO_TOKENS.liveSampleRateHz);
       audioName = `live-${Date.now()}.wav`;
     }
     const file = new File([audioBlob], audioName, { type: audioBlob.type });
@@ -1974,24 +2027,29 @@ async function stopLive(enhance: boolean): Promise<void> {
       const j = await pollJob(job_id, localAbortController.signal, (job) => {
         $("progressFill").style.width = Math.round((job.progress || 0) * 100) + "%";
         $("progressText").textContent = Math.round((job.progress || 0) * 100) + "%";
-      }, { initialWaitMs: 50, maxWaitMs: 180, growth: 1.06 });
+      }, {
+        initialWaitMs: UI_TOKENS.polling.fastInitialWaitMs,
+        maxWaitMs: UI_TOKENS.polling.fastMaxWaitMs,
+        growth: UI_TOKENS.polling.fastGrowth,
+      });
       applyJobResult(j);
       transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
     } else {
       // Remote provider — use chunked transcription if chunks were pre-transcribed.
       const hasPreTranscribed = chunkTranscriptions.length > 0;
       let tailText = "";
+      let forceFullSync = false;
 
       // Transcribe the remaining tail audio (samples not yet sent by the scheduler).
       let totalSamples = 0;
       for (const c of chunks) totalSamples += c.length;
       const remainingSamples = totalSamples - chunkLastSentSamples;
-      if (remainingSamples > 1600) { // at least 0.1 second of audio
+      if (remainingSamples > UI_TOKENS.capture.tailMinSamples) {
         const allMerged = new Float32Array(totalSamples);
         let mOff = 0;
         for (const c of chunks) { allMerged.set(c, mOff); mOff += c.length; }
         const tailAudio = allMerged.slice(chunkLastSentSamples);
-        const tailBlob = encodeCompactWav(tailAudio, 16000, 8000);
+        const tailBlob = encodeCompactWav(tailAudio, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
         const tailFile = new File([tailBlob], `tail-${Date.now()}.wav`, { type: tailBlob.type });
         try {
           const tailResult = await remoteJobSyncWithFallback(tailFile, {
@@ -2006,15 +2064,22 @@ async function stopLive(enhance: boolean): Promise<void> {
 
       // Wait for any in-flight chunk transcriptions to finish (max 8s).
       if (chunkPendingCount > 0) {
-        const deadline = Date.now() + 8000;
+        const deadline = Date.now() + UI_TOKENS.polling.remoteChunkSettleTimeoutMs;
         while (chunkPendingCount > 0 && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 200));
+          await new Promise((r) => setTimeout(r, UI_TOKENS.polling.remoteChunkSettleWaitMs));
         }
+        if (chunkPendingCount > 0) forceFullSync = true;
+      }
+      if (chunkStates.some((s) => s === "pending" || s === "failed")) {
+        forceFullSync = true;
       }
 
       if (hasPreTranscribed) {
         // Merge all chunk results + tail.
-        const parts = [...chunkTranscriptions.filter(Boolean)];
+        const parts = chunkTranscriptions
+          .map((text, idx) => ({ text: String(text || "").trim(), state: chunkStates[idx] || "failed" }))
+          .filter((x) => x.state === "done" && !!x.text)
+          .map((x) => x.text);
         if (tailText) parts.push(tailText);
         transcriptRaw = parts.join(" ").trim();
       } else {
@@ -2033,6 +2098,20 @@ async function stopLive(enhance: boolean): Promise<void> {
           });
           transcriptRaw = String(syncOut.text || "").trim();
         }
+      }
+
+      // Guarantee completeness: if any dispatched chunk did not settle successfully
+      // before stop, run one authoritative full-file transcription pass.
+      if (forceFullSync || !transcriptRaw) {
+        $("progressFill").style.width = "80%";
+        $("progressText").textContent = "80%";
+        const syncOut = await remoteJobSyncWithFallback(file, {
+          provider,
+          language: ($("language") as HTMLSelectElement).value,
+          diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+          openrouterModel: getRemoteModelValue(provider),
+        });
+        transcriptRaw = String(syncOut.text || "").trim();
       }
 
       $("finalOutput").textContent = transcriptRaw;
@@ -2244,7 +2323,7 @@ void loadCfg().then(() => loadMics(false));
 initQuickControls();
 syncRemoteModelOptions();
 void refreshNetworkState();
-window.setInterval(() => void refreshNetworkState(), 10000);
+window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());
 window.addEventListener("offline", () => void refreshNetworkState());
 void loadRecordings(false).catch(() => { });

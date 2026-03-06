@@ -48,6 +48,42 @@ let PORT = 8321;
 let BASE_URL = `http://${HOST}:${PORT}`;
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
+const OVERLAY_TOKENS = Object.freeze({
+  window: Object.freeze({
+    width: 320,
+    height: 47,
+    bottomOffset: 10,
+  }),
+  pill: Object.freeze({
+    marginTop: 6,
+    gap: 9,
+    padY: 6,
+    padX: 10,
+    borderRadius: 999,
+    border: "1px solid rgba(255,255,255,.18)",
+    background: "linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97))",
+    backdrop: "blur(8px) saturate(100%)",
+  }),
+  wave: Object.freeze({
+    width: 54,
+    height: 16,
+    barWidth: 1.4,
+    barGap: 1.0,
+    idleTickMs: 120,
+    activeStaleMs: 220,
+  }),
+  timer: Object.freeze({
+    tickMs: 200,
+  }),
+  sounds: Object.freeze({
+    start: Object.freeze({ durationSec: 0.075, baseHz: 760, endHz: 980, gainPeak: 0.04 }),
+    stop: Object.freeze({ durationSec: 0.09, baseHz: 560, endHz: 420, gainPeak: 0.055 }),
+  }),
+  stateIcon: Object.freeze({
+    size: 14,
+    dotSize: 8,
+  }),
+});
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -485,12 +521,13 @@ async function setRendererModelChoice(provider, model) {
 }
 
 function createOverlayHtml() {
+  const t = OVERLAY_TOKENS;
   return `
   <html>
     <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;display:flex;justify-content:center;">
       <div id="stack">
       <div id="queuePill">
-        <canvas id="queueWave" width="54" height="12"></canvas>
+        <canvas id="queueWave" width="${t.wave.width}" height="12"></canvas>
         <span id="queueTimer">00:00</span>
       </div>
       <div id="pill">
@@ -509,7 +546,7 @@ function createOverlayHtml() {
         </div>
         <div id="core">
           <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
-          <canvas id="wave" width="54" height="16"></canvas>
+          <canvas id="wave" width="${t.wave.width}" height="${t.wave.height}"></canvas>
           <span id="timer">00:00</span>
           <span id="stateIcon" aria-hidden="true"></span>
         </div>
@@ -530,8 +567,8 @@ function createOverlayHtml() {
           align-items:center;
           justify-content:flex-start;
           gap:6px;
-          padding:6px 8px;
-          border-radius:999px;
+          padding:${t.pill.padY}px 8px;
+          border-radius:${t.pill.borderRadius}px;
           border:1px solid #333;
           background:#161616;
           box-shadow:none;
@@ -559,11 +596,11 @@ function createOverlayHtml() {
           opacity:1;
         }
         #queueWave{
-          width:54px;
+          width:${t.wave.width}px;
           height:12px;
           display:block;
           opacity:.95;
-          flex:0 0 54px;
+          flex:0 0 ${t.wave.width}px;
         }
         #queueTimer{
           font-size:9px;
@@ -578,9 +615,9 @@ function createOverlayHtml() {
         #wave{
           display:block;
           opacity:.95;
-          width:54px;
-          height:16px;
-          flex:0 0 54px;
+          width:${t.wave.width}px;
+          height:${t.wave.height}px;
+          flex:0 0 ${t.wave.width}px;
         }
         #quickPanel{
           display:flex;
@@ -961,9 +998,9 @@ function createOverlayHtml() {
         let queueStart = Date.now();
         let waveMode = 'recording';
         const dpr = Math.max(1, Math.min(3, Number(window.devicePixelRatio || 1)));
-        const waveW = 54;
-        const waveH = 16;
-        const queueW = 54;
+        const waveW = ${t.wave.width};
+        const waveH = ${t.wave.height};
+        const queueW = ${t.wave.width};
         const queueH = 12;
         cv.width = Math.round(waveW * dpr);
         cv.height = Math.round(waveH * dpr);
@@ -976,8 +1013,8 @@ function createOverlayHtml() {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         qCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-        const bw = 1.4;
-        const gap = 1.0;
+        const bw = ${t.wave.barWidth};
+        const gap = ${t.wave.barGap};
         const maxBars = Math.floor(waveW / (bw + gap));
         const qBw = 1.2;
         const qGap = 0.8;
@@ -1012,7 +1049,7 @@ function createOverlayHtml() {
               const mm = String(Math.floor(s / 60)).padStart(2, '0');
               const ss = String(s % 60).padStart(2, '0');
               qTimer.textContent = mm + ':' + ss;
-            }, 200);
+            }, ${t.timer.tickMs});
           }
           if (!queueVisible) {
             queueBars.length = 0;
@@ -1124,7 +1161,7 @@ function createOverlayHtml() {
         };
         window.startTimer = () => {
           if (timerId) clearInterval(timerId);
-          timerId = setInterval(tick, 200);
+          timerId = setInterval(tick, ${t.timer.tickMs});
         };
         window.playCue = (kind) => {
           try {
@@ -1137,15 +1174,16 @@ function createOverlayHtml() {
               audioCtx.resume().catch(() => {});
             }
             const now = audioCtx.currentTime;
-            const dur = kind === 'stop' ? 0.09 : 0.075;
-            const base = kind === 'stop' ? 560 : 760;
+            const cue = kind === 'stop' ? ${JSON.stringify(t.sounds.stop)} : ${JSON.stringify(t.sounds.start)};
+            const dur = cue.durationSec;
+            const base = cue.baseHz;
             const osc = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
             osc.type = 'triangle';
             osc.frequency.setValueAtTime(base, now);
-            osc.frequency.exponentialRampToValueAtTime(kind === 'stop' ? 420 : 980, now + dur);
+            osc.frequency.exponentialRampToValueAtTime(cue.endHz, now + dur);
             gain.gain.setValueAtTime(0.0001, now);
-            gain.gain.exponentialRampToValueAtTime(kind === 'stop' ? 0.055 : 0.04, now + 0.012);
+            gain.gain.exponentialRampToValueAtTime(cue.gainPeak, now + 0.012);
             gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
             osc.connect(gain);
             gain.connect(audioCtx.destination);
@@ -1218,21 +1256,21 @@ function createOverlayHtml() {
           el.textContent = mm + ':' + ss;
         };
         setInterval(() => {
-          if (activeWave && Date.now() - lastLevelAt < 220) return;
+          if (activeWave && Date.now() - lastLevelAt < ${t.wave.activeStaleMs}) return;
           const idle = activeWave
             ? (0.08 + Math.random() * 0.12)
             : ((waveMode === 'transcribing' || waveMode === 'upscaling') ? 0.055 : (0.03 + Math.random() * 0.03));
           bars.push(idle);
           while (bars.length > maxBars) bars.shift();
           render();
-        }, 120);
+        }, ${t.wave.idleTickMs});
         setInterval(() => {
           if (!queueVisible) return;
-          if (Date.now() - lastQueueLevelAt < 220) return;
+          if (Date.now() - lastQueueLevelAt < ${t.wave.activeStaleMs}) return;
           queueBars.push(0.05 + Math.random() * 0.06);
           while (queueBars.length > qMaxBars) queueBars.shift();
           renderQueue();
-        }, 120);
+        }, ${t.wave.idleTickMs});
         tick();
         window.startTimer();
         window.setQuickOpen(false);
@@ -1274,7 +1312,7 @@ function createOverlayHtml() {
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
-    width: 320,
+    width: OVERLAY_TOKENS.window.width,
     height: OVERLAY_FIXED_HEIGHT,
     frame: false,
     transparent: true,
@@ -1398,7 +1436,7 @@ function positionOverlayWindow() {
   const wa = screen.getPrimaryDisplay().workArea;
   const [w, h] = overlayWin.getSize();
   const x = Math.round(wa.x + (wa.width - w) / 2);
-  const y = Math.round(wa.y + wa.height - h - 10);
+  const y = Math.round(wa.y + wa.height - h - OVERLAY_TOKENS.window.bottomOffset);
   overlayWin.setPosition(x, y, false);
 }
 
@@ -2162,10 +2200,10 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   // ── Enterprise Paste Logic ──
   // Clipboard is already populated synchronously via Electron before we get here.
   // We simply invoke the robust layout-agnostic Cmd+V via AppleScript 'key code 9'.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     // Refresh clipboard just in case OS flushed it
     try { clipboard.writeText(String(text)); } catch { }
-    await sleep(40);
+    await sleep(80 + attempt * 70);
 
     logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "robust_paste" });
     traceStep(trace, "method_begin", { method: "robust_paste", attempt: attempt + 1 });
@@ -2214,6 +2252,59 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     } else {
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
+  }
+
+  // Secondary fallback: trigger Edit -> Paste menu item in target process.
+  const menuPasteScript = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${Math.trunc(pid)}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      end if
+      if p is missing value and targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then
+        set p to first process whose frontmost is true
+      end if
+      if p is missing value then return "ERR:no-process"
+      set frontmost of p to true
+      delay 0.32
+      try
+        click menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p
+        delay 0.16
+        return "OK:menu-paste"
+      on error errMsg
+        return "ERR:menu-paste:" & errMsg
+      end try
+    end tell
+  `;
+  const menuRes = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 12000 });
+  traceStep(trace, "menu_paste_result", {
+    ok: !!menuRes.ok,
+    code: menuRes.code,
+    stdout: compactLogText(menuRes.stdout),
+    stderr: compactLogText(menuRes.stderr),
+  });
+  if (menuRes.ok) {
+    const out = String(menuRes.stdout || "").trim();
+    if (out.startsWith("OK:")) {
+      setTimeout(() => {
+        if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+      }, 1200);
+      traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: false });
+      return { ok: true, reason: out, method: "menu-paste", verified: false };
+    }
+    lastReason = out || lastReason;
+  } else {
+    lastReason = String(menuRes.stderr || menuRes.stdout || lastReason || "menu-paste-failed").trim();
   }
 
   // Exhausted all robust attempts

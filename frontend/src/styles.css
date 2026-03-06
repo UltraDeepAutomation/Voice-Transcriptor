@@ -20,12 +20,47 @@ body {
   --bg: #121212;
   --bg-2: #1a1a1a;
   --bg-3: #222222;
+  --bg-4: #1c1c1c;
+  --bg-5: #202020;
+  --bg-6: #232323;
+  --bg-7: #242424;
+  --bg-8: #252525;
+  --bg-9: #2a2a2a;
+  --bg-10: #2d2d2d;
+  --bg-11: #303030;
   --line: #313131;
   --line-2: #434343;
+  --line-3: #5f5f5f;
+  --line-4: #666666;
+  --line-5: #6f6f6f;
   --text: #efefef;
   --text-2: #bdbdbd;
   --text-3: #8f8f8f;
+  --text-mute-strong: #dcdcdc;
+  --icon-stroke: #d4d4d4;
+  --status-neutral: #969696;
+  --status-rec: #d8d8d8;
+  --status-done: #c6c6c6;
+  --status-process: #a1a1a1;
+  --net-neutral: #7a7a7a;
+  --net-online: #79b88a;
+  --net-offline: #b87878;
+  --overlay-backdrop: rgba(0, 0, 0, 0.55);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --accent-soft-bg: rgba(64, 96, 146, 0.16);
+  --accent-soft-border: rgba(108, 144, 198, 0.3);
+  --accent-strong-bg: rgba(64, 96, 146, 0.18);
+  --accent-strong-border: rgba(108, 144, 198, 0.34);
+  --purple-soft-bg: rgba(126, 88, 170, 0.2);
+  --purple-soft-border: rgba(168, 126, 214, 0.34);
+  --radius-sm: 8px;
+  --radius-md: 10px;
   --radius: 12px;
+  --h-control: 44px;
+  --h-topbar: 46px;
+  --dur-fast: 100ms;
+  --dur-base: 120ms;
+  --dur-slow: 140ms;
 }
 
 body {
@@ -69,7 +104,7 @@ body {
   font-weight: 520;
   text-align: left;
   cursor: pointer;
-  transition: all 140ms ease;
+  transition: all var(--dur-slow) ease;
   -webkit-app-region: no-drag;
 }
 
@@ -81,7 +116,7 @@ body {
 .sb-item.active {
   color: var(--text);
   border-color: var(--line-2);
-  background: #252525;
+  background: var(--bg-8);
 }
 
 .content {
@@ -99,7 +134,7 @@ body {
 }
 
 .window-topbar {
-  height: 46px;
+  height: var(--h-topbar);
   border-bottom: 1px solid var(--line);
   display: flex;
   align-items: center;
@@ -137,22 +172,22 @@ body {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 2px 8px;
-  background: #1a1a1a;
+  background: var(--bg-2);
 }
 
 .net-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #7a7a7a;
+  background: var(--net-neutral);
 }
 
 .net-dot.online {
-  background: #79b88a;
+  background: var(--net-online);
 }
 
 .net-dot.offline {
-  background: #b87878;
+  background: var(--net-offline);
 }
 
 .net-text {
@@ -207,7 +242,7 @@ input {
   border-radius: var(--radius);
   color: var(--text);
   padding: 10px 12px;
-  height: 44px;
+  height: var(--h-control);
   font-size: 12px;
   font-family: inherit;
   outline: none;
@@ -231,7 +266,7 @@ select {
 
 select:focus,
 input:focus {
-  border-color: #5f5f5f;
+  border-color: var(--line-3);
 }
 
 .ctrl-group {
@@ -254,8 +289,8 @@ input:focus {
   align-items: center;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #1a1a1a;
-  height: 44px;
+  background: var(--bg-2);
+  height: var(--h-control);
   padding: 6px 10px;
 }
 
@@ -277,19 +312,19 @@ input:focus {
   min-width: 148px;
   padding: 5px 28px 5px 10px;
   font-size: 12px;
-  border-radius: 10px;
-  background-color: rgba(64, 96, 146, 0.16);
-  border-color: rgba(108, 144, 198, 0.3);
+  border-radius: var(--radius-md);
+  background-color: var(--accent-soft-bg);
+  border-color: var(--accent-soft-border);
 }
 
 .quick-settings-btn {
   width: 44px;
-  height: 44px;
+  height: var(--h-control);
   padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: #232323;
+  background: var(--bg-6);
 }
 
 .quick-settings-btn::before {
@@ -304,7 +339,7 @@ input:focus {
 
 .quick-settings-btn.active {
   border-color: var(--line-2);
-  background: #2a2a2a;
+  background: var(--bg-9);
 }
 
 .quick-settings-btn.active::before {
@@ -318,28 +353,28 @@ input:focus {
   border: 1px solid var(--line-2);
   border-radius: var(--radius);
   padding: 0 14px;
-  height: 44px;
+  height: var(--h-control);
   min-width: 170px;
-  background: #1a1a1a;
+  background: var(--bg-2);
 }
 
 .status-dot {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: #969696;
+  background: var(--status-neutral);
 }
 
 .status-dot.rec {
-  background: #d8d8d8;
+  background: var(--status-rec);
 }
 
 .status-dot.done {
-  background: #c6c6c6;
+  background: var(--status-done);
 }
 
 .status-dot.process {
-  background: #a1a1a1;
+  background: var(--status-process);
 }
 
 .status-text {
@@ -360,24 +395,24 @@ input:focus {
 
 .mini-wave {
   width: 260px;
-  height: 44px;
+  height: var(--h-control);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #1a1a1a;
+  background: var(--bg-2);
 }
 
 .btn {
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #242424;
+  background: var(--bg-7);
   color: var(--text);
   cursor: pointer;
-  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+  transition: border-color var(--dur-base) ease, background var(--dur-base) ease, transform var(--dur-base) ease;
   -webkit-app-region: no-drag;
 }
 
 .btn:hover {
-  border-color: #666666;
+  border-color: var(--line-4);
 }
 
 .btn:active {
@@ -391,7 +426,7 @@ input:focus {
 
 .mic-btn {
   width: 44px;
-  height: 44px;
+  height: var(--h-control);
   padding: 0;
   position: relative;
   display: inline-flex;
@@ -414,8 +449,8 @@ input:focus {
 }
 
 .mic-btn.recording {
-  background: #303030;
-  border-color: #6f6f6f;
+  background: var(--bg-11);
+  border-color: var(--line-5);
 }
 
 .mic-btn.recording::before {
@@ -423,7 +458,7 @@ input:focus {
   height: 12px;
   border: 0;
   border-radius: 3px;
-  background: #dcdcdc;
+  background: var(--text-mute-strong);
   background-image: none;
 }
 
@@ -464,7 +499,7 @@ input:focus {
   border-bottom: 1px solid var(--line);
   min-height: 72px;
   padding: 0;
-  background: #1c1c1c;
+  background: var(--bg-4);
   flex-shrink: 0;
 }
 
@@ -576,8 +611,8 @@ input:focus {
 #upscalePresetSelect {
   min-width: 136px;
   max-width: 180px;
-  background-color: rgba(126, 88, 170, 0.2);
-  border-color: rgba(168, 126, 214, 0.34);
+  background-color: var(--purple-soft-bg);
+  border-color: var(--purple-soft-border);
 }
 
 .upscale-preset-wrap {
@@ -604,7 +639,7 @@ input:focus {
   margin-left: 6px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 120ms ease;
+  transition: opacity var(--dur-base) ease;
 }
 
 .upscale-preset-wrap:hover .preset-delete-btn.can-delete {
@@ -615,7 +650,7 @@ input:focus {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--overlay-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -644,7 +679,7 @@ input:focus {
   min-height: 132px;
   border-radius: var(--radius);
   border: 1px solid var(--line);
-  background: #202020;
+  background: var(--bg-5);
   color: var(--text);
   padding: 10px 12px;
   font-size: 12px;
@@ -658,7 +693,7 @@ input:focus {
   min-height: 170px;
   border-radius: var(--radius);
   border: 1px solid var(--line);
-  background: #202020;
+  background: var(--bg-5);
   color: var(--text);
   padding: 10px 12px;
   font-size: 12px;
@@ -671,8 +706,8 @@ input:focus {
   max-width: 96px;
   text-overflow: ellipsis;
   overflow: hidden;
-  background-color: rgba(64, 96, 146, 0.18);
-  border-color: rgba(108, 144, 198, 0.34);
+  background-color: var(--accent-strong-bg);
+  border-color: var(--accent-strong-border);
 }
 
 #remoteModelSelect {
@@ -680,8 +715,8 @@ input:focus {
   max-width: 110px;
   text-overflow: ellipsis;
   overflow: hidden;
-  background-color: rgba(64, 96, 146, 0.16);
-  border-color: rgba(108, 144, 198, 0.3);
+  background-color: var(--accent-soft-bg);
+  border-color: var(--accent-soft-border);
 }
 
 .transcribe-settings-wrap {
@@ -695,11 +730,11 @@ input:focus {
   right: 0;
   z-index: 100;
   min-width: 180px;
-  background: #1e1e1e;
+  background: var(--bg-4);
   border: 1px solid var(--line-2);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-popover);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -713,12 +748,12 @@ input:focus {
   color: var(--text-2);
   cursor: pointer;
   padding: 4px 6px;
-  border-radius: 6px;
-  transition: background 100ms ease;
+  border-radius: var(--radius-sm);
+  transition: background var(--dur-fast) ease;
 }
 
 .popup-check:hover {
-  background: #2a2a2a;
+  background: var(--bg-9);
 }
 
 .popup-check input {
@@ -741,7 +776,7 @@ input:focus {
   height: 20px;
   border-radius: var(--radius);
   border: 1px solid var(--line-2);
-  background: #2d2d2d;
+  background: var(--bg-10);
   position: relative;
   cursor: pointer;
 }
@@ -755,7 +790,7 @@ input:focus {
   height: 14px;
   border-radius: calc(var(--radius) - 4px);
   background: #bcbcbc;
-  transition: transform 150ms ease;
+  transition: transform var(--dur-slow) ease;
 }
 
 .toggle-inline input:checked::before {
@@ -795,7 +830,7 @@ input:focus {
   min-height: 0;
   padding: 16px;
   overflow: auto;
-  background: #1a1a1a;
+  background: var(--bg-2);
   color: var(--text-2);
   font-family: Menlo, ui-monospace, monospace;
   line-height: 1.7;
@@ -821,11 +856,11 @@ input:focus {
 
 .upload-drop {
   border: 1px dashed var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 14px;
   text-align: center;
   cursor: pointer;
-  background: #202020;
+  background: var(--bg-5);
 }
 
 .upload-drop.drag {
@@ -901,7 +936,7 @@ input:focus {
 }
 
 .link-btn:hover {
-  border-color: #6f6f6f;
+  border-color: var(--line-5);
   color: var(--text);
 }
 
@@ -948,7 +983,7 @@ input:focus {
   padding: 0 12px;
   font-size: 11px;
   font-weight: 600;
-  background: #252525;
+  background: var(--bg-8);
   border-color: var(--line-2);
   color: var(--text);
 }
@@ -1033,7 +1068,7 @@ input:focus {
 
 .recordings-stats {
   border-bottom: 1px solid var(--line);
-  background: #1a1a1a;
+  background: var(--bg-2);
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
@@ -1102,7 +1137,7 @@ input:focus {
 .word-chip {
   border: 1px solid var(--line);
   border-radius: 3px;
-  background: #252525;
+  background: var(--bg-8);
   padding: 1px 4px;
   font-size: 9px;
   font-weight: 500;
@@ -1136,7 +1171,7 @@ input:focus {
   height: 32px;
   border-radius: var(--radius);
   border: 1px solid var(--line);
-  background: #232323;
+  background: var(--bg-6);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1145,7 +1180,7 @@ input:focus {
 }
 
 .icon-btn:hover {
-  border-color: #666666;
+  border-color: var(--line-4);
 }
 
 .icon-btn:active {
