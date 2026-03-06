@@ -56,8 +56,13 @@ body {
   --radius-sm: 8px;
   --radius-md: 10px;
   --radius: 12px;
-  --h-control: 44px;
+  --h-control: 40px;
   --h-topbar: 46px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
   --dur-fast: 100ms;
   --dur-base: 120ms;
   --dur-slow: 140ms;
@@ -197,42 +202,29 @@ body {
 
 .topbar {
   border-bottom: 1px solid var(--line);
-  padding: 14px 20px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 14px 16px;
+  padding: var(--space-3) var(--space-5);
+  display: block;
   -webkit-app-region: drag;
 }
 
-.topbar-fields {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
+.topbar-row {
+  display: grid;
+  grid-template-columns: 180px 180px 180px minmax(220px, 1fr) 56px;
+  align-items: start;
+  gap: var(--space-2);
   min-width: 0;
   -webkit-app-region: no-drag;
 }
 
-.field {
+.top-item {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  align-items: flex-start;
+  gap: var(--space-2);
   min-width: 0;
 }
 
-.topbar-fields select {
-  width: 210px;
-}
-
-.inline-field {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.inline-field .lbl {
-  min-width: 28px;
+.top-item .lbl {
   padding-left: 0;
 }
 
@@ -280,13 +272,31 @@ input:focus {
   border-color: var(--line-3);
 }
 
-.ctrl-group {
-  display: flex;
-  align-items: center;
-  justify-self: end;
-  align-self: end;
-  gap: 10px;
-  -webkit-app-region: no-drag;
+.top-item select,
+.top-item .status-pill,
+.top-item .mini-wave,
+.top-item .mic-btn {
+  width: 100%;
+}
+
+.top-item-stop {
+  align-items: stretch;
+  width: 56px;
+}
+
+.topbar .top-item select,
+.topbar .status-pill,
+.topbar .mini-wave,
+.topbar .mic-btn {
+  height: 36px;
+}
+
+.topbar .top-item select {
+  padding: 7px 30px 7px 10px;
+}
+
+.topbar .status-pill {
+  padding: 0 10px;
 }
 
 /* Quick settings are controlled from the recording capsule, not from the main top bar. */
@@ -365,7 +375,6 @@ input:focus {
   border-radius: var(--radius);
   padding: 0 14px;
   height: var(--h-control);
-  min-width: 170px;
   background: var(--bg-2);
 }
 
@@ -389,23 +398,22 @@ input:focus {
 }
 
 .status-text {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-2);
-  min-width: 54px;
+  min-width: 44px;
   font-weight: 600;
 }
 
 .timer {
   font-family: Menlo, ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   color: var(--text);
-  min-width: 44px;
+  min-width: 40px;
   text-align: right;
 }
 
 .mini-wave {
-  width: 260px;
   height: var(--h-control);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -465,13 +473,37 @@ input:focus {
 }
 
 .mic-btn {
-  width: 44px;
+  width: 100%;
   height: var(--h-control);
   padding: 0;
   position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+.top-item-stop .mic-btn::before {
+  width: 10px;
+  height: 10px;
+  border: 0;
+  border-radius: 2px;
+  background: #f5f5f5;
+  background-image: none;
+}
+
+.top-item-stop .mic-btn {
+  border-color: #7a2e2e;
+  background: linear-gradient(180deg, #412020, #341a1a);
+}
+
+.top-item-stop .mic-btn:hover {
+  border-color: #9b3f3f;
+  background: linear-gradient(180deg, #4a2424, #3a1d1d);
+}
+
+.top-item-stop .mic-btn.recording {
+  border-color: #b84f4f;
+  background: linear-gradient(180deg, #5a2a2a, #452121);
 }
 
 .mic-btn::before {
@@ -817,10 +849,11 @@ input:focus {
   width: 36px;
   height: 20px;
   border-radius: var(--radius);
-  border: 1px solid var(--line-2);
-  background: var(--bg-10);
+  border: 1px solid #575757;
+  background: #2d2d2d;
   position: relative;
   cursor: pointer;
+  transition: background var(--dur-base) ease, border-color var(--dur-base) ease;
 }
 
 .toggle-inline input::before {
@@ -831,15 +864,13 @@ input:focus {
   width: 14px;
   height: 14px;
   border-radius: calc(var(--radius) - 4px);
-  background: #bcbcbc;
-  transition: transform var(--dur-slow) ease;
+  background: #f0f0f0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: transform var(--dur-slow) ease, background var(--dur-base) ease;
 }
 
 .toggle-inline input:checked::before {
   transform: translateX(16px);
-}
-
-.toggle-inline input:checked::before {
   background: #ffffff;
 }
 
@@ -1150,6 +1181,14 @@ input:focus {
   white-space: nowrap;
 }
 
+.stats-grid .stats-k {
+  font-size: 9px;
+}
+
+.stats-grid .stats-v {
+  font-size: 11px;
+}
+
 .stats-top {
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -1168,7 +1207,7 @@ input:focus {
 
 .stats-split {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1.45fr 0.9fr;
   gap: 4px;
 }
 
@@ -1291,10 +1330,10 @@ input:focus {
 }
 
 .settings {
-  padding: 12px;
+  padding: var(--space-3);
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  gap: var(--space-3);
   overflow-y: auto;
   flex: 1;
 }
@@ -1302,25 +1341,47 @@ input:focus {
 .card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 16px;
+  padding: var(--space-4);
   background: var(--bg-2);
 }
 
 .card h2 {
   font-size: 14px;
-  margin-bottom: 14px;
+  margin-bottom: var(--space-3);
 }
 
 .field-stack {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
+}
+
+.card > .hint {
+  margin-bottom: var(--space-3);
+}
+
+.settings .field {
+  gap: var(--space-2);
+}
+
+.settings .field input,
+.settings .field select {
+  height: 40px;
+  font-size: 12px;
+}
+
+.settings .field .lbl {
+  margin-bottom: var(--space-1);
+}
+
+.settings .toggle-inline {
+  gap: var(--space-2);
 }
 
 .key-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .key-row input {
@@ -1328,9 +1389,9 @@ input:focus {
 }
 
 .key-action-btn {
-  width: var(--h-control);
-  height: var(--h-control);
-  min-width: var(--h-control);
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
   position: relative;
 }
 
@@ -1360,11 +1421,12 @@ input:focus {
 .btn-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 14px;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
 }
 
 .settings-toggle {
+  margin-bottom: var(--space-2);
   justify-content: space-between;
   width: 100%;
 }
@@ -1383,16 +1445,11 @@ canvas,
 
 @media (max-width: 1180px) {
   .topbar {
-    grid-template-columns: 1fr;
-    align-items: start;
+    overflow-x: auto;
   }
 
-  .topbar-fields {
-    width: 100%;
-  }
-
-  .ctrl-group {
-    justify-self: start;
+  .topbar-row {
+    min-width: 760px;
   }
 
   .settings {
@@ -1405,17 +1462,8 @@ canvas,
     grid-template-columns: 168px 1fr;
   }
 
-  .topbar-fields {
-    width: 100%;
-  }
-
-  .ctrl-group {
-    width: 100%;
-    justify-content: space-between;
-  }
-
-  .mini-wave {
-    width: min(52vw, 240px);
+  .topbar-row {
+    min-width: 760px;
   }
 
   .split {

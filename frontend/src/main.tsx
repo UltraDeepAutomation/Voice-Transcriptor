@@ -195,6 +195,7 @@ const OPENROUTER_AUDIO_MODELS = [
   "google/gemini-2.5-flash",
   "openai/gpt-4o-audio-preview",
 ];
+const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
 
 let isBusy = false;
 let isRecording = false;
@@ -427,7 +428,10 @@ function getRemoteModelValue(provider: Provider): string {
     if (v) return v;
     return "google/gemini-2.5-flash";
   }
-  if (provider === "deepgram") return "";
+  if (provider === "deepgram") {
+    const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
+    return v || DEEPGRAM_AUDIO_MODELS[0];
+  }
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
@@ -439,7 +443,15 @@ function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
     return;
   }
   if (provider === "deepgram") {
-    sel.hidden = true;
+    sel.hidden = false;
+    sel.innerHTML = "";
+    DEEPGRAM_AUDIO_MODELS.forEach((model) => {
+      const opt = document.createElement("option");
+      opt.value = model;
+      opt.textContent = model;
+      sel.appendChild(opt);
+    });
+    sel.value = DEEPGRAM_AUDIO_MODELS[0];
     return;
   }
   const preferred =
@@ -468,7 +480,7 @@ async function remoteJob(
   fd.set("provider", opts.provider || "openrouter");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
-  if (opts.provider === "openrouter") {
+  if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
   }
   const r = await fetch("/api/remote/jobs", { method: "POST", body: fd, headers: authHeaders() });
@@ -485,7 +497,7 @@ async function remoteJobSync(
   fd.set("provider", opts.provider || "openrouter");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
-  if (opts.provider === "openrouter") {
+  if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
   }
   const r = await fetch("/api/remote/transcribe-sync", { method: "POST", body: fd, headers: authHeaders() });
@@ -994,7 +1006,7 @@ function queueUiPreferencesSave(): void {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
     const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
-    const openrouterModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
+    const openrouterModel = (($("orModel") as HTMLInputElement).value || "").trim();
     void apiPost<{ ok: boolean }>("/api/config", {
       preferences: {
         recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
@@ -1020,7 +1032,10 @@ async function loadCfg(): Promise<void> {
     keyInput("deepgram").placeholder = "DEEPGRAM_API_KEY";
     syncKeyActionButton("openrouter");
     syncKeyActionButton("deepgram");
-    $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
+    const cfgPathLabel = document.getElementById("configPathLabel");
+    if (cfgPathLabel) {
+      cfgPathLabel.textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
+    }
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     ($("recordingsDirInput") as HTMLInputElement).value = (cfg.preferences || {}).recordings_dir || "";
@@ -1404,33 +1419,38 @@ async function loadRecordingsStats(): Promise<void> {
 
   const providers = $("statsProviders");
   providers.innerHTML = "";
-  (s.providers || []).slice(0, 8).forEach((p) => {
+  const providerItems = (s.providers || [])
+    .filter((p) => {
+      const n = String(p.name || "").trim().toLowerCase();
+      return n !== "fal" && n !== "fal.ai" && n !== "falai";
+    })
+    .slice(0, 8);
+  if (!providerItems.length) {
+    providerItems.push(
+      { name: "local", count: 0 },
+      { name: "openrouter", count: 0 },
+      { name: "deepgram", count: 0 }
+    );
+  }
+  providerItems.forEach((p) => {
     const chip = document.createElement("span");
     chip.className = "word-chip";
     chip.textContent = `${p.name} (${p.count})`;
     providers.appendChild(chip);
   });
-  if (!providers.children.length) {
-    const empty = document.createElement("span");
-    empty.className = "hint";
-    empty.textContent = "No provider data.";
-    providers.appendChild(empty);
-  }
 
   const languages = $("statsLanguages");
   languages.innerHTML = "";
-  (s.languages || []).slice(0, 8).forEach((l) => {
+  const languageItems = (s.languages || []).slice(0, 8);
+  if (!languageItems.length) {
+    languageItems.push({ name: "auto", count: 0 });
+  }
+  languageItems.forEach((l) => {
     const chip = document.createElement("span");
     chip.className = "word-chip";
     chip.textContent = `${l.name} (${l.count})`;
     languages.appendChild(chip);
   });
-  if (!languages.children.length) {
-    const empty = document.createElement("span");
-    empty.className = "hint";
-    empty.textContent = "No language data.";
-    languages.appendChild(empty);
-  }
 }
 
 async function openRecording(name: string): Promise<void> {
@@ -1524,6 +1544,13 @@ autoToggle.addEventListener("change", () => {
 });
 const livePreviewToggle = $("livePreviewToggle") as HTMLInputElement;
 livePreviewToggle.addEventListener("change", () => {
+  if (!livePreviewToggle.checked && ws) {
+    try {
+      ws.close();
+    } catch { }
+    ws = null;
+    if (isRecording) setStatus("Recording");
+  }
   queueUiPreferencesSave();
 });
 
@@ -1544,7 +1571,9 @@ function shouldLivePreview(): boolean {
 });
 ($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
   const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
-  if (v) ($("orModel") as HTMLInputElement).value = v;
+  if (v && (($("providerSelect") as HTMLSelectElement).value || "local") === "openrouter") {
+    ($("orModel") as HTMLInputElement).value = v;
+  }
   queueUiPreferencesSave();
 });
 ($("quickProviderSelect") as HTMLSelectElement).addEventListener("change", () => {
@@ -1820,9 +1849,11 @@ async function startLive(): Promise<void> {
     ws.binaryType = "arraybuffer";
     ws.onopen = () => setStatus("Recording");
     ws.onerror = () => {
+      if (!shouldLivePreview()) return;
       $("liveOutput").textContent += "\n[WebSocket error]";
     };
     ws.onmessage = (ev: MessageEvent<string>) => {
+      if (!shouldLivePreview()) return;
       let m: unknown;
       try {
         m = JSON.parse(ev.data);
@@ -1952,14 +1983,18 @@ async function startLive(): Promise<void> {
         src.connect(scriptNode);
         scriptNode.connect(scriptSinkGain);
         scriptSinkGain.connect(ac.destination);
-        const cur = $("liveOutput").textContent || "";
-        if (!cur.includes("[Mic fallback engaged]")) {
-          $("liveOutput").textContent = (cur ? `${cur}\n` : "") + "[Mic fallback engaged]";
+        if (shouldLivePreview()) {
+          const cur = $("liveOutput").textContent || "";
+          if (!cur.includes("[Mic fallback engaged]")) {
+            $("liveOutput").textContent = (cur ? `${cur}\n` : "") + "[Mic fallback engaged]";
+          }
         }
       } catch { }
     }, UI_TOKENS.capture.fallbackInitDelayMs);
   } catch (e) {
-    $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
+    if (shouldLivePreview()) {
+      $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
+    }
     await stopLive(false);
     setStatus("Error");
   }

@@ -31,14 +31,17 @@
 
       <section class="view" data-view="record">
         <div class="topbar">
-          <div class="topbar-fields">
-            <label class="inline-field">
+          <select id="mode" hidden>
+            <option value="live" selected>Live</option>
+          </select>
+          <div class="topbar-row">
+            <label class="top-item top-item-mic">
               <span class="lbl">Mic</span>
               <select id="micSelect">
                 <option value="">Select mic</option>
               </select>
             </label>
-            <label class="inline-field">
+            <label class="top-item top-item-lang">
               <span class="lbl">Lang</span>
               <select id="language">
                 <option value="auto">Auto</option>
@@ -46,16 +49,26 @@
                 <option value="en">EN</option>
               </select>
             </label>
-          </div>
-
-          <div class="ctrl-group">
-            <div class="status-pill">
-              <div class="status-dot" id="statusDot"></div>
-              <span class="status-text" id="statusText">Idle</span>
-              <span class="timer" id="timer">00:00</span>
+            <div class="top-item top-item-recording">
+              <span class="lbl">Recording</span>
+              <div class="status-pill">
+                <div class="status-dot" id="statusDot"></div>
+                <span class="status-text" id="statusText">Idle</span>
+                <span class="timer" id="timer">00:00</span>
+              </div>
             </div>
-
-            <div id="vuFill" hidden></div>
+            <div class="top-item top-item-waveform">
+              <span class="lbl">Waveform</span>
+              <canvas class="mini-wave" id="waveCanvas" width="240" height="44"></canvas>
+            </div>
+            <div class="top-item top-item-stop">
+              <span class="lbl">Stop</span>
+              <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
+              <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
+            </div>
+          </div>
+          <div id="vuFill" hidden></div>
+          <div hidden>
             <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
               <label class="quick-field">
                 <span class="quick-lbl">Provider</span>
@@ -69,10 +82,6 @@
             </div>
             <button class="btn quick-settings-btn" id="quickSettingsToggle" type="button"
               aria-label="Toggle quick settings" aria-pressed="false"></button>
-            <canvas class="mini-wave" id="waveCanvas" width="240" height="44"></canvas>
-
-            <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
-            <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
           </div>
         </div>
 
@@ -124,6 +133,7 @@
                     <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
                     <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
                     <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
+                    <option value="nova-3">nova-3</option>
                   </select>
                   <div class="transcribe-settings-wrap">
                     <button class="icon-btn" id="transcribeSettingsBtn" type="button" aria-label="Transcribe settings"
@@ -286,7 +296,6 @@
           <div class="card">
             <h2>API Keys</h2>
             <p class="hint">Stored locally on this Mac</p>
-            <p class="hint" id="configPathLabel">Config: -</p>
             <div class="field-stack">
               <label class="field">
                 <span class="lbl">OpenRouter</span>
