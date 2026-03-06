@@ -32,28 +32,20 @@
       <section class="view" data-view="record">
         <div class="topbar">
           <div class="topbar-fields">
-            <div class="field">
-              <span class="lbl">Mode</span>
-              <select id="mode">
-                <option value="live">Live</option>
-                <option value="remote">Remote</option>
+            <label class="inline-field">
+              <span class="lbl">Mic</span>
+              <select id="micSelect">
+                <option value="">Select mic</option>
               </select>
-              <span class="hint" id="modeHint">Live mode: fast local stream.</span>
-            </div>
-            <div class="field">
+            </label>
+            <label class="inline-field">
               <span class="lbl">Lang</span>
               <select id="language">
                 <option value="auto">Auto</option>
                 <option value="ru">RU</option>
                 <option value="en">EN</option>
               </select>
-            </div>
-            <div class="field">
-              <span class="lbl">Mic</span>
-              <select id="micSelect">
-                <option value="">Select mic</option>
-              </select>
-            </div>
+            </label>
           </div>
 
           <div class="ctrl-group">
@@ -91,7 +83,7 @@
                 <span class="pane-title">Live Preview</span>
                 <div class="pane-actions">
                   <label class="toggle-inline" title="Show live partial transcript while recording">
-                    <input id="livePreviewToggle" type="checkbox" checked />
+                    <input id="livePreviewToggle" type="checkbox" />
                   </label>
                 </div>
               </div>
@@ -276,7 +268,6 @@
               </div>
             </div>
             <div class="pane-header">
-              <span class="pane-title recording-title" id="recordingTitle">Select recording</span>
               <div class="recording-header-actions">
                 <span class="pane-badge" id="recordingMeta"></span>
                 <button class="icon-btn" id="recordingCopyBtn" type="button" aria-label="Copy recording text"
@@ -297,16 +288,24 @@
             <p class="hint">Stored locally on this Mac</p>
             <p class="hint" id="configPathLabel">Config: -</p>
             <div class="field-stack">
-              <label class="field"><span class="lbl">OpenRouter</span><input id="orKey" type="password"
-                  placeholder="OPENROUTER_API_KEY" /></label>
-              <label class="field"><span class="lbl">Deepgram</span><input id="deepgramKey" type="password"
-                  placeholder="DEEPGRAM_API_KEY" /></label>
+              <label class="field">
+                <span class="lbl">OpenRouter</span>
+                <span class="key-row">
+                  <input id="orKey" type="password" placeholder="OPENROUTER_API_KEY" />
+                  <button class="icon-btn key-action-btn save" id="orKeyActionBtn" type="button" aria-label="Save OpenRouter key"
+                    title="Save key"></button>
+                </span>
+              </label>
+              <label class="field">
+                <span class="lbl">Deepgram</span>
+                <span class="key-row">
+                  <input id="deepgramKey" type="password" placeholder="DEEPGRAM_API_KEY" />
+                  <button class="icon-btn key-action-btn save" id="deepgramKeyActionBtn" type="button"
+                    aria-label="Save Deepgram key" title="Save key"></button>
+                </span>
+              </label>
               <input id="orModel" type="hidden" value="google/gemini-3.1-flash-lite-preview" />
             </div>
-            <div class="btn-row">
-              <button class="btn btn-primary" id="saveBtn">Save Keys</button>
-            </div>
-            <p class="hint" id="cfgMsg"></p>
           </div>
           <div class="card">
             <h2>Defaults</h2>
@@ -330,6 +329,7 @@
             </div>
             <div class="btn-row">
               <button class="btn btn-ghost" id="pickRecordingsDirBtn" type="button">Choose Folder</button>
+              <button class="btn btn-ghost" id="openRecordingsDirBtn" type="button">Open Folder</button>
             </div>
           </div>
         </div>

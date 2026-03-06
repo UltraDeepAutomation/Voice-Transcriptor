@@ -1290,6 +1290,28 @@ def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
         raise HTTPException(status_code=500, detail=f"folder picker failed: {stderr or 'unknown error'}")
 
 
+@app.post("/api/recordings/open-folder")
+def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: None = Depends(_require_api_auth)):
+    requested = str((payload or {}).get("path") or "").strip()
+    if requested:
+        d = Path(requested).expanduser()
+        if not d.is_absolute():
+            d = (_resolve_recordings_dir() / d).resolve()
+        d.mkdir(parents=True, exist_ok=True)
+    else:
+        d = _resolve_recordings_dir()
+    if os.name != "posix":
+        raise HTTPException(status_code=400, detail="open folder is supported on macOS only")
+    try:
+        subprocess.run(["open", str(d)], check=True, capture_output=True, text=True, timeout=15)
+        return {"ok": True, "path": str(d)}
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="open folder timed out")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        raise HTTPException(status_code=500, detail=f"open folder failed: {stderr or 'unknown error'}")
+
+
 @app.get("/api/recordings")
 def list_recordings(_auth: None = Depends(_require_api_auth)):
     d = _resolve_recordings_dir()

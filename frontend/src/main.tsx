@@ -2,6 +2,7 @@ import "./styles.css";
 
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type JobStatus = "queued" | "running" | "done" | "error";
+type KeyProvider = "openrouter" | "deepgram";
 
 interface JobResultPayload {
   text?: string;
@@ -209,6 +210,11 @@ let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
 let silenceStartedAtMs = 0;
 let autoStopTriggered = false;
+const MASKED_KEY_VALUE = "••••••••••••";
+const keySavedState: Record<KeyProvider, boolean> = {
+  openrouter: false,
+  deepgram: false,
+};
 
 const apiToken = (): string => {
   const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
@@ -222,7 +228,7 @@ const authHeaders = (): HeadersInit => ({ "X-Api-Token": apiToken() });
 
 function setBusy(nextBusy: boolean): void {
   isBusy = !!nextBusy;
-  ["btnStart", "btnStop", "btnTranscribeFile", "pickFileBtn", "mode", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn"].forEach((id) => {
+  ["btnStart", "btnStop", "btnTranscribeFile", "pickFileBtn", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
@@ -252,6 +258,52 @@ function getAutoStopSilenceConfig(): { enabled: boolean; seconds: number; thresh
   const seconds = clampNumber(Number.isFinite(secondsRaw) ? Math.round(secondsRaw) : 2, 1, 120);
   const thresholdDb = clampNumber(Number.isFinite(thresholdRaw) ? Math.round(thresholdRaw) : -42, -80, -10);
   return { enabled, seconds, thresholdDb };
+}
+
+function keyInput(provider: KeyProvider): HTMLInputElement {
+  return $(provider === "openrouter" ? "orKey" : "deepgramKey") as HTMLInputElement;
+}
+
+function keyActionButton(provider: KeyProvider): HTMLButtonElement {
+  return $(provider === "openrouter" ? "orKeyActionBtn" : "deepgramKeyActionBtn") as HTMLButtonElement;
+}
+
+function isMaskedKeyInput(el: HTMLInputElement): boolean {
+  return el.dataset.masked === "1";
+}
+
+function markKeyMasked(provider: KeyProvider, saved: boolean): void {
+  const el = keyInput(provider);
+  const isSaved = !!saved;
+  keySavedState[provider] = isSaved;
+  if (isSaved) {
+    el.value = MASKED_KEY_VALUE;
+    el.dataset.masked = "1";
+  } else {
+    el.value = "";
+    delete el.dataset.masked;
+  }
+}
+
+function clearMaskedKeyOnEdit(provider: KeyProvider): void {
+  const el = keyInput(provider);
+  if (!isMaskedKeyInput(el)) return;
+  el.value = "";
+  delete el.dataset.masked;
+}
+
+function syncKeyActionButton(provider: KeyProvider): void {
+  const btn = keyActionButton(provider);
+  const input = keyInput(provider);
+  const masked = isMaskedKeyInput(input);
+  const hasTyped = !masked && !!input.value.trim();
+  const canDelete = keySavedState[provider] && !hasTyped;
+  const canSave = hasTyped;
+  btn.classList.toggle("delete", canDelete);
+  btn.classList.toggle("save", !canDelete);
+  btn.disabled = !(canDelete || canSave);
+  btn.title = canDelete ? "Delete key" : "Save key";
+  btn.setAttribute("aria-label", canDelete ? "Delete key" : "Save key");
 }
 
 // Auto-stop is handled exclusively by the overlay main process (desktop/main.js).
@@ -544,11 +596,7 @@ async function pollJob(
 }
 
 function syncMode(): void {
-  const mode = ($("mode") as HTMLSelectElement).value;
-  const live = mode === "live";
-  $("modeHint").textContent = live
-    ? "Live mode: fast local stream from microphone."
-    : "Remote mode: upload file and transcribe with selected provider.";
+  const live = true;
 
   $("livePane").hidden = !live;
   $("splitGap").hidden = !live;
@@ -612,8 +660,6 @@ document.querySelectorAll(".sb-item").forEach((e) => {
     }
   });
 });
-
-($("mode") as HTMLSelectElement).onchange = syncMode;
 
 async function loadMics(forceReload = false): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia || !navigator.mediaDevices?.enumerateDevices) {
@@ -799,7 +845,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
 function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
   const silence = getAutoStopSilenceConfig();
   return {
-    mode: (($("mode") as HTMLSelectElement).value || "live").trim(),
+    mode: "live",
     provider: (($("providerSelect") as HTMLSelectElement).value || "local").trim(),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
     local_model: (($("model") as HTMLSelectElement).value || "small").trim(),
@@ -968,10 +1014,12 @@ async function loadCfg(): Promise<void> {
     const dgK = ((cfg.providers || {}).deepgram || {}).key;
     hasOpenrouterKey = !!String(orK || "").trim();
     hasDeepgramKey = !!String(dgK || "").trim();
-    ($("orKey") as HTMLInputElement).placeholder = orK ? "(saved)" : "OPENROUTER_API_KEY";
-    ($("deepgramKey") as HTMLInputElement).placeholder = dgK ? "(saved)" : "DEEPGRAM_API_KEY";
-    ($("orKey") as HTMLInputElement).value = "";
-    ($("deepgramKey") as HTMLInputElement).value = "";
+    markKeyMasked("openrouter", hasOpenrouterKey);
+    markKeyMasked("deepgram", hasDeepgramKey);
+    keyInput("openrouter").placeholder = "OPENROUTER_API_KEY";
+    keyInput("deepgram").placeholder = "DEEPGRAM_API_KEY";
+    syncKeyActionButton("openrouter");
+    syncKeyActionButton("deepgram");
     $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
@@ -981,11 +1029,7 @@ async function loadCfg(): Promise<void> {
     const providerSel = $("providerSelect") as HTMLSelectElement;
     const quickProviderSel = $("quickProviderSelect") as HTMLSelectElement;
     const modelSel = $("model") as HTMLSelectElement;
-    const modeSel = $("mode") as HTMLSelectElement;
-    if (ui.mode && Array.from(modeSel.options).some((o) => o.value === ui.mode)) {
-      modeSel.value = ui.mode;
-      syncMode();
-    }
+    syncMode();
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
     }
@@ -1000,7 +1044,7 @@ async function loadCfg(): Promise<void> {
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
     const livePreview = $("livePreviewToggle") as HTMLInputElement;
     auto.checked = ui.auto_transcribe !== false;
-    livePreview.checked = ui.live_preview !== false;
+    livePreview.checked = ui.live_preview === true;
     const autoStopEnabledEl = $("autoStopSilenceEnabled") as HTMLInputElement;
     const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
@@ -1031,9 +1075,7 @@ async function loadCfg(): Promise<void> {
     }
     await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
-    $("cfgMsg").textContent = "Loaded";
   } catch {
-    $("cfgMsg").textContent = "Error loading config";
     try {
       await loadUpscalePresets("builtin_clean");
     } catch { }
@@ -1042,36 +1084,71 @@ async function loadCfg(): Promise<void> {
   }
 }
 
-async function saveCfg(): Promise<void> {
-  $("cfgMsg").textContent = "Saving...";
-  const cfg = {
+async function saveProviderKey(provider: KeyProvider): Promise<void> {
+  const input = keyInput(provider);
+  const value = isMaskedKeyInput(input) ? "" : input.value.trim();
+  if (!value) return;
+  await apiPost<{ ok: boolean }>("/api/config", {
     providers: {
-      openrouter: { key: ($("orKey") as HTMLInputElement).value.trim() },
-      deepgram: { key: ($("deepgramKey") as HTMLInputElement).value.trim() },
+      [provider]: { key: value },
     },
-    preferences: {
-      remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "openrouter").trim() || "openrouter"),
-      recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
-      openrouter: { model: ($("orModel") as HTMLInputElement).value.trim() },
-      ui: collectUiPreferences(),
-    },
-  };
-  await apiPost<{ ok: boolean }>("/api/config", cfg);
-  hasOpenrouterKey = hasOpenrouterKey || !!(($("orKey") as HTMLInputElement).value || "").trim();
-  hasDeepgramKey = hasDeepgramKey || !!(($("deepgramKey") as HTMLInputElement).value || "").trim();
-  ($("orKey") as HTMLInputElement).value = "";
-  ($("deepgramKey") as HTMLInputElement).value = "";
-  await loadCfg();
-  $("cfgMsg").textContent = "Saved";
+  });
+  if (provider === "openrouter") {
+    hasOpenrouterKey = true;
+  } else {
+    hasDeepgramKey = true;
+  }
+  markKeyMasked(provider, true);
+  syncKeyActionButton(provider);
 }
 
-$("saveBtn").addEventListener("click", () => void saveCfg().catch((e: Error) => ($("cfgMsg").textContent = e.message)));
-($("mode") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+async function deleteProviderKey(provider: KeyProvider): Promise<void> {
+  await apiPost<{ ok: boolean }>("/api/config", {
+    providers: {
+      [provider]: { key: "" },
+    },
+  });
+  if (provider === "openrouter") {
+    hasOpenrouterKey = false;
+  } else {
+    hasDeepgramKey = false;
+  }
+  markKeyMasked(provider, false);
+  syncKeyActionButton(provider);
+}
+
+async function handleKeyAction(provider: KeyProvider): Promise<void> {
+  const btn = keyActionButton(provider);
+  if (btn.classList.contains("delete")) {
+    await deleteProviderKey(provider);
+    return;
+  }
+  await saveProviderKey(provider);
+}
+
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+["openrouter", "deepgram"].forEach((providerName) => {
+  const provider = providerName as KeyProvider;
+  const input = keyInput(provider);
+  const btn = keyActionButton(provider);
+  input.addEventListener("focus", () => {
+    clearMaskedKeyOnEdit(provider);
+    syncKeyActionButton(provider);
+  });
+  input.addEventListener("input", () => {
+    syncKeyActionButton(provider);
+  });
+  btn.addEventListener("click", () => {
+    void handleKeyAction(provider).catch((e: Error) => {
+      console.error(e.message);
+      syncKeyActionButton(provider);
+    });
+  });
+});
 ($("autoSendEnterToggle") as HTMLButtonElement).addEventListener("click", () => {
   const btn = $("autoSendEnterToggle") as HTMLButtonElement;
   setAutoSendEnterEnabled(!btn.classList.contains("active"));
@@ -1183,7 +1260,15 @@ $("pickRecordingsDirBtn").addEventListener("click", () =>
       queueUiPreferencesSave();
     })
     .catch((e: Error) => {
-      $("cfgMsg").textContent = e.message;
+      console.error(e.message);
+    })
+);
+$("openRecordingsDirBtn").addEventListener("click", () =>
+  void apiPost<{ ok: boolean; path: string }>("/api/recordings/open-folder", {
+    path: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
+  })
+    .catch((e: Error) => {
+      console.error(e.message);
     })
 );
 
@@ -1286,7 +1371,6 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
   if (selectedRecordingName) {
     await openRecording(selectedRecordingName);
   } else {
-    $("recordingTitle").textContent = "Select recording";
     $("recordingMeta").textContent = "";
     $("recordingContent").textContent = "";
     updateRecordingCopyState();
@@ -1355,7 +1439,6 @@ async function openRecording(name: string): Promise<void> {
   const r = await apiGet<{ name: string; modified_at: string; size_bytes: number; content: string }>(
     "/api/recordings/" + encodeURIComponent(name)
   );
-  $("recordingTitle").textContent = r.name || name;
   $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${Math.round((r.size_bytes || 0) / 1024)} KB`;
   $("recordingContent").textContent = r.content || "";
   updateRecordingCopyState();
@@ -1411,7 +1494,6 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     $("recordingContent").textContent = `Deleted ${data.deleted} recording(s).`;
-    $("recordingTitle").textContent = "Select recording";
     $("recordingMeta").textContent = "";
     await loadRecordings(true);
   } catch (e: any) {
@@ -1446,11 +1528,11 @@ livePreviewToggle.addEventListener("change", () => {
 });
 
 function shouldAutoTranscribe(): boolean {
-  return autoToggle.checked && ($("mode") as HTMLSelectElement).value === "live";
+  return autoToggle.checked;
 }
 
 function shouldLivePreview(): boolean {
-  return livePreviewToggle.checked && ($("mode") as HTMLSelectElement).value === "live";
+  return livePreviewToggle.checked;
 }
 
 ($("providerSelect") as HTMLSelectElement).addEventListener("change", () => {
