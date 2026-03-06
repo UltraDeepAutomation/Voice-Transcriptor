@@ -62,19 +62,11 @@ _migrate_legacy_data()
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "providers": {
-        "fal": {"key": ""},
         "openrouter": {"key": ""},
-        "deepgram": {"key": ""},
     },
     "preferences": {
-        "remote_provider": "fal",
+        "remote_provider": "openrouter",
         "recordings_dir": "",
-        "fal": {
-            "diarize": True,
-            "num_speakers": None,
-            "chunk_level": "segment",
-            "task": "transcribe",
-        },
         "openrouter": {
             "model": "google/gemini-2.5-flash",
         },
@@ -117,7 +109,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
 def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg = json.loads(json.dumps(cfg))
     providers = cfg.get("providers") or {}
-    for name in ("fal", "openrouter", "deepgram"):
+    for name in ("openrouter",):
         if isinstance(providers.get(name), dict) and "key" in providers[name]:
             k = providers[name].get("key") or ""
             providers[name]["key"] = "" if not k else (k[:3] + "..." + k[-2:])

@@ -33,14 +33,8 @@ from backend.audio import AudioError, ensure_wav_16k, split_channels
 from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
 from backend.live import LiveSession
 from backend.jobs import JobStore
-from backend.remote_fal import RemoteError as FalRemoteError
-from backend.remote_fal import fal_whisper_transcribe
-from backend.remote_groq import RemoteError as GroqRemoteError
-from backend.remote_groq import groq_transcribe
 from backend.remote_openrouter import RemoteError as OrRemoteError
 from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
-from backend.remote_deepgram import RemoteError as DgRemoteError
-from backend.remote_deepgram import deepgram_transcribe
 from backend.transcribe import merge_channel_transcripts, transcribe_file
 
 
@@ -60,7 +54,7 @@ WS_CONNECT_LIMIT_PER_MIN = 20
 RESULT_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_RESULT_RETENTION_SEC", "86400"))
 LIVE_RECOVERY_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", "86400"))
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
-ALLOWED_REMOTE_PROVIDERS = {"fal", "openrouter", "groq", "deepgram"}
+ALLOWED_REMOTE_PROVIDERS = {"openrouter"}
 ALLOWED_AUDIO_EXTS = {
     ".wav",
     ".mp3",
@@ -861,33 +855,6 @@ async def create_job(
     return {"job_id": job_id}
 
 
-def _format_fal_transcript(result: dict) -> str:
-    chunks = result.get("chunks") or []
-    if not isinstance(chunks, list) or not chunks:
-        return (result.get("text") or "").strip()
-
-    lines = []
-    last_speaker = None
-    last_text = ""
-    for c in chunks:
-        if not isinstance(c, dict):
-            continue
-        text = (c.get("text") or "").strip()
-        if not text:
-            continue
-        speaker = c.get("speaker")
-        speaker_id = "Speaker" if speaker is None else str(speaker)
-        if speaker_id == last_speaker:
-            last_text = (last_text + " " + text).strip()
-            if lines:
-                lines[-1] = f"{last_speaker}: {last_text}"
-        else:
-            last_speaker = speaker_id
-            last_text = text
-            lines.append(f"{speaker_id}: {text}")
-    return "\n".join(lines).strip() or (result.get("text") or "").strip()
-
-
 def _run_remote_transcribe_once(
     *,
     provider_norm: str,
@@ -905,43 +872,11 @@ def _run_remote_transcribe_once(
     prov = (
         provider_norm
         or cfg.get("preferences", {}).get("remote_provider")
-        or "fal"
+        or "openrouter"
     ).strip()
 
     if audio_bytes is None and upload_path is not None:
         audio_bytes = upload_path.read_bytes()
-    if prov == "fal":
-        fal_key = ((cfg.get("providers") or {}).get("fal") or {}).get("key") or ""
-        pref = (cfg.get("preferences") or {}).get("fal") or {}
-        ns = None
-        if num_speakers.strip():
-            try:
-                ns = int(num_speakers.strip())
-            except Exception:
-                ns = None
-        if ns is None:
-            ns = pref.get("num_speakers")
-
-        out = fal_whisper_transcribe(
-            fal_key=fal_key,
-            audio_bytes=audio_bytes,
-            filename=orig_name,
-            task=pref.get("task") or "transcribe",
-            language=language,
-            diarize=bool(diarize)
-            if diarize is not None
-            else bool(pref.get("diarize", False)),
-            num_speakers=ns,
-            chunk_level=pref.get("chunk_level") or "none",
-            timeout_sec=600,
-        )
-        text = _format_fal_transcript(out)
-        return {
-            "provider": "fal",
-            "text": text,
-            "raw": out,
-        }
-
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("openrouter") or {}
@@ -956,43 +891,6 @@ def _run_remote_transcribe_once(
         )
         return {
             "provider": "openrouter",
-            "model": model,
-            "text": (out.get("text") or "").strip(),
-            "raw": out.get("raw"),
-        }
-
-    if prov == "groq":
-        groq_key = ((cfg.get("providers") or {}).get("groq") or {}).get("key") or ""
-        pref = (cfg.get("preferences") or {}).get("groq") or {}
-        model = (
-            openrouter_model or pref.get("model") or "whisper-large-v3-turbo"
-        ).strip()
-        out = groq_transcribe(
-            api_key=groq_key,
-            audio_bytes=audio_bytes,
-            filename=orig_name,
-            model=model,
-            language=language,
-        )
-        return {
-            "provider": "groq",
-            "model": model,
-            "text": (out.get("text") or "").strip(),
-            "raw": out.get("raw"),
-        }
-
-    if prov == "deepgram":
-        dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
-        model = (openrouter_model or "nova-3").strip()
-        out = deepgram_transcribe(
-            api_key=dg_key,
-            audio_bytes=audio_bytes,
-            filename=orig_name,
-            model=model,
-            language=language,
-        )
-        return {
-            "provider": "deepgram",
             "model": model,
             "text": (out.get("text") or "").strip(),
             "raw": out.get("raw"),
@@ -1056,7 +954,7 @@ async def create_remote_job(
                     "txt": str(result_txt_path),
                 },
             )
-        except (FalRemoteError, OrRemoteError, GroqRemoteError, DgRemoteError) as e:
+        except OrRemoteError as e:
             jobs.set_error(job_id, str(e))
         except Exception as e:
             jobs.set_error(job_id, f"Remote transcription failed: {e}")
@@ -1102,7 +1000,7 @@ async def remote_transcribe_sync(
             cfg=cfg,
         )
         return {"ok": True, "result": result}
-    except (FalRemoteError, OrRemoteError, GroqRemoteError, DgRemoteError) as e:
+    except OrRemoteError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Remote transcription failed: {e}")

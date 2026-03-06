@@ -1,6 +1,6 @@
 import "./styles.css";
 
-type Provider = "local" | "fal" | "openrouter" | "groq" | "deepgram";
+type Provider = "local" | "openrouter" | "";
 type JobStatus = "queued" | "running" | "done" | "error";
 
 interface JobResultPayload {
@@ -25,10 +25,7 @@ interface NetworkStatusResponse {
 
 interface AppConfig {
   providers?: {
-    fal?: { key?: string };
     openrouter?: { key?: string };
-    groq?: { key?: string };
-    deepgram?: { key?: string };
   };
   _meta?: {
     config_path?: string;
@@ -36,7 +33,6 @@ interface AppConfig {
   preferences?: {
     remote_provider?: string;
     recordings_dir?: string;
-    fal?: { diarize?: boolean; num_speakers?: number | null; chunk_level?: string; task?: string };
     openrouter?: { model?: string };
     ui?: {
       mode?: string;
@@ -393,9 +389,6 @@ function getRemoteModelValue(provider: Provider): string {
     if (v) return v;
     return "google/gemini-2.5-flash";
   }
-  if (provider === "fal") return "fal-ai/whisper";
-  if (provider === "groq") return "whisper-large-v3-turbo";
-  if (provider === "deepgram") return "nova-3";
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
@@ -404,40 +397,6 @@ function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
   const sel = $("remoteModelSelect") as HTMLSelectElement;
   if (provider === "local" || !provider) {
     sel.hidden = true;
-    return;
-  }
-  if (provider === "fal") {
-    sel.hidden = false;
-    sel.innerHTML = "";
-    const falOpt = document.createElement("option");
-    falOpt.value = "fal-ai/whisper";
-    falOpt.textContent = "fal-ai/whisper";
-    sel.appendChild(falOpt);
-    sel.value = "fal-ai/whisper";
-    return;
-  }
-  if (provider === "groq") {
-    sel.hidden = false;
-    sel.innerHTML = "";
-    for (const m of ["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"]) {
-      const o = document.createElement("option");
-      o.value = m;
-      o.textContent = m;
-      sel.appendChild(o);
-    }
-    sel.value = "whisper-large-v3-turbo";
-    return;
-  }
-  if (provider === "deepgram") {
-    sel.hidden = false;
-    sel.innerHTML = "";
-    for (const m of ["nova-3", "nova-2", "whisper-large"]) {
-      const o = document.createElement("option");
-      o.value = m;
-      o.textContent = m;
-      sel.appendChild(o);
-    }
-    sel.value = "nova-3";
     return;
   }
   const preferred =
@@ -463,7 +422,7 @@ async function remoteJob(
 ): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
-  fd.set("provider", opts.provider || "fal");
+  fd.set("provider", opts.provider || "openrouter");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
   if (opts.provider === "openrouter") {
@@ -480,7 +439,7 @@ async function remoteJobSync(
 ): Promise<{ text: string; provider: string; model?: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
-  fd.set("provider", opts.provider || "fal");
+  fd.set("provider", opts.provider || "openrouter");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
   if (opts.provider === "openrouter") {
@@ -515,28 +474,7 @@ async function remoteJobSyncWithFallback(
   file: File,
   opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
 ): Promise<{ text: string; provider: string; model?: string }> {
-  const preferred = opts.provider;
-  const candidates: Provider[] = preferred === "deepgram"
-    ? ["deepgram", "openrouter", "groq", "fal"]
-    : [preferred];
-  let lastErr: unknown = null;
-  for (let i = 0; i < candidates.length; i++) {
-    const p = candidates[i];
-    try {
-      return await remoteJobSync(file, {
-        provider: p,
-        language: opts.language,
-        diarize: opts.diarize,
-        openrouterModel: opts.openrouterModel,
-      });
-    } catch (e) {
-      lastErr = e;
-      if (!isTransientRemoteNetworkError(e) || i === candidates.length - 1) {
-        throw e;
-      }
-    }
-  }
-  throw (lastErr || new Error("Remote transcription failed"));
+  return remoteJobSync(file, opts);
 }
 
 async function localJob(
@@ -993,16 +931,12 @@ function queueUiPreferencesSave(): void {
   uiPrefSaveTimer = window.setTimeout(() => {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
-    const remoteProvider = provider === "fal" || provider === "openrouter" ? provider : "fal";
+    const remoteProvider = provider === "openrouter" ? provider : "openrouter";
     const openrouterModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
     void apiPost<{ ok: boolean }>("/api/config", {
       preferences: {
         recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
         remote_provider: remoteProvider,
-        fal: {
-          diarize: ($("diarizeDefault") as HTMLInputElement).checked,
-          chunk_level: ($("chunkSelect") as HTMLSelectElement).value,
-        },
         openrouter: { model: openrouterModel || "google/gemini-2.5-flash" },
         ui: collectUiPreferences(),
       },
@@ -1014,24 +948,13 @@ async function loadCfg(): Promise<void> {
   suppressUiPrefAutosave = true;
   try {
     const cfg = await apiGet<AppConfig>("/api/config");
-    const falK = ((cfg.providers || {}).fal || {}).key;
     const orK = ((cfg.providers || {}).openrouter || {}).key;
-    const groqK = ((cfg.providers || {}).groq || {}).key;
-    const dgK = ((cfg.providers || {}).deepgram || {}).key;
-    ($("falKey") as HTMLInputElement).placeholder = falK ? "(saved)" : "FAL_KEY";
     ($("orKey") as HTMLInputElement).placeholder = orK ? "(saved)" : "OPENROUTER_API_KEY";
-    ($("groqKey") as HTMLInputElement).placeholder = groqK ? "(saved)" : "GROQ_API_KEY";
-    ($("deepgramKey") as HTMLInputElement).placeholder = dgK ? "(saved)" : "DEEPGRAM_API_KEY";
-    ($("falKey") as HTMLInputElement).value = "";
     ($("orKey") as HTMLInputElement).value = "";
-    ($("groqKey") as HTMLInputElement).value = "";
-    ($("deepgramKey") as HTMLInputElement).value = "";
     $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     ($("recordingsDirInput") as HTMLInputElement).value = (cfg.preferences || {}).recordings_dir || "";
-    ($("diarizeDefault") as HTMLInputElement).checked = (cfg.preferences || {}).fal?.diarize === true;
-    ($("chunkSelect") as HTMLSelectElement).value = (cfg.preferences || {}).fal?.chunk_level || "none";
     const ui = (cfg.preferences || {}).ui || {};
     const languageSel = $("language") as HTMLSelectElement;
     const providerSel = $("providerSelect") as HTMLSelectElement;
@@ -1102,24 +1025,17 @@ async function saveCfg(): Promise<void> {
   $("cfgMsg").textContent = "Saving...";
   const cfg = {
     providers: {
-      fal: { key: ($("falKey") as HTMLInputElement).value.trim() },
       openrouter: { key: ($("orKey") as HTMLInputElement).value.trim() },
-      groq: { key: ($("groqKey") as HTMLInputElement).value.trim() },
-      deepgram: { key: ($("deepgramKey") as HTMLInputElement).value.trim() },
     },
     preferences: {
-      remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "fal").trim() || "fal"),
+      remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "openrouter").trim() || "openrouter"),
       recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
-      fal: { diarize: ($("diarizeDefault") as HTMLInputElement).checked, chunk_level: ($("chunkSelect") as HTMLSelectElement).value },
       openrouter: { model: ($("orModel") as HTMLInputElement).value.trim() },
       ui: collectUiPreferences(),
     },
   };
   await apiPost<{ ok: boolean }>("/api/config", cfg);
-  ($("falKey") as HTMLInputElement).value = "";
   ($("orKey") as HTMLInputElement).value = "";
-  ($("groqKey") as HTMLInputElement).value = "";
-  ($("deepgramKey") as HTMLInputElement).value = "";
   await loadCfg();
   $("cfgMsg").textContent = "Saved";
 }
@@ -1128,8 +1044,6 @@ $("saveBtn").addEventListener("click", () => void saveCfg().catch((e: Error) => 
 $("reloadBtn").addEventListener("click", () => void loadCfg().catch((e: Error) => ($("cfgMsg").textContent = e.message)));
 ($("mode") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("diarizeDefault") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("chunkSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());

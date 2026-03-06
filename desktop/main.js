@@ -215,7 +215,7 @@ function getRepoRoot() {
 
 function normalizeProviderChoice(value) {
   const v = String(value || "").trim();
-  if (v === "local" || v === "fal" || v === "openrouter" || v === "") return v;
+  if (v === "local" || v === "openrouter" || v === "") return v;
   return "local";
 }
 
@@ -269,7 +269,7 @@ async function getRendererModelContext() {
         const remoteOptions = Array.from(remoteSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
         const models = provider === 'local'
           ? (localOptions.length ? localOptions : ${JSON.stringify(LOCAL_MODELS)})
-          : (remoteOptions.length ? remoteOptions : (remoteModel ? [remoteModel] : (provider === 'fal' ? ['fal-ai/whisper'] : [])));
+          : (remoteOptions.length ? remoteOptions : (remoteModel ? [remoteModel] : []));
         const model = provider === 'local' ? localModel : remoteModel;
         return { provider, model, models };
       })();
