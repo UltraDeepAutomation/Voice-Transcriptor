@@ -254,29 +254,10 @@ function getAutoStopSilenceConfig(): { enabled: boolean; seconds: number; thresh
   return { enabled, seconds, thresholdDb };
 }
 
-function evaluateSilenceAutoStop(rms: number): void {
-  if (!isRecording || autoStopTriggered) return;
-  const cfg = getAutoStopSilenceConfig();
-  if (!cfg.enabled) {
-    silenceStartedAtMs = 0;
-    return;
-  }
-  const dbfs = rms > 1e-8 ? 20 * Math.log10(rms) : -96;
-  if (dbfs >= cfg.thresholdDb) {
-    silenceStartedAtMs = 0;
-    return;
-  }
-  const now = Date.now();
-  if (!silenceStartedAtMs) {
-    silenceStartedAtMs = now;
-    return;
-  }
-  if (now - silenceStartedAtMs < cfg.seconds * 1000) return;
-  autoStopTriggered = true;
-  setStatus("Auto stop");
-  window.setTimeout(() => {
-    if (isRecording) void stopLive(shouldAutoTranscribe());
-  }, 0);
+// Auto-stop is handled exclusively by the overlay main process (desktop/main.js).
+// Removed the redundant frontend evaluateSilenceAutoStop() that was racing the overlay.
+function evaluateSilenceAutoStop(_rms: number): void {
+  // no-op: overlay is the single source of truth for auto-stop
 }
 
 async function parseError(r: Response): Promise<string> {
@@ -1654,6 +1635,10 @@ function pushCapturedFrame(input: Float32Array): void {
   captureFrameCount += 1;
   captureRmsAccum += rms;
   if (peak > capturePeakMax) capturePeakMax = peak;
+  // CRITICAL: set __transcriptorRmsLevel here too, not just in setVU.
+  // The overlay main process reads this for silence detection.
+  // setVU runs in rAF which stalls when the window is hidden.
+  window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(rms) ? rms : 0);
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
@@ -1802,8 +1787,15 @@ async function startLive(): Promise<void> {
     });
 
     const buf = new Float32Array(analyser.fftSize);
+    // Use setInterval instead of requestAnimationFrame.
+    // rAF throttles to ~0 fps when the Electron window is hidden (which it
+    // always is during overlay recording). setInterval keeps firing reliably.
+    let vuIntervalId: ReturnType<typeof setInterval> | null = null;
     const tick = (): void => {
-      if (!analyser) return;
+      if (!analyser) {
+        if (vuIntervalId) { clearInterval(vuIntervalId); vuIntervalId = null; }
+        return;
+      }
       analyser.getFloatTimeDomainData(buf);
       let sum = 0;
       let peak = 0;
@@ -1824,9 +1816,8 @@ async function startLive(): Promise<void> {
         if (waveBars.length > maxBars) waveBars = waveBars.slice(-maxBars);
       }
       draw();
-      waveAnimId = requestAnimationFrame(tick);
     };
-    tick();
+    vuIntervalId = setInterval(tick, 100);
 
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
       const input = ev.data;

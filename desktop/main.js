@@ -51,7 +51,7 @@ let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
 let micPermissionChecked = false;
-const OVERLAY_FIXED_HEIGHT = 96;
+const OVERLAY_FIXED_HEIGHT = 120;
 
 const HOST = "127.0.0.1";
 let PORT = 8321;
@@ -592,6 +592,7 @@ function createOverlayHtml() {
       <div id="settingsSlot">
         <div id="settingsPill">
           <div id="quickPanel">
+            <div class="qRow">
             <div id="quickUpscaleCapsule" title="Upscale settings">
               <input id="quickUpscaleToggle" type="checkbox" />
               <span id="quickUpscaleOffLabel">Upscale</span>
@@ -603,6 +604,20 @@ function createOverlayHtml() {
               </div>
             </div>
             <button id="quickSendEnterBtn" aria-label="Auto send after paste" title="Auto send after paste"></button>
+            </div>
+            <div class="qRow">
+              <div id="quickAutoStopCapsule">
+                <label id="quickAutoStopLabel" title="Auto stop on silence">
+                  <input id="quickAutoStopToggle" type="checkbox" />
+                  <span class="toggleDot"></span>
+                  <span class="toggleText">Stop</span>
+                </label>
+                <label id="quickAutoStopSecsLabel" title="Seconds of silence">
+                  <input id="quickAutoStopSecs" type="number" min="1" max="30" step="1" value="2" />
+                  <span class="secsUnit">s</span>
+                </label>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -662,7 +677,8 @@ function createOverlayHtml() {
         }
         #settingsSlot{
           width:100%;
-          height:34px;
+          height:auto;
+          min-height:34px;
           display:flex;
           align-items:center;
           justify-content:center;
@@ -671,8 +687,8 @@ function createOverlayHtml() {
         #settingsPill{
           width:fit-content;
           min-height:22px;
-          padding:6px 8px;
-          border-radius:999px;
+          padding:5px 8px;
+          border-radius:14px;
           border:1px solid #333;
           background:#161616;
           opacity:0;
@@ -711,12 +727,115 @@ function createOverlayHtml() {
         }
         #quickPanel{
           display:flex;
+          flex-direction:column;
           align-items:center;
-          gap:4px;
+          gap:5px;
           max-width:230px;
           min-width:0;
           overflow:hidden;
           flex:0 0 auto;
+        }
+        .qRow{
+          display:flex;
+          align-items:center;
+          gap:4px;
+          width:100%;
+          justify-content:center;
+        }
+        #quickAutoStopCapsule{
+          display:inline-flex;
+          align-items:center;
+          gap:4px;
+          padding:0 5px 0 3px;
+          height:22px;
+          border-radius:999px;
+          border:1px solid #333;
+          background:#222;
+          color:#d0d0d0;
+          white-space:nowrap;
+          min-width:0;
+        }
+        #quickAutoStopLabel{
+          display:inline-flex;
+          align-items:center;
+          gap:3px;
+          cursor:pointer;
+          font-size:10px;
+          font-weight:600;
+          user-select:none;
+          -webkit-user-select:none;
+        }
+        #quickAutoStopToggle{
+          appearance:none;
+          width:26px;
+          height:14px;
+          border-radius:999px;
+          border:1px solid #444;
+          background:#333;
+          position:relative;
+          outline:none;
+          cursor:pointer;
+          flex:0 0 26px;
+          transition:background .15s ease, border-color .15s ease;
+        }
+        #quickAutoStopToggle::before{
+          content:"";
+          position:absolute;
+          top:1px;
+          left:1px;
+          width:10px;
+          height:10px;
+          border-radius:50%;
+          background:#888;
+          transition:transform .15s ease, background .15s ease;
+        }
+        #quickAutoStopToggle:checked{
+          background:#2e5c3a;
+          border-color:#4a8a5a;
+        }
+        #quickAutoStopToggle:checked::before{
+          transform:translateX(12px);
+          background:#90e0a0;
+        }
+        .toggleText{
+          font-size:10px;
+          font-weight:600;
+          color:#bbb;
+        }
+        #quickAutoStopSecsLabel{
+          display:inline-flex;
+          align-items:center;
+          gap:1px;
+          margin-left:2px;
+        }
+        #quickAutoStopSecs{
+          appearance:none;
+          -moz-appearance:textfield;
+          width:24px;
+          height:18px;
+          border:1px solid #444;
+          border-radius:6px;
+          background:#2a2a2a;
+          color:#e0e0e0;
+          font-size:10px;
+          font-weight:700;
+          text-align:center;
+          padding:0 1px;
+          outline:none;
+          font-family:Menlo,ui-monospace,monospace;
+        }
+        #quickAutoStopSecs::-webkit-inner-spin-button,
+        #quickAutoStopSecs::-webkit-outer-spin-button{
+          appearance:none;
+          margin:0;
+        }
+        #quickAutoStopSecs:focus{
+          border-color:#5a5a5a;
+        }
+        .secsUnit{
+          font-size:9px;
+          font-weight:600;
+          color:#888;
         }
         #quickUpscaleCapsule{
           display:inline-flex;
@@ -1114,7 +1233,7 @@ function createOverlayHtml() {
         const qGap = 0.8;
         const qMaxBars = Math.floor(queueW / (qBw + qGap));
         window.setLevel = (lv) => {
-          if (waveMode === 'transcribing') return;
+          if (waveMode !== 'recording') return;
           const raw = Math.max(0, Math.min(1, Number(lv) || 0));
           const level = Math.max(0, Math.min(1, Math.pow(raw, 0.72) * 1.45));
           lastLevelAt = Date.now();
@@ -1249,6 +1368,22 @@ function createOverlayHtml() {
           const next = !quickSendEnterBtn.classList.contains('on');
           window.setAutoSendEnabled(next);
           document.title = '__overlay_autosend__' + (next ? '1' : '0');
+        });
+        const quickAutoStopToggle = document.getElementById('quickAutoStopToggle');
+        const quickAutoStopSecs = document.getElementById('quickAutoStopSecs');
+        window.setAutoStopConfig = (enabled, seconds) => {
+          const on = !!enabled;
+          if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
+          const sec = Math.min(30, Math.max(1, Math.round(Number(seconds) || 2)));
+          if (Number(quickAutoStopSecs.value) !== sec) quickAutoStopSecs.value = sec;
+        };
+        quickAutoStopToggle.addEventListener('change', () => {
+          document.title = '__overlay_autostop_enabled__' + (quickAutoStopToggle.checked ? '1' : '0');
+        });
+        quickAutoStopSecs.addEventListener('change', () => {
+          const v = Math.min(30, Math.max(1, Math.round(Number(quickAutoStopSecs.value) || 2)));
+          quickAutoStopSecs.value = v;
+          document.title = '__overlay_autostop_secs__' + v;
         });
         window.setTimer = (t) => {
           const str = String(t || '').trim();
@@ -1487,6 +1622,39 @@ function ensureOverlayWindow() {
       void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
+    if (raw.startsWith("__overlay_autostop_enabled__")) {
+      const v = raw.endsWith("1");
+      overlayAutoStopConfig = { ...overlayAutoStopConfig, enabled: !!v };
+      lastOverlayUiInteractionAt = Date.now();
+      suppressActivateUntil = Date.now() + 3000;
+      suppressMainWindowUntil = Date.now() + 3000;
+      // Sync to renderer
+      if (win && !win.isDestroyed() && win.webContents) {
+        win.webContents.executeJavaScript(
+          `(() => { const el = document.getElementById('autoStopSilenceEnabled'); if (el) el.checked = ${v}; })();`,
+          true
+        ).catch(() => { });
+      }
+      void restoreFrontAppFocusAfterOverlayUi();
+      return;
+    }
+    if (raw.startsWith("__overlay_autostop_secs__")) {
+      const secStr = raw.replace("__overlay_autostop_secs__", "");
+      const sec = Math.min(30, Math.max(1, Math.round(Number(secStr) || 2)));
+      overlayAutoStopConfig = { ...overlayAutoStopConfig, seconds: sec };
+      lastOverlayUiInteractionAt = Date.now();
+      suppressActivateUntil = Date.now() + 3000;
+      suppressMainWindowUntil = Date.now() + 3000;
+      // Sync to renderer
+      if (win && !win.isDestroyed() && win.webContents) {
+        win.webContents.executeJavaScript(
+          `(() => { const el = document.getElementById('autoStopSilenceSeconds'); if (el) el.value = ${sec}; })();`,
+          true
+        ).catch(() => { });
+      }
+      void restoreFrontAppFocusAfterOverlayUi();
+      return;
+    }
     if (raw === "__overlay_mouse_enter__") {
       // Mouse entered the pill — capture mouse events.
       if (overlayWin && !overlayWin.isDestroyed()) {
@@ -1580,8 +1748,8 @@ async function showRecordingOverlay() {
     overlayQuickAutoSend = await getRendererAutoSendEnterEnabled();
     overlayQuickAutoSendInitialized = true;
   }
-    overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
-    overlayAutoStopUiActive = false;
+  overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
+  overlayAutoStopUiActive = false;
   if (!overlayQuickSettingsInitialized) {
     const rendererQuickOpen = await getRendererQuickSettingsOpen();
     if (rendererQuickOpen !== null) {
@@ -1591,8 +1759,9 @@ async function showRecordingOverlay() {
   }
   const hasQueuedTranscriptions = pendingTranscriptionCount > 0;
   try {
+    const asCfg = overlayAutoStopConfig;
     await ow.webContents.executeJavaScript(
-      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
+      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setAutoStopConfig && window.setAutoStopConfig(${!!asCfg.enabled}, ${Number(asCfg.seconds) || 2}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
       true
     );
   } catch { }
@@ -1644,7 +1813,7 @@ async function showRecordingOverlay() {
           overlaySilenceStartedAt = 0;
         } else {
           const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
-          const warmupMs = 1200;
+          const warmupMs = 1500;
           if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
             overlaySilenceStartedAt = 0;
             overlayWin.webContents.executeJavaScript(
@@ -1653,9 +1822,10 @@ async function showRecordingOverlay() {
             ).catch(() => { });
             return;
           }
-          const silentByDb = safeRms <= thresholdRms;
-          const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 1400;
-          const consideredSilent = silentByDb || staleAudioFrames;
+          // Only use dB-based silence detection — no staleAudioFrames shortcut.
+          // staleAudioFrames was causing false stops during active speech when
+          // the audio pipeline had minor hiccups.
+          const consideredSilent = safeRms <= thresholdRms;
           if (consideredSilent) {
             if (!overlaySilenceStartedAt) {
               overlaySilenceStartedAt = now;
@@ -1664,6 +1834,12 @@ async function showRecordingOverlay() {
             if (silentElapsed >= Number(cfg.seconds) * 1000) {
               overlaySilenceStartedAt = 0;
               overlayStopInFlight = true;
+              // Immediately kill the wave monitor so no more VU levels
+              // are pumped into the overlay (prevents yellow/red flicker)
+              if (overlayWaveMonitor) {
+                clearInterval(overlayWaveMonitor);
+                overlayWaveMonitor = null;
+              }
               appendMainLog(`[overlay-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
               stopRecordingFromOverlay().catch((e) => {
                 appendMainLog(`[overlay-autostop-error] ${compactLogText(e?.message || e)}`);
@@ -1673,6 +1849,22 @@ async function showRecordingOverlay() {
             }
           } else {
             overlaySilenceStartedAt = 0;
+          }
+          // Separate fail-safe: if audio pipeline is truly dead (no frames for 8 seconds),
+          // force stop to avoid infinite hang. This is NOT silence detection.
+          const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 8000;
+          if (staleAudioFrames && !overlayStopInFlight) {
+            overlayStopInFlight = true;
+            if (overlayWaveMonitor) {
+              clearInterval(overlayWaveMonitor);
+              overlayWaveMonitor = null;
+            }
+            appendMainLog(`[overlay-autostop-stale] audio pipeline dead for 8s, forcing stop`);
+            stopRecordingFromOverlay().catch((e) => {
+              appendMainLog(`[overlay-autostop-stale-error] ${compactLogText(e?.message || e)}`);
+              overlayStopInFlight = false;
+              hideRecordingOverlay();
+            });
           }
         }
         overlayWin.webContents.executeJavaScript(
@@ -1778,6 +1970,11 @@ async function setOverlayStatus(text) {
 }
 
 async function showPostStopYellowThenTranscribing(delayMs = 500) {
+  // Kill wave monitor so no more VU levels leak in during yellow/blue phase
+  if (overlayWaveMonitor) {
+    clearInterval(overlayWaveMonitor);
+    overlayWaveMonitor = null;
+  }
   await setOverlayStatus("Auto stop");
   if (overlayTranscribingStatusTimer) {
     clearTimeout(overlayTranscribingStatusTimer);
@@ -1933,9 +2130,14 @@ async function toggleRecordingFromShortcut() {
       pasteTargetAppName = "";
       pasteTargetAppPid = 0;
       await syncOverlayQueueVisual(false);
-      await showPostStopYellowThenTranscribing(500);
+      await showPostStopYellowThenTranscribing(700);
     } else {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
+      // Kill wave monitor immediately — recording is done
+      if (overlayWaveMonitor) {
+        clearInterval(overlayWaveMonitor);
+        overlayWaveMonitor = null;
+      }
       await playOverlayCue("stop");
       await setOverlayStatus("Saved To App");
       setTimeout(() => hideRecordingOverlay(), 1400);
@@ -1988,7 +2190,7 @@ async function stopRecordingFromOverlay() {
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
     await syncOverlayQueueVisual(false);
-    await showPostStopYellowThenTranscribing(500);
+    await showPostStopYellowThenTranscribing(700);
   } else {
     await setOverlayStatus("Saved To App");
     setTimeout(() => hideRecordingOverlay(), 1400);
