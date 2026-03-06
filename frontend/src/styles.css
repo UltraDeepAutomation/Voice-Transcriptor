@@ -406,9 +406,27 @@ input:focus {
   border-radius: var(--radius);
   background: var(--bg-7);
   color: var(--text);
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
   transition: border-color var(--dur-base) ease, background var(--dur-base) ease, transform var(--dur-base) ease;
   -webkit-app-region: no-drag;
+}
+
+.btn-primary {
+  background: var(--accent-soft-bg);
+  border-color: var(--accent-soft-border);
+  color: var(--text);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: var(--line-2);
 }
 
 .btn:hover {
@@ -1275,8 +1293,20 @@ input:focus {
 
 .btn-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 14px;
+}
+
+#cfgMsg {
+  margin-top: 8px;
+  min-height: 16px;
+  color: var(--text-2);
+}
+
+.settings-toggle {
+  justify-content: space-between;
+  width: 100%;
 }
 
 .pane,

@@ -1,6 +1,6 @@
 import "./styles.css";
 
-type Provider = "local" | "openrouter" | "";
+type Provider = "local" | "openrouter" | "deepgram" | "";
 type JobStatus = "queued" | "running" | "done" | "error";
 
 interface JobResultPayload {
@@ -26,6 +26,7 @@ interface NetworkStatusResponse {
 interface AppConfig {
   providers?: {
     openrouter?: { key?: string };
+    deepgram?: { key?: string };
   };
   _meta?: {
     config_path?: string;
@@ -195,6 +196,8 @@ const OPENROUTER_AUDIO_MODELS = [
 let isBusy = false;
 let isRecording = false;
 let isNetworkOnline = true;
+let hasOpenrouterKey = false;
+let hasDeepgramKey = false;
 let selectedFile: File | null = null;
 let pollAbortController: AbortController | null = null;
 let uiPrefSaveTimer: number | null = null;
@@ -389,6 +392,7 @@ function getRemoteModelValue(provider: Provider): string {
     if (v) return v;
     return "google/gemini-2.5-flash";
   }
+  if (provider === "deepgram") return "";
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
@@ -396,6 +400,10 @@ function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
   const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const sel = $("remoteModelSelect") as HTMLSelectElement;
   if (provider === "local" || !provider) {
+    sel.hidden = true;
+    return;
+  }
+  if (provider === "deepgram") {
     sel.hidden = true;
     return;
   }
@@ -475,6 +483,29 @@ async function remoteJobSyncWithFallback(
   opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
 ): Promise<{ text: string; provider: string; model?: string }> {
   return remoteJobSync(file, opts);
+}
+
+function isProviderKeyConfigured(provider: Provider): boolean {
+  if (provider === "local" || !provider) return true;
+  if (provider === "openrouter") {
+    const typed = (($("orKey") as HTMLInputElement).value || "").trim();
+    return hasOpenrouterKey || !!typed;
+  }
+  if (provider === "deepgram") {
+    const typed = (($("deepgramKey") as HTMLInputElement).value || "").trim();
+    return hasDeepgramKey || !!typed;
+  }
+  return true;
+}
+
+function providerKeyErrorMessage(provider: Provider): string {
+  if (provider === "deepgram") {
+    return "Deepgram API key is not configured. Add it in Settings -> API Keys.";
+  }
+  if (provider === "openrouter") {
+    return "OpenRouter API key is not configured. Add it in Settings -> API Keys.";
+  }
+  return "Provider API key is not configured.";
 }
 
 async function localJob(
@@ -931,7 +962,7 @@ function queueUiPreferencesSave(): void {
   uiPrefSaveTimer = window.setTimeout(() => {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
-    const remoteProvider = provider === "openrouter" ? provider : "openrouter";
+    const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
     const openrouterModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
     void apiPost<{ ok: boolean }>("/api/config", {
       preferences: {
@@ -949,8 +980,13 @@ async function loadCfg(): Promise<void> {
   try {
     const cfg = await apiGet<AppConfig>("/api/config");
     const orK = ((cfg.providers || {}).openrouter || {}).key;
+    const dgK = ((cfg.providers || {}).deepgram || {}).key;
+    hasOpenrouterKey = !!String(orK || "").trim();
+    hasDeepgramKey = !!String(dgK || "").trim();
     ($("orKey") as HTMLInputElement).placeholder = orK ? "(saved)" : "OPENROUTER_API_KEY";
+    ($("deepgramKey") as HTMLInputElement).placeholder = dgK ? "(saved)" : "DEEPGRAM_API_KEY";
     ($("orKey") as HTMLInputElement).value = "";
+    ($("deepgramKey") as HTMLInputElement).value = "";
     $("configPathLabel").textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
@@ -1026,6 +1062,7 @@ async function saveCfg(): Promise<void> {
   const cfg = {
     providers: {
       openrouter: { key: ($("orKey") as HTMLInputElement).value.trim() },
+      deepgram: { key: ($("deepgramKey") as HTMLInputElement).value.trim() },
     },
     preferences: {
       remote_provider: ((($("providerSelect") as HTMLSelectElement).value || "openrouter").trim() || "openrouter"),
@@ -1035,7 +1072,10 @@ async function saveCfg(): Promise<void> {
     },
   };
   await apiPost<{ ok: boolean }>("/api/config", cfg);
+  hasOpenrouterKey = hasOpenrouterKey || !!(($("orKey") as HTMLInputElement).value || "").trim();
+  hasDeepgramKey = hasDeepgramKey || !!(($("deepgramKey") as HTMLInputElement).value || "").trim();
   ($("orKey") as HTMLInputElement).value = "";
+  ($("deepgramKey") as HTMLInputElement).value = "";
   await loadCfg();
   $("cfgMsg").textContent = "Saved";
 }
@@ -1976,6 +2016,15 @@ async function stopLive(enhance: boolean): Promise<void> {
   } else {
     setStatus("Processing");
   }
+  if (provider !== "local" && !isProviderKeyConfigured(provider)) {
+    const msg = providerKeyErrorMessage(provider);
+    $("progressRow").hidden = true;
+    $("finalOutput").textContent = msg;
+    setStatus("Error");
+    clearLiveDraft();
+    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    return;
+  }
   const transcribeStartedAt = performance.now();
   $("progressRow").hidden = false;
   // Allow next hotkey/session to start while this recording is transcribing.
@@ -2194,6 +2243,14 @@ async function transcribeSelectedFile(): Promise<void> {
     setStatus("Processing (Offline Local)");
   } else {
     setStatus("Processing");
+  }
+  if (provider !== "local" && !isProviderKeyConfigured(provider)) {
+    const msg = providerKeyErrorMessage(provider);
+    $("progressRow").hidden = true;
+    $("finalOutput").textContent = msg;
+    setStatus("Error");
+    setBusy(false);
+    return;
   }
   const transcribeStartedAt = performance.now();
   $("progressRow").hidden = false;

@@ -50,7 +50,8 @@ const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
-    width: 320,
+    collapsedWidth: 320,
+    expandedWidth: 374,
     height: 47,
     bottomOffset: 10,
   }),
@@ -82,6 +83,9 @@ const OVERLAY_TOKENS = Object.freeze({
   stateIcon: Object.freeze({
     size: 14,
     dotSize: 8,
+  }),
+  quickPanel: Object.freeze({
+    width: 138,
   }),
 });
 
@@ -215,7 +219,7 @@ function getRepoRoot() {
 
 function normalizeProviderChoice(value) {
   const v = String(value || "").trim();
-  if (v === "local" || v === "openrouter" || v === "") return v;
+  if (v === "local" || v === "openrouter" || v === "deepgram" || v === "") return v;
   return "local";
 }
 
@@ -580,6 +584,8 @@ function createOverlayHtml() {
           border:1px solid #333;
           background:#161616;
           box-shadow:none;
+          overflow:hidden;
+          isolation:isolate;
         }
         #core{
           display:flex;
@@ -631,16 +637,15 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           gap:4px;
-          width:176px;
+          width:${t.quickPanel.width}px;
           min-width:0;
           opacity:1;
           overflow:hidden;
-          transition:width .16s ease, opacity .12s ease, margin-right .16s ease;
         }
         #pill.qs-closed #quickPanel{
+          display:none;
           width:0;
           opacity:0;
-          margin-right:-6px;
           pointer-events:none;
         }
         #quickUpscaleCapsule{
@@ -1289,21 +1294,6 @@ function createOverlayHtml() {
         window.setAutoSendEnabled(false);
         window.setQueueVisible(false);
 
-        // Dynamic sizing: report actual pill dimensions so main.js can resize the window tightly.
-        const reportLayout = () => {
-          const stack = document.getElementById('stack');
-          if (!stack) return;
-          const rect = stack.getBoundingClientRect();
-          const w = Math.ceil(rect.width);
-          const h = Math.ceil(rect.height);
-          if (w > 10 && h > 10) {
-            document.title = '__overlay_layout__' + w + 'x' + h;
-          }
-        };
-        const layoutObserver = new ResizeObserver(reportLayout);
-        layoutObserver.observe(document.getElementById('stack'));
-        setTimeout(reportLayout, 60);
-
         // Mouse enter/leave: toggle click interception on the capsule.
         // When mouse is over the pill, we capture events; otherwise pass through.
         const stackEl = document.getElementById('stack');
@@ -1321,7 +1311,7 @@ function createOverlayHtml() {
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
   overlayWin = new BrowserWindow({
-    width: OVERLAY_TOKENS.window.width,
+    width: getOverlayWindowWidth(),
     height: OVERLAY_FIXED_HEIGHT,
     frame: false,
     transparent: true,
@@ -1366,6 +1356,7 @@ function ensureOverlayWindow() {
     if (raw.startsWith("__overlay_settings__")) {
       overlayQuickSettingsOpen = raw.endsWith("1");
       overlayQuickSettingsInitialized = true;
+      applyOverlayWindowSize();
       lastOverlayUiInteractionAt = Date.now();
       suppressActivateUntil = Date.now() + 3000;
       suppressMainWindowUntil = Date.now() + 3000;
@@ -1407,22 +1398,6 @@ function ensureOverlayWindow() {
       void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
-    if (raw.startsWith("__overlay_layout__")) {
-      // Dynamic capsule resize: overlay reports its actual pill size.
-      try {
-        const parts = raw.replace("__overlay_layout__", "").split("x");
-        const w = parseInt(parts[0], 10);
-        const h = parseInt(parts[1], 10);
-        if (w > 40 && h > 20 && w < 900 && h < 500 && overlayWin && !overlayWin.isDestroyed()) {
-          // Keep overlay vertically stable. Only width may adapt; height is fixed
-          // to eliminate up/down jumps when queue/settings appear.
-          const newW = Math.max(180, Math.min(760, w + 16));
-          overlayWin.setSize(newW, OVERLAY_FIXED_HEIGHT, false);
-          positionOverlayWindow();
-        }
-      } catch { }
-      return;
-    }
     if (raw === "__overlay_mouse_enter__") {
       // Mouse entered the pill — capture mouse events.
       if (overlayWin && !overlayWin.isDestroyed()) {
@@ -1453,6 +1428,20 @@ function positionOverlayWindow() {
   overlayWin.setPosition(x, y, false);
 }
 
+function getOverlayWindowWidth() {
+  return overlayQuickSettingsOpen
+    ? OVERLAY_TOKENS.window.expandedWidth
+    : OVERLAY_TOKENS.window.collapsedWidth;
+}
+
+function applyOverlayWindowSize() {
+  if (!overlayWin || overlayWin.isDestroyed()) return;
+  try {
+    overlayWin.setSize(getOverlayWindowWidth(), OVERLAY_FIXED_HEIGHT, false);
+    positionOverlayWindow();
+  } catch { }
+}
+
 async function syncOverlayQueueVisual(recordingHint = null) {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
   const isRec = typeof recordingHint === "boolean" ? recordingHint : await isRendererRecording();
@@ -1467,6 +1456,8 @@ async function syncOverlayQueueVisual(recordingHint = null) {
 
 async function showRecordingOverlay() {
   suppressActivateDuringOverlayFlow = true;
+  // Always start a new recording with a stable collapsed capsule layout.
+  overlayQuickSettingsOpen = false;
   pasteTargetAppName = "";
   pasteTargetAppPid = 0;
   const front = await getFrontmostAppInfo();
@@ -1502,8 +1493,7 @@ async function showRecordingOverlay() {
     );
   } catch { }
   try {
-    ow.setSize(320, OVERLAY_FIXED_HEIGHT, false);
-    positionOverlayWindow();
+    applyOverlayWindowSize();
   } catch { }
   await syncOverlayQueueVisual(true);
   ow.showInactive();
@@ -1562,8 +1552,7 @@ async function ensureOverlayVisible(options = {}) {
     );
   } catch { }
   try {
-    ow.setSize(320, OVERLAY_FIXED_HEIGHT, false);
-    positionOverlayWindow();
+    applyOverlayWindowSize();
   } catch { }
   const jsParts = [];
   if (resetTimer) jsParts.push("window.resetTimer && window.resetTimer();");

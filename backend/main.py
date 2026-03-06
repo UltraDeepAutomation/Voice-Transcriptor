@@ -35,6 +35,8 @@ from backend.live import LiveSession
 from backend.jobs import JobStore
 from backend.remote_openrouter import RemoteError as OrRemoteError
 from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
+from backend.remote_deepgram import RemoteError as DgRemoteError
+from backend.remote_deepgram import deepgram_transcribe
 from backend.transcribe import merge_channel_transcripts, transcribe_file
 
 
@@ -54,7 +56,7 @@ WS_CONNECT_LIMIT_PER_MIN = 20
 RESULT_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_RESULT_RETENTION_SEC", "86400"))
 LIVE_RECOVERY_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", "86400"))
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
-ALLOWED_REMOTE_PROVIDERS = {"openrouter"}
+ALLOWED_REMOTE_PROVIDERS = {"openrouter", "deepgram"}
 ALLOWED_AUDIO_EXTS = {
     ".wav",
     ".mp3",
@@ -896,6 +898,23 @@ def _run_remote_transcribe_once(
             "raw": out.get("raw"),
         }
 
+    if prov == "deepgram":
+        dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
+        model = (openrouter_model or "nova-3").strip()
+        out = deepgram_transcribe(
+            api_key=dg_key,
+            audio_bytes=audio_bytes,
+            filename=orig_name,
+            model=model,
+            language=language,
+        )
+        return {
+            "provider": "deepgram",
+            "model": model,
+            "text": (out.get("text") or "").strip(),
+            "raw": out.get("raw"),
+        }
+
     raise Exception(f"Unknown provider: {prov}")
 
 
@@ -954,7 +973,7 @@ async def create_remote_job(
                     "txt": str(result_txt_path),
                 },
             )
-        except OrRemoteError as e:
+        except (OrRemoteError, DgRemoteError) as e:
             jobs.set_error(job_id, str(e))
         except Exception as e:
             jobs.set_error(job_id, f"Remote transcription failed: {e}")
@@ -1000,7 +1019,7 @@ async def remote_transcribe_sync(
             cfg=cfg,
         )
         return {"ok": True, "result": result}
-    except OrRemoteError as e:
+    except (OrRemoteError, DgRemoteError) as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Remote transcription failed: {e}")

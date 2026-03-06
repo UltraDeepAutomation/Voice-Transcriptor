@@ -299,7 +299,7 @@
                   placeholder="OPENROUTER_API_KEY" /></label>
               <label class="field"><span class="lbl">Deepgram</span><input id="deepgramKey" type="password"
                   placeholder="DEEPGRAM_API_KEY" /></label>
-              <label class="field"><span class="lbl">Model</span><input id="orModel" type="text"
+              <label class="field"><span class="lbl">OpenRouter Model</span><input id="orModel" type="text"
                   placeholder="google/gemini-2.5-flash" /></label>
             </div>
             <div class="btn-row">
@@ -311,8 +311,7 @@
             <div class="card">
               <h2>Defaults</h2>
               <div class="field-stack">
-              <label class="check-inline"><input type="checkbox" id="autoStopSilenceEnabled" /> <span>Auto stop on
-                  silence</span></label>
+              <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox" id="autoStopSilenceEnabled" /></label>
               <label class="field"><span class="lbl">Silence (sec)</span><input id="autoStopSilenceSeconds"
                   type="number" min="1" max="120" step="1" value="2" /></label>
               <label class="field"><span class="lbl">Threshold (dBFS)</span><input id="autoStopSilenceDb"

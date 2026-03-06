@@ -63,6 +63,7 @@ _migrate_legacy_data()
 DEFAULT_CONFIG: Dict[str, Any] = {
     "providers": {
         "openrouter": {"key": ""},
+        "deepgram": {"key": ""},
     },
     "preferences": {
         "remote_provider": "openrouter",
@@ -109,7 +110,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
 def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg = json.loads(json.dumps(cfg))
     providers = cfg.get("providers") or {}
-    for name in ("openrouter",):
+    for name in ("openrouter", "deepgram"):
         if isinstance(providers.get(name), dict) and "key" in providers[name]:
             k = providers[name].get("key") or ""
             providers[name]["key"] = "" if not k else (k[:3] + "..." + k[-2:])
