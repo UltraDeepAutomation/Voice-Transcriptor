@@ -429,6 +429,17 @@ input:focus {
   border-color: var(--line-2);
 }
 
+.btn-danger {
+  background: #3a1a1a;
+  border-color: #6a2a2a;
+  color: #ff8080;
+}
+
+.btn-danger:hover {
+  background: #4a2020;
+  border-color: #8a3a3a;
+}
+
 .btn:hover {
   border-color: var(--line-4);
 }
@@ -1110,7 +1121,7 @@ input:focus {
 }
 
 .stats-k {
-  font-size: 9px;
+  font-size: 11px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-3);
@@ -1120,7 +1131,7 @@ input:focus {
 }
 
 .stats-v {
-  font-size: 11px;
+  font-size: 15px;
   font-weight: 700;
   color: var(--text);
   white-space: nowrap;

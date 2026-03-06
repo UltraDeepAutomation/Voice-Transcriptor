@@ -236,12 +236,14 @@
               <span class="refresh-ico" aria-hidden="true"></span>
               <span>Refresh</span>
             </button>
+            <button class="btn btn-danger" id="recordingsDeleteAllBtn" type="button"
+              aria-label="Delete all recordings">Delete All</button>
           </div>
         </div>
         <div class="recordings-layout">
           <div class="recordings-list" id="recordingsList"></div>
           <div class="recordings-viewer">
-            <div class="recordings-stats" id="recordingsStatsPanel" hidden>
+            <div class="recordings-stats" id="recordingsStatsPanel">
               <div class="stats-grid">
                 <div class="stats-card"><span class="stats-k">Recordings</span><span class="stats-v"
                     id="statsTotal">0</span></div>
@@ -299,23 +301,22 @@
                   placeholder="OPENROUTER_API_KEY" /></label>
               <label class="field"><span class="lbl">Deepgram</span><input id="deepgramKey" type="password"
                   placeholder="DEEPGRAM_API_KEY" /></label>
-              <label class="field"><span class="lbl">OpenRouter Model</span><input id="orModel" type="text"
-                  placeholder="google/gemini-2.5-flash" /></label>
+              <input id="orModel" type="hidden" value="google/gemini-3.1-flash-lite-preview" />
             </div>
             <div class="btn-row">
-              <button class="btn btn-primary" id="saveBtn">Save</button>
-              <button class="btn btn-ghost" id="reloadBtn">Reload</button>
+              <button class="btn btn-primary" id="saveBtn">Save Keys</button>
             </div>
-            <p id="cfgMsg"></p>
+            <p class="hint" id="cfgMsg"></p>
           </div>
-            <div class="card">
-              <h2>Defaults</h2>
-              <div class="field-stack">
-              <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox" id="autoStopSilenceEnabled" /></label>
+          <div class="card">
+            <h2>Defaults</h2>
+            <div class="field-stack">
+              <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
+                  id="autoStopSilenceEnabled" /></label>
               <label class="field"><span class="lbl">Silence (sec)</span><input id="autoStopSilenceSeconds"
                   type="number" min="1" max="120" step="1" value="2" /></label>
-              <label class="field"><span class="lbl">Threshold (dBFS)</span><input id="autoStopSilenceDb"
-                  type="number" min="-80" max="-10" step="1" value="-42" /></label>
+              <label class="field"><span class="lbl">Threshold (dBFS)</span><input id="autoStopSilenceDb" type="number"
+                  min="-80" max="-10" step="1" value="-42" /></label>
             </div>
           </div>
           <div class="card">
@@ -373,6 +374,18 @@
         <button class="btn btn-primary" id="upscalePromptSaveBtn" type="button">Save</button>
         <button class="btn btn-ghost" id="upscalePromptDefaultBtn" type="button">Set Default</button>
         <button class="btn btn-ghost" id="upscalePromptCancelBtn" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="deleteAllModal" hidden>
+    <div class="modal-card">
+      <h3>Delete All Recordings</h3>
+      <p style="color:#ccc;margin:12px 0 16px;">Are you sure you want to delete all recordings? This action cannot be
+        undone.</p>
+      <div class="btn-row">
+        <button class="btn btn-danger" id="deleteAllConfirmBtn" type="button">Yes, Delete All</button>
+        <button class="btn btn-ghost" id="deleteAllCancelBtn" type="button">Cancel</button>
       </div>
     </div>
   </div>

@@ -1066,7 +1066,6 @@ async function saveCfg(): Promise<void> {
 }
 
 $("saveBtn").addEventListener("click", () => void saveCfg().catch((e: Error) => ($("cfgMsg").textContent = e.message)));
-$("reloadBtn").addEventListener("click", () => void loadCfg().catch((e: Error) => ($("cfgMsg").textContent = e.message)));
 ($("mode") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
@@ -1398,6 +1397,29 @@ $("recordingsStatsBtn").addEventListener("click", () => {
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 $("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || ""));
 $("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || ""));
+
+// ── Delete All recordings ──
+$("recordingsDeleteAllBtn").addEventListener("click", () => {
+  ($("deleteAllModal") as HTMLElement).hidden = false;
+});
+$("deleteAllCancelBtn").addEventListener("click", () => {
+  ($("deleteAllModal") as HTMLElement).hidden = true;
+});
+$("deleteAllConfirmBtn").addEventListener("click", async () => {
+  try {
+    const r = await fetch(`/api/recordings?token=${encodeURIComponent(apiToken())}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    $("recordingContent").textContent = `Deleted ${data.deleted} recording(s).`;
+    $("recordingTitle").textContent = "Select recording";
+    $("recordingMeta").textContent = "";
+    await loadRecordings(true);
+  } catch (e: any) {
+    $("recordingContent").textContent = `Delete failed: ${e.message}`;
+  } finally {
+    ($("deleteAllModal") as HTMLElement).hidden = true;
+  }
+});
 
 // ── Transcribe settings gear popup ──
 const transcribeSettingsBtn = $("transcribeSettingsBtn") as HTMLButtonElement;

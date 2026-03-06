@@ -1311,6 +1311,20 @@ def list_recordings(_auth: None = Depends(_require_api_auth)):
     return {"items": items, "directory": str(d)}
 
 
+@app.delete("/api/recordings")
+def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
+    d = _resolve_recordings_dir()
+    deleted = 0
+    failed = 0
+    for p in list(d.glob("*.txt")):
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception:
+            failed += 1
+    return {"deleted": deleted, "failed": failed}
+
+
 @app.get("/api/recordings/{recording_name}")
 def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth)):
     p = _recording_path_or_404(recording_name)

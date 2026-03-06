@@ -596,7 +596,7 @@ function createOverlayHtml() {
               <input id="quickAutoStopToggle" type="checkbox" />
               <span class="capsuleLabel">Stop</span>
               <label id="quickAutoStopSecsLabel">
-                <input id="quickAutoStopSecs" type="number" min="1" max="30" step="1" value="2" />
+                <input id="quickAutoStopSecs" type="text" inputmode="numeric" pattern="[0-9]*" value="2" style="ime-mode:disabled" />
               </label>
             </div>
             <div id="quickUpscaleCapsule" title="Upscale settings">
@@ -723,7 +723,7 @@ function createOverlayHtml() {
         #quickPanel{
           display:flex;
           flex-direction:column;
-          align-items:flex-start;
+          align-items:stretch;
           gap:4px;
           min-width:0;
           overflow:visible;
@@ -731,10 +731,10 @@ function createOverlayHtml() {
         }
         /* ── Shared capsule base ── */
         #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule{
-          display:inline-flex;
+          display:flex;
           align-items:center;
           gap:5px;
-          padding:0 6px 0 3px;
+          padding:0 6px 0 2px;
           height:22px;
           border-radius:999px;
           white-space:nowrap;
@@ -1315,10 +1315,19 @@ function createOverlayHtml() {
         quickAutoStopToggle.addEventListener('change', () => {
           document.title = '__overlay_autostop_enabled__' + (quickAutoStopToggle.checked ? '1' : '0');
         });
-        quickAutoStopSecs.addEventListener('change', () => {
-          const v = Math.min(30, Math.max(1, Math.round(Number(quickAutoStopSecs.value) || 2)));
+        quickAutoStopSecs.addEventListener('focus', () => {
+          document.title = '__overlay_input_focus__';
+        });
+        quickAutoStopSecs.addEventListener('blur', () => {
+          const v = Math.min(20, Math.max(1, Math.round(Number(quickAutoStopSecs.value) || 2)));
           quickAutoStopSecs.value = v;
           document.title = '__overlay_autostop_secs__' + v;
+          setTimeout(() => { document.title = '__overlay_input_blur__'; }, 50);
+        });
+        quickAutoStopSecs.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            quickAutoStopSecs.blur();
+          }
         });
         window.setTimer = (t) => {
           const str = String(t || '').trim();
@@ -1586,6 +1595,22 @@ function ensureOverlayWindow() {
           `(() => { const el = document.getElementById('autoStopSilenceSeconds'); if (el) el.value = ${sec}; })();`,
           true
         ).catch(() => { });
+      }
+      void restoreFrontAppFocusAfterOverlayUi();
+      return;
+    }
+    if (raw === "__overlay_input_focus__") {
+      // User clicked into an input field — make overlay temporarily focusable for keyboard.
+      if (overlayWin && !overlayWin.isDestroyed()) {
+        overlayWin.setFocusable(true);
+        overlayWin.focus();
+      }
+      return;
+    }
+    if (raw === "__overlay_input_blur__") {
+      // User left the input field — restore non-focusable overlay state.
+      if (overlayWin && !overlayWin.isDestroyed()) {
+        overlayWin.setFocusable(false);
       }
       void restoreFrontAppFocusAfterOverlayUi();
       return;
