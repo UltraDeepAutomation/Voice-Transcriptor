@@ -497,7 +497,12 @@ function createOverlayHtml() {
           <div id="quickUpscaleCapsule" title="Upscale settings">
             <input id="quickUpscaleToggle" type="checkbox" />
             <span id="quickUpscaleOffLabel">Upscale</span>
-            <select id="quickUpscale" title="Upscale preset"></select>
+            <div id="quickUpscaleDrop">
+              <button id="quickUpscaleBtn" type="button" aria-label="Upscale preset">
+                <span id="quickUpscaleBtnText">Clean</span>
+              </button>
+              <div id="quickUpscaleMenu"></div>
+            </div>
           </div>
           <button id="quickSendEnterBtn" aria-label="Auto send after paste" title="Auto send after paste"></button>
         </div>
@@ -528,10 +533,9 @@ function createOverlayHtml() {
           gap:6px;
           padding:6px 8px;
           border-radius:999px;
-          border:1px solid rgba(255,255,255,.18);
-          background:linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97));
+          border:1px solid rgba(255,255,255,.2);
+          background:#1b1b1b;
           box-shadow:none;
-          backdrop-filter:blur(8px) saturate(100%);
         }
         #core{
           display:flex;
@@ -545,7 +549,7 @@ function createOverlayHtml() {
           padding:2px 8px;
           border-radius:999px;
           border:1px solid rgba(255,255,255,.16);
-          background:linear-gradient(180deg,rgba(38,38,38,.95),rgba(20,20,20,.95));
+          background:#191919;
           display:flex;
           align-items:center;
           justify-content:space-between;
@@ -651,24 +655,81 @@ function createOverlayHtml() {
           letter-spacing:.01em;
           opacity:.92;
         }
-        #quickUpscale{
+        #quickUpscaleDrop{
+          position:relative;
+        }
+        #quickUpscaleBtn{
           appearance:none;
           border:1px solid rgba(196,148,230,.28);
           border-radius:999px;
           background:rgba(72,52,92,.32);
           color:rgba(236,236,236,.96);
           height:18px;
-          padding:0 20px 0 8px;
+          padding:0 18px 0 8px;
           font-size:10px;
           font-weight:600;
-          max-width:94px;
-          min-width:94px;
-          background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-          background-repeat:no-repeat;
-          background-position:right 6px center;
-          outline:none;
+          max-width:96px;
+          min-width:96px;
+          text-align:left;
+          cursor:pointer;
+          position:relative;
         }
-        #quickUpscaleCapsule.up-off #quickUpscale{
+        #quickUpscaleBtn::after{
+          content:"";
+          position:absolute;
+          right:6px;
+          top:50%;
+          width:8px;
+          height:5px;
+          transform:translateY(-50%);
+          background-repeat:no-repeat;
+          background-position:center;
+          background-size:8px 5px;
+          background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+        }
+        #quickUpscaleBtnText{
+          display:block;
+          overflow:hidden;
+          text-overflow:ellipsis;
+          white-space:nowrap;
+        }
+        #quickUpscaleMenu{
+          position:absolute;
+          left:0;
+          top:22px;
+          min-width:100%;
+          border:1px solid rgba(196,148,230,.3);
+          border-radius:10px;
+          background:#211c26;
+          display:none;
+          z-index:5;
+          max-height:160px;
+          overflow:auto;
+          padding:4px;
+        }
+        #quickUpscaleMenu.open{
+          display:block;
+        }
+        .quickUpscaleItem{
+          width:100%;
+          appearance:none;
+          border:0;
+          border-radius:8px;
+          height:22px;
+          padding:0 8px;
+          text-align:left;
+          color:rgba(238,238,238,.95);
+          background:transparent;
+          font-size:10px;
+          cursor:pointer;
+        }
+        .quickUpscaleItem:hover{
+          background:rgba(255,255,255,.1);
+        }
+        .quickUpscaleItem.active{
+          background:rgba(176,128,236,.28);
+        }
+        #quickUpscaleCapsule.up-off #quickUpscaleDrop{
           display:none;
         }
         #quickUpscaleCapsule.up-on #quickUpscaleOffLabel{
@@ -890,8 +951,12 @@ function createOverlayHtml() {
         const quickPanel = document.getElementById('quickPanel');
         const quickUpscaleCapsule = document.getElementById('quickUpscaleCapsule');
         const quickUpscaleToggle = document.getElementById('quickUpscaleToggle');
-        const quickUpscale = document.getElementById('quickUpscale');
+        const quickUpscaleBtn = document.getElementById('quickUpscaleBtn');
+        const quickUpscaleBtnText = document.getElementById('quickUpscaleBtnText');
+        const quickUpscaleMenu = document.getElementById('quickUpscaleMenu');
         const quickSendEnterBtn = document.getElementById('quickSendEnterBtn');
+        let quickUpscaleOptions = [];
+        let quickUpscaleSelected = 'builtin_clean';
         let timerId = null;
         let queueTimerId = null;
         let audioCtx = null;
@@ -903,12 +968,28 @@ function createOverlayHtml() {
         let queueVisible = false;
         let queueStart = Date.now();
         let waveMode = 'recording';
+        const dpr = Math.max(1, Math.min(3, Number(window.devicePixelRatio || 1)));
+        const waveW = 54;
+        const waveH = 16;
+        const queueW = 54;
+        const queueH = 12;
+        cv.width = Math.round(waveW * dpr);
+        cv.height = Math.round(waveH * dpr);
+        cv.style.width = waveW + 'px';
+        cv.style.height = waveH + 'px';
+        qCv.width = Math.round(queueW * dpr);
+        qCv.height = Math.round(queueH * dpr);
+        qCv.style.width = queueW + 'px';
+        qCv.style.height = queueH + 'px';
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        qCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
         const bw = 1.4;
         const gap = 1.0;
-        const maxBars = Math.floor(cv.width / (bw + gap));
+        const maxBars = Math.floor(waveW / (bw + gap));
         const qBw = 1.2;
         const qGap = 0.8;
-        const qMaxBars = Math.floor(qCv.width / (qBw + qGap));
+        const qMaxBars = Math.floor(queueW / (qBw + qGap));
         window.setLevel = (lv) => {
           if (waveMode === 'transcribing') return;
           const raw = Math.max(0, Math.min(1, Number(lv) || 0));
@@ -994,33 +1075,26 @@ function createOverlayHtml() {
         };
         window.setUpscaleOptions = (items, selected) => {
           const list = Array.isArray(items) ? items : [];
-          quickUpscale.innerHTML = '';
+          quickUpscaleOptions = [];
           list.forEach((it) => {
             const id = String((it && it.id) || '').trim();
             if (!id) return;
             const name = String((it && it.name) || id).trim();
-            const opt = document.createElement('option');
-            opt.value = id;
-            opt.textContent = name.length > 10 ? (name.slice(0, 10) + '…') : name;
-            opt.title = name;
-            quickUpscale.appendChild(opt);
+            quickUpscaleOptions.push({ id, name });
           });
-          if (!quickUpscale.options.length) {
-            const opt = document.createElement('option');
-            opt.value = 'builtin_clean';
-            opt.textContent = 'Clean';
-            quickUpscale.appendChild(opt);
+          if (!quickUpscaleOptions.length) {
+            quickUpscaleOptions.push({ id: 'builtin_clean', name: 'Clean' });
           }
           const next = String(selected || '').trim();
-          if (next && Array.from(quickUpscale.options).some((o) => o.value === next)) {
-            quickUpscale.value = next;
-          }
+          quickUpscaleSelected = next && quickUpscaleOptions.some((o) => o.id === next) ? next : quickUpscaleOptions[0].id;
+          renderUpscaleMenu();
         };
         window.setUpscale = (presetId) => {
           const v = String(presetId || '').trim();
           if (!v) return;
-          if (!Array.from(quickUpscale.options).some((o) => o.value === v)) return;
-          if (quickUpscale.value !== v) quickUpscale.value = v;
+          if (!quickUpscaleOptions.some((o) => o.id === v)) return;
+          quickUpscaleSelected = v;
+          renderUpscaleMenu();
         };
         window.setAutoSendEnabled = (enabled) => {
           const on = !!enabled;
@@ -1036,12 +1110,11 @@ function createOverlayHtml() {
           window.setUpscaleEnabled(quickUpscaleToggle.checked);
           document.title = '__overlay_upscale_enabled__' + (quickUpscaleToggle.checked ? '1' : '0');
         });
-        quickUpscale.addEventListener('change', () => {
-          const v = String(quickUpscale.value || '').trim();
-          if (!v) return;
-          quickUpscale.value = v;
-          document.title = '__overlay_upscale__' + encodeURIComponent(v);
+        quickUpscaleBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          quickUpscaleMenu.classList.toggle('open');
         });
+        document.addEventListener('click', () => quickUpscaleMenu.classList.remove('open'));
         quickSendEnterBtn.addEventListener('click', () => {
           const next = !quickSendEnterBtn.classList.contains('on');
           window.setAutoSendEnabled(next);
@@ -1095,13 +1168,13 @@ function createOverlayHtml() {
           }
         };
         const render = () => {
-          ctx.clearRect(0, 0, cv.width, cv.height);
+          ctx.clearRect(0, 0, waveW, waveH);
           for (let i = 0; i < bars.length; i++) {
             const v = bars[bars.length - 1 - i];
-            const x = cv.width - (i + 1) * (bw + gap);
+            const x = waveW - (i + 1) * (bw + gap);
             if (x < 0) break;
-            const h = Math.max(2, Math.min(cv.height - 2, v * (cv.height - 2)));
-            const y = (cv.height - h) / 2;
+            const h = Math.max(2, Math.min(waveH - 2, v * (waveH - 2)));
+            const y = (waveH - h) / 2;
             if (waveMode === 'recording') {
               ctx.fillStyle = 'rgba(255,77,77,.88)';
             } else if (waveMode === 'transcribing') {
@@ -1115,16 +1188,36 @@ function createOverlayHtml() {
           }
         };
         const renderQueue = () => {
-          qCtx.clearRect(0, 0, qCv.width, qCv.height);
+          qCtx.clearRect(0, 0, queueW, queueH);
           for (let i = 0; i < queueBars.length; i++) {
             const v = queueBars[queueBars.length - 1 - i];
-            const x = qCv.width - (i + 1) * (qBw + qGap);
+            const x = queueW - (i + 1) * (qBw + qGap);
             if (x < 0) break;
-            const h = Math.max(2, Math.min(qCv.height - 1, v * (qCv.height - 1)));
-            const y = (qCv.height - h) / 2;
+            const h = Math.max(2, Math.min(queueH - 1, v * (queueH - 1)));
+            const y = (queueH - h) / 2;
             qCtx.fillStyle = 'rgba(98,216,132,.94)';
             qCtx.fillRect(x, y, qBw, h);
           }
+        };
+        const renderUpscaleMenu = () => {
+          const selected = quickUpscaleOptions.find((x) => x.id === quickUpscaleSelected) || quickUpscaleOptions[0] || { id: 'builtin_clean', name: 'Clean' };
+          quickUpscaleBtnText.textContent = (selected.name || selected.id || 'Upscale');
+          quickUpscaleMenu.innerHTML = '';
+          quickUpscaleOptions.forEach((x) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'quickUpscaleItem' + (x.id === quickUpscaleSelected ? ' active' : '');
+            b.textContent = x.name.length > 22 ? (x.name.slice(0, 22) + '…') : x.name;
+            b.title = x.name;
+            b.addEventListener('click', (ev) => {
+              ev.stopPropagation();
+              quickUpscaleSelected = x.id;
+              renderUpscaleMenu();
+              quickUpscaleMenu.classList.remove('open');
+              document.title = '__overlay_upscale__' + encodeURIComponent(x.id);
+            });
+            quickUpscaleMenu.appendChild(b);
+          });
         };
         const tick = () => {
           const s = Math.max(0, Math.floor((Date.now() - start) / 1000));
