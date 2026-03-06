@@ -325,6 +325,12 @@
                   <option>segment</option>
                   <option>word</option>
                 </select></label>
+              <label class="check-inline"><input type="checkbox" id="autoStopSilenceEnabled" /> <span>Auto stop on
+                  silence</span></label>
+              <label class="field"><span class="lbl">Silence (sec)</span><input id="autoStopSilenceSeconds"
+                  type="number" min="1" max="120" step="1" value="2" /></label>
+              <label class="field"><span class="lbl">Threshold (dBFS)</span><input id="autoStopSilenceDb"
+                  type="number" min="-80" max="-10" step="1" value="-42" /></label>
             </div>
           </div>
           <div class="card">

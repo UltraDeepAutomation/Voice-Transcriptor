@@ -200,6 +200,14 @@ async function ensureWindowVisible(options = {}) {
   win.focus();
 }
 
+async function restoreFrontAppFocusAfterOverlayUi() {
+  const targetPid = Number(pasteTargetAppPid || 0);
+  if (!targetPid) return;
+  try {
+    await activateAppByPid(targetPid);
+  } catch { }
+}
+
 function getRepoRoot() {
   if (app.isPackaged) return process.resourcesPath;
   return path.join(__dirname, "..");
@@ -623,13 +631,14 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           gap:4px;
-          max-width:230px;
+          width:176px;
           min-width:0;
           opacity:1;
           overflow:hidden;
+          transition:width .16s ease, opacity .12s ease, margin-right .16s ease;
         }
         #pill.qs-closed #quickPanel{
-          max-width:0;
+          width:0;
           opacity:0;
           margin-right:-6px;
           pointer-events:none;
@@ -1082,7 +1091,7 @@ function createOverlayHtml() {
             stateIcon.classList.add('transcribing');
           } else if (raw === 'upscaling') {
             stateIcon.classList.add('upscaling');
-          } else if (raw === 'paste sent' || raw === 'done' || raw === 'saved to app') {
+          } else if (raw === 'paste sent' || raw === 'pasted' || raw === 'sent' || raw === 'done' || raw === 'saved to app') {
             stateIcon.classList.add('ok');
           } else if (raw === 'paste failed' || raw === 'grant access' || raw === 'secure field' || raw === 'no text focus' || raw === 'clipboard error') {
             stateIcon.classList.add('fail');
@@ -1364,6 +1373,7 @@ function ensureOverlayWindow() {
         try { win.hide(); } catch { }
       }
       void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
+      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_upscale_enabled__")) {
@@ -1373,6 +1383,7 @@ function ensureOverlayWindow() {
       suppressActivateUntil = Date.now() + 3000;
       suppressMainWindowUntil = Date.now() + 3000;
       void setRendererUpscaleEnabledChoice(v);
+      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_upscale__")) {
@@ -1382,6 +1393,7 @@ function ensureOverlayWindow() {
       suppressActivateUntil = Date.now() + 3000;
       suppressMainWindowUntil = Date.now() + 3000;
       void setRendererUpscalePresetChoice(v);
+      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_autosend__")) {
@@ -1392,6 +1404,7 @@ function ensureOverlayWindow() {
       suppressActivateUntil = Date.now() + 3000;
       suppressMainWindowUntil = Date.now() + 3000;
       void setRendererAutoSendEnterChoice(v);
+      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_layout__")) {
@@ -2584,8 +2597,12 @@ async function processPostStopTask(task) {
     appendMainLog(
       `[paste-auto] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
+    if (pasted.ok) {
+      // Show success immediately once the paste actually happened.
+      await setOverlayStatus("Pasted");
+    }
     if (pasted.ok && task.autoSendEnter) {
-      await sleep(400);
+      await sleep(220);
       const sent = await sendCommandEnterToFocusedApp(effectiveTargetName, effectiveTargetPid);
       traceStep(trace, "cmd_enter_result", {
         ok: !!sent.ok,
@@ -2594,6 +2611,9 @@ async function processPostStopTask(task) {
       appendMainLog(
         `[cmd-enter] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
       );
+      if (sent.ok) {
+        await setOverlayStatus("Sent");
+      }
       if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
         openPrivacyAccessibilitySettings();
       }
@@ -3078,9 +3098,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", async () => {
-  // Ignore synthetic activation pulses right after capsule interactions,
-  // but allow explicit Dock/Menu activation even while recording/transcribing.
-  if (Date.now() - lastOverlayUiInteractionAt < 1300) return;
+  // Allow explicit Dock/Menu activation even while recording/transcribing.
   ensureWindowVisible({ manual: true, force: true });
 });
 

@@ -50,6 +50,9 @@ interface AppConfig {
       upscale_enabled?: boolean;
       upscale_preset?: string;
       auto_send_enter?: boolean;
+      auto_stop_silence_enabled?: boolean;
+      auto_stop_silence_seconds?: number;
+      auto_stop_silence_db?: number;
     };
   };
 }
@@ -203,6 +206,8 @@ let suppressUiPrefAutosave = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
+let silenceStartedAtMs = 0;
+let autoStopTriggered = false;
 
 const apiToken = (): string => {
   const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
@@ -233,6 +238,44 @@ function setStatus(st: string): void {
   const dot = $("statusDot");
   dot.className =
     "status-dot" + (st === "Recording" ? " rec" : st === "Processing" ? " process" : st === "Done" ? " done" : "");
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getAutoStopSilenceConfig(): { enabled: boolean; seconds: number; thresholdDb: number } {
+  const enabled = !!($("autoStopSilenceEnabled") as HTMLInputElement).checked;
+  const secondsRaw = Number(($("autoStopSilenceSeconds") as HTMLInputElement).value);
+  const thresholdRaw = Number(($("autoStopSilenceDb") as HTMLInputElement).value);
+  const seconds = clampNumber(Number.isFinite(secondsRaw) ? Math.round(secondsRaw) : 2, 1, 120);
+  const thresholdDb = clampNumber(Number.isFinite(thresholdRaw) ? Math.round(thresholdRaw) : -42, -80, -10);
+  return { enabled, seconds, thresholdDb };
+}
+
+function evaluateSilenceAutoStop(rms: number): void {
+  if (!isRecording || autoStopTriggered) return;
+  const cfg = getAutoStopSilenceConfig();
+  if (!cfg.enabled) {
+    silenceStartedAtMs = 0;
+    return;
+  }
+  const dbfs = rms > 1e-8 ? 20 * Math.log10(rms) : -96;
+  if (dbfs >= cfg.thresholdDb) {
+    silenceStartedAtMs = 0;
+    return;
+  }
+  const now = Date.now();
+  if (!silenceStartedAtMs) {
+    silenceStartedAtMs = now;
+    return;
+  }
+  if (now - silenceStartedAtMs < cfg.seconds * 1000) return;
+  autoStopTriggered = true;
+  setStatus("Auto stop");
+  window.setTimeout(() => {
+    if (isRecording) void stopLive(shouldAutoTranscribe());
+  }, 0);
 }
 
 async function parseError(r: Response): Promise<string> {
@@ -800,6 +843,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
 }
 
 function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
+  const silence = getAutoStopSilenceConfig();
   return {
     mode: (($("mode") as HTMLSelectElement).value || "live").trim(),
     provider: (($("providerSelect") as HTMLSelectElement).value || "local").trim(),
@@ -812,6 +856,9 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
     upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
     auto_send_enter: !!($("autoSendEnterToggle") as HTMLButtonElement).classList.contains("active"),
+    auto_stop_silence_enabled: silence.enabled,
+    auto_stop_silence_seconds: silence.seconds,
+    auto_stop_silence_db: silence.thresholdDb,
   };
 }
 
@@ -1010,6 +1057,24 @@ async function loadCfg(): Promise<void> {
     const livePreview = $("livePreviewToggle") as HTMLInputElement;
     auto.checked = ui.auto_transcribe !== false;
     livePreview.checked = ui.live_preview !== false;
+    const autoStopEnabledEl = $("autoStopSilenceEnabled") as HTMLInputElement;
+    const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
+    const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
+    autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
+    autoStopSecondsEl.value = String(
+      clampNumber(
+        Number.isFinite(Number(ui.auto_stop_silence_seconds)) ? Number(ui.auto_stop_silence_seconds) : 2,
+        1,
+        120
+      )
+    );
+    autoStopDbEl.value = String(
+      clampNumber(
+        Number.isFinite(Number(ui.auto_stop_silence_db)) ? Number(ui.auto_stop_silence_db) : -42,
+        -80,
+        -10
+      )
+    );
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
     upscaleToggle.checked = ui.upscale_enabled === true;
     setAutoSendEnterEnabled(ui.auto_send_enter === true);
@@ -1065,6 +1130,9 @@ $("reloadBtn").addEventListener("click", () => void loadCfg().catch((e: Error) =
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("diarizeDefault") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("chunkSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoSendEnterToggle") as HTMLButtonElement).addEventListener("click", () => {
   const btn = $("autoSendEnterToggle") as HTMLButtonElement;
@@ -1648,6 +1716,8 @@ async function startLive(): Promise<void> {
   resetOutputs();
   chunks = [];
   workletLastFrameAt = 0;
+  silenceStartedAtMs = 0;
+  autoStopTriggered = false;
   captureFrameCount = 0;
   captureRmsAccum = 0;
   capturePeakMax = 0;
@@ -1776,6 +1846,7 @@ async function startLive(): Promise<void> {
       }
       const rms = Math.sqrt(sum / buf.length);
       setVU(rms);
+      evaluateSilenceAutoStop(rms);
 
       waveFrameCount += 1;
       if (waveFrameCount % WAVE_PUSH_EVERY_FRAMES === 0) {
@@ -1918,6 +1989,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   } catch { }
   ws = null;
   isRecording = false;
+  silenceStartedAtMs = 0;
+  autoStopTriggered = false;
   currentRecordingId = 0;
   window.__transcriptorIsRecording = false;
   window.__transcriptorCurrentRecordingId = 0;
