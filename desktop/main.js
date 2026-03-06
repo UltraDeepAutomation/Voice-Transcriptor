@@ -42,6 +42,8 @@ let overlayRecordingStartedAt = 0;
 let overlaySeenAudioFrames = false;
 let overlaySpeechRecoveryStartedAt = 0;
 let overlayAutoStopYellowSince = 0;
+let overlayAutoStopTriggerTimer = null;
+let overlayTranscribingStatusTimer = null;
 let lastOverlayUiInteractionAt = 0;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
@@ -628,7 +630,7 @@ function createOverlayHtml() {
           align-items:center;
           justify-content:flex-start;
           gap:6px;
-          padding:${t.pill.padY}px 8px;
+          padding:${t.pill.padY}px 7px ${t.pill.padY}px 5px;
           border-radius:${t.pill.borderRadius}px;
           border:1px solid #333;
           background:#161616;
@@ -1550,6 +1552,14 @@ async function showRecordingOverlay() {
   overlaySeenAudioFrames = false;
   overlaySpeechRecoveryStartedAt = 0;
   overlayAutoStopYellowSince = 0;
+  if (overlayAutoStopTriggerTimer) {
+    clearTimeout(overlayAutoStopTriggerTimer);
+    overlayAutoStopTriggerTimer = null;
+  }
+  if (overlayTranscribingStatusTimer) {
+    clearTimeout(overlayTranscribingStatusTimer);
+    overlayTranscribingStatusTimer = null;
+  }
   pasteTargetAppName = "";
   pasteTargetAppPid = 0;
   const front = await getFrontmostAppInfo();
@@ -1632,23 +1642,11 @@ async function showRecordingOverlay() {
         }
         if (!isRec || !cfg.enabled || overlayStopInFlight) {
           overlaySilenceStartedAt = 0;
-          overlaySpeechRecoveryStartedAt = 0;
-          overlayAutoStopYellowSince = 0;
-          if (overlayAutoStopUiActive) {
-            overlayAutoStopUiActive = false;
-            overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Recording");`, true).catch(() => { });
-          }
         } else {
           const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
           const warmupMs = 1200;
           if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
             overlaySilenceStartedAt = 0;
-            overlaySpeechRecoveryStartedAt = 0;
-            overlayAutoStopYellowSince = 0;
-            if (overlayAutoStopUiActive) {
-              overlayAutoStopUiActive = false;
-              overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Recording");`, true).catch(() => { });
-            }
             overlayWin.webContents.executeJavaScript(
               `window.setLevel(${safeLevel}); window.setQueueLevel && window.setQueueLevel(${safeLevel});`,
               true
@@ -1658,41 +1656,23 @@ async function showRecordingOverlay() {
           const silentByDb = safeRms <= thresholdRms;
           const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 1400;
           const consideredSilent = silentByDb || staleAudioFrames;
-          if (!consideredSilent) {
-            overlaySilenceStartedAt = 0;
-            overlaySpeechRecoveryStartedAt = 0;
-            overlayAutoStopYellowSince = 0;
-            if (overlayAutoStopUiActive) {
-              overlayAutoStopUiActive = false;
-              overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Recording");`, true).catch(() => { });
+          if (consideredSilent) {
+            if (!overlaySilenceStartedAt) {
+              overlaySilenceStartedAt = now;
             }
-          } else if (!overlaySilenceStartedAt) {
-            overlaySilenceStartedAt = now;
-            overlaySpeechRecoveryStartedAt = 0;
-            overlayAutoStopYellowSince = 0;
-          } else {
-            overlaySpeechRecoveryStartedAt = 0;
             const silentElapsed = now - overlaySilenceStartedAt;
-            const armYellowAfterMs = Number(cfg.seconds) * 1000;
-            const yellowLeadMs = 500;
-            if (!overlayAutoStopUiActive && silentElapsed >= armYellowAfterMs) {
-              overlayAutoStopUiActive = true;
-              overlayAutoStopYellowSince = now;
-              overlayWin.webContents.executeJavaScript(`window.setStatus && window.setStatus("Auto stop");`, true).catch(() => { });
+            if (silentElapsed >= Number(cfg.seconds) * 1000) {
+              overlaySilenceStartedAt = 0;
+              overlayStopInFlight = true;
+              appendMainLog(`[overlay-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
+              stopRecordingFromOverlay().catch((e) => {
+                appendMainLog(`[overlay-autostop-error] ${compactLogText(e?.message || e)}`);
+                overlayStopInFlight = false;
+                hideRecordingOverlay();
+              });
             }
-            if (overlayAutoStopUiActive && overlayAutoStopYellowSince > 0 && (now - overlayAutoStopYellowSince) >= yellowLeadMs) {
+          } else {
             overlaySilenceStartedAt = 0;
-            overlayAutoStopUiActive = false;
-            overlaySpeechRecoveryStartedAt = 0;
-            overlayAutoStopYellowSince = 0;
-            overlayStopInFlight = true;
-            appendMainLog(`[overlay-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
-            stopRecordingFromOverlay().catch((e) => {
-              appendMainLog(`[overlay-autostop-error] ${compactLogText(e?.message || e)}`);
-              overlayStopInFlight = false;
-              hideRecordingOverlay();
-            });
-            }
           }
         }
         overlayWin.webContents.executeJavaScript(
@@ -1771,6 +1751,14 @@ function hideRecordingOverlay() {
   overlaySeenAudioFrames = false;
   overlaySpeechRecoveryStartedAt = 0;
   overlayAutoStopYellowSince = 0;
+  if (overlayAutoStopTriggerTimer) {
+    clearTimeout(overlayAutoStopTriggerTimer);
+    overlayAutoStopTriggerTimer = null;
+  }
+  if (overlayTranscribingStatusTimer) {
+    clearTimeout(overlayTranscribingStatusTimer);
+    overlayTranscribingStatusTimer = null;
+  }
   overlayAutoStopUiActive = false;
   suppressActivateDuringOverlayFlow = false;
   if (overlayWaveMonitor) {
@@ -1787,6 +1775,21 @@ async function setOverlayStatus(text) {
       true
     );
   } catch { }
+}
+
+async function showPostStopYellowThenTranscribing(delayMs = 500) {
+  await setOverlayStatus("Auto stop");
+  if (overlayTranscribingStatusTimer) {
+    clearTimeout(overlayTranscribingStatusTimer);
+    overlayTranscribingStatusTimer = null;
+  }
+  overlayTranscribingStatusTimer = setTimeout(() => {
+    overlayTranscribingStatusTimer = null;
+    if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
+    if (pendingTranscriptionCount > 0 || overlayStopInFlight) {
+      void setOverlayStatus("Transcribing");
+    }
+  }, delayMs);
 }
 
 async function playOverlayCue(kind = "start") {
@@ -1919,7 +1922,6 @@ async function toggleRecordingFromShortcut() {
     if (result.auto) {
       traceStep(trace, "recording_stopped", { autoTranscribe: true, timerText: result.timerText || "" });
       await playOverlayCue("stop");
-      await setOverlayStatus("Transcribing");
       enqueuePostStopTask({
         autoTranscribe: true,
         autoSendEnter: !!result.autoSendEnter,
@@ -1931,6 +1933,7 @@ async function toggleRecordingFromShortcut() {
       pasteTargetAppName = "";
       pasteTargetAppPid = 0;
       await syncOverlayQueueVisual(false);
+      await showPostStopYellowThenTranscribing(500);
     } else {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       await playOverlayCue("stop");
@@ -1974,7 +1977,6 @@ async function stopRecordingFromOverlay() {
 
   if (result?.ok) {
     await playOverlayCue("stop");
-    await setOverlayStatus("Transcribing");
     enqueuePostStopTask({
       autoTranscribe: true,
       autoSendEnter: !!result.autoSendEnter,
@@ -1986,6 +1988,7 @@ async function stopRecordingFromOverlay() {
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
     await syncOverlayQueueVisual(false);
+    await showPostStopYellowThenTranscribing(500);
   } else {
     await setOverlayStatus("Saved To App");
     setTimeout(() => hideRecordingOverlay(), 1400);
