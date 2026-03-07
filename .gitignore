@@ -36,6 +36,7 @@ pnpm-debug.log*
 data/*.log
 data/*.pid
 data/api_token.txt
+data/config.json
 data/uploads/
 data/results/
 *.log

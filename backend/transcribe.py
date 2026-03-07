@@ -1,10 +1,17 @@
+"""Local Whisper transcription: audio array → segments + text.
+
+Thread-safe model cache, empty-sequence error handling, stereo channel merge.
+"""
+
+import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from faster_whisper import WhisperModel
 
+logger = logging.getLogger(__name__)
 
 _MODEL_LOCK = threading.Lock()
 _MODEL_CACHE: Dict[str, WhisperModel] = {}
@@ -33,6 +40,49 @@ def _model(model_name: str) -> WhisperModel:
             m = WhisperModel(model_name, device="cpu", compute_type="int8")
             _MODEL_CACHE[model_name] = m
         return m
+
+
+def _build_result(
+    segments,
+    info,
+    word_timestamps: bool,
+) -> Dict[str, Any]:
+    """Convert faster-whisper segment iterator + info into a result dict.
+
+    Shared by both transcribe_audio and transcribe_file to avoid duplication.
+    """
+    out_segments: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+    for s in segments:
+        seg: Dict[str, Any] = {
+            "start": float(s.start),
+            "end": float(s.end),
+            "text": (s.text or "").strip(),
+        }
+        words = getattr(s, "words", None)
+        if word_timestamps and words:
+            seg["words"] = [
+                {
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    "word": w.word,
+                    "prob": float(w.probability) if w.probability is not None else None,
+                }
+                for w in words
+            ]
+        out_segments.append(seg)
+        if seg["text"]:
+            text_parts.append(seg["text"])
+
+    return {
+        "language": getattr(info, "language", None),
+        "language_probability": float(
+            getattr(info, "language_probability", 0.0) or 0.0
+        ),
+        "duration": float(getattr(info, "duration", 0.0) or 0.0),
+        "segments": out_segments,
+        "text": " ".join(text_parts).strip(),
+    }
 
 
 def transcribe_audio(
@@ -69,38 +119,7 @@ def transcribe_audio(
             return _empty_transcribe_result(duration)
         raise
 
-    out_segments: List[Dict[str, Any]] = []
-    text_parts: List[str] = []
-    for s in segments:
-        seg: Dict[str, Any] = {
-            "start": float(s.start),
-            "end": float(s.end),
-            "text": (s.text or "").strip(),
-        }
-        words = getattr(s, "words", None)
-        if word_timestamps and words:
-            seg["words"] = [
-                {
-                    "start": float(w.start),
-                    "end": float(w.end),
-                    "word": w.word,
-                    "prob": float(w.probability) if w.probability is not None else None,
-                }
-                for w in words
-            ]
-        out_segments.append(seg)
-        if seg["text"]:
-            text_parts.append(seg["text"])
-
-    return {
-        "language": getattr(info, "language", None),
-        "language_probability": float(
-            getattr(info, "language_probability", 0.0) or 0.0
-        ),
-        "duration": float(getattr(info, "duration", 0.0) or 0.0),
-        "segments": out_segments,
-        "text": " ".join(text_parts).strip(),
-    }
+    return _build_result(segments, info, word_timestamps)
 
 
 def transcribe_file(
@@ -132,38 +151,7 @@ def transcribe_file(
             return _empty_transcribe_result(0.0)
         raise
 
-    out_segments: List[Dict[str, Any]] = []
-    text_parts: List[str] = []
-    for s in segments:
-        seg: Dict[str, Any] = {
-            "start": float(s.start),
-            "end": float(s.end),
-            "text": (s.text or "").strip(),
-        }
-        words = getattr(s, "words", None)
-        if word_timestamps and words:
-            seg["words"] = [
-                {
-                    "start": float(w.start),
-                    "end": float(w.end),
-                    "word": w.word,
-                    "prob": float(w.probability) if w.probability is not None else None,
-                }
-                for w in words
-            ]
-        out_segments.append(seg)
-        if seg["text"]:
-            text_parts.append(seg["text"])
-
-    return {
-        "language": getattr(info, "language", None),
-        "language_probability": float(
-            getattr(info, "language_probability", 0.0) or 0.0
-        ),
-        "duration": float(getattr(info, "duration", 0.0) or 0.0),
-        "segments": out_segments,
-        "text": " ".join(text_parts).strip(),
-    }
+    return _build_result(segments, info, word_timestamps)
 
 
 def merge_channel_transcripts(t1: Dict[str, Any], t2: Dict[str, Any]) -> Dict[str, Any]:

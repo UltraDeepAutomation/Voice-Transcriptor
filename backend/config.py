@@ -1,13 +1,36 @@
+"""Application configuration: data directory, config file, and API key encryption.
+
+Configuration is stored as JSON in ~/Library/Application Support/Transcriptor/config.json
+(macOS) or ~/.config/Transcriptor/config.json (Linux). API keys are encrypted at rest
+using Fernet symmetric encryption when the cryptography package is available; otherwise
+keys are stored in plain text with a warning logged at startup.
+"""
+
 import json
+import logging
 import os
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+    Fernet = None  # type: ignore[assignment,misc]
+    InvalidToken = Exception  # type: ignore[assignment,misc]
+    logging.warning(
+        "cryptography package not installed — API keys will be stored in plain text. "
+        "Run: pip3 install 'cryptography>=42.0.0' to enable encryption."
+    )
+
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 LEGACY_DATA_DIR = APP_ROOT / "data"
+
+_ENC_PREFIX = "enc:"
 
 
 def _default_data_dir() -> Path:
@@ -25,6 +48,107 @@ def _default_data_dir() -> Path:
 DATA_DIR = _default_data_dir()
 CONFIG_PATH = DATA_DIR / "config.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Fernet encryption key — one per machine, stored with strict permissions.
+# ---------------------------------------------------------------------------
+_KEYFILE = DATA_DIR / ".encryption_key"
+
+
+def _load_or_create_fernet_key() -> bytes:
+    """Return a 32-byte URL-safe base64-encoded Fernet key.
+
+    Created once per machine and stored in the user data directory with
+    ``chmod 0600`` so that only the file owner can read it.
+    Returns ``b""`` when the cryptography package is not installed.
+    """
+    if not _HAS_CRYPTO:
+        return b""
+    if _KEYFILE.exists():
+        raw = _KEYFILE.read_bytes().strip()
+        if raw:
+            try:
+                # Validate it is a real Fernet key.
+                Fernet(raw)
+                return raw
+            except Exception:
+                pass  # Corrupted — regenerate below.
+    key = Fernet.generate_key()
+    _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
+    _KEYFILE.write_bytes(key)
+    try:
+        os.chmod(_KEYFILE, 0o600)
+    except Exception:
+        pass
+    return key
+
+
+_FERNET_KEY = _load_or_create_fernet_key()
+_FERNET = Fernet(_FERNET_KEY) if _HAS_CRYPTO and _FERNET_KEY else None
+
+
+def encrypt_value(plain: str) -> str:
+    """Encrypt a string and return it with the ``enc:`` prefix.
+    Returns the plain string unchanged when cryptography is unavailable.
+    """
+    if not plain:
+        return ""
+    if _FERNET is None:
+        return plain  # no-crypto fallback
+    token = _FERNET.encrypt(plain.encode("utf-8"))
+    return _ENC_PREFIX + token.decode("ascii")
+
+
+def decrypt_value(stored: str) -> str:
+    """Decrypt a value previously encrypted by :func:`encrypt_value`.
+
+    If *stored* does not carry the ``enc:`` prefix it is returned as-is so
+    that plain-text values written before encryption was enabled still work
+    (transparent migration).
+    """
+    if not stored:
+        return ""
+    if not stored.startswith(_ENC_PREFIX):
+        return stored  # plain-text (legacy / not encrypted yet)
+    if _FERNET is None:
+        return ""  # encrypted value but no crypto — can't decrypt
+    token = stored[len(_ENC_PREFIX):]
+    try:
+        return _FERNET.decrypt(token.encode("ascii")).decode("utf-8")
+    except (InvalidToken, Exception):
+        return ""  # corrupted — treat as empty
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _encrypt_provider_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep copy of *cfg* with all ``providers.*.key`` values encrypted."""
+    cfg = json.loads(json.dumps(cfg))
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        for name in list(providers.keys()):
+            prov = providers.get(name)
+            if isinstance(prov, dict) and "key" in prov:
+                raw = str(prov.get("key") or "").strip()
+                if raw and not raw.startswith(_ENC_PREFIX):
+                    prov["key"] = encrypt_value(raw)
+    return cfg
+
+
+def _decrypt_provider_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep copy of *cfg* with all ``providers.*.key`` values decrypted."""
+    cfg = json.loads(json.dumps(cfg))
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        for name in list(providers.keys()):
+            prov = providers.get(name)
+            if isinstance(prov, dict) and "key" in prov:
+                stored = str(prov.get("key") or "").strip()
+                if stored:
+                    prov["key"] = decrypt_value(stored)
+    return cfg
 
 
 def _migrate_legacy_data() -> None:
@@ -86,22 +210,48 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
 
 
 def load_config() -> Dict[str, Any]:
+    """Load config and return it with decrypted provider keys.
+
+    If the on-disk config contains plain-text keys (pre-encryption era),
+    they are transparently encrypted in-place on first read.
+    """
     if not CONFIG_PATH.exists():
         return dict(DEFAULT_CONFIG)
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             return dict(DEFAULT_CONFIG)
-        return _deep_merge(DEFAULT_CONFIG, raw)
+        merged = _deep_merge(DEFAULT_CONFIG, raw)
+
+        # Auto-migrate: if any provider key is plain-text, encrypt it on disk.
+        needs_migration = False
+        providers = merged.get("providers")
+        if isinstance(providers, dict):
+            for prov in providers.values():
+                if isinstance(prov, dict) and "key" in prov:
+                    k = str(prov.get("key") or "").strip()
+                    if k and not k.startswith(_ENC_PREFIX):
+                        needs_migration = True
+                        break
+        if needs_migration:
+            encrypted_cfg = _encrypt_provider_keys(merged)
+            payload = json.dumps(encrypted_cfg, ensure_ascii=False, indent=2)
+            tmp = CONFIG_PATH.with_suffix(".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(CONFIG_PATH)
+
+        return _decrypt_provider_keys(merged)
     except Exception:
         return dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
+    """Merge *cfg* into the current config and persist with encrypted keys."""
     current = load_config()
     merged_current = _deep_merge(current, cfg or {})
     merged = _deep_merge(DEFAULT_CONFIG, merged_current)
-    payload = json.dumps(merged, ensure_ascii=False, indent=2)
+    encrypted = _encrypt_provider_keys(merged)
+    payload = json.dumps(encrypted, ensure_ascii=False, indent=2)
     tmp = CONFIG_PATH.with_suffix(".tmp")
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(CONFIG_PATH)
@@ -115,3 +265,4 @@ def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
             k = providers[name].get("key") or ""
             providers[name]["key"] = "" if not k else (k[:3] + "..." + k[-2:])
     return cfg
+

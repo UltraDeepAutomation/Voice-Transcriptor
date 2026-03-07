@@ -1,43 +1,61 @@
-# Call Transcriptor (MVP)
+# Transcriptor
 
-Локальное веб-приложение для транскрипции записей звонков через Whisper (faster-whisper).
+Голосовой транскриптор с поддержкой живой записи, удалённой транскрипции (OpenRouter, Deepgram) и локального Whisper.
+
+## Установка (macOS)
+
+### Один скрипт — всё установит:
+
+```bash
+chmod +x setup.sh && ./setup.sh
+```
+
+Скрипт автоматически:
+- Установит Homebrew (если нет)
+- Установит Python 3, Node.js, ffmpeg
+- Установит все Python и Node зависимости
+- Соберёт frontend и Electron приложение
+- Установит `Transcriptor.app` в Applications
+- Снимет карантин macOS
+
+### Запуск
+
+```bash
+./run.sh
+```
+
+Или откройте **Transcriptor** из Applications / Dock.
+
+## Настройка после установки
+
+1. Откройте **Settings** в приложении
+2. Введите свои API-ключи:
+   - **OpenRouter** — для удалённой транскрипции и улучшения текста
+   - **Deepgram** — альтернативный провайдер транскрипции
+3. Ключи хранятся зашифрованными локально на вашем Mac
 
 ## Возможности
 
-- Загрузка аудиофайла и получение текста
-- Лайв транскрипция с микрофона во время записи (псевдо-стриминг через WebSocket)
-- Удаленная транскрипция через OpenRouter
-- Desktop-обертка для macOS/Windows (Electron)
-- Режим для стерео-записей звонков: разделение каналов и маркировка A/B
-- Выгрузка результата в TXT и JSON
+- 🎙 **Live транскрипция** — запись с микрофона в реальном времени
+- 📝 **Upscale** — улучшение текста через AI с кастомными пресетами
+- 🔒 **Шифрование** — API-ключи зашифрованы Fernet (AES-128)
+- 💾 **Записи** — все транскрипции сохраняются локально
+- 🌐 **Провайдеры** — Local Whisper, OpenRouter, Deepgram
 
-## Установка
+## Системные требования
 
-Рекомендуется поставить ffmpeg (для MP3/M4A и для ресемплинга в 16kHz):
+- macOS 11+ (Big Sur и выше)
+- 4 GB RAM (8 GB для больших моделей Whisper)
+- Микрофон
 
-```bash
-brew install ffmpeg
+## Структура проекта
+
 ```
-
-Python-зависимости:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+backend/     — Python FastAPI сервер
+frontend/    — Vite + TypeScript UI
+desktop/     — Electron приложение
+data/        — Рабочая директория (не коммитится)
+setup.sh     — Установка одной командой
+run.sh       — Быстрый запуск
+BUILD.sh     — Сборка Electron .app
 ```
-
-## Запуск
-
-```bash
-npm --prefix frontend install
-npm --prefix frontend run build
-python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8321
-```
-
-Открыть: http://127.0.0.1:8321
-
-## Примечания
-
-- Если `ffmpeg` не установлен, загрузите WAV 16kHz (иначе конвертация/ресемплинг не сработает).
-- Модель `large-v3` на CPU может быть очень медленной; для начала используйте `small`.

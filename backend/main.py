@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import asyncio
 import uuid
@@ -46,6 +47,8 @@ LIVE_RECOVERY_DIR = DATA_DIR / "live_recovery"
 for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Call Transcriptor")
 jobs = JobStore(max_workers=2)
@@ -336,6 +339,12 @@ def _normalize_language(value: str) -> Optional[str]:
 
 
 def _is_broken_pipe_error(exc: Exception) -> bool:
+    """Return True if the exception is a harmless broken-pipe or WebSocket shutdown race.
+
+    These errors occur when the client disconnects mid-stream (e.g., tab close,
+    network drop) and the server tries to write to a closed pipe. They are
+    transient and safe to ignore — the recording data has already been captured.
+    """
     msg = str(exc or "").lower()
     if isinstance(exc, BrokenPipeError):
         return True
@@ -373,7 +382,7 @@ def _transcribe_with_retry(
             if not _is_broken_pipe_error(e) or attempt >= retries:
                 raise
             # Short backoff before retrying transient pipe failures.
-            print(f"[transcribe retry] broken pipe on attempt {attempt + 1}, retrying...")
+            logger.warning("transcribe retry: broken pipe on attempt %d, retrying...", attempt + 1)
             time.sleep(0.35)
     if last_exc:
         raise last_exc
@@ -679,11 +688,11 @@ async def ws_transcribe(websocket: WebSocket):
         except Exception as e:
             nonlocal had_error
             if _is_broken_pipe_error(e):
-                print(f"[ws receiver] transient broken pipe: {e}")
+                logger.warning("ws receiver: transient broken pipe: %s", e)
                 stop.set()
                 return
             had_error = True
-            print(f"[ws receiver] error: {e}")
+            logger.error("ws receiver error: %s", e, exc_info=True)
             stop.set()
 
     async def transcriber():
@@ -696,11 +705,11 @@ async def ws_transcribe(websocket: WebSocket):
         except Exception as e:
             nonlocal had_error
             if _is_broken_pipe_error(e):
-                print(f"[ws transcriber] transient broken pipe: {e}")
+                logger.warning("ws transcriber: transient broken pipe: %s", e)
                 stop.set()
                 return
             had_error = True
-            print(f"[ws transcriber] error: {e}")
+            logger.error("ws transcriber error: %s", e, exc_info=True)
             stop.set()
 
     rx = asyncio.create_task(receiver())
@@ -717,7 +726,7 @@ async def ws_transcribe(websocket: WebSocket):
         stop.set()
     except Exception as e:
         if _is_broken_pipe_error(e):
-            print(f"[ws] transient broken pipe: {e}")
+            logger.warning("ws: transient broken pipe: %s", e)
             had_error = False
             stop.set()
         else:
@@ -1247,8 +1256,9 @@ def download(job_id: str, kind: str, _auth: None = Depends(_require_api_auth)):
 
 @app.get("/api/config")
 def get_config(_auth: None = Depends(_require_api_auth)):
+    # Deliberately omit config_path — we do not expose internal filesystem
+    # layout to the renderer (user explicitly requested this).
     cfg = redact_config(load_config())
-    cfg["_meta"] = {"config_path": str(CONFIG_PATH)}
     return cfg
 
 
@@ -1297,6 +1307,19 @@ def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: No
         d = Path(requested).expanduser()
         if not d.is_absolute():
             d = (_resolve_recordings_dir() / d).resolve()
+        else:
+            d = d.resolve()
+        # Safety: only allow opening the recordings dir or its subdirectories,
+        # or well-known user-accessible directories.
+        recordings_root = _resolve_recordings_dir().resolve()
+        home_dir = Path.home().resolve()
+        try:
+            d.relative_to(recordings_root)
+        except ValueError:
+            try:
+                d.relative_to(home_dir)
+            except ValueError:
+                raise HTTPException(status_code=403, detail="path outside allowed directories")
         d.mkdir(parents=True, exist_ok=True)
     else:
         d = _resolve_recordings_dir()
@@ -1477,4 +1500,4 @@ def save_recording(
     else:
         out = target_dir / _recording_filename(title)
     out.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-    return {"ok": True, "name": out.name, "path": str(out)}
+    return {"ok": True, "name": out.name}

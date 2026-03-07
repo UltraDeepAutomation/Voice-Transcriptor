@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from collections import deque
 from typing import Optional
@@ -7,6 +8,7 @@ import numpy as np
 
 from backend.transcribe import transcribe_audio
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class LiveConfig:
@@ -92,13 +94,14 @@ class LiveSession:
 
             # Skip if no audio yet or audio too short
             if audio_window.shape[0] == 0:
-                print("[live] no audio window yet, skipping transcribe")
+                logger.debug("no audio window yet, skipping transcribe")
                 return None
 
             audio_duration = audio_window.shape[0] / float(sr)
             if audio_duration < self.cfg.min_audio_sec:
-                print(
-                    f"[live] audio too short ({audio_duration:.2f}s < {self.cfg.min_audio_sec}s), skipping transcribe"
+                logger.debug(
+                    "audio too short (%.2fs < %.2fs), skipping transcribe",
+                    audio_duration, self.cfg.min_audio_sec,
                 )
                 return None
 
@@ -108,8 +111,9 @@ class LiveSession:
         # Transcribe outside the lock — offload CPU-heavy inference to thread pool
         # so the event loop stays responsive for WS I/O.
         try:
-            print(
-                f"[live] transcribing {audio_window.shape[0]} samples ({audio_window.shape[0] / sr:.2f}s)"
+            logger.info(
+                "transcribing %d samples (%.2fs)",
+                audio_window.shape[0], audio_window.shape[0] / sr,
             )
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
@@ -124,14 +128,12 @@ class LiveSession:
                     best_of=1,
                 ),
             )
-            print(
-                f"[live] transcribe result: {len(result.get('segments', []))} segments"
+            logger.info(
+                "transcribe result: %d segments",
+                len(result.get('segments', [])),
             )
         except Exception as e:
-            print(f"[live] transcribe error: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.error("transcribe error: %s", e, exc_info=True)
             return None
 
         new_segments = []
@@ -147,7 +149,7 @@ class LiveSession:
             self._last_emitted_end = max(self._last_emitted_end, g_end)
 
         if not new_segments:
-            print("[live] no new segments to emit")
+            logger.debug("no new segments to emit")
             return None
-        print(f"[live] emitting {len(new_segments)} new segments")
+        logger.info("emitting %d new segments", len(new_segments))
         return {"type": "segments", "segments": new_segments}

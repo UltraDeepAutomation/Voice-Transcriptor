@@ -1309,7 +1309,7 @@ function createOverlayHtml() {
         window.setAutoStopConfig = (enabled, seconds) => {
           const on = !!enabled;
           if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
-          const sec = Math.min(30, Math.max(1, Math.round(Number(seconds) || 2)));
+          const sec = Math.min(20, Math.max(1, Math.round(Number(seconds) || 2)));
           if (Number(quickAutoStopSecs.value) !== sec) quickAutoStopSecs.value = sec;
         };
         quickAutoStopToggle.addEventListener('change', () => {
@@ -1515,7 +1515,7 @@ function ensureOverlayWindow() {
         } catch { }
       }
       stopRecordingFromOverlay().catch((e) => {
-        console.log("[overlay] stop failed:", e?.message || e);
+        appendMainLog(`[overlay] stop failed: ${e?.message || e}`);
         overlayStopInFlight = false;
         hideRecordingOverlay();
       });
@@ -1584,7 +1584,7 @@ function ensureOverlayWindow() {
     }
     if (raw.startsWith("__overlay_autostop_secs__")) {
       const secStr = raw.replace("__overlay_autostop_secs__", "");
-      const sec = Math.min(30, Math.max(1, Math.round(Number(secStr) || 2)));
+      const sec = Math.min(20, Math.max(1, Math.round(Number(secStr) || 2)));
       overlayAutoStopConfig = { ...overlayAutoStopConfig, seconds: sec };
       lastOverlayUiInteractionAt = Date.now();
       suppressActivateUntil = Date.now() + 3000;
@@ -3065,7 +3065,7 @@ async function pasteLatestTranscriptFromShortcut() {
       if (String(pasted.reason || "").includes("no-accessibility")) {
         openPrivacyAccessibilitySettings();
       }
-      console.log("[paste-last] failed:", pasted.reason || "unknown");
+      appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
@@ -3089,8 +3089,10 @@ function fileExists(p) {
 
 function getPythonCandidates(repoRoot) {
   const fromEnv = (process.env.PYTHON || "").trim();
+  const appVenvPy = path.join(getAppVenvDir(), "bin", "python3");
   const candidates = [
     fromEnv,
+    appVenvPy,
     path.join(repoRoot, ".venv", "bin", "python3"),
     path.join(repoRoot, ".venv", "bin", "python"),
     "/opt/homebrew/bin/python3",
@@ -3188,25 +3190,109 @@ async function pickBackendPort(host, preferred = 8321) {
   });
 }
 
-async function resolvePython(repoRoot) {
-  const candidates = getPythonCandidates(repoRoot);
-  for (const py of candidates) {
-    const check = await runCommand(py, ["-c", "import sys; print(sys.executable)"], {
-      cwd: repoRoot,
-      timeoutMs: 8000
+// ── App-scoped venv (persists across app updates) ──
+function getAppVenvDir() {
+  return path.join(app.getPath("userData"), ".venv");
+}
+
+async function findSystemPython(repoRoot) {
+  // Find any working Python 3 on the system (for venv creation)
+  const sysCandidates = [
+    (process.env.PYTHON || "").trim(),
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+    "python3",
+    "python"
+  ].filter(Boolean);
+  for (const py of sysCandidates) {
+    if (py.startsWith("/") && !fileExists(py)) continue;
+    const check = await runCommand(py, ["-c", "import sys; print(sys.version_info.major)"], {
+      cwd: repoRoot, timeoutMs: 8000
     });
-    if (check.ok) {
-      const resolved = (check.stdout || "").trim() || py;
-      return resolved;
-    }
+    if (check.ok && (check.stdout || "").trim() === "3") return py;
   }
   return null;
+}
+
+async function ensureAppVenv(repoRoot) {
+  const venvDir = getAppVenvDir();
+  const venvPy = path.join(venvDir, "bin", "python3");
+
+  // If venv already exists and works, return it
+  if (fileExists(venvPy)) {
+    const check = await runCommand(venvPy, ["-c", "import sys; print(sys.executable)"], {
+      cwd: repoRoot, timeoutMs: 8000
+    });
+    if (check.ok) return venvPy;
+    // Venv is broken — delete and recreate
+    appendMainLog(`[venv] existing venv broken, recreating`);
+    try { fs.rmSync(venvDir, { recursive: true, force: true }); } catch { }
+  }
+
+  // Find a system Python to create the venv with
+  const sysPy = await findSystemPython(repoRoot);
+  if (!sysPy) return null;
+
+  appendMainLog(`[venv] creating app venv at "${venvDir}" using "${sysPy}"`);
+  const create = await runCommand(sysPy, ["-m", "venv", venvDir], {
+    cwd: repoRoot, timeoutMs: 60000
+  });
+
+  if (!create.ok) {
+    appendMainLog(`[venv] creation failed: ${(create.stderr || "").trim()}`);
+    return null;
+  }
+
+  if (fileExists(venvPy)) return venvPy;
+  return null;
+}
+
+async function resolvePython(repoRoot) {
+  // 1) Try app venv (highest priority)
+  const appVenvPy = path.join(getAppVenvDir(), "bin", "python3");
+  if (fileExists(appVenvPy)) {
+    const check = await runCommand(appVenvPy, ["-c", "import sys; print(sys.executable)"], {
+      cwd: repoRoot, timeoutMs: 8000
+    });
+    if (check.ok) return (check.stdout || "").trim() || appVenvPy;
+  }
+
+  // 2) Try dev venv (for development)
+  const devVenvPy = path.join(repoRoot, ".venv", "bin", "python3");
+  if (fileExists(devVenvPy)) {
+    const check = await runCommand(devVenvPy, ["-c", "import sys; print(sys.executable)"], {
+      cwd: repoRoot, timeoutMs: 8000
+    });
+    if (check.ok) return (check.stdout || "").trim() || devVenvPy;
+  }
+
+  // 3) Create app venv from system Python
+  setBackendBootStatus("Setting up Python environment…");
+  const created = await ensureAppVenv(repoRoot);
+  if (created) return created;
+
+  // 4) Fallback to any system Python (will need --user pip later)
+  return await findSystemPython(repoRoot);
+}
+
+let backendBootStatus = "";
+function setBackendBootStatus(msg) {
+  backendBootStatus = msg || "";
+  appendMainLog(`[backend-boot-status] ${msg}`);
+  // Broadcast to renderer if window exists
+  if (win && !win.isDestroyed() && win.webContents) {
+    win.webContents.executeJavaScript(
+      `window.__setBackendBootStatus && window.__setBackendBootStatus(${JSON.stringify(msg)});`,
+      true
+    ).catch(() => { });
+  }
 }
 
 async function ensureBackendRuntime(python, repoRoot) {
   const importCheck = await runCommand(
     python,
-    ["-c", "import fastapi, uvicorn, multipart"],
+    ["-c", "import fastapi, uvicorn, multipart, cryptography"],
     { cwd: repoRoot, timeoutMs: 12000 }
   );
 
@@ -3217,13 +3303,38 @@ async function ensureBackendRuntime(python, repoRoot) {
     return { ok: false, details: "requirements.txt not found in app resources" };
   }
 
-  const install = await runCommand(
-    python,
-    ["-m", "pip", "install", "--user", "-r", requirementsPath],
-    { cwd: repoRoot, timeoutMs: 300000 }
-  );
+  setBackendBootStatus("Installing dependencies (first launch)…");
 
-  if (!install.ok) {
+  // If Python is inside app venv, install directly (no --user needed)
+  const isAppVenv = python.startsWith(getAppVenvDir());
+  const pipArgs = ["-m", "pip", "install", "-r", requirementsPath];
+  if (!isAppVenv) {
+    pipArgs.splice(3, 0, "--user");
+  }
+
+  const install = await runCommand(python, pipArgs, {
+    cwd: repoRoot, timeoutMs: 300000
+  });
+
+  if (!install.ok && !isAppVenv) {
+    // Retry with --break-system-packages for macOS 14+ managed Python
+    appendMainLog("[backend-runtime] retrying pip with --break-system-packages");
+    const retry = await runCommand(
+      python,
+      ["-m", "pip", "install", "--user", "--break-system-packages", "-r", requirementsPath],
+      { cwd: repoRoot, timeoutMs: 300000 }
+    );
+    if (!retry.ok) {
+      return {
+        ok: false,
+        details: [
+          "Python dependencies are missing and auto-install failed.",
+          `python: ${python}`,
+          (retry.stderr || retry.stdout || "").trim()
+        ].join("\n")
+      };
+    }
+  } else if (!install.ok) {
     return {
       ok: false,
       details: [
@@ -3234,9 +3345,11 @@ async function ensureBackendRuntime(python, repoRoot) {
     };
   }
 
+  setBackendBootStatus("Verifying dependencies…");
+
   const recheck = await runCommand(
     python,
-    ["-c", "import fastapi, uvicorn, multipart"],
+    ["-c", "import fastapi, uvicorn, multipart, cryptography"],
     { cwd: repoRoot, timeoutMs: 12000 }
   );
 
@@ -3257,18 +3370,36 @@ async function ensureBackendRuntime(python, repoRoot) {
 async function startBackend() {
   if (backend) return;
   const repoRoot = getRepoRoot();
+  setBackendBootStatus("Locating Python…");
   const python = await resolvePython(repoRoot);
 
   if (!python) {
-    backendBootError = "Python 3 interpreter was not found.";
+    backendBootError = "Python 3 interpreter was not found. Please install Python 3 from python.org.";
+    setBackendBootStatus("");
+    // Broadcast error to renderer
+    if (win && !win.isDestroyed() && win.webContents) {
+      win.webContents.executeJavaScript(
+        `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+        true
+      ).catch(() => { });
+    }
     return;
   }
 
   const runtime = await ensureBackendRuntime(python, repoRoot);
   if (!runtime.ok) {
     backendBootError = runtime.details || "Backend runtime is unavailable.";
+    setBackendBootStatus("");
+    if (win && !win.isDestroyed() && win.webContents) {
+      win.webContents.executeJavaScript(
+        `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+        true
+      ).catch(() => { });
+    }
     return;
   }
+
+  setBackendBootStatus("Starting backend…");
 
   const preferredPort = Number(process.env.TRANSCRIPTOR_PORT || 8321) || 8321;
   PORT = await pickBackendPort(HOST, preferredPort);
@@ -3291,17 +3422,14 @@ async function startBackend() {
 
   backend.stdout.on("data", (d) => {
     const msg = d.toString();
-    console.log("[backend stdout]", msg);
     appendMainLog(`[backend-stdout] ${compactLogText(msg, 1400)}`);
   });
   backend.stderr.on("data", (d) => {
     const msg = d.toString();
-    console.log("[backend stderr]", msg);
     appendMainLog(`[backend-stderr] ${compactLogText(msg, 1400)}`);
   });
 
   backend.on("exit", (code) => {
-    console.log("[backend] exited with code", code);
     appendMainLog(`[backend-exit] code=${code}`);
     backend = null;
     if (!isQuitting && Number(code || 0) !== 0) {
@@ -3326,7 +3454,6 @@ async function startBackend() {
 
   backend.on("error", (err) => {
     backendBootError = err.message;
-    console.log("[backend] spawn error:", err.message);
     appendMainLog(`[backend-error] ${err.message}`);
   });
 }
@@ -3549,29 +3676,29 @@ app.whenReady().then(async () => {
       else win.webContents.openDevTools();
     });
     if (!ok) {
-      console.log("[app] failed to register devtools shortcut");
+      appendMainLog("[app] failed to register devtools shortcut");
     }
   }
 
   const recordHotkey = process.platform === "darwin" ? "Alt+Left" : "Alt+Left";
   const hotkeyOk = globalShortcut.register(recordHotkey, () => {
     toggleRecordingFromShortcut().catch((e) => {
-      console.log("[shortcut] toggle failed:", e?.message || e);
+      appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
       hideRecordingOverlay();
     });
   });
   if (!hotkeyOk) {
-    console.log("[app] failed to register recording shortcut:", recordHotkey);
+    appendMainLog(`[app] failed to register recording shortcut: ${recordHotkey}`);
   }
   const pasteLastHotkey = process.platform === "darwin" ? "Alt+Shift+7" : "Alt+Shift+7";
   const pasteLastHotkeyOk = globalShortcut.register(pasteLastHotkey, () => {
     pasteLatestTranscriptFromShortcut().catch((e) => {
-      console.log("[shortcut] paste-last failed:", e?.message || e);
+      appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
       hideRecordingOverlay();
     });
   });
   if (!pasteLastHotkeyOk) {
-    console.log("[app] failed to register paste-last shortcut:", pasteLastHotkey);
+    appendMainLog(`[app] failed to register paste-last shortcut: ${pasteLastHotkey}`);
   }
 
   await requestMacPastePermissionsOnce();

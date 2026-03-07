@@ -1,3 +1,10 @@
+"""Audio conversion utilities: WAV normalization, channel splitting, and format detection.
+
+Uses ffmpeg for format conversion when available, with a fallback to soundfile
+for WAV files that are already in the expected format (16kHz PCM_16 mono).
+"""
+
+import logging
 import os
 import shutil
 import subprocess

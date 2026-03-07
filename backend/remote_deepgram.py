@@ -7,33 +7,17 @@ Accepts raw audio bytes (WAV/MP3/etc.) as the request body.
 Deepgram bills per second — ideal for chunked processing.
 """
 
-import time
+import logging
 from typing import Any, Dict, Optional
 
-import requests
-from requests import RequestException
+from backend.http_retry import RemoteError, request_with_retry
 
+logger = logging.getLogger(__name__)
 
-class RemoteError(RuntimeError):
-    pass
-
-
+# Re-export for backward compatibility
 DeepgramRemoteError = RemoteError
 
 DEEPGRAM_API_BASE = "https://api.deepgram.com/v1"
-
-
-def _request_with_retry(method: str, url: str, retries: int = 3, **kwargs):
-    last_err = None
-    for attempt in range(retries):
-        try:
-            return requests.request(method, url, **kwargs)
-        except RequestException as e:
-            last_err = e
-            if attempt == retries - 1:
-                break
-            time.sleep(0.3 if attempt == 0 else 0.8 * attempt)
-    raise RemoteError(f"network error: {last_err}")
 
 
 def deepgram_transcribe(
@@ -81,7 +65,8 @@ def deepgram_transcribe(
         "Content-Type": content_type,
     }
 
-    r = _request_with_retry(
+    logger.info("deepgram_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
+    r = request_with_retry(
         "POST", url,
         headers=headers,
         params=params,
@@ -107,6 +92,7 @@ def deepgram_transcribe(
     except (KeyError, IndexError):
         pass
 
+    logger.info("deepgram_transcribe: success, %d chars", len(text))
     return {
         "text": str(text).strip(),
         "raw": result,

@@ -1,6 +1,7 @@
 import "./styles.css";
 
 type Provider = "local" | "openrouter" | "deepgram" | "";
+type RemoteProvider = "openrouter" | "deepgram";
 type JobStatus = "queued" | "running" | "done" | "error";
 type KeyProvider = "openrouter" | "deepgram";
 
@@ -51,6 +52,8 @@ interface AppConfig {
       auto_stop_silence_enabled?: boolean;
       auto_stop_silence_seconds?: number;
       auto_stop_silence_db?: number;
+      remote_model_openrouter?: string;
+      remote_model_deepgram?: string;
     };
   };
 }
@@ -103,6 +106,8 @@ declare global {
     __transcriptorLastFinishedRecordingId?: number;
     __transcriptorFinishedRecords?: FinishedRecordingEntry[];
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
+    __setBackendBootStatus?: (msg: string) => void;
+    __setBackendBootError?: (msg: string) => void;
   }
 }
 
@@ -211,7 +216,11 @@ let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
 let silenceStartedAtMs = 0;
 let autoStopTriggered = false;
-const MASKED_KEY_VALUE = "••••••••••••";
+const remoteModelByProvider: Record<RemoteProvider, string> = {
+  openrouter: OPENROUTER_AUDIO_MODELS[1],
+  deepgram: DEEPGRAM_AUDIO_MODELS[0],
+};
+const MASKED_KEY_VALUE = "••••••••••••••••••••••••••••••••••••••••";
 const keySavedState: Record<KeyProvider, boolean> = {
   openrouter: false,
   deepgram: false,
@@ -280,9 +289,17 @@ function markKeyMasked(provider: KeyProvider, saved: boolean): void {
   if (isSaved) {
     el.value = MASKED_KEY_VALUE;
     el.dataset.masked = "1";
+    el.readOnly = true;
+    el.tabIndex = -1;
+    el.style.cursor = "default";
+    el.style.pointerEvents = "none";
   } else {
     el.value = "";
     delete el.dataset.masked;
+    el.readOnly = false;
+    el.tabIndex = 0;
+    el.style.cursor = "";
+    el.style.pointerEvents = "";
   }
 }
 
@@ -307,11 +324,8 @@ function syncKeyActionButton(provider: KeyProvider): void {
   btn.setAttribute("aria-label", canDelete ? "Delete key" : "Save key");
 }
 
-// Auto-stop is handled exclusively by the overlay main process (desktop/main.js).
-// Removed the redundant frontend evaluateSilenceAutoStop() that was racing the overlay.
-function evaluateSilenceAutoStop(_rms: number): void {
-  // no-op: overlay is the single source of truth for auto-stop
-}
+// Auto-stop silence detection is handled exclusively by the overlay main process
+// (desktop/main.js showRecordingOverlay waveMonitor). No frontend-side auto-stop.
 
 async function parseError(r: Response): Promise<string> {
   let details = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
@@ -424,18 +438,17 @@ function encodeCompactWav(
 
 function getRemoteModelValue(provider: Provider): string {
   if (provider === "openrouter") {
-    const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
-    if (v) return v;
-    return "google/gemini-2.5-flash";
+    const v = (remoteModelByProvider.openrouter || "").trim();
+    return v || OPENROUTER_AUDIO_MODELS[1];
   }
   if (provider === "deepgram") {
-    const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
+    const v = (remoteModelByProvider.deepgram || "").trim();
     return v || DEEPGRAM_AUDIO_MODELS[0];
   }
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
-function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
+function syncRemoteModelOptions(): void {
   const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const sel = $("remoteModelSelect") as HTMLSelectElement;
   if (provider === "local" || !provider) {
@@ -451,13 +464,12 @@ function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
       opt.textContent = model;
       sel.appendChild(opt);
     });
-    sel.value = DEEPGRAM_AUDIO_MODELS[0];
+    const preferredDeepgram = (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
+    sel.value = DEEPGRAM_AUDIO_MODELS.includes(preferredDeepgram) ? preferredDeepgram : DEEPGRAM_AUDIO_MODELS[0];
+    remoteModelByProvider.deepgram = sel.value;
     return;
   }
-  const preferred =
-    (defaultOpenrouterModel || "").trim() ||
-    (($("orModel") as HTMLInputElement)?.value || "").trim() ||
-    OPENROUTER_AUDIO_MODELS[0];
+  const preferred = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1];
   const models = new Set<string>(OPENROUTER_AUDIO_MODELS);
   if (preferred) models.add(preferred);
   sel.hidden = false;
@@ -469,6 +481,7 @@ function syncRemoteModelOptions(defaultOpenrouterModel?: string): void {
     sel.appendChild(opt);
   });
   sel.value = preferred;
+  remoteModelByProvider.openrouter = sel.value;
 }
 
 async function remoteJob(
@@ -529,6 +542,8 @@ async function remoteJobSyncWithFallback(
   file: File,
   opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
 ): Promise<{ text: string; provider: string; model?: string }> {
+  // Single implementation — kept as a named function for stack trace readability
+  // and to provide a single place for future fallback/retry logic.
   return remoteJobSync(file, opts);
 }
 
@@ -558,7 +573,7 @@ function providerKeyErrorMessage(provider: Provider): string {
 async function localJob(
   file: File,
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean }
-): Promise<any> {
+): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("language", opts.language || "auto");
@@ -716,22 +731,42 @@ async function loadMics(forceReload = false): Promise<void> {
 
 const canvas = $("waveCanvas") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
-let waveBars: number[] = [];
+
+// --- Ring buffer for waveform bars (avoids GC-heavy Array.slice) ---
+const WAVE_BUF_CAP = 512;
+const waveBuf = new Float32Array(WAVE_BUF_CAP);
+let waveBufHead = 0;
+let waveBufLen = 0;
 let maxBars = 0;
 let waveAnimId = 0;
 const BAR_W = 3;
 const BAR_GAP = 2;
 const WAVE_PUSH_EVERY_FRAMES = 5;
 let waveFrameCount = 0;
+let waveDirty = false;
+
+function waveBarAt(reverseIdx: number): number {
+  const idx = (waveBufHead - 1 - reverseIdx + WAVE_BUF_CAP) % WAVE_BUF_CAP;
+  return waveBuf[idx];
+}
+
+function wavePush(v: number): void {
+  waveBuf[waveBufHead] = v;
+  waveBufHead = (waveBufHead + 1) % WAVE_BUF_CAP;
+  if (waveBufLen < WAVE_BUF_CAP) waveBufLen++;
+  waveDirty = true;
+}
+
+function waveClear(): void {
+  waveBufHead = 0;
+  waveBufLen = 0;
+}
 
 function resize(): void {
   const r = (canvas.parentElement as HTMLElement).getBoundingClientRect();
   canvas.width = r.width;
   canvas.height = r.height;
   maxBars = Math.max(32, Math.floor(r.width / (BAR_W + BAR_GAP)) + 4);
-  if (waveBars.length > maxBars) {
-    waveBars = waveBars.slice(-maxBars);
-  }
   draw();
 }
 new ResizeObserver(resize).observe(canvas.parentElement as Element);
@@ -742,7 +777,7 @@ function draw(): void {
   const H = canvas.height;
   ctx.clearRect(0, 0, W, H);
   const mid = H / 2;
-  if (waveBars.length === 0) {
+  if (waveBufLen === 0) {
     ctx.strokeStyle = "#333";
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -752,9 +787,9 @@ function draw(): void {
     return;
   }
 
-  const count = Math.min(maxBars, waveBars.length);
+  const count = Math.min(maxBars, waveBufLen);
   for (let i = 0; i < count; i++) {
-    const v = waveBars[waveBars.length - 1 - i];
+    const v = waveBarAt(i);
     const x = W - (i + 1) * (BAR_W + BAR_GAP);
     if (x < 0) break;
 
@@ -766,6 +801,23 @@ function draw(): void {
     ctx.fillStyle = "rgba(210,210,210,0.7)";
     ctx.fillRect(x, y + h * 0.15, BAR_W, h * 0.7);
   }
+  waveDirty = false;
+}
+
+// --- rAF-driven render loop (decoupled from data collection) ---
+let waveLoopRunning = false;
+function waveLoop(): void {
+  if (!waveLoopRunning) return;
+  if (waveDirty) draw();
+  requestAnimationFrame(waveLoop);
+}
+function startWaveLoop(): void {
+  if (waveLoopRunning) return;
+  waveLoopRunning = true;
+  requestAnimationFrame(waveLoop);
+}
+function stopWaveLoop(): void {
+  waveLoopRunning = false;
 }
 
 let vu = 0;
@@ -871,6 +923,8 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_stop_silence_enabled: silence.enabled,
     auto_stop_silence_seconds: silence.seconds,
     auto_stop_silence_db: silence.thresholdDb,
+    remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1],
+    remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0],
   };
 }
 
@@ -1006,7 +1060,8 @@ function queueUiPreferencesSave(): void {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
     const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
-    const openrouterModel = (($("orModel") as HTMLInputElement).value || "").trim();
+    const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+    ($("orModel") as HTMLInputElement).value = openrouterModel;
     void apiPost<{ ok: boolean }>("/api/config", {
       preferences: {
         recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
@@ -1032,14 +1087,12 @@ async function loadCfg(): Promise<void> {
     keyInput("deepgram").placeholder = "DEEPGRAM_API_KEY";
     syncKeyActionButton("openrouter");
     syncKeyActionButton("deepgram");
-    const cfgPathLabel = document.getElementById("configPathLabel");
-    if (cfgPathLabel) {
-      cfgPathLabel.textContent = "Config: " + (((cfg._meta || {}).config_path as string) || "-");
-    }
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     ($("recordingsDirInput") as HTMLInputElement).value = (cfg.preferences || {}).recordings_dir || "";
     const ui = (cfg.preferences || {}).ui || {};
+    remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+    remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEEPGRAM_AUDIO_MODELS[0] || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
     const languageSel = $("language") as HTMLSelectElement;
     const providerSel = $("providerSelect") as HTMLSelectElement;
     const quickProviderSel = $("quickProviderSelect") as HTMLSelectElement;
@@ -1083,10 +1136,12 @@ async function loadCfg(): Promise<void> {
     setAutoSendEnterEnabled(ui.auto_send_enter === true);
     pendingUpscalePresetId = String(ui.upscale_preset || "").trim();
     preferredMicId = String(ui.mic_id || "").trim();
-    syncRemoteModelOptions(cfgOpenrouterModel);
+    syncRemoteModelOptions();
     const remoteSel = $("remoteModelSelect") as HTMLSelectElement;
-    if (providerSel.value === "openrouter" && cfgOpenrouterModel) {
-      remoteSel.value = cfgOpenrouterModel;
+    if (providerSel.value === "openrouter") {
+      remoteSel.value = getRemoteModelValue("openrouter");
+    } else if (providerSel.value === "deepgram") {
+      remoteSel.value = getRemoteModelValue("deepgram");
     }
     await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
@@ -1265,7 +1320,8 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
     });
 });
 ($("orModel") as HTMLInputElement).addEventListener("change", () => {
-  syncRemoteModelOptions(($("orModel") as HTMLInputElement).value.trim());
+  remoteModelByProvider.openrouter = (($("orModel") as HTMLInputElement).value || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+  syncRemoteModelOptions();
   queueUiPreferencesSave();
 });
 $("pickRecordingsDirBtn").addEventListener("click", () =>
@@ -1533,8 +1589,8 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
     $("recordingContent").textContent = `Deleted ${data.deleted} recording(s).`;
     $("recordingMeta").textContent = "";
     await loadRecordings(true);
-  } catch (e: any) {
-    $("recordingContent").textContent = `Delete failed: ${e.message}`;
+  } catch (e: unknown) {
+    $("recordingContent").textContent = `Delete failed: ${(e as Error).message}`;
   } finally {
     ($("deleteAllModal") as HTMLElement).hidden = true;
   }
@@ -1588,8 +1644,13 @@ function shouldLivePreview(): boolean {
 });
 ($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
   const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
-  if (v && (($("providerSelect") as HTMLSelectElement).value || "local") === "openrouter") {
+  const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  if (v && provider === "openrouter") {
+    remoteModelByProvider.openrouter = v;
     ($("orModel") as HTMLInputElement).value = v;
+  }
+  if (v && provider === "deepgram") {
+    remoteModelByProvider.deepgram = v;
   }
   queueUiPreferencesSave();
 });
@@ -1793,6 +1854,16 @@ function pushCapturedFrame(input: Float32Array): void {
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
   chunks.push(new Float32Array(ds));
+  // Enterprise memory management: consolidate fragments periodically to avoid
+  // GC pressure and O(n) merge cost at stop time for long recordings.
+  if (chunks.length > 500) {
+    const total = chunks.reduce((a, c) => a + c.length, 0);
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    chunks.length = 0;
+    chunks.push(merged);
+  }
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const pcm = new ArrayBuffer(ds.length * 2);
   const dv = new DataView(pcm);
@@ -1959,17 +2030,15 @@ async function startLive(): Promise<void> {
       }
       const rms = Math.sqrt(sum / buf.length);
       setVU(rms);
-      evaluateSilenceAutoStop(rms);
 
       waveFrameCount += 1;
       if (waveFrameCount % WAVE_PUSH_EVERY_FRAMES === 0) {
         const level = Math.min(1, rms * UI_TOKENS.capture.waveformMixRms + peak * UI_TOKENS.capture.waveformMixPeak);
-        waveBars.push(level);
-        if (waveBars.length > maxBars) waveBars = waveBars.slice(-maxBars);
+        wavePush(level);
       }
-      draw();
     };
     vuIntervalId = setInterval(tick, 100);
+    startWaveLoop();
 
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
       const input = ev.data;
@@ -2120,7 +2189,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   window.__transcriptorCurrentRecordingId = 0;
   setRecordButton(false);
   waveFrameCount = 0;
-  waveBars = [];
+  waveClear();
+  stopWaveLoop();
   draw();
   resetVU();
 
@@ -2547,3 +2617,15 @@ syncMode();
 setStatus("Idle");
 setRecordButton(false);
 updateRecordingCopyState();
+
+// ── Backend boot status / error display ──
+window.__setBackendBootStatus = (msg: string) => {
+  if (msg) {
+    setStatus(msg);
+  }
+};
+window.__setBackendBootError = (msg: string) => {
+  setStatus("Backend Error");
+  ($("statusDot") as HTMLElement).className = "status-dot error";
+  $("liveOutput").textContent = msg || "Backend failed to start.";
+};

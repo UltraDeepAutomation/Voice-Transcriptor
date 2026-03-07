@@ -1,10 +1,13 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
 echo "=== Building Transcriptor App ==="
+
+# Clean stale build artifacts to prevent duplicate Spotlight entries
+rm -rf desktop/dist/mac desktop/dist/mac-arm64 2>/dev/null || true
 
 cd desktop
 
@@ -56,6 +59,13 @@ fi
 
 echo "Installing to $INSTALL_ROOT..."
 cp -R "$APP_PATH" "$INSTALL_ROOT/"
+
+# Clean build artifacts to prevent duplicate Spotlight entries
+echo "Cleaning build artifacts..."
+rm -rf dist/mac dist/mac-arm64 2>/dev/null
+
+# Remove quarantine for unsigned apps
+xattr -rd com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
 
 echo "=== Done! ==="
 echo "Installed app: $TARGET_APP"

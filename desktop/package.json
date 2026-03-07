@@ -1,6 +1,8 @@
 {
   "name": "transcriptor",
   "version": "1.0.0",
+  "description": "Voice-to-text transcription with auto-paste for macOS",
+  "author": "Transcriptor",
   "private": true,
   "main": "main.js",
   "scripts": {
@@ -25,17 +27,20 @@
       {
         "from": "../backend",
         "to": "backend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/.ruff_cache/**"
+        ]
       },
       {
         "from": "../frontend/dist",
         "to": "frontend",
-        "filter": ["**/*", "!**/*.map"]
-      },
-      {
-        "from": "../data",
-        "to": "data",
-        "filter": ["config.json"]
+        "filter": [
+          "**/*",
+          "!**/*.map"
+        ]
       },
       {
         "from": "../requirements.txt",
@@ -44,10 +49,19 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "icon.png",
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
       "hardenedRuntime": false,
       "identity": null,
       "target": [
-        { "target": "dir", "arch": ["arm64", "x64"] }
+        {
+          "target": "dir",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ]
     }
   }
