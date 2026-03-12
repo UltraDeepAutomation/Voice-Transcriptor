@@ -3552,7 +3552,7 @@ async function createWindow(options = {}) {
     if (!backend) {
       await startBackend();
     }
-    await waitForHttp(`${BASE_URL}/api/health`, 20000);
+    await waitForHttp(`${BASE_URL}/api/health`, 120_000);
     await win.loadURL(url);
     if (showWindow) {
       win.show();
@@ -3562,7 +3562,6 @@ async function createWindow(options = {}) {
     const details = [
       err.message,
       backendBootError,
-      `resources: ${getRepoRoot()}`
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -3570,13 +3569,30 @@ async function createWindow(options = {}) {
     await win.loadURL(
       `data:text/html,${encodeURIComponent(`
       <html>
-        <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system;padding:28px;line-height:1.5">
-          <h2 style="margin:0 0 12px 0">Transcriptor backend startup error</h2>
-          <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333">${escapeHtml(details)}</pre>
+        <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system;padding:28px;line-height:1.6">
+          <h2 style="margin:0 0 16px 0">Transcriptor — Backend startup failed</h2>
+          <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333;margin-bottom:20px">${escapeHtml(details)}</pre>
+          <div id="status" style="padding:10px 14px;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:16px;color:#7defa0;font-size:13px">⏳ Checking if backend is starting...</div>
+          <h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>
+          <p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>
+          <p style="color:#ddd;margin:8px 0"><b>→ Right-click</b> on <code style="background:#333;padding:2px 6px;border-radius:4px">setup.command</code> → <b>Open</b> → <b>Open</b></p>
+          <p style="color:#666;font-size:12px;margin:12px 0 4px">Or paste in Terminal:</p>
+          <pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">bash ~/Downloads/Voice\\\\ Transcriptor/setup.command</pre>
+          <script>
+            let attempt = 0;
+            function checkHealth() {
+              attempt++;
+              const s = document.getElementById('status');
+              s.textContent = '⏳ Waiting for backend... (attempt ' + attempt + ')';
+              fetch('${BASE_URL}/api/health', { signal: AbortSignal.timeout(3000) })
+                .then(r => { if (r.ok) { s.textContent = '✅ Backend is up! Reloading...'; s.style.background='#1a3a1a'; s.style.borderColor='#2a6a2a'; setTimeout(() => location.reload(), 500); } else { setTimeout(checkHealth, 3000); } })
+                .catch(() => setTimeout(checkHealth, 3000));
+            }
+            checkHealth();
+          </script>
         </body>
       </html>
-    `)}
-    `
+    `)}`
     );
   }
 }

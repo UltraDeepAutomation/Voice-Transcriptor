@@ -741,7 +741,8 @@ let maxBars = 0;
 let waveAnimId = 0;
 const BAR_W = 3;
 const BAR_GAP = 2;
-const WAVE_PUSH_EVERY_FRAMES = 5;
+const WAVE_METER_INTERVAL_MS = 50;
+const WAVE_PUSH_EVERY_FRAMES = 2;
 let waveFrameCount = 0;
 let waveDirty = false;
 
@@ -2037,7 +2038,7 @@ async function startLive(): Promise<void> {
         wavePush(level);
       }
     };
-    vuIntervalId = setInterval(tick, 100);
+    vuIntervalId = setInterval(tick, WAVE_METER_INTERVAL_MS);
     startWaveLoop();
 
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {

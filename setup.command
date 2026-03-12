@@ -30,6 +30,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT_DIR="$(pwd)"
 
+# ── Auto-remove quarantine from ALL project files (fixes Gatekeeper blocks) ──
+xattr -cr "$ROOT_DIR" 2>/dev/null || true
+chmod +x "$ROOT_DIR/setup.command" "$ROOT_DIR/run.command" "$ROOT_DIR/BUILD.sh" 2>/dev/null || true
+
 echo -e "${BOLD}"
 echo "  ╔══════════════════════════════════════╗"
 echo "  ║     Transcriptor — macOS Setup       ║"
@@ -57,6 +61,8 @@ else
   print_warn "Homebrew not found — installing..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   print_ok "Homebrew installed"
+  echo -e "  ${YELLOW}TIP: If brew is not in PATH in new terminals, add to ~/.zprofile:${NC}"
+  echo -e "  ${YELLOW}  eval \"\$($(brew --prefix 2>/dev/null || echo /opt/homebrew)/bin/brew shellenv)\"${NC}"
 fi
 
 # Ensure Homebrew is in PATH for this session (Apple Silicon vs Intel)
@@ -146,8 +152,12 @@ fi
 VENV_PY="$APP_VENV/bin/python3"
 VENV_PIP="$APP_VENV/bin/pip"
 
+print_step "Upgrading pip..."
+"$VENV_PIP" install --upgrade pip --quiet 2>&1 | tail -3
+print_ok "pip upgraded"
+
 print_step "Installing Python dependencies into venv..."
-"$VENV_PIP" install -r "$ROOT_DIR/requirements.txt" --quiet 2>&1
+"$VENV_PIP" install -r "$ROOT_DIR/requirements.txt" --quiet
 # Verify critical imports
 "$VENV_PY" -c "import fastapi, uvicorn, cryptography" 2>/dev/null \
   && print_ok "Python packages installed and verified" \
@@ -188,6 +198,13 @@ done
 
 if [ -z "$APP_PATH" ]; then
   print_fail "Could not find built app — check build output above"
+fi
+# Verify app bundle structure
+if [ ! -f "$APP_PATH/Contents/Resources/backend/main.py" ]; then
+  print_warn "App bundle may be incomplete — backend/main.py not found inside .app"
+fi
+if [ ! -f "$APP_PATH/Contents/Resources/frontend/index.html" ]; then
+  print_warn "App bundle may be incomplete — frontend/index.html not found inside .app"
 fi
 print_ok "App built: $APP_PATH"
 

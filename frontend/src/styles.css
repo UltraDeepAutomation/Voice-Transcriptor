@@ -510,27 +510,34 @@ input:focus {
 }
 
 .top-item-stop .mic-btn::before {
-  width: 12px;
-  height: 12px;
+  width: 10px;
+  height: 10px;
   border: 0;
-  border-radius: 2px;
-  background: #f5f5f5;
+  border-radius: 50%;
+  background: #d36d6d;
   background-image: none;
 }
 
 .top-item-stop .mic-btn {
-  border-color: #6e3232;
-  background: linear-gradient(180deg, #3f2121, #321919);
+  border-color: var(--line-2);
+  background: var(--bg-7);
 }
 
 .top-item-stop .mic-btn:hover {
-  border-color: #954444;
-  background: linear-gradient(180deg, #492626, #3a1d1d);
+  border-color: #7a7a7a;
+  background: #2b2b2b;
 }
 
 .top-item-stop .mic-btn.recording {
   border-color: #ad5151;
   background: linear-gradient(180deg, #582b2b, #432020);
+}
+
+.top-item-stop .mic-btn.recording::before {
+  width: 9px;
+  height: 9px;
+  border-radius: 1px;
+  background: #f3f3f3;
 }
 
 .mic-btn::before {
@@ -596,7 +603,7 @@ input:focus {
   align-items: stretch;
   justify-content: flex-start;
   border-bottom: 1px solid var(--line);
-  min-height: 72px;
+  min-height: 0;
   padding: 0;
   background: var(--bg-4);
   flex-shrink: 0;
@@ -611,7 +618,7 @@ input:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 34px;
+  min-height: 32px;
   padding: 6px 12px;
   gap: 8px;
 }
@@ -621,7 +628,7 @@ input:focus {
 }
 
 .pane-head-row-bottom {
-  min-height: 36px;
+  min-height: 38px;
 }
 
 .pane-title {
@@ -673,15 +680,9 @@ input:focus {
 #resultPane .pane-head-row-bottom .pane-actions {
   width: 100%;
   justify-content: flex-start;
-  flex-wrap: nowrap;
-  gap: 5px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-}
-
-#resultPane .pane-head-row-bottom .pane-actions::-webkit-scrollbar {
-  display: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  overflow: visible;
 }
 
 #resultPane .check-inline {
@@ -696,15 +697,9 @@ input:focus {
 #upscalePane .pane-head-row-bottom .pane-actions {
   width: 100%;
   justify-content: flex-start;
-  gap: 5px;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-}
-
-#upscalePane .pane-head-row-bottom .pane-actions::-webkit-scrollbar {
-  display: none;
+  gap: 6px;
+  flex-wrap: wrap;
+  overflow: visible;
 }
 
 #upscalePresetSelect {
@@ -805,6 +800,7 @@ input:focus {
 #providerSelect {
   min-width: 80px;
   max-width: 104px;
+  flex: 0 1 auto;
   text-overflow: ellipsis;
   overflow: hidden;
   background-color: var(--accent-strong-bg);
@@ -814,6 +810,7 @@ input:focus {
 #remoteModelSelect {
   min-width: 94px;
   max-width: 124px;
+  flex: 0 1 auto;
   text-overflow: ellipsis;
   overflow: hidden;
   background-color: var(--accent-soft-bg);
