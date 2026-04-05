@@ -14,6 +14,7 @@
         <button class="sb-item active" data-view="record">Record</button>
         <button class="sb-item" data-view="recordings">Recordings</button>
         <button class="sb-item" data-view="settings">Settings</button>
+        <button class="sb-item" data-view="graph">Graph</button>
       </div>
     </nav>
 
@@ -291,6 +292,25 @@
         </div>
       </section>
 
+      <section class="view" data-view="graph" hidden>
+        <div class="graph-container" id="graphContainer">
+          <canvas id="graphCanvas"></canvas>
+          <div class="graph-controls">
+            <button class="graph-ctrl-btn" id="graphZoomIn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+            <button class="graph-ctrl-btn" id="graphZoomOut" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+            <button class="graph-ctrl-btn" id="graphZoomReset" type="button" title="Reset view" aria-label="Reset view">⟲</button>
+          </div>
+          <div class="graph-tooltip" id="graphTooltip" hidden>
+            <span class="graph-tooltip-title" id="graphTooltipTitle"></span>
+            <span class="graph-tooltip-meta" id="graphTooltipMeta"></span>
+            <span class="graph-tooltip-preview" id="graphTooltipPreview"></span>
+          </div>
+          <div class="graph-info" id="graphInfo">
+            <span class="graph-info-text" id="graphInfoText">0 recordings</span>
+          </div>
+        </div>
+      </section>
+
       <section class="view" data-view="settings" hidden>
         <div class="settings">
           <div class="card">
@@ -339,6 +359,24 @@
             <div class="btn-row">
               <button class="btn btn-ghost" id="pickRecordingsDirBtn" type="button">Choose Folder</button>
               <button class="btn btn-ghost" id="openRecordingsDirBtn" type="button">Open Folder</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Keyboard Shortcuts</h2>
+            <p class="hint">Click a shortcut to record a new combination. Press Esc to cancel.</p>
+            <div class="field-stack">
+              <label class="field">
+                <span class="lbl">Record Toggle</span>
+                <button class="shortcut-btn" id="shortcutRecord" type="button" data-shortcut-id="record">
+                  <span class="shortcut-keys">⌥ ←</span>
+                </button>
+              </label>
+              <label class="field">
+                <span class="lbl">Paste Last Transcript</span>
+                <button class="shortcut-btn" id="shortcutPaste" type="button" data-shortcut-id="paste">
+                  <span class="shortcut-keys">⌥ ⇧ 7</span>
+                </button>
+              </label>
             </div>
           </div>
         </div>

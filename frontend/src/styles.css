@@ -1128,6 +1128,7 @@ input:focus {
   padding: 10px 12px;
   cursor: pointer;
   margin-bottom: 8px;
+  transition: border-color var(--dur-base) ease, background var(--dur-base) ease, color var(--dur-base) ease;
 }
 
 .recording-item:hover {
@@ -1140,17 +1141,34 @@ input:focus {
   color: var(--text);
 }
 
-.recording-item .title {
+.recording-item .rec-title {
   display: block;
   font-size: 12px;
   font-weight: 600;
   margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.recording-item .meta {
+.recording-item .rec-meta {
   display: block;
   font-size: 10px;
   color: var(--text-3);
+}
+
+.recording-item .rec-provider {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  background: var(--bg-9);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 4px;
+  vertical-align: middle;
 }
 
 .recordings-viewer {
@@ -1491,6 +1509,60 @@ input:focus {
   width: 100%;
 }
 
+/* ── Shortcut picker button ─────────────────────────────────────────── */
+.shortcut-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  min-width: 90px;
+  min-height: 34px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+  user-select: none;
+}
+
+.shortcut-btn:hover {
+  background: var(--hover);
+  border-color: var(--accent);
+}
+
+.shortcut-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.shortcut-btn.recording {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+  animation: shortcut-pulse 1.2s ease-in-out infinite;
+}
+
+.shortcut-btn.recording .shortcut-keys {
+  color: var(--accent);
+  opacity: 1;
+}
+
+@keyframes shortcut-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.20); }
+  50% { box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.35); }
+}
+
+.shortcut-keys {
+  font-family: "SF Mono", "Menlo", "Monaco", monospace;
+  font-size: 12.5px;
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
 .pane,
 .pane-actions,
 select,
@@ -1564,4 +1636,122 @@ canvas,
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-hover);
+}
+
+/* ── Graph Tab ───────────────────────────────────────────── */
+
+.graph-container {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+#graphCanvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  will-change: transform;
+}
+
+#graphCanvas:active {
+  cursor: grabbing;
+}
+
+.graph-controls {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 10;
+}
+
+.graph-ctrl-btn {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--dur-base), border-color var(--dur-base);
+  -webkit-app-region: no-drag;
+}
+
+.graph-ctrl-btn:hover {
+  background: var(--bg-9);
+  border-color: var(--line-4);
+}
+
+.graph-ctrl-btn:active {
+  transform: scale(0.95);
+}
+
+.graph-tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 20;
+  background: rgba(34, 34, 34, 0.92);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  max-width: 280px;
+  box-shadow: var(--shadow-popover);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.graph-tooltip-title {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph-tooltip-meta {
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.graph-tooltip-preview {
+  font-size: 11px;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.4;
+}
+
+.graph-info {
+  position: absolute;
+  bottom: 14px;
+  left: 14px;
+  z-index: 10;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+}
+
+.graph-info-text {
+  font-size: 10px;
+  color: var(--text-3);
+  letter-spacing: 0.06em;
+  font-weight: 600;
 }

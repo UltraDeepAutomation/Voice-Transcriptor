@@ -54,6 +54,8 @@ interface AppConfig {
       auto_stop_silence_db?: number;
       remote_model_openrouter?: string;
       remote_model_deepgram?: string;
+      shortcut_record?: string;
+      shortcut_paste?: string;
     };
   };
 }
@@ -63,6 +65,8 @@ interface RecordingItem {
   display_name: string;
   modified_at: string;
   size_bytes: number;
+  provider: string;
+  language: string;
 }
 
 interface RecordingsStats {
@@ -151,8 +155,8 @@ const UI_TOKENS = {
     fastInitialWaitMs: 50,
     fastMaxWaitMs: 180,
     fastGrowth: 1.06,
-    remoteChunkSettleWaitMs: 200,
-    remoteChunkSettleTimeoutMs: 8_000,
+    remoteChunkSettleWaitMs: 150,
+    remoteChunkSettleTimeoutMs: 3_000,
   },
   draft: {
     autosaveIntervalMs: 1_200,
@@ -168,7 +172,7 @@ const UI_TOKENS = {
   },
   capture: {
     fallbackInitDelayMs: 1_300,
-    chunkIntervalMs: 8_000,
+    chunkIntervalMs: 4_000,
     chunkMinNewSamples: AUDIO_TOKENS.liveSampleRateHz, // 1 sec @ live sample rate
     tailMinSamples: Math.floor(AUDIO_TOKENS.liveSampleRateHz / 10), // 0.1 sec @ live sample rate
     vuAmplify: 4,
@@ -204,6 +208,8 @@ const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
 
 let isBusy = false;
 let isRecording = false;
+let mediaRecorder: MediaRecorder | null = null;
+let recordedWebmChunks: Blob[] = [];
 let isNetworkOnline = true;
 let hasOpenrouterKey = false;
 let hasDeepgramKey = false;
@@ -681,9 +687,12 @@ document.querySelectorAll(".sb-item").forEach((e) => {
     const v = (e as HTMLElement).dataset.view;
     document.querySelectorAll(".view").forEach((el) => ((el as HTMLElement).hidden = (el as HTMLElement).dataset.view !== v));
     document.querySelectorAll(".sb-item").forEach((el) => el.classList.toggle("active", (el as HTMLElement).dataset.view === v));
-    $("windowViewLabel").textContent = v === "settings" ? "Settings" : v === "recordings" ? "Recordings" : "Record";
+    $("windowViewLabel").textContent = v === "settings" ? "Settings" : v === "recordings" ? "Recordings" : v === "graph" ? "Graph" : "Record";
     if (v === "recordings") {
       void loadRecordings(false);
+    }
+    if (v === "graph") {
+      void loadGraphData();
     }
   });
 });
@@ -926,6 +935,137 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_stop_silence_db: silence.thresholdDb,
     remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1],
     remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0],
+    shortcut_record: currentShortcuts.record,
+    shortcut_paste: currentShortcuts.paste,
+  };
+}
+
+// ── Keyboard Shortcut Picker ────────────────────────────────────────────────
+
+const DEFAULT_SHORTCUTS = { record: "Alt+Left", paste: "Alt+Shift+7" };
+let currentShortcuts = { ...DEFAULT_SHORTCUTS };
+let activeShortcutBtn: HTMLButtonElement | null = null;
+
+/** Convert Electron accelerator string → human-readable macOS symbols */
+function acceleratorToDisplay(acc: string): string {
+  if (!acc) return "—";
+  const parts = acc.split("+");
+  const symbols: string[] = [];
+  for (const p of parts) {
+    const lc = p.trim().toLowerCase();
+    if (lc === "command" || lc === "cmd" || lc === "meta" || lc === "super") { symbols.push("⌘"); continue; }
+    if (lc === "control" || lc === "ctrl" || lc === "commandorcontrol" || lc === "cmdorctrl") { symbols.push("⌃"); continue; }
+    if (lc === "alt" || lc === "option") { symbols.push("⌥"); continue; }
+    if (lc === "shift") { symbols.push("⇧"); continue; }
+    // Arrow keys
+    if (lc === "left" || lc === "arrowleft") { symbols.push("←"); continue; }
+    if (lc === "right" || lc === "arrowright") { symbols.push("→"); continue; }
+    if (lc === "up" || lc === "arrowup") { symbols.push("↑"); continue; }
+    if (lc === "down" || lc === "arrowdown") { symbols.push("↓"); continue; }
+    if (lc === "space") { symbols.push("␣"); continue; }
+    if (lc === "enter" || lc === "return") { symbols.push("↩"); continue; }
+    if (lc === "backspace" || lc === "delete") { symbols.push("⌫"); continue; }
+    if (lc === "tab") { symbols.push("⇥"); continue; }
+    if (lc === "escape" || lc === "esc") { symbols.push("⎋"); continue; }
+    symbols.push(p.trim().toUpperCase());
+  }
+  return symbols.join(" ");
+}
+
+/** Convert KeyboardEvent → Electron accelerator string */
+function keyEventToAccelerator(e: KeyboardEvent): string | null {
+  // Must have at least one modifier
+  if (!e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) return null;
+  // Ignore standalone modifier keys
+  if (["Alt", "Control", "Meta", "Shift"].includes(e.key)) return null;
+
+  const parts: string[] = [];
+  if (e.ctrlKey || e.metaKey) parts.push("CommandOrControl");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey) parts.push("Shift");
+
+  // Map the key
+  const key = e.key;
+  if (key === "ArrowLeft") parts.push("Left");
+  else if (key === "ArrowRight") parts.push("Right");
+  else if (key === "ArrowUp") parts.push("Up");
+  else if (key === "ArrowDown") parts.push("Down");
+  else if (key === " ") parts.push("Space");
+  else if (key === "Enter") parts.push("Enter");
+  else if (key === "Backspace") parts.push("Backspace");
+  else if (key === "Delete") parts.push("Delete");
+  else if (key === "Tab") parts.push("Tab");
+  else if (key.length === 1) parts.push(key.toUpperCase());
+  else parts.push(key);
+
+  return parts.join("+");
+}
+
+function updateShortcutDisplay(btnId: string, accelerator: string): void {
+  const btn = document.getElementById(btnId) as HTMLButtonElement | null;
+  if (!btn) return;
+  const keysSpan = btn.querySelector(".shortcut-keys");
+  if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
+}
+
+function startShortcutRecording(btn: HTMLButtonElement): void {
+  // Cancel any existing recording
+  stopShortcutRecording(false);
+  activeShortcutBtn = btn;
+  btn.classList.add("recording");
+  const keysSpan = btn.querySelector(".shortcut-keys");
+  if (keysSpan) keysSpan.textContent = "Press keys...";
+  // Add global keydown listener
+  document.addEventListener("keydown", handleShortcutKeydown, true);
+}
+
+function stopShortcutRecording(restoreDisplay: boolean): void {
+  if (!activeShortcutBtn) return;
+  activeShortcutBtn.classList.remove("recording");
+  if (restoreDisplay) {
+    const id = activeShortcutBtn.dataset.shortcutId;
+    const acc = id === "record" ? currentShortcuts.record : currentShortcuts.paste;
+    const keysSpan = activeShortcutBtn.querySelector(".shortcut-keys");
+    if (keysSpan) keysSpan.textContent = acceleratorToDisplay(acc);
+  }
+  document.removeEventListener("keydown", handleShortcutKeydown, true);
+  activeShortcutBtn = null;
+}
+
+function handleShortcutKeydown(e: KeyboardEvent): void {
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+
+  if (e.key === "Escape") {
+    stopShortcutRecording(true);
+    return;
+  }
+
+  const accelerator = keyEventToAccelerator(e);
+  if (!accelerator) return; // Still pressing only modifiers
+
+  if (!activeShortcutBtn) return;
+  const id = activeShortcutBtn.dataset.shortcutId;
+  if (id === "record") {
+    currentShortcuts.record = accelerator;
+  } else if (id === "paste") {
+    currentShortcuts.paste = accelerator;
+  }
+
+  // Update display
+  const keysSpan = activeShortcutBtn.querySelector(".shortcut-keys");
+  if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
+
+  stopShortcutRecording(false);
+
+  // Persist to config
+  queueUiPreferencesSave();
+
+  // Signal the Electron main process to reload shortcuts
+  (window as any).__transcriptorPendingShortcuts = {
+    record: currentShortcuts.record,
+    paste: currentShortcuts.paste,
   };
 }
 
@@ -1146,6 +1286,11 @@ async function loadCfg(): Promise<void> {
     }
     await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
+    // Load keyboard shortcuts
+    if (ui.shortcut_record) currentShortcuts.record = ui.shortcut_record;
+    if (ui.shortcut_paste) currentShortcuts.paste = ui.shortcut_paste;
+    updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
+    updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
   } catch {
     try {
       await loadUpscalePresets("builtin_clean");
@@ -1344,6 +1489,16 @@ $("openRecordingsDirBtn").addEventListener("click", () =>
     })
 );
 
+// ── Shortcut picker click listeners ─────────────────────────────────────────
+$("shortcutRecord").addEventListener("click", (e) => {
+  e.preventDefault();
+  startShortcutRecording($("shortcutRecord") as HTMLButtonElement);
+});
+$("shortcutPaste").addEventListener("click", (e) => {
+  e.preventDefault();
+  startShortcutRecording($("shortcutPaste") as HTMLButtonElement);
+});
+
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";
 let recordingsStatsOpen = true;
@@ -1422,9 +1577,10 @@ function renderRecordingsList(): void {
     const btn = document.createElement("button");
     btn.className = "recording-item" + (it.name === selectedRecordingName ? " active" : "");
     btn.type = "button";
-    btn.innerHTML = `<span class="title">${it.display_name}</span><span class="meta">${fmtDateTime(it.modified_at)} · ${Math.round(
+    const providerBadge = it.provider && it.provider !== "unknown" ? `<span class="rec-provider">${it.provider}</span>` : "";
+    btn.innerHTML = `<span class="rec-title">${it.display_name}</span><span class="rec-meta">${fmtDateTime(it.modified_at)} · ${Math.round(
       it.size_bytes / 1024
-    )} KB</span>`;
+    )} KB${providerBadge ? " · " + providerBadge : ""}</span>`;
     btn.onclick = () => void openRecording(it.name);
     list.appendChild(btn);
   });
@@ -1708,6 +1864,8 @@ let scriptNode: ScriptProcessorNode | null = null;
 let scriptSinkGain: GainNode | null = null;
 let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
+let chunkSubmitTimer: number | null = null;
+let chunkAbortController: AbortController | null = null;
 let startAt = 0;
 let chunks: Float32Array[] = [];
 let draftSaveTimer: number | null = null;
@@ -1719,68 +1877,7 @@ let capturePeakMax = 0;
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 
-// ── Chunked transcription pipeline ──────────────────────────────────────────
-// During recording with a remote provider, we send audio in fixed-size chunks
-// for parallel transcription. By the time the user stops, ~90% of text is ready.
-let chunkTimer: number | null = null;
-let chunkTranscriptions: string[] = [];  // ordered partial results
-let chunkStates: Array<"pending" | "done" | "failed"> = [];
-let chunkLastSentSamples = 0;             // how many samples already sent
-let chunkPendingCount = 0;                // in-flight requests
-
-function chunkTranscribeSchedulerTick(): void {
-  const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
-  const effectiveProvider = resolveEffectiveProvider(providerValue);
-  if (effectiveProvider === "local" || !effectiveProvider || !isRecording) return;
-  // Count total samples accumulated
-  let totalSamples = 0;
-  for (const c of chunks) totalSamples += c.length;
-  // Only send if we have at least 1 second of new audio (16000 samples)
-  const newSamples = totalSamples - chunkLastSentSamples;
-  if (newSamples < UI_TOKENS.capture.chunkMinNewSamples) return;
-  // Extract only the new audio since last send
-  const allMerged = new Float32Array(totalSamples);
-  let off = 0;
-  for (const c of chunks) { allMerged.set(c, off); off += c.length; }
-  const newAudio = allMerged.slice(chunkLastSentSamples);
-  const chunkIndex = chunkTranscriptions.length;
-  chunkTranscriptions.push("");  // placeholder
-  chunkStates.push("pending");
-  chunkLastSentSamples = totalSamples;
-  chunkPendingCount++;
-  // Fire-and-forget background transcription
-  const audioBlob = encodeCompactWav(newAudio, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
-  const file = new File([audioBlob], `chunk-${chunkIndex}.wav`, { type: audioBlob.type });
-  remoteJobSync(file, {
-    provider: effectiveProvider,
-    language: ($("language") as HTMLSelectElement).value,
-    diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-    openrouterModel: getRemoteModelValue(effectiveProvider),
-  }).then((r) => {
-    chunkTranscriptions[chunkIndex] = r.text;
-    chunkStates[chunkIndex] = "done";
-    chunkPendingCount--;
-  }).catch(() => {
-    chunkStates[chunkIndex] = "failed";
-    chunkPendingCount--;
-  });
-}
-
-function startChunkScheduler(): void {
-  stopChunkScheduler();
-  chunkTranscriptions = [];
-  chunkStates = [];
-  chunkLastSentSamples = 0;
-  chunkPendingCount = 0;
-  const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
-  const effectiveProvider = resolveEffectiveProvider(providerValue);
-  if (effectiveProvider === "local" || !effectiveProvider) return;
-  chunkTimer = window.setInterval(chunkTranscribeSchedulerTick, UI_TOKENS.capture.chunkIntervalMs);
-}
-
-function stopChunkScheduler(): void {
-  if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
-}
+// (Chunked pipeline removed — single sync call is faster and simpler.)
 
 function publishFinishedRecording(recordingId: number, text: string): void {
   const rid = Math.max(0, Number(recordingId || 0));
@@ -1897,7 +1994,7 @@ async function startLive(): Promise<void> {
   setBusy(true);
   isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
-  startChunkScheduler();
+  // Recording started — transcription happens on stop via single sync call.
   window.__transcriptorIsRecording = true;
   window.__transcriptorLastFrameAt = Date.now();
   window.__transcriptorLastFinishedText = "";
@@ -1999,6 +2096,16 @@ async function startLive(): Promise<void> {
         await ac.resume();
       } catch { }
     }
+    recordedWebmChunks = [];
+    try {
+      mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedWebmChunks.push(e.data);
+      };
+      mediaRecorder.start(1000);
+    } catch (e) {
+      console.warn("MediaRecorder failed, falling back to WAV encoder", e);
+    }
     src = ac.createMediaStreamSource(stream);
     analyser = ac.createAnalyser();
     analyser.fftSize = 2048;
@@ -2078,6 +2185,44 @@ async function startLive(): Promise<void> {
         }
       } catch { }
     }, UI_TOKENS.capture.fallbackInitDelayMs);
+    
+    if (chunkSubmitTimer) {
+      clearInterval(chunkSubmitTimer);
+    }
+    let chunkInFlight = false;
+    chunkAbortController = new AbortController();
+    chunkSubmitTimer = window.setInterval(async () => {
+      if (!isRecording || recordedWebmChunks.length < 3) return;
+      if (chunkInFlight) return; // Don't stack concurrent API calls
+      const providerStr = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+      const provider = resolveEffectiveProvider(providerStr);
+      if (provider === "local" || !isProviderKeyConfigured(provider)) return;
+
+      const webmBlob = new Blob(recordedWebmChunks, { type: "audio/webm" });
+      const file = new File([webmBlob], `live-snap-${Date.now()}.webm`, { type: webmBlob.type });
+
+      chunkInFlight = true;
+      try {
+        const out = await remoteJobSyncWithFallback(file, {
+          provider,
+          language: ($("language") as HTMLSelectElement).value,
+          diarize: ($("diarizeCheck") as HTMLInputElement).checked,
+          openrouterModel: getRemoteModelValue(provider),
+        });
+        if (isRecording && out && out.text) {
+          $("liveOutput").textContent = out.text;
+          $("liveOutput").scrollTop = $("liveOutput").scrollHeight;
+          persistLiveDraft(true);
+        }
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "AbortError")) {
+          console.warn("Chunk upload failed", e);
+        }
+      } finally {
+        chunkInFlight = false;
+      }
+    }, 5000);
+
   } catch (e) {
     if (shouldLivePreview()) {
       $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
@@ -2104,7 +2249,13 @@ async function stopLive(enhance: boolean): Promise<void> {
   const sourceLiveText = ($("liveOutput").textContent || "").trim();
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
-  const title = "Recording " + new Date().toLocaleString();
+  let title = "Recording " + new Date().toLocaleString();
+  const _smartTitle = (text: string): string => {
+    const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+    if (words.length === 0) return title;
+    const preview = words.slice(0, 8).join(" ");
+    return preview.length > 80 ? preview.slice(0, 77) + "..." : preview;
+  };
   const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const languageValue = ($("language") as HTMLSelectElement).value;
   const effectiveProvider = resolveEffectiveProvider(providerValue);
@@ -2122,12 +2273,57 @@ async function stopLive(enhance: boolean): Promise<void> {
     (tooShortToTrust && hardSilence) ||
     (tooShortToTrust && likelySilenceWithoutPreview);
 
-  stopChunkScheduler();
-  // Let the last worklet buffers arrive before disconnecting graph.
-  await waitForWorkletDrain();
+  // ── Fast path for remote providers: fire API call BEFORE cleanup ──────────
+  // Snapshot audio and start the Deepgram/OpenRouter request immediately.
+  // The ~2s API latency overlaps with the ~400ms of UI cleanup below.
+  const provider = effectiveProvider;
+  const isRemote = provider !== "local" && !!provider && enhance && chunks.length > 0;
+  let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
+
+  if (isRemote && isProviderKeyConfigured(provider)) {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      await new Promise<void>((resolve) => {
+        mediaRecorder!.onstop = () => resolve();
+        mediaRecorder!.stop();
+      });
+      const webmBlob = new Blob(recordedWebmChunks, { type: "audio/webm" });
+      const file = new File([webmBlob], `live-${Date.now()}.webm`, { type: webmBlob.type });
+      remoteApiPromise = remoteJobSyncWithFallback(file, {
+        provider,
+        language: (document.getElementById("language") as HTMLSelectElement).value,
+        diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+        openrouterModel: getRemoteModelValue(provider),
+      });
+    } else {
+      // Snapshot chunks NOW (before cleanup clears them)
+      const total = chunks.reduce((a, c) => a + c.length, 0);
+      const merged = new Float32Array(total);
+      let off = 0;
+      chunks.forEach((c) => { merged.set(c, off); off += c.length; });
+      const audioBlob = encodeCompactWav(merged, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
+      const file = new File([audioBlob], `live-${Date.now()}.wav`, { type: audioBlob.type });
+      // Fire API call NOW — don't await, let it run during cleanup
+      remoteApiPromise = remoteJobSyncWithFallback(file, {
+        provider,
+        language: (document.getElementById("language") as HTMLSelectElement).value,
+        diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+        openrouterModel: getRemoteModelValue(provider),
+      });
+    }
+  }
+
+  // ── Cleanup (runs while API call is in flight) ──────────────────────────
   if (timer) {
     clearInterval(timer);
     timer = null;
+  }
+  if (chunkSubmitTimer) {
+    clearInterval(chunkSubmitTimer);
+    chunkSubmitTimer = null;
+  }
+  if (chunkAbortController) {
+    chunkAbortController.abort();
+    chunkAbortController = null;
   }
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
@@ -2180,6 +2376,8 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (ws) ws.close();
   } catch { }
   ws = null;
+  mediaRecorder = null;
+  recordedWebmChunks = [];
   isRecording = false;
   silenceStartedAtMs = 0;
   autoStopTriggered = false;
@@ -2200,7 +2398,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     setStatus("Done");
     try {
       await saveRecordingText({
-        title,
+        title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "[ Silence ]",
         provider: providerValue,
@@ -2218,7 +2416,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (!enhance || chunks.length === 0) {
     try {
       await saveRecordingText({
-        title,
+        title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "",
         provider: providerValue,
@@ -2233,11 +2431,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     return;
   }
 
-  const provider = effectiveProvider;
   if (!provider) {
     try {
       await saveRecordingText({
-        title,
+        title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "",
         provider: "local",
@@ -2271,33 +2468,20 @@ async function stopLive(enhance: boolean): Promise<void> {
   // Allow next hotkey/session to start while this recording is transcribing.
   setBusy(false);
   try {
-    const localAbortController = new AbortController();
-    const total = chunks.reduce((a, c) => a + c.length, 0);
-    const merged = new Float32Array(total);
-    let off = 0;
-    chunks.forEach((c) => {
-      merged.set(c, off);
-      off += c.length;
-    });
-    // For remote providers, use compact WAV (8kHz) — halves payload instantly.
-    // For local, use full 16kHz WAV (faster-whisper expects higher quality).
-    let audioBlob: Blob;
-    let audioName: string;
-    if (provider !== "local") {
-      audioBlob = encodeCompactWav(merged, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
-      audioName = `live-${Date.now()}.wav`;
-    } else {
-      audioBlob = encodeWav(merged, AUDIO_TOKENS.liveSampleRateHz);
-      audioName = `live-${Date.now()}.wav`;
-    }
-    const file = new File([audioBlob], audioName, { type: audioBlob.type });
     let transcriptRaw = "";
     if (provider === "local") {
+      // Local provider: encode and submit job
+      const total = chunks.reduce((a, c) => a + c.length, 0);
+      const merged = new Float32Array(total);
+      let off = 0;
+      chunks.forEach((c) => { merged.set(c, off); off += c.length; });
+      const audioBlob = encodeWav(merged, AUDIO_TOKENS.liveSampleRateHz);
+      const file = new File([audioBlob], `live-${Date.now()}.wav`, { type: audioBlob.type });
+      const localAbortController = new AbortController();
       const create = await localJob(file, {
         language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
         model: resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value),
         splitStereo: false,
-        // Live hotkey flow never needs per-word timestamps; disabling speeds up local decoding.
         wordTimestamps: false,
       });
       const { job_id } = create;
@@ -2312,85 +2496,29 @@ async function stopLive(enhance: boolean): Promise<void> {
       applyJobResult(j);
       transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
     } else {
-      // Remote provider — use chunked transcription if chunks were pre-transcribed.
-      const hasPreTranscribed = chunkTranscriptions.length > 0;
-      let tailText = "";
-      let forceFullSync = false;
-
-      // Transcribe the remaining tail audio (samples not yet sent by the scheduler).
-      let totalSamples = 0;
-      for (const c of chunks) totalSamples += c.length;
-      const remainingSamples = totalSamples - chunkLastSentSamples;
-      if (remainingSamples > UI_TOKENS.capture.tailMinSamples) {
-        const allMerged = new Float32Array(totalSamples);
-        let mOff = 0;
-        for (const c of chunks) { allMerged.set(c, mOff); mOff += c.length; }
-        const tailAudio = allMerged.slice(chunkLastSentSamples);
-        const tailBlob = encodeCompactWav(tailAudio, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
-        const tailFile = new File([tailBlob], `tail-${Date.now()}.wav`, { type: tailBlob.type });
+      // ── Remote provider: instant draft + background refinement ─────────
+      // Show chunk-timer preview text IMMEDIATELY so user sees results
+      // in <100ms. The full-audio API result replaces it when ready.
+      const chunkDraft = ($("liveOutput").textContent || "").trim();
+      if (chunkDraft) {
+        $("finalOutput").textContent = chunkDraft;
+        transcriptRaw = chunkDraft;
+        setStatus("Refining...");
+      }
+      $("progressFill").style.width = "50%";
+      $("progressText").textContent = "50%";
+      if (remoteApiPromise) {
         try {
-          const tailResult = await remoteJobSyncWithFallback(tailFile, {
-            provider,
-            language: ($("language") as HTMLSelectElement).value,
-            diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-            openrouterModel: getRemoteModelValue(provider),
-          });
-          tailText = String(tailResult.text || "").trim();
-        } catch { }
-      }
-
-      // Wait for any in-flight chunk transcriptions to finish (max 8s).
-      if (chunkPendingCount > 0) {
-        const deadline = Date.now() + UI_TOKENS.polling.remoteChunkSettleTimeoutMs;
-        while (chunkPendingCount > 0 && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, UI_TOKENS.polling.remoteChunkSettleWaitMs));
-        }
-        if (chunkPendingCount > 0) forceFullSync = true;
-      }
-      if (chunkStates.some((s) => s === "pending" || s === "failed")) {
-        forceFullSync = true;
-      }
-
-      if (hasPreTranscribed) {
-        // Merge all chunk results + tail.
-        const parts = chunkTranscriptions
-          .map((text, idx) => ({ text: String(text || "").trim(), state: chunkStates[idx] || "failed" }))
-          .filter((x) => x.state === "done" && !!x.text)
-          .map((x) => x.text);
-        if (tailText) parts.push(tailText);
-        transcriptRaw = parts.join(" ").trim();
-      } else {
-        // No chunks were pre-transcribed (recording was too short) — use tail result.
-        if (tailText) {
-          transcriptRaw = tailText;
-        } else {
-          // Fallback: send entire recording.
-          $("progressFill").style.width = "65%";
-          $("progressText").textContent = "65%";
-          const syncOut = await remoteJobSyncWithFallback(file, {
-            provider,
-            language: ($("language") as HTMLSelectElement).value,
-            diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-            openrouterModel: getRemoteModelValue(provider),
-          });
-          transcriptRaw = String(syncOut.text || "").trim();
+          const syncOut = await remoteApiPromise;
+          const finalText = String(syncOut.text || "").trim();
+          if (finalText) {
+            transcriptRaw = finalText;
+          }
+        } catch (e) {
+          console.warn("Final transcription failed, using draft:", e);
+          // Keep the chunkDraft as transcriptRaw
         }
       }
-
-      // Guarantee completeness: if any dispatched chunk did not settle successfully
-      // before stop, run one authoritative full-file transcription pass.
-      if (forceFullSync || !transcriptRaw) {
-        $("progressFill").style.width = "80%";
-        $("progressText").textContent = "80%";
-        const syncOut = await remoteJobSyncWithFallback(file, {
-          provider,
-          language: ($("language") as HTMLSelectElement).value,
-          diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-          openrouterModel: getRemoteModelValue(provider),
-        });
-        transcriptRaw = String(syncOut.text || "").trim();
-      }
-
       $("finalOutput").textContent = transcriptRaw;
       $("progressFill").style.width = "100%";
       $("progressText").textContent = "100%";
@@ -2410,6 +2538,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     // saveRecordingText is non-blocking for recordings list reload.
     try {
+      title = _smartTitle(transcriptRaw);
       await saveRecordingText({
         title,
         sourceText: sourceLiveText,
@@ -2426,7 +2555,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     setStatus("Error");
     try {
       await saveRecordingText({
-        title,
+        title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "",
         provider,
@@ -2603,6 +2732,422 @@ window.addEventListener("transcriptor-hotkey-stop", () => {
     void stopLive(shouldAutoTranscribe());
   }
 });
+
+// ══════════════════════════════════════════════════════════════
+// ██  Graph Tab — Semantic Cluster Graph                    ██
+// ══════════════════════════════════════════════════════════════
+
+interface GraphNode {
+  name: string;
+  displayName: string;
+  provider: string;
+  keywords: string[];
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  r: number;
+}
+
+const GRAPH_COLORS: Record<string, string> = {
+  local: "#888888",
+  openrouter: "#6c90c6",
+  deepgram: "#79b88a",
+  unknown: "#777777",
+  toi: "#a888cc",
+};
+const GRAPH_PROVIDER_LABELS: Record<string, string> = {
+  local: "Local", openrouter: "OpenRouter", deepgram: "Deepgram", unknown: "Unknown", toi: "TOI",
+};
+
+const G_ZOOM_FACTOR = 1.1;
+const G_ZOOM_MIN = 0.02;
+const G_ZOOM_MAX = 12;
+const G_DRAG_THRESHOLD = 4;
+
+let gNodes: GraphNode[] = [];
+let gEdges: [number, number][] = [];
+let gZoom = 1;
+let gPanX = 0;
+let gPanY = 0;
+let gDragging = false;
+let gDragStartX = 0;
+let gDragStartY = 0;
+let gDragPanStartX = 0;
+let gDragPanStartY = 0;
+let gDragDist = 0;
+let gHovered: GraphNode | null = null;
+let gCssW = 0;
+let gCssH = 0;
+
+function gHex(hex: string, a: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+function gColor(p: string): string { return GRAPH_COLORS[p] || GRAPH_COLORS.unknown; }
+
+function gKeywordSimilarity(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const setB = new Set(b);
+  let shared = 0;
+  for (const w of a) { if (setB.has(w)) shared++; }
+  return shared / Math.max(a.length, b.length);
+}
+
+/** O(N) keyword-cluster layout — groups nodes by top keyword, places clusters in spiral */
+function gClusterLayout(): void {
+  const clusters: Map<string, number[]> = new Map();
+  gNodes.forEach((n, i) => {
+    const key = n.keywords.length > 0 ? n.keywords[0] : "__none__";
+    let arr = clusters.get(key);
+    if (!arr) { arr = []; clusters.set(key, arr); }
+    arr.push(i);
+  });
+
+  const clusterList = [...clusters.entries()].sort((a, b) => b[1].length - a[1].length);
+  const spacing = Math.max(80, Math.sqrt(gNodes.length) * 10);
+  let angle = 0;
+  let spiralR = 0;
+
+  clusterList.forEach(([, indices], ci) => {
+    let cx: number, cy: number;
+    if (ci === 0) {
+      cx = 0; cy = 0;
+    } else {
+      angle += 2.4 / Math.sqrt(ci);
+      spiralR += spacing / (2 * Math.PI);
+      cx = Math.cos(angle) * spiralR;
+      cy = Math.sin(angle) * spiralR;
+    }
+
+    const n = indices.length;
+    const clusterR = Math.max(20, Math.sqrt(n) * 14);
+    indices.forEach((nodeIdx, j) => {
+      if (n === 1) {
+        gNodes[nodeIdx].x = cx + (Math.random() - 0.5) * 6;
+        gNodes[nodeIdx].y = cy + (Math.random() - 0.5) * 6;
+      } else {
+        const a2 = (2 * Math.PI * j) / n;
+        const r2 = clusterR * (0.3 + 0.7 * Math.random());
+        gNodes[nodeIdx].x = cx + Math.cos(a2) * r2;
+        gNodes[nodeIdx].y = cy + Math.sin(a2) * r2;
+      }
+    });
+  });
+}
+
+/** Pre-compute edges, capped at 400 strongest */
+function gComputeEdges(): void {
+  const N = gNodes.length;
+  const MAX_EDGES = 400;
+  const candidates: { i: number; j: number; sim: number }[] = [];
+
+  if (N > 300) {
+    const kwMap: Map<string, number[]> = new Map();
+    gNodes.forEach((nd, i) => {
+      for (const kw of nd.keywords) {
+        let arr = kwMap.get(kw);
+        if (!arr) { arr = []; kwMap.set(kw, arr); }
+        arr.push(i);
+      }
+    });
+    const seen = new Set<string>();
+    kwMap.forEach((indices) => {
+      for (let a = 0; a < Math.min(indices.length, 40); a++) {
+        for (let b = a + 1; b < Math.min(indices.length, 40); b++) {
+          const ii = indices[a], jj = indices[b];
+          const key = ii < jj ? `${ii}_${jj}` : `${jj}_${ii}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const sim = gKeywordSimilarity(gNodes[ii].keywords, gNodes[jj].keywords);
+          if (sim >= 0.3) candidates.push({ i: ii, j: jj, sim });
+        }
+      }
+    });
+  } else {
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        const sim = gKeywordSimilarity(gNodes[i].keywords, gNodes[j].keywords);
+        if (sim >= 0.2) candidates.push({ i, j, sim });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => b.sim - a.sim);
+  gEdges = candidates.slice(0, MAX_EDGES).map((cc) => [cc.i, cc.j]);
+}
+
+function gCenterView(): void {
+  if (gNodes.length === 0) return;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  gNodes.forEach((n) => { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x); minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y); });
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const spanX = maxX - minX + 100, spanY = maxY - minY + 100;
+  const cw = gCssW || 800, ch = gCssH || 600;
+  gZoom = Math.min(cw / spanX, ch / spanY, 2);
+  gZoom = Math.max(G_ZOOM_MIN, Math.min(G_ZOOM_MAX, gZoom));
+  gPanX = cw / 2 - cx * gZoom;
+  gPanY = ch / 2 - cy * gZoom;
+}
+
+function gExtractKeywordsFromTitle(title: string): string[] {
+  const words = (title || "").toLowerCase().replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 2);
+  return words.slice(0, 8);
+}
+
+async function loadGraphData(): Promise<void> {
+  try {
+    let items: Array<{ name: string; display_name: string; provider: string; keywords: string[] }> = [];
+    try {
+      const r = await apiGet<{ nodes: Array<{ name: string; display_name: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
+      items = (r.nodes || []).map((it) => ({
+        name: it.name, display_name: it.display_name,
+        provider: it.provider || "unknown", keywords: it.keywords || [],
+      }));
+    } catch {
+      const r = await apiGet<{ items: RecordingItem[] }>("/api/recordings");
+      items = (r.items || []).map((it) => ({
+        name: it.name, display_name: it.display_name,
+        provider: it.provider || "unknown",
+        keywords: gExtractKeywordsFromTitle(it.display_name),
+      }));
+    }
+
+    gNodes = items.map((it) => ({
+      name: it.name, displayName: it.display_name,
+      provider: it.provider || "unknown", keywords: it.keywords || [],
+      x: 0, y: 0, vx: 0, vy: 0,
+      r: Math.max(3, Math.min(10, 3 + Math.sqrt(Math.max((it.keywords || []).length, 1)) * 1.5)),
+    }));
+    $("graphInfoText").textContent = `${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}`;
+    if (gNodes.length === 0) { gRender(); return; }
+
+    gClusterLayout();
+    gComputeEdges();
+    gCenterView();
+    gRender();
+  } catch (e) {
+    $("graphInfoText").textContent = "Error: " + (e as Error).message;
+  }
+}
+
+function gRender(): void {
+  const gc = $("graphCanvas") as HTMLCanvasElement;
+  const container = $("graphContainer");
+  const rect = container.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  gCssW = rect.width; gCssH = rect.height;
+  gc.width = rect.width * dpr; gc.height = rect.height * dpr;
+  gc.style.width = rect.width + "px"; gc.style.height = rect.height + "px";
+  const c = gc.getContext("2d")!;
+  c.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+
+  c.fillStyle = "#121212";
+  c.fillRect(0, 0, W, H);
+
+  if (gNodes.length === 0) {
+    c.fillStyle = "#8f8f8f"; c.font = "13px 'SF Pro Text', -apple-system, sans-serif";
+    c.textAlign = "center"; c.textBaseline = "middle";
+    c.fillText("No recordings to display", W / 2, H / 2);
+    c.font = "10px 'SF Pro Text', -apple-system, sans-serif"; c.fillStyle = "#666";
+    c.fillText("Create recordings to see them visualized here", W / 2, H / 2 + 22);
+    return;
+  }
+
+  // Viewport in graph coords
+  const vl = -gPanX / gZoom, vt = -gPanY / gZoom;
+  const vr = (W - gPanX) / gZoom, vb = (H - gPanY) / gZoom;
+  const pad = 20 / gZoom;
+
+  c.save();
+  c.translate(gPanX, gPanY);
+  c.scale(gZoom, gZoom);
+
+  // Edges — single batched path
+  if (gEdges.length > 0) {
+    c.beginPath();
+    c.strokeStyle = "rgba(255,255,255,0.04)";
+    c.lineWidth = 0.4;
+    for (const [ai, bi] of gEdges) {
+      const ax = gNodes[ai].x, ay = gNodes[ai].y;
+      const bx = gNodes[bi].x, by = gNodes[bi].y;
+      if (Math.max(ax, bx) < vl || Math.min(ax, bx) > vr || Math.max(ay, by) < vt || Math.min(ay, by) > vb) continue;
+      c.moveTo(ax, ay);
+      c.lineTo(bx, by);
+    }
+    c.stroke();
+  }
+
+  // Nodes — batched per color
+  const byColor: Map<string, GraphNode[]> = new Map();
+  for (const n of gNodes) {
+    if (n.x + n.r + pad < vl || n.x - n.r - pad > vr || n.y + n.r + pad < vt || n.y - n.r - pad > vb) continue;
+    const col = gColor(n.provider);
+    let arr = byColor.get(col);
+    if (!arr) { arr = []; byColor.set(col, arr); }
+    arr.push(n);
+  }
+
+  byColor.forEach((nodes, col) => {
+    c.beginPath();
+    c.fillStyle = gHex(col, 0.7);
+    for (const n of nodes) {
+      if (n === gHovered) continue;
+      c.moveTo(n.x + n.r, n.y);
+      c.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+    }
+    c.fill();
+  });
+
+  // Hovered node
+  if (gHovered) {
+    const n = gHovered;
+    const col = gColor(n.provider);
+    const grd = c.createRadialGradient(n.x, n.y, n.r, n.x, n.y, n.r + 16);
+    grd.addColorStop(0, gHex(col, 0.3)); grd.addColorStop(1, gHex(col, 0));
+    c.beginPath(); c.arc(n.x, n.y, n.r + 16, 0, Math.PI * 2); c.fillStyle = grd; c.fill();
+    c.beginPath(); c.arc(n.x, n.y, n.r, 0, Math.PI * 2); c.fillStyle = col; c.fill();
+    c.strokeStyle = "#fff"; c.lineWidth = 1.5; c.stroke();
+    c.fillStyle = "#fff";
+    c.font = `${Math.max(10, 11 / gZoom)}px 'SF Pro Text', -apple-system, sans-serif`;
+    c.textAlign = "center"; c.textBaseline = "bottom";
+    c.fillText(n.displayName, n.x, n.y - n.r - 6);
+  }
+
+  c.restore();
+
+  // Legend
+  const providers = [...new Set(gNodes.map((n) => n.provider))];
+  let ly = 16;
+  c.textAlign = "right"; c.textBaseline = "middle";
+  c.font = "9px 'SF Pro Text', -apple-system, sans-serif";
+  for (const p of providers) {
+    const col = gColor(p);
+    const lx = W - 56;
+    c.beginPath(); c.arc(lx + 10, ly, 4, 0, Math.PI * 2); c.fillStyle = col; c.fill();
+    c.fillStyle = "#999"; c.fillText(GRAPH_PROVIDER_LABELS[p] || p, lx + 2, ly);
+    ly += 16;
+  }
+}
+
+function gHitTest(mx: number, my: number): GraphNode | null {
+  const gx = (mx - gPanX) / gZoom, gy = (my - gPanY) / gZoom;
+  let best: GraphNode | null = null;
+  let bestD = Infinity;
+  for (const n of gNodes) {
+    const dx = n.x - gx, dy = n.y - gy;
+    const d = dx * dx + dy * dy;
+    const rr = (n.r + 6) * (n.r + 6);
+    if (d <= rr && d < bestD) { best = n; bestD = d; }
+  }
+  return best;
+}
+
+function gShowTooltip(node: GraphNode, mx: number, my: number): void {
+  const tt = $("graphTooltip");
+  $("graphTooltipTitle").textContent = node.displayName;
+  $("graphTooltipMeta").textContent = node.provider + (node.keywords.length ? " · " + node.keywords.slice(0, 5).join(", ") : "");
+  $("graphTooltipPreview").textContent = "";
+  tt.hidden = false;
+  const rect = $("graphContainer").getBoundingClientRect();
+  let left = mx + 16, top = my - 10;
+  if (left + 280 > rect.width) left = mx - 290;
+  if (left < 4) left = 4;
+  if (top < 4) top = 4;
+  if (top + 80 > rect.height) top = rect.height - 84;
+  tt.style.left = left + "px"; tt.style.top = top + "px";
+}
+
+function gHideTooltip(): void {
+  $("graphTooltip").hidden = true;
+  gHovered = null;
+}
+
+function gNavToRecording(node: GraphNode): void {
+  document.querySelectorAll(".view").forEach((el) => ((el as HTMLElement).hidden = (el as HTMLElement).dataset.view !== "recordings"));
+  document.querySelectorAll(".sb-item").forEach((el) => el.classList.toggle("active", (el as HTMLElement).dataset.view === "recordings"));
+  $("windowViewLabel").textContent = "Recordings";
+  selectedRecordingName = node.name;
+  void loadRecordings(true);
+}
+
+(() => {
+  const gc = $("graphCanvas") as HTMLCanvasElement;
+  const ct = $("graphContainer");
+
+  ct.addEventListener("wheel", (e: WheelEvent) => {
+    e.preventDefault();
+    const rect = ct.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const dir = e.deltaY < 0 ? G_ZOOM_FACTOR : 1 / G_ZOOM_FACTOR;
+    const nz = Math.max(G_ZOOM_MIN, Math.min(G_ZOOM_MAX, gZoom * dir));
+    gPanX = mx - (mx - gPanX) * (nz / gZoom);
+    gPanY = my - (my - gPanY) * (nz / gZoom);
+    gZoom = nz;
+    gRender();
+  }, { passive: false });
+
+  ct.addEventListener("mousedown", (e: MouseEvent) => {
+    if (e.button !== 0) return;
+    gDragging = true; gDragDist = 0;
+    gDragStartX = e.clientX; gDragStartY = e.clientY;
+    gDragPanStartX = gPanX; gDragPanStartY = gPanY;
+  });
+
+  window.addEventListener("mousemove", (e: MouseEvent) => {
+    if (gDragging) {
+      const dx = e.clientX - gDragStartX, dy = e.clientY - gDragStartY;
+      gDragDist = Math.sqrt(dx * dx + dy * dy);
+      gPanX = gDragPanStartX + dx; gPanY = gDragPanStartY + dy;
+      gRender();
+      return;
+    }
+    const rect = ct.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    if (mx < 0 || my < 0 || mx > rect.width || my > rect.height) {
+      if (gHovered) { gHideTooltip(); gRender(); }
+      return;
+    }
+    const hit = gHitTest(mx, my);
+    if (hit !== gHovered) {
+      gHovered = hit;
+      if (hit) gShowTooltip(hit, mx, my); else gHideTooltip();
+      gRender();
+    } else if (hit) {
+      gShowTooltip(hit, mx, my);
+    }
+  });
+
+  window.addEventListener("mouseup", () => { gDragging = false; });
+
+  gc.addEventListener("click", (e: MouseEvent) => {
+    if (gDragDist > G_DRAG_THRESHOLD) return;
+    const rect = ct.getBoundingClientRect();
+    const hit = gHitTest(e.clientX - rect.left, e.clientY - rect.top);
+    if (hit) gNavToRecording(hit);
+  });
+
+  $("graphZoomIn").addEventListener("click", () => {
+    const nz = Math.min(G_ZOOM_MAX, gZoom * G_ZOOM_FACTOR);
+    gPanX = gCssW / 2 - (gCssW / 2 - gPanX) * (nz / gZoom);
+    gPanY = gCssH / 2 - (gCssH / 2 - gPanY) * (nz / gZoom);
+    gZoom = nz; gRender();
+  });
+  $("graphZoomOut").addEventListener("click", () => {
+    const nz = Math.max(G_ZOOM_MIN, gZoom / G_ZOOM_FACTOR);
+    gPanX = gCssW / 2 - (gCssW / 2 - gPanX) * (nz / gZoom);
+    gPanY = gCssH / 2 - (gCssH / 2 - gPanY) * (nz / gZoom);
+    gZoom = nz; gRender();
+  });
+  $("graphZoomReset").addEventListener("click", () => { gCenterView(); gRender(); });
+
+  new ResizeObserver(() => {
+    if (!ct.closest("[hidden]")) gRender();
+  }).observe(ct);
+})();
 
 void loadCfg().then(() => loadMics(false));
 initQuickControls();

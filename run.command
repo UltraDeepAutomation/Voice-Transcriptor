@@ -122,6 +122,9 @@ lsof -ti tcp:$BACKEND_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
 DATA_DIR="$HOME/Library/Application Support/Transcriptor"
 mkdir -p "$DATA_DIR"
 
+export PYTHONPATH="$ROOT_DIR:$PYTHONPATH"
+export TRANSCRIPTOR_DATA_DIR="$DATA_DIR"
+
 "$VENV_PY" -m uvicorn backend.main:app \
   --host 127.0.0.1 \
   --port $BACKEND_PORT \

@@ -15,12 +15,8 @@ let tray = null;
 let backendBootError = "";
 let isQuitting = false;
 let shortcutToggleInFlight = false;
-let suppressActivateUntil = 0;
-let suppressActivateDuringOverlayFlow = false;
 let pasteTargetAppName = "";
 let pasteTargetAppPid = 0;
-let suppressMainWindowUntil = 0;
-let manualWindowRevealUntil = 0;
 let overlayStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
@@ -181,36 +177,12 @@ function traceEnd(ctx, status = "done", details = {}) {
   );
 }
 
-async function shouldBlockMainWindowPresentation(options = {}) {
-  const allowDuringRecording = !!options.allowDuringRecording;
-  const force = !!options.force;
-  if (overlayStopInFlight) return true;
-  if (force) return false;
-  if (!allowDuringRecording && Date.now() < suppressMainWindowUntil) return true;
-  if (Date.now() < suppressActivateUntil) return true;
-  if (!allowDuringRecording) {
-    if (suppressActivateDuringOverlayFlow) return true;
-    if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) return true;
-  }
-  if (allowDuringRecording) return false;
-  try {
-    return await isRendererRecording();
-  } catch {
-    return false;
-  }
-}
-
 async function ensureWindowVisible(options = {}) {
-  const manual = !!options.manual;
   const force = !!options.force;
-  if (await shouldBlockMainWindowPresentation({ allowDuringRecording: manual, force })) return;
-  if (!force && Date.now() < suppressMainWindowUntil) return;
+  if (!force && overlayStopInFlight) return;
   if (!win || win.isDestroyed()) {
     await createWindow();
     return;
-  }
-  if (manual) {
-    manualWindowRevealUntil = Date.now() + 4000;
   }
   if (win.isMinimized()) win.restore();
   if (!win.isVisible()) win.show();
@@ -218,14 +190,6 @@ async function ensureWindowVisible(options = {}) {
     await startBackend();
   }
   win.focus();
-}
-
-async function restoreFrontAppFocusAfterOverlayUi() {
-  const targetPid = Number(pasteTargetAppPid || 0);
-  if (!targetPid) return;
-  try {
-    await activateAppByPid(targetPid);
-  } catch { }
 }
 
 function getRepoRoot() {
@@ -1286,7 +1250,17 @@ function createOverlayHtml() {
           const on = !!enabled;
           if (quickAutoSendToggle.checked !== on) quickAutoSendToggle.checked = on;
         };
-        gearBtn.addEventListener('click', () => {
+
+        // Make the entire core of the capsule clickable to stop recording
+        document.getElementById('core').addEventListener('click', (e) => {
+          if (waveMode === 'recording') {
+            e.stopPropagation();
+            document.title = '__overlay_stop__';
+          }
+        });
+
+        gearBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
           const next = !settingsSlot.classList.contains('on');
           window.setQuickOpen(next);
           document.title = '__overlay_settings__' + (next ? '1' : '0');
@@ -1507,8 +1481,6 @@ function ensureOverlayWindow() {
     event.preventDefault();
     if (raw.startsWith("__overlay_stop__")) {
       overlayStopInFlight = true;
-      suppressActivateDuringOverlayFlow = true;
-      suppressMainWindowUntil = Date.now() + 15000;
       if (win && !win.isDestroyed() && win.isVisible()) {
         try {
           win.hide();
@@ -1526,33 +1498,24 @@ function ensureOverlayWindow() {
       overlayQuickSettingsInitialized = true;
       applyOverlayWindowSize();
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 3000;
-      suppressMainWindowUntil = Date.now() + 3000;
       if (win && !win.isDestroyed() && win.isVisible()) {
         try { win.hide(); } catch { }
       }
       void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_upscale_enabled__")) {
       const v = raw.endsWith("1");
       overlayQuickUpscaleEnabled = !!v;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 3000;
-      suppressMainWindowUntil = Date.now() + 3000;
       void setRendererUpscaleEnabledChoice(v);
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_upscale__")) {
       const v = String(decodeURIComponent(raw.replace("__overlay_upscale__", "")) || "").trim();
       overlayQuickUpscalePreset = v;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 3000;
-      suppressMainWindowUntil = Date.now() + 3000;
       void setRendererUpscalePresetChoice(v);
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_autosend__")) {
@@ -1560,18 +1523,13 @@ function ensureOverlayWindow() {
       overlayQuickAutoSend = !!v;
       overlayQuickAutoSendInitialized = true;
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 3000;
-      suppressMainWindowUntil = Date.now() + 3000;
       void setRendererAutoSendEnterChoice(v);
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_autostop_enabled__")) {
       const v = raw.endsWith("1");
       overlayAutoStopConfig = { ...overlayAutoStopConfig, enabled: !!v };
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 3000;
-      suppressMainWindowUntil = Date.now() + 3000;
       // Sync to renderer
       if (win && !win.isDestroyed() && win.webContents) {
         win.webContents.executeJavaScript(
@@ -1579,7 +1537,6 @@ function ensureOverlayWindow() {
           true
         ).catch(() => { });
       }
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw.startsWith("__overlay_autostop_secs__")) {
@@ -1587,8 +1544,6 @@ function ensureOverlayWindow() {
       const sec = Math.min(20, Math.max(1, Math.round(Number(secStr) || 2)));
       overlayAutoStopConfig = { ...overlayAutoStopConfig, seconds: sec };
       lastOverlayUiInteractionAt = Date.now();
-      suppressActivateUntil = Date.now() + 3000;
-      suppressMainWindowUntil = Date.now() + 3000;
       // Sync to renderer
       if (win && !win.isDestroyed() && win.webContents) {
         win.webContents.executeJavaScript(
@@ -1596,7 +1551,6 @@ function ensureOverlayWindow() {
           true
         ).catch(() => { });
       }
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw === "__overlay_input_focus__") {
@@ -1612,7 +1566,6 @@ function ensureOverlayWindow() {
       if (overlayWin && !overlayWin.isDestroyed()) {
         overlayWin.setFocusable(false);
       }
-      void restoreFrontAppFocusAfterOverlayUi();
       return;
     }
     if (raw === "__overlay_mouse_enter__") {
@@ -1672,7 +1625,6 @@ async function syncOverlayQueueVisual(recordingHint = null) {
 }
 
 async function showRecordingOverlay() {
-  suppressActivateDuringOverlayFlow = true;
   // Preserve user's last quick-settings open/closed choice across runs.
   overlaySilenceStartedAt = 0;
   overlayAutoStopConfigRefreshAt = 0;
@@ -1837,7 +1789,6 @@ async function showRecordingOverlay() {
 }
 
 async function ensureOverlayVisible(options = {}) {
-  suppressActivateDuringOverlayFlow = true;
   const { resetTimer = false, startTimer = false, status = null } = options;
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
@@ -1912,7 +1863,6 @@ function hideRecordingOverlay() {
     overlayTranscribingStatusTimer = null;
   }
   overlayAutoStopUiActive = false;
-  suppressActivateDuringOverlayFlow = false;
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
@@ -2109,8 +2059,6 @@ async function toggleRecordingFromShortcut() {
 }
 
 async function stopRecordingFromOverlay() {
-  suppressActivateUntil = Date.now() + 2500;
-  suppressMainWindowUntil = Date.now() + 10000;
   await ensureBackgroundWindow();
   if (!win || win.isDestroyed() || !win.webContents) return;
   if (win.isVisible()) win.hide();
@@ -2766,7 +2714,7 @@ async function runPostStopQueue() {
 
 async function processPostStopTask(task) {
   const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
-  const deadline = Date.now() + 45000;
+  const deadline = Date.now() + 120000;
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
@@ -3417,7 +3365,12 @@ async function startBackend() {
   backend = spawn(python, args, {
     cwd: repoRoot,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, PYTHONUNBUFFERED: "1" }
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: "1",
+      PYTHONPATH: repoRoot + (process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""),
+      TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
+    }
   });
 
   backend.stdout.on("data", (d) => {
@@ -3528,19 +3481,12 @@ async function createWindow(options = {}) {
     if (process.platform === "darwin" && !isQuitting) {
       event.preventDefault();
       win.hide();
+      if (app.dock) app.dock.hide();
       return;
     }
   });
   win.on("show", () => {
-    isRendererRecording()
-      .then((recording) => {
-        if (!recording) return;
-        if (Date.now() < manualWindowRevealUntil) return;
-        try {
-          win.hide();
-        } catch { }
-      })
-      .catch(() => { });
+    if (process.platform === "darwin" && app.dock) app.dock.show();
   });
 
   win.on("closed", () => {
@@ -3603,8 +3549,18 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("activate", async () => {
-  // Allow explicit Dock/Menu activation even while recording/transcribing.
+app.on("activate", () => {
+  // In menu bar mode (dock hidden), ignore all activation events.
+  if (process.platform === "darwin" && app.dock && !app.dock.isVisible()) {
+    return;
+  }
+  // When the recording overlay is visible, clicking its buttons triggers
+  // macOS app activation (even though the window is focusable:false).
+  // Don't show the main window — the user is interacting with the overlay.
+  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) {
+    return;
+  }
+  if (overlayStopInFlight) return;
   ensureWindowVisible({ manual: true, force: true });
 });
 
@@ -3658,8 +3614,47 @@ app.whenReady().then(async () => {
   if (process.platform === "darwin" && app.dock) {
     app.dock.show();
   }
-  tray = new Tray(nativeImage.createEmpty());
-  tray.setTitle("●");
+  // Create a 5-bar sound wave tray icon matching the app icon (icon.png).
+  // 32×32 @2x retina, template image auto-adapts to light/dark menu bar.
+  const trayCanvas = (() => {
+    const s = 32;
+    const buf = Buffer.alloc(s * s * 4, 0);
+    const barW = 3;
+    const gap = 2;
+    const totalW = 5 * barW + 4 * gap;
+    const startX = Math.round((s - totalW) / 2);
+    const heights = [14, 19, 24, 18, 12];
+
+    const setPixel = (x, y, alpha) => {
+      if (x < 0 || x >= s || y < 0 || y >= s) return;
+      const i = (y * s + x) * 4;
+      buf[i] = 0; buf[i + 1] = 0; buf[i + 2] = 0; buf[i + 3] = alpha;
+    };
+
+    for (let b = 0; b < 5; b++) {
+      const bx = startX + b * (barW + gap);
+      const h = heights[b];
+      const top = Math.round((s - h) / 2);
+      const bot = top + h;
+      for (let y = top; y < bot; y++) {
+        for (let x = bx; x < bx + barW; x++) {
+          // Round the top and bottom corners
+          const isTopEdge = y === top;
+          const isBotEdge = y === bot - 1;
+          const isLeftEdge = x === bx;
+          const isRightEdge = x === bx + barW - 1;
+          if ((isTopEdge || isBotEdge) && (isLeftEdge || isRightEdge)) {
+            setPixel(x, y, 140); // soften corners
+          } else {
+            setPixel(x, y, 255);
+          }
+        }
+      }
+    }
+    return nativeImage.createFromBuffer(buf, { width: s, height: s, scaleFactor: 2.0 });
+  })();
+  trayCanvas.setTemplateImage(true);
+  tray = new Tray(trayCanvas);
   const trayMenu = Menu.buildFromTemplate([
     {
       label: "Open Transcriptor",
@@ -3673,12 +3668,7 @@ app.whenReady().then(async () => {
       click: () => app.quit()
     }
   ]);
-  tray.on("click", (event) => {
-    // macOS: Ctrl+left-click should behave as right-click.
-    if (event?.ctrlKey) {
-      tray?.popUpContextMenu(trayMenu);
-      return;
-    }
+  tray.on("click", () => {
     ensureWindowVisible({ manual: true, force: true });
   });
   tray.on("right-click", () => {
@@ -3696,26 +3686,79 @@ app.whenReady().then(async () => {
     }
   }
 
-  const recordHotkey = process.platform === "darwin" ? "Alt+Left" : "Alt+Left";
-  const hotkeyOk = globalShortcut.register(recordHotkey, () => {
-    toggleRecordingFromShortcut().catch((e) => {
-      appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
-      hideRecordingOverlay();
-    });
-  });
-  if (!hotkeyOk) {
-    appendMainLog(`[app] failed to register recording shortcut: ${recordHotkey}`);
+  // ── Global Shortcuts (config-driven with live reload) ─────────────────────
+  let registeredRecordHotkey = "";
+  let registeredPasteHotkey = "";
+
+  function readShortcutsFromConfig() {
+    const defaults = { record: "Alt+Left", paste: "Alt+Shift+7" };
+    try {
+      const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+      const cfgPath = path.join(dataDir, "config.json");
+      if (fs.existsSync(cfgPath)) {
+        const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+        const ui = raw?.preferences?.ui || {};
+        return {
+          record: String(ui.shortcut_record || defaults.record).trim() || defaults.record,
+          paste: String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste,
+        };
+      }
+    } catch (e) {
+      appendMainLog(`[shortcuts] config read error: ${e?.message || e}`);
+    }
+    return defaults;
   }
-  const pasteLastHotkey = process.platform === "darwin" ? "Alt+Shift+7" : "Alt+Shift+7";
-  const pasteLastHotkeyOk = globalShortcut.register(pasteLastHotkey, () => {
-    pasteLatestTranscriptFromShortcut().catch((e) => {
-      appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
-      hideRecordingOverlay();
+
+  function registerGlobalShortcuts() {
+    const shortcuts = readShortcutsFromConfig();
+    // Unregister old shortcuts (keep devtools)
+    if (registeredRecordHotkey) {
+      try { globalShortcut.unregister(registeredRecordHotkey); } catch { }
+    }
+    if (registeredPasteHotkey) {
+      try { globalShortcut.unregister(registeredPasteHotkey); } catch { }
+    }
+
+    registeredRecordHotkey = shortcuts.record;
+    const hotkeyOk = globalShortcut.register(registeredRecordHotkey, () => {
+      toggleRecordingFromShortcut().catch((e) => {
+        appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
+        hideRecordingOverlay();
+      });
     });
-  });
-  if (!pasteLastHotkeyOk) {
-    appendMainLog(`[app] failed to register paste-last shortcut: ${pasteLastHotkey}`);
+    if (!hotkeyOk) {
+      appendMainLog(`[app] failed to register recording shortcut: ${registeredRecordHotkey}`);
+    }
+
+    registeredPasteHotkey = shortcuts.paste;
+    const pasteLastHotkeyOk = globalShortcut.register(registeredPasteHotkey, () => {
+      pasteLatestTranscriptFromShortcut().catch((e) => {
+        appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
+        hideRecordingOverlay();
+      });
+    });
+    if (!pasteLastHotkeyOk) {
+      appendMainLog(`[app] failed to register paste-last shortcut: ${registeredPasteHotkey}`);
+    }
+    appendMainLog(`[shortcuts] registered: record=${registeredRecordHotkey} paste=${registeredPasteHotkey}`);
   }
+
+  registerGlobalShortcuts();
+
+  // Poll for live shortcut changes from the renderer settings UI
+  setInterval(async () => {
+    if (!win || win.isDestroyed() || !win.webContents) return;
+    try {
+      const pending = await win.webContents.executeJavaScript(
+        `(() => { const p = window.__transcriptorPendingShortcuts; if (p) { delete window.__transcriptorPendingShortcuts; return p; } return null; })()`,
+        true
+      );
+      if (pending && (pending.record || pending.paste)) {
+        appendMainLog(`[shortcuts] live reload: record=${pending.record} paste=${pending.paste}`);
+        registerGlobalShortcuts();
+      }
+    } catch { }
+  }, 2000);
 
   await requestMacPastePermissionsOnce();
   await startBackend();

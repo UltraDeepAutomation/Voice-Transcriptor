@@ -487,10 +487,56 @@ def _extract_stats_text(content: str) -> str:
     text = (content or "").strip()
     if not text:
         return ""
-    m = re.search(r"(?:Original:|Transcription:)\s*(.*)", text, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    # Prefer Transcription section (clean text) over Original (raw live)
+    m_trans = re.search(r"Transcription:\s*(.*)", text, flags=re.DOTALL | re.IGNORECASE)
+    if m_trans:
+        result = m_trans.group(1).strip()
+        # Strip any trailing sections that might follow
+        result = re.split(r"\n\s*Original:", result, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if result:
+            return result
+    m_orig = re.search(r"Original:\s*(.*)", text, flags=re.DOTALL | re.IGNORECASE)
+    if m_orig:
+        result = m_orig.group(1).strip()
+        result = re.split(r"\n\s*Transcription:", result, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if result:
+            return result
     return text
+
+
+def _extract_transcript_text(content: str) -> str:
+    """Extract transcript text specifically for display name generation.
+    Prefers Transcription section, falls back to Original."""
+    text = (content or "").strip()
+    if not text:
+        return ""
+    m_trans = re.search(r"Transcription:\s*(.*?)(?:\n\s*$|\nOriginal:|$)", text, flags=re.DOTALL | re.IGNORECASE)
+    if m_trans and m_trans.group(1).strip():
+        return m_trans.group(1).strip()
+    m_orig = re.search(r"Original:\s*(.*?)(?:\n\s*$|\nTranscription:|$)", text, flags=re.DOTALL | re.IGNORECASE)
+    if m_orig and m_orig.group(1).strip():
+        return m_orig.group(1).strip()
+    return ""
+
+
+def _first_words(content: str, max_words: int = 8) -> str:
+    """Extract first N meaningful words from recording file content for display name."""
+    text = _extract_transcript_text(content)
+    if not text:
+        return ""
+    # Strip bracketed markers like [Silence]
+    text = re.sub(r"\[.*?\]", "", text).strip()
+    if not text:
+        return ""
+    # Collapse whitespace and take first N words
+    words = text.split()
+    preview = " ".join(words[:max_words])
+    if len(words) > max_words:
+        preview += "..."
+    # Limit total length for UI
+    if len(preview) > 80:
+        preview = preview[:77] + "..."
+    return preview
 
 
 def _tokenize_words(text: str) -> list[str]:
@@ -1023,16 +1069,23 @@ async def remote_transcribe_sync(
     audio_bytes = await file.read()
     lang_opt = _normalize_language(language)
     cfg = load_config()
+    loop = asyncio.get_event_loop()
     try:
-        result = _run_remote_transcribe_once(
-            provider_norm=provider_norm,
-            audio_bytes=audio_bytes,
-            orig_name=orig_name,
-            language=lang_opt,
-            diarize=diarize,
-            num_speakers=num_speakers,
-            openrouter_model=openrouter_model,
-            cfg=cfg,
+        # CRITICAL: run in thread pool so synchronous requests.request()
+        # does NOT block the event loop. Without this, parallel chunk
+        # requests from the frontend serialize (5×3s = 15-60s).
+        result = await loop.run_in_executor(
+            None,
+            lambda: _run_remote_transcribe_once(
+                provider_norm=provider_norm,
+                audio_bytes=audio_bytes,
+                orig_name=orig_name,
+                language=lang_opt,
+                diarize=diarize,
+                num_speakers=num_speakers,
+                openrouter_model=openrouter_model,
+                cfg=cfg,
+            ),
         )
         return {"ok": True, "result": result}
     except (OrRemoteError, DgRemoteError) as e:
@@ -1335,25 +1388,126 @@ def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: No
         raise HTTPException(status_code=500, detail=f"open folder failed: {stderr or 'unknown error'}")
 
 
+_list_cache: Optional[dict] = None
+_list_cache_at = 0.0
+_list_cache_key: Optional[tuple] = None
+_LIST_CACHE_TTL = 5.0
+
+
 @app.get("/api/recordings")
 def list_recordings(_auth: None = Depends(_require_api_auth)):
+    global _list_cache, _list_cache_at, _list_cache_key
     d = _resolve_recordings_dir()
+    now = time.time()
+
+    # Build lightweight cache key: dir mtime + file count
+    try:
+        dir_mtime = d.stat().st_mtime
+        file_count = sum(1 for _ in d.glob("*.txt"))
+    except Exception:
+        dir_mtime = 0.0
+        file_count = -1
+    cache_key = (str(d), dir_mtime, file_count)
+
+    if (
+        _list_cache is not None
+        and _list_cache_key == cache_key
+        and (now - _list_cache_at) < _LIST_CACHE_TTL
+    ):
+        return _list_cache
+
     items = []
     for p in d.glob("*.txt"):
         try:
             st = p.stat()
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            # Smart display_name: first words of transcript text
+            first = _first_words(raw)
+            display = first if first else p.stem
+            # Extract metadata from file header
+            provider = _extract_meta_field(raw, "Provider").lower() or ""
+            language = _extract_meta_field(raw, "Language").lower() or ""
             items.append(
                 {
                     "name": p.name,
-                    "display_name": p.stem,
+                    "display_name": display,
                     "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
                     "size_bytes": st.st_size,
+                    "provider": provider,
+                    "language": language,
                 }
             )
         except Exception:
             continue
     items.sort(key=lambda x: x["modified_at"], reverse=True)
-    return {"items": items, "directory": str(d)}
+    result = {"items": items, "directory": str(d)}
+    _list_cache = result
+    _list_cache_at = now
+    _list_cache_key = cache_key
+    return result
+
+
+_graph_cache: Optional[dict] = None
+_graph_cache_at = 0.0
+_graph_cache_key: Optional[tuple] = None
+_GRAPH_CACHE_TTL = 30.0
+
+
+@app.get("/api/recordings/graph")
+def recordings_graph(_auth: None = Depends(_require_api_auth)):
+    """Return recordings with extracted keywords for semantic graph visualization."""
+    global _graph_cache, _graph_cache_at, _graph_cache_key
+    d = _resolve_recordings_dir()
+    now = time.time()
+
+    try:
+        dir_mtime = d.stat().st_mtime
+        file_count = sum(1 for _ in d.glob("*.txt"))
+    except Exception:
+        dir_mtime = 0.0
+        file_count = -1
+    cache_key = (str(d), dir_mtime, file_count)
+
+    if (
+        _graph_cache is not None
+        and _graph_cache_key == cache_key
+        and (now - _graph_cache_at) < _GRAPH_CACHE_TTL
+    ):
+        return _graph_cache
+
+    nodes = []
+    for p in d.glob("*.txt"):
+        try:
+            st = p.stat()
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            first = _first_words(raw)
+            display = first if first else p.stem
+            provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
+            text = _extract_stats_text(raw)
+            keywords = _tokenize_words(text)
+            # Count frequency and take top 10
+            freq: dict[str, int] = {}
+            for w in keywords:
+                freq[w] = freq.get(w, 0) + 1
+            top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            nodes.append(
+                {
+                    "name": p.name,
+                    "display_name": display,
+                    "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    "size_bytes": st.st_size,
+                    "provider": provider,
+                    "keywords": [w for w, _ in top],
+                }
+            )
+        except Exception:
+            continue
+
+    result = {"nodes": nodes}
+    _graph_cache = result
+    _graph_cache_at = now
+    _graph_cache_key = cache_key
+    return result
 
 
 @app.delete("/api/recordings")
