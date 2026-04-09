@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LiveConfig:
     sample_rate: int = 16000
-    window_sec: float = 12.0
+    window_sec: float = 8.0
     overlap_sec: float = 1.0
-    min_step_sec: float = 0.8
+    min_step_sec: float = 1.0
     min_audio_sec: float = 0.7
     emit_epsilon_sec: float = 0.05
 

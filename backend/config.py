@@ -176,6 +176,12 @@ def _migrate_legacy_data() -> None:
                     dst = new_rec / p.name
                     if not dst.exists():
                         shutil.copy2(p, dst)
+                    stem = p.stem
+                    for ext in (".wav", ".m4a", ".mp3", ".flac", ".ogg", ".aac", ".mp4", ".webm"):
+                        audio_src = legacy_rec / f"{stem}{ext}"
+                        audio_dst = new_rec / audio_src.name
+                        if audio_src.exists() and not audio_dst.exists():
+                            shutil.copy2(audio_src, audio_dst)
     except Exception:
         # Non-fatal: app should continue even if migration fails.
         pass
@@ -265,4 +271,3 @@ def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
             k = providers[name].get("key") or ""
             providers[name]["key"] = "" if not k else (k[:3] + "..." + k[-2:])
     return cfg
-

@@ -4,6 +4,8 @@ type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type JobStatus = "queued" | "running" | "done" | "error";
 type KeyProvider = "openrouter" | "deepgram";
+type ViewName = "record" | "recordings" | "settings" | "graph";
+type UiTone = "neutral" | "info" | "success" | "warning" | "error";
 
 interface JobResultPayload {
   text?: string;
@@ -67,6 +69,10 @@ interface RecordingItem {
   size_bytes: number;
   provider: string;
   language: string;
+  has_audio?: boolean;
+  audio_name?: string;
+  audio_size_bytes?: number;
+  audio_mime?: string;
 }
 
 interface RecordingsStats {
@@ -96,6 +102,46 @@ interface FinishedRecordingEntry {
   finishedAt: number;
   text: string;
 }
+
+interface CurrentRecordingSummary {
+  title: string;
+  status: string;
+  tone: UiTone;
+  provider?: string;
+  model?: string;
+  language?: string;
+  durationSec?: number;
+  audioBytes?: number;
+  transcriptChars?: number;
+  transcriptWords?: number;
+  transcribeLatencyMs?: number;
+  savedName?: string;
+  recovered?: boolean;
+}
+
+interface LatestSavedAudioState {
+  savedName?: string;
+  archiveDir?: string;
+  title: string;
+  sizeBytes?: number;
+  downloadName?: string;
+  mimeType?: string;
+  file?: File | null;
+}
+
+interface SavedRecordingRef {
+  name: string;
+  archiveDir: string;
+}
+
+interface LiveSessionSnapshot {
+  provider: Provider;
+  effectiveProvider: Provider;
+  model: string;
+  language: string;
+}
+
+type UiStatusTone = "neutral" | "info" | "success" | "warning" | "error";
 
 declare global {
   interface Window {
@@ -139,6 +185,12 @@ const fmtMs = (ms: number): string => {
   if (n < 1000) return `${Math.round(n)} ms`;
   return `${(n / 1000).toFixed(2)} s`;
 };
+const fmtBytes = (bytes: number): string => {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+};
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 const MAX_FILE_BYTES = 500 * 1024 * 1024;
@@ -180,9 +232,9 @@ const UI_TOKENS = {
     waveformMixPeak: 0.45,
   },
   drain: {
-    maxWaitMs: 180,
-    idleMs: 45,
-    pollStepMs: 24,
+    maxWaitMs: 450,
+    idleMs: 120,
+    pollStepMs: 30,
   },
 } as const;
 const ALLOWED_AUDIO_MIME = new Set([
@@ -222,6 +274,16 @@ let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
 let silenceStartedAtMs = 0;
 let autoStopTriggered = false;
+let currentRecordingAudioObjectUrl = "";
+let activeLiveSessionId = "";
+let activeLiveArchiveDir = "";
+let activeLiveSessionSnapshot: LiveSessionSnapshot | null = null;
+let activeUiSessionToken = "";
+let currentRecordingSummary: CurrentRecordingSummary | null = null;
+let latestSavedAudioState: LatestSavedAudioState | null = null;
+let recordSessionNoticeTimer: number | null = null;
+let busyScopeToken = "";
+let liveStartAbortReason = "";
 const remoteModelByProvider: Record<RemoteProvider, string> = {
   openrouter: OPENROUTER_AUDIO_MODELS[1],
   deepgram: DEEPGRAM_AUDIO_MODELS[0],
@@ -242,12 +304,255 @@ const apiToken = (): string => {
 
 const authHeaders = (): HeadersInit => ({ "X-Api-Token": apiToken() });
 
-function setBusy(nextBusy: boolean): void {
+function createClientSessionId(): string {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `live-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function revokeCurrentRecordingAudioUrl(): void {
+  if (!currentRecordingAudioObjectUrl) return;
+  URL.revokeObjectURL(currentRecordingAudioObjectUrl);
+  currentRecordingAudioObjectUrl = "";
+}
+
+function isCurrentUiSession(token = ""): boolean {
+  if (!token) return true;
+  return token === activeUiSessionToken;
+}
+
+function latestRecordingAudioUrl(savedName = "", archiveDir = ""): string {
+  const safeName = String(savedName || "").trim();
+  if (!safeName) return "";
+  const params = new URLSearchParams({ token: apiToken() });
+  const safeArchiveDir = String(archiveDir || "").trim();
+  if (safeArchiveDir) params.set("archive_dir", safeArchiveDir);
+  return `/api/recordings/${encodeURIComponent(safeName)}/audio?${params.toString()}`;
+}
+
+function renderLatestSavedAudio(): void {
+  const row = $("currentRecordingAudioRow");
+  const audioEl = $("currentRecordingAudio") as HTMLAudioElement;
+  const labelEl = $("currentRecordingAudioRow").querySelector(".current-audio-label") as HTMLElement | null;
+  const openBtn = $("currentRecordingOpenBtn") as HTMLAnchorElement;
+  const downloadBtn = $("currentRecordingDownloadBtn") as HTMLAnchorElement;
+  const metaEl = $("currentRecordingAudioMeta");
+
+  audioEl.pause();
+  revokeCurrentRecordingAudioUrl();
+
+  if (!latestSavedAudioState) {
+    row.hidden = true;
+    if (labelEl) labelEl.textContent = "Latest Saved Audio";
+    audioEl.removeAttribute("src");
+    audioEl.load();
+    openBtn.href = "#";
+    downloadBtn.href = "#";
+    downloadBtn.removeAttribute("download");
+    metaEl.textContent = "Available after the first saved recording.";
+    return;
+  }
+
+  const backendUrl = latestRecordingAudioUrl(latestSavedAudioState.savedName || "", latestSavedAudioState.archiveDir || "");
+  const playbackUrl = latestSavedAudioState.file
+    ? URL.createObjectURL(latestSavedAudioState.file)
+    : backendUrl;
+  if (!playbackUrl) {
+    row.hidden = true;
+    audioEl.removeAttribute("src");
+    audioEl.load();
+    openBtn.href = "#";
+    downloadBtn.href = "#";
+    downloadBtn.removeAttribute("download");
+    metaEl.textContent = "Available after the first saved recording.";
+    return;
+  }
+  currentRecordingAudioObjectUrl = latestSavedAudioState.file ? playbackUrl : "";
+  audioEl.src = playbackUrl;
+  audioEl.load();
+  row.hidden = false;
+  if (labelEl) {
+    labelEl.textContent = latestSavedAudioState.savedName ? "Latest Saved Audio" : "Current Session Audio";
+  }
+  openBtn.href = backendUrl || playbackUrl;
+  downloadBtn.href = backendUrl || playbackUrl;
+  downloadBtn.download =
+    latestSavedAudioState.downloadName ||
+    latestSavedAudioState.file?.name ||
+    `${(latestSavedAudioState.savedName || "recording").replace(/\.txt$/i, "")}.wav`;
+  metaEl.textContent = latestSavedAudioState.sizeBytes
+    ? `${latestSavedAudioState.title} · ${fmtBytes(latestSavedAudioState.sizeBytes)}`
+    : latestSavedAudioState.title;
+}
+
+function setLatestSavedAudio(state: LatestSavedAudioState | null): void {
+  latestSavedAudioState = state
+    ? {
+      title: String(state.title || "").trim() || "Recording audio",
+      savedName: String(state.savedName || "").trim(),
+      archiveDir: String(state.archiveDir || "").trim(),
+      sizeBytes: Math.max(0, Number(state.sizeBytes) || 0),
+      downloadName: String(state.downloadName || "").trim(),
+      mimeType: String(state.mimeType || "").trim(),
+      file: state.file || null,
+    }
+    : null;
+  renderLatestSavedAudio();
+}
+
+function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir = "", _sessionToken = ""): void {
+  if (!file) {
+    setLatestSavedAudio(null);
+    return;
+  }
+  setLatestSavedAudio({
+    title: savedName ? recordingTitleFromName(savedName) : (file.name || "Recording audio"),
+    savedName,
+    archiveDir,
+    sizeBytes: file.size,
+    downloadName: file.name || "recording.wav",
+    mimeType: file.type || "",
+    file,
+  });
+}
+
+function providerLabel(provider: string): string {
+  const value = String(provider || "").trim().toLowerCase();
+  if (!value || value === "unknown") return "Unknown";
+  if (value === "local") return "Local";
+  if (value === "openrouter") return "OpenRouter";
+  if (value === "deepgram") return "Deepgram";
+  return provider;
+}
+
+function countWords(text: string): number {
+  const value = String(text || "").trim();
+  if (!value) return 0;
+  return value.split(/\s+/).filter(Boolean).length;
+}
+
+function recordingTitleFromName(name: string): string {
+  return decodeURIComponent(String(name || "").replace(/\.txt$/i, ""));
+}
+
+function resetRecordSessionNotice(): void {
+  if (recordSessionNoticeTimer) {
+    window.clearTimeout(recordSessionNoticeTimer);
+    recordSessionNoticeTimer = null;
+  }
+  const el = $("recordSessionNotice");
+  el.hidden = true;
+  el.className = "session-notice";
+  $("recordSessionNoticeText").textContent = "";
+}
+
+function showRecordSessionNotice(message: string, tone: UiTone = "info", timeoutMs = 7000, sessionToken = ""): void {
+  if (!isCurrentUiSession(sessionToken)) return;
+  const text = String(message || "").trim();
+  if (!text) {
+    resetRecordSessionNotice();
+    return;
+  }
+  if (recordSessionNoticeTimer) {
+    window.clearTimeout(recordSessionNoticeTimer);
+    recordSessionNoticeTimer = null;
+  }
+  const el = $("recordSessionNotice");
+  el.hidden = false;
+  el.className = `session-notice ${tone}`;
+  $("recordSessionNoticeText").textContent = text;
+  if (timeoutMs > 0) {
+    recordSessionNoticeTimer = window.setTimeout(() => {
+      resetRecordSessionNotice();
+    }, timeoutMs);
+  }
+}
+
+function renderCurrentRecordingSummary(): void {
+  const card = $("recordingSummaryCard");
+  const titleEl = $("recordingSummaryTitle");
+  const statusEl = $("recordingSummaryStatus");
+  const metaEl = $("recordingSummaryMeta");
+  const openBtn = $("recordingSummaryOpenRecordingsBtn") as HTMLButtonElement;
+  const summary = currentRecordingSummary;
+  if (!summary) {
+    card.hidden = true;
+    card.className = "recording-summary-card";
+    titleEl.textContent = "Recording summary";
+    statusEl.textContent = "Audio capture is idle.";
+    metaEl.replaceChildren();
+    openBtn.disabled = true;
+    return;
+  }
+
+  card.hidden = false;
+  card.className = `recording-summary-card ${summary.tone}`;
+  titleEl.textContent = summary.title || "Recording summary";
+  statusEl.textContent = summary.status || "Awaiting next action.";
+  openBtn.disabled = !summary.savedName;
+
+  const chips: Array<{ text: string; tone?: "strong" | "success" | "warning" }> = [];
+  if (summary.savedName) chips.push({ text: "Saved", tone: "success" });
+  if (summary.recovered) chips.push({ text: "Recovered", tone: "warning" });
+  if (summary.provider) chips.push({ text: providerLabel(summary.provider), tone: "strong" });
+  if (summary.model) chips.push({ text: summary.model });
+  if (summary.language) chips.push({ text: `Lang ${String(summary.language).toUpperCase()}` });
+  if (summary.durationSec && summary.durationSec > 0) chips.push({ text: `Duration ${fmtDur(summary.durationSec)}` });
+  if (summary.audioBytes && summary.audioBytes > 0) chips.push({ text: `Audio ${fmtBytes(summary.audioBytes)}` });
+  if (summary.transcriptWords && summary.transcriptWords > 0) chips.push({ text: `${summary.transcriptWords} words` });
+  if (summary.transcriptChars && summary.transcriptChars > 0) chips.push({ text: `${summary.transcriptChars} chars` });
+  if (summary.transcribeLatencyMs && summary.transcribeLatencyMs > 0) chips.push({ text: `Latency ${fmtMs(summary.transcribeLatencyMs)}` });
+
+  metaEl.replaceChildren();
+  chips.forEach((chip) => {
+    const node = document.createElement("span");
+    node.className = `meta-chip${chip.tone ? ` ${chip.tone}` : ""}`;
+    node.textContent = chip.text;
+    metaEl.appendChild(node);
+  });
+}
+
+function setCurrentRecordingSummary(summary: CurrentRecordingSummary | null, sessionToken = ""): void {
+  if (!isCurrentUiSession(sessionToken)) return;
+  currentRecordingSummary = summary ? { ...summary } : null;
+  renderCurrentRecordingSummary();
+}
+
+function patchCurrentRecordingSummary(patch: Partial<CurrentRecordingSummary>, sessionToken = ""): void {
+  if (!isCurrentUiSession(sessionToken)) return;
+  const next: CurrentRecordingSummary = {
+    title: currentRecordingSummary?.title || "Recording summary",
+    status: currentRecordingSummary?.status || "Awaiting next action.",
+    tone: currentRecordingSummary?.tone || "neutral",
+    ...(currentRecordingSummary || {}),
+    ...patch,
+  };
+  setCurrentRecordingSummary(next, sessionToken);
+}
+
+function setBusy(nextBusy: boolean, scopeToken = ""): void {
+  if (scopeToken) {
+    if (nextBusy) {
+      busyScopeToken = scopeToken;
+    } else if (busyScopeToken && busyScopeToken !== scopeToken) {
+      return;
+    } else {
+      busyScopeToken = "";
+    }
+  } else if (!nextBusy) {
+    busyScopeToken = "";
+  }
   isBusy = !!nextBusy;
   ["btnStart", "btnStop", "btnTranscribeFile", "pickFileBtn", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
+}
+
+function setStatusScoped(scopeToken: string, st: string): void {
+  if (!isCurrentUiSession(scopeToken)) return;
+  setStatus(st);
 }
 
 function setRecordButton(recording: boolean): void {
@@ -260,7 +565,16 @@ function setStatus(st: string): void {
   $("statusText").textContent = st;
   const dot = $("statusDot");
   dot.className =
-    "status-dot" + (st === "Recording" ? " rec" : st === "Processing" ? " process" : st === "Done" ? " done" : "");
+    "status-dot" +
+    (st === "Recording"
+      ? " rec"
+      : st === "Processing" || st.startsWith("Processing") || st === "Refining..."
+        ? " process"
+        : st === "Done"
+          ? " done"
+          : st === "Error" || st === "Backend Error"
+            ? " error"
+            : "");
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -442,6 +756,51 @@ function encodeCompactWav(
   return encodeWav(resampled, outputSr);
 }
 
+function mergeCapturedChunks(frames: Float32Array[]): Float32Array {
+  if (!frames.length) return new Float32Array(0);
+  const total = frames.reduce((acc, chunk) => acc + chunk.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of frames) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+function createWavFileFromSamples(samples: Float32Array, sampleRate: number, name: string): File {
+  const audioBlob = encodeWav(samples, sampleRate);
+  return new File([audioBlob], name, { type: audioBlob.type || "audio/wav" });
+}
+
+function createCompactWavFileFromSamples(samples: Float32Array, inputSampleRate: number, name: string): File {
+  const audioBlob = encodeCompactWav(samples, inputSampleRate, AUDIO_TOKENS.compactSampleRateHz);
+  return new File([audioBlob], name, { type: audioBlob.type || "audio/wav" });
+}
+
+async function stopMediaRecorderAndFlush(): Promise<void> {
+  const recorder = mediaRecorder;
+  if (!recorder || recorder.state === "inactive") return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    recorder.addEventListener("stop", finish, { once: true });
+    window.setTimeout(finish, UI_TOKENS.polling.remoteChunkSettleTimeoutMs);
+    try {
+      recorder.requestData();
+    } catch { }
+    try {
+      recorder.stop();
+    } catch {
+      finish();
+    }
+  });
+}
+
 function getRemoteModelValue(provider: Provider): string {
   if (provider === "openrouter") {
     const v = (remoteModelByProvider.openrouter || "").trim();
@@ -509,7 +868,7 @@ async function remoteJob(
 
 async function remoteJobSync(
   file: File,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
+  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
 ): Promise<{ text: string; provider: string; model?: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
@@ -519,7 +878,12 @@ async function remoteJobSync(
   if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
   }
-  const r = await fetch("/api/remote/transcribe-sync", { method: "POST", body: fd, headers: authHeaders() });
+  const r = await fetch("/api/remote/transcribe-sync", {
+    method: "POST",
+    body: fd,
+    headers: authHeaders(),
+    signal: opts.signal,
+  });
   if (!r.ok) throw new Error(await parseError(r));
   const js = (await r.json()) as { ok?: boolean; result?: { text?: string; provider?: string; model?: string } };
   return {
@@ -546,7 +910,7 @@ function isTransientRemoteNetworkError(err: unknown): boolean {
 
 async function remoteJobSyncWithFallback(
   file: File,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
+  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
 ): Promise<{ text: string; provider: string; model?: string }> {
   // Single implementation — kept as a named function for stack trace readability
   // and to provide a single place for future fallback/retry logic.
@@ -576,6 +940,259 @@ function providerKeyErrorMessage(provider: Provider): string {
   return "Provider API key is not configured.";
 }
 
+function setArchiveStatus(message: string, tone: UiStatusTone = "neutral"): void {
+  const normalizedTone = tone || "neutral";
+  ["recordingsArchiveStatus", "settingsArchiveStatus"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = message;
+    el.className = `archive-status archive-status-${normalizedTone}`;
+  });
+  syncRecordContextStrip();
+  syncRecordingsHeaderSummary();
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
+}
+
+function setSettingsSaveStatus(message: string, tone: UiStatusTone = "neutral"): void {
+  const el = $("settingsSaveStatus");
+  el.textContent = message;
+  el.className = `settings-save-status settings-save-status-${tone}`;
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
+}
+
+function selectedMicLabel(): string {
+  const select = $("micSelect") as HTMLSelectElement;
+  const option = select.selectedOptions?.[0];
+  const raw = String(option?.textContent || "").trim();
+  if (!raw || raw.toLowerCase().includes("select mic")) return "Not selected";
+  return raw;
+}
+
+function archiveLabelShort(pathValue: string): string {
+  const raw = String(pathValue || "").trim();
+  if (!raw) return "Default archive";
+  const parts = raw.split("/").filter(Boolean);
+  return parts[parts.length - 1] || raw;
+}
+
+function setSectionSummary(
+  containerId: string,
+  items: Array<{ text: string; tone?: UiStatusTone }>
+): void {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.replaceChildren();
+  items
+    .filter((item) => String(item?.text || "").trim())
+    .forEach((item) => {
+      const chip = document.createElement("span");
+      chip.className = `section-chip${item.tone && item.tone !== "neutral" ? ` ${item.tone}` : ""}`;
+      chip.textContent = item.text;
+      container.appendChild(chip);
+    });
+}
+
+function syncRecordingsHeaderSummary(): void {
+  const total = recordingItems.length;
+  const filtered = getFilteredRecordings().length;
+  const archiveName = archiveLabelShort(currentArchiveDirSnapshot() || configuredRecordingsDir);
+  const selectedItem = selectedRecordingName ? recordingItems.find((item) => item.name === selectedRecordingName) : null;
+  setSectionSummary("recordingsHeaderSummary", [
+    { text: total ? `${total} saved session${total === 1 ? "" : "s"}` : "No saved sessions", tone: total ? "success" : "neutral" },
+    {
+      text: recordingsSearchQuery ? `${filtered} visible in search` : "Full archive view",
+      tone: recordingsSearchQuery ? "info" : "neutral",
+    },
+    {
+      text: `Archive · ${archiveName}`,
+      tone: currentArchiveDirSnapshot() || configuredRecordingsDir ? "info" : "warning",
+    },
+    ...(selectedItem ? [{ text: `Selected · ${selectedItem.display_name}`, tone: "neutral" as UiStatusTone }] : []),
+  ]);
+}
+
+function syncSettingsHeaderSummary(): void {
+  const keyCount = Number(hasOpenrouterKey) + Number(hasDeepgramKey);
+  const shortcutCount = Number(!!currentShortcuts.record) + Number(!!currentShortcuts.paste);
+  const draftArchive =
+    document.getElementById("recordingsDirInput") instanceof HTMLInputElement
+      ? (document.getElementById("recordingsDirInput") as HTMLInputElement).value.trim()
+      : "";
+  const archiveName = archiveLabelShort(draftArchive || currentArchiveDirSnapshot() || configuredRecordingsDir);
+  setSectionSummary("settingsHeaderSummary", [
+    { text: `${keyCount}/2 remote keys configured`, tone: keyCount === 2 ? "success" : keyCount ? "warning" : "neutral" },
+    { text: `Archive · ${archiveName}`, tone: currentArchiveDirSnapshot() || configuredRecordingsDir ? "info" : "neutral" },
+    { text: `${shortcutCount}/2 shortcuts ready`, tone: shortcutCount === 2 ? "success" : "warning" },
+  ]);
+}
+
+function syncSettingsCardSummaries(): void {
+  setSectionSummary("apiKeysCardSummary", [
+    { text: hasOpenrouterKey ? "OpenRouter ready" : "OpenRouter missing", tone: hasOpenrouterKey ? "success" : "warning" },
+    { text: hasDeepgramKey ? "Deepgram ready" : "Deepgram missing", tone: hasDeepgramKey ? "success" : "warning" },
+  ]);
+
+  const autoStopEnabled = document.getElementById("autoStopSilenceEnabled") instanceof HTMLInputElement
+    ? (document.getElementById("autoStopSilenceEnabled") as HTMLInputElement).checked
+    : false;
+  const autoStopSeconds = document.getElementById("autoStopSilenceSeconds") instanceof HTMLInputElement
+    ? (document.getElementById("autoStopSilenceSeconds") as HTMLInputElement).value.trim()
+    : "";
+  const autoStopDb = document.getElementById("autoStopSilenceDb") instanceof HTMLInputElement
+    ? (document.getElementById("autoStopSilenceDb") as HTMLInputElement).value.trim()
+    : "";
+  setSectionSummary("defaultsCardSummary", [
+    { text: autoStopEnabled ? "Auto stop on silence" : "Manual stop only", tone: autoStopEnabled ? "success" : "neutral" },
+    { text: autoStopSeconds ? `${autoStopSeconds}s silence window` : "Silence window unset", tone: "info" },
+    { text: autoStopDb ? `${autoStopDb} dBFS threshold` : "Threshold unset", tone: "neutral" },
+  ]);
+
+  const archiveDraft = document.getElementById("recordingsDirInput") instanceof HTMLInputElement
+    ? (document.getElementById("recordingsDirInput") as HTMLInputElement).value.trim()
+    : "";
+  const activeArchiveName = archiveLabelShort(archiveDraft || currentArchiveDirSnapshot() || configuredRecordingsDir);
+  setSectionSummary("archiveCardSummary", [
+    { text: `Target · ${activeArchiveName}`, tone: archiveDraft || currentArchiveDirSnapshot() || configuredRecordingsDir ? "info" : "neutral" },
+    { text: recordingsBootstrapReady ? "Archive ready" : "Archive syncing", tone: recordingsBootstrapReady ? "success" : "warning" },
+  ]);
+
+  setSectionSummary("shortcutsCardSummary", [
+    { text: `Record · ${acceleratorToDisplay(currentShortcuts.record)}`, tone: currentShortcuts.record ? "success" : "warning" },
+    { text: `Paste · ${acceleratorToDisplay(currentShortcuts.paste)}`, tone: currentShortcuts.paste ? "success" : "warning" },
+  ]);
+}
+
+function syncGraphHeaderSummary(): void {
+  const providerCount = new Set(gNodes.map((node) => node.provider).filter(Boolean)).size;
+  const archiveName = archiveLabelShort(currentArchiveDirSnapshot() || configuredRecordingsDir);
+  setSectionSummary("graphHeaderSummary", [
+    { text: `${gNodes.length} node${gNodes.length === 1 ? "" : "s"}`, tone: gNodes.length ? "success" : "neutral" },
+    { text: providerCount ? `${providerCount} provider group${providerCount === 1 ? "" : "s"}` : "No provider groups", tone: providerCount ? "info" : "neutral" },
+    { text: `Archive · ${archiveName}`, tone: currentArchiveDirSnapshot() || configuredRecordingsDir ? "info" : "neutral" },
+    {
+      text: gNodes.length ? "Click any node to open its recording" : "Create recordings to populate the graph",
+      tone: gNodes.length ? "neutral" : "warning",
+    },
+  ]);
+}
+
+function setGraphStatus(message: string, tone: UiStatusTone = "neutral"): void {
+  const el = $("graphStatus");
+  el.textContent = message;
+  el.className = `archive-status archive-status-${tone}`;
+  syncGraphHeaderSummary();
+}
+
+function syncWindowViewMeta(view: ViewName): void {
+  const meta =
+    view === "settings"
+      ? "Keys, defaults, archive, and shortcut controls."
+      : view === "recordings"
+        ? "Search, review, replay, and manage saved sessions."
+        : view === "graph"
+          ? "Explore relationships across saved transcripts."
+          : "Live capture, transcription, archive, and session status.";
+  $("windowViewMeta").textContent = meta;
+}
+
+function syncRecordContextStrip(): void {
+  $("recordContextMic").textContent = `Mic: ${selectedMicLabel()}`;
+  const archiveShort = archiveLabelShort(currentArchiveDirSnapshot() || configuredRecordingsDir);
+  $("recordContextArchive").textContent = recordingsBootstrapReady
+    ? `Archive: ${archiveShort}`
+    : "Archive: Initializing…";
+  if (isRecording && activeLiveSessionSnapshot) {
+    const provider = providerLabel(activeLiveSessionSnapshot.effectiveProvider);
+    const language = String(activeLiveSessionSnapshot.language || "auto").toUpperCase();
+    $("recordContextSession").textContent = `Session: Locked · ${provider} · ${activeLiveSessionSnapshot.model} · ${language}`;
+    return;
+  }
+  $("recordContextSession").textContent = "Session: Ready for a new recording";
+}
+
+function syncRecordingsSearchControls(): void {
+  const clearBtn = $("recordingsSearchClearBtn") as HTMLButtonElement;
+  const hasQuery = !!recordingsSearchQuery.trim();
+  clearBtn.disabled = recordingsUiLoading || !hasQuery;
+}
+
+function setRecordingViewerHelper(message: string): void {
+  $("recordingViewerHelper").textContent = message;
+}
+
+function modalFocusableElements(modal: HTMLElement): HTMLElement[] {
+  return Array.from(
+    modal.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((el) => !el.hasAttribute("hidden"));
+}
+
+function openModal(modalId: string, focusSelector = ""): void {
+  const modal = $(modalId);
+  lastModalFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  modal.hidden = false;
+  activeModalId = modalId;
+  const focusTarget = focusSelector ? (modal.querySelector(focusSelector) as HTMLElement | null) : null;
+  const fallback = modalFocusableElements(modal)[0] || modal;
+  (focusTarget || fallback).focus();
+}
+
+function closeModal(modalId: string): void {
+  const modal = $(modalId);
+  modal.hidden = true;
+  if (activeModalId === modalId) activeModalId = "";
+  if (lastModalFocus && document.contains(lastModalFocus)) {
+    lastModalFocus.focus();
+  }
+  lastModalFocus = null;
+}
+
+function syncPaneContexts(): void {
+  syncRecordContextStrip();
+  const sessionSnapshot = isRecording ? activeLiveSessionSnapshot : null;
+  const livePreviewEnabled = shouldLivePreview();
+  const liveModel = sessionSnapshot
+    ? sessionSnapshot.effectiveProvider === "local"
+      ? resolveLivePreviewLocalModel(sessionSnapshot.model)
+      : sessionSnapshot.model
+    : resolveLivePreviewLocalModel(($("model") as HTMLSelectElement).value);
+  const language = (sessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto")).trim().toUpperCase();
+  const livePrefix = livePreviewEnabled ? "Live preview on" : "Live preview is off";
+  $("livePaneContext").textContent = sessionSnapshot
+    ? `${livePrefix} · session locked · ${liveModel} · ${language}`
+    : livePreviewEnabled
+      ? `Live preview on · ${liveModel} · ${language}`
+      : "Live preview is off. Recording still captures the full audio.";
+
+  const selectedProvider = sessionSnapshot?.provider || ((($("providerSelect") as HTMLSelectElement).value || "local") as Provider);
+  const effectiveProvider = sessionSnapshot?.effectiveProvider || resolveEffectiveProvider(selectedProvider);
+  const providerModel =
+    sessionSnapshot?.model ||
+    (effectiveProvider === "local"
+      ? resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value)
+      : getRemoteModelValue(effectiveProvider));
+  const providerText =
+    effectiveProvider === "local"
+      ? `Local · ${providerModel}`
+      : `${providerLabel(effectiveProvider)} · ${providerModel}`;
+  const autoTranscribeText = shouldAutoTranscribe() ? "Auto transcribe on" : "Auto transcribe off";
+  const providerSuffix =
+    selectedProvider !== effectiveProvider ? `${providerText} · fallback active` : providerText;
+  $("resultPaneContext").textContent = sessionSnapshot
+    ? `${autoTranscribeText} · session locked · ${providerSuffix}`
+    : `${autoTranscribeText} · ${providerSuffix}`;
+
+  const upscaleEnabled = shouldUpscale();
+  const preset = selectedUpscalePreset();
+  const autoSendEnabled = ($("autoSendEnterToggle") as HTMLButtonElement).classList.contains("active");
+  $("upscalePaneContext").textContent = upscaleEnabled
+    ? `${sessionSnapshot ? "Session locked · " : ""}Upscale on · ${preset?.name || "Preset"}${autoSendEnabled ? " · auto send" : ""}`
+    : "Upscale is off. Raw transcript is used as the canonical output.";
+}
+
 async function localJob(
   file: File,
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean }
@@ -591,6 +1208,66 @@ async function localJob(
   return (await r.json()) as { job_id: string };
 }
 
+async function localJobSync(
+  file: File,
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean }
+): Promise<{ text: string }> {
+  const fd = new FormData();
+  fd.append("file", file, file.name || "audio.wav");
+  fd.set("language", opts.language || "auto");
+  fd.set("model", opts.model || "small");
+  fd.set("split_stereo", String(!!opts.splitStereo));
+  fd.set("word_timestamps", String(!!opts.wordTimestamps));
+  const r = await fetch("/api/transcribe-sync", { method: "POST", body: fd, headers: authHeaders() });
+  if (!r.ok) throw new Error(await parseError(r));
+  const js = (await r.json()) as { ok?: boolean; result?: { text?: string } };
+  return { text: String(js?.result?.text || "").trim() };
+}
+
+async function warmLocalModel(model: string): Promise<void> {
+  const resolvedModel = (model || "").trim() || "small";
+  const fd = new FormData();
+  fd.set("model", resolvedModel);
+  const r = await fetch("/api/transcribe/warmup", { method: "POST", body: fd, headers: authHeaders() });
+  if (!r.ok) throw new Error(await parseError(r));
+}
+
+async function discardLiveRecovery(sessionId: string): Promise<void> {
+  const safeSessionId = (sessionId || "").trim();
+  if (!safeSessionId) return;
+  const r = await fetch(`/api/live/recoveries/${encodeURIComponent(safeSessionId)}/discard`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!r.ok) throw new Error(await parseError(r));
+}
+
+async function recoverBackendAudioSessions(): Promise<void> {
+  const r = await apiGet<{ items: Array<{ session_id: string }> }>("/api/live/recoveries");
+  const items = Array.isArray(r.items) ? r.items : [];
+  if (!items.length) return;
+  const archiveDir = currentArchiveDirSnapshot();
+  for (const item of items) {
+    const sessionId = String(item?.session_id || "").trim();
+    if (!sessionId) continue;
+    const resp = await fetch(`/api/live/recoveries/${encodeURIComponent(sessionId)}/promote`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(archiveDir ? { archive_dir: archiveDir } : {}),
+    });
+    if (!resp.ok) throw new Error(await parseError(resp));
+  }
+  showRecordSessionNotice(
+    `Recovered ${items.length} interrupted recording${items.length === 1 ? "" : "s"} into Recordings.`,
+    "success",
+    9000
+  );
+  loadRecordings(true).catch(() => { });
+}
+
 function resolveFastLocalLanguage(language: string): string {
   const raw = String(language || "").trim();
   if (raw && raw.toLowerCase() !== "auto") return raw;
@@ -601,6 +1278,25 @@ function resolveFastLiveLocalModel(model: string): string {
   const raw = String(model || "").trim() || "small";
   if (raw === "medium" || raw === "large-v3") return "small";
   return raw;
+}
+
+function resolveLivePreviewLocalModel(model: string): string {
+  const raw = String(model || "").trim() || "small";
+  if (raw === "tiny" || raw === "base") return raw;
+  return "tiny";
+}
+
+function scheduleLocalWarmup(): void {
+  const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const provider = resolveEffectiveProvider(selectedProvider);
+  if (provider !== "local") return;
+  const model =
+    $("uploadPanel").hidden
+      ? resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value)
+      : (($("model") as HTMLSelectElement).value || "small");
+  warmLocalModel(model).catch((e) => {
+    console.warn("Local model warmup failed", e);
+  });
 }
 
 async function pollJob(
@@ -657,6 +1353,32 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
     return;
   }
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
+  syncPaneContexts();
+}
+
+function switchView(view: ViewName): void {
+  document.querySelectorAll(".view").forEach((el) => {
+    const node = el as HTMLElement;
+    node.hidden = node.dataset.view !== view;
+  });
+  document.querySelectorAll(".sb-item").forEach((el) => {
+    const active = (el as HTMLElement).dataset.view === view;
+    el.classList.toggle("active", active);
+    if (active) {
+      el.setAttribute("aria-current", "page");
+    } else {
+      el.removeAttribute("aria-current");
+    }
+  });
+  $("windowViewLabel").textContent =
+    view === "settings" ? "Settings" : view === "recordings" ? "Recordings" : view === "graph" ? "Graph" : "Record";
+  syncWindowViewMeta(view);
+  if (view === "recordings") {
+    void loadRecordings(true).catch(() => { });
+  }
+  if (view === "graph") {
+    void loadGraphData();
+  }
 }
 
 function resolveEffectiveProvider(preferred: Provider): Provider {
@@ -684,16 +1406,8 @@ async function refreshNetworkState(): Promise<void> {
 
 document.querySelectorAll(".sb-item").forEach((e) => {
   e.addEventListener("click", () => {
-    const v = (e as HTMLElement).dataset.view;
-    document.querySelectorAll(".view").forEach((el) => ((el as HTMLElement).hidden = (el as HTMLElement).dataset.view !== v));
-    document.querySelectorAll(".sb-item").forEach((el) => el.classList.toggle("active", (el as HTMLElement).dataset.view === v));
-    $("windowViewLabel").textContent = v === "settings" ? "Settings" : v === "recordings" ? "Recordings" : v === "graph" ? "Graph" : "Record";
-    if (v === "recordings") {
-      void loadRecordings(false);
-    }
-    if (v === "graph") {
-      void loadGraphData();
-    }
+    const v = ((e as HTMLElement).dataset.view || "record") as ViewName;
+    switchView(v);
   });
 });
 
@@ -727,16 +1441,18 @@ async function loadMics(forceReload = false): Promise<void> {
     if (nextVal && Array.from(sel.options).some((o) => o.value === nextVal)) {
       sel.value = nextVal;
     }
+    syncRecordContextStrip();
   } catch (e) {
     console.error("Error loading microphones:", e);
     const sel = $("micSelect") as HTMLSelectElement;
     if (forceReload || !sel.options.length || /loading/i.test(sel.value || "")) {
       sel.innerHTML = '<option value="">Permission denied</option>';
     }
+    syncRecordContextStrip();
   }
 }
 
-($("micSelect") as HTMLSelectElement).onclick = () => void loadMics(true);
+($("refreshMicsBtn") as HTMLButtonElement).addEventListener("click", () => void loadMics(true));
 
 const canvas = $("waveCanvas") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
@@ -818,7 +1534,7 @@ function draw(): void {
 let waveLoopRunning = false;
 function waveLoop(): void {
   if (!waveLoopRunning) return;
-  if (waveDirty) draw();
+  if (waveDirty && document.visibilityState === "visible") draw();
   requestAnimationFrame(waveLoop);
 }
 function startWaveLoop(): void {
@@ -861,9 +1577,12 @@ function persistLiveDraft(recording: boolean): void {
       title,
       source_text: liveText,
       transcript_text: finalText,
-      provider: ($("providerSelect") as HTMLSelectElement).value || "local",
-      model: getRemoteModelValue((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
-      language: ($("language") as HTMLSelectElement).value,
+      provider: activeLiveSessionSnapshot?.provider || (($("providerSelect") as HTMLSelectElement).value || "local"),
+      model:
+        activeLiveSessionSnapshot?.model ||
+        getRemoteModelValue((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
+      language: activeLiveSessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
+      archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
     };
     localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
   } catch { }
@@ -891,6 +1610,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       provider?: string;
       model?: string;
       language?: string;
+      archive_dir?: string;
       updated_at?: number;
     };
     const sourceText = String(draft.source_text || "").trim();
@@ -900,7 +1620,8 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       return;
     }
     const stamp = Number(draft.updated_at || Date.now());
-    await saveRecordingText({
+    const recovered = await saveRecordingText({
+      archiveDir: String(draft.archive_dir || "").trim() || currentArchiveDirSnapshot(),
       title: String(draft.title || "Recovered recording") + " (Recovered)",
       sourceText,
       transcriptText,
@@ -909,6 +1630,19 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       language: String(draft.language || "auto"),
     });
     $("finalOutput").textContent = transcriptText || sourceText;
+    setCurrentRecordingSummary({
+      title: String(draft.title || "Recovered recording"),
+      status: "Recovered unsaved draft from the previous session.",
+      tone: "warning",
+      provider: String(draft.provider || "local"),
+      model: String(draft.model || "-"),
+      language: String(draft.language || "auto"),
+      transcriptChars: (transcriptText || sourceText).length,
+      transcriptWords: countWords(transcriptText || sourceText),
+      savedName: recovered.name,
+      recovered: true,
+    });
+    showRecordSessionNotice("Recovered the last unsaved draft from a previous session.", "warning", 9000);
     setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
     clearLiveDraft();
   } catch {
@@ -1006,6 +1740,8 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
   if (!btn) return;
   const keysSpan = btn.querySelector(".shortcut-keys");
   if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
 }
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
@@ -1061,6 +1797,8 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
 
   // Persist to config
   queueUiPreferencesSave();
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
 
   // Signal the Electron main process to reload shortcuts
   (window as any).__transcriptorPendingShortcuts = {
@@ -1079,6 +1817,7 @@ function setAutoSendEnterEnabled(enabled: boolean): void {
   btn.classList.toggle("active", on);
   btn.setAttribute("aria-pressed", on ? "true" : "false");
   btn.title = on ? "Auto send after paste: ON" : "Auto send after paste: OFF";
+  syncPaneContexts();
 }
 
 function upscalePresetId(): string {
@@ -1124,22 +1863,21 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   const customCount = upscalePresets.filter((x) => !x.builtin).length;
   addBtn.disabled = customCount >= 3;
   syncUpscalePresetControls();
+  syncPaneContexts();
 }
 
 function openUpscalePresetModal(): void {
-  const modal = $("upscalePresetModal");
   const name = $("upscalePresetNameInput") as HTMLInputElement;
   const instruction = $("upscalePresetInstructionInput") as HTMLTextAreaElement;
   $("upscalePresetMsg").textContent = "";
   name.value = "";
   instruction.value =
     "Improve transcript quality: keep same language as input, preserve meaning, fix punctuation and grammar. Return only final transcript text without quotes.";
-  modal.hidden = false;
-  name.focus();
+  openModal("upscalePresetModal", "#upscalePresetNameInput");
 }
 
 function closeUpscalePresetModal(): void {
-  $("upscalePresetModal").hidden = true;
+  closeModal("upscalePresetModal");
 }
 
 function openUpscalePromptModal(): void {
@@ -1150,24 +1888,27 @@ function openUpscalePromptModal(): void {
   ($("upscalePromptInstructionInput") as HTMLTextAreaElement).value =
     String(preset.instruction || preset.default_instruction || "").trim();
   $("upscalePromptMsg").textContent = "";
-  $("upscalePromptModal").hidden = false;
-  ($("upscalePromptInstructionInput") as HTMLTextAreaElement).focus();
+  openModal("upscalePromptModal", "#upscalePromptInstructionInput");
 }
 
 function closeUpscalePromptModal(): void {
-  $("upscalePromptModal").hidden = true;
+  closeModal("upscalePromptModal");
 }
 
-async function runUpscaleIfEnabled(text: string): Promise<string> {
+async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<string> {
   const input = String(text || "").trim();
   if (!input) return "";
   if (!shouldUpscale()) {
-    $("upscaleOutput").textContent = "";
-    $("upscaleLatency").textContent = "--";
+    if (isCurrentUiSession(sessionToken)) {
+      $("upscaleOutput").textContent = "";
+      $("upscaleLatency").textContent = "--";
+    }
     return input;
   }
-  setStatus("Upscaling");
-  $("upscaleOutput").textContent = "Upscaling...";
+  setStatusScoped(sessionToken, "Upscaling");
+  if (isCurrentUiSession(sessionToken)) {
+    $("upscaleOutput").textContent = "Upscaling...";
+  }
   const t0 = performance.now();
   const remoteModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
   try {
@@ -1178,15 +1919,19 @@ async function runUpscaleIfEnabled(text: string): Promise<string> {
     });
     const out = String(r.text || "").trim();
     if (!out) throw new Error("Upscale returned empty text");
-    $("upscaleOutput").textContent = out;
-    $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
-    setStatus("Done");
+    if (isCurrentUiSession(sessionToken)) {
+      $("upscaleOutput").textContent = out;
+      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+    }
+    setStatusScoped(sessionToken, "Done");
     return out;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
-    $("upscaleOutput").textContent = `Upscale failed: ${msg}\n\nUsing original transcript.`;
-    $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
-    setStatus("Done");
+    if (isCurrentUiSession(sessionToken)) {
+      $("upscaleOutput").textContent = `Upscale failed: ${msg}\n\nUsing original transcript.`;
+      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+    }
+    setStatusScoped(sessionToken, "Done");
     return input;
   }
 }
@@ -1197,20 +1942,49 @@ function queueUiPreferencesSave(): void {
     clearTimeout(uiPrefSaveTimer);
     uiPrefSaveTimer = null;
   }
+  setSettingsSaveStatus("Saving settings locally…", "info");
   uiPrefSaveTimer = window.setTimeout(() => {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
     const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
     const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+    const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
+    const shouldRefreshRecordingsArchive = nextRecordingsDir !== configuredRecordingsDir;
     ($("orModel") as HTMLInputElement).value = openrouterModel;
     void apiPost<{ ok: boolean }>("/api/config", {
       preferences: {
-        recordings_dir: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
+        recordings_dir: nextRecordingsDir,
         remote_provider: remoteProvider,
         openrouter: { model: openrouterModel || "google/gemini-2.5-flash" },
         ui: collectUiPreferences(),
       },
-    }).catch(() => { });
+    })
+      .then(() => {
+        configuredRecordingsDir = nextRecordingsDir;
+        setSettingsSaveStatus("Settings saved locally.", "success");
+        if (!shouldRefreshRecordingsArchive) return;
+        activeResolvedRecordingsDir = "";
+        recordingsBootstrapReady = false;
+        setArchiveStatus("Switching to the selected archive…", "info");
+        const reloadTask = loadRecordings(false).catch((e) => {
+          console.warn("Recordings archive reload failed", e);
+          setArchiveStatus("Archive reload failed. The previous archive remains active.", "error");
+          setSettingsSaveStatus("Settings saved, but archive reload failed.", "warning");
+        });
+        const trackedReloadPromise = reloadTask.finally(() => {
+          if (recordingsBootstrapPromise === trackedReloadPromise) {
+            recordingsBootstrapPromise = null;
+          }
+          recordingsBootstrapReady = !!currentArchiveDirSnapshot();
+          if (recordingsBootstrapReady) {
+            setArchiveStatus("Archive is ready.", "success");
+          }
+        });
+        recordingsBootstrapPromise = trackedReloadPromise;
+      })
+      .catch(() => {
+        setSettingsSaveStatus("Failed to save settings locally.", "error");
+      });
   }, UI_TOKENS.settings.saveDebounceMs);
 }
 
@@ -1230,7 +2004,8 @@ async function loadCfg(): Promise<void> {
     syncKeyActionButton("deepgram");
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
-    ($("recordingsDirInput") as HTMLInputElement).value = (cfg.preferences || {}).recordings_dir || "";
+    configuredRecordingsDir = (cfg.preferences || {}).recordings_dir || "";
+    ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;
     const ui = (cfg.preferences || {}).ui || {};
     remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || OPENROUTER_AUDIO_MODELS[1];
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEEPGRAM_AUDIO_MODELS[0] || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
@@ -1297,6 +2072,10 @@ async function loadCfg(): Promise<void> {
     } catch { }
   } finally {
     suppressUiPrefAutosave = false;
+    setSettingsSaveStatus("All settings are saved locally.", "neutral");
+    syncSettingsHeaderSummary();
+    syncSettingsCardSummaries();
+    syncPaneContexts();
   }
 }
 
@@ -1316,6 +2095,8 @@ async function saveProviderKey(provider: KeyProvider): Promise<void> {
   }
   markKeyMasked(provider, true);
   syncKeyActionButton(provider);
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
 }
 
 async function deleteProviderKey(provider: KeyProvider): Promise<void> {
@@ -1331,6 +2112,8 @@ async function deleteProviderKey(provider: KeyProvider): Promise<void> {
   }
   markKeyMasked(provider, false);
   syncKeyActionButton(provider);
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
 }
 
 async function handleKeyAction(provider: KeyProvider): Promise<void> {
@@ -1343,10 +2126,26 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 }
 
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("recordingsDirInput") as HTMLInputElement).addEventListener("input", () => {
+  syncSettingsHeaderSummary();
+  syncSettingsCardSummaries();
+});
+($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => {
+  syncSettingsCardSummaries();
+  queueUiPreferencesSave();
+});
+($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => {
+  syncSettingsCardSummaries();
+  queueUiPreferencesSave();
+});
+($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => {
+  syncSettingsCardSummaries();
+  queueUiPreferencesSave();
+});
+($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => {
+  syncPaneContexts();
+  queueUiPreferencesSave();
+});
 ["openrouter", "deepgram"].forEach((providerName) => {
   const provider = providerName as KeyProvider;
   const input = keyInput(provider);
@@ -1372,6 +2171,7 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 });
 ($("upscalePresetSelect") as HTMLSelectElement).addEventListener("change", () => {
   syncUpscalePresetControls();
+  syncPaneContexts();
   queueUiPreferencesSave();
 });
 ($("upscalePresetAddBtn") as HTMLButtonElement).addEventListener("click", () => openUpscalePresetModal());
@@ -1502,14 +2302,31 @@ $("shortcutPaste").addEventListener("click", (e) => {
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";
 let recordingsStatsOpen = true;
+let recordingsSearchQuery = "";
+let recordingsLoadRequestSeq = 0;
+let recordingOpenRequestSeq = 0;
+let recordingsStatsRequestSeq = 0;
+let recordingsUiLoading = false;
+let configuredRecordingsDir = "";
+let activeResolvedRecordingsDir = "";
+let recordingsBootstrapReady = false;
+let recordingsBootstrapPromise: Promise<void> | null = null;
+let activeModalId = "";
+let lastModalFocus: HTMLElement | null = null;
 
 function syncRecordingsStatsVisibility(): void {
   $("recordingsStatsPanel").hidden = !recordingsStatsOpen;
   const btn = $("recordingsStatsBtn") as HTMLButtonElement;
   if (recordingsStatsOpen) {
     btn.classList.add("active");
+    btn.textContent = "Hide Stats";
+    btn.setAttribute("aria-label", "Hide stats");
+    btn.setAttribute("aria-pressed", "true");
   } else {
     btn.classList.remove("active");
+    btn.textContent = "Show Stats";
+    btn.setAttribute("aria-label", "Show stats");
+    btn.setAttribute("aria-pressed", "false");
   }
 }
 
@@ -1517,6 +2334,115 @@ function updateRecordingCopyState(): void {
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
   const hasText = !!($("recordingContent").textContent || "").trim();
   btn.disabled = !hasText;
+}
+
+function resetRecordingViewer(placeholder = "Choose a recording from the left list..."): void {
+  $("recordingTitleLabel").textContent = "Choose a recording";
+  $("recordingMeta").textContent = "";
+  setRecordingViewerHelper("Select a recording to inspect transcript details and replay saved audio.");
+  $("recordingContent").setAttribute("aria-busy", "false");
+  $("recordingContent").setAttribute("data-placeholder", placeholder);
+  $("recordingContent").textContent = "";
+  const player = $("recordingAudio") as HTMLAudioElement;
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  player.hidden = true;
+  $("recordingAudioActions").hidden = true;
+  updateRecordingCopyState();
+}
+
+function setRecordingViewerLoading(displayName: string): void {
+  $("recordingTitleLabel").textContent = displayName || "Loading recording";
+  $("recordingMeta").textContent = "Loading recording...";
+  setRecordingViewerHelper("Fetching transcript and audio from the active archive…");
+  $("recordingContent").setAttribute("aria-busy", "true");
+  $("recordingContent").setAttribute("data-placeholder", "Loading recording...");
+  $("recordingContent").textContent = "";
+  const player = $("recordingAudio") as HTMLAudioElement;
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  player.hidden = true;
+  $("recordingAudioActions").hidden = true;
+  updateRecordingCopyState();
+}
+
+function reconcileCurrentRecordingSummaryWithArchive(): void {
+  const savedName = String(currentRecordingSummary?.savedName || "").trim();
+  if (!savedName) return;
+  if (recordingItems.some((item) => item.name === savedName)) return;
+  setCurrentRecordingSummary({
+    ...(currentRecordingSummary as CurrentRecordingSummary),
+    savedName: "",
+    tone: currentRecordingSummary?.tone === "error" ? "error" : "warning",
+    status: "Saved files for this session are no longer present in the active recordings archive.",
+  });
+}
+
+function syncLatestSavedAudioFromRecordings(): void {
+  reconcileCurrentRecordingSummaryWithArchive();
+  const freshestWithAudio = recordingItems.find((item) => item.has_audio);
+  if (!freshestWithAudio) {
+    if (latestSavedAudioState?.file && !latestSavedAudioState.savedName) return;
+    setLatestSavedAudio(null);
+    return;
+  }
+  const current = latestSavedAudioState;
+  const sameRecording = !!current?.savedName && current.savedName === freshestWithAudio.name;
+  setLatestSavedAudio({
+    title: freshestWithAudio.display_name || recordingTitleFromName(freshestWithAudio.name),
+    savedName: freshestWithAudio.name,
+    archiveDir: currentArchiveDirSnapshot(),
+    sizeBytes: Number(freshestWithAudio.audio_size_bytes || current?.sizeBytes || 0),
+    downloadName: freshestWithAudio.audio_name || current?.downloadName || `${freshestWithAudio.name.replace(/\.txt$/i, "")}.wav`,
+    mimeType: freshestWithAudio.audio_mime || current?.mimeType || "",
+    file: sameRecording ? (current?.file || null) : null,
+  });
+}
+
+function getFilteredRecordings(): RecordingItem[] {
+  const query = recordingsSearchQuery.trim().toLowerCase();
+  if (!query) return recordingItems;
+  return recordingItems.filter((item) => {
+    const haystack = [item.display_name, item.name, item.provider, item.language].join(" ").toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function syncRecordingsFilterHint(filteredCount: number, totalCount: number): void {
+  if (recordingsUiLoading) {
+    $("recordingsFilterHint").textContent = "Refreshing recordings...";
+    return;
+  }
+  $("recordingsFilterHint").textContent =
+    filteredCount === totalCount
+      ? `Showing ${totalCount} of ${totalCount}`
+      : `Showing ${filteredCount} of ${totalCount}`;
+}
+
+function setRecordingsUiLoading(nextLoading: boolean): void {
+  recordingsUiLoading = !!nextLoading;
+  $("recordingsList").setAttribute("aria-busy", recordingsUiLoading ? "true" : "false");
+  ($("recordingsRefreshBtn") as HTMLButtonElement).disabled = recordingsUiLoading;
+  ($("recordingsSearchInput") as HTMLInputElement).disabled = recordingsUiLoading;
+  ($("recordingsSearchClearBtn") as HTMLButtonElement).disabled = recordingsUiLoading || !recordingsSearchQuery.trim();
+  if (recordingsUiLoading) {
+    setArchiveStatus("Refreshing archive contents…", "info");
+  }
+  syncRecordingsFilterHint(getFilteredRecordings().length, recordingItems.length);
+  syncRecordingsHeaderSummary();
+}
+
+function flashButtonFeedback(btn: HTMLButtonElement, copiedLabel: string, defaultTitle: string): void {
+  const prevAria = btn.getAttribute("aria-label") || defaultTitle;
+  const prevTitle = btn.title || defaultTitle;
+  btn.setAttribute("aria-label", copiedLabel);
+  btn.title = copiedLabel;
+  window.setTimeout(() => {
+    btn.setAttribute("aria-label", prevAria);
+    btn.title = prevTitle;
+  }, 900);
 }
 
 async function copyRecordingText(): Promise<void> {
@@ -1536,16 +2462,10 @@ async function copyRecordingText(): Promise<void> {
     ta.remove();
   }
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
-  const prevLabel = btn.getAttribute("aria-label") || "Copy recording text";
-  btn.setAttribute("aria-label", "Copied");
-  btn.title = "Copied";
-  window.setTimeout(() => {
-    btn.setAttribute("aria-label", prevLabel);
-    btn.title = "Copy";
-  }, 900);
+  flashButtonFeedback(btn, "Copied", "Copy recording text");
 }
 
-async function copyTextContent(text: string): Promise<void> {
+async function copyTextContent(text: string, btnId = ""): Promise<void> {
   const value = String(text || "").trim();
   if (!value) return;
   try {
@@ -1561,52 +2481,183 @@ async function copyTextContent(text: string): Promise<void> {
     document.execCommand("copy");
     ta.remove();
   }
+  if (btnId) {
+    const btn = $(btnId) as HTMLButtonElement;
+    flashButtonFeedback(btn, "Copied", btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text");
+  }
+}
+
+function isArchiveMutationConflict(error: unknown): boolean {
+  const message = String((error as Error)?.message || "").toLowerCase();
+  return message.includes("no longer exists in the target archive") || message.includes("archive directory is no longer available");
+}
+
+function currentArchiveDirSnapshot(): string {
+  return String(activeResolvedRecordingsDir || "").trim();
+}
+
+async function ensureRecordingsArchiveReady(): Promise<string> {
+  if (currentArchiveDirSnapshot()) {
+    recordingsBootstrapReady = true;
+    return currentArchiveDirSnapshot();
+  }
+  if (recordingsBootstrapPromise) {
+    await recordingsBootstrapPromise;
+    const resolved = currentArchiveDirSnapshot();
+    if (resolved) {
+      recordingsBootstrapReady = true;
+      return resolved;
+    }
+  }
+  await loadRecordings(false);
+  const resolved = currentArchiveDirSnapshot();
+  if (!resolved) {
+    setArchiveStatus("Archive is not ready yet.", "error");
+    throw new Error("Recordings archive is not ready yet. Please try again.");
+  }
+  recordingsBootstrapReady = true;
+  return resolved;
+}
+
+function renderRecordingsEmptyState(message: string, actionLabel: string, onClick: () => void): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "recordings-empty-state";
+  const text = document.createElement("p");
+  text.className = "hint";
+  text.textContent = message;
+  const btn = document.createElement("button");
+  btn.className = "btn btn-ghost recordings-empty-action";
+  btn.type = "button";
+  btn.textContent = actionLabel;
+  btn.onclick = onClick;
+  wrap.appendChild(text);
+  wrap.appendChild(btn);
+  return wrap;
 }
 
 function renderRecordingsList(): void {
   const list = $("recordingsList");
-  list.innerHTML = "";
+  list.replaceChildren();
+  const filteredItems = getFilteredRecordings();
+  syncRecordingsSearchControls();
+  syncRecordingsFilterHint(filteredItems.length, recordingItems.length);
+  syncRecordingsHeaderSummary();
   if (!recordingItems.length) {
-    const empty = document.createElement("div");
-    empty.className = "hint";
-    empty.textContent = "No recordings yet.";
-    list.appendChild(empty);
+    list.appendChild(
+      renderRecordingsEmptyState("No recordings yet.", "Start Recording", () => {
+        switchView("record");
+      })
+    );
     return;
   }
-  recordingItems.forEach((it) => {
+  if (!filteredItems.length) {
+    list.appendChild(
+      renderRecordingsEmptyState("No recordings match the current search.", "Clear Search", () => {
+        recordingsSearchQuery = "";
+        const input = $("recordingsSearchInput") as HTMLInputElement;
+        input.value = "";
+        renderRecordingsList();
+        if (!selectedRecordingName && recordingItems.length) {
+          selectedRecordingName = recordingItems[0].name;
+          void openRecording(selectedRecordingName);
+        }
+      })
+    );
+    return;
+  }
+  filteredItems.forEach((it) => {
     const btn = document.createElement("button");
     btn.className = "recording-item" + (it.name === selectedRecordingName ? " active" : "");
     btn.type = "button";
-    const providerBadge = it.provider && it.provider !== "unknown" ? `<span class="rec-provider">${it.provider}</span>` : "";
-    btn.innerHTML = `<span class="rec-title">${it.display_name}</span><span class="rec-meta">${fmtDateTime(it.modified_at)} · ${Math.round(
-      it.size_bytes / 1024
-    )} KB${providerBadge ? " · " + providerBadge : ""}</span>`;
+    btn.dataset.recordingName = it.name;
+    btn.setAttribute("aria-current", it.name === selectedRecordingName ? "true" : "false");
+    const title = document.createElement("span");
+    title.className = "rec-title";
+    title.textContent = it.display_name;
+    const meta = document.createElement("span");
+    meta.className = "rec-meta";
+    meta.textContent = `${fmtDateTime(it.modified_at)} · ${fmtBytes(it.size_bytes)}`;
+    const badges = document.createElement("div");
+    badges.className = "rec-badges";
+    if (it.provider && it.provider !== "unknown") {
+      const providerBadge = document.createElement("span");
+      providerBadge.className = "rec-provider";
+      providerBadge.textContent = providerLabel(it.provider);
+      badges.appendChild(providerBadge);
+    }
+    if (it.language) {
+      const languageBadge = document.createElement("span");
+      languageBadge.className = "rec-provider";
+      languageBadge.textContent = String(it.language).toUpperCase();
+      badges.appendChild(languageBadge);
+    }
+    if (it.has_audio) {
+      const audioBadge = document.createElement("span");
+      audioBadge.className = "rec-provider";
+      audioBadge.textContent = "Audio";
+      badges.appendChild(audioBadge);
+    }
+    btn.appendChild(title);
+    btn.appendChild(meta);
+    if (badges.childElementCount > 0) btn.appendChild(badges);
     btn.onclick = () => void openRecording(it.name);
     list.appendChild(btn);
   });
 }
 
-async function loadRecordings(keepSelection: boolean): Promise<void> {
-  const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
-  recordingItems = r.items || [];
-  $("recordingsDirLabel").textContent = "Directory: " + (r.directory || "-");
-  $("recordingsCountLabel").textContent = `Total recordings: ${recordingItems.length}`;
-  if (!keepSelection || !recordingItems.some((x) => x.name === selectedRecordingName)) {
-    selectedRecordingName = recordingItems[0]?.name || "";
-  }
+async function moveRecordingSelection(step: number): Promise<void> {
+  const filteredItems = getFilteredRecordings();
+  if (!filteredItems.length) return;
+  const currentIndex = Math.max(0, filteredItems.findIndex((item) => item.name === selectedRecordingName));
+  const nextIndex = Math.min(filteredItems.length - 1, Math.max(0, currentIndex + step));
+  const next = filteredItems[nextIndex];
+  if (!next) return;
+  selectedRecordingName = next.name;
   renderRecordingsList();
-  await loadRecordingsStats();
-  if (selectedRecordingName) {
-    await openRecording(selectedRecordingName);
-  } else {
-    $("recordingMeta").textContent = "";
-    $("recordingContent").textContent = "";
-    updateRecordingCopyState();
+  await openRecording(next.name);
+  const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-name="${CSS.escape(next.name)}"]`);
+  target?.focus();
+}
+
+async function loadRecordings(keepSelection: boolean): Promise<void> {
+  const requestSeq = ++recordingsLoadRequestSeq;
+  setRecordingsUiLoading(true);
+  try {
+    const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
+    if (requestSeq !== recordingsLoadRequestSeq) return;
+    recordingItems = r.items || [];
+    activeResolvedRecordingsDir = String(r.directory || "").trim();
+    syncLatestSavedAudioFromRecordings();
+    $("recordingsDirLabel").textContent = "Directory: " + (r.directory || "-");
+    $("recordingsCountLabel").textContent = `Total recordings: ${recordingItems.length}`;
+    const filteredItems = getFilteredRecordings();
+    if (!keepSelection || !filteredItems.some((x) => x.name === selectedRecordingName)) {
+      selectedRecordingName = filteredItems[0]?.name || "";
+    }
+    renderRecordingsList();
+    await loadRecordingsStats();
+    if (selectedRecordingName) {
+      await openRecording(selectedRecordingName);
+    } else {
+      resetRecordingViewer(recordingsSearchQuery ? "No recordings match the current search." : "Choose a recording from the left list...");
+    }
+    syncRecordingsHeaderSummary();
+    setArchiveStatus(`Archive is ready${r.directory ? ` · ${r.directory}` : ""}`, "success");
+    setSettingsSaveStatus("Settings saved locally.", "success");
+  } catch (e) {
+    setArchiveStatus("Archive is unavailable right now.", "error");
+    throw e;
+  } finally {
+    if (requestSeq === recordingsLoadRequestSeq) {
+      setRecordingsUiLoading(false);
+    }
   }
 }
 
 async function loadRecordingsStats(): Promise<void> {
+  const requestSeq = ++recordingsStatsRequestSeq;
   const s = await apiGet<RecordingsStats>("/api/recordings/stats/summary");
+  if (requestSeq !== recordingsStatsRequestSeq) return;
   $("statsTotal").textContent = String(s.total_recordings || 0);
   $("statsWords").textContent = String(s.total_words || 0);
   $("statsChars").textContent = String(s.total_chars || 0);
@@ -1686,35 +2737,136 @@ async function loadRecordingsStats(): Promise<void> {
 async function openRecording(name: string): Promise<void> {
   selectedRecordingName = name;
   renderRecordingsList();
-  const r = await apiGet<{ name: string; modified_at: string; size_bytes: number; content: string }>(
-    "/api/recordings/" + encodeURIComponent(name)
-  );
-  $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${Math.round((r.size_bytes || 0) / 1024)} KB`;
-  $("recordingContent").textContent = r.content || "";
-  updateRecordingCopyState();
+  const requestSeq = ++recordingOpenRequestSeq;
+  const pendingDisplayName = recordingItems.find((item) => item.name === name)?.display_name || recordingTitleFromName(name);
+  setRecordingViewerLoading(pendingDisplayName);
+  try {
+    const r = await apiGet<{
+      name: string;
+      modified_at: string;
+      size_bytes: number;
+      content: string;
+      has_audio?: boolean;
+      audio_name?: string;
+      audio_size_bytes?: number;
+    }>(
+      "/api/recordings/" + encodeURIComponent(name)
+    );
+    if (requestSeq !== recordingOpenRequestSeq || selectedRecordingName !== name) return;
+    const displayName = recordingItems.find((item) => item.name === name)?.display_name || recordingTitleFromName(name);
+    const audioMeta = r.has_audio ? ` · Audio ${fmtBytes(r.audio_size_bytes || 0)}` : "";
+    $("recordingTitleLabel").textContent = displayName;
+    $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}${audioMeta}`;
+    setRecordingViewerHelper(r.has_audio ? "Transcript and source audio are available for this session." : "Transcript is available. No source audio was stored for this session.");
+    $("recordingContent").setAttribute("aria-busy", "false");
+    $("recordingContent").setAttribute("data-placeholder", "Transcription will appear here...");
+    $("recordingContent").textContent = r.content || "";
+    const player = $("recordingAudio") as HTMLAudioElement;
+    const audioActions = $("recordingAudioActions");
+    const openBtn = $("recordingOpenAudioBtn") as HTMLAnchorElement;
+    const downloadBtn = $("recordingDownloadAudioBtn") as HTMLAnchorElement;
+    if (r.has_audio) {
+      const audioUrl = latestRecordingAudioUrl(name, currentArchiveDirSnapshot());
+      player.hidden = false;
+      audioActions.hidden = false;
+      player.src = audioUrl;
+      player.load();
+      openBtn.href = audioUrl;
+      downloadBtn.href = audioUrl;
+      downloadBtn.download = r.audio_name || `${name.replace(/\.txt$/i, "")}.wav`;
+    } else {
+      player.pause();
+      player.removeAttribute("src");
+      player.load();
+      player.hidden = true;
+      audioActions.hidden = true;
+      openBtn.removeAttribute("href");
+      downloadBtn.removeAttribute("href");
+    }
+    updateRecordingCopyState();
+  } catch (e) {
+    if (requestSeq !== recordingOpenRequestSeq || selectedRecordingName !== name) return;
+    const message = (e as Error).message || "Failed to load recording.";
+    $("recordingTitleLabel").textContent = pendingDisplayName;
+    $("recordingMeta").textContent = "Recording load failed";
+    setRecordingViewerHelper("The selected recording could not be opened from the active archive.");
+    $("recordingContent").setAttribute("aria-busy", "false");
+    $("recordingContent").setAttribute("data-placeholder", "Recording failed to load.");
+    $("recordingContent").textContent = message;
+    const player = $("recordingAudio") as HTMLAudioElement;
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+    player.hidden = true;
+    $("recordingAudioActions").hidden = true;
+    updateRecordingCopyState();
+  }
 }
 
 async function saveRecordingText(opts: {
+  name?: string;
+  archiveDir?: string;
+  requireExisting?: boolean;
   title: string;
   sourceText: string;
   transcriptText: string;
   provider: string;
   model: string;
   language: string;
-}): Promise<void> {
+  audioFile?: File | null;
+  refreshList?: boolean;
+}): Promise<SavedRecordingRef> {
+  if (!opts.archiveDir && !recordingsBootstrapReady) {
+    await ensureRecordingsArchiveReady();
+  }
   const sourceText = (opts.sourceText || "").trim();
   const transcriptText = (opts.transcriptText || "").trim();
-  if (!sourceText && !transcriptText) return;
-  await apiPost<{ ok: boolean; name: string }>("/api/recordings/save", {
-    title: opts.title,
-    source_text: sourceText,
-    transcript_text: transcriptText,
-    provider: opts.provider,
-    model: opts.model,
-    language: opts.language,
-  });
+  const audioFile = opts.audioFile || null;
+  const existingName = (opts.name || "").trim();
+  const archiveDir = (opts.archiveDir || currentArchiveDirSnapshot()).trim();
+  const requireExisting = !!opts.requireExisting;
+  if (!sourceText && !transcriptText && !audioFile) {
+    return { name: existingName, archiveDir };
+  }
+  let savedName = existingName;
+  let savedArchiveDir = archiveDir;
+  if (audioFile) {
+    const fd = new FormData();
+    fd.append("file", audioFile, audioFile.name || "recording.wav");
+    if (existingName) fd.set("name", existingName);
+    if (archiveDir) fd.set("archive_dir", archiveDir);
+    if (requireExisting) fd.set("require_existing", "true");
+    fd.set("title", opts.title);
+    fd.set("source_text", sourceText);
+    fd.set("transcript_text", transcriptText);
+    fd.set("provider", opts.provider);
+    fd.set("model", opts.model);
+    fd.set("language", opts.language);
+    const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
+    if (!r.ok) throw new Error(await parseError(r));
+    const js = (await r.json()) as { name?: string; archive_dir?: string };
+    savedName = String(js.name || existingName || "").trim();
+    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+  } else {
+    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
+      name: existingName,
+      archive_dir: archiveDir,
+      require_existing: requireExisting,
+      title: opts.title,
+      source_text: sourceText,
+      transcript_text: transcriptText,
+      provider: opts.provider,
+      model: opts.model,
+      language: opts.language,
+    });
+    savedName = String(js.name || existingName || "").trim();
+    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+  }
   // Fire-and-forget: don't block critical path for recordings list reload.
-  loadRecordings(true).catch(() => { });
+  if (opts.refreshList !== false) {
+    loadRecordings(true).catch(() => { });
+  }
+  return { name: savedName, archiveDir: savedArchiveDir };
 }
 
 $("recordingsRefreshBtn").addEventListener("click", () =>
@@ -1723,33 +2875,157 @@ $("recordingsRefreshBtn").addEventListener("click", () =>
     updateRecordingCopyState();
   })
 );
+$("recordingsSearchInput").addEventListener("input", (ev) => {
+  recordingsSearchQuery = String((ev.target as HTMLInputElement).value || "").trim().toLowerCase();
+  const filteredItems = getFilteredRecordings();
+  if (selectedRecordingName && !filteredItems.some((item) => item.name === selectedRecordingName)) {
+    selectedRecordingName = filteredItems[0]?.name || "";
+    renderRecordingsList();
+    if (selectedRecordingName) {
+      void openRecording(selectedRecordingName);
+    } else {
+      resetRecordingViewer("No recordings match the current search.");
+    }
+    return;
+  }
+  renderRecordingsList();
+});
+$("recordingsSearchClearBtn").addEventListener("click", () => {
+  if (!recordingsSearchQuery) return;
+  recordingsSearchQuery = "";
+  const input = $("recordingsSearchInput") as HTMLInputElement;
+  input.value = "";
+  renderRecordingsList();
+  if (!selectedRecordingName && recordingItems.length) {
+    selectedRecordingName = recordingItems[0].name;
+    void openRecording(selectedRecordingName);
+  }
+});
+($("recordingsList") as HTMLDivElement).addEventListener("keydown", (ev) => {
+  if (ev.key === "ArrowDown") {
+    ev.preventDefault();
+    void moveRecordingSelection(1);
+    return;
+  }
+  if (ev.key === "ArrowUp") {
+    ev.preventDefault();
+    void moveRecordingSelection(-1);
+    return;
+  }
+  if (ev.key === "Home") {
+    ev.preventDefault();
+    const first = getFilteredRecordings()[0];
+    if (!first) return;
+    selectedRecordingName = first.name;
+    renderRecordingsList();
+    void openRecording(first.name).then(() => {
+      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-name="${CSS.escape(first.name)}"]`);
+      target?.focus();
+    });
+    return;
+  }
+  if (ev.key === "End") {
+    ev.preventDefault();
+    const filtered = getFilteredRecordings();
+    const last = filtered[filtered.length - 1];
+    if (!last) return;
+    selectedRecordingName = last.name;
+    renderRecordingsList();
+    void openRecording(last.name).then(() => {
+      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-name="${CSS.escape(last.name)}"]`);
+      target?.focus();
+    });
+  }
+});
+($("recordingsSearchInput") as HTMLInputElement).addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    if (!recordingsSearchQuery) return;
+    recordingsSearchQuery = "";
+    const input = ev.currentTarget as HTMLInputElement;
+    input.value = "";
+    renderRecordingsList();
+    if (!selectedRecordingName && recordingItems.length) {
+      selectedRecordingName = recordingItems[0].name;
+      void openRecording(selectedRecordingName);
+    }
+    return;
+  }
+  if (ev.key === "Enter") {
+    const first = getFilteredRecordings()[0];
+    if (!first) return;
+    selectedRecordingName = first.name;
+    void openRecording(first.name);
+  }
+});
 $("recordingsStatsBtn").addEventListener("click", () => {
   recordingsStatsOpen = !recordingsStatsOpen;
   syncRecordingsStatsVisibility();
 });
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
-$("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || ""));
-$("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || ""));
+$("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || "", "resultCopyBtn"));
+$("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || "", "upscaleCopyBtn"));
+$("recordingSummaryOpenRecordingsBtn").addEventListener("click", () => {
+  const savedName = (currentRecordingSummary?.savedName || "").trim();
+  if (!savedName) return;
+  recordingsSearchQuery = "";
+  ($("recordingsSearchInput") as HTMLInputElement).value = "";
+  selectedRecordingName = savedName;
+  switchView("recordings");
+});
 
 // ── Delete All recordings ──
 $("recordingsDeleteAllBtn").addEventListener("click", () => {
-  ($("deleteAllModal") as HTMLElement).hidden = false;
+  openModal("deleteAllModal", "#deleteAllConfirmBtn");
 });
 $("deleteAllCancelBtn").addEventListener("click", () => {
-  ($("deleteAllModal") as HTMLElement).hidden = true;
+  closeModal("deleteAllModal");
+});
+($("deleteAllModal") as HTMLDivElement).addEventListener("click", (e) => {
+  if (e.target === $("deleteAllModal")) closeModal("deleteAllModal");
 });
 $("deleteAllConfirmBtn").addEventListener("click", async () => {
   try {
     const r = await fetch(`/api/recordings?token=${encodeURIComponent(apiToken())}`, { method: "DELETE" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
+    setLatestSavedAudio(null);
+    if (currentRecordingSummary?.savedName) {
+      patchCurrentRecordingSummary({
+        savedName: "",
+        status: "Recording archive was cleared. Session summary is kept, but saved files were deleted.",
+        tone: "warning",
+      });
+    }
+    showRecordSessionNotice(`Deleted ${data.deleted} recording(s) from the archive.`, "warning", 7000);
     $("recordingContent").textContent = `Deleted ${data.deleted} recording(s).`;
     $("recordingMeta").textContent = "";
     await loadRecordings(true);
   } catch (e: unknown) {
     $("recordingContent").textContent = `Delete failed: ${(e as Error).message}`;
   } finally {
-    ($("deleteAllModal") as HTMLElement).hidden = true;
+    closeModal("deleteAllModal");
+  }
+});
+document.addEventListener("keydown", (ev) => {
+  if (!activeModalId) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeModal(activeModalId);
+    return;
+  }
+  if (ev.key !== "Tab") return;
+  const modal = $(activeModalId);
+  const focusables = modalFocusableElements(modal);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement as HTMLElement | null;
+  if (ev.shiftKey && active === first) {
+    ev.preventDefault();
+    last.focus();
+  } else if (!ev.shiftKey && active === last) {
+    ev.preventDefault();
+    first.focus();
   }
 });
 
@@ -1770,6 +3046,7 @@ syncRecordingsStatsVisibility();
 
 const autoToggle = $("autoTranscribeToggle") as HTMLInputElement;
 autoToggle.addEventListener("change", () => {
+  syncPaneContexts();
   queueUiPreferencesSave();
 });
 const livePreviewToggle = $("livePreviewToggle") as HTMLInputElement;
@@ -1781,6 +3058,7 @@ livePreviewToggle.addEventListener("change", () => {
     ws = null;
     if (isRecording) setStatus("Recording");
   }
+  syncPaneContexts();
   queueUiPreferencesSave();
 });
 
@@ -1797,7 +3075,9 @@ function shouldLivePreview(): boolean {
   const quick = $("quickProviderSelect") as HTMLSelectElement;
   if (quick.value !== main.value) quick.value = main.value;
   syncRemoteModelOptions();
+  syncPaneContexts();
   queueUiPreferencesSave();
+  scheduleLocalWarmup();
 });
 ($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
   const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
@@ -1809,6 +3089,7 @@ function shouldLivePreview(): boolean {
   if (v && provider === "deepgram") {
     remoteModelByProvider.deepgram = v;
   }
+  syncPaneContexts();
   queueUiPreferencesSave();
 });
 ($("quickProviderSelect") as HTMLSelectElement).addEventListener("change", () => {
@@ -1851,9 +3132,19 @@ function initQuickControls(): void {
   window.__transcriptorSetQuickSettingsOpen = applyQuickSettingsFromMain;
 }
 
-($("language") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
-($("model") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
-($("micSelect") as HTMLSelectElement).addEventListener("change", () => queueUiPreferencesSave());
+($("language") as HTMLSelectElement).addEventListener("change", () => {
+  syncPaneContexts();
+  queueUiPreferencesSave();
+});
+($("model") as HTMLSelectElement).addEventListener("change", () => {
+  syncPaneContexts();
+  queueUiPreferencesSave();
+  scheduleLocalWarmup();
+});
+($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
+  syncRecordContextStrip();
+  queueUiPreferencesSave();
+});
 
 let ws: WebSocket | null = null;
 let ac: AudioContext | null = null;
@@ -1874,8 +3165,14 @@ let fallbackCaptureTimer: number | null = null;
 let captureFrameCount = 0;
 let captureRmsAccum = 0;
 let capturePeakMax = 0;
+let captureSampleCount = 0;
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
+let stopTransitionInFlight = false;
+let flushRequestSeq = 0;
+const pendingWorkletFlushes = new Map<string, () => void>();
+let lastRemotePreviewSubmittedSamples = 0;
+let remotePreviewRequestSeq = 0;
 
 // (Chunked pipeline removed — single sync call is faster and simpler.)
 
@@ -1901,6 +3198,8 @@ function publishFinishedRecording(recordingId: number, text: string): void {
 }
 
 function resetOutputs(): void {
+  resetRecordSessionNotice();
+  setCurrentRecordingSummary(null);
   $("liveOutput").textContent = "";
   $("finalOutput").textContent = "";
   $("upscaleOutput").textContent = "";
@@ -1952,6 +3251,7 @@ function pushCapturedFrame(input: Float32Array): void {
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
   chunks.push(new Float32Array(ds));
+  captureSampleCount += ds.length;
   // Enterprise memory management: consolidate fragments periodically to avoid
   // GC pressure and O(n) merge cost at stop time for long recordings.
   if (chunks.length > 500) {
@@ -1974,6 +3274,44 @@ function pushCapturedFrame(input: Float32Array): void {
   } catch { }
 }
 
+function getCapturedTailSamples(maxSamples: number): Float32Array {
+  const need = Math.max(0, Math.floor(maxSamples));
+  if (!need || !chunks.length || captureSampleCount <= 0) return new Float32Array(0);
+  const outLen = Math.min(need, captureSampleCount);
+  const out = new Float32Array(outLen);
+  let writeOffset = outLen;
+  for (let i = chunks.length - 1; i >= 0 && writeOffset > 0; i--) {
+    const chunk = chunks[i];
+    if (!chunk.length) continue;
+    const take = Math.min(writeOffset, chunk.length);
+    writeOffset -= take;
+    out.set(chunk.subarray(chunk.length - take), writeOffset);
+  }
+  return writeOffset === 0 ? out : out.subarray(writeOffset);
+}
+
+async function flushWorkletPort(timeoutMs = 350): Promise<void> {
+  const node = workletNode;
+  if (!node) return;
+  const token = `flush-${Date.now()}-${++flushRequestSeq}`;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      pendingWorkletFlushes.delete(token);
+      resolve();
+    };
+    pendingWorkletFlushes.set(token, finish);
+    window.setTimeout(finish, timeoutMs);
+    try {
+      node.port.postMessage({ type: "flush", token });
+    } catch {
+      finish();
+    }
+  });
+}
+
 function micErrorTag(e: unknown): string {
   const err = e as { name?: unknown; message?: unknown };
   const name = String(err?.name || "").trim();
@@ -1982,8 +3320,47 @@ function micErrorTag(e: unknown): string {
 }
 
 async function startLive(): Promise<void> {
-  if (isBusy) return;
+  if (isBusy || stopTransitionInFlight) return;
+  let sessionArchiveDir = "";
+  try {
+    sessionArchiveDir = await ensureRecordingsArchiveReady();
+  } catch (e) {
+    const message = (e as Error).message || "Recordings archive is not ready yet.";
+    $("finalOutput").textContent = message;
+    setArchiveStatus(message, "error");
+    showRecordSessionNotice(message, "error", 7000);
+    setStatus("Error");
+    return;
+  }
+  liveStartAbortReason = "";
+  const sessionUiToken = createClientSessionId();
+  activeUiSessionToken = sessionUiToken;
+  activeLiveSessionId = sessionUiToken;
+  activeLiveArchiveDir = sessionArchiveDir;
   resetOutputs();
+  const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const selectedEffectiveProvider = resolveEffectiveProvider(selectedProvider);
+  const selectedModel =
+    selectedEffectiveProvider === "local"
+      ? resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value)
+      : getRemoteModelValue(selectedEffectiveProvider);
+  const selectedLanguage = (($("language") as HTMLSelectElement).value || "auto").trim();
+  const sessionTitle = "Recording " + new Date().toLocaleString();
+  activeLiveSessionSnapshot = {
+    provider: selectedProvider,
+    effectiveProvider: selectedEffectiveProvider,
+    model: selectedModel,
+    language: selectedLanguage,
+  };
+  setCurrentRecordingSummary({
+    title: sessionTitle,
+    status: "Preparing microphone capture and session buffers.",
+    tone: "info",
+    provider: selectedProvider || "local",
+    model: selectedModel,
+    language: selectedLanguage,
+    durationSec: 0,
+  }, sessionUiToken);
   chunks = [];
   workletLastFrameAt = 0;
   silenceStartedAtMs = 0;
@@ -1991,7 +3368,10 @@ async function startLive(): Promise<void> {
   captureFrameCount = 0;
   captureRmsAccum = 0;
   capturePeakMax = 0;
-  setBusy(true);
+  captureSampleCount = 0;
+  lastRemotePreviewSubmittedSamples = 0;
+  remotePreviewRequestSeq = 0;
+  setBusy(true, sessionUiToken);
   isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
   // Recording started — transcription happens on stop via single sync call.
@@ -2005,7 +3385,7 @@ async function startLive(): Promise<void> {
   // Keep single mic button interactive while recording.
   ($("btnStart") as HTMLButtonElement).disabled = false;
   (document.getElementById("btnStop") as HTMLButtonElement).disabled = false;
-  setStatus("Starting");
+  setStatusScoped(sessionUiToken, "Starting");
   window.__transcriptorVuLevel = 0;
   window.__transcriptorRmsLevel = 0;
   window.__transcriptorLastFrameAt = 0;
@@ -2018,7 +3398,11 @@ async function startLive(): Promise<void> {
   }
   draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
   timer = window.setInterval(() => {
-    $("timer").textContent = fmtTime((Date.now() - startAt) / 1000);
+    const durationSec = (Date.now() - startAt) / 1000;
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("timer").textContent = fmtTime(durationSec);
+    }
+    patchCurrentRecordingSummary({ durationSec }, sessionUiToken);
   }, UI_TOKENS.timer.tickMs);
 
   const enableLivePreview = shouldLivePreview();
@@ -2027,13 +3411,18 @@ async function startLive(): Promise<void> {
       wsBase() +
       "/ws/transcribe?" +
       new URLSearchParams({
-        model: resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value),
+        model: resolveLivePreviewLocalModel(($("model") as HTMLSelectElement).value),
         language: ($("language") as HTMLSelectElement).value,
+        session_id: activeLiveSessionId,
+        archive_dir: activeLiveArchiveDir,
         token: apiToken(),
       })
     );
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => setStatus("Recording");
+    ws.onopen = () => {
+      setStatusScoped(sessionUiToken, "Recording");
+      patchCurrentRecordingSummary({ status: "Recording with live preview enabled.", tone: "info" }, sessionUiToken);
+    };
     ws.onerror = () => {
       if (!shouldLivePreview()) return;
       $("liveOutput").textContent += "\n[WebSocket error]";
@@ -2065,7 +3454,8 @@ async function startLive(): Promise<void> {
       }
     };
   } else {
-    setStatus("Recording");
+    setStatusScoped(sessionUiToken, "Recording");
+    patchCurrentRecordingSummary({ status: "Recording. Audio is being captured locally.", tone: "info" }, sessionUiToken);
   }
 
   try {
@@ -2149,8 +3539,19 @@ async function startLive(): Promise<void> {
     startWaveLoop();
 
     workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-      const input = ev.data;
-      pushCapturedFrame(input);
+      const msg = ev.data as unknown;
+      if (msg instanceof Float32Array) {
+        pushCapturedFrame(msg);
+        return;
+      }
+      if (msg && typeof msg === "object" && "type" in msg) {
+        const data = msg as { type?: unknown; token?: unknown };
+        if (data.type === "flush-ack") {
+          const token = String(data.token || "");
+          const resolve = pendingWorkletFlushes.get(token);
+          if (resolve) resolve();
+        }
+      }
     };
 
     src.connect(workletNode);
@@ -2192,28 +3593,36 @@ async function startLive(): Promise<void> {
     let chunkInFlight = false;
     chunkAbortController = new AbortController();
     chunkSubmitTimer = window.setInterval(async () => {
-      if (!isRecording || recordedWebmChunks.length < 3) return;
+      if (!isRecording || captureSampleCount < UI_TOKENS.capture.tailMinSamples) return;
       if (chunkInFlight) return; // Don't stack concurrent API calls
-      const providerStr = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
-      const provider = resolveEffectiveProvider(providerStr);
+      const sessionSnapshot = activeLiveSessionSnapshot;
+      const provider = sessionSnapshot?.effectiveProvider || "local";
       if (provider === "local" || !isProviderKeyConfigured(provider)) return;
-
-      const webmBlob = new Blob(recordedWebmChunks, { type: "audio/webm" });
-      const file = new File([webmBlob], `live-snap-${Date.now()}.webm`, { type: webmBlob.type });
+      const newSamples = captureSampleCount - lastRemotePreviewSubmittedSamples;
+      if (newSamples < UI_TOKENS.capture.chunkMinNewSamples) return;
+      const previewTail = getCapturedTailSamples(AUDIO_TOKENS.liveSampleRateHz * 12);
+      if (previewTail.length < UI_TOKENS.capture.tailMinSamples) return;
+      const file = createCompactWavFileFromSamples(previewTail, AUDIO_TOKENS.liveSampleRateHz, `live-snap-${Date.now()}.wav`);
+      const requestSeq = ++remotePreviewRequestSeq;
 
       chunkInFlight = true;
       try {
         const out = await remoteJobSyncWithFallback(file, {
           provider,
-          language: ($("language") as HTMLSelectElement).value,
+          language: sessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
           diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-          openrouterModel: getRemoteModelValue(provider),
+          openrouterModel:
+            provider === "openrouter"
+              ? (sessionSnapshot?.model || getRemoteModelValue(provider))
+              : getRemoteModelValue(provider),
+          signal: chunkAbortController?.signal,
         });
-        if (isRecording && out && out.text) {
+        if (isRecording && requestSeq === remotePreviewRequestSeq && out && out.text) {
           $("liveOutput").textContent = out.text;
           $("liveOutput").scrollTop = $("liveOutput").scrollHeight;
           persistLiveDraft(true);
         }
+        lastRemotePreviewSubmittedSamples = captureSampleCount;
       } catch (e) {
         if (!(e instanceof DOMException && e.name === "AbortError")) {
           console.warn("Chunk upload failed", e);
@@ -2221,14 +3630,19 @@ async function startLive(): Promise<void> {
       } finally {
         chunkInFlight = false;
       }
-    }, 5000);
+    }, UI_TOKENS.capture.chunkIntervalMs);
 
   } catch (e) {
+    liveStartAbortReason = micErrorTag(e) || (e as Error).message || "Unable to start recording.";
     if (shouldLivePreview()) {
-      $("liveOutput").textContent = micErrorTag(e) || (e as Error).message;
+      $("liveOutput").textContent = liveStartAbortReason;
     }
+    patchCurrentRecordingSummary({
+      status: liveStartAbortReason,
+      tone: "error",
+    }, sessionUiToken);
     await stopLive(false);
-    setStatus("Error");
+    setStatusScoped(sessionUiToken, "Error");
   }
 }
 
@@ -2245,7 +3659,11 @@ async function waitForWorkletDrain(
 }
 
 async function stopLive(enhance: boolean): Promise<void> {
+  if (stopTransitionInFlight) return;
+  stopTransitionInFlight = true;
   const recordingId = currentRecordingId;
+  const liveSessionId = activeLiveSessionId;
+  const sessionUiToken = liveSessionId;
   const sourceLiveText = ($("liveOutput").textContent || "").trim();
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
@@ -2256,60 +3674,72 @@ async function stopLive(enhance: boolean): Promise<void> {
     const preview = words.slice(0, 8).join(" ");
     return preview.length > 80 ? preview.slice(0, 77) + "..." : preview;
   };
-  const providerValue = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
-  const languageValue = ($("language") as HTMLSelectElement).value;
-  const effectiveProvider = resolveEffectiveProvider(providerValue);
-  const modelValue =
-    effectiveProvider === "local"
-      ? resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value)
-      : getRemoteModelValue(effectiveProvider);
+  const liveSnapshot = activeLiveSessionSnapshot || {
+    provider: (($("providerSelect") as HTMLSelectElement).value || "local") as Provider,
+    effectiveProvider: resolveEffectiveProvider((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
+    model: resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value),
+    language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+  };
+  const providerValue = liveSnapshot.provider;
+  const languageValue = liveSnapshot.language;
+  const effectiveProvider = liveSnapshot.effectiveProvider;
+  const modelValue = liveSnapshot.model;
   const avgCaptureRms = captureFrameCount > 0 ? captureRmsAccum / captureFrameCount : 0;
   const noLiveText = !sourceLiveText;
   const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
   const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.003 && capturePeakMax < 0.045;
   const tooShortToTrust = recordedSec < 1.25;
   const silentCapture =
-    captureFrameCount < 6 ||
     (tooShortToTrust && hardSilence) ||
     (tooShortToTrust && likelySilenceWithoutPreview);
-
-  // ── Fast path for remote providers: fire API call BEFORE cleanup ──────────
-  // Snapshot audio and start the Deepgram/OpenRouter request immediately.
-  // The ~2s API latency overlaps with the ~400ms of UI cleanup below.
   const provider = effectiveProvider;
-  const isRemote = provider !== "local" && !!provider && enhance && chunks.length > 0;
   let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
+  let savedAudioFile: File | null = null;
+  let transcribeInputFile: File | null = null;
+  const sessionArchiveDir = String(activeLiveArchiveDir || currentArchiveDirSnapshot()).trim();
+  const startupAbortReason = liveStartAbortReason;
+  liveStartAbortReason = "";
+  setCurrentRecordingSummary({
+    title: _smartTitle(sourceLiveText),
+    status: "Finalizing recording and assembling the canonical audio file.",
+    tone: "info",
+    provider: providerValue || "local",
+    model: modelValue,
+    language: languageValue,
+    durationSec: recordedSec,
+    transcriptChars: sourceLiveText.length,
+    transcriptWords: countWords(sourceLiveText),
+  }, sessionUiToken);
 
-  if (isRemote && isProviderKeyConfigured(provider)) {
-    if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      await new Promise<void>((resolve) => {
-        mediaRecorder!.onstop = () => resolve();
-        mediaRecorder!.stop();
-      });
-      const webmBlob = new Blob(recordedWebmChunks, { type: "audio/webm" });
-      const file = new File([webmBlob], `live-${Date.now()}.webm`, { type: webmBlob.type });
-      remoteApiPromise = remoteJobSyncWithFallback(file, {
-        provider,
-        language: (document.getElementById("language") as HTMLSelectElement).value,
-        diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-        openrouterModel: getRemoteModelValue(provider),
-      });
-    } else {
-      // Snapshot chunks NOW (before cleanup clears them)
-      const total = chunks.reduce((a, c) => a + c.length, 0);
-      const merged = new Float32Array(total);
-      let off = 0;
-      chunks.forEach((c) => { merged.set(c, off); off += c.length; });
-      const audioBlob = encodeCompactWav(merged, AUDIO_TOKENS.liveSampleRateHz, AUDIO_TOKENS.compactSampleRateHz);
-      const file = new File([audioBlob], `live-${Date.now()}.wav`, { type: audioBlob.type });
-      // Fire API call NOW — don't await, let it run during cleanup
-      remoteApiPromise = remoteJobSyncWithFallback(file, {
-        provider,
-        language: (document.getElementById("language") as HTMLSelectElement).value,
-        diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-        openrouterModel: getRemoteModelValue(provider),
-      });
-    }
+  await waitForWorkletDrain();
+  await stopMediaRecorderAndFlush();
+  try {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+  } catch { }
+  await flushWorkletPort();
+  await waitForWorkletDrain();
+
+  const mergedCapture = mergeCapturedChunks(chunks);
+  const hasCapturedPcm = mergedCapture.length > 0;
+  if (hasCapturedPcm) {
+    savedAudioFile = createWavFileFromSamples(mergedCapture, AUDIO_TOKENS.liveSampleRateHz, `live-${Date.now()}.wav`);
+    transcribeInputFile =
+      provider === "local"
+        ? savedAudioFile
+        : createCompactWavFileFromSamples(mergedCapture, AUDIO_TOKENS.liveSampleRateHz, `live-${Date.now()}.wav`);
+  } else if (recordedWebmChunks.length > 0) {
+    const webmBlob = new Blob(recordedWebmChunks, { type: "audio/webm" });
+    savedAudioFile = new File([webmBlob], `live-${Date.now()}.webm`, { type: webmBlob.type || "audio/webm" });
+    transcribeInputFile = savedAudioFile;
+  }
+
+  if (provider !== "local" && !!provider && enhance && transcribeInputFile && isProviderKeyConfigured(provider)) {
+    remoteApiPromise = remoteJobSyncWithFallback(transcribeInputFile, {
+      provider,
+      language: languageValue,
+      diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+      openrouterModel: provider === "openrouter" ? modelValue : getRemoteModelValue(provider),
+    });
   }
 
   // ── Cleanup (runs while API call is in flight) ──────────────────────────
@@ -2378,6 +3808,9 @@ async function stopLive(enhance: boolean): Promise<void> {
   ws = null;
   mediaRecorder = null;
   recordedWebmChunks = [];
+  activeLiveSessionId = "";
+  activeLiveArchiveDir = "";
+  activeLiveSessionSnapshot = null;
   isRecording = false;
   silenceStartedAtMs = 0;
   autoStopTriggered = false;
@@ -2393,11 +3826,79 @@ async function stopLive(enhance: boolean): Promise<void> {
   draw();
   resetVU();
 
+  if (savedAudioFile) {
+    setCurrentRecordingAudio(savedAudioFile, "", sessionArchiveDir, sessionUiToken);
+    patchCurrentRecordingSummary({ audioBytes: savedAudioFile.size }, sessionUiToken);
+  }
+
+  let persistedRecordingName = "";
+  let persistedRecordingArchiveDir = "";
+  const provisionalTitle = _smartTitle(sourceLiveText);
+  if (savedAudioFile) {
+    try {
+      const persisted = await saveRecordingText({
+        archiveDir: sessionArchiveDir,
+        title: provisionalTitle,
+        sourceText: sourceLiveText,
+        transcriptText: "",
+        provider: providerValue || "local",
+        model: modelValue,
+        language: languageValue,
+        audioFile: savedAudioFile,
+        refreshList: false,
+      });
+      persistedRecordingName = persisted.name;
+      persistedRecordingArchiveDir = persisted.archiveDir;
+      setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
+      await discardLiveRecovery(liveSessionId);
+      patchCurrentRecordingSummary({
+        title: provisionalTitle,
+        status: enhance && transcribeInputFile ? "Audio saved locally. Starting final transcription." : "Audio saved locally.",
+        tone: "success",
+        savedName: persistedRecordingName,
+      }, sessionUiToken);
+      showRecordSessionNotice("Recording audio is saved and available immediately.", "success", 6000, sessionUiToken);
+    } catch (e) {
+      console.warn("Initial audio persistence failed", e);
+      patchCurrentRecordingSummary({
+        title: provisionalTitle,
+        status: "Audio capture finished, but initial save failed. Final transcript may still complete.",
+        tone: "error",
+      }, sessionUiToken);
+    }
+  }
+  stopTransitionInFlight = false;
+
+  if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureFrameCount === 0) {
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("finalOutput").textContent = startupAbortReason;
+      $("progressRow").hidden = true;
+    }
+    clearLiveDraft();
+    setBusy(false, sessionUiToken);
+    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    setStatusScoped(sessionUiToken, "Error");
+    patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: startupAbortReason,
+      tone: "error",
+      durationSec: 0,
+      transcriptChars: 0,
+      transcriptWords: 0,
+    }, sessionUiToken);
+    return;
+  }
+
   if (silentCapture) {
-    $("finalOutput").textContent = "[ Silence ]";
-    setStatus("Done");
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("finalOutput").textContent = "[ Silence ]";
+    }
+    setStatusScoped(sessionUiToken, "Done");
     try {
       await saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
         title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "[ Silence ]",
@@ -2405,17 +3906,37 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch { }
+    } catch (e) {
+      if (isArchiveMutationConflict(e)) {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
+          tone: "warning",
+          transcriptChars: "[ Silence ]".length,
+          transcriptWords: 1,
+        }, sessionUiToken);
+      }
+    }
     clearLiveDraft();
-    setBusy(false);
+    setBusy(false, sessionUiToken);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: "Silence detected. Audio remains available for review.",
+      tone: "success",
+      transcriptChars: "[ Silence ]".length,
+      transcriptWords: 1,
+    }, sessionUiToken);
     publishFinishedRecording(recordingId, "[ Silence ]");
     return;
   }
 
-  if (!enhance || chunks.length === 0) {
+  if (!enhance || !transcribeInputFile) {
     try {
       await saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
         title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "",
@@ -2423,17 +3944,33 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch { }
+    } catch (e) {
+      if (isArchiveMutationConflict(e)) {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "Audio is available, but the original archive changed before the session metadata could be finalized.",
+          tone: "warning",
+        }, sessionUiToken);
+      }
+    }
     clearLiveDraft();
-    setBusy(false);
+    setBusy(false, sessionUiToken);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
-    setStatus("Idle");
+    setStatusScoped(sessionUiToken, "Idle");
+    patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: "Audio saved. Final transcription was skipped for this session.",
+      tone: "success",
+    }, sessionUiToken);
     return;
   }
 
   if (!provider) {
     try {
       await saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
         title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "",
@@ -2441,72 +3978,128 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch { }
+    } catch (e) {
+      if (isArchiveMutationConflict(e)) {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
+          tone: "warning",
+        }, sessionUiToken);
+      }
+    }
     clearLiveDraft();
-    setBusy(false);
+    setBusy(false, sessionUiToken);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
-    setStatus("Idle");
+    setStatusScoped(sessionUiToken, "Idle");
+    patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: "Audio saved. No transcription provider is selected.",
+      tone: "warning",
+    }, sessionUiToken);
     return;
   }
 
   if (providerValue !== effectiveProvider) {
-    setStatus("Processing (Offline Local)");
+    setStatusScoped(sessionUiToken, "Processing (Offline Local)");
   } else {
-    setStatus("Processing");
+    setStatusScoped(sessionUiToken, "Processing");
   }
   if (provider !== "local" && !isProviderKeyConfigured(provider)) {
     const msg = providerKeyErrorMessage(provider);
-    $("progressRow").hidden = true;
-    $("finalOutput").textContent = msg;
-    setStatus("Error");
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("progressRow").hidden = true;
+      $("finalOutput").textContent = msg;
+    }
+    setStatusScoped(sessionUiToken, "Error");
+    patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: `${msg} Audio is still saved locally.`,
+      tone: "error",
+    }, sessionUiToken);
+    try {
+      await saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
+        title: _smartTitle(sourceLiveText),
+        sourceText: sourceLiveText,
+        transcriptText: "",
+        provider,
+        model: modelValue,
+        language: languageValue,
+      });
+    } catch (e) {
+      if (isArchiveMutationConflict(e)) {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: `${msg} The original archive changed before the session metadata could be finalized.`,
+          tone: "warning",
+        }, sessionUiToken);
+      }
+    }
     clearLiveDraft();
+    setBusy(false, sessionUiToken);
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
     return;
   }
   const transcribeStartedAt = performance.now();
-  $("progressRow").hidden = false;
+  if (isCurrentUiSession(sessionUiToken)) {
+    $("progressRow").hidden = false;
+  }
+  patchCurrentRecordingSummary({
+    title: provisionalTitle,
+    status:
+      providerValue !== effectiveProvider
+        ? "Internet is unavailable. Transcribing locally from the saved audio."
+        : `Transcribing with ${providerLabel(provider)}.`,
+    tone: "info",
+  }, sessionUiToken);
   // Allow next hotkey/session to start while this recording is transcribing.
-  setBusy(false);
+  setBusy(false, sessionUiToken);
   try {
     let transcriptRaw = "";
+    let transcriptForPaste = "";
+    let finalSaveConflict = false;
     if (provider === "local") {
-      // Local provider: encode and submit job
-      const total = chunks.reduce((a, c) => a + c.length, 0);
-      const merged = new Float32Array(total);
-      let off = 0;
-      chunks.forEach((c) => { merged.set(c, off); off += c.length; });
-      const audioBlob = encodeWav(merged, AUDIO_TOKENS.liveSampleRateHz);
-      const file = new File([audioBlob], `live-${Date.now()}.wav`, { type: audioBlob.type });
-      const localAbortController = new AbortController();
-      const create = await localJob(file, {
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressFill").style.width = "35%";
+        $("progressText").textContent = "35%";
+      }
+      const syncOut = await localJobSync(transcribeInputFile as File, {
         language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
         model: resolveFastLiveLocalModel(($("model") as HTMLSelectElement).value),
         splitStereo: false,
         wordTimestamps: false,
       });
-      const { job_id } = create;
-      const j = await pollJob(job_id, localAbortController.signal, (job) => {
-        $("progressFill").style.width = Math.round((job.progress || 0) * 100) + "%";
-        $("progressText").textContent = Math.round((job.progress || 0) * 100) + "%";
-      }, {
-        initialWaitMs: UI_TOKENS.polling.fastInitialWaitMs,
-        maxWaitMs: UI_TOKENS.polling.fastMaxWaitMs,
-        growth: UI_TOKENS.polling.fastGrowth,
-      });
-      applyJobResult(j);
-      transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
+      transcriptRaw = String(syncOut.text || "").trim();
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("finalOutput").textContent = transcriptRaw;
+        $("progressFill").style.width = "100%";
+        $("progressText").textContent = "100%";
+        $("progressRow").hidden = true;
+      }
+      setStatusScoped(sessionUiToken, "Done");
     } else {
       // ── Remote provider: instant draft + background refinement ─────────
       // Show chunk-timer preview text IMMEDIATELY so user sees results
       // in <100ms. The full-audio API result replaces it when ready.
-      const chunkDraft = ($("liveOutput").textContent || "").trim();
+      const chunkDraft = sourceLiveText;
       if (chunkDraft) {
-        $("finalOutput").textContent = chunkDraft;
+        if (isCurrentUiSession(sessionUiToken)) {
+          $("finalOutput").textContent = chunkDraft;
+        }
         transcriptRaw = chunkDraft;
-        setStatus("Refining...");
+        setStatusScoped(sessionUiToken, "Refining...");
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "Preview is ready. Waiting for the full-audio refinement pass.",
+          tone: "info",
+        }, sessionUiToken);
       }
-      $("progressFill").style.width = "50%";
-      $("progressText").textContent = "50%";
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressFill").style.width = "50%";
+        $("progressText").textContent = "50%";
+      }
       if (remoteApiPromise) {
         try {
           const syncOut = await remoteApiPromise;
@@ -2515,22 +4108,25 @@ async function stopLive(enhance: boolean): Promise<void> {
             transcriptRaw = finalText;
           }
         } catch (e) {
+          if (!transcriptRaw) throw e;
           console.warn("Final transcription failed, using draft:", e);
-          // Keep the chunkDraft as transcriptRaw
         }
       }
-      $("finalOutput").textContent = transcriptRaw;
-      $("progressFill").style.width = "100%";
-      $("progressText").textContent = "100%";
-      $("progressRow").hidden = true;
-      setStatus("Done");
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("finalOutput").textContent = transcriptRaw;
+        $("progressFill").style.width = "100%";
+        $("progressText").textContent = "100%";
+        $("progressRow").hidden = true;
+      }
+      setStatusScoped(sessionUiToken, "Done");
     }
-    let transcriptForPaste = "";
     // Publish raw transcript immediately so paste can happen without waiting for upscale.
     if (transcriptRaw) {
-      $("finalOutput").textContent = transcriptRaw;
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("finalOutput").textContent = transcriptRaw;
+      }
       publishFinishedRecording(recordingId, transcriptRaw);
-      transcriptForPaste = await runUpscaleIfEnabled(transcriptRaw);
+      transcriptForPaste = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
       // If upscale changed the text, publish the upgraded version.
       if (transcriptForPaste && transcriptForPaste !== transcriptRaw) {
         publishFinishedRecording(recordingId, transcriptForPaste);
@@ -2540,6 +4136,9 @@ async function stopLive(enhance: boolean): Promise<void> {
     try {
       title = _smartTitle(transcriptRaw);
       await saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
         title,
         sourceText: sourceLiveText,
         transcriptText: transcriptRaw,
@@ -2547,14 +4146,48 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch { }
-    $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
+    } catch (e) {
+      if (isArchiveMutationConflict(e)) {
+        finalSaveConflict = true;
+        patchCurrentRecordingSummary({
+          title,
+          status: "Transcript finished, but the original archive changed before final save. The session was not recreated in a different archive.",
+          tone: "warning",
+          transcriptChars: transcriptRaw.length,
+          transcriptWords: countWords(transcriptRaw),
+        }, sessionUiToken);
+      }
+    }
+    const latencyMs = performance.now() - transcribeStartedAt;
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("transcribeLatency").textContent = fmtMs(latencyMs);
+    }
+    patchCurrentRecordingSummary({
+      title,
+      status: finalSaveConflict
+        ? "Transcript is ready in memory, but the original archive changed before the final save completed."
+        : transcriptRaw
+          ? "Final transcript is ready. Audio and transcript are both available."
+          : "Transcription completed, but no spoken words were detected.",
+      tone: finalSaveConflict ? "warning" : "success",
+      transcriptChars: transcriptRaw.length,
+      transcriptWords: countWords(transcriptRaw),
+      transcribeLatencyMs: latencyMs,
+      ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
+    }, sessionUiToken);
+    publishFinishedRecording(recordingId, transcriptForPaste || transcriptRaw || sourceLiveText);
   } catch (e) {
-    $("progressRow").hidden = true;
-    $("finalOutput").textContent = (e as Error).message;
-    setStatus("Error");
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("progressRow").hidden = true;
+      $("finalOutput").textContent = (e as Error).message;
+    }
+    setStatusScoped(sessionUiToken, "Error");
+    let fallbackSaveConflict = false;
     try {
       await saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
         title: _smartTitle(sourceLiveText),
         sourceText: sourceLiveText,
         transcriptText: "",
@@ -2562,15 +4195,35 @@ async function stopLive(enhance: boolean): Promise<void> {
         model: modelValue,
         language: languageValue,
       });
-    } catch { }
-    $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
+    } catch (saveError) {
+      if (isArchiveMutationConflict(saveError)) {
+        fallbackSaveConflict = true;
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: `${(e as Error).message}. The original archive changed before the fallback save completed, so the session was not recreated elsewhere.`,
+          tone: "warning",
+          transcribeLatencyMs: performance.now() - transcribeStartedAt,
+        }, sessionUiToken);
+      }
+    }
+    const latencyMs = performance.now() - transcribeStartedAt;
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("transcribeLatency").textContent = fmtMs(latencyMs);
+    }
+    patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: fallbackSaveConflict
+        ? `${(e as Error).message}. The original archive changed before the fallback save completed.`
+        : `${(e as Error).message}. Audio is still saved and available.`,
+      tone: fallbackSaveConflict ? "warning" : "error",
+      transcribeLatencyMs: latencyMs,
+      ...(persistedRecordingName && !fallbackSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
+    }, sessionUiToken);
+    publishFinishedRecording(recordingId, sourceLiveText);
   } finally {
     clearLiveDraft();
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
   }
-  // Signal desktop main process that transcription is complete with final text.
-  const _finishedText = (($("upscaleOutput").textContent || "").trim() || ($("finalOutput").textContent || $("liveOutput").textContent || "").trim());
-  publishFinishedRecording(recordingId, _finishedText);
 }
 
 function setSelectedFile(file: File | null): void {
@@ -2605,37 +4258,90 @@ async function transcribeSelectedFile(): Promise<void> {
     return;
   }
 
+  const sessionUiToken = createClientSessionId();
+  activeUiSessionToken = sessionUiToken;
   resetOutputs();
-  setBusy(true);
+  setBusy(true, sessionUiToken);
   const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const provider = resolveEffectiveProvider(selectedProvider);
+  const modelValue = provider === "local" ? (($("model") as HTMLSelectElement).value || "small") : getRemoteModelValue(provider);
+  setCurrentRecordingSummary({
+    title: selectedFile.name || "Selected audio file",
+    status: "Preparing file transcription.",
+    tone: "info",
+    provider,
+    model: modelValue,
+    language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+    audioBytes: selectedFile.size,
+  }, sessionUiToken);
   if (selectedProvider !== provider) {
-    setStatus("Processing (Offline Local)");
+    setStatusScoped(sessionUiToken, "Processing (Offline Local)");
   } else {
-    setStatus("Processing");
+    setStatusScoped(sessionUiToken, "Processing");
   }
   if (provider !== "local" && !isProviderKeyConfigured(provider)) {
     const msg = providerKeyErrorMessage(provider);
-    $("progressRow").hidden = true;
-    $("finalOutput").textContent = msg;
-    setStatus("Error");
-    setBusy(false);
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("progressRow").hidden = true;
+      $("finalOutput").textContent = msg;
+    }
+    setStatusScoped(sessionUiToken, "Error");
+    patchCurrentRecordingSummary({
+      status: msg,
+      tone: "error",
+    }, sessionUiToken);
+    setBusy(false, sessionUiToken);
     return;
   }
   const transcribeStartedAt = performance.now();
-  $("progressRow").hidden = false;
+  if (isCurrentUiSession(sessionUiToken)) {
+    $("progressRow").hidden = false;
+  }
+  patchCurrentRecordingSummary({
+    status:
+      selectedProvider !== provider
+        ? "Internet is unavailable. Transcribing the selected file locally."
+        : `Transcribing file with ${providerLabel(provider)}.`,
+    tone: "info",
+  }, sessionUiToken);
 
   try {
     pollAbortController?.abort();
     pollAbortController = new AbortController();
-    let create: { job_id: string } | null = null;
     if (provider === "local") {
-      create = await localJob(selectedFile, {
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressFill").style.width = "35%";
+        $("progressText").textContent = "35%";
+      }
+      const syncOut = await localJobSync(selectedFile, {
         language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
         model: ($("model") as HTMLSelectElement).value,
         splitStereo: ($("splitStereoCheck") as HTMLInputElement).checked,
         wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
       });
+      const transcriptRaw = String(syncOut.text || "").trim();
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("finalOutput").textContent = transcriptRaw;
+        $("progressFill").style.width = "100%";
+        $("progressText").textContent = "100%";
+        $("progressRow").hidden = true;
+      }
+      setStatusScoped(sessionUiToken, "Done");
+      if (transcriptRaw) {
+        await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
+      }
+      const latencyMs = performance.now() - transcribeStartedAt;
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("transcribeLatency").textContent = fmtMs(latencyMs);
+      }
+      patchCurrentRecordingSummary({
+        status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
+        tone: "success",
+        transcriptChars: transcriptRaw.length,
+        transcriptWords: countWords(transcriptRaw),
+        transcribeLatencyMs: latencyMs,
+      }, sessionUiToken);
+      return;
     } else {
       const syncOut = await remoteJobSyncWithFallback(selectedFile, {
         provider,
@@ -2643,38 +4349,45 @@ async function transcribeSelectedFile(): Promise<void> {
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,
         openrouterModel: getRemoteModelValue(provider),
       });
-      $("finalOutput").textContent = syncOut.text || "";
-      $("progressFill").style.width = "100%";
-      $("progressText").textContent = "100%";
-      $("progressRow").hidden = true;
-      setStatus("Done");
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("finalOutput").textContent = syncOut.text || "";
+        $("progressFill").style.width = "100%";
+        $("progressText").textContent = "100%";
+        $("progressRow").hidden = true;
+      }
+      setStatusScoped(sessionUiToken, "Done");
       const transcriptRaw = String(syncOut.text || "").trim();
       if (transcriptRaw) {
-        await runUpscaleIfEnabled(transcriptRaw);
+        await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
       }
-      $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
+      const latencyMs = performance.now() - transcribeStartedAt;
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("transcribeLatency").textContent = fmtMs(latencyMs);
+      }
+      patchCurrentRecordingSummary({
+        status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
+        tone: "success",
+        transcriptChars: transcriptRaw.length,
+        transcriptWords: countWords(transcriptRaw),
+        transcribeLatencyMs: latencyMs,
+      }, sessionUiToken);
       return;
     }
-
-    const j = await pollJob((create as { job_id: string }).job_id, pollAbortController.signal, (job) => {
-      $("progressFill").style.width = Math.round((job.progress || 0) * 100) + "%";
-      $("progressText").textContent = Math.round((job.progress || 0) * 100) + "%";
-    });
-    applyJobResult(j);
-    const transcriptRaw = typeof j.result?.text === "string" ? j.result.text.trim() : "";
-    if (transcriptRaw) {
-      $("finalOutput").textContent = transcriptRaw;
-      await runUpscaleIfEnabled(transcriptRaw);
-    }
-    $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
   } catch (e) {
-    $("progressRow").hidden = true;
-    $("finalOutput").textContent = (e as Error).message;
-    setStatus("Error");
-    $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("progressRow").hidden = true;
+      $("finalOutput").textContent = (e as Error).message;
+      $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
+    }
+    setStatusScoped(sessionUiToken, "Error");
+    patchCurrentRecordingSummary({
+      status: (e as Error).message || "File transcription failed.",
+      tone: "error",
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
+    }, sessionUiToken);
   } finally {
     pollAbortController = null;
-    setBusy(false);
+    setBusy(false, sessionUiToken);
   }
 }
 
@@ -2899,6 +4612,8 @@ function gExtractKeywordsFromTitle(title: string): string[] {
 
 async function loadGraphData(): Promise<void> {
   try {
+    $("graphContainer").setAttribute("aria-busy", "true");
+    setGraphStatus("Refreshing graph…", "info");
     let items: Array<{ name: string; display_name: string; provider: string; keywords: string[] }> = [];
     try {
       const r = await apiGet<{ nodes: Array<{ name: string; display_name: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
@@ -2922,6 +4637,11 @@ async function loadGraphData(): Promise<void> {
       r: Math.max(3, Math.min(10, 3 + Math.sqrt(Math.max((it.keywords || []).length, 1)) * 1.5)),
     }));
     $("graphInfoText").textContent = `${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}`;
+    syncGraphHeaderSummary();
+    setGraphStatus(
+      gNodes.length ? `Graph is ready · ${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}` : "Graph is ready. No recordings yet.",
+      gNodes.length ? "success" : "warning"
+    );
     if (gNodes.length === 0) { gRender(); return; }
 
     gClusterLayout();
@@ -2930,6 +4650,11 @@ async function loadGraphData(): Promise<void> {
     gRender();
   } catch (e) {
     $("graphInfoText").textContent = "Error: " + (e as Error).message;
+    gNodes = [];
+    syncGraphHeaderSummary();
+    setGraphStatus("Graph failed to load.", "error");
+  } finally {
+    $("graphContainer").setAttribute("aria-busy", "false");
   }
 }
 
@@ -3067,11 +4792,30 @@ function gHideTooltip(): void {
 }
 
 function gNavToRecording(node: GraphNode): void {
-  document.querySelectorAll(".view").forEach((el) => ((el as HTMLElement).hidden = (el as HTMLElement).dataset.view !== "recordings"));
-  document.querySelectorAll(".sb-item").forEach((el) => el.classList.toggle("active", (el as HTMLElement).dataset.view === "recordings"));
-  $("windowViewLabel").textContent = "Recordings";
+  recordingsSearchQuery = "";
+  ($("recordingsSearchInput") as HTMLInputElement).value = "";
   selectedRecordingName = node.name;
-  void loadRecordings(true);
+  switchView("recordings");
+}
+
+async function initRecordingsBootstrap(): Promise<void> {
+  recordingsBootstrapReady = false;
+  try {
+    await loadRecordings(false);
+  } catch (e) {
+    console.warn("Initial recordings load failed", e);
+  }
+  try {
+    await recoverBackendAudioSessions();
+  } catch (e) {
+    console.warn("Recovery import failed", e);
+  }
+  try {
+    await recoverLiveDraftIfAny();
+  } catch (e) {
+    console.warn("Draft recovery failed", e);
+  }
+  recordingsBootstrapReady = !!currentArchiveDirSnapshot();
 }
 
 (() => {
@@ -3143,25 +4887,44 @@ function gNavToRecording(node: GraphNode): void {
     gZoom = nz; gRender();
   });
   $("graphZoomReset").addEventListener("click", () => { gCenterView(); gRender(); });
+  $("graphRefreshBtn").addEventListener("click", () => void loadGraphData());
+  $("graphOpenRecordingsBtn").addEventListener("click", () => switchView("recordings"));
 
   new ResizeObserver(() => {
     if (!ct.closest("[hidden]")) gRender();
   }).observe(ct);
 })();
 
-void loadCfg().then(() => loadMics(false));
+void loadCfg()
+  .then(async () => {
+    await loadMics(false);
+    scheduleLocalWarmup();
+  })
+  .catch(() => { });
 initQuickControls();
 syncRemoteModelOptions();
+syncWindowViewMeta("record");
+syncPaneContexts();
+setArchiveStatus("Archive is initializing…", "info");
+setSettingsSaveStatus("All settings are saved locally.", "neutral");
+setGraphStatus("Graph is ready.", "neutral");
+syncRecordingsHeaderSummary();
+syncSettingsHeaderSummary();
+syncSettingsCardSummaries();
+syncGraphHeaderSummary();
 void refreshNetworkState();
 window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());
 window.addEventListener("offline", () => void refreshNetworkState());
-void loadRecordings(false).catch(() => { });
-void recoverLiveDraftIfAny();
+recordingsBootstrapPromise = initRecordingsBootstrap().finally(() => {
+  recordingsBootstrapPromise = null;
+});
 draw();
 syncMode();
 setStatus("Idle");
 setRecordButton(false);
+setCurrentRecordingSummary(null);
+resetRecordingViewer();
 updateRecordingCopyState();
 
 // ── Backend boot status / error display ──

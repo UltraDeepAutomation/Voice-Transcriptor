@@ -21,8 +21,13 @@
     <main class="content">
       <div class="window-topbar">
         <div class="window-topbar-inner">
-          <span class="window-title">Transcriptor</span>
-          <span class="window-view" id="windowViewLabel">Record</span>
+          <div class="window-heading">
+            <span class="window-title">Transcriptor</span>
+            <div class="window-view-stack">
+              <span class="window-view" id="windowViewLabel">Record</span>
+              <span class="window-view-meta" id="windowViewMeta">Live capture, transcription, and session status.</span>
+            </div>
+          </div>
           <span class="net-pill" id="netPill" title="Internet connection status">
             <span class="net-dot" id="netDot"></span>
             <span class="net-text" id="netText">Offline</span>
@@ -38,9 +43,15 @@
           <div class="topbar-row">
             <label class="top-item top-item-mic">
               <span class="lbl">Mic</span>
-              <select id="micSelect">
-                <option value="">Select mic</option>
-              </select>
+              <div class="mic-select-row">
+                <select id="micSelect">
+                  <option value="">Select mic</option>
+                </select>
+                <button class="icon-btn mic-refresh-btn" id="refreshMicsBtn" type="button" aria-label="Reload microphones"
+                  title="Reload microphones">
+                  <span class="refresh-ico" aria-hidden="true"></span>
+                </button>
+              </div>
             </label>
             <label class="top-item top-item-lang">
               <span class="lbl">Lang</span>
@@ -67,6 +78,11 @@
               <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
               <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
             </div>
+          </div>
+          <div class="record-context-strip" id="recordContextStrip">
+            <span class="context-chip" id="recordContextMic">Mic: Not selected</span>
+            <span class="context-chip" id="recordContextArchive">Archive: Initializing…</span>
+            <span class="context-chip" id="recordContextSession">Session: Ready for a new recording</span>
           </div>
           <div id="vuFill" hidden></div>
           <div hidden>
@@ -98,6 +114,7 @@
                 </div>
               </div>
               <div class="pane-head-row pane-head-row-bottom">
+                <span class="pane-context" id="livePaneContext">Live preview is off.</span>
                 <div class="pane-actions">
                   <select id="model">
                     <option value="tiny">tiny</option>
@@ -123,6 +140,7 @@
                 </div>
               </div>
               <div class="pane-head-row pane-head-row-bottom">
+                <span class="pane-context" id="resultPaneContext">Auto transcribe is on.</span>
                 <div class="pane-actions">
                   <select id="providerSelect">
                     <option value="local">Local (Whisper)</option>
@@ -178,6 +196,36 @@
               <span class="progress-text" id="progressText">0%</span>
             </div>
 
+            <div class="session-notice" id="recordSessionNotice" hidden>
+              <span class="session-notice-dot" aria-hidden="true"></span>
+              <span class="session-notice-text" id="recordSessionNoticeText"></span>
+            </div>
+
+            <section class="recording-summary-card" id="recordingSummaryCard" hidden>
+              <div class="recording-summary-main">
+                <div class="recording-summary-copy">
+                  <span class="recording-summary-eyebrow">Session Status</span>
+                  <h3 class="recording-summary-title" id="recordingSummaryTitle">Recording summary</h3>
+                  <p class="recording-summary-status" id="recordingSummaryStatus">Audio capture is idle.</p>
+                </div>
+                <div class="recording-summary-actions">
+                  <button class="btn btn-ghost recording-summary-open-btn" id="recordingSummaryOpenRecordingsBtn"
+                    type="button">Open in Recordings</button>
+                </div>
+              </div>
+              <div class="recording-summary-meta" id="recordingSummaryMeta"></div>
+            </section>
+
+            <div class="pane-footer current-audio-row" id="currentRecordingAudioRow" hidden>
+              <div class="current-audio-copy">
+                <span class="current-audio-label">Latest Saved Audio</span>
+                <span class="current-audio-meta" id="currentRecordingAudioMeta">Available after the first saved recording.</span>
+              </div>
+              <audio id="currentRecordingAudio" controls></audio>
+              <a class="link-btn" id="currentRecordingOpenBtn" href="#" target="_blank" rel="noopener">Open Audio</a>
+              <a class="link-btn" id="currentRecordingDownloadBtn" href="#">Download Audio</a>
+            </div>
+
             <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
 
             <div class="pane-footer" id="downloadRow" hidden>
@@ -196,6 +244,7 @@
                 </div>
               </div>
               <div class="pane-head-row pane-head-row-bottom">
+                <span class="pane-context" id="upscalePaneContext">Upscale is off.</span>
                 <div class="pane-actions">
                   <div class="upscale-preset-wrap" id="upscalePresetWrap">
                     <select id="upscalePresetSelect" title="Upscale preset"></select>
@@ -225,15 +274,19 @@
       </section>
 
       <section class="view" data-view="recordings" hidden>
-        <div class="recordings-head">
-          <div class="recordings-head-main">
+        <div class="recordings-head screen-header">
+          <div class="recordings-head-main screen-header-copy">
+            <span class="section-eyebrow">Archive</span>
             <h2>Saved Recordings</h2>
+            <p class="screen-header-description">Search transcripts, reopen source audio, and review the current archive without losing session context.</p>
+            <div class="section-summary-row" id="recordingsHeaderSummary"></div>
             <p class="hint" id="recordingsDirLabel">Directory: -</p>
             <p class="hint" id="recordingsCountLabel">Total recordings: 0</p>
+            <p class="archive-status archive-status-neutral" id="recordingsArchiveStatus">Archive is ready.</p>
           </div>
-          <div class="recordings-head-actions">
+          <div class="recordings-head-actions screen-header-actions">
             <button class="btn ui-toggle-btn" id="recordingsStatsBtn" type="button"
-              aria-label="Toggle stats">Stats</button>
+              aria-label="Hide stats" aria-pressed="true">Hide Stats</button>
             <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button"
               aria-label="Refresh recordings">
               <span class="refresh-ico" aria-hidden="true"></span>
@@ -244,7 +297,20 @@
           </div>
         </div>
         <div class="recordings-layout">
-          <div class="recordings-list" id="recordingsList"></div>
+          <div class="recordings-list-pane">
+            <div class="recordings-list-toolbar">
+              <div class="panel-intro">
+                <span class="panel-title">Archive List</span>
+                <p class="panel-description">Search by title, provider, or language. Use Enter to open the first result and arrow keys to move between recordings.</p>
+              </div>
+              <div class="recordings-search-row">
+                <input id="recordingsSearchInput" type="search" placeholder="Search recordings, providers, languages" />
+                <button class="btn btn-ghost recordings-search-clear" id="recordingsSearchClearBtn" type="button">Clear</button>
+              </div>
+              <span class="hint recordings-filter-hint" id="recordingsFilterHint">Showing 0 of 0</span>
+            </div>
+            <div class="recordings-list" id="recordingsList" tabindex="0" aria-label="Saved recordings list"></div>
+          </div>
           <div class="recordings-viewer">
             <div class="recordings-stats" id="recordingsStatsPanel">
               <div class="stats-grid">
@@ -278,44 +344,93 @@
                 <div class="top-words" id="statsTopWords"></div>
               </div>
             </div>
-            <div class="pane-header">
-              <div class="recording-header-actions">
+            <div class="pane-header recordings-viewer-header">
+              <div class="recording-title-block">
+                <span class="pane-title">Transcript</span>
+                <strong class="recording-viewer-title" id="recordingTitleLabel">Choose a recording</strong>
                 <span class="pane-badge" id="recordingMeta"></span>
+                <span class="recording-viewer-helper" id="recordingViewerHelper">Select a recording to inspect transcript details and replay saved audio.</span>
+              </div>
+              <div class="recording-header-actions">
+                <div class="recording-audio-actions" id="recordingAudioActions" hidden>
+                  <a class="icon-btn" id="recordingOpenAudioBtn" aria-label="Open recording audio" title="Open audio"
+                    target="_blank" rel="noopener">
+                    <span aria-hidden="true">↗</span>
+                  </a>
+                  <a class="icon-btn" id="recordingDownloadAudioBtn" aria-label="Download recording audio" title="Download audio">
+                    <span aria-hidden="true">↓</span>
+                  </a>
+                </div>
                 <button class="icon-btn" id="recordingCopyBtn" type="button" aria-label="Copy recording text"
                   title="Copy">
                   <span class="copy-ico" aria-hidden="true"></span>
                 </button>
               </div>
             </div>
+            <audio id="recordingAudio" controls hidden></audio>
             <pre class="out" id="recordingContent" data-placeholder="Choose a recording from the left list..."></pre>
           </div>
         </div>
       </section>
 
       <section class="view" data-view="graph" hidden>
-        <div class="graph-container" id="graphContainer">
-          <canvas id="graphCanvas"></canvas>
-          <div class="graph-controls">
-            <button class="graph-ctrl-btn" id="graphZoomIn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
-            <button class="graph-ctrl-btn" id="graphZoomOut" type="button" title="Zoom out" aria-label="Zoom out">−</button>
-            <button class="graph-ctrl-btn" id="graphZoomReset" type="button" title="Reset view" aria-label="Reset view">⟲</button>
+        <div class="graph-shell">
+          <div class="screen-header">
+            <div class="screen-header-copy">
+              <span class="section-eyebrow">Graph</span>
+              <h2>Transcript Relationships</h2>
+              <p class="screen-header-description">Explore the archive by provider and keyword overlap, then jump directly back into the matching recording.</p>
+              <div class="section-summary-row" id="graphHeaderSummary"></div>
+            </div>
+            <div class="screen-header-actions">
+              <p class="archive-status archive-status-neutral" id="graphStatus">Graph is ready.</p>
+              <button class="btn btn-ghost refresh-btn" id="graphRefreshBtn" type="button" aria-label="Refresh graph">
+                <span class="refresh-ico" aria-hidden="true"></span>
+                <span>Refresh</span>
+              </button>
+              <button class="btn btn-ghost" id="graphOpenRecordingsBtn" type="button">Open Recordings</button>
+            </div>
           </div>
-          <div class="graph-tooltip" id="graphTooltip" hidden>
-            <span class="graph-tooltip-title" id="graphTooltipTitle"></span>
-            <span class="graph-tooltip-meta" id="graphTooltipMeta"></span>
-            <span class="graph-tooltip-preview" id="graphTooltipPreview"></span>
-          </div>
-          <div class="graph-info" id="graphInfo">
-            <span class="graph-info-text" id="graphInfoText">0 recordings</span>
+          <div class="graph-body">
+            <div class="graph-container" id="graphContainer">
+              <canvas id="graphCanvas"></canvas>
+              <div class="graph-controls">
+                <button class="graph-ctrl-btn" id="graphZoomIn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+                <button class="graph-ctrl-btn" id="graphZoomOut" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+                <button class="graph-ctrl-btn" id="graphZoomReset" type="button" title="Reset view" aria-label="Reset view">⟲</button>
+              </div>
+              <div class="graph-tooltip" id="graphTooltip" hidden>
+                <span class="graph-tooltip-title" id="graphTooltipTitle"></span>
+                <span class="graph-tooltip-meta" id="graphTooltipMeta"></span>
+                <span class="graph-tooltip-preview" id="graphTooltipPreview"></span>
+              </div>
+              <div class="graph-info" id="graphInfo">
+                <span class="graph-info-text" id="graphInfoText">0 recordings</span>
+              </div>
+            </div>
           </div>
         </div>
       </section>
 
       <section class="view" data-view="settings" hidden>
-        <div class="settings">
+        <div class="settings-shell">
+          <div class="screen-header">
+            <div class="screen-header-copy">
+              <span class="section-eyebrow">Workspace</span>
+              <h2>Settings</h2>
+              <p class="screen-header-description">Manage local defaults, archive routing, remote provider credentials, and shortcut behavior from one place.</p>
+              <div class="section-summary-row" id="settingsHeaderSummary"></div>
+            </div>
+          </div>
+          <div class="settings">
           <div class="card">
-            <h2>API Keys</h2>
-            <p class="hint">Stored locally on this Mac</p>
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>API Keys</h2>
+                <p class="hint card-description">Stored locally on this Mac and used only when the selected provider needs them.</p>
+              </div>
+              <div class="card-summary-row" id="apiKeysCardSummary"></div>
+            </div>
             <div class="field-stack">
               <label class="field">
                 <span class="lbl">OpenRouter</span>
@@ -337,7 +452,13 @@
             </div>
           </div>
           <div class="card">
-            <h2>Defaults</h2>
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Defaults</h2>
+                <p class="hint card-description">Applied to new recordings unless the active session has already locked its own settings.</p>
+              </div>
+              <div class="card-summary-row" id="defaultsCardSummary"></div>
+            </div>
             <div class="field-stack">
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
                   id="autoStopSilenceEnabled" /></label>
@@ -348,8 +469,15 @@
             </div>
           </div>
           <div class="card">
-            <h2>Recordings</h2>
-            <p class="hint">All text recordings are stored here.</p>
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Recordings</h2>
+                <p class="hint card-description">All text recordings are stored here.</p>
+              </div>
+              <div class="card-summary-row" id="archiveCardSummary"></div>
+            </div>
+            <p class="archive-status archive-status-neutral" id="settingsArchiveStatus">Archive is ready.</p>
+            <p class="hint">Archive changes apply to the next recording. Active sessions stay pinned to the archive they started with.</p>
             <div class="field-stack">
               <label class="field">
                 <span class="lbl">Folder</span>
@@ -360,10 +488,16 @@
               <button class="btn btn-ghost" id="pickRecordingsDirBtn" type="button">Choose Folder</button>
               <button class="btn btn-ghost" id="openRecordingsDirBtn" type="button">Open Folder</button>
             </div>
+            <p class="settings-save-status settings-save-status-neutral" id="settingsSaveStatus">All settings are saved locally.</p>
           </div>
           <div class="card">
-            <h2>Keyboard Shortcuts</h2>
-            <p class="hint">Click a shortcut to record a new combination. Press Esc to cancel.</p>
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Keyboard Shortcuts</h2>
+                <p class="hint card-description">Click a shortcut to record a new combination. Press Esc to cancel and keep the current binding.</p>
+              </div>
+              <div class="card-summary-row" id="shortcutsCardSummary"></div>
+            </div>
             <div class="field-stack">
               <label class="field">
                 <span class="lbl">Record Toggle</span>
@@ -378,6 +512,7 @@
                 </button>
               </label>
             </div>
+          </div>
           </div>
         </div>
       </section>

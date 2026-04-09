@@ -9,11 +9,17 @@ from typing import Optional
 
 import requests
 from requests import RequestException
+from requests.adapters import HTTPAdapter
 
 
 class RemoteError(RuntimeError):
     """Raised when a remote API call fails irrecoverably."""
     pass
+
+
+_SESSION = requests.Session()
+_SESSION.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0))
+_SESSION.mount("http://", HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0))
 
 
 def request_with_retry(
@@ -35,7 +41,7 @@ def request_with_retry(
     last_err: Optional[Exception] = None
     for attempt in range(retries):
         try:
-            return requests.request(method, url, timeout=timeout, **kwargs)
+            return _SESSION.request(method, url, timeout=timeout, **kwargs)
         except RequestException as e:
             last_err = e
             if attempt == retries - 1:

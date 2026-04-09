@@ -10,6 +10,7 @@
     "dev": "NODE_ENV=development electron .",
     "build:frontend": "npm --prefix ../frontend run build",
     "dist": "npm run build:frontend && electron-builder --mac --dir --x64 --arm64",
+    "dist:win": "npm run build:frontend && electron-builder --win --x64",
     "dist:dmg": "electron-builder --mac dmg"
   },
   "devDependencies": {
@@ -63,6 +64,15 @@
           ]
         }
       ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "icon.png"
     }
   }
 }

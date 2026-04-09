@@ -25,7 +25,7 @@ on_error() {
 trap 'on_error $LINENO' ERR
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."
 ROOT_DIR="$(pwd)"
 
 # Ensure Homebrew is in PATH (Apple Silicon vs Intel)

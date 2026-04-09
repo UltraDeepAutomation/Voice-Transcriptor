@@ -27,12 +27,12 @@ trap 'on_error $LINENO' ERR
 set -euo pipefail
 
 # ── Resolve this script's directory (works when double-clicked in Finder) ──
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."
 ROOT_DIR="$(pwd)"
 
 # ── Auto-remove quarantine from ALL project files (fixes Gatekeeper blocks) ──
 xattr -cr "$ROOT_DIR" 2>/dev/null || true
-chmod +x "$ROOT_DIR/setup.command" "$ROOT_DIR/run.command" "$ROOT_DIR/BUILD.sh" 2>/dev/null || true
+chmod +x "$ROOT_DIR/install/mac/setup.command" "$ROOT_DIR/install/mac/run.command" "$ROOT_DIR/install/mac/BUILD.sh" 2>/dev/null || true
 
 echo -e "${BOLD}"
 echo "  ╔══════════════════════════════════════╗"

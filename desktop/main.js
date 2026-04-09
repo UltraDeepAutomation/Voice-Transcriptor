@@ -2225,6 +2225,25 @@ function openPrivacyAutomationSettings() {
 }
 
 async function getFrontmostAppName() {
+  if (process.platform === "win32") {
+    const pwsh = `
+      Add-Type @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class Window {
+          [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+          [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+        }
+"@
+      $hwnd = [Window]::GetForegroundWindow()
+      $pid = 0
+      [Window]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
+      $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+      if ($proc) { Write-Output $proc.Name } else { Write-Output "" }
+    `;
+    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+    return res.ok ? (res.stdout || "").trim() : "";
+  }
   const res = await runCommand(
     "osascript",
     ["-e", 'tell application "System Events" to get name of first process whose frontmost is true'],
@@ -2235,6 +2254,31 @@ async function getFrontmostAppName() {
 }
 
 async function getFrontmostAppInfo() {
+  if (process.platform === "win32") {
+    const pwsh = `
+      Add-Type @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class Window {
+          [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+          [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+        }
+"@
+      $hwnd = [Window]::GetForegroundWindow()
+      $pid = 0
+      [Window]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
+      $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+      if ($proc) { Write-Output ($proc.Name + "||" + $pid) } else { Write-Output "||0" }
+    `;
+    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+    if (!res.ok) return { name: "", pid: 0 };
+    const raw = String(res.stdout || "").trim();
+    const [name, pidText] = raw.split("||");
+    return {
+      name: String(name || "").trim(),
+      pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0
+    };
+  }
   const script = `
     tell application "System Events"
       set p to first process whose frontmost is true
@@ -2256,6 +2300,26 @@ async function getFrontmostAppInfo() {
 async function activateAppByName(name) {
   const appName = String(name || "").trim();
   if (!appName || isBadActivationTarget(appName)) return false;
+  if (process.platform === "win32") {
+    const pwsh = `
+      Add-Type @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class Window {
+          [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        }
+"@
+      $proc = Get-Process -Name "${appName.replace(/"/g, '`"')}" -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($proc -and $proc.MainWindowHandle) {
+        [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+        Write-Output "1"
+      } else { Write-Output "0" }
+    `;
+    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+    if (!res.ok) return false;
+    await sleep(350);
+    return true;
+  }
   const escaped = escapeAppleScriptString(appName);
   const res = await runCommand("osascript", ["-e", `tell application "${escaped}" to activate`], {
     timeoutMs: 5000
@@ -2268,6 +2332,25 @@ async function activateAppByName(name) {
 async function activateAppByPid(pid) {
   const n = Number(pid || 0);
   if (!Number.isFinite(n) || n <= 0) return false;
+  if (process.platform === "win32") {
+    const pwsh = `
+      Add-Type @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class Window {
+          [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        }
+"@
+      $proc = Get-Process -Id ${Math.trunc(n)} -ErrorAction SilentlyContinue
+      if ($proc -and $proc.MainWindowHandle) {
+        [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+        Write-Output "1"
+      } else { Write-Output "0" }
+    `;
+    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+    if (!res.ok) return false;
+    return String(res.stdout || "").trim() === "1";
+  }
   const script = `
     tell application "System Events"
       if exists (first process whose unix id is ${Math.trunc(n)}) then
@@ -2497,8 +2580,47 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
 
   // ── Enterprise Paste Logic ──
   // Clipboard is already populated synchronously via Electron before we get here.
-  // We simply invoke the robust layout-agnostic Cmd+V via AppleScript 'key code 9'.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  
+  if (process.platform === "win32") {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { clipboard.writeText(String(text)); } catch { }
+      await sleep(45 + attempt * 40);
+
+      logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "powershell_paste" });
+      traceStep(trace, "method_begin", { method: "powershell_paste", attempt: attempt + 1 });
+
+      const cmdStarted = Date.now();
+      
+      const targetHintStr = (effectiveTargetPid > 0) ? `Get-Process -Id ${effectiveTargetPid} -ErrorAction SilentlyContinue | Select-Object -First 1` : (effectiveTargetName ? `Get-Process -Name "${effectiveTargetName.replace(/"/g, '`"')}" -ErrorAction SilentlyContinue | Select-Object -First 1` : "");
+      
+      const pwsh = `
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Window {
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+          }
+"@
+        ${targetHintStr ? `$proc = ${targetHintStr}; if ($proc -and $proc.MainWindowHandle) { [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 80; }` : ""}
+        [System.Windows.Forms.SendKeys]::SendWait("^{v}")
+        Write-Output "OK:powershell-paste"
+      `;
+
+      const check = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 3200 });
+      
+      if (check.ok && (check.stdout || "").trim().includes("OK:")) {
+         traceEnd(trace, "success", { method: "powershell_paste", attempt: attempt + 1, reason: "powershell_success", verified: false });
+         setTimeout(() => {
+           if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+         }, 1200);
+         return { ok: true, reason: "OK:powershell_paste", method: "powershell_paste", verified: false };
+      }
+      lastReason = (check.stderr || check.stdout || "powershell-failed").trim();
+    }
+  } else {
+    // macOS AppleScript 'key code 9'
+    for (let attempt = 0; attempt < 3; attempt++) {
     // Refresh clipboard just in case OS flushed it
     try { clipboard.writeText(String(text)); } catch { }
     await sleep(45 + attempt * 40);
@@ -2551,6 +2673,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       lastReason = (check.stderr || check.stdout || "osascript-failed").trim();
     }
   }
+  } // end macOS block
 
   // Secondary fallback: trigger Edit -> Paste menu item in target process.
   const menuPasteScript = `
@@ -2640,6 +2763,19 @@ async function sendCommandEnterToFocusedApp(targetAppName = "", targetAppPid = 0
     await activateAppByName(targetName);
     await sleep(110);
   }
+  
+  if (process.platform === "win32") {
+      const pwsh = `
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+      `;
+      const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 3200 });
+      if (res.ok) {
+        return { ok: true, reason: "powershell-enter-sent" };
+      }
+      return { ok: false, reason: String(res.stderr || res.stdout || "powershell-enter-failed") };
+  }
+
   const primary = `
     tell application "System Events"
       keystroke return using command down
@@ -2810,6 +2946,7 @@ async function processPostStopTask(task) {
       break;
     }
     const canUseUnscopedFinalText =
+      task.recordingId <= 0 &&
       !state.isRec &&
       !state.busy &&
       !state.progressVisible &&
@@ -2832,6 +2969,7 @@ async function processPostStopTask(task) {
       break;
     }
     const canUseFinalTextFallback =
+      task.recordingId <= 0 &&
       !state.isRec &&
       !state.busy &&
       !state.progressVisible &&
@@ -2851,9 +2989,6 @@ async function processPostStopTask(task) {
         expectedRecordingId: task.recordingId || 0,
       });
       break;
-    }
-    if (!transcript && state.liveText && state.liveText.length > 0) {
-      transcript = state.liveText;
     }
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
       (state.status === "Done" || state.status === "Error" || state.status === "Idle");
@@ -3145,7 +3280,10 @@ function getAppVenvDir() {
 
 async function findSystemPython(repoRoot) {
   // Find any working Python 3 on the system (for venv creation)
-  const sysCandidates = [
+  const sysCandidates = process.platform === "win32" ? [
+    (process.env.PYTHON || "").trim(),
+    "python"
+  ].filter(Boolean) : [
     (process.env.PYTHON || "").trim(),
     "/opt/homebrew/bin/python3",
     "/usr/local/bin/python3",
@@ -3165,7 +3303,9 @@ async function findSystemPython(repoRoot) {
 
 async function ensureAppVenv(repoRoot) {
   const venvDir = getAppVenvDir();
-  const venvPy = path.join(venvDir, "bin", "python3");
+  const venvPy = process.platform === "win32"
+    ? path.join(venvDir, "Scripts", "python.exe")
+    : path.join(venvDir, "bin", "python3");
 
   // If venv already exists and works, return it
   if (fileExists(venvPy)) {
@@ -3198,7 +3338,9 @@ async function ensureAppVenv(repoRoot) {
 
 async function resolvePython(repoRoot) {
   // 1) Try app venv (highest priority)
-  const appVenvPy = path.join(getAppVenvDir(), "bin", "python3");
+  const appVenvPy = process.platform === "win32"
+    ? path.join(getAppVenvDir(), "Scripts", "python.exe")
+    : path.join(getAppVenvDir(), "bin", "python3");
   if (fileExists(appVenvPy)) {
     const check = await runCommand(appVenvPy, ["-c", "import sys; print(sys.executable)"], {
       cwd: repoRoot, timeoutMs: 8000
@@ -3207,7 +3349,9 @@ async function resolvePython(repoRoot) {
   }
 
   // 2) Try dev venv (for development)
-  const devVenvPy = path.join(repoRoot, ".venv", "bin", "python3");
+  const devVenvPy = process.platform === "win32"
+    ? path.join(repoRoot, ".venv", "Scripts", "python.exe")
+    : path.join(repoRoot, ".venv", "bin", "python3");
   if (fileExists(devVenvPy)) {
     const check = await runCommand(devVenvPy, ["-c", "import sys; print(sys.executable)"], {
       cwd: repoRoot, timeoutMs: 8000

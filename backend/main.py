@@ -8,13 +8,15 @@ import secrets
 import threading
 import time
 import subprocess
+import mimetypes
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
+import numpy as np
 from fastapi import (
     Body,
     Depends,
@@ -30,7 +32,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.audio import AudioError, ensure_wav_16k, split_channels
+from backend.audio import AudioError, ensure_wav_16k, split_channels, write_wav
 from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
 from backend.live import LiveSession
 from backend.jobs import JobStore
@@ -38,7 +40,7 @@ from backend.remote_openrouter import RemoteError as OrRemoteError
 from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
 from backend.remote_deepgram import RemoteError as DgRemoteError
 from backend.remote_deepgram import deepgram_transcribe
-from backend.transcribe import merge_channel_transcripts, transcribe_file
+from backend.transcribe import merge_channel_transcripts, transcribe_file, warm_model, warm_state
 
 
 UPLOADS_DIR = DATA_DIR / "uploads"
@@ -70,6 +72,7 @@ ALLOWED_AUDIO_EXTS = {
     ".mp4",
     ".webm",
 }
+LIVE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 COMMON_STOPWORDS = {
     "и", "в", "на", "что", "как", "это", "я", "ты", "мы", "вы", "он", "она", "оно", "они",
@@ -161,6 +164,25 @@ def _load_or_create_api_token() -> str:
 API_TOKEN = _load_or_create_api_token()
 
 
+def _warm_default_local_model() -> None:
+    try:
+        started = time.perf_counter()
+        state = warm_model("small", probe=True)
+        logger.info(
+            "default local model warmed: model=small load_ms=%d probe_ms=%d total_ms=%d",
+            int(state.get("loaded_ms", 0)),
+            int(state.get("probe_ms", 0)),
+            int((time.perf_counter() - started) * 1000),
+        )
+    except Exception:
+        logger.exception("default local model warmup failed")
+
+
+@app.on_event("startup")
+def _startup_warm_models() -> None:
+    threading.Thread(target=_warm_default_local_model, daemon=True).start()
+
+
 def _origin_allowed(origin: str, request: Request) -> bool:
     parsed = urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
@@ -233,10 +255,110 @@ def _cleanup_live_recovery_files() -> None:
             pass
 
 
+def _normalize_live_session_id(value: str) -> str:
+    raw = (value or "").strip()
+    if raw and LIVE_SESSION_ID_RE.fullmatch(raw):
+        return raw
+    return str(uuid.uuid4())
+
+
+def _live_recovery_paths(session_id: str) -> tuple[Optional[Path], Optional[Path]]:
+    safe_session_id = (session_id or "").strip()
+    if not safe_session_id or not LIVE_SESSION_ID_RE.fullmatch(safe_session_id):
+        return None, None
+    matches = sorted(LIVE_RECOVERY_DIR.glob(f"*_{safe_session_id}.pcm16"))
+    if not matches:
+        return None, None
+    pcm_path = matches[-1]
+    meta_path = pcm_path.with_suffix(".json")
+    return pcm_path, meta_path
+
+
+def _delete_live_recovery(session_id: str) -> bool:
+    pcm_path, meta_path = _live_recovery_paths(session_id)
+    if pcm_path is None:
+        return False
+    pcm_path.unlink(missing_ok=True)
+    if meta_path is not None:
+        meta_path.unlink(missing_ok=True)
+    return True
+
+
+def _list_live_recoveries() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for pcm_path in sorted(LIVE_RECOVERY_DIR.glob("*.pcm16"), reverse=True):
+        try:
+            meta_path = pcm_path.with_suffix(".json")
+            raw = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            session_id = str(raw.get("session_id") or "").strip() or pcm_path.stem.split("_")[-1]
+            if not LIVE_SESSION_ID_RE.fullmatch(session_id):
+                continue
+            bytes_count = int(raw.get("bytes") or pcm_path.stat().st_size or 0)
+            if bytes_count < 32000:
+                continue
+            records.append(
+                {
+                    "session_id": session_id,
+                    "started_at": str(raw.get("started_at") or ""),
+                    "finished_at": str(raw.get("finished_at") or ""),
+                    "sample_rate": int(raw.get("sample_rate") or 16000),
+                    "bytes": bytes_count,
+                    "model": str(raw.get("model") or "small"),
+                    "language": str(raw.get("language") or "auto"),
+                    "duration_sec": round(bytes_count / 32000.0, 2),
+                }
+            )
+        except Exception:
+            continue
+    return records
+
+
+def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, Any]:
+    pcm_path, meta_path = _live_recovery_paths(session_id)
+    if pcm_path is None or meta_path is None or not pcm_path.exists():
+        raise HTTPException(status_code=404, detail="live recovery not found")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    audio_bytes = pcm_path.read_bytes()
+    if len(audio_bytes) < 32000:
+        raise HTTPException(status_code=400, detail="live recovery too short")
+
+    pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    started_at = str(meta.get("started_at") or "").strip()
+    model = str(meta.get("model") or "small").strip() or "small"
+    language = str(meta.get("language") or "auto").strip() or "auto"
+    pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
+    title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    stem = _recording_stem(title)
+    target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
+    audio_out = target_dir / f"{stem}.wav"
+    text_out = target_dir / f"{stem}.txt"
+    tmp_audio = target_dir / f"{stem}.wav.tmp-{uuid.uuid4().hex}"
+    try:
+        write_wav(str(tmp_audio), pcm, 16000)
+        os.replace(tmp_audio, audio_out)
+        _write_recording_text_file(
+            out=text_out,
+            title=title,
+            source_text="[Recovered live audio capture]",
+            transcript_text="",
+            provider="local",
+            model=model,
+            language=language,
+        )
+    finally:
+        tmp_audio.unlink(missing_ok=True)
+    _invalidate_recordings_cache()
+    _delete_live_recovery(session_id)
+    return {"name": text_out.name, "audio_name": audio_out.name, "archive_dir": str(target_dir)}
+
+
 async def _require_api_auth(request: Request) -> None:
     if request.url.path in {"/api/health", "/api/network"}:
         return
-    provided = (request.headers.get("x-api-token") or "").strip()
+    provided = (request.headers.get("x-api-token") or request.query_params.get("token") or "").strip()
     if not provided or provided != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
@@ -271,6 +393,18 @@ def index():
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.post("/api/transcribe/warmup")
+async def transcribe_warmup(
+    _auth: None = Depends(_require_api_auth),
+    model: str = Form("small"),
+):
+    if model not in ALLOWED_LOCAL_MODELS:
+        raise HTTPException(status_code=400, detail="unsupported model")
+    loop = asyncio.get_event_loop()
+    state = await loop.run_in_executor(None, lambda: warm_model(model, probe=False))
+    return {"ok": True, "model": model, "state": warm_state(model) or state}
 
 
 @app.get("/api/network")
@@ -313,6 +447,12 @@ async def _save_upload_file(upload: UploadFile, target: Path) -> int:
                 )
             f.write(chunk)
     return total
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    tmp_path = path.with_suffix(path.suffix + f".tmp-{uuid.uuid4().hex}")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def _normalize_filename(name: str) -> str:
@@ -389,6 +529,65 @@ def _transcribe_with_retry(
     raise RuntimeError("transcribe_with_retry failed without exception")
 
 
+def _run_local_transcribe_once(
+    *,
+    run_id: str,
+    upload_path: Path,
+    model: str,
+    language: Optional[str],
+    split_stereo: bool,
+    word_timestamps: bool,
+    progress_cb: Optional[Callable[[float], None]] = None,
+) -> dict[str, Any]:
+    temp_paths: list[str] = []
+
+    def set_progress(value: float) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(value)
+        except Exception:
+            pass
+
+    try:
+        if split_stereo:
+            wav_path = str(RESULTS_DIR / f"{run_id}.16k.wav")
+            temp_paths.append(wav_path)
+            ensure_wav_16k(str(upload_path), wav_path, channels=2)
+            set_progress(0.15)
+            ch1, ch2 = split_channels(wav_path)
+        else:
+            ch1, ch2 = (None, None)
+            set_progress(0.15)
+
+        if ch1 and ch2:
+            temp_paths.extend([ch1, ch2])
+            set_progress(0.2)
+            t1 = _transcribe_with_retry(
+                ch1, model, language=language, word_timestamps=word_timestamps
+            )
+            set_progress(0.6)
+            t2 = _transcribe_with_retry(
+                ch2, model, language=language, word_timestamps=word_timestamps
+            )
+            set_progress(0.9)
+            return merge_channel_transcripts(t1, t2)
+
+        set_progress(0.25)
+        mono_wav = str(RESULTS_DIR / f"{run_id}.mono16k.wav")
+        temp_paths.append(mono_wav)
+        ensure_wav_16k(str(upload_path), mono_wav, channels=1)
+        return _transcribe_with_retry(
+            mono_wav, model, language=language, word_timestamps=word_timestamps
+        )
+    finally:
+        for p in temp_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
 def _validate_config_payload(payload: dict) -> None:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="invalid config")
@@ -407,6 +606,27 @@ def _validate_config_payload(payload: dict) -> None:
 _rec_dir_cache: Optional[Path] = None
 _rec_dir_cache_at = 0.0
 _REC_DIR_CACHE_TTL = 10.0
+
+
+def _invalidate_recordings_cache() -> None:
+    global _list_cache, _list_cache_at, _list_cache_key
+    global _graph_cache, _graph_cache_at, _graph_cache_key
+    global _stats_cache, _stats_cache_at, _stats_cache_key
+    _list_cache = None
+    _list_cache_at = 0.0
+    _list_cache_key = None
+    _graph_cache = None
+    _graph_cache_at = 0.0
+    _graph_cache_key = None
+    _stats_cache = None
+    _stats_cache_at = 0.0
+    _stats_cache_key = None
+
+
+def _invalidate_recordings_dir_cache() -> None:
+    global _rec_dir_cache, _rec_dir_cache_at
+    _rec_dir_cache = None
+    _rec_dir_cache_at = 0.0
 
 
 def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
@@ -473,14 +693,126 @@ def _recording_filename(title: str) -> str:
     return f"{ts}__{_sanitize_name(title)}.txt"
 
 
-def _recording_path_or_404(name: str) -> Path:
+def _recording_stem(name_or_title: str) -> str:
+    raw = os.path.basename(name_or_title or "").strip()
+    if raw.endswith(".txt"):
+        return Path(raw).stem
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{ts}__{_sanitize_name(raw or 'recording')}"
+
+
+def _recording_path_or_404(name: str, target_dir: Optional[Path] = None) -> Path:
     safe = os.path.basename(name or "")
     if not safe.endswith(".txt") or safe in {"", ".", ".."}:
         raise HTTPException(status_code=400, detail="invalid recording name")
-    p = _resolve_recordings_dir() / safe
+    p = (target_dir or _resolve_recordings_dir()) / safe
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="recording not found")
     return p
+
+
+def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True) -> Path:
+    hint = str(archive_dir or "").strip()
+    if not hint:
+        resolved = _resolve_recordings_dir()
+        if create:
+            resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
+    candidate = Path(hint).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=400, detail="archive_dir must be an absolute path")
+    resolved = candidate.resolve()
+    home_dir = Path.home().resolve()
+    try:
+        resolved.relative_to(home_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="archive_dir is outside allowed directories") from exc
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
+    elif not resolved.exists() or not resolved.is_dir():
+        raise HTTPException(status_code=409, detail="archive directory is no longer available")
+    return resolved
+
+
+def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optional[Path]:
+    stem = Path(os.path.basename(name or "")).stem
+    if not stem:
+        return None
+    root_dir = target_dir or _resolve_recordings_dir()
+    for ext in (".wav", ".m4a", ".mp3", ".flac", ".ogg", ".aac", ".mp4", ".webm"):
+        candidate = root_dir / f"{stem}{ext}"
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> dict[str, Any]:
+    audio_path = _recording_audio_path(name, target_dir=target_dir)
+    if audio_path is None:
+        return {
+            "has_audio": False,
+            "audio_name": "",
+            "audio_size_bytes": 0,
+            "audio_mime": "",
+        }
+    mime = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    try:
+        size_bytes = audio_path.stat().st_size
+    except Exception:
+        size_bytes = 0
+    return {
+        "has_audio": True,
+        "audio_name": audio_path.name,
+        "audio_size_bytes": size_bytes,
+        "audio_mime": mime,
+    }
+
+
+def _render_recording_content(
+    *,
+    title: str,
+    source_text: str,
+    transcript_text: str,
+    provider: str,
+    model: str,
+    language: str,
+) -> str:
+    lines = [
+        f"Title: {title}",
+        f"Saved at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Language: {language or 'auto'}",
+        f"Provider: {provider or 'local'}",
+        f"Model: {model or '-'}",
+        "",
+    ]
+    if source_text:
+        lines.extend(["Original:", source_text, ""])
+    if transcript_text:
+        lines.extend(["Transcription:", transcript_text, ""])
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_recording_text_file(
+    *,
+    out: Path,
+    title: str,
+    source_text: str,
+    transcript_text: str,
+    provider: str,
+    model: str,
+    language: str,
+) -> None:
+    _atomic_write_text(
+        out,
+        _render_recording_content(
+            title=title,
+            source_text=source_text,
+            transcript_text=transcript_text,
+            provider=provider,
+            model=model,
+            language=language,
+        ),
+    )
 
 
 def _extract_stats_text(content: str) -> str:
@@ -707,14 +1039,35 @@ async def ws_transcribe(websocket: WebSocket):
     model = (qp.get("model") or "small").strip() or "small"
     language = (qp.get("language") or "auto").strip()
     lang_opt: Optional[str] = None if language in ("", "auto", "Auto") else language
+    session_id = _normalize_live_session_id(qp.get("session_id") or "")
+    archive_dir = str(qp.get("archive_dir") or "").strip()
 
     session = LiveSession(model_name=model, language=lang_opt)
     stop = asyncio.Event()
     started_at = datetime.now()
-    session_id = str(uuid.uuid4())
     recovery_pcm_path = LIVE_RECOVERY_DIR / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}.pcm16"
     recovery_meta_path = LIVE_RECOVERY_DIR / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}.json"
     recovery_file = recovery_pcm_path.open("wb")
+    recovery_meta_path.write_text(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "started_at": started_at.isoformat(),
+                "finished_at": "",
+                "sample_rate": 16000,
+                "format": "pcm16le_mono",
+                "bytes": 0,
+                "chunks": 0,
+                "model": model,
+                "language": lang_opt or "auto",
+                "archive_dir": archive_dir,
+                "status": "recording",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     chunk_count = 0
     byte_count = 0
@@ -794,13 +1147,8 @@ async def ws_transcribe(websocket: WebSocket):
             recovery_file.close()
         except Exception:
             pass
-        # Keep only meaningful captures; remove tiny accidental openings.
         try:
             if byte_count < 32000:  # ~1s at 16kHz mono pcm16
-                recovery_pcm_path.unlink(missing_ok=True)
-                recovery_meta_path.unlink(missing_ok=True)
-            elif not had_error:
-                # Normal/healthy session: no need to keep raw audio.
                 recovery_pcm_path.unlink(missing_ok=True)
                 recovery_meta_path.unlink(missing_ok=True)
             else:
@@ -816,6 +1164,8 @@ async def ws_transcribe(websocket: WebSocket):
                             "chunks": chunk_count,
                             "model": model,
                             "language": lang_opt or "auto",
+                            "archive_dir": archive_dir,
+                            "status": "error" if had_error else "recoverable",
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -824,6 +1174,28 @@ async def ws_transcribe(websocket: WebSocket):
                 )
         except Exception:
             pass
+
+
+@app.get("/api/live/recoveries")
+def list_live_recoveries(_auth: None = Depends(_require_api_auth)):
+    _cleanup_live_recovery_files()
+    return {"items": _list_live_recoveries()}
+
+
+@app.post("/api/live/recoveries/{session_id}/discard")
+def discard_live_recovery(session_id: str, _auth: None = Depends(_require_api_auth)):
+    deleted = _delete_live_recovery(session_id)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/api/live/recoveries/{session_id}/promote")
+def promote_live_recovery(
+    session_id: str,
+    payload: dict = Body(default_factory=dict),
+    _auth: None = Depends(_require_api_auth),
+):
+    result = _promote_live_recovery(session_id, str((payload or {}).get("archive_dir") or "").strip())
+    return {"ok": True, **result}
 
 
 @app.post("/api/jobs")
@@ -850,41 +1222,17 @@ async def create_job(
     lang_opt = _normalize_language(language)
 
     def run():
-        temp_paths = []
         try:
             jobs.set_running(job_id)
-            if split_stereo:
-                # Split flow: decode once to stereo, then run per-channel transcription.
-                wav_path = str(RESULTS_DIR / f"{job_id}.16k.wav")
-                temp_paths.append(wav_path)
-                ensure_wav_16k(str(upload_path), wav_path, channels=2)
-                jobs.set_progress(job_id, 0.15)
-                ch1, ch2 = split_channels(wav_path)
-            else:
-                ch1, ch2 = (None, None)
-                jobs.set_progress(job_id, 0.15)
-
-            if ch1 and ch2:
-                temp_paths.extend([ch1, ch2])
-                jobs.set_progress(job_id, 0.2)
-                t1 = _transcribe_with_retry(
-                    ch1, model, language=lang_opt, word_timestamps=word_timestamps
-                )
-                jobs.set_progress(job_id, 0.6)
-                t2 = _transcribe_with_retry(
-                    ch2, model, language=lang_opt, word_timestamps=word_timestamps
-                )
-                jobs.set_progress(job_id, 0.9)
-                result = merge_channel_transcripts(t1, t2)
-            else:
-                jobs.set_progress(job_id, 0.25)
-                mono_wav = str(RESULTS_DIR / f"{job_id}.mono16k.wav")
-                temp_paths.append(mono_wav)
-                # Fast path: single mono conversion for default/local live flow.
-                ensure_wav_16k(str(upload_path), mono_wav, channels=1)
-                result = _transcribe_with_retry(
-                    mono_wav, model, language=lang_opt, word_timestamps=word_timestamps
-                )
+            result = _run_local_transcribe_once(
+                run_id=job_id,
+                upload_path=upload_path,
+                model=model,
+                language=lang_opt,
+                split_stereo=split_stereo,
+                word_timestamps=word_timestamps,
+                progress_cb=lambda value: jobs.set_progress(job_id, value),
+            )
 
             result_json_path = RESULTS_DIR / f"{job_id}.json"
             result_txt_path = RESULTS_DIR / f"{job_id}.txt"
@@ -905,11 +1253,6 @@ async def create_job(
         except Exception as e:
             jobs.set_error(job_id, f"Transcription failed: {e}")
         finally:
-            for p in temp_paths:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
             try:
                 os.remove(upload_path)
             except Exception:
@@ -917,6 +1260,49 @@ async def create_job(
 
     jobs.submit(run)
     return {"job_id": job_id}
+
+
+@app.post("/api/transcribe-sync")
+async def transcribe_sync(
+    _auth: None = Depends(_require_api_auth),
+    file: UploadFile = File(...),
+    language: str = Form("auto"),
+    model: str = Form("small"),
+    split_stereo: bool = Form(True),
+    word_timestamps: bool = Form(False),
+):
+    if model not in ALLOWED_LOCAL_MODELS:
+        raise HTTPException(status_code=400, detail="unsupported model")
+
+    request_id = str(uuid.uuid4())
+    orig_name = _normalize_filename(file.filename or "audio.wav")
+    _validate_audio_filename(orig_name)
+    upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
+    await _save_upload_file(file, upload_path)
+    lang_opt = _normalize_language(language)
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: _run_local_transcribe_once(
+                run_id=request_id,
+                upload_path=upload_path,
+                model=model,
+                language=lang_opt,
+                split_stereo=split_stereo,
+                word_timestamps=word_timestamps,
+            ),
+        )
+        return {"ok": True, "result": result}
+    except AudioError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+    finally:
+        try:
+            os.remove(upload_path)
+        except Exception:
+            pass
 
 
 def _run_remote_transcribe_once(
@@ -1319,6 +1705,8 @@ def get_config(_auth: None = Depends(_require_api_auth)):
 def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
     _validate_config_payload(payload)
     save_config(payload)
+    _invalidate_recordings_dir_cache()
+    _invalidate_recordings_cache()
     return {"ok": True}
 
 
@@ -1435,6 +1823,7 @@ def list_recordings(_auth: None = Depends(_require_api_auth)):
                     "size_bytes": st.st_size,
                     "provider": provider,
                     "language": language,
+                    **_recording_audio_payload(p.name),
                 }
             )
         except Exception:
@@ -1518,9 +1907,13 @@ def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
     for p in list(d.glob("*.txt")):
         try:
             p.unlink()
+            audio_path = _recording_audio_path(p.name)
+            if audio_path is not None:
+                audio_path.unlink(missing_ok=True)
             deleted += 1
         except Exception:
             failed += 1
+    _invalidate_recordings_cache()
     return {"deleted": deleted, "failed": failed}
 
 
@@ -1533,7 +1926,23 @@ def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth))
         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
         "size_bytes": st.st_size,
         "content": p.read_text(encoding="utf-8", errors="replace"),
+        **_recording_audio_payload(p.name),
     }
+
+
+@app.get("/api/recordings/{recording_name}/audio")
+def get_recording_audio(
+    recording_name: str,
+    archive_dir: str = "",
+    _auth: None = Depends(_require_api_auth),
+):
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=False) if str(archive_dir or "").strip() else None
+    p = _recording_path_or_404(recording_name, target_dir=target_dir)
+    audio_path = _recording_audio_path(p.name, target_dir=target_dir)
+    if audio_path is None:
+        raise HTTPException(status_code=404, detail="recording audio not found")
+    media_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    return FileResponse(str(audio_path), media_type=media_type, filename=audio_path.name)
 
 
 _stats_cache: Optional[dict] = None
@@ -1624,6 +2033,8 @@ def save_recording(
     _auth: None = Depends(_require_api_auth),
 ):
     existing_name = os.path.basename(str(payload.get("name") or "").strip())
+    archive_dir = str(payload.get("archive_dir") or "").strip()
+    require_existing = bool(payload.get("require_existing"))
     title = _sanitize_name(str(payload.get("title") or "recording"))
     source_text = str(payload.get("source_text") or "").strip()
     transcript_text = str(payload.get("transcript_text") or "").strip()
@@ -1633,25 +2044,89 @@ def save_recording(
     if not source_text and not transcript_text:
         source_text = "[No speech captured]"
 
-    lines = [
-        f"Title: {title}",
-        f"Saved at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Language: {language or 'auto'}",
-        f"Provider: {provider or 'local'}",
-        f"Model: {model or '-'}",
-        "",
-    ]
-    if source_text:
-        lines.extend(["Original:", source_text, ""])
-    if transcript_text:
-        lines.extend(["Transcription:", transcript_text, ""])
-
-    target_dir = _resolve_recordings_dir()
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=not require_existing)
     if existing_name:
         if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
         out = target_dir / existing_name
+        if require_existing and not out.exists():
+            raise HTTPException(status_code=409, detail="recording no longer exists in the target archive")
     else:
+        if require_existing:
+            raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
         out = target_dir / _recording_filename(title)
-    out.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-    return {"ok": True, "name": out.name}
+    _write_recording_text_file(
+        out=out,
+        title=title,
+        source_text=source_text,
+        transcript_text=transcript_text,
+        provider=provider,
+        model=model,
+        language=language,
+    )
+    _invalidate_recordings_cache()
+    return {"ok": True, "name": out.name, "archive_dir": str(target_dir)}
+
+
+@app.post("/api/recordings/save-with-audio")
+async def save_recording_with_audio(
+    _auth: None = Depends(_require_api_auth),
+    file: UploadFile = File(...),
+    name: str = Form(""),
+    archive_dir: str = Form(""),
+    require_existing: bool = Form(False),
+    title: str = Form("recording"),
+    source_text: str = Form(""),
+    transcript_text: str = Form(""),
+    provider: str = Form(""),
+    model: str = Form(""),
+    language: str = Form(""),
+):
+    existing_name = os.path.basename(str(name or "").strip())
+    safe_title = _sanitize_name(str(title or "recording"))
+    safe_source_text = str(source_text or "").strip()
+    safe_transcript_text = str(transcript_text or "").strip()
+    safe_provider = str(provider or "").strip()
+    safe_model = str(model or "").strip()
+    safe_language = str(language or "").strip()
+    if not safe_source_text and not safe_transcript_text:
+        safe_source_text = "[No speech captured]"
+
+    orig_name = _normalize_filename(file.filename or "recording.wav")
+    _validate_audio_filename(orig_name)
+    ext = Path(orig_name).suffix.lower() or ".wav"
+
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=not bool(require_existing))
+    if existing_name:
+        if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
+            raise HTTPException(status_code=400, detail="invalid recording name")
+        stem = Path(existing_name).stem
+        if require_existing and not (target_dir / existing_name).exists():
+            raise HTTPException(status_code=409, detail="recording no longer exists in the target archive")
+    else:
+        if require_existing:
+            raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
+        stem = _recording_stem(safe_title)
+
+    out_text = target_dir / f"{stem}.txt"
+    out_audio = target_dir / f"{stem}{ext}"
+    tmp_audio = target_dir / f"{stem}{ext}.tmp-{uuid.uuid4().hex}"
+    existing_audio = _recording_audio_path(f"{stem}.txt", target_dir=target_dir)
+    try:
+        await _save_upload_file(file, tmp_audio)
+        os.replace(tmp_audio, out_audio)
+        _write_recording_text_file(
+            out=out_text,
+            title=safe_title,
+            source_text=safe_source_text,
+            transcript_text=safe_transcript_text,
+            provider=safe_provider,
+            model=safe_model,
+            language=safe_language,
+        )
+    finally:
+        tmp_audio.unlink(missing_ok=True)
+    if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
+        existing_audio.unlink(missing_ok=True)
+    _invalidate_recordings_cache()
+    return {"ok": True, "name": out_text.name, "audio_name": out_audio.name, "archive_dir": str(target_dir)}

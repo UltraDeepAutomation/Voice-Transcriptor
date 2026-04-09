@@ -6,6 +6,7 @@ Thread-safe model cache, empty-sequence error handling, stereo channel merge.
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,29 @@ logger = logging.getLogger(__name__)
 
 _MODEL_LOCK = threading.Lock()
 _MODEL_CACHE: Dict[str, WhisperModel] = {}
+_MODEL_WARM_STATE: Dict[str, Dict[str, float]] = {}
+_CPU_COUNT = max(1, os.cpu_count() or 1)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid integer env %s=%r; using default=%d", name, raw, default)
+        return default
+
+
+_DEFAULT_CPU_THREADS = max(
+    4,
+    min(8, _env_int("TRANSCRIPTOR_WHISPER_CPU_THREADS", max(4, _CPU_COUNT // 2))),
+)
+_DEFAULT_NUM_WORKERS = max(
+    1,
+    min(3, _env_int("TRANSCRIPTOR_WHISPER_NUM_WORKERS", 2 if _CPU_COUNT >= 8 else 1)),
+)
 
 
 def _is_empty_sequence_transcribe_error(exc: Exception) -> bool:
@@ -37,9 +61,58 @@ def _model(model_name: str) -> WhisperModel:
     with _MODEL_LOCK:
         m = _MODEL_CACHE.get(model_name)
         if m is None:
-            m = WhisperModel(model_name, device="cpu", compute_type="int8")
+            started = time.perf_counter()
+            m = WhisperModel(
+                model_name,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=_DEFAULT_CPU_THREADS,
+                num_workers=_DEFAULT_NUM_WORKERS,
+            )
             _MODEL_CACHE[model_name] = m
+            logger.info(
+                "whisper model loaded: model=%s cpu_threads=%d num_workers=%d load_ms=%d",
+                model_name,
+                _DEFAULT_CPU_THREADS,
+                _DEFAULT_NUM_WORKERS,
+                int((time.perf_counter() - started) * 1000),
+            )
         return m
+
+
+def warm_model(model_name: str, probe: bool = False) -> Dict[str, float]:
+    started = time.perf_counter()
+    _model(model_name)
+    load_ms = int((time.perf_counter() - started) * 1000)
+    probe_ms = 0
+    if probe:
+        probe_started = time.perf_counter()
+        try:
+            transcribe_audio(
+                np.zeros((16000,), dtype=np.float32),
+                model_name,
+                language=None,
+                vad_filter=True,
+                word_timestamps=False,
+                beam_size=1,
+                best_of=1,
+            )
+        except Exception:
+            logger.exception("whisper warm probe failed: model=%s", model_name)
+        probe_ms = int((time.perf_counter() - probe_started) * 1000)
+    state = {
+        "loaded_ms": float(load_ms),
+        "probe_ms": float(probe_ms),
+        "warmed_at": float(time.time()),
+    }
+    with _MODEL_LOCK:
+        _MODEL_WARM_STATE[model_name] = state
+    return state
+
+
+def warm_state(model_name: str) -> Dict[str, float]:
+    with _MODEL_LOCK:
+        return dict(_MODEL_WARM_STATE.get(model_name) or {})
 
 
 def _build_result(
