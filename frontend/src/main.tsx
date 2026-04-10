@@ -2536,8 +2536,7 @@ function resetRecordingViewer(placeholder = "Choose a recording from the left li
   player.pause();
   player.removeAttribute("src");
   player.load();
-  player.hidden = true;
-  $("recordingAudioActions").hidden = true;
+  $("recordingAudioRow").hidden = true;
   updateRecordingCopyState();
 }
 
@@ -2551,8 +2550,7 @@ function setRecordingViewerLoading(displayName: string): void {
   player.pause();
   player.removeAttribute("src");
   player.load();
-  player.hidden = true;
-  $("recordingAudioActions").hidden = true;
+  $("recordingAudioRow").hidden = true;
   updateRecordingCopyState();
 }
 
@@ -2923,26 +2921,17 @@ async function openRecording(name: string): Promise<void> {
     $("recordingContent").setAttribute("data-placeholder", "Transcription will appear here...");
     $("recordingContent").textContent = r.content || "";
     const player = $("recordingAudio") as HTMLAudioElement;
-    const audioActions = $("recordingAudioActions");
-    const openBtn = $("recordingOpenAudioBtn") as HTMLAnchorElement;
-    const downloadBtn = $("recordingDownloadAudioBtn") as HTMLAnchorElement;
+    const audioRow = $("recordingAudioRow");
     if (r.has_audio) {
       const audioUrl = latestRecordingAudioUrl(name, currentArchiveDirSnapshot());
-      player.hidden = false;
-      audioActions.hidden = false;
+      audioRow.hidden = false;
       player.src = audioUrl;
       player.load();
-      openBtn.href = audioUrl;
-      downloadBtn.href = audioUrl;
-      downloadBtn.download = r.audio_name || `${name.replace(/\.txt$/i, "")}.wav`;
     } else {
       player.pause();
       player.removeAttribute("src");
       player.load();
-      player.hidden = true;
-      audioActions.hidden = true;
-      openBtn.removeAttribute("href");
-      downloadBtn.removeAttribute("href");
+      audioRow.hidden = true;
     }
     updateRecordingCopyState();
   } catch (e) {
@@ -2957,8 +2946,7 @@ async function openRecording(name: string): Promise<void> {
     player.pause();
     player.removeAttribute("src");
     player.load();
-    player.hidden = true;
-    $("recordingAudioActions").hidden = true;
+    $("recordingAudioRow").hidden = true;
     updateRecordingCopyState();
   }
 }

@@ -193,16 +193,8 @@ body {
   background: var(--bg-8);
 }
 
-.sb-item.active::before {
-  content: "";
-  position: absolute;
-  top: 10px;
-  bottom: 10px;
-  left: 0;
-  width: 3px;
-  border-radius: 999px;
-  background: rgba(144, 176, 228, 0.9);
-}
+/* Left accent stripe removed by UX request — selected state is
+   signalled by the darker background + border alone. */
 
 .content {
   display: flex;
@@ -1831,16 +1823,8 @@ textarea:focus-visible,
   color: var(--text);
 }
 
-.recording-item.active::before {
-  content: "";
-  position: absolute;
-  top: 10px;
-  bottom: 10px;
-  left: 0;
-  width: 3px;
-  border-radius: 999px;
-  background: rgba(144, 176, 228, 0.9);
-}
+/* Left accent stripe removed by UX request — the darker background
+   plus the border is enough signal for the selected recording. */
 
 .recording-item .rec-title {
   display: block;
@@ -2080,10 +2064,13 @@ textarea:focus-visible,
   min-height: 64px;
 }
 
-#recordingAudio {
-  width: calc(100% - 24px);
-  margin: 0 12px 12px;
-}
+/* The legacy ``#recordingAudio { width: calc(100% - 24px); ...}``
+   rule used to force the player full-width in the Recordings
+   viewer, which made it tall and stretched. The player is now
+   styled identically to the Record-view player via the shared
+   ``#currentRecordingAudio, #recordingAudio`` rule above, and
+   is wrapped in a ``.current-audio-row`` footer for consistent
+   layout. */
 
 .icon-btn {
   width: 32px;
@@ -2745,11 +2732,14 @@ canvas,
 }
 
 .graph-controls {
+  /* Pinned to the bottom-right of the canvas area — they used to
+     sit at top-right where long title/meta strings from hovered
+     nodes could overlap them. Bottom-right is always clear. */
   position: absolute;
-  top: 14px;
+  bottom: 14px;
   right: 14px;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 4px;
   z-index: 10;
   padding: 6px;
@@ -2835,6 +2825,9 @@ canvas,
 }
 
 .graph-info {
+  /* Bottom-left, pairing with the new bottom-right control cluster
+     so the hover tooltips at the top of the canvas never compete
+     with either. */
   position: absolute;
   bottom: 14px;
   left: 14px;

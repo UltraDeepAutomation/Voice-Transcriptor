@@ -328,22 +328,15 @@
                 <span class="pane-badge" id="recordingMeta"></span>
               </div>
               <div class="recording-header-actions">
-                <div class="recording-audio-actions" id="recordingAudioActions" hidden>
-                  <a class="icon-btn" id="recordingOpenAudioBtn" aria-label="Open recording audio" title="Open audio"
-                    target="_blank" rel="noopener">
-                    <span aria-hidden="true">↗</span>
-                  </a>
-                  <a class="icon-btn" id="recordingDownloadAudioBtn" aria-label="Download recording audio" title="Download audio">
-                    <span aria-hidden="true">↓</span>
-                  </a>
-                </div>
                 <button class="icon-btn" id="recordingCopyBtn" type="button" aria-label="Copy recording text"
                   title="Copy">
                   <span class="copy-ico" aria-hidden="true"></span>
                 </button>
               </div>
             </div>
-            <audio id="recordingAudio" controls hidden></audio>
+            <div class="pane-footer current-audio-row" id="recordingAudioRow" hidden>
+              <audio id="recordingAudio" controls></audio>
+            </div>
             <pre class="out" id="recordingContent" data-placeholder="Choose a recording from the left list..."></pre>
           </div>
         </div>
