@@ -25,7 +25,6 @@
             <span class="window-title">Transcriptor</span>
             <div class="window-view-stack">
               <span class="window-view" id="windowViewLabel">Record</span>
-              <span class="window-view-meta" id="windowViewMeta">Live capture, transcription, and session status.</span>
             </div>
           </div>
           <span class="net-pill" id="netPill" title="Internet connection status">
@@ -79,11 +78,6 @@
               <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
             </div>
           </div>
-          <div class="record-context-strip" id="recordContextStrip">
-            <span class="context-chip" id="recordContextMic">Mic: Not selected</span>
-            <span class="context-chip" id="recordContextArchive">Archive: Initializing…</span>
-            <span class="context-chip" id="recordContextSession">Session: Ready for a new recording</span>
-          </div>
           <div id="vuFill" hidden></div>
           <div hidden>
             <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
@@ -113,16 +107,17 @@
                   </label>
                 </div>
               </div>
-              <div class="pane-head-row pane-head-row-bottom">
-                <span class="pane-context" id="livePaneContext">Live preview is off.</span>
-                <div class="pane-actions">
-                  <select id="model">
-                    <option value="tiny">tiny</option>
-                    <option value="base">base</option>
-                    <option value="small" selected>small</option>
-                    <option value="medium">medium</option>
-                    <option value="large-v3">large-v3</option>
-                  </select>
+              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
+                <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-live">
+                  <div class="pane-control-group pane-control-group-compact">
+                    <select id="model">
+                      <option value="tiny">tiny</option>
+                      <option value="base">base</option>
+                      <option value="small" selected>small</option>
+                      <option value="medium">medium</option>
+                      <option value="large-v3">large-v3</option>
+                    </select>
+                  </div>
                 </div>
               </div>
             </div>
@@ -139,35 +134,38 @@
                   </label>
                 </div>
               </div>
-              <div class="pane-head-row pane-head-row-bottom">
-                <span class="pane-context" id="resultPaneContext">Auto transcribe is on.</span>
-                <div class="pane-actions">
-                  <select id="providerSelect">
-                    <option value="local">Local (Whisper)</option>
-                    <option value="deepgram">Deepgram</option>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="">None</option>
-                  </select>
-                  <select id="remoteModelSelect" title="Remote model" hidden>
-                    <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
-                    <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
-                    <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
-                    <option value="nova-3">nova-3</option>
-                  </select>
-                  <div class="transcribe-settings-wrap">
-                    <button class="icon-btn" id="transcribeSettingsBtn" type="button" aria-label="Transcribe settings"
-                      title="Settings">
-                      <span class="gear-ico" aria-hidden="true"></span>
-                    </button>
-                    <div class="transcribe-settings-popup" id="transcribeSettingsPopup" hidden>
-                      <label class="popup-check"><input type="checkbox" id="diarizeCheck" /> <span>Speaker
-                          diarization</span></label>
-                    </div>
+              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
+                <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-transcribe">
+                  <div class="pane-control-group pane-control-group-primary">
+                    <select id="providerSelect">
+                      <option value="local">Local (Whisper)</option>
+                      <option value="deepgram">Deepgram</option>
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="">None</option>
+                    </select>
+                    <select id="remoteModelSelect" title="Remote model" hidden>
+                      <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
+                      <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
+                      <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
+                      <option value="nova-3">nova-3</option>
+                    </select>
                   </div>
-                  <button class="icon-btn" id="resultCopyBtn" type="button" aria-label="Copy result text"
-                    title="Copy result">
-                    <span class="copy-ico" aria-hidden="true"></span>
-                  </button>
+                  <div class="pane-control-group pane-control-group-secondary">
+                    <div class="transcribe-settings-wrap">
+                      <button class="icon-btn" id="transcribeSettingsBtn" type="button" aria-label="Transcribe settings"
+                        title="Settings">
+                        <span class="gear-ico" aria-hidden="true"></span>
+                      </button>
+                      <div class="transcribe-settings-popup" id="transcribeSettingsPopup" hidden>
+                        <label class="popup-check"><input type="checkbox" id="diarizeCheck" /> <span>Speaker
+                            diarization</span></label>
+                      </div>
+                    </div>
+                    <button class="icon-btn" id="resultCopyBtn" type="button" aria-label="Copy result text"
+                      title="Copy result">
+                      <span class="copy-ico" aria-hidden="true"></span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -201,34 +199,23 @@
               <span class="session-notice-text" id="recordSessionNoticeText"></span>
             </div>
 
-            <section class="recording-summary-card" id="recordingSummaryCard" hidden>
-              <div class="recording-summary-main">
-                <div class="recording-summary-copy">
-                  <span class="recording-summary-eyebrow">Session Status</span>
-                  <h3 class="recording-summary-title" id="recordingSummaryTitle">Recording summary</h3>
-                  <p class="recording-summary-status" id="recordingSummaryStatus">Audio capture is idle.</p>
-                </div>
-                <div class="recording-summary-actions">
-                  <button class="btn btn-ghost recording-summary-open-btn" id="recordingSummaryOpenRecordingsBtn"
-                    type="button">Open in Recordings</button>
-                </div>
-              </div>
-              <div class="recording-summary-meta" id="recordingSummaryMeta"></div>
-            </section>
+            <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
 
             <div class="pane-footer current-audio-row" id="currentRecordingAudioRow" hidden>
               <div class="current-audio-copy">
-                <span class="current-audio-label">Latest Saved Audio</span>
-                <span class="current-audio-meta" id="currentRecordingAudioMeta">Available after the first saved recording.</span>
+                <span class="current-audio-meta" id="currentRecordingAudioMeta"></span>
               </div>
               <audio id="currentRecordingAudio" controls></audio>
-              <a class="link-btn" id="currentRecordingOpenBtn" href="#" target="_blank" rel="noopener">Open Audio</a>
-              <a class="link-btn" id="currentRecordingDownloadBtn" href="#">Download Audio</a>
+              <div class="pane-footer-actions current-audio-actions">
+                <a class="icon-btn" id="currentRecordingOpenBtn" href="#" target="_blank" rel="noopener" aria-label="Open audio"
+                  title="Open audio"><span aria-hidden="true">↗</span></a>
+                <a class="icon-btn" id="currentRecordingDownloadBtn" href="#" aria-label="Download audio"
+                  title="Download audio"><span aria-hidden="true">↓</span></a>
+              </div>
             </div>
 
-            <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
-
-            <div class="pane-footer" id="downloadRow" hidden>
+            <div class="pane-footer resource-row" id="downloadRow" hidden>
+              <span class="pane-footer-label">Exports</span>
               <a class="link-btn" id="dlTxt" href="#">TXT</a>
               <a class="link-btn" id="dlJson" href="#">JSON</a>
             </div>
@@ -243,28 +230,31 @@
                   </label>
                 </div>
               </div>
-              <div class="pane-head-row pane-head-row-bottom">
-                <span class="pane-context" id="upscalePaneContext">Upscale is off.</span>
-                <div class="pane-actions">
-                  <div class="upscale-preset-wrap" id="upscalePresetWrap">
-                    <select id="upscalePresetSelect" title="Upscale preset"></select>
-                    <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button"
-                      aria-label="Delete preset" title="Delete preset">×</button>
+              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
+                <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-upscale">
+                  <div class="pane-control-group pane-control-group-primary">
+                    <div class="upscale-preset-wrap" id="upscalePresetWrap">
+                      <select id="upscalePresetSelect" title="Upscale preset"></select>
+                      <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button"
+                        aria-label="Delete preset" title="Delete preset">×</button>
+                    </div>
+                    <button class="icon-btn" id="upscalePresetEditBtn" type="button" aria-label="Edit preset prompt"
+                      title="Edit preset prompt">
+                      <span class="gear-ico" aria-hidden="true"></span>
+                    </button>
+                    <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset"
+                      title="Add preset">+</button>
                   </div>
-                  <button class="icon-btn" id="upscalePresetEditBtn" type="button" aria-label="Edit preset prompt"
-                    title="Edit preset prompt">
-                    <span class="gear-ico" aria-hidden="true"></span>
-                  </button>
-                  <button class="icon-btn preset-add-btn" id="upscalePresetAddBtn" type="button" aria-label="Add preset"
-                    title="Add preset">+</button>
-                  <button class="icon-btn send-enter-btn" id="autoSendEnterToggle" type="button"
-                    aria-label="Auto send after paste" aria-pressed="false" title="Auto send after paste: OFF">
-                    <span class="send-enter-ico" aria-hidden="true"></span>
-                  </button>
-                  <button class="icon-btn" id="upscaleCopyBtn" type="button" aria-label="Copy upscale text"
-                    title="Copy upscale">
-                    <span class="copy-ico" aria-hidden="true"></span>
-                  </button>
+                  <div class="pane-control-group pane-control-group-secondary">
+                    <button class="icon-btn send-enter-btn" id="autoSendEnterToggle" type="button"
+                      aria-label="Auto send after paste" aria-pressed="false" title="Auto send after paste: OFF">
+                      <span class="send-enter-ico" aria-hidden="true"></span>
+                    </button>
+                    <button class="icon-btn" id="upscaleCopyBtn" type="button" aria-label="Copy upscale text"
+                      title="Copy upscale">
+                      <span class="copy-ico" aria-hidden="true"></span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -276,17 +266,11 @@
       <section class="view" data-view="recordings" hidden>
         <div class="recordings-head screen-header">
           <div class="recordings-head-main screen-header-copy">
-            <span class="section-eyebrow">Archive</span>
-            <h2>Saved Recordings</h2>
-            <p class="screen-header-description">Search transcripts, reopen source audio, and review the current archive without losing session context.</p>
-            <div class="section-summary-row" id="recordingsHeaderSummary"></div>
-            <p class="hint" id="recordingsDirLabel">Directory: -</p>
-            <p class="hint" id="recordingsCountLabel">Total recordings: 0</p>
-            <p class="archive-status archive-status-neutral" id="recordingsArchiveStatus">Archive is ready.</p>
+            <h2>Recordings</h2>
           </div>
           <div class="recordings-head-actions screen-header-actions">
             <button class="btn ui-toggle-btn" id="recordingsStatsBtn" type="button"
-              aria-label="Hide stats" aria-pressed="true">Hide Stats</button>
+              aria-label="Show stats" aria-pressed="false">Stats</button>
             <button class="btn btn-ghost refresh-btn" id="recordingsRefreshBtn" type="button"
               aria-label="Refresh recordings">
               <span class="refresh-ico" aria-hidden="true"></span>
@@ -299,20 +283,15 @@
         <div class="recordings-layout">
           <div class="recordings-list-pane">
             <div class="recordings-list-toolbar">
-              <div class="panel-intro">
-                <span class="panel-title">Archive List</span>
-                <p class="panel-description">Search by title, provider, or language. Use Enter to open the first result and arrow keys to move between recordings.</p>
-              </div>
               <div class="recordings-search-row">
-                <input id="recordingsSearchInput" type="search" placeholder="Search recordings, providers, languages" />
+                <input id="recordingsSearchInput" type="search" placeholder="Search recordings" />
                 <button class="btn btn-ghost recordings-search-clear" id="recordingsSearchClearBtn" type="button">Clear</button>
               </div>
-              <span class="hint recordings-filter-hint" id="recordingsFilterHint">Showing 0 of 0</span>
             </div>
             <div class="recordings-list" id="recordingsList" tabindex="0" aria-label="Saved recordings list"></div>
           </div>
           <div class="recordings-viewer">
-            <div class="recordings-stats" id="recordingsStatsPanel">
+            <div class="recordings-stats" id="recordingsStatsPanel" hidden>
               <div class="stats-grid">
                 <div class="stats-card"><span class="stats-k">Recordings</span><span class="stats-v"
                     id="statsTotal">0</span></div>
@@ -349,7 +328,6 @@
                 <span class="pane-title">Transcript</span>
                 <strong class="recording-viewer-title" id="recordingTitleLabel">Choose a recording</strong>
                 <span class="pane-badge" id="recordingMeta"></span>
-                <span class="recording-viewer-helper" id="recordingViewerHelper">Select a recording to inspect transcript details and replay saved audio.</span>
               </div>
               <div class="recording-header-actions">
                 <div class="recording-audio-actions" id="recordingAudioActions" hidden>
@@ -377,13 +355,9 @@
         <div class="graph-shell">
           <div class="screen-header">
             <div class="screen-header-copy">
-              <span class="section-eyebrow">Graph</span>
-              <h2>Transcript Relationships</h2>
-              <p class="screen-header-description">Explore the archive by provider and keyword overlap, then jump directly back into the matching recording.</p>
-              <div class="section-summary-row" id="graphHeaderSummary"></div>
+              <h2>Graph</h2>
             </div>
             <div class="screen-header-actions">
-              <p class="archive-status archive-status-neutral" id="graphStatus">Graph is ready.</p>
               <button class="btn btn-ghost refresh-btn" id="graphRefreshBtn" type="button" aria-label="Refresh graph">
                 <span class="refresh-ico" aria-hidden="true"></span>
                 <span>Refresh</span>
@@ -416,20 +390,15 @@
         <div class="settings-shell">
           <div class="screen-header">
             <div class="screen-header-copy">
-              <span class="section-eyebrow">Workspace</span>
               <h2>Settings</h2>
-              <p class="screen-header-description">Manage local defaults, archive routing, remote provider credentials, and shortcut behavior from one place.</p>
-              <div class="section-summary-row" id="settingsHeaderSummary"></div>
             </div>
           </div>
           <div class="settings">
-          <div class="card">
+          <div class="card card-api">
             <div class="card-header">
               <div class="card-header-copy">
                 <h2>API Keys</h2>
-                <p class="hint card-description">Stored locally on this Mac and used only when the selected provider needs them.</p>
               </div>
-              <div class="card-summary-row" id="apiKeysCardSummary"></div>
             </div>
             <div class="field-stack">
               <label class="field">
@@ -451,13 +420,11 @@
               <input id="orModel" type="hidden" value="google/gemini-3.1-flash-lite-preview" />
             </div>
           </div>
-          <div class="card">
+          <div class="card card-defaults">
             <div class="card-header">
               <div class="card-header-copy">
                 <h2>Defaults</h2>
-                <p class="hint card-description">Applied to new recordings unless the active session has already locked its own settings.</p>
               </div>
-              <div class="card-summary-row" id="defaultsCardSummary"></div>
             </div>
             <div class="field-stack">
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
@@ -468,16 +435,12 @@
                   min="-80" max="-10" step="1" value="-42" /></label>
             </div>
           </div>
-          <div class="card">
+          <div class="card card-recordings">
             <div class="card-header">
               <div class="card-header-copy">
-                <h2>Recordings</h2>
-                <p class="hint card-description">All text recordings are stored here.</p>
+                <h2>Archive</h2>
               </div>
-              <div class="card-summary-row" id="archiveCardSummary"></div>
             </div>
-            <p class="archive-status archive-status-neutral" id="settingsArchiveStatus">Archive is ready.</p>
-            <p class="hint">Archive changes apply to the next recording. Active sessions stay pinned to the archive they started with.</p>
             <div class="field-stack">
               <label class="field">
                 <span class="lbl">Folder</span>
@@ -488,25 +451,22 @@
               <button class="btn btn-ghost" id="pickRecordingsDirBtn" type="button">Choose Folder</button>
               <button class="btn btn-ghost" id="openRecordingsDirBtn" type="button">Open Folder</button>
             </div>
-            <p class="settings-save-status settings-save-status-neutral" id="settingsSaveStatus">All settings are saved locally.</p>
           </div>
-          <div class="card">
+          <div class="card card-shortcuts">
             <div class="card-header">
               <div class="card-header-copy">
-                <h2>Keyboard Shortcuts</h2>
-                <p class="hint card-description">Click a shortcut to record a new combination. Press Esc to cancel and keep the current binding.</p>
+                <h2>Shortcuts</h2>
               </div>
-              <div class="card-summary-row" id="shortcutsCardSummary"></div>
             </div>
             <div class="field-stack">
               <label class="field">
-                <span class="lbl">Record Toggle</span>
+                <span class="lbl">Record</span>
                 <button class="shortcut-btn" id="shortcutRecord" type="button" data-shortcut-id="record">
                   <span class="shortcut-keys">⌥ ←</span>
                 </button>
               </label>
               <label class="field">
-                <span class="lbl">Paste Last Transcript</span>
+                <span class="lbl">Paste</span>
                 <button class="shortcut-btn" id="shortcutPaste" type="button" data-shortcut-id="paste">
                   <span class="shortcut-keys">⌥ ⇧ 7</span>
                 </button>
@@ -532,7 +492,7 @@
           placeholder="System instruction for transcript improvement"></textarea>
       </label>
       <p class="hint" id="upscalePresetMsg"></p>
-      <div class="btn-row">
+      <div class="modal-actions">
         <button class="btn btn-primary" id="upscalePresetSaveBtn" type="button">Save Preset</button>
         <button class="btn btn-ghost" id="upscalePresetCancelBtn" type="button">Cancel</button>
       </div>
@@ -565,7 +525,7 @@
       <h3>Delete All Recordings</h3>
       <p class="modal-body-text">Are you sure you want to delete all recordings? This action cannot be
         undone.</p>
-      <div class="btn-row">
+      <div class="modal-actions">
         <button class="btn btn-danger" id="deleteAllConfirmBtn" type="button">Yes, Delete All</button>
         <button class="btn btn-ghost" id="deleteAllCancelBtn" type="button">Cancel</button>
       </div>

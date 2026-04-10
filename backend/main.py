@@ -87,7 +87,7 @@ COMMON_STOPWORDS = {
     "i", "you", "we", "they", "he", "she", "be", "are", "was", "were", "do", "does", "did",
 }
 
-UPSCALE_PRESETS = {"clean", "business", "ai_code"}
+UPSCALE_PRESETS = {"clean", "business", "ai_code", "refine"}
 UPSCALE_PRESETS_DIR = DATA_DIR / "upscale_presets"
 UPSCALE_MAX_CUSTOM_PRESETS = 3
 UPSCALE_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -121,6 +121,16 @@ BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
             "Structure output into readable short paragraphs and clean sentence boundaries without adding new facts. "
             "Keep output in the same language as input. "
             "Return only final improved transcript text. No quotes, no comments, no markdown."
+        ),
+    },
+    "refine": {
+        "name": "Refine",
+        "instruction": (
+            "Refine transcript readability without rewriting the content. Preserve the original language, meaning, order, "
+            "facts, and important wording. Do not summarize, shorten, paraphrase, or add new information. "
+            "Fix obvious punctuation and grammar issues only when needed for readability. "
+            "Split the text into natural, readable paragraphs at topic or sentence-group boundaries. "
+            "Return only final refined transcript text. No quotes, no comments, no markdown."
         ),
     },
 }
@@ -335,7 +345,7 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
     target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
     audio_out = target_dir / f"{stem}.wav"
     text_out = target_dir / f"{stem}.txt"
-    tmp_audio = target_dir / f"{stem}.wav.tmp-{uuid.uuid4().hex}"
+    tmp_audio = _atomic_temp_path(audio_out)
     try:
         write_wav(str(tmp_audio), pcm, 16000)
         os.replace(tmp_audio, audio_out)
@@ -374,6 +384,17 @@ if frontend_assets_dir.exists():
     app.mount("/assets", StaticFiles(directory=str(frontend_assets_dir)), name="assets")
 
 
+@app.middleware("http")
+async def add_frontend_cache_control(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path or ""
+    if path == "/" or path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     index_path = frontend_dist_dir / "index.html"
@@ -386,8 +407,17 @@ def index():
         "</script>"
     )
     if "</body>" in html:
-        return html.replace("</body>", injected + "</body>")
-    return html + injected
+        html = html.replace("</body>", injected + "</body>")
+    else:
+        html = html + injected
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/health")
@@ -701,6 +731,12 @@ def _recording_stem(name_or_title: str) -> str:
     return f"{ts}__{_sanitize_name(raw or 'recording')}"
 
 
+def _atomic_temp_path(final_path: Path) -> Path:
+    suffix = "".join(final_path.suffixes)
+    stem = final_path.name[: -len(suffix)] if suffix else final_path.name
+    return final_path.with_name(f"{stem}.tmp-{uuid.uuid4().hex}{suffix}")
+
+
 def _recording_path_or_404(name: str, target_dir: Optional[Path] = None) -> Path:
     safe = os.path.basename(name or "")
     if not safe.endswith(".txt") or safe in {"", ".", ".."}:
@@ -903,6 +939,11 @@ def _upscale_instruction(preset: str) -> str:
         return (
             "Improve transcript for software engineering context. Preserve technical terms, commands, "
             "identifiers, and model/tool names exactly; fix punctuation and grammar."
+        )
+    if p == "refine":
+        return (
+            "Refine transcript readability without changing meaning: keep the same language, preserve wording and facts, "
+            "fix obvious punctuation, and split text into natural readable paragraphs."
         )
     return (
         "Clean transcript text: fix punctuation and grammar, remove stutters/fillers, "
@@ -2110,7 +2151,7 @@ async def save_recording_with_audio(
 
     out_text = target_dir / f"{stem}.txt"
     out_audio = target_dir / f"{stem}{ext}"
-    tmp_audio = target_dir / f"{stem}{ext}.tmp-{uuid.uuid4().hex}"
+    tmp_audio = _atomic_temp_path(out_audio)
     existing_audio = _recording_audio_path(f"{stem}.txt", target_dir=target_dir)
     try:
         await _save_upload_file(file, tmp_audio)

@@ -47,6 +47,7 @@ let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
 let micPermissionChecked = false;
+let loadedFrontendBuildSignature = "";
 const OVERLAY_FIXED_HEIGHT = 150;
 
 const HOST = "127.0.0.1";
@@ -122,6 +123,10 @@ function compactLogText(value, max = 180) {
   return `${s.slice(0, max)}...`;
 }
 
+function normalizeTranscriptText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
 function textDigest(input) {
   const str = String(input || "");
   let h = 2166136261;
@@ -133,10 +138,11 @@ function textDigest(input) {
 }
 
 function isMeaningfulTranscriptText(value) {
-  const txt = String(value || "").trim();
+  const txt = normalizeTranscriptText(value);
   if (!txt) return false;
   const lower = txt.toLowerCase();
-  if (lower === "error" || lower === "[websocket error]" || lower === "[silence]") return false;
+  const compact = lower.replace(/\s+/g, "");
+  if (lower === "error" || lower === "[websocket error]" || compact === "[silence]") return false;
   if (lower.startsWith("http ") || lower.startsWith("network error")) return false;
   return true;
 }
@@ -184,17 +190,78 @@ async function ensureWindowVisible(options = {}) {
     await createWindow();
     return;
   }
-  if (win.isMinimized()) win.restore();
-  if (!win.isVisible()) win.show();
   if (backend === null) {
     await startBackend();
   }
+  await refreshWindowForFrontendBuild(false);
+  if (win.isMinimized()) win.restore();
+  if (!win.isVisible()) win.show();
   win.focus();
 }
 
 function getRepoRoot() {
   if (app.isPackaged) return process.resourcesPath;
   return path.join(__dirname, "..");
+}
+
+function getFrontendBuildRoot() {
+  const repoRoot = getRepoRoot();
+  const devDistDir = path.join(repoRoot, "frontend", "dist");
+  const packagedFrontendDir = path.join(repoRoot, "frontend");
+  if (fs.existsSync(path.join(devDistDir, "index.html"))) return devDistDir;
+  if (fs.existsSync(path.join(packagedFrontendDir, "index.html"))) return packagedFrontendDir;
+  return devDistDir;
+}
+
+function getFrontendBuildSignature() {
+  try {
+    const buildRoot = getFrontendBuildRoot();
+    const indexPath = path.join(buildRoot, "index.html");
+    if (!fs.existsSync(indexPath)) return "";
+    const parts = [];
+    const indexStat = fs.statSync(indexPath);
+    parts.push(`index:${indexStat.size}:${indexStat.mtimeMs}`);
+    const assetsDir = path.join(buildRoot, "assets");
+    if (fs.existsSync(assetsDir)) {
+      const entries = fs.readdirSync(assetsDir).sort();
+      for (const entry of entries) {
+        const filePath = path.join(assetsDir, entry);
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) continue;
+        parts.push(`${entry}:${stat.size}:${stat.mtimeMs}`);
+      }
+    }
+    return parts.join("|");
+  } catch (error) {
+    appendMainLog(`[frontend-signature-error] ${error?.message || error}`);
+    return "";
+  }
+}
+
+async function refreshWindowForFrontendBuild(force = false) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  const nextSignature = getFrontendBuildSignature();
+  if (!nextSignature) return;
+  if (!force && loadedFrontendBuildSignature && loadedFrontendBuildSignature === nextSignature) return;
+  appendMainLog(
+    `[frontend-refresh] force=${force} from=${loadedFrontendBuildSignature || "none"} to=${nextSignature}`
+  );
+  try {
+    await win.webContents.session.clearCache();
+  } catch (error) {
+    appendMainLog(`[frontend-refresh-cache-error] ${error?.message || error}`);
+  }
+  try {
+    await win.webContents.session.clearStorageData({
+      origin: BASE_URL,
+      storages: ["serviceworkers", "cachestorage"],
+    });
+  } catch (error) {
+    appendMainLog(`[frontend-refresh-storage-error] ${error?.message || error}`);
+  }
+  if (!force && !win.webContents.isLoading()) {
+    await win.webContents.reloadIgnoringCache();
+  }
 }
 
 function normalizeProviderChoice(value) {
@@ -2068,12 +2135,13 @@ async function stopRecordingFromOverlay() {
     (() => {
       const isRec = !!(window.__transcriptorIsRecording);
       const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
+      const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
       const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
       const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
-      if (!isRec) return { ok: false, recording: false, timerText, recordingId, autoSendEnter };
+      if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
       // Use dedicated stop event — avoids dual-path race with btnStop.click().
       window.dispatchEvent(new Event('transcriptor-hotkey-stop'));
-      return { ok: true, recording: false, timerText, recordingId, autoSendEnter };
+      return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
     })();
     `,
     true
@@ -2087,18 +2155,25 @@ async function stopRecordingFromOverlay() {
 
   if (result?.ok) {
     await playOverlayCue("stop");
-    enqueuePostStopTask({
-      autoTranscribe: true,
-      autoSendEnter: !!result.autoSendEnter,
-      stopRequestedAt: Date.now(),
-      recordingId: Number(result.recordingId || 0),
-      targetName: pasteTargetAppName,
-      targetPid: pasteTargetAppPid,
-    });
-    pasteTargetAppName = "";
-    pasteTargetAppPid = 0;
-    await syncOverlayQueueVisual(false);
-    await showPostStopYellowThenTranscribing(700);
+    if (result.auto) {
+      enqueuePostStopTask({
+        autoTranscribe: true,
+        autoSendEnter: !!result.autoSendEnter,
+        stopRequestedAt: Date.now(),
+        recordingId: Number(result.recordingId || 0),
+        targetName: pasteTargetAppName,
+        targetPid: pasteTargetAppPid,
+      });
+      pasteTargetAppName = "";
+      pasteTargetAppPid = 0;
+      await syncOverlayQueueVisual(false);
+      await showPostStopYellowThenTranscribing(700);
+    } else {
+      pasteTargetAppName = "";
+      pasteTargetAppPid = 0;
+      await setOverlayStatus("Saved To App");
+      setTimeout(() => hideRecordingOverlay(), 1400);
+    }
   } else {
     await setOverlayStatus("Saved To App");
     setTimeout(() => hideRecordingOverlay(), 1400);
@@ -2111,12 +2186,32 @@ async function queryRendererState() {
     return await win.webContents.executeJavaScript(
       `
       (() => {
+        const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
+        const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
+        const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
+        const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
+        const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
+        const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
+        const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
         const status = (document.getElementById('statusText')?.textContent || '').trim();
         const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
         const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
         const busy = !!document.getElementById('btnStart')?.disabled;
         const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-        return { status, finalText, liveText, busy, progressVisible };
+        return {
+          finishedAt,
+          finishedRecordingId,
+          finishedText,
+          uiFinalAt,
+          uiFinalRecordingId,
+          uiFinalText,
+          uiFinalKind,
+          status,
+          finalText,
+          liveText,
+          busy,
+          progressVisible,
+        };
       })();
       `,
       true
@@ -2871,6 +2966,10 @@ async function processPostStopTask(task) {
           const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
           const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
           const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
+          const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
+          const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
+          const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
+          const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
           const finishedRecords = Array.isArray(window.__transcriptorFinishedRecords)
             ? window.__transcriptorFinishedRecords
               .map((x) => ({
@@ -2887,7 +2986,22 @@ async function processPostStopTask(task) {
           const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
           const busy = !!document.getElementById('btnStart')?.disabled;
           const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-          return { finishedAt, finishedRecordingId, finishedText, finishedRecords, isRec, status, finalText, liveText, busy, progressVisible };
+          return {
+            finishedAt,
+            finishedRecordingId,
+            finishedText,
+            uiFinalAt,
+            uiFinalRecordingId,
+            uiFinalText,
+            uiFinalKind,
+            finishedRecords,
+            isRec,
+            status,
+            finalText,
+            liveText,
+            busy,
+            progressVisible,
+          };
         })();
         `,
         true
@@ -2921,10 +3035,24 @@ async function processPostStopTask(task) {
         .filter((x) => Number(x?.finishedAt || 0) > stopRequestedAt)
         .sort((a, b) => Number(b?.finishedAt || 0) - Number(a?.finishedAt || 0))[0]
       : null;
+    const uiFinalKind = String(state.uiFinalKind || "").trim().toLowerCase();
+    const uiFinalText = normalizeTranscriptText(state.uiFinalText || "");
+    const uiFinalReadyByRecording =
+      uiFinalKind === "transcript" &&
+      isMeaningfulTranscriptText(uiFinalText) &&
+      task.recordingId > 0 &&
+      Number(state.uiFinalRecordingId || 0) === task.recordingId;
+    const uiFinalReadyByTime =
+      uiFinalKind === "transcript" &&
+      isMeaningfulTranscriptText(uiFinalText) &&
+      task.recordingId <= 0 &&
+      Number(state.uiFinalAt || 0) > stopRequestedAt;
     const readyByRecording = !!byRecording || (task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId);
     const readyByTime = !!byTime || (task.recordingId <= 0 && state.finishedAt > stopRequestedAt);
-    if (readyByRecording || readyByTime) {
-      transcript = String(byRecording?.text || byTime?.text || state.finishedText || state.finalText || state.liveText || "").trim();
+    if (readyByRecording || readyByTime || uiFinalReadyByRecording || uiFinalReadyByTime) {
+      transcript = normalizeTranscriptText(
+        byRecording?.text || byTime?.text || state.finishedText || uiFinalText || ""
+      );
       if (!isMeaningfulTranscriptText(transcript)) {
         traceStep(trace, "signal_ready_ignored_non_transcript", {
           pollCount,
@@ -2938,55 +3066,11 @@ async function processPostStopTask(task) {
       traceStep(trace, "signal_ready", {
         pollCount,
         finishedAt: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0),
-        finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || 0),
+        finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
         expectedRecordingId: task.recordingId || 0,
-        delay: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0) - stopRequestedAt,
+        delay: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || state.uiFinalAt || 0) - stopRequestedAt,
+        source: byRecording ? "finished_record" : byTime ? "finished_record_by_time" : state.finishedText ? "finished_text" : "ui_final",
         textLen: transcript.length,
-      });
-      break;
-    }
-    const canUseUnscopedFinalText =
-      task.recordingId <= 0 &&
-      !state.isRec &&
-      !state.busy &&
-      !state.progressVisible &&
-      (statusLower === "done" || statusLower === "idle") &&
-      !!(state.finalText && String(state.finalText).trim());
-    if (canUseUnscopedFinalText) {
-      transcript = String(state.finalText || "").trim();
-      if (!isMeaningfulTranscriptText(transcript)) {
-        transcript = "";
-        await sleep(30);
-        continue;
-      }
-      traceStep(trace, "final_text_fallback_ready", {
-        pollCount,
-        textLen: transcript.length,
-        status: state.status || "",
-        busy: !!state.busy,
-        progressVisible: !!state.progressVisible,
-      });
-      break;
-    }
-    const canUseFinalTextFallback =
-      task.recordingId <= 0 &&
-      !state.isRec &&
-      !state.busy &&
-      !state.progressVisible &&
-      pollCount >= 3 &&
-      !!(state.finalText && String(state.finalText).trim());
-    if (canUseFinalTextFallback) {
-      transcript = String(state.finalText || "").trim();
-      if (!isMeaningfulTranscriptText(transcript)) {
-        transcript = "";
-        await sleep(30);
-        continue;
-      }
-      traceStep(trace, "final_text_recording_fallback", {
-        pollCount,
-        textLen: transcript.length,
-        status: state.status || "",
-        expectedRecordingId: task.recordingId || 0,
       });
       break;
     }
@@ -3081,11 +3165,18 @@ async function processPostStopTask(task) {
 
 async function getLatestTranscriptText() {
   const s = await queryRendererState();
-  const current = String(s?.finalText || s?.liveText || "").trim();
-  if (current) {
-    lastTranscriptText = current;
-    saveLastTranscriptToDisk(current);
-    return current;
+  const finished = normalizeTranscriptText(s?.finishedText || "");
+  if (isMeaningfulTranscriptText(finished)) {
+    lastTranscriptText = finished;
+    saveLastTranscriptToDisk(finished);
+    return finished;
+  }
+  const uiFinalKind = String(s?.uiFinalKind || "").trim().toLowerCase();
+  const uiFinalText = normalizeTranscriptText(s?.uiFinalText || "");
+  if (uiFinalKind === "transcript" && isMeaningfulTranscriptText(uiFinalText)) {
+    lastTranscriptText = uiFinalText;
+    saveLastTranscriptToDisk(uiFinalText);
+    return uiFinalText;
   }
   if (lastTranscriptText) return lastTranscriptText;
   const disk = loadLastTranscriptFromDisk();
@@ -3618,6 +3709,10 @@ async function createWindow(options = {}) {
   win.webContents.on("did-fail-load", (_event, code, desc, url) => {
     appendMainLog(`[did-fail-load] code=${code} desc=${desc} url=${url}`);
   });
+  win.webContents.on("did-finish-load", () => {
+    loadedFrontendBuildSignature = getFrontendBuildSignature();
+    appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
+  });
 
   win.on("close", (event) => {
     // Keep renderer warm on macOS so global-hotkey actions are instant and
@@ -3643,6 +3738,7 @@ async function createWindow(options = {}) {
       await startBackend();
     }
     await waitForHttp(`${BASE_URL}/api/health`, 120_000);
+    await refreshWindowForFrontendBuild(true);
     await win.loadURL(url);
     if (showWindow) {
       win.show();
