@@ -7,3 +7,8 @@ numpy==1.26.4
 requests==2.32.3
 urllib3<2
 cryptography>=42.0.0
+# Used by backend.remote_deepgram_live for proxying PCM to Deepgram's live
+# streaming endpoint. uvicorn[standard] brings a compatible version in
+# transitively, but we pin it directly so production installs cannot
+# silently lose the dependency.
+websockets>=13.0

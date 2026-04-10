@@ -108,13 +108,57 @@ function appendMainLog(message) {
       mainLogFilePath = path.join(app.getPath("userData"), "main.log");
     }
     fs.appendFile(mainLogFilePath, `[${new Date().toISOString()}] ${message}\n`, "utf8", () => { });
-  } catch { }
+  } catch (e) {
+    // Last-resort: the logger itself failed. Fall back to stderr so
+    // we never silently lose signal.
+    // eslint-disable-next-line no-console
+    console.error("appendMainLog failed", e);
+  }
 }
 
 function logPasteTrace(step, details = {}) {
   try {
     appendMainLog(`[paste-trace] ${JSON.stringify({ step, ...details })}`);
-  } catch { }
+  } catch (e) {
+    // JSON.stringify cycles or unrepresentable values — fall back to
+    // a single-line dump. Do NOT recurse via appendMainLog with
+    // objects that just threw.
+    try {
+      appendMainLog(`[paste-trace-error] step=${step} error=${e?.message || e}`);
+    } catch (inner) {
+      // eslint-disable-next-line no-console
+      console.error("logPasteTrace catastrophic failure", inner);
+    }
+  }
+}
+
+/**
+ * Best-effort execution helper with observability.
+ *
+ * Use for "might legitimately fail during teardown" calls — executing JS
+ * in the renderer after it's been destroyed, resizing a hidden window,
+ * or clipboard ops on platforms where the caller might not have focus.
+ * Failures are logged to main.log (``safe-exec`` tag) and ``null`` is
+ * returned so the caller can continue.
+ *
+ * Do NOT call inside ``appendMainLog`` / ``logPasteTrace``.
+ */
+async function safeExec(context, fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    appendMainLog(`[safe-exec] ${context}: ${error?.message || error}`);
+    return null;
+  }
+}
+
+function safeExecSync(context, fn) {
+  try {
+    return fn();
+  } catch (error) {
+    appendMainLog(`[safe-exec-sync] ${context}: ${error?.message || error}`);
+    return null;
+  }
 }
 
 function compactLogText(value, max = 180) {
@@ -213,54 +257,73 @@ function getFrontendBuildRoot() {
   return devDistDir;
 }
 
-function getFrontendBuildSignature() {
+// Signature cache: stat the frontend entry file at most once per TTL
+// window. Since Vite emits hashed asset filenames, index.html is the
+// SSOT for the build — any asset change implies index.html references
+// a different hash and therefore a different on-disk content. Stat'ing
+// 10+ asset files on every window show was a main-thread stall.
+const FRONTEND_SIGNATURE_TTL_MS = 1500;
+let cachedFrontendSignature = "";
+let cachedFrontendSignatureAt = 0;
+
+async function getFrontendBuildSignature() {
+  const now = Date.now();
+  if (cachedFrontendSignature && now - cachedFrontendSignatureAt < FRONTEND_SIGNATURE_TTL_MS) {
+    return cachedFrontendSignature;
+  }
   try {
-    const buildRoot = getFrontendBuildRoot();
-    const indexPath = path.join(buildRoot, "index.html");
-    if (!fs.existsSync(indexPath)) return "";
-    const parts = [];
-    const indexStat = fs.statSync(indexPath);
-    parts.push(`index:${indexStat.size}:${indexStat.mtimeMs}`);
-    const assetsDir = path.join(buildRoot, "assets");
-    if (fs.existsSync(assetsDir)) {
-      const entries = fs.readdirSync(assetsDir).sort();
-      for (const entry of entries) {
-        const filePath = path.join(assetsDir, entry);
-        const stat = fs.statSync(filePath);
-        if (!stat.isFile()) continue;
-        parts.push(`${entry}:${stat.size}:${stat.mtimeMs}`);
-      }
-    }
-    return parts.join("|");
+    const indexPath = path.join(getFrontendBuildRoot(), "index.html");
+    const stat = await fs.promises.stat(indexPath);
+    cachedFrontendSignature = `index:${stat.size}:${stat.mtimeMs}`;
+    cachedFrontendSignatureAt = now;
+    return cachedFrontendSignature;
   } catch (error) {
-    appendMainLog(`[frontend-signature-error] ${error?.message || error}`);
+    if (error && error.code !== "ENOENT") {
+      appendMainLog(`[frontend-signature-error] ${error?.message || error}`);
+    }
+    cachedFrontendSignature = "";
+    cachedFrontendSignatureAt = now;
     return "";
   }
 }
 
+function invalidateFrontendSignatureCache() {
+  cachedFrontendSignature = "";
+  cachedFrontendSignatureAt = 0;
+}
+
 async function refreshWindowForFrontendBuild(force = false) {
   if (!win || win.isDestroyed() || !win.webContents) return;
-  const nextSignature = getFrontendBuildSignature();
+  if (force) {
+    invalidateFrontendSignatureCache();
+  }
+  const nextSignature = await getFrontendBuildSignature();
   if (!nextSignature) return;
-  if (!force && loadedFrontendBuildSignature && loadedFrontendBuildSignature === nextSignature) return;
+
+  // First-launch case: the renderer hasn't reported its loaded
+  // signature yet (``did-finish-load`` hasn't fired). Doing clearCache
+  // + reload here would be a spurious white flash on every app startup.
+  if (!loadedFrontendBuildSignature) return;
+
+  if (!force && loadedFrontendBuildSignature === nextSignature) return;
+
   appendMainLog(
     `[frontend-refresh] force=${force} from=${loadedFrontendBuildSignature || "none"} to=${nextSignature}`
   );
-  try {
-    await win.webContents.session.clearCache();
-  } catch (error) {
-    appendMainLog(`[frontend-refresh-cache-error] ${error?.message || error}`);
-  }
-  try {
-    await win.webContents.session.clearStorageData({
+  await safeExec("refreshWindowForFrontendBuild:clearCache", () =>
+    win.webContents.session.clearCache()
+  );
+  await safeExec("refreshWindowForFrontendBuild:clearStorageData", () =>
+    win.webContents.session.clearStorageData({
       origin: BASE_URL,
       storages: ["serviceworkers", "cachestorage"],
-    });
-  } catch (error) {
-    appendMainLog(`[frontend-refresh-storage-error] ${error?.message || error}`);
-  }
-  if (!force && !win.webContents.isLoading()) {
-    await win.webContents.reloadIgnoringCache();
+    })
+  );
+  loadedFrontendBuildSignature = nextSignature;
+  if (!win.webContents.isLoading()) {
+    await safeExec("refreshWindowForFrontendBuild:reload", () =>
+      win.webContents.reloadIgnoringCache()
+    );
   }
 }
 
@@ -433,8 +496,8 @@ async function setRendererUpscalePresetChoice(presetId) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const target = String(presetId || "").trim();
   if (!target) return;
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererUpscalePresetChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const target = ${JSON.stringify(target)};
@@ -449,15 +512,15 @@ async function setRendererUpscalePresetChoice(presetId) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function setRendererUpscaleEnabledChoice(enabled) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const target = !!enabled;
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererUpscaleEnabledChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const target = ${target ? "true" : "false"};
@@ -471,15 +534,15 @@ async function setRendererUpscaleEnabledChoice(enabled) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function setRendererQuickSettingsOpenChoice(open) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const target = !!open;
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererQuickSettingsOpenChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const target = ${target ? "true" : "false"};
@@ -495,15 +558,15 @@ async function setRendererQuickSettingsOpenChoice(open) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function setRendererAutoSendEnterChoice(enabled) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const target = !!enabled;
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererAutoSendEnterChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const btn = document.getElementById('autoSendEnterToggle');
@@ -514,15 +577,15 @@ async function setRendererAutoSendEnterChoice(enabled) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function setRendererProviderChoice(provider) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const normalized = normalizeProviderChoice(provider);
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererProviderChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const target = ${JSON.stringify(normalized)};
@@ -540,15 +603,15 @@ async function setRendererProviderChoice(provider) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function setRendererLocalModelChoice(model) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const normalized = normalizeLocalModelChoice(model);
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererLocalModelChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const target = ${JSON.stringify(normalized)};
@@ -561,16 +624,16 @@ async function setRendererLocalModelChoice(model) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function setRendererModelChoice(provider, model) {
   if (!win || win.isDestroyed() || !win.webContents) return;
   const p = normalizeProviderChoice(provider);
   const target = String(model || "").trim();
-  try {
-    await win.webContents.executeJavaScript(
+  await safeExec("setRendererModelChoice", () =>
+    win.webContents.executeJavaScript(
       `
       (() => {
         const provider = ${JSON.stringify(p)};
@@ -606,8 +669,8 @@ async function setRendererModelChoice(provider, model) {
       })();
       `,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 function createOverlayHtml() {
@@ -1549,9 +1612,7 @@ function ensureOverlayWindow() {
     if (raw.startsWith("__overlay_stop__")) {
       overlayStopInFlight = true;
       if (win && !win.isDestroyed() && win.isVisible()) {
-        try {
-          win.hide();
-        } catch { }
+        safeExecSync("overlay_stop:winHide", () => win.hide());
       }
       stopRecordingFromOverlay().catch((e) => {
         appendMainLog(`[overlay] stop failed: ${e?.message || e}`);
@@ -1566,7 +1627,7 @@ function ensureOverlayWindow() {
       applyOverlayWindowSize();
       lastOverlayUiInteractionAt = Date.now();
       if (win && !win.isDestroyed() && win.isVisible()) {
-        try { win.hide(); } catch { }
+        safeExecSync("overlay_settings:winHide", () => win.hide());
       }
       void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
       return;
@@ -1673,22 +1734,22 @@ function getOverlayWindowWidth() {
 
 function applyOverlayWindowSize() {
   if (!overlayWin || overlayWin.isDestroyed()) return;
-  try {
+  safeExecSync("applyOverlayWindowSize", () => {
     overlayWin.setSize(getOverlayWindowWidth(), OVERLAY_FIXED_HEIGHT, false);
     positionOverlayWindow();
-  } catch { }
+  });
 }
 
 async function syncOverlayQueueVisual(recordingHint = null) {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
   const isRec = typeof recordingHint === "boolean" ? recordingHint : await isRendererRecording();
   const showQueue = pendingTranscriptionCount > 0 && !!isRec;
-  try {
-    await overlayWin.webContents.executeJavaScript(
+  await safeExec("syncOverlayQueueVisual", () =>
+    overlayWin.webContents.executeJavaScript(
       `window.setQueueVisible && window.setQueueVisible(${showQueue ? "true" : "false"});`,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function showRecordingOverlay() {
@@ -1863,7 +1924,7 @@ async function ensureOverlayVisible(options = {}) {
     await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
     overlayLoaded = true;
   }
-  try {
+  await safeExec("ensureOverlayVisible:initializeQuickSettings", async () => {
     const upscaleCtx = await getRendererUpscalePresetContext();
     overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
     overlayQuickUpscalePreset = upscaleCtx.selected;
@@ -1882,18 +1943,16 @@ async function ensureOverlayVisible(options = {}) {
       `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
       true
     );
-  } catch { }
-  try {
-    applyOverlayWindowSize();
-  } catch { }
+  });
+  applyOverlayWindowSize();
   const jsParts = [];
   if (resetTimer) jsParts.push("window.resetTimer && window.resetTimer();");
   if (startTimer) jsParts.push("window.startTimer && window.startTimer();");
   if (typeof status === "string") jsParts.push(`window.setStatus && window.setStatus(${JSON.stringify(status)});`);
   if (jsParts.length) {
-    try {
-      await ow.webContents.executeJavaScript(jsParts.join(" "), true);
-    } catch { }
+    await safeExec("ensureOverlayVisible:execJsParts", () =>
+      ow.webContents.executeJavaScript(jsParts.join(" "), true)
+    );
   }
   await syncOverlayQueueVisual();
   ow.showInactive();
@@ -1903,9 +1962,9 @@ async function setOverlayTimer(text) {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
   const value = String(text || "").trim();
   if (!/^\d{2}:\d{2}$/.test(value)) return;
-  try {
-    await overlayWin.webContents.executeJavaScript(`window.setTimer && window.setTimer(${JSON.stringify(value)});`, true);
-  } catch { }
+  await safeExec("setOverlayTimer", () =>
+    overlayWin.webContents.executeJavaScript(`window.setTimer && window.setTimer(${JSON.stringify(value)});`, true)
+  );
 }
 
 function hideRecordingOverlay() {
@@ -1938,12 +1997,12 @@ function hideRecordingOverlay() {
 
 async function setOverlayStatus(text) {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
-  try {
-    await overlayWin.webContents.executeJavaScript(
+  await safeExec("setOverlayStatus", () =>
+    overlayWin.webContents.executeJavaScript(
       `window.setStatus && window.setStatus(${JSON.stringify(String(text || ""))});`,
       true
-    );
-  } catch { }
+    )
+  );
 }
 
 async function showPostStopYellowThenTranscribing(delayMs = 500) {
@@ -1982,15 +2041,13 @@ async function playOverlayCue(kind = "start") {
 
 async function isRendererRecording() {
   if (!win || win.isDestroyed() || !win.webContents) return false;
-  try {
-    const recording = await win.webContents.executeJavaScript(
+  const recording = await safeExec("isRendererRecording", () =>
+    win.webContents.executeJavaScript(
       `(() => { return !!(window.__transcriptorIsRecording); })();`,
       true
-    );
-    return !!recording;
-  } catch {
-    return false;
-  }
+    )
+  );
+  return !!recording;
 }
 
 async function ensureBackgroundWindow() {
@@ -3709,8 +3766,8 @@ async function createWindow(options = {}) {
   win.webContents.on("did-fail-load", (_event, code, desc, url) => {
     appendMainLog(`[did-fail-load] code=${code} desc=${desc} url=${url}`);
   });
-  win.webContents.on("did-finish-load", () => {
-    loadedFrontendBuildSignature = getFrontendBuildSignature();
+  win.webContents.on("did-finish-load", async () => {
+    loadedFrontendBuildSignature = (await getFrontendBuildSignature()) || "";
     appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
   });
 

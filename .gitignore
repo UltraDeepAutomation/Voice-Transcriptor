@@ -44,6 +44,11 @@ data/results/
 tmp/
 temp/
 
+# Stray bundled Electron main at repo root (accidentally written by older
+# build scripts). Keep out of the tree so they don't get re-committed.
+/main.js
+/.tmp_app_main.js
+
 # Env / secrets
 .env
 .env.*

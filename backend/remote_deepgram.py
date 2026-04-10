@@ -1,10 +1,14 @@
-"""Deepgram Nova-3 — ultra-fast transcription (~300ms latency).
+"""Deepgram Nova-3 — pre-recorded REST transcription.
 
-Uses the pre-recorded REST endpoint:
-  POST https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true
+Uses the synchronous listen endpoint:
+    POST https://api.deepgram.com/v1/listen
+
+Used for:
+  * File uploads and stop-time fallback transcription of the canonical WAV.
+  * NOT used for live streaming — see ``backend.remote_deepgram_live``
+    which is the single source of truth for live Deepgram sessions.
 
 Accepts raw audio bytes (WAV/MP3/etc.) as the request body.
-Deepgram bills per second — ideal for chunked processing.
 """
 
 import logging
@@ -27,22 +31,22 @@ def deepgram_transcribe(
     filename: str,
     model: str = "nova-3",
     language: Optional[str] = None,
-    smart_format: bool = True,
 ) -> Dict[str, Any]:
     """Transcribe audio using Deepgram's pre-recorded API.
 
     Returns {"text": str, "raw": dict}.
+
+    Note: ``smart_format`` is intentionally disabled. It only fully supports
+    English / Spanish / French; for Russian and other languages it applies
+    a "basic formatting" pass that actually strips punctuation. We instead
+    enable the individual features that work across all languages
+    (``punctuate``, ``paragraphs``, ``numerals``).
     """
     if not api_key:
         raise RemoteError("Deepgram API key is not configured")
 
     url = f"{DEEPGRAM_API_BASE}/listen"
 
-    # Build query params.
-    # IMPORTANT: Do NOT use smart_format=true — it only fully supports
-    # English/Spanish/French. For Russian and other languages it applies
-    # "basic formatting" which actually strips punctuation. Instead we
-    # enable individual features that work for ALL languages.
     params: Dict[str, str] = {
         "model": model or "nova-3",
         "punctuate": "true",

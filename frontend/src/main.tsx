@@ -2,24 +2,9 @@ import "./styles.css";
 
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
-type JobStatus = "queued" | "running" | "done" | "error";
 type KeyProvider = "openrouter" | "deepgram";
 type ViewName = "record" | "recordings" | "settings" | "graph";
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
-
-interface JobResultPayload {
-  text?: string;
-  [key: string]: unknown;
-}
-
-interface JobResponse {
-  job_id: string;
-  status: JobStatus;
-  progress: number;
-  error: string | null;
-  result: JobResultPayload | null;
-  result_files: Record<string, string> | null;
-}
 
 interface NetworkStatusResponse {
   online: boolean;
@@ -103,21 +88,35 @@ interface FinishedRecordingEntry {
   text: string;
 }
 
+/**
+ * Canonical live recording session state — single source of truth.
+ *
+ * Every field listed here is either rendered to the UI (see
+ * ``renderCurrentRecordingSummary``) or consumed by a reconcile /
+ * conflict-detection path. Fields that had no consumer were removed in
+ * the SSOT cleanup (provider/model/language/durationSec/audioBytes/
+ * transcriptChars/transcriptWords/recovered) — they used to be written
+ * to a now-deleted context strip and were ghost state.
+ */
 interface CurrentRecordingSummary {
+  /** Short human title derived from the live draft. Rendered indirectly
+   *  via ``setStatus`` chips that prefer status over title. */
   title: string;
+  /** User-visible status line. Rendered via ``setStatus`` on every
+   *  update and into the session notice banner when tone escalates. */
   status: string;
+  /** Drives status-dot colour and the notice banner tone. */
   tone: UiTone;
-  provider?: string;
-  model?: string;
-  language?: string;
-  durationSec?: number;
-  audioBytes?: number;
-  transcriptChars?: number;
-  transcriptWords?: number;
+  /** Wall-clock milliseconds from stop → transcript-ready. Rendered
+   *  into the ``transcribeLatency`` pill on every update. */
   transcribeLatencyMs?: number;
+  /** Name of the persisted file inside the archive. The reconcile
+   *  helper reads this to catch the case where the archive has been
+   *  mutated outside the app. */
   savedName?: string;
-  recovered?: boolean;
 }
+
+type StatusKind = "idle" | "recording" | "processing" | "done" | "error" | "warning" | "info";
 
 interface LatestSavedAudioState {
   savedName?: string;
@@ -138,6 +137,8 @@ interface TranscriptSegment {
   start: number;
   end: number;
   text: string;
+  /** Deepgram diarization index when enabled. undefined otherwise. */
+  speaker?: number;
 }
 
 interface LocalTranscriptionResult {
@@ -153,6 +154,94 @@ interface LiveSessionSnapshot {
   language: string;
   assistLocalModel: string;
   finalLocalModel: string;
+}
+
+type LiveWsMode = "local-assist" | "deepgram-stream";
+
+interface LiveFinalEnvelope {
+  text: string;
+  segments: TranscriptSegment[];
+  durationSec: number;
+  source: string;
+  error?: string;
+}
+
+/**
+ * Discriminated union of server → client messages on /ws/transcribe.
+ *
+ * Matches the protocol documented on the Python side in ``backend.main``
+ * and ``backend.remote_deepgram_live``. The ``parseLiveWsMessage``
+ * helper below is the ONLY place we cast ``unknown`` into this type —
+ * every consumer should use its narrowed output.
+ */
+type LiveWsMessage =
+  | { type: "segments"; segments: TranscriptSegment[]; isFinal: boolean; speechFinal: boolean }
+  | { type: "interim"; segment: TranscriptSegment }
+  | {
+      type: "final";
+      text: string;
+      segments: TranscriptSegment[];
+      durationSec: number;
+      source: string;
+      error?: string;
+    }
+  | { type: "error"; error: string; fatal: boolean };
+
+function parseLiveWsMessage(raw: string): LiveWsMessage | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const obj = parsed as Record<string, unknown>;
+  const type = String(obj.type || "").trim();
+
+  if (type === "segments") {
+    const rawSegs = Array.isArray(obj.segments) ? obj.segments : [];
+    const segments = rawSegs
+      .map((s) => normalizeTranscriptSegment(s))
+      .filter((s): s is TranscriptSegment => !!s);
+    return {
+      type: "segments",
+      segments,
+      isFinal: !!obj.is_final,
+      speechFinal: !!obj.speech_final,
+    };
+  }
+
+  if (type === "interim") {
+    const segment = normalizeTranscriptSegment(obj.segment);
+    if (!segment) return null;
+    return { type: "interim", segment };
+  }
+
+  if (type === "final") {
+    const rawSegs = Array.isArray(obj.segments) ? obj.segments : [];
+    const segments = rawSegs
+      .map((s) => normalizeTranscriptSegment(s))
+      .filter((s): s is TranscriptSegment => !!s);
+    const error = typeof obj.error === "string" && obj.error ? obj.error : undefined;
+    return {
+      type: "final",
+      text: String(obj.text || ""),
+      segments,
+      durationSec: Math.max(0, Number(obj.durationSec) || 0),
+      source: String(obj.source || ""),
+      error,
+    };
+  }
+
+  if (type === "error") {
+    return {
+      type: "error",
+      error: String(obj.error || "live stream error"),
+      fatal: !!obj.fatal,
+    };
+  }
+
+  return null;
 }
 
 type UiStatusTone = "neutral" | "info" | "success" | "warning" | "error";
@@ -213,20 +302,11 @@ const fmtBytes = (bytes: number): string => {
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 const MAX_FILE_BYTES = 500 * 1024 * 1024;
-const MAX_JOB_WAIT_MS = 45 * 60 * 1000;
 const AUDIO_TOKENS = {
   liveSampleRateHz: 16_000,
-  compactSampleRateHz: 8_000,
 } as const;
 const UI_TOKENS = {
   polling: {
-    initialWaitMs: 180,
-    maxWaitMs: 700,
-    growth: 1.16,
-    fastInitialWaitMs: 50,
-    fastMaxWaitMs: 180,
-    fastGrowth: 1.06,
-    remoteChunkSettleWaitMs: 150,
     remoteChunkSettleTimeoutMs: 3_000,
   },
   draft: {
@@ -243,9 +323,6 @@ const UI_TOKENS = {
   },
   capture: {
     fallbackInitDelayMs: 1_300,
-    chunkIntervalMs: 4_000,
-    chunkMinNewSamples: AUDIO_TOKENS.liveSampleRateHz, // 1 sec @ live sample rate
-    tailMinSamples: Math.floor(AUDIO_TOKENS.liveSampleRateHz / 10), // 0.1 sec @ live sample rate
     vuAmplify: 4,
     waveformMixRms: 6.6,
     waveformMixPeak: 0.45,
@@ -479,35 +556,25 @@ function normalizeTranscriptWhitespace(text: string): string {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-function mergeRollingPreviewText(current: string, incoming: string): string {
-  const base = normalizeTranscriptWhitespace(current);
-  const next = normalizeTranscriptWhitespace(incoming);
-  if (!next) return base;
-  if (!base || base === next || base.endsWith(next) || base.includes(next)) return base || next;
-  if (next.endsWith(base)) return next;
-
-  const baseWords = base.split(" ");
-  const nextWords = next.split(" ");
-  const maxOverlap = Math.min(baseWords.length, nextWords.length, 48);
-  for (let size = maxOverlap; size >= 4; size--) {
-    if (baseWords.slice(-size).join(" ") !== nextWords.slice(0, size).join(" ")) continue;
-    return `${base} ${nextWords.slice(size).join(" ")}`.trim();
-  }
-  return `${base}\n${next}`.trim();
-}
-
 function joinTranscriptSegments(segments: TranscriptSegment[]): string {
   return segments.map((segment) => normalizeTranscriptWhitespace(segment.text)).filter(Boolean).join(" ").trim();
 }
 
 function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): TranscriptSegment | null {
   if (!raw || typeof raw !== "object") return null;
-  const source = raw as { start?: unknown; end?: unknown; text?: unknown };
+  const source = raw as { start?: unknown; end?: unknown; text?: unknown; speaker?: unknown };
   const text = normalizeTranscriptWhitespace(String(source.text || ""));
   const start = Math.max(0, Number(source.start || 0) + timeOffsetSec);
   const end = Math.max(start, Number(source.end || 0) + timeOffsetSec);
   if (!text || !Number.isFinite(start) || !Number.isFinite(end)) return null;
-  return { start, end, text };
+  const segment: TranscriptSegment = { start, end, text };
+  if (source.speaker !== undefined && source.speaker !== null) {
+    const speakerIndex = Number(source.speaker);
+    if (Number.isFinite(speakerIndex) && speakerIndex >= 0) {
+      segment.speaker = Math.floor(speakerIndex);
+    }
+  }
+  return segment;
 }
 
 function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
@@ -528,6 +595,36 @@ function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegme
     merged.push(segment);
   }
   return merged;
+}
+
+/**
+ * Format an ordered list of transcript segments for display.
+ *
+ * When ``speaker`` is populated (Deepgram diarize), consecutive
+ * segments from the same speaker are coalesced under one ``Speaker N:``
+ * prefix. Speaker transitions start a new paragraph so the user can
+ * visually separate voices in the live preview.
+ */
+function formatSegmentsForDisplay(segments: TranscriptSegment[], separator: string): string {
+  if (!segments.length) return "";
+  const parts: string[] = [];
+  let lastSpeaker: number | undefined;
+  for (const seg of segments) {
+    const t = seg.text.trim();
+    if (!t) continue;
+    if (seg.speaker !== undefined && seg.speaker !== lastSpeaker) {
+      // New speaker — add a speaker-prefixed chunk.
+      if (parts.length) parts.push("\n");
+      parts.push(`Speaker ${seg.speaker}: ${t}`);
+      lastSpeaker = seg.speaker;
+    } else {
+      if (parts.length && parts[parts.length - 1] !== "\n") {
+        parts.push(separator);
+      }
+      parts.push(t);
+    }
+  }
+  return parts.join("").trim();
 }
 
 function recordingTitleFromName(name: string): string {
@@ -571,21 +668,106 @@ function showRecordSessionNotice(message: string, tone: UiTone = "info", timeout
   }
 }
 
-function renderCurrentRecordingSummary(): void {
-  return;
+/**
+ * Render the current recording summary to the live DOM.
+ *
+ * The summary is the SSOT for "what is happening right now". Every time
+ * it changes we push:
+ *   - the status text into the header status pill (``setStatus``)
+ *   - warning/error tones into the session notice banner so the user
+ *     gets a persistent visual cue without extra wiring at call sites.
+ *
+ * Rendering is debounced against a previous-state snapshot so that no
+ * identical status line is re-broadcast twice. This keeps the notice
+ * banner from flashing on repeated patches with the same text.
+ */
+let lastRenderedStatusText = "";
+let lastRenderedStatusTone: UiTone = "neutral";
+let lastNoticedStatusKey = "";
+
+function toneToStatusKind(tone: UiTone, fallbackText: string): StatusKind {
+  switch (tone) {
+    case "error":
+      return "error";
+    case "warning":
+      return "warning";
+    case "success":
+      return inferStatusKindFromText(fallbackText) === "recording" ? "recording" : "done";
+    case "info":
+      return inferStatusKindFromText(fallbackText) === "recording" ? "recording" : "processing";
+    default:
+      return inferStatusKindFromText(fallbackText);
+  }
+}
+
+function inferStatusKindFromText(text: string): StatusKind {
+  const t = (text || "").trim();
+  if (!t) return "idle";
+  if (t === "Recording" || t.startsWith("Recording")) return "recording";
+  if (t === "Done") return "done";
+  if (t === "Error" || t === "Backend Error" || t.startsWith("Error")) return "error";
+  if (t === "Idle") return "idle";
+  if (
+    t === "Processing" ||
+    t.startsWith("Processing") ||
+    t === "Starting" ||
+    t === "Refining..." ||
+    t.startsWith("Finalizing") ||
+    t.startsWith("Transcribing") ||
+    t.startsWith("Upscaling")
+  ) {
+    return "processing";
+  }
+  return "info";
+}
+
+let lastRenderedLatencyMs: number | null = null;
+
+function renderCurrentRecordingSummary(
+  summary: CurrentRecordingSummary | null,
+  sessionToken = ""
+): void {
+  if (!summary) {
+    lastRenderedStatusText = "";
+    lastRenderedStatusTone = "neutral";
+    lastNoticedStatusKey = "";
+    lastRenderedLatencyMs = null;
+    return;
+  }
+  const status = String(summary.status || "").trim();
+  const tone = (summary.tone || "neutral") as UiTone;
+  if (status && (status !== lastRenderedStatusText || tone !== lastRenderedStatusTone)) {
+    lastRenderedStatusText = status;
+    lastRenderedStatusTone = tone;
+    setStatus(status, toneToStatusKind(tone, status));
+    if (tone === "warning" || tone === "error") {
+      const noticeKey = `${tone}::${status}`;
+      if (noticeKey !== lastNoticedStatusKey) {
+        lastNoticedStatusKey = noticeKey;
+        showRecordSessionNotice(status, tone, 7000, sessionToken);
+      }
+    }
+  }
+  if (
+    summary.transcribeLatencyMs !== undefined &&
+    summary.transcribeLatencyMs !== lastRenderedLatencyMs
+  ) {
+    lastRenderedLatencyMs = summary.transcribeLatencyMs;
+    $("transcribeLatency").textContent = fmtMs(summary.transcribeLatencyMs);
+  }
 }
 
 function setCurrentRecordingSummary(summary: CurrentRecordingSummary | null, sessionToken = ""): void {
   if (!isCurrentUiSession(sessionToken)) return;
   currentRecordingSummary = summary ? { ...summary } : null;
-  renderCurrentRecordingSummary();
+  renderCurrentRecordingSummary(currentRecordingSummary, sessionToken);
 }
 
 function patchCurrentRecordingSummary(patch: Partial<CurrentRecordingSummary>, sessionToken = ""): void {
   if (!isCurrentUiSession(sessionToken)) return;
   const next: CurrentRecordingSummary = {
     title: currentRecordingSummary?.title || "Recording summary",
-    status: currentRecordingSummary?.status || "Awaiting next action.",
+    status: currentRecordingSummary?.status || "",
     tone: currentRecordingSummary?.tone || "neutral",
     ...(currentRecordingSummary || {}),
     ...patch,
@@ -612,9 +794,9 @@ function setBusy(nextBusy: boolean, scopeToken = ""): void {
   });
 }
 
-function setStatusScoped(scopeToken: string, st: string): void {
+function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): void {
   if (!isCurrentUiSession(scopeToken)) return;
-  setStatus(st);
+  setStatus(st, kind);
 }
 
 function setRecordButton(recording: boolean): void {
@@ -623,20 +805,31 @@ function setRecordButton(recording: boolean): void {
   b.setAttribute("aria-label", recording ? "Stop recording" : "Start recording");
 }
 
-function setStatus(st: string): void {
+function statusKindToDotClass(kind: StatusKind): string {
+  switch (kind) {
+    case "recording":
+      return " rec";
+    case "processing":
+      return " process";
+    case "done":
+      return " done";
+    case "error":
+      return " error";
+    case "warning":
+      return " warn";
+    case "info":
+      return " process";
+    case "idle":
+    default:
+      return "";
+  }
+}
+
+function setStatus(st: string, kind?: StatusKind): void {
   $("statusText").textContent = st;
+  const resolvedKind: StatusKind = kind || inferStatusKindFromText(st);
   const dot = $("statusDot");
-  dot.className =
-    "status-dot" +
-    (st === "Recording"
-      ? " rec"
-      : st === "Processing" || st.startsWith("Processing") || st === "Refining..."
-        ? " process"
-        : st === "Done"
-          ? " done"
-          : st === "Error" || st === "Backend Error"
-            ? " error"
-            : "");
+  dot.className = "status-dot" + statusKindToDotClass(resolvedKind);
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -721,10 +914,13 @@ async function parseError(r: Response): Promise<string> {
       details = `${details}: ${JSON.stringify(j)}`;
     }
   } catch {
+    // Body wasn't JSON; fall through to text parsing.
     try {
       const txt = await r.text();
       if (txt && txt.trim()) details = `${details}: ${txt.trim()}`;
-    } catch { }
+    } catch (textError) {
+      console.debug("parseError: response body unavailable", textError);
+    }
   }
   return details || `HTTP ${r.status}`;
 }
@@ -803,21 +999,6 @@ function encodeWav(float32: Float32Array, sr: number): Blob {
   return new Blob([buf], { type: "audio/wav" });
 }
 
-/**
- * Encode Float32 PCM → compact WAV at a lower sample rate for remote providers.
- * Downsamples 16kHz → 8kHz to halve the payload size. This is instant (pure math)
- * unlike MediaRecorder which requires real-time playback duration.
- * 8kHz mono is the telephony standard and all speech recognition APIs accept it.
- */
-function encodeCompactWav(
-  float32: Float32Array,
-  inputSr: number,
-  outputSr: number = AUDIO_TOKENS.compactSampleRateHz
-): Blob {
-  const resampled = inputSr === outputSr ? float32 : downsample(float32, inputSr, outputSr);
-  return encodeWav(resampled, outputSr);
-}
-
 function mergeCapturedChunks(frames: Float32Array[]): Float32Array {
   if (!frames.length) return new Float32Array(0);
   const total = frames.reduce((acc, chunk) => acc + chunk.length, 0);
@@ -832,11 +1013,6 @@ function mergeCapturedChunks(frames: Float32Array[]): Float32Array {
 
 function createWavFileFromSamples(samples: Float32Array, sampleRate: number, name: string): File {
   const audioBlob = encodeWav(samples, sampleRate);
-  return new File([audioBlob], name, { type: audioBlob.type || "audio/wav" });
-}
-
-function createCompactWavFileFromSamples(samples: Float32Array, inputSampleRate: number, name: string): File {
-  const audioBlob = encodeCompactWav(samples, inputSampleRate, AUDIO_TOKENS.compactSampleRateHz);
   return new File([audioBlob], name, { type: audioBlob.type || "audio/wav" });
 }
 
@@ -928,10 +1104,13 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
     window.setTimeout(finish, UI_TOKENS.polling.remoteChunkSettleTimeoutMs);
     try {
       recorder.requestData();
-    } catch { }
+    } catch (e) {
+      console.debug("MediaRecorder requestData rejected (harmless)", e);
+    }
     try {
       recorder.stop();
-    } catch {
+    } catch (e) {
+      console.debug("MediaRecorder stop rejected (harmless)", e);
       finish();
     }
   });
@@ -1044,15 +1223,6 @@ function isTransientRemoteNetworkError(err: unknown): boolean {
   );
 }
 
-async function remoteJobSyncWithFallback(
-  file: File,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
-): Promise<{ text: string; provider: string; model?: string }> {
-  // Single implementation — kept as a named function for stack trace readability
-  // and to provide a single place for future fallback/retry logic.
-  return remoteJobSync(file, opts);
-}
-
 function isProviderKeyConfigured(provider: Provider): boolean {
   if (provider === "local" || !provider) return true;
   if (provider === "openrouter") {
@@ -1076,61 +1246,10 @@ function providerKeyErrorMessage(provider: Provider): string {
   return "Provider API key is not configured.";
 }
 
-function setArchiveStatus(message: string, tone: UiStatusTone = "neutral"): void {
-  void message;
-  void tone;
-}
-
-function setSettingsSaveStatus(message: string, tone: UiStatusTone = "neutral"): void {
-  void message;
-  void tone;
-}
-
-function setSectionSummary(
-  containerId: string,
-  items: Array<{ text: string; tone?: UiStatusTone }>
-): void {
-  void containerId;
-  void items;
-}
-
-function syncRecordingsHeaderSummary(): void {
-  return;
-}
-
-function syncSettingsHeaderSummary(): void {
-  return;
-}
-
-function syncSettingsCardSummaries(): void {
-  return;
-}
-
-function syncGraphHeaderSummary(): void {
-  return;
-}
-
-function setGraphStatus(message: string, tone: UiStatusTone = "neutral"): void {
-  void message;
-  void tone;
-}
-
-function syncWindowViewMeta(view: ViewName): void {
-  void view;
-}
-
-function syncRecordContextStrip(): void {
-  return;
-}
-
 function syncRecordingsSearchControls(): void {
   const clearBtn = $("recordingsSearchClearBtn") as HTMLButtonElement;
   const hasQuery = !!recordingsSearchQuery.trim();
   clearBtn.disabled = recordingsUiLoading || !hasQuery;
-}
-
-function setRecordingViewerHelper(message: string): void {
-  void message;
 }
 
 function modalFocusableElements(modal: HTMLElement): HTMLElement[] {
@@ -1159,25 +1278,6 @@ function closeModal(modalId: string): void {
     lastModalFocus.focus();
   }
   lastModalFocus = null;
-}
-
-function syncPaneContexts(): void {
-  syncRecordContextStrip();
-}
-
-async function localJob(
-  file: File,
-  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean }
-): Promise<{ job_id: string }> {
-  const fd = new FormData();
-  fd.append("file", file, file.name || "audio.wav");
-  fd.set("language", opts.language || "auto");
-  fd.set("model", opts.model || "small");
-  fd.set("split_stereo", String(!!opts.splitStereo));
-  fd.set("word_timestamps", String(!!opts.wordTimestamps));
-  const r = await fetch("/api/jobs", { method: "POST", body: fd, headers: authHeaders() });
-  if (!r.ok) throw new Error(await parseError(r));
-  return (await r.json()) as { job_id: string };
 }
 
 async function localJobSync(
@@ -1292,23 +1392,33 @@ function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalMod
   };
 }
 
-function shouldRunLocalIncrementalAssist(snapshot: LiveSessionSnapshot | null = activeLiveSessionSnapshot): boolean {
-  void snapshot;
-  // Keep the local assist pipeline as the canonical live SSOT for every session.
-  // Preview visibility only affects rendering, not whether incremental capture runs.
-  return true;
+/**
+ * Returns the WebSocket mode for a given session snapshot.
+ *
+ * SSOT routing rules:
+ *   - deepgram (online)  → dedicated Deepgram streaming WebSocket
+ *   - any other provider → local faster-whisper assist pipeline
+ */
+function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
+  const provider = snapshot?.effectiveProvider
+    || resolveEffectiveProvider((($("providerSelect") as HTMLSelectElement).value || "local") as Provider);
+  if (provider === "deepgram" && isProviderKeyConfigured("deepgram")) {
+    return "deepgram-stream";
+  }
+  return "local-assist";
 }
 
 function getCanonicalLiveSourceText(): string {
-  return liveDraftText.trim() || remoteLivePreviewText.trim();
+  const committed = liveDraftText.trim();
+  if (committed) return committed;
+  return liveInterimText.trim();
 }
 
-function getVisibleLivePreviewText(sessionSnapshot: LiveSessionSnapshot | null = isRecording ? activeLiveSessionSnapshot : null): string {
-  const effectiveProvider = sessionSnapshot?.effectiveProvider
-    || resolveEffectiveProvider((($("providerSelect") as HTMLSelectElement).value || "local") as Provider);
-  return effectiveProvider === "local"
-    ? liveDraftDisplayText
-    : (remoteLivePreviewText || liveDraftDisplayText);
+function getVisibleLivePreviewText(): string {
+  const committed = liveDraftDisplayText.trim();
+  const interim = liveInterimText.trim();
+  if (committed && interim) return `${committed} ${interim}`;
+  return committed || interim;
 }
 
 function scheduleLocalWarmup(): void {
@@ -1328,31 +1438,6 @@ function scheduleLocalWarmup(): void {
       console.warn(`Local model warmup failed for ${model}`, e);
     });
   });
-}
-
-async function pollJob(
-  jobId: string,
-  signal: AbortSignal,
-  cb?: (j: JobResponse) => void,
-  opts?: { initialWaitMs?: number; maxWaitMs?: number; growth?: number }
-): Promise<JobResponse> {
-  const started = Date.now();
-  let waitMs = Math.max(20, Math.floor(Number(opts?.initialWaitMs ?? UI_TOKENS.polling.initialWaitMs)));
-  const maxWaitMs = Math.max(waitMs, Math.floor(Number(opts?.maxWaitMs ?? UI_TOKENS.polling.maxWaitMs)));
-  const growth = Math.max(1.01, Number(opts?.growth ?? UI_TOKENS.polling.growth));
-  while (true) {
-    if (signal.aborted) {
-      throw new Error("Request canceled");
-    }
-    if (Date.now() - started > MAX_JOB_WAIT_MS) {
-      throw new Error("Job timeout (45 min)");
-    }
-    const j = await apiGet<JobResponse>("/api/jobs/" + jobId, signal);
-    cb && cb(j);
-    if (j.status === "done" || j.status === "error") return j;
-    await new Promise((r) => setTimeout(r, waitMs));
-    waitMs = Math.min(maxWaitMs, Math.round(waitMs * growth));
-  }
 }
 
 function syncMode(): void {
@@ -1384,7 +1469,6 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
     return;
   }
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
-  syncPaneContexts();
 }
 
 function switchView(view: ViewName): void {
@@ -1403,7 +1487,6 @@ function switchView(view: ViewName): void {
   });
   $("windowViewLabel").textContent =
     view === "settings" ? "Settings" : view === "recordings" ? "Recordings" : view === "graph" ? "Graph" : "Record";
-  syncWindowViewMeta(view);
   if (view === "recordings") {
     void loadRecordings(true).catch(() => { });
   }
@@ -1472,14 +1555,12 @@ async function loadMics(forceReload = false): Promise<void> {
     if (nextVal && Array.from(sel.options).some((o) => o.value === nextVal)) {
       sel.value = nextVal;
     }
-    syncRecordContextStrip();
   } catch (e) {
     console.error("Error loading microphones:", e);
     const sel = $("micSelect") as HTMLSelectElement;
     if (forceReload || !sel.options.length || /loading/i.test(sel.value || "")) {
       sel.innerHTML = '<option value="">Permission denied</option>';
     }
-    syncRecordContextStrip();
   }
 }
 
@@ -1616,13 +1697,18 @@ function persistLiveDraft(recording: boolean): void {
       archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
     };
     localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
-  } catch { }
+  } catch (e) {
+    // localStorage quota or serialization problems are non-fatal.
+    console.debug("persistLiveDraft skipped", e);
+  }
 }
 
 function clearLiveDraft(): void {
   try {
     localStorage.removeItem(LIVE_DRAFT_KEY);
-  } catch { }
+  } catch (e) {
+    console.debug("clearLiveDraft skipped", e);
+  }
 }
 
 async function recoverLiveDraftIfAny(): Promise<void> {
@@ -1660,24 +1746,24 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       model: String(draft.model || "-"),
       language: String(draft.language || "auto"),
     });
-    $("finalOutput").textContent = transcriptText || sourceText;
+    const recoveredText = transcriptText || sourceText;
+    publishRecordingOutput({
+      recordingId: 0,
+      pasteText: recoveredText,
+      domText: recoveredText,
+      kind: "transcript",
+    });
     setCurrentRecordingSummary({
       title: String(draft.title || "Recovered recording"),
       status: "Recovered unsaved draft from the previous session.",
       tone: "warning",
-      provider: String(draft.provider || "local"),
-      model: String(draft.model || "-"),
-      language: String(draft.language || "auto"),
-      transcriptChars: (transcriptText || sourceText).length,
-      transcriptWords: countWords(transcriptText || sourceText),
       savedName: recovered.name,
-      recovered: true,
     });
     showRecordSessionNotice("Recovered the last unsaved draft from a previous session.", "warning", 9000);
     setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
     clearLiveDraft();
-  } catch {
-    // Keep draft for next startup attempt.
+  } catch (e) {
+    console.warn("Live draft recovery failed; keeping draft for next startup", e);
   }
 }
 
@@ -1771,8 +1857,6 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
   if (!btn) return;
   const keysSpan = btn.querySelector(".shortcut-keys");
   if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
-  syncSettingsHeaderSummary();
-  syncSettingsCardSummaries();
 }
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
@@ -1828,8 +1912,6 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
 
   // Persist to config
   queueUiPreferencesSave();
-  syncSettingsHeaderSummary();
-  syncSettingsCardSummaries();
 
   // Signal the Electron main process to reload shortcuts
   (window as any).__transcriptorPendingShortcuts = {
@@ -1848,7 +1930,6 @@ function setAutoSendEnterEnabled(enabled: boolean): void {
   btn.classList.toggle("active", on);
   btn.setAttribute("aria-pressed", on ? "true" : "false");
   btn.title = on ? "Auto send after paste: ON" : "Auto send after paste: OFF";
-  syncPaneContexts();
 }
 
 function upscalePresetId(): string {
@@ -1904,7 +1985,6 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   const customCount = upscalePresets.filter((x) => !x.builtin).length;
   addBtn.disabled = customCount >= 3;
   syncUpscalePresetControls();
-  syncPaneContexts();
 }
 
 function openUpscalePresetModal(): void {
@@ -1983,7 +2063,6 @@ function queueUiPreferencesSave(): void {
     clearTimeout(uiPrefSaveTimer);
     uiPrefSaveTimer = null;
   }
-  setSettingsSaveStatus("Saving settings locally…", "info");
   uiPrefSaveTimer = window.setTimeout(() => {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
@@ -2002,15 +2081,11 @@ function queueUiPreferencesSave(): void {
     })
       .then(() => {
         configuredRecordingsDir = nextRecordingsDir;
-        setSettingsSaveStatus("Settings saved locally.", "success");
         if (!shouldRefreshRecordingsArchive) return;
         activeResolvedRecordingsDir = "";
         recordingsBootstrapReady = false;
-        setArchiveStatus("Switching to the selected archive…", "info");
         const reloadTask = loadRecordings(false).catch((e) => {
           console.warn("Recordings archive reload failed", e);
-          setArchiveStatus("Archive reload failed. The previous archive remains active.", "error");
-          setSettingsSaveStatus("Settings saved, but archive reload failed.", "warning");
         });
         const trackedReloadPromise = reloadTask.finally(() => {
           if (recordingsBootstrapPromise === trackedReloadPromise) {
@@ -2018,13 +2093,11 @@ function queueUiPreferencesSave(): void {
           }
           recordingsBootstrapReady = !!currentArchiveDirSnapshot();
           if (recordingsBootstrapReady) {
-            setArchiveStatus("Archive is ready.", "success");
           }
         });
         recordingsBootstrapPromise = trackedReloadPromise;
       })
       .catch(() => {
-        setSettingsSaveStatus("Failed to save settings locally.", "error");
       });
   }, UI_TOKENS.settings.saveDebounceMs);
 }
@@ -2107,16 +2180,15 @@ async function loadCfg(): Promise<void> {
     if (ui.shortcut_paste) currentShortcuts.paste = ui.shortcut_paste;
     updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
     updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
-  } catch {
+  } catch (configError) {
+    console.warn("Initial config load failed, retrying with built-in preset", configError);
     try {
       await loadUpscalePresets("builtin_clean");
-    } catch { }
+    } catch (presetError) {
+      console.warn("Built-in preset fallback also failed", presetError);
+    }
   } finally {
     suppressUiPrefAutosave = false;
-    setSettingsSaveStatus("All settings are saved locally.", "neutral");
-    syncSettingsHeaderSummary();
-    syncSettingsCardSummaries();
-    syncPaneContexts();
   }
 }
 
@@ -2136,8 +2208,6 @@ async function saveProviderKey(provider: KeyProvider): Promise<void> {
   }
   markKeyMasked(provider, true);
   syncKeyActionButton(provider);
-  syncSettingsHeaderSummary();
-  syncSettingsCardSummaries();
 }
 
 async function deleteProviderKey(provider: KeyProvider): Promise<void> {
@@ -2153,8 +2223,6 @@ async function deleteProviderKey(provider: KeyProvider): Promise<void> {
   }
   markKeyMasked(provider, false);
   syncKeyActionButton(provider);
-  syncSettingsHeaderSummary();
-  syncSettingsCardSummaries();
 }
 
 async function handleKeyAction(provider: KeyProvider): Promise<void> {
@@ -2168,23 +2236,17 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("input", () => {
-  syncSettingsHeaderSummary();
-  syncSettingsCardSummaries();
 });
 ($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => {
-  syncSettingsCardSummaries();
   queueUiPreferencesSave();
 });
 ($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => {
-  syncSettingsCardSummaries();
   queueUiPreferencesSave();
 });
 ($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => {
-  syncSettingsCardSummaries();
   queueUiPreferencesSave();
 });
 ($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => {
-  syncPaneContexts();
   queueUiPreferencesSave();
 });
 ["openrouter", "deepgram"].forEach((providerName) => {
@@ -2212,7 +2274,6 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 });
 ($("upscalePresetSelect") as HTMLSelectElement).addEventListener("change", () => {
   syncUpscalePresetControls();
-  syncPaneContexts();
   queueUiPreferencesSave();
 });
 ($("upscalePresetAddBtn") as HTMLButtonElement).addEventListener("click", () => openUpscalePresetModal());
@@ -2380,7 +2441,6 @@ function updateRecordingCopyState(): void {
 function resetRecordingViewer(placeholder = "Choose a recording from the left list..."): void {
   $("recordingTitleLabel").textContent = "Choose a recording";
   $("recordingMeta").textContent = "";
-  setRecordingViewerHelper("");
   $("recordingContent").setAttribute("aria-busy", "false");
   $("recordingContent").setAttribute("data-placeholder", placeholder);
   $("recordingContent").textContent = "";
@@ -2396,7 +2456,6 @@ function resetRecordingViewer(placeholder = "Choose a recording from the left li
 function setRecordingViewerLoading(displayName: string): void {
   $("recordingTitleLabel").textContent = displayName || "Loading recording";
   $("recordingMeta").textContent = "Loading…";
-  setRecordingViewerHelper("");
   $("recordingContent").setAttribute("aria-busy", "true");
   $("recordingContent").setAttribute("data-placeholder", "Loading recording...");
   $("recordingContent").textContent = "";
@@ -2451,22 +2510,12 @@ function getFilteredRecordings(): RecordingItem[] {
   });
 }
 
-function syncRecordingsFilterHint(filteredCount: number, totalCount: number): void {
-  void filteredCount;
-  void totalCount;
-}
-
 function setRecordingsUiLoading(nextLoading: boolean): void {
   recordingsUiLoading = !!nextLoading;
   $("recordingsList").setAttribute("aria-busy", recordingsUiLoading ? "true" : "false");
   ($("recordingsRefreshBtn") as HTMLButtonElement).disabled = recordingsUiLoading;
   ($("recordingsSearchInput") as HTMLInputElement).disabled = recordingsUiLoading;
   ($("recordingsSearchClearBtn") as HTMLButtonElement).disabled = recordingsUiLoading || !recordingsSearchQuery.trim();
-  if (recordingsUiLoading) {
-    setArchiveStatus("Refreshing archive contents…", "info");
-  }
-  syncRecordingsFilterHint(getFilteredRecordings().length, recordingItems.length);
-  syncRecordingsHeaderSummary();
 }
 
 function flashButtonFeedback(btn: HTMLButtonElement, copiedLabel: string, defaultTitle: string): void {
@@ -2547,7 +2596,6 @@ async function ensureRecordingsArchiveReady(): Promise<string> {
   await loadRecordings(false);
   const resolved = currentArchiveDirSnapshot();
   if (!resolved) {
-    setArchiveStatus("Archive is not ready yet.", "error");
     throw new Error("Recordings archive is not ready yet. Please try again.");
   }
   recordingsBootstrapReady = true;
@@ -2575,8 +2623,6 @@ function renderRecordingsList(): void {
   list.replaceChildren();
   const filteredItems = getFilteredRecordings();
   syncRecordingsSearchControls();
-  syncRecordingsFilterHint(filteredItems.length, recordingItems.length);
-  syncRecordingsHeaderSummary();
   if (!recordingItems.length) {
     list.appendChild(
       renderRecordingsEmptyState("No recordings yet.", "Start Recording", () => {
@@ -2674,11 +2720,7 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
     } else {
       resetRecordingViewer(recordingsSearchQuery ? "No recordings match the current search." : "Choose a recording from the left list...");
     }
-    syncRecordingsHeaderSummary();
-    setArchiveStatus("Archive is ready.", "success");
-    setSettingsSaveStatus("Settings saved locally.", "success");
   } catch (e) {
-    setArchiveStatus("Archive is unavailable right now.", "error");
     throw e;
   } finally {
     if (requestSeq === recordingsLoadRequestSeq) {
@@ -2789,7 +2831,6 @@ async function openRecording(name: string): Promise<void> {
     const displayName = recordingItems.find((item) => item.name === name)?.display_name || recordingTitleFromName(name);
     $("recordingTitleLabel").textContent = displayName;
     $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}`;
-    setRecordingViewerHelper("");
     $("recordingContent").setAttribute("aria-busy", "false");
     $("recordingContent").setAttribute("data-placeholder", "Transcription will appear here...");
     $("recordingContent").textContent = r.content || "";
@@ -2821,7 +2862,6 @@ async function openRecording(name: string): Promise<void> {
     const message = sanitizeUiErrorMessage(e, "Could not open this recording.");
     $("recordingTitleLabel").textContent = pendingDisplayName;
     $("recordingMeta").textContent = "Load failed";
-    setRecordingViewerHelper("");
     $("recordingContent").setAttribute("aria-busy", "false");
     $("recordingContent").setAttribute("data-placeholder", "Recording failed to load.");
     $("recordingContent").textContent = message;
@@ -3070,16 +3110,14 @@ syncRecordingsStatsVisibility();
 
 const autoToggle = $("autoTranscribeToggle") as HTMLInputElement;
 autoToggle.addEventListener("change", () => {
-  syncPaneContexts();
   queueUiPreferencesSave();
 });
 const livePreviewToggle = $("livePreviewToggle") as HTMLInputElement;
 livePreviewToggle.addEventListener("change", () => {
   if (!livePreviewToggle.checked) {
-    setRemoteLivePreviewText("");
+    liveInterimText = "";
   }
   syncLiveOutputFromState();
-  syncPaneContexts();
   queueUiPreferencesSave();
 });
 
@@ -3096,7 +3134,6 @@ function shouldLivePreview(): boolean {
   const quick = $("quickProviderSelect") as HTMLSelectElement;
   if (quick.value !== main.value) quick.value = main.value;
   syncRemoteModelOptions();
-  syncPaneContexts();
   queueUiPreferencesSave();
   scheduleLocalWarmup();
 });
@@ -3110,7 +3147,6 @@ function shouldLivePreview(): boolean {
   if (v && provider === "deepgram") {
     remoteModelByProvider.deepgram = v;
   }
-  syncPaneContexts();
   queueUiPreferencesSave();
 });
 ($("quickProviderSelect") as HTMLSelectElement).addEventListener("change", () => {
@@ -3154,16 +3190,13 @@ function initQuickControls(): void {
 }
 
 ($("language") as HTMLSelectElement).addEventListener("change", () => {
-  syncPaneContexts();
   queueUiPreferencesSave();
 });
 ($("model") as HTMLSelectElement).addEventListener("change", () => {
-  syncPaneContexts();
   queueUiPreferencesSave();
   scheduleLocalWarmup();
 });
 ($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
-  syncRecordContextStrip();
   queueUiPreferencesSave();
 });
 
@@ -3176,8 +3209,6 @@ let scriptNode: ScriptProcessorNode | null = null;
 let scriptSinkGain: GainNode | null = null;
 let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
-let chunkSubmitTimer: number | null = null;
-let chunkAbortController: AbortController | null = null;
 let startAt = 0;
 let chunks: Float32Array[] = [];
 let draftSaveTimer: number | null = null;
@@ -3189,47 +3220,216 @@ let capturePeakMax = 0;
 let captureSampleCount = 0;
 let liveDraftText = "";
 let liveDraftDisplayText = "";
-let remoteLivePreviewText = "";
+let liveInterimText = "";
 let liveTranscriptSegments: TranscriptSegment[] = [];
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 let stopTransitionInFlight = false;
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
-let lastRemotePreviewSubmittedSamples = 0;
-let remotePreviewRequestSeq = 0;
+let liveWsMode: LiveWsMode = "local-assist";
+/**
+ * Finalize barrier for the live WebSocket.
+ *
+ * Each recording session has its own slot, keyed by the session UI
+ * token. A second recording started before the first one has finished
+ * finalizing cannot leak its envelope into the first one — when the
+ * first session's ``waitForLiveFinalEnvelope(token, ms)`` resolves, it
+ * reads only the slot that belongs to its own token.
+ */
+interface LiveFinalSlot {
+  envelope: LiveFinalEnvelope | null;
+  waiters: Array<(envelope: LiveFinalEnvelope | null) => void>;
+}
+const liveFinalSlots = new Map<string, LiveFinalSlot>();
+let liveStreamError = "";
 
-// (Chunked pipeline removed — single sync call is faster and simpler.)
-
-function publishFinishedRecording(recordingId: number, text: string): void {
-  const rid = Math.max(0, Number(recordingId || 0));
-  const payload = String(text || "").trim();
-  const lower = payload.toLowerCase();
-  const compact = lower.replace(/\s+/g, "");
-  const invalid =
-    !payload ||
-    lower === "error" ||
-    lower === "[websocket error]" ||
-    lower.startsWith("http ") ||
-    compact === "[silence]";
-  if (invalid) return;
-  if (!payload) return;
-  const finishedAt = Date.now();
-  window.__transcriptorLastFinishedText = payload;
-  window.__transcriptorLastFinishedAt = finishedAt;
-  window.__transcriptorLastFinishedRecordingId = rid;
-  if (!rid) return;
-  const list = Array.isArray(window.__transcriptorFinishedRecords) ? window.__transcriptorFinishedRecords.slice() : [];
-  const next = list.filter((x) => Number(x?.recordingId || 0) !== rid);
-  next.push({ recordingId: rid, finishedAt, text: payload });
-  window.__transcriptorFinishedRecords = next.slice(-30);
+function ensureLiveFinalSlot(token: string): LiveFinalSlot {
+  let slot = liveFinalSlots.get(token);
+  if (!slot) {
+    slot = { envelope: null, waiters: [] };
+    liveFinalSlots.set(token, slot);
+  }
+  return slot;
 }
 
-function clearRecordingFinalSignal(): void {
+function resolveLiveFinal(token: string, envelope: LiveFinalEnvelope): void {
+  if (!token) {
+    logger_warn_client("resolveLiveFinal called without session token; ignored");
+    return;
+  }
+  const slot = ensureLiveFinalSlot(token);
+  slot.envelope = envelope;
+  const waiters = slot.waiters;
+  slot.waiters = [];
+  for (const waiter of waiters) {
+    try {
+      waiter(envelope);
+    } catch (e) {
+      console.warn("live final waiter threw", e);
+    }
+  }
+}
+
+function clearLiveStreamState(): void {
+  // Drop stale slots whose sessions are definitely over. We keep slots
+  // owned by the CURRENTLY active UI session so that a just-started
+  // session doesn't lose its future envelope. Old sessions release
+  // any lingering waiters with a null envelope so no promise hangs.
+  const activeToken = activeUiSessionToken || "";
+  for (const [token, slot] of liveFinalSlots) {
+    if (token === activeToken) continue;
+    const waiters = slot.waiters;
+    slot.waiters = [];
+    for (const waiter of waiters) {
+      try {
+        waiter(null);
+      } catch (e) {
+        console.warn("stale live final waiter threw", e);
+      }
+    }
+    liveFinalSlots.delete(token);
+  }
+  liveStreamError = "";
+  liveInterimText = "";
+}
+
+function waitForLiveFinalEnvelope(
+  token: string,
+  timeoutMs: number
+): Promise<LiveFinalEnvelope | null> {
+  if (!token) {
+    return Promise.resolve(null);
+  }
+  const slot = ensureLiveFinalSlot(token);
+  if (slot.envelope) {
+    return Promise.resolve(slot.envelope);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value: LiveFinalEnvelope | null): void => {
+      if (settled) return;
+      settled = true;
+      slot.waiters = slot.waiters.filter((w) => w !== handler);
+      resolve(value);
+    };
+    const handler = (envelope: LiveFinalEnvelope | null): void => done(envelope);
+    slot.waiters.push(handler);
+    window.setTimeout(
+      () => done(slot.envelope),
+      Math.max(0, timeoutMs)
+    );
+  });
+}
+
+// Tiny helper so the logger_warn_client reference above is not a
+// dangling name during initialization.
+function logger_warn_client(message: string): void {
+  console.warn(message);
+}
+
+/**
+ * ── Recording output SSOT ───────────────────────────────────────────────
+ *
+ * There are two distinct semantic channels the rest of the system reads:
+ *
+ *   1. ``pasteReady`` — consumed by the Electron main process through
+ *      ``window.__transcriptorLastFinished*`` and
+ *      ``window.__transcriptorFinishedRecords``. This tells the overlay
+ *      "a transcript is ready to paste NOW".
+ *
+ *   2. ``uiFinal`` — consumed by the Electron main process through
+ *      ``window.__transcriptorLastUiFinal*`` for overlay state machines
+ *      that need to know what the UI is currently showing. This is also
+ *      what drives the ``$finalOutput`` DOM element.
+ *
+ * Historically these lived in two separate helpers (``publishFinishedRecording``
+ * and ``publishRecordingFinalSignal``) and were always called in pairs at
+ * almost every site. That made it trivial to update one channel and
+ * silently forget the other. ``publishRecordingOutput`` is the new SSOT:
+ * one call, one atomic update of both channels plus the DOM.
+ */
+interface RecordingOutputSignal {
+  recordingId: number;
+  /** The canonical, paste-ready text (post-upscale if upscaling was used).
+   *  Passing an empty string means "no paste is available". */
+  pasteText?: string;
+  /** The text to render in the ``$finalOutput`` DOM element. Defaults to
+   *  ``pasteText`` when omitted. Pass explicit ``""`` to clear the DOM. */
+  domText?: string;
+  /** Classification of this event for the overlay state machine. */
+  kind?: RecordingFinalSignalKind;
+  sessionToken?: string;
+}
+
+function recordingOutputIsInvalidTranscript(payload: string): boolean {
+  const lower = payload.toLowerCase();
+  const compact = lower.replace(/\s+/g, "");
+  if (!payload) return true;
+  if (lower === "error" || lower === "[websocket error]") return true;
+  if (lower.startsWith("http ")) return true;
+  if (compact === "[silence]") return true;
+  return false;
+}
+
+function publishRecordingOutput(signal: RecordingOutputSignal): void {
+  const rid = Math.max(0, Number(signal.recordingId || 0));
+  const pasteText = String(signal.pasteText || "").trim();
+  const domText =
+    signal.domText === undefined ? pasteText : String(signal.domText || "").trim();
+  const kind: RecordingFinalSignalKind = pasteText
+    ? signal.kind || "transcript"
+    : signal.kind || "";
+  const now = Date.now();
+
+  // Channel 1: paste-ready history (only for valid transcripts).
+  if (pasteText && !recordingOutputIsInvalidTranscript(pasteText)) {
+    window.__transcriptorLastFinishedText = pasteText;
+    window.__transcriptorLastFinishedAt = now;
+    window.__transcriptorLastFinishedRecordingId = rid;
+    if (rid > 0) {
+      const list = Array.isArray(window.__transcriptorFinishedRecords)
+        ? window.__transcriptorFinishedRecords.slice()
+        : [];
+      const next = list.filter((entry) => Number(entry?.recordingId || 0) !== rid);
+      next.push({ recordingId: rid, finishedAt: now, text: pasteText });
+      window.__transcriptorFinishedRecords = next.slice(-30);
+    }
+  }
+
+  // Channel 2: UI-final signal (always updated so the overlay can track
+  // both transcript and error/status states).
+  window.__transcriptorLastUiFinalText = pasteText;
+  window.__transcriptorLastUiFinalAt = pasteText ? now : 0;
+  window.__transcriptorLastUiFinalRecordingId = pasteText ? rid : 0;
+  window.__transcriptorLastUiFinalKind = kind;
+
+  // Channel 3: the DOM itself. Respects the active UI session so that a
+  // stale async handler from a previous recording cannot clobber the
+  // current display.
+  if (isCurrentUiSession(signal.sessionToken || "")) {
+    $("finalOutput").textContent = domText;
+  }
+}
+
+function clearRecordingOutput(): void {
   window.__transcriptorLastUiFinalText = "";
   window.__transcriptorLastUiFinalAt = 0;
   window.__transcriptorLastUiFinalRecordingId = 0;
   window.__transcriptorLastUiFinalKind = "";
+}
+
+/**
+ * Legacy shims — kept so the existing call sites don't need to move in
+ * the same patch. They route through ``publishRecordingOutput`` so all
+ * three channels stay consistent.
+ */
+function publishFinishedRecording(recordingId: number, text: string): void {
+  publishRecordingOutput({ recordingId, pasteText: text, kind: "transcript" });
+}
+
+function clearRecordingFinalSignal(): void {
+  clearRecordingOutput();
 }
 
 function publishRecordingFinalSignal(opts: {
@@ -3239,32 +3439,60 @@ function publishRecordingFinalSignal(opts: {
   kind?: RecordingFinalSignalKind;
   sessionToken?: string;
 }): void {
-  const rid = Math.max(0, Number(opts.recordingId || 0));
-  const signalText = String(opts.signalText || "").trim();
-  const domText = String(opts.domText ?? signalText).trim();
-  const kind = signalText ? (opts.kind || "status") : "";
-  window.__transcriptorLastUiFinalText = signalText;
-  window.__transcriptorLastUiFinalAt = signalText ? Date.now() : 0;
-  window.__transcriptorLastUiFinalRecordingId = signalText ? rid : 0;
-  window.__transcriptorLastUiFinalKind = kind;
-  if (isCurrentUiSession(opts.sessionToken || "")) {
-    $("finalOutput").textContent = domText;
+  publishRecordingOutput({
+    recordingId: opts.recordingId,
+    pasteText: opts.signalText,
+    domText: opts.domText,
+    kind: opts.kind,
+    sessionToken: opts.sessionToken,
+  });
+}
+
+/**
+ * Live-output render coalescing.
+ *
+ * Deepgram interim events can arrive at 10–20 Hz and every segment
+ * commit rewrites ``$("liveOutput").textContent`` + scrolls to the
+ * bottom. Naively doing that on every event produces layout thrash
+ * and visible jank. We coalesce all updates into a single rAF tick so
+ * no matter how many events arrive between paints, the DOM is touched
+ * at most once per frame.
+ */
+let liveOutputRenderScheduled = false;
+
+function scheduleLiveOutputRender(): void {
+  if (liveOutputRenderScheduled) return;
+  liveOutputRenderScheduled = true;
+  const run = (): void => {
+    liveOutputRenderScheduled = false;
+    const el = $("liveOutput");
+    if (!shouldLivePreview()) {
+      if (el.textContent !== "") el.textContent = "";
+      return;
+    }
+    const text = getVisibleLivePreviewText();
+    if (el.textContent !== text) {
+      el.textContent = text;
+      el.scrollTop = el.scrollHeight;
+    }
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(run);
+  } else {
+    window.setTimeout(run, 16);
   }
 }
 
 function syncLiveOutputFromState(): void {
-  const sessionSnapshot = isRecording ? activeLiveSessionSnapshot : null;
-  $("liveOutput").textContent = shouldLivePreview() ? getVisibleLivePreviewText(sessionSnapshot) : "";
-  if (shouldLivePreview()) {
-    $("liveOutput").scrollTop = $("liveOutput").scrollHeight;
-  }
+  scheduleLiveOutputRender();
 }
 
 function resetLiveDraftState(): void {
   liveDraftText = "";
   liveDraftDisplayText = "";
-  remoteLivePreviewText = "";
+  liveInterimText = "";
   liveTranscriptSegments = [];
+  liveCommittedDisplayCache = "";
   syncLiveOutputFromState();
 }
 
@@ -3274,15 +3502,24 @@ function setLiveDraftState(text: string, displayText = text): void {
   syncLiveOutputFromState();
 }
 
-function setRemoteLivePreviewText(text: string): void {
-  remoteLivePreviewText = normalizeTranscriptWhitespace(text);
+function setLiveInterimText(text: string): void {
+  const next = normalizeTranscriptWhitespace(text);
+  if (next === liveInterimText) return;
+  liveInterimText = next;
   syncLiveOutputFromState();
 }
 
-function appendRemoteLivePreviewText(text: string): void {
-  remoteLivePreviewText = mergeRollingPreviewText(remoteLivePreviewText, text);
-  syncLiveOutputFromState();
-}
+/**
+ * Incremental committed-segment buffer.
+ *
+ * ``mergeTranscriptSegments`` is O(n log n); rebuilding the flat join
+ * on every append is O(n). For a 1-hour session with ~3000 committed
+ * segments that's ~4.5M string operations on every interim event.
+ * Instead we maintain an append-only cache that only rebuilds when
+ * the merge detected an out-of-order segment (which shouldn't happen
+ * with well-behaved streaming providers but we guard for it).
+ */
+let liveCommittedDisplayCache = "";
 
 function appendLiveTranscriptSegments(rawSegments: unknown[]): void {
   const nextSegments = Array.isArray(rawSegments)
@@ -3291,17 +3528,58 @@ function appendLiveTranscriptSegments(rawSegments: unknown[]): void {
       .filter((segment): segment is TranscriptSegment => !!segment)
     : [];
   if (!nextSegments.length) return;
-  liveTranscriptSegments = mergeTranscriptSegments([...liveTranscriptSegments, ...nextSegments]);
-  const displayText = liveTranscriptSegments.map((segment) => segment.text).join("\n").trim();
-  setLiveDraftState(joinTranscriptSegments(liveTranscriptSegments), displayText);
+
+  const prevLen = liveTranscriptSegments.length;
+  const combined = liveTranscriptSegments.concat(nextSegments);
+  const merged = mergeTranscriptSegments(combined);
+  const appendOnly =
+    merged.length === combined.length &&
+    merged.length >= prevLen &&
+    merged.slice(0, prevLen).every((seg, i) => seg === liveTranscriptSegments[i]);
+
+  liveTranscriptSegments = merged;
+  // Committed-final text is the SSOT. Clear any lingering interim so
+  // the visible preview matches the committed stream.
+  liveInterimText = "";
+
+  const separator = liveWsMode === "deepgram-stream" ? " " : "\n";
+  // If diarize is on, rebuild via formatSegmentsForDisplay because the
+  // speaker prefix transitions can't be incrementally appended without
+  // losing the "same-speaker coalesce" behavior. For mono streams we
+  // take the fast append-only path.
+  const hasDiarization = liveTranscriptSegments.some((s) => s.speaker !== undefined);
+  if (hasDiarization) {
+    liveCommittedDisplayCache = formatSegmentsForDisplay(liveTranscriptSegments, separator);
+  } else if (appendOnly) {
+    // O(k) incremental append where k is the number of new segments.
+    let delta = "";
+    for (let i = prevLen; i < merged.length; i++) {
+      const t = merged[i].text;
+      if (!t) continue;
+      if (delta) delta += separator;
+      delta += t;
+    }
+    if (delta) {
+      liveCommittedDisplayCache = liveCommittedDisplayCache
+        ? `${liveCommittedDisplayCache}${separator}${delta}`
+        : delta;
+    }
+  } else {
+    // Segments reordered or deduped — rebuild from scratch.
+    liveCommittedDisplayCache = merged
+      .map((segment) => segment.text)
+      .filter(Boolean)
+      .join(separator)
+      .trim();
+  }
+  setLiveDraftState(joinTranscriptSegments(liveTranscriptSegments), liveCommittedDisplayCache);
 }
 
 function resetOutputs(): void {
   resetRecordSessionNotice();
   setCurrentRecordingSummary(null);
   resetLiveDraftState();
-  clearRecordingFinalSignal();
-  $("finalOutput").textContent = "";
+  publishRecordingOutput({ recordingId: 0, pasteText: "", domText: "", kind: "" });
   $("upscaleOutput").textContent = "";
   $("transcribeLatency").textContent = "--";
   $("upscaleLatency").textContent = "--";
@@ -3310,21 +3588,6 @@ function resetOutputs(): void {
   $("downloadRow").hidden = true;
   $("progressFill").style.width = "0%";
   $("progressText").textContent = "0%";
-}
-
-function applyJobResult(j: JobResponse): void {
-  $("progressRow").hidden = true;
-  const resultText = j.result?.text;
-  if (j.status === "done" && typeof resultText === "string" && resultText) {
-    $("finalOutput").textContent = resultText;
-    $("downloadRow").hidden = false;
-    ($("dlTxt") as HTMLAnchorElement).href = `/api/jobs/${j.job_id}/download/txt`;
-    ($("dlJson") as HTMLAnchorElement).href = `/api/jobs/${j.job_id}/download/json`;
-    setStatus("Done");
-    return;
-  }
-  $("finalOutput").textContent = j.error || "Error";
-  setStatus("Error");
 }
 
 function pushCapturedFrame(input: Float32Array): void {
@@ -3352,13 +3615,27 @@ function pushCapturedFrame(input: Float32Array): void {
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
   chunks.push(new Float32Array(ds));
   captureSampleCount += ds.length;
-  // Enterprise memory management: consolidate fragments periodically to avoid
-  // GC pressure and O(n) merge cost at stop time for long recordings.
-  if (chunks.length > 500) {
+  // Enterprise memory management: consolidate fragments when either the
+  // fragment count or the total live-buffer size crosses a threshold.
+  // Without this, a long recording produces tens of thousands of tiny
+  // Float32Array allocations that each pin a separate ArrayBuffer in
+  // the JS heap, triggering GC pressure and slowing down the capture
+  // thread. Fragment count is the common case for short quick takes;
+  // the size floor catches aggressive downsampling (e.g., 48kHz input
+  // where each fragment is large) on long recordings.
+  const CONSOLIDATE_FRAGMENT_LIMIT = 256;
+  const CONSOLIDATE_SAMPLE_LIMIT = AUDIO_TOKENS.liveSampleRateHz * 30; // 30 s @ 16 kHz
+  if (
+    chunks.length > CONSOLIDATE_FRAGMENT_LIMIT ||
+    (chunks.length > 1 && captureSampleCount > CONSOLIDATE_SAMPLE_LIMIT)
+  ) {
     const total = chunks.reduce((a, c) => a + c.length, 0);
     const merged = new Float32Array(total);
     let off = 0;
-    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    for (const c of chunks) {
+      merged.set(c, off);
+      off += c.length;
+    }
     chunks.length = 0;
     chunks.push(merged);
   }
@@ -3371,23 +3648,11 @@ function pushCapturedFrame(input: Float32Array): void {
   }
   try {
     ws.send(pcm);
-  } catch { }
-}
-
-function getCapturedTailSamples(maxSamples: number): Float32Array {
-  const need = Math.max(0, Math.floor(maxSamples));
-  if (!need || !chunks.length || captureSampleCount <= 0) return new Float32Array(0);
-  const outLen = Math.min(need, captureSampleCount);
-  const out = new Float32Array(outLen);
-  let writeOffset = outLen;
-  for (let i = chunks.length - 1; i >= 0 && writeOffset > 0; i--) {
-    const chunk = chunks[i];
-    if (!chunk.length) continue;
-    const take = Math.min(writeOffset, chunk.length);
-    writeOffset -= take;
-    out.set(chunk.subarray(chunk.length - take), writeOffset);
+  } catch (e) {
+    // Harmless race when the socket closes mid-frame; the buffered audio
+    // has already been written to `chunks` for local canonical playback.
+    console.debug("live ws send skipped", e);
   }
-  return writeOffset === 0 ? out : out.subarray(writeOffset);
 }
 
 async function flushWorkletPort(timeoutMs = 350): Promise<void> {
@@ -3426,10 +3691,13 @@ async function startLive(): Promise<void> {
     sessionArchiveDir = await ensureRecordingsArchiveReady();
   } catch (e) {
     const message = (e as Error).message || "Recordings archive is not ready yet.";
-    $("finalOutput").textContent = message;
-    setArchiveStatus(message, "error");
-    showRecordSessionNotice(message, "error", 7000);
-    setStatus("Error");
+    publishRecordingOutput({
+      recordingId: 0,
+      pasteText: "",
+      domText: message,
+      kind: "error",
+    });
+    patchCurrentRecordingSummary({ status: message, tone: "error" });
     return;
   }
   liveStartAbortReason = "";
@@ -3459,10 +3727,6 @@ async function startLive(): Promise<void> {
     title: sessionTitle,
     status: "Preparing microphone capture and session buffers.",
     tone: "info",
-    provider: selectedProvider || "local",
-    model: selectedModel,
-    language: selectedLanguage,
-    durationSec: 0,
   }, sessionUiToken);
   chunks = [];
   workletLastFrameAt = 0;
@@ -3473,8 +3737,8 @@ async function startLive(): Promise<void> {
   capturePeakMax = 0;
   captureSampleCount = 0;
   resetLiveDraftState();
-  lastRemotePreviewSubmittedSamples = 0;
-  remotePreviewRequestSeq = 0;
+  clearLiveStreamState();
+  liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
   setBusy(true, sessionUiToken);
   isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
@@ -3507,69 +3771,104 @@ async function startLive(): Promise<void> {
     if (isCurrentUiSession(sessionUiToken)) {
       $("timer").textContent = fmtTime(durationSec);
     }
-    patchCurrentRecordingSummary({ durationSec }, sessionUiToken);
   }, UI_TOKENS.timer.tickMs);
 
   const enableVisibleLivePreview = shouldLivePreview();
-  const enableLocalWebsocketPreview = shouldRunLocalIncrementalAssist(activeLiveSessionSnapshot);
-  if (enableLocalWebsocketPreview) {
-    ws = new WebSocket(
-      wsBase() +
-      "/ws/transcribe?" +
-      new URLSearchParams({
-        model: activeLiveSessionSnapshot.assistLocalModel,
-        language: activeLiveSessionSnapshot.language,
-        session_id: activeLiveSessionId,
-        archive_dir: activeLiveArchiveDir,
-        token: apiToken(),
-      })
-    );
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      setStatusScoped(sessionUiToken, "Recording");
-      patchCurrentRecordingSummary(
-        {
-          status: enableVisibleLivePreview
-            ? selectedEffectiveProvider === "local"
-              ? "Recording with live preview enabled."
-              : "Recording with live preview enabled. Local assist remains canonical while remote preview streams in."
-            : "Recording. Background local assist is active for fast stop finalization.",
-          tone: "info",
-        },
-        sessionUiToken
-      );
-    };
-    ws.onerror = () => {
-      if (shouldLivePreview()) {
-        setLiveDraftState(liveDraftText, `${liveDraftDisplayText}${liveDraftDisplayText ? "\n" : ""}[WebSocket error]`);
-      }
-    };
-    ws.onmessage = (ev: MessageEvent<string>) => {
-      let m: unknown;
-      try {
-        m = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      if (typeof m !== "object" || m === null) return;
-      const msg = m as { type?: unknown; error?: unknown; segments?: unknown };
-      if (msg.type === "error") {
+  const wsQuery = new URLSearchParams({
+    provider: liveWsMode === "deepgram-stream" ? "deepgram" : "local",
+    language: activeLiveSessionSnapshot.language,
+    session_id: activeLiveSessionId,
+    archive_dir: activeLiveArchiveDir,
+    token: apiToken(),
+    diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
+  });
+  if (liveWsMode === "deepgram-stream") {
+    wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
+  } else {
+    wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
+  }
+  ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString());
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    const statusMsg =
+      liveWsMode === "deepgram-stream"
+        ? enableVisibleLivePreview
+          ? "Recording. Deepgram live streaming is active."
+          : "Recording. Deepgram live stream is committing segments in the background."
+        : enableVisibleLivePreview
+          ? selectedEffectiveProvider === "local"
+            ? "Recording with live preview enabled."
+            : "Recording with live preview enabled. Local assist is canonical for fast stop."
+          : "Recording. Background local assist is active for fast stop finalization.";
+    patchCurrentRecordingSummary({ status: statusMsg, tone: "info" }, sessionUiToken);
+  };
+  ws.onerror = (ev) => {
+    console.warn("live ws transport error", ev);
+  };
+  ws.onclose = (ev) => {
+    // A clean close (1000/1005) after finalize is expected. An unclean
+    // close before finalize means the stream died; release any pending
+    // waiters for THIS session with a synthetic error envelope so
+    // stopLive doesn't hang on waitForLiveFinalEnvelope.
+    const slot = liveFinalSlots.get(sessionUiToken);
+    if (!slot) return;
+    if (slot.envelope) return;
+    if (slot.waiters.length === 0) return;
+    if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
+    console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
+    resolveLiveFinal(sessionUiToken, {
+      text: "",
+      segments: [],
+      durationSec: 0,
+      source: liveWsMode,
+      error: `live stream closed unexpectedly (code=${ev.code})`,
+    });
+  };
+  ws.onmessage = (ev: MessageEvent<string>) => {
+    const msg = parseLiveWsMessage(ev.data);
+    if (!msg) return;
+    switch (msg.type) {
+      case "error": {
+        liveStreamError = msg.error;
+        console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
         if (shouldLivePreview()) {
-          setLiveDraftState(liveDraftText, `${liveDraftDisplayText}${liveDraftDisplayText ? "\n" : ""}[${String(msg.error ?? "error")}]`);
+          setLiveInterimText(`[${msg.error}]`);
+        }
+        if (msg.fatal) {
+          patchCurrentRecordingSummary(
+            {
+              status: `Live stream error: ${msg.error}`,
+              tone: "error",
+            },
+            sessionUiToken
+          );
         }
         return;
       }
-      if (msg.type === "segments" && Array.isArray(msg.segments)) {
+      case "segments": {
         appendLiveTranscriptSegments(msg.segments);
         if (liveDraftText) {
           persistLiveDraft(true);
         }
+        return;
       }
-    };
-  } else {
-    setStatusScoped(sessionUiToken, "Recording");
-    patchCurrentRecordingSummary({ status: "Recording. Audio is being captured locally.", tone: "info" }, sessionUiToken);
-  }
+      case "interim": {
+        setLiveInterimText(msg.segment.text);
+        return;
+      }
+      case "final": {
+        const envelope: LiveFinalEnvelope = {
+          text: normalizeTranscriptWhitespace(msg.text),
+          segments: msg.segments,
+          durationSec: msg.durationSec,
+          source: msg.source || liveWsMode,
+        };
+        if (msg.error) envelope.error = msg.error;
+        resolveLiveFinal(sessionUiToken, envelope);
+        return;
+      }
+    }
+  };
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -3597,7 +3896,9 @@ async function startLive(): Promise<void> {
     if (ac.state !== "running") {
       try {
         await ac.resume();
-      } catch { }
+      } catch (e) {
+        console.debug("AudioContext resume rejected (non-fatal)", e);
+      }
     }
     recordedWebmChunks = [];
     try {
@@ -3697,55 +3998,10 @@ async function startLive(): Promise<void> {
             setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
           }
         }
-      } catch { }
-    }, UI_TOKENS.capture.fallbackInitDelayMs);
-    
-    if (chunkSubmitTimer) {
-      clearInterval(chunkSubmitTimer);
-    }
-    let chunkInFlight = false;
-    chunkAbortController = new AbortController();
-    chunkSubmitTimer = window.setInterval(async () => {
-      if (!isRecording || captureSampleCount < UI_TOKENS.capture.tailMinSamples) return;
-      if (chunkInFlight) return; // Don't stack concurrent API calls
-      const sessionSnapshot = activeLiveSessionSnapshot;
-      const provider = sessionSnapshot?.effectiveProvider || "local";
-      if (!shouldLivePreview()) {
-        setRemoteLivePreviewText("");
-        return;
-      }
-      if (provider === "local" || !isProviderKeyConfigured(provider)) return;
-      const newSamples = captureSampleCount - lastRemotePreviewSubmittedSamples;
-      if (newSamples < UI_TOKENS.capture.chunkMinNewSamples) return;
-      const previewTail = getCapturedTailSamples(AUDIO_TOKENS.liveSampleRateHz * 12);
-      if (previewTail.length < UI_TOKENS.capture.tailMinSamples) return;
-      const file = createCompactWavFileFromSamples(previewTail, AUDIO_TOKENS.liveSampleRateHz, `live-snap-${Date.now()}.wav`);
-      const requestSeq = ++remotePreviewRequestSeq;
-
-      chunkInFlight = true;
-      try {
-        const out = await remoteJobSyncWithFallback(file, {
-          provider,
-          language: sessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
-          diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-          openrouterModel:
-            provider === "openrouter"
-              ? (sessionSnapshot?.model || getRemoteModelValue(provider))
-              : getRemoteModelValue(provider),
-          signal: chunkAbortController?.signal,
-        });
-        if (isRecording && requestSeq === remotePreviewRequestSeq && out && out.text) {
-          appendRemoteLivePreviewText(out.text);
-        }
-        lastRemotePreviewSubmittedSamples = captureSampleCount;
       } catch (e) {
-        if (!(e instanceof DOMException && e.name === "AbortError")) {
-          console.warn("Chunk upload failed", e);
-        }
-      } finally {
-        chunkInFlight = false;
+        console.warn("ScriptProcessor fallback init failed", e);
       }
-    }, UI_TOKENS.capture.chunkIntervalMs);
+    }, UI_TOKENS.capture.fallbackInitDelayMs);
 
   } catch (e) {
     liveStartAbortReason = micErrorTag(e) || (e as Error).message || "Unable to start recording.";
@@ -3757,7 +4013,6 @@ async function startLive(): Promise<void> {
       tone: "error",
     }, sessionUiToken);
     await stopLive(false);
-    setStatusScoped(sessionUiToken, "Error");
   }
 }
 
@@ -3775,6 +4030,7 @@ async function waitForWorkletDrain(
 
 async function stopLive(enhance: boolean): Promise<void> {
   if (stopTransitionInFlight) return;
+  if (!isRecording) return;
   stopTransitionInFlight = true;
   const recordingId = currentRecordingId;
   const liveSessionId = activeLiveSessionId;
@@ -3820,21 +4076,37 @@ async function stopLive(enhance: boolean): Promise<void> {
     title: _smartTitle(sourceLiveText),
     status: "Finalizing recording and assembling the canonical audio file.",
     tone: "info",
-    provider: providerValue || "local",
-    model: modelValue,
-    language: languageValue,
-    durationSec: recordedSec,
-    transcriptChars: sourceLiveText.length,
-    transcriptWords: countWords(sourceLiveText),
   }, sessionUiToken);
 
+  await flushWorkletPort();
   await waitForWorkletDrain();
   await stopMediaRecorderAndFlush();
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
-  } catch { }
-  await flushWorkletPort();
-  await waitForWorkletDrain();
+  } catch (e) {
+    console.debug("MediaStream stop failed (non-fatal)", e);
+  }
+
+  // Tell the backend to finalize the upstream provider (Deepgram or local)
+  // BEFORE we close the socket. The backend will send a {type:"final", ...}
+  // envelope that we await below. This is what eliminates the double
+  // re-upload path — no need to re-submit the full audio because Deepgram
+  // has already finalized the stream. The awaited promise is keyed by
+  // session token so that if the user starts a new recording before this
+  // one finishes finalizing, we cannot accidentally read the new
+  // session's envelope.
+  let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
+  if (ws) {
+    const finalizeWaitMs = liveWsMode === "deepgram-stream" ? 8000 : 1500;
+    liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, finalizeWaitMs);
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "finalize" }));
+      } catch (e) {
+        console.warn("live ws finalize send failed", e);
+      }
+    }
+  }
 
   const mergedCapture = mergeCapturedChunks(chunks);
   const canonicalCapture = await selectCanonicalCapturedAudio({
@@ -3848,27 +4120,28 @@ async function stopLive(enhance: boolean): Promise<void> {
     transcribeInputFile = canonicalCapture.file;
   }
 
-  if (provider !== "local" && !!provider && enhance && transcribeInputFile && isProviderKeyConfigured(provider)) {
-    remoteApiPromise = remoteJobSyncWithFallback(transcribeInputFile, {
+  // Only OpenRouter needs a stop-time REST re-upload — it has no streaming
+  // API. Deepgram's final envelope is authoritative and already contains
+  // the complete transcript by the time it arrives. For Deepgram we only
+  // fall back to REST if the live stream failed outright (see below).
+  if (
+    provider === "openrouter" &&
+    enhance &&
+    transcribeInputFile &&
+    isProviderKeyConfigured(provider)
+  ) {
+    remoteApiPromise = remoteJobSync(transcribeInputFile, {
       provider,
       language: languageValue,
       diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-      openrouterModel: provider === "openrouter" ? modelValue : getRemoteModelValue(provider),
+      openrouterModel: modelValue,
     });
   }
 
-  // ── Cleanup (runs while API call is in flight) ──────────────────────────
+  // ── Cleanup (runs while provider is finalizing) ─────────────────────────
   if (timer) {
     clearInterval(timer);
     timer = null;
-  }
-  if (chunkSubmitTimer) {
-    clearInterval(chunkSubmitTimer);
-    chunkSubmitTimer = null;
-  }
-  if (chunkAbortController) {
-    chunkAbortController.abort();
-    chunkAbortController = null;
   }
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
@@ -3883,43 +4156,60 @@ async function stopLive(enhance: boolean): Promise<void> {
     clearTimeout(fallbackCaptureTimer);
     fallbackCaptureTimer = null;
   }
-  try {
+  // Web Audio node teardown. These ``disconnect()`` / ``close()`` calls
+  // throw InvalidStateError when a node was already disconnected in a
+  // previous error path. That is the only exception class expected here
+  // so silent catches are the correct semantics; anything else would be
+  // a programmer bug we want surfaced via an uncaught rejection instead.
+  const tearDown = (step: string, fn: () => void): void => {
+    try {
+      fn();
+    } catch (e) {
+      if (e instanceof DOMException) return;
+      console.warn(`live teardown step failed: ${step}`, e);
+    }
+  };
+  tearDown("workletNode.disconnect", () => {
     if (workletNode) {
       workletNode.disconnect();
       workletNode.port.onmessage = null;
     }
-  } catch { }
-  try {
+  });
+  tearDown("scriptNode.disconnect", () => {
     if (scriptNode) {
       scriptNode.disconnect();
       scriptNode.onaudioprocess = null;
     }
-  } catch { }
-  try {
+  });
+  tearDown("scriptSinkGain.disconnect", () => {
     if (scriptSinkGain) scriptSinkGain.disconnect();
-  } catch { }
-  try {
+  });
+  tearDown("analyser.disconnect", () => {
     if (analyser) analyser.disconnect();
-  } catch { }
-  try {
+  });
+  tearDown("src.disconnect", () => {
     if (src) src.disconnect();
-  } catch { }
-  try {
+  });
+  tearDown("stream.getTracks.stop", () => {
     if (stream) stream.getTracks().forEach((t) => t.stop());
-  } catch { }
+  });
   stream = null;
-  try {
-    if (ac) ac.close().catch(() => { });
-  } catch { }
+  tearDown("ac.close", () => {
+    if (ac) {
+      ac.close().catch((e) => {
+        console.debug("AudioContext close rejected (harmless)", e);
+      });
+    }
+  });
   ac = null;
   workletNode = null;
   scriptNode = null;
   scriptSinkGain = null;
   src = null;
   analyser = null;
-  try {
+  tearDown("ws.close", () => {
     if (ws) ws.close();
-  } catch { }
+  });
   ws = null;
   mediaRecorder = null;
   recordedWebmChunks = [];
@@ -3943,7 +4233,6 @@ async function stopLive(enhance: boolean): Promise<void> {
 
   if (savedAudioFile) {
     setCurrentRecordingAudio(savedAudioFile, "", sessionArchiveDir, sessionUiToken);
-    patchCurrentRecordingSummary({ audioBytes: savedAudioFile.size }, sessionUiToken);
   }
 
   let persistedRecordingName = "";
@@ -4003,9 +4292,6 @@ async function stopLive(enhance: boolean): Promise<void> {
       title: provisionalTitle,
       status: startupAbortReason,
       tone: "error",
-      durationSec: 0,
-      transcriptChars: 0,
-      transcriptWords: 0,
     }, sessionUiToken);
     return;
   }
@@ -4037,8 +4323,6 @@ async function stopLive(enhance: boolean): Promise<void> {
           title: provisionalTitle,
           status: "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
           tone: "warning",
-          transcriptChars: "[ Silence ]".length,
-          transcriptWords: 1,
         }, sessionUiToken);
       }
     }
@@ -4049,8 +4333,6 @@ async function stopLive(enhance: boolean): Promise<void> {
       title: provisionalTitle,
       status: "Silence detected. Audio remains available for review.",
       tone: "success",
-      transcriptChars: "[ Silence ]".length,
-      transcriptWords: 1,
     }, sessionUiToken);
     return;
   }
@@ -4221,6 +4503,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     let transcriptRaw = "";
     let transcriptForPaste = "";
     let finalSaveConflict = false;
+
     if (provider === "local") {
       if (isCurrentUiSession(sessionUiToken)) {
         $("progressFill").style.width = "35%";
@@ -4228,40 +4511,97 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
       const syncOut = await runLocalFinalPass();
       transcriptRaw = String(syncOut.text || "").trim();
-      publishRecordingFinalSignal({
-        recordingId,
-        signalText: "",
-        domText: transcriptRaw,
-        kind: "status",
-        sessionToken: sessionUiToken,
-      });
+    } else if (provider === "deepgram") {
+      // Deepgram streamed the full transcript in real time. We only need
+      // to await the final envelope that the backend dispatches after
+      // we sent {type:"finalize"} above. No file re-upload, no extra
+      // billing, no 10-second stall.
       if (isCurrentUiSession(sessionUiToken)) {
-        $("progressFill").style.width = "100%";
-        $("progressText").textContent = "100%";
-        $("progressRow").hidden = true;
+        $("progressFill").style.width = "80%";
+        $("progressText").textContent = "80%";
       }
-      setStatusScoped(sessionUiToken, "Done");
+      setStatusScoped(sessionUiToken, "Finalizing live stream");
+      patchCurrentRecordingSummary({
+        title: provisionalTitle,
+        status: "Waiting for Deepgram to flush the final segments.",
+        tone: "info",
+      }, sessionUiToken);
+      const envelope = liveFinalPromise ? await liveFinalPromise : null;
+      const envelopeError = envelope?.error || liveStreamError || "";
+
+      if (envelope && envelope.text && !envelopeError) {
+        transcriptRaw = envelope.text.trim();
+      } else if (envelope && envelope.segments.length && !envelopeError) {
+        transcriptRaw = joinTranscriptSegments(envelope.segments);
+      }
+
+      if (!transcriptRaw) {
+        // Live stream ran into trouble (connect fail, mid-stream drop,
+        // empty transcript, timeout). Try Deepgram REST on the saved
+        // canonical audio — it's the same service and gives us the
+        // same quality without any streaming-state coupling.
+        if (transcribeInputFile && isProviderKeyConfigured("deepgram")) {
+          const restStatus = envelopeError
+            ? `Live stream issue (${envelopeError}). Falling back to Deepgram REST on the saved audio.`
+            : "Live stream returned no transcript. Falling back to Deepgram REST on the saved audio.";
+          patchCurrentRecordingSummary({
+            title: provisionalTitle,
+            status: restStatus,
+            tone: "warning",
+          }, sessionUiToken);
+          try {
+            const fallback = await remoteJobSync(transcribeInputFile, {
+              provider: "deepgram",
+              language: languageValue,
+              diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+              openrouterModel: getRemoteModelValue("deepgram"),
+            });
+            transcriptRaw = String(fallback.text || "").trim();
+          } catch (e) {
+            console.warn("Deepgram REST fallback failed; using local full-audio pass", e);
+            patchCurrentRecordingSummary({
+              title: provisionalTitle,
+              status: "Deepgram REST fallback failed. Transcribing locally from the saved audio.",
+              tone: "warning",
+            }, sessionUiToken);
+            try {
+              const fallbackOut = await runLocalFinalPass();
+              transcriptRaw = String(fallbackOut.text || "").trim();
+            } catch (localError) {
+              console.error("Local fallback also failed", localError);
+            }
+          }
+        }
+      }
+
+      // Last resort: whatever the local assist did capture during the
+      // session. For Deepgram mode there is no local assist (the WS
+      // ran deepgram proxy), so this is typically empty — but kept
+      // defensively so the user never sees a blank transcript.
+      if (!transcriptRaw) {
+        const committed = getCanonicalLiveSourceText();
+        if (committed) transcriptRaw = committed;
+      }
     } else {
-      const previewDraft = remoteLivePreviewText.trim() || liveDraftDisplayText.trim() || sourceLiveText;
-      if (previewDraft) {
-        setStatusScoped(sessionUiToken, "Transcribing");
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "Live preview stays separate while the full-audio transcript is being finalized.",
-          tone: "info",
-        }, sessionUiToken);
-      }
+      // OpenRouter (or any future non-streaming remote): the REST promise
+      // started during the cleanup phase is the authoritative path.
       if (isCurrentUiSession(sessionUiToken)) {
         $("progressFill").style.width = "50%";
         $("progressText").textContent = "50%";
       }
+      const previewDraft = liveDraftDisplayText.trim() || sourceLiveText;
+      if (previewDraft) {
+        setStatusScoped(sessionUiToken, "Transcribing");
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "Live preview stays visible while the full-audio transcript is being finalized.",
+          tone: "info",
+        }, sessionUiToken);
+      }
       if (remoteApiPromise) {
         try {
           const syncOut = await remoteApiPromise;
-          const finalText = String(syncOut.text || "").trim();
-          if (finalText) {
-            transcriptRaw = finalText;
-          }
+          transcriptRaw = String(syncOut.text || "").trim();
         } catch (e) {
           console.warn("Remote final transcription failed, falling back to local full-audio pass:", e);
           patchCurrentRecordingSummary({
@@ -4285,20 +4625,21 @@ async function stopLive(enhance: boolean): Promise<void> {
       if (!transcriptRaw && previewDraft) {
         transcriptRaw = previewDraft;
       }
-      publishRecordingFinalSignal({
-        recordingId,
-        signalText: "",
-        domText: transcriptRaw,
-        kind: "status",
-        sessionToken: sessionUiToken,
-      });
-      if (isCurrentUiSession(sessionUiToken)) {
-        $("progressFill").style.width = "100%";
-        $("progressText").textContent = "100%";
-        $("progressRow").hidden = true;
-      }
-      setStatusScoped(sessionUiToken, "Done");
     }
+
+    publishRecordingFinalSignal({
+      recordingId,
+      signalText: "",
+      domText: transcriptRaw,
+      kind: "status",
+      sessionToken: sessionUiToken,
+    });
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("progressFill").style.width = "100%";
+      $("progressText").textContent = "100%";
+      $("progressRow").hidden = true;
+    }
+    setStatusScoped(sessionUiToken, "Done");
     let pasteReadyText = "";
     if (transcriptRaw) {
       transcriptForPaste = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
@@ -4333,14 +4674,11 @@ async function stopLive(enhance: boolean): Promise<void> {
           title,
           status: "Transcript finished, but the original archive changed before final save. The session was not recreated in a different archive.",
           tone: "warning",
-          transcriptChars: transcriptRaw.length,
-          transcriptWords: countWords(transcriptRaw),
         }, sessionUiToken);
       }
     }
     const latencyMs = performance.now() - transcribeStartedAt;
     if (isCurrentUiSession(sessionUiToken)) {
-      $("transcribeLatency").textContent = fmtMs(latencyMs);
     }
     patchCurrentRecordingSummary({
       title,
@@ -4350,8 +4688,6 @@ async function stopLive(enhance: boolean): Promise<void> {
           ? "Final transcript is ready. Audio and transcript are both available."
           : "Transcription completed, but no spoken words were detected.",
       tone: finalSaveConflict ? "warning" : "success",
-      transcriptChars: transcriptRaw.length,
-      transcriptWords: countWords(transcriptRaw),
       transcribeLatencyMs: latencyMs,
       ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
     }, sessionUiToken);
@@ -4395,7 +4731,6 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     const latencyMs = performance.now() - transcribeStartedAt;
     if (isCurrentUiSession(sessionUiToken)) {
-      $("transcribeLatency").textContent = fmtMs(latencyMs);
     }
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -4412,12 +4747,23 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
 }
 
+function reportFileSelectionError(message: string): void {
+  selectedFile = null;
+  $("fileName").textContent = "No file selected";
+  publishRecordingOutput({
+    recordingId: 0,
+    pasteText: "",
+    domText: message,
+    kind: "error",
+  });
+  patchCurrentRecordingSummary({ status: message, tone: "error" });
+}
+
 function setSelectedFile(file: File | null): void {
   if (file && file.size > MAX_FILE_BYTES) {
-    selectedFile = null;
-    $("fileName").textContent = "No file selected";
-    $("finalOutput").textContent = `File is too large. Max ${Math.round(MAX_FILE_BYTES / (1024 * 1024))} MB.`;
-    setStatus("Error");
+    reportFileSelectionError(
+      `File is too large. Max ${Math.round(MAX_FILE_BYTES / (1024 * 1024))} MB.`
+    );
     return;
   }
   if (file) {
@@ -4425,10 +4771,9 @@ function setSelectedFile(file: File | null): void {
     const mimeOk = !file.type || ALLOWED_AUDIO_MIME.has(file.type);
     const extOk = !!ext && ALLOWED_AUDIO_EXT.has(ext);
     if (!mimeOk && !extOk) {
-      selectedFile = null;
-      $("fileName").textContent = "No file selected";
-      $("finalOutput").textContent = "Unsupported audio format. Allowed: WAV, MP3, M4A, FLAC, OGG, AAC, MP4, WEBM.";
-      setStatus("Error");
+      reportFileSelectionError(
+        "Unsupported audio format. Allowed: WAV, MP3, M4A, FLAC, OGG, AAC, MP4, WEBM."
+      );
       return;
     }
   }
@@ -4439,8 +4784,13 @@ function setSelectedFile(file: File | null): void {
 async function transcribeSelectedFile(): Promise<void> {
   if (isBusy) return;
   if (!selectedFile) {
-    $("finalOutput").textContent = "Please choose an audio file first.";
-    setStatus("Error");
+    publishRecordingOutput({
+      recordingId: 0,
+      pasteText: "",
+      domText: "Please choose an audio file first.",
+      kind: "error",
+    });
+    patchCurrentRecordingSummary({ status: "Please choose an audio file first.", tone: "error" });
     return;
   }
 
@@ -4455,10 +4805,6 @@ async function transcribeSelectedFile(): Promise<void> {
     title: selectedFile.name || "Selected audio file",
     status: "Preparing file transcription.",
     tone: "info",
-    provider,
-    model: modelValue,
-    language: (($("language") as HTMLSelectElement).value || "auto").trim(),
-    audioBytes: selectedFile.size,
   }, sessionUiToken);
   if (selectedProvider !== provider) {
     setStatusScoped(sessionUiToken, "Processing (Offline Local)");
@@ -4469,9 +4815,14 @@ async function transcribeSelectedFile(): Promise<void> {
     const msg = providerKeyErrorMessage(provider);
     if (isCurrentUiSession(sessionUiToken)) {
       $("progressRow").hidden = true;
-      $("finalOutput").textContent = msg;
     }
-    setStatusScoped(sessionUiToken, "Error");
+    publishRecordingOutput({
+      recordingId: 0,
+      pasteText: "",
+      domText: msg,
+      kind: "error",
+      sessionToken: sessionUiToken,
+    });
     patchCurrentRecordingSummary({
       status: msg,
       tone: "error",
@@ -4532,18 +4883,15 @@ async function transcribeSelectedFile(): Promise<void> {
       }
       const latencyMs = performance.now() - transcribeStartedAt;
       if (isCurrentUiSession(sessionUiToken)) {
-        $("transcribeLatency").textContent = fmtMs(latencyMs);
       }
       patchCurrentRecordingSummary({
         status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
         tone: "success",
-        transcriptChars: transcriptRaw.length,
-        transcriptWords: countWords(transcriptRaw),
         transcribeLatencyMs: latencyMs,
       }, sessionUiToken);
       return;
     } else {
-      const syncOut = await remoteJobSyncWithFallback(selectedFile, {
+      const syncOut = await remoteJobSync(selectedFile, {
         provider,
         language: ($("language") as HTMLSelectElement).value,
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,
@@ -4576,13 +4924,10 @@ async function transcribeSelectedFile(): Promise<void> {
       }
       const latencyMs = performance.now() - transcribeStartedAt;
       if (isCurrentUiSession(sessionUiToken)) {
-        $("transcribeLatency").textContent = fmtMs(latencyMs);
       }
       patchCurrentRecordingSummary({
         status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
         tone: "success",
-        transcriptChars: transcriptRaw.length,
-        transcriptWords: countWords(transcriptRaw),
         transcribeLatencyMs: latencyMs,
       }, sessionUiToken);
       return;
@@ -4599,7 +4944,6 @@ async function transcribeSelectedFile(): Promise<void> {
     });
     if (isCurrentUiSession(sessionUiToken)) {
       $("progressRow").hidden = true;
-      $("transcribeLatency").textContent = fmtMs(performance.now() - transcribeStartedAt);
     }
     setStatusScoped(sessionUiToken, "Error");
     patchCurrentRecordingSummary({
@@ -4835,7 +5179,6 @@ function gExtractKeywordsFromTitle(title: string): string[] {
 async function loadGraphData(): Promise<void> {
   try {
     $("graphContainer").setAttribute("aria-busy", "true");
-    setGraphStatus("Refreshing graph…", "info");
     let items: Array<{ name: string; display_name: string; provider: string; keywords: string[] }> = [];
     try {
       const r = await apiGet<{ nodes: Array<{ name: string; display_name: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
@@ -4859,11 +5202,6 @@ async function loadGraphData(): Promise<void> {
       r: Math.max(3, Math.min(10, 3 + Math.sqrt(Math.max((it.keywords || []).length, 1)) * 1.5)),
     }));
     $("graphInfoText").textContent = `${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}`;
-    syncGraphHeaderSummary();
-    setGraphStatus(
-      gNodes.length ? `Graph is ready · ${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}` : "Graph is ready. No recordings yet.",
-      gNodes.length ? "success" : "warning"
-    );
     if (gNodes.length === 0) { gRender(); return; }
 
     gClusterLayout();
@@ -4873,8 +5211,6 @@ async function loadGraphData(): Promise<void> {
   } catch (e) {
     $("graphInfoText").textContent = "Error: " + (e as Error).message;
     gNodes = [];
-    syncGraphHeaderSummary();
-    setGraphStatus("Graph failed to load.", "error");
   } finally {
     $("graphContainer").setAttribute("aria-busy", "false");
   }
@@ -5125,15 +5461,6 @@ void loadCfg()
   .catch(() => { });
 initQuickControls();
 syncRemoteModelOptions();
-syncWindowViewMeta("record");
-syncPaneContexts();
-setArchiveStatus("Archive is initializing…", "info");
-setSettingsSaveStatus("All settings are saved locally.", "neutral");
-setGraphStatus("Graph is ready.", "neutral");
-syncRecordingsHeaderSummary();
-syncSettingsHeaderSummary();
-syncSettingsCardSummaries();
-syncGraphHeaderSummary();
 void refreshNetworkState();
 window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());

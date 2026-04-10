@@ -891,6 +891,12 @@ textarea:focus-visible,
   align-items: center;
   padding-top: 8px;
   padding-bottom: 8px;
+  /* The bottom row used to hold ``pane-context`` on the left and
+     ``pane-actions`` on the right. After the context strip was removed
+     in the UI simplification commit, only actions remain. The inherited
+     ``justify-content: space-between`` would push a lone child to the
+     LEFT edge, which is wrong — controls should still be right-aligned. */
+  justify-content: flex-end;
 }
 
 .pane-context {

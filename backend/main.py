@@ -40,6 +40,11 @@ from backend.remote_openrouter import RemoteError as OrRemoteError
 from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
 from backend.remote_deepgram import RemoteError as DgRemoteError
 from backend.remote_deepgram import deepgram_transcribe
+from backend.remote_deepgram_live import (
+    DeepgramLiveConfig,
+    DeepgramLiveError,
+    DeepgramLiveSession,
+)
 from backend.transcribe import merge_channel_transcripts, transcribe_file, warm_model, warm_state
 
 
@@ -166,8 +171,10 @@ def _load_or_create_api_token() -> str:
     API_TOKEN_PATH.write_text(token, encoding="utf-8")
     try:
         os.chmod(API_TOKEN_PATH, 0o600)
-    except Exception:
-        pass
+    except OSError as e:
+        # Non-POSIX filesystems (Windows) or read-only mounts: the token
+        # file will still exist with default permissions.
+        logger.debug("api token chmod skipped: %s", e)
     return token
 
 
@@ -242,8 +249,8 @@ def _cleanup_expired_files() -> None:
                     continue
                 if p.stat().st_mtime < cutoff:
                     p.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("cleanup skipped for %s: %s", p, e)
 
 
 def _cleanup_live_recovery_files() -> None:
@@ -261,8 +268,8 @@ def _cleanup_live_recovery_files() -> None:
                 continue
             if p.stat().st_mtime < cutoff:
                 p.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug("live recovery cleanup skipped for %s: %s", p, e)
 
 
 def _normalize_live_session_id(value: str) -> str:
@@ -384,14 +391,28 @@ if frontend_assets_dir.exists():
     app.mount("/assets", StaticFiles(directory=str(frontend_assets_dir)), name="assets")
 
 
+# Cache-control policy:
+#   /           → no-store (HTML entry changes on every rebuild; clients must
+#                 always fetch the latest bundle hashes).
+#   /assets/*   → immutable, 1 year (Vite emits hashed filenames).
+#   /api/*      → no caching headers (let FastAPI responses decide).
+_INDEX_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+_ASSETS_CACHE_HEADERS = {
+    "Cache-Control": "public, max-age=31536000, immutable",
+}
+
+
 @app.middleware("http")
 async def add_frontend_cache_control(request: Request, call_next):
     response = await call_next(request)
     path = request.url.path or ""
-    if path == "/" or path.startswith("/assets/"):
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
+    if path.startswith("/assets/"):
+        for k, v in _ASSETS_CACHE_HEADERS.items():
+            response.headers[k] = v
     return response
 
 
@@ -410,14 +431,7 @@ def index():
         html = html.replace("</body>", injected + "</body>")
     else:
         html = html + injected
-    return HTMLResponse(
-        html,
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
+    return HTMLResponse(html, headers=_INDEX_CACHE_HEADERS)
 
 
 @app.get("/api/health")
@@ -576,8 +590,8 @@ def _run_local_transcribe_once(
             return
         try:
             progress_cb(value)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("progress callback raised: %s", e)
 
     try:
         if split_stereo:
@@ -614,8 +628,8 @@ def _run_local_transcribe_once(
         for p in temp_paths:
             try:
                 os.remove(p)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("temp file removal skipped for %s: %s", p, e)
 
 
 def _validate_config_payload(payload: dict) -> None:
@@ -692,14 +706,14 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                         dst = default_dir / txt.name
                         if not dst.exists():
                             dst.write_bytes(txt.read_bytes())
-            except Exception:
-                pass
+            except OSError as e:
+                logger.warning("volatile recordings migration failed: %s", e)
             try:
                 prefs["recordings_dir"] = ""
                 cfg["preferences"] = prefs
                 save_config(cfg)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.warning("volatile config reset failed: %s", e)
             _rec_dir_cache = default_dir
             _rec_dir_cache_at = now
             return default_dir
@@ -1065,7 +1079,27 @@ def _resolve_upscale_preset(preset_id: str) -> dict[str, Any]:
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket):
-    _cleanup_live_recovery_files()
+    """Provider-aware live transcription WebSocket.
+
+    Protocol (client → server):
+        - Binary PCM16LE mono frames at the configured sample rate.
+        - Text JSON control messages, e.g. ``{"type": "finalize"}`` which
+          flushes the upstream session and causes the server to emit a
+          canonical ``{"type": "final", ...}`` event before closing.
+
+    Protocol (server → client):
+        - ``{"type": "segments", "segments": [...], "is_final": bool}`` —
+          a committed chunk of transcript ready to merge into the SSOT.
+        - ``{"type": "interim", "segment": {...}}`` — (Deepgram only) a
+          non-committed partial hypothesis for the tail of the stream.
+        - ``{"type": "final", "text": str, "segments": [...],
+             "durationSec": float}`` — the canonical transcript at end
+          of session.
+        - ``{"type": "error", "error": str}`` — unrecoverable failure.
+    """
+    # Kick the recovery cleanup off the event loop — the websocket
+    # handshake must not wait for a directory scan on slow filesystems.
+    asyncio.get_running_loop().run_in_executor(None, _cleanup_live_recovery_files)
     token = (websocket.query_params.get("token") or "").strip()
     if token != API_TOKEN:
         await websocket.close(code=4401, reason="unauthorized")
@@ -1077,144 +1111,481 @@ async def ws_transcribe(websocket: WebSocket):
     await websocket.accept()
 
     qp = websocket.query_params
-    model = (qp.get("model") or "small").strip() or "small"
+    provider = _normalize_live_provider(qp.get("provider"))
+    model = (qp.get("model") or "").strip()
     language = (qp.get("language") or "auto").strip()
     lang_opt: Optional[str] = None if language in ("", "auto", "Auto") else language
     session_id = _normalize_live_session_id(qp.get("session_id") or "")
     archive_dir = str(qp.get("archive_dir") or "").strip()
+    diarize = str(qp.get("diarize") or "").strip().lower() in ("1", "true", "yes", "on")
 
-    session = LiveSession(model_name=model, language=lang_opt)
-    stop = asyncio.Event()
     started_at = datetime.now()
-    recovery_pcm_path = LIVE_RECOVERY_DIR / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}.pcm16"
-    recovery_meta_path = LIVE_RECOVERY_DIR / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}.json"
-    recovery_file = recovery_pcm_path.open("wb")
-    recovery_meta_path.write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "started_at": started_at.isoformat(),
-                "finished_at": "",
-                "sample_rate": 16000,
-                "format": "pcm16le_mono",
-                "bytes": 0,
-                "chunks": 0,
-                "model": model,
-                "language": lang_opt or "auto",
-                "archive_dir": archive_dir,
-                "status": "recording",
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    recovery_ctx = _open_live_recovery(
+        session_id=session_id,
+        started_at=started_at,
+        provider=provider,
+        model=model or ("nova-3" if provider == "deepgram" else "small"),
+        language=lang_opt or "auto",
+        archive_dir=archive_dir,
     )
 
-    chunk_count = 0
-    byte_count = 0
-    had_error = False
+    try:
+        if provider == "deepgram":
+            dg_cfg = load_config()
+            dg_key = (((dg_cfg.get("providers") or {}).get("deepgram") or {}).get("key") or "").strip()
+            if not dg_key:
+                await _ws_send_json(
+                    websocket,
+                    {
+                        "type": "error",
+                        "error": "Deepgram API key is not configured",
+                        "fatal": True,
+                    },
+                )
+                await _ws_send_json(
+                    websocket,
+                    {
+                        "type": "final",
+                        "text": "",
+                        "segments": [],
+                        "durationSec": 0.0,
+                        "source": "deepgram-live",
+                        "error": "Deepgram API key is not configured",
+                    },
+                )
+                recovery_ctx["had_error"] = True
+                return
+            await _run_deepgram_live_session(
+                websocket=websocket,
+                api_key=dg_key,
+                model=model or "nova-3",
+                language=language,
+                diarize=diarize,
+                recovery=recovery_ctx,
+            )
+        else:
+            await _run_local_live_session(
+                websocket=websocket,
+                model=model or "small",
+                language=lang_opt,
+                recovery=recovery_ctx,
+            )
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        if not _is_broken_pipe_error(e):
+            recovery_ctx["had_error"] = True
+            logger.error("ws/transcribe fatal error: %s", e, exc_info=True)
+            await _ws_send_json(
+                websocket,
+                {"type": "error", "error": str(e), "fatal": True},
+            )
+        else:
+            logger.warning("ws/transcribe transient broken pipe: %s", e)
+    finally:
+        _finalize_live_recovery(recovery_ctx)
 
-    async def receiver():
-        nonlocal chunk_count, byte_count
+
+def _normalize_live_provider(raw: Optional[str]) -> str:
+    """Return the provider to use for a live WebSocket session.
+
+    Only providers with genuine streaming support (``deepgram``) take a
+    dedicated path; everything else runs the local ``LiveSession``
+    assist pipeline.
+    """
+    value = (raw or "").strip().lower()
+    if value == "deepgram":
+        return "deepgram"
+    return "local"
+
+
+def _open_live_recovery(
+    *,
+    session_id: str,
+    started_at: datetime,
+    provider: str,
+    model: str,
+    language: str,
+    archive_dir: str,
+) -> dict:
+    """Create a recovery PCM file + metadata for a live session."""
+    stem = f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}"
+    pcm_path = LIVE_RECOVERY_DIR / f"{stem}.pcm16"
+    meta_path = LIVE_RECOVERY_DIR / f"{stem}.json"
+    pcm_file = pcm_path.open("wb")
+    meta_payload = {
+        "session_id": session_id,
+        "started_at": started_at.isoformat(),
+        "finished_at": "",
+        "sample_rate": 16000,
+        "format": "pcm16le_mono",
+        "bytes": 0,
+        "chunks": 0,
+        "model": model,
+        "language": language,
+        "archive_dir": archive_dir,
+        "status": "recording",
+        "provider": provider,
+    }
+    meta_path.write_text(
+        json.dumps(meta_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "session_id": session_id,
+        "started_at": started_at,
+        "pcm_path": pcm_path,
+        "meta_path": meta_path,
+        "pcm_file": pcm_file,
+        "meta": meta_payload,
+        "bytes": 0,
+        "chunks": 0,
+        "had_error": False,
+    }
+
+
+def _record_recovery_chunk(recovery: dict, data: bytes) -> None:
+    recovery["chunks"] += 1
+    recovery["bytes"] += len(data)
+    try:
+        recovery["pcm_file"].write(data)
+    except OSError as e:
+        logger.warning("live recovery write failed: %s", e)
+
+
+def _finalize_live_recovery(recovery: dict) -> None:
+    try:
+        recovery["pcm_file"].flush()
+        recovery["pcm_file"].close()
+    except OSError as e:
+        logger.warning("live recovery close failed: %s", e)
+    try:
+        if recovery["bytes"] < 32000:  # ~1s at 16kHz mono pcm16
+            recovery["pcm_path"].unlink(missing_ok=True)
+            recovery["meta_path"].unlink(missing_ok=True)
+            return
+        meta = dict(recovery["meta"])
+        meta.update(
+            {
+                "finished_at": datetime.now().isoformat(),
+                "bytes": recovery["bytes"],
+                "chunks": recovery["chunks"],
+                "status": "error" if recovery["had_error"] else "recoverable",
+            }
+        )
+        recovery["meta_path"].write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        logger.warning("live recovery meta write failed: %s", e)
+
+
+async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
+    """Send a JSON payload on a WebSocket, swallowing harmless shutdown races.
+
+    Returns ``True`` on success. Logs transient broken-pipe errors and
+    returns ``False`` without raising so the caller can continue its
+    cleanup.
+    """
+    try:
+        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        return True
+    except Exception as e:
+        if _is_broken_pipe_error(e):
+            logger.debug("ws send skipped (pipe closed): %s", e)
+        else:
+            logger.warning("ws send failed: %s", e)
+        return False
+
+
+async def _ws_recv_next(websocket: WebSocket) -> dict:
+    """Receive the next WebSocket message as a normalized dict.
+
+    Returns ``{"kind": "bytes", "data": bytes}`` for binary frames,
+    ``{"kind": "control", "payload": dict}`` for JSON text frames
+    (e.g., ``{"type": "finalize"}``), ``{"kind": "text", "data": str}``
+    for text frames that fail to parse as JSON, or
+    ``{"kind": "disconnect"}`` when the client closed the socket.
+    """
+    try:
+        message = await websocket.receive()
+    except WebSocketDisconnect:
+        return {"kind": "disconnect"}
+    mtype = message.get("type")
+    if mtype == "websocket.disconnect":
+        return {"kind": "disconnect"}
+    if "bytes" in message and message["bytes"] is not None:
+        return {"kind": "bytes", "data": message["bytes"]}
+    text = message.get("text")
+    if text is None:
+        return {"kind": "disconnect"}
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return {"kind": "control", "payload": parsed}
+    except (ValueError, TypeError) as e:
+        logger.debug("ws recv: non-json text frame ignored: %s", e)
+    return {"kind": "text", "data": text}
+
+
+async def _run_local_live_session(
+    *,
+    websocket: WebSocket,
+    model: str,
+    language: Optional[str],
+    recovery: dict,
+) -> None:
+    """Drive the local faster-whisper assist pipeline for a live session."""
+    if model not in ALLOWED_LOCAL_MODELS:
+        model = "small"
+    session = LiveSession(model_name=model, language=language)
+    stop = asyncio.Event()
+
+    async def receiver() -> None:
         try:
             while not stop.is_set():
-                data = await websocket.receive_bytes()
-                chunk_count += 1
-                byte_count += len(data)
-                recovery_file.write(data)
-                await session.append_pcm16le(data)
-        except WebSocketDisconnect:
-            stop.set()
+                msg = await _ws_recv_next(websocket)
+                kind = msg["kind"]
+                if kind == "disconnect":
+                    stop.set()
+                    return
+                if kind == "bytes":
+                    data = msg["data"]
+                    _record_recovery_chunk(recovery, data)
+                    await session.append_pcm16le(data)
+                    continue
+                if kind == "control":
+                    if msg["payload"].get("type") == "finalize":
+                        stop.set()
+                        return
         except Exception as e:
-            nonlocal had_error
             if _is_broken_pipe_error(e):
-                logger.warning("ws receiver: transient broken pipe: %s", e)
-                stop.set()
-                return
-            had_error = True
-            logger.error("ws receiver error: %s", e, exc_info=True)
+                logger.warning("ws local receiver broken pipe: %s", e)
+            else:
+                recovery["had_error"] = True
+                logger.error("ws local receiver error: %s", e, exc_info=True)
             stop.set()
 
-    async def transcriber():
+    async def transcriber() -> None:
         try:
             while not stop.is_set():
                 out = await session.maybe_transcribe()
                 if out:
-                    await websocket.send_text(json.dumps(out, ensure_ascii=False))
-                await asyncio.sleep(0.2)
+                    if not await _ws_send_json(websocket, out):
+                        stop.set()
+                        return
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    pass
         except Exception as e:
-            nonlocal had_error
             if _is_broken_pipe_error(e):
-                logger.warning("ws transcriber: transient broken pipe: %s", e)
-                stop.set()
-                return
-            had_error = True
-            logger.error("ws transcriber error: %s", e, exc_info=True)
+                logger.warning("ws local transcriber broken pipe: %s", e)
+            else:
+                recovery["had_error"] = True
+                logger.error("ws local transcriber error: %s", e, exc_info=True)
             stop.set()
 
-    rx = asyncio.create_task(receiver())
-    tx = asyncio.create_task(transcriber())
+    rx = asyncio.create_task(receiver(), name="ws-local-rx")
+    tx = asyncio.create_task(transcriber(), name="ws-local-tx")
     try:
-        done, pending = await asyncio.wait(
-            {rx, tx}, return_when=asyncio.FIRST_EXCEPTION
-        )
-        for t in done:
-            exc = t.exception()
-            if exc:
-                raise exc
-    except WebSocketDisconnect:
-        stop.set()
-    except Exception as e:
-        if _is_broken_pipe_error(e):
-            logger.warning("ws: transient broken pipe: %s", e)
-            had_error = False
-            stop.set()
-        else:
-            had_error = True
-            stop.set()
-            try:
-                await websocket.send_text(
-                    json.dumps({"type": "error", "error": str(e)}, ensure_ascii=False)
-                )
-            except Exception:
-                pass
+        await asyncio.wait({rx, tx}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         stop.set()
-        for t in (rx, tx):
-            if not t.done():
-                t.cancel()
+        for task in (rx, tx):
+            if not task.done():
+                task.cancel()
+        for task in (rx, tx):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Best-effort final emit in case transcriber missed the tail
         try:
-            recovery_file.flush()
-            recovery_file.close()
-        except Exception:
-            pass
+            tail = await session.maybe_transcribe()
+            if tail:
+                await _ws_send_json(websocket, tail)
+        except Exception as e:
+            if not _is_broken_pipe_error(e):
+                logger.debug("ws local tail emit failed: %s", e)
+        await _ws_send_json(
+            websocket,
+            {
+                "type": "final",
+                "text": "",
+                "segments": [],
+                "durationSec": 0.0,
+                "source": "local-assist",
+            },
+        )
+
+
+async def _run_deepgram_live_session(
+    *,
+    websocket: WebSocket,
+    api_key: str,
+    model: str,
+    language: str,
+    diarize: bool,
+    recovery: dict,
+) -> None:
+    """Drive the Deepgram live streaming proxy for one recording.
+
+    On a hard Deepgram failure (connect error, mid-stream fatal error,
+    socket drop) we do NOT swallow the failure — we surface it to the
+    frontend via ``{"type":"error","fatal":true}`` and the subsequent
+    ``{"type":"final","error":...}``. The frontend then falls back to
+    the Deepgram REST endpoint on the saved canonical WAV. This gives
+    us two independent paths into Deepgram (WS + REST) without coupling
+    the server state machine to either one.
+    """
+    dg_cfg = DeepgramLiveConfig(
+        model=model or "nova-3",
+        language=language or "auto",
+        sample_rate=16000,
+        interim_results=True,
+        diarize=bool(diarize),
+    )
+    session = DeepgramLiveSession(api_key=api_key, config=dg_cfg)
+    try:
+        await session.connect()
+    except DeepgramLiveError as e:
+        logger.warning("ws deepgram connect failed: %s", e)
+        await _ws_send_json(
+            websocket,
+            {"type": "error", "error": str(e), "fatal": True},
+        )
+        await _ws_send_json(
+            websocket,
+            {
+                "type": "final",
+                "text": "",
+                "segments": [],
+                "durationSec": 0.0,
+                "source": "deepgram-live",
+                "error": str(e),
+            },
+        )
+        recovery["had_error"] = True
+        return
+
+    stop = asyncio.Event()
+    upstream_fatal = False
+
+    async def receiver() -> None:
         try:
-            if byte_count < 32000:  # ~1s at 16kHz mono pcm16
-                recovery_pcm_path.unlink(missing_ok=True)
-                recovery_meta_path.unlink(missing_ok=True)
+            while not stop.is_set():
+                msg = await _ws_recv_next(websocket)
+                kind = msg["kind"]
+                if kind == "disconnect":
+                    stop.set()
+                    return
+                if kind == "bytes":
+                    if session.is_closed:
+                        # Upstream already died; keep recording the
+                        # PCM locally so the REST fallback has the full
+                        # audio but don't waste cycles pushing it.
+                        _record_recovery_chunk(recovery, msg["data"])
+                        continue
+                    data = msg["data"]
+                    _record_recovery_chunk(recovery, data)
+                    await session.send_pcm(data)
+                    continue
+                if kind == "control":
+                    if msg["payload"].get("type") == "finalize":
+                        stop.set()
+                        return
+        except Exception as e:
+            if _is_broken_pipe_error(e):
+                logger.warning("ws deepgram receiver broken pipe: %s", e)
             else:
-                recovery_meta_path.write_text(
-                    json.dumps(
-                        {
-                            "session_id": session_id,
-                            "started_at": started_at.isoformat(),
-                            "finished_at": datetime.now().isoformat(),
-                            "sample_rate": 16000,
-                            "format": "pcm16le_mono",
-                            "bytes": byte_count,
-                            "chunks": chunk_count,
-                            "model": model,
-                            "language": lang_opt or "auto",
-                            "archive_dir": archive_dir,
-                            "status": "error" if had_error else "recoverable",
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-        except Exception:
+                recovery["had_error"] = True
+                logger.error("ws deepgram receiver error: %s", e, exc_info=True)
+            stop.set()
+
+    async def forwarder() -> None:
+        nonlocal upstream_fatal
+        try:
+            async for event in session.events():
+                if not await _ws_send_json(websocket, event):
+                    stop.set()
+                    return
+                if event.get("type") == "error":
+                    recovery["had_error"] = True
+                    if event.get("fatal"):
+                        upstream_fatal = True
+                        stop.set()
+                        return
+        except Exception as e:
+            if not _is_broken_pipe_error(e):
+                recovery["had_error"] = True
+                logger.error("ws deepgram forwarder error: %s", e, exc_info=True)
+            stop.set()
+
+    rx = asyncio.create_task(receiver(), name="ws-dg-rx")
+    fw = asyncio.create_task(forwarder(), name="ws-dg-fw")
+    try:
+        await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stop.set()
+        if not rx.done():
+            rx.cancel()
+        try:
+            await rx
+        except (asyncio.CancelledError, Exception):
             pass
+
+        final_payload: dict
+        finalize_error: Optional[str] = None
+        try:
+            drained = await session.finalize(wait_timeout=3.0)
+            final_payload = {
+                "type": "final",
+                "text": drained.get("text", ""),
+                "segments": drained.get("segments", []),
+                "durationSec": drained.get("durationSec", 0.0),
+                "source": "deepgram-live",
+                "stats": drained.get("stats"),
+            }
+        except Exception as e:
+            finalize_error = str(e)
+            recovery["had_error"] = True
+            logger.error("deepgram finalize failed: %s", e, exc_info=True)
+            final_payload = {
+                "type": "final",
+                "text": session.final_text(),
+                "segments": [],
+                "durationSec": 0.0,
+                "source": "deepgram-live",
+                "error": finalize_error,
+            }
+
+        if upstream_fatal and session.last_error:
+            final_payload["error"] = session.last_error
+
+        if not fw.done():
+            try:
+                await asyncio.wait_for(fw, timeout=0.25)
+            except asyncio.TimeoutError:
+                fw.cancel()
+                try:
+                    await fw
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        logger.info(
+            "ws deepgram session complete: bytes=%d chunks=%d final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s",
+            session.stats.bytes_sent,
+            session.stats.chunks_sent,
+            session.stats.segments_final,
+            session.stats.segments_interim,
+            f"{session.stats.connect_ms:.0f}" if session.stats.connect_ms else "?",
+            f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
+        )
+
+        await _ws_send_json(websocket, final_payload)
+        await session.close()
 
 
 @app.get("/api/live/recoveries")
@@ -1296,8 +1667,8 @@ async def create_job(
         finally:
             try:
                 os.remove(upload_path)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("upload cleanup skipped for %s: %s", upload_path, e)
 
     jobs.submit(run)
     return {"job_id": job_id}
@@ -1342,8 +1713,8 @@ async def transcribe_sync(
     finally:
         try:
             os.remove(upload_path)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug("sync upload cleanup skipped for %s: %s", upload_path, e)
 
 
 def _run_remote_transcribe_once(
@@ -1469,8 +1840,8 @@ async def create_remote_job(
         finally:
             try:
                 os.remove(upload_path)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("upload cleanup skipped for %s: %s", upload_path, e)
 
     jobs.submit(run)
     return {"job_id": job_id}
