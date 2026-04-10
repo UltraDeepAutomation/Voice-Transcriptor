@@ -264,6 +264,7 @@ declare global {
     __transcriptorLastUiFinalAt?: number;
     __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
+    __transcriptorPcmWindowRotated?: boolean;
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
@@ -364,16 +365,35 @@ const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
  * — audio models like ``gpt-4o-audio-preview`` accept audio input but
  * don't take the "text + instruction → text" shape that upscaling
  * needs. The first entry is the default selection on fresh installs.
+ *
+ * Each entry has an ``id`` (what OpenRouter expects on the wire) and
+ * a ``label`` (what we render in the dropdown). The label is kept
+ * short so the select doesn't force the upscale pane toolbar to wrap
+ * onto a second row.
  */
-const OPENROUTER_UPSCALE_MODELS = [
-  "google/gemini-2.5-flash",
-  "google/gemini-2.5-pro",
-  "openai/gpt-4o-mini",
-  "openai/gpt-4o",
-  "anthropic/claude-3.5-sonnet",
-  "anthropic/claude-haiku-4.5",
+interface UpscaleModelOption {
+  id: string;
+  label: string;
+}
+const OPENROUTER_UPSCALE_MODELS: UpscaleModelOption[] = [
+  { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+  { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  { id: "openai/gpt-4o-mini", label: "GPT-4o mini" },
+  { id: "openai/gpt-4o", label: "GPT-4o" },
+  { id: "anthropic/claude-3.5-sonnet", label: "Claude 3.5 Sonnet" },
+  { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5" },
 ];
-const DEFAULT_UPSCALE_MODEL = OPENROUTER_UPSCALE_MODELS[0];
+const DEFAULT_UPSCALE_MODEL = OPENROUTER_UPSCALE_MODELS[0].id;
+
+function labelForUpscaleModel(id: string): string {
+  const known = OPENROUTER_UPSCALE_MODELS.find((m) => m.id === id);
+  if (known) return known.label;
+  // Custom/unknown IDs: strip the vendor prefix and any ``-preview``
+  // suffix so long paths like ``openai/gpt-4.1-mini-preview`` don't
+  // blow out the dropdown width.
+  const short = id.split("/").pop() || id;
+  return short.replace(/-preview$/, "").trim() || id;
+}
 
 let isBusy = false;
 let isRecording = false;
@@ -1761,25 +1781,71 @@ function clearLiveDraft(): void {
   }
 }
 
+interface PersistedLiveDraft {
+  title?: string;
+  source_text?: string;
+  transcript_text?: string;
+  provider?: string;
+  model?: string;
+  language?: string;
+  archive_dir?: string;
+  updated_at?: number;
+}
+
+function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.warn("live draft: invalid JSON, discarding", e);
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.warn("live draft: top-level is not an object, discarding");
+    return null;
+  }
+  // Structural type guard: every field that we use is coerced to its
+  // expected type; anything unparseable degrades to empty string /
+  // zero. This is stricter than a bare ``as`` cast and guarantees
+  // downstream code never sees ``null`` / ``undefined`` / arrays /
+  // wrong types in fields we promise are strings.
+  const obj = parsed as Record<string, unknown>;
+  const pickString = (key: string): string => {
+    const v = obj[key];
+    return typeof v === "string" ? v : "";
+  };
+  const pickNumber = (key: string): number => {
+    const v = obj[key];
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+  return {
+    title: pickString("title"),
+    source_text: pickString("source_text"),
+    transcript_text: pickString("transcript_text"),
+    provider: pickString("provider"),
+    model: pickString("model"),
+    language: pickString("language"),
+    archive_dir: pickString("archive_dir"),
+    updated_at: pickNumber("updated_at"),
+  };
+}
+
 async function recoverLiveDraftIfAny(): Promise<void> {
   let raw = "";
   try {
     raw = localStorage.getItem(LIVE_DRAFT_KEY) || "";
-  } catch {
+  } catch (e) {
+    console.debug("live draft: localStorage read failed", e);
     return;
   }
   if (!raw) return;
+  const draft = parsePersistedLiveDraft(raw);
+  if (!draft) {
+    clearLiveDraft();
+    return;
+  }
   try {
-    const draft = JSON.parse(raw) as {
-      title?: string;
-      source_text?: string;
-      transcript_text?: string;
-      provider?: string;
-      model?: string;
-      language?: string;
-      archive_dir?: string;
-      updated_at?: number;
-    };
     const sourceText = String(draft.source_text || "").trim();
     const transcriptText = String(draft.transcript_text || "").trim();
     if (!sourceText && !transcriptText) {
@@ -2029,7 +2095,19 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
       sel.appendChild(o);
     });
   }
-  const next = upscalePresets.some((x) => x.id === prev) ? prev : (upscalePresets[0]?.id || "builtin_clean");
+  // Default selection strategy when the user hasn't saved a preference yet:
+  //   1. Honour explicitly-requested preferredId / pendingUpscalePresetId
+  //   2. Prefer the "Clean" builtin — it's the safest, most neutral style
+  //   3. Fall back to the first preset in the list
+  //   4. Hard-code "builtin_clean" if even the list is empty
+  let next: string;
+  if (prev && upscalePresets.some((x) => x.id === prev)) {
+    next = prev;
+  } else if (upscalePresets.some((x) => x.id === "builtin_clean")) {
+    next = "builtin_clean";
+  } else {
+    next = upscalePresets[0]?.id || "builtin_clean";
+  }
   sel.value = next;
   pendingUpscalePresetId = "";
   const addBtn = $("upscalePresetAddBtn") as HTMLButtonElement;
@@ -2078,20 +2156,36 @@ function populateUpscaleModelOptions(): void {
   const sel = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
   if (!sel) return;
   const preferred = (sel.value || "").trim() || DEFAULT_UPSCALE_MODEL;
+  const ids = new Set<string>(OPENROUTER_UPSCALE_MODELS.map((m) => m.id));
   // Keep any user-added custom model by merging it into the list.
-  const models = new Set<string>(OPENROUTER_UPSCALE_MODELS);
-  if (preferred) models.add(preferred);
+  if (preferred) ids.add(preferred);
   sel.innerHTML = "";
-  for (const model of models) {
+  for (const id of ids) {
     const opt = document.createElement("option");
-    opt.value = model;
-    opt.textContent = model;
+    opt.value = id;
+    opt.textContent = labelForUpscaleModel(id);
+    // Keep the full id in the title attribute for hover — the short
+    // label in the dropdown is for layout, not for hiding the source
+    // model.
+    opt.title = id;
     sel.appendChild(opt);
   }
-  sel.value = OPENROUTER_UPSCALE_MODELS.includes(preferred) || models.has(preferred)
-    ? preferred
-    : DEFAULT_UPSCALE_MODEL;
+  sel.value = ids.has(preferred) ? preferred : DEFAULT_UPSCALE_MODEL;
 }
+
+/**
+ * Serialises upscale calls so the user can never accidentally fire
+ * two concurrent requests on the same input (e.g., by stopping one
+ * recording and immediately stopping another, or by toggling the
+ * upscale switch mid-flight).
+ *
+ * Keyed by sessionToken to guarantee that only one upscale per
+ * session is in flight, but multiple sessions can still process in
+ * parallel (important when the user stops B while A is still being
+ * upscaled). The in-flight promise is returned so the second caller
+ * observes the same result as the first.
+ */
+const upscaleInFlightBySession = new Map<string, Promise<string>>();
 
 async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<string> {
   const input = String(text || "").trim();
@@ -2103,38 +2197,46 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
     }
     return input;
   }
-  setStatusScoped(sessionToken, "Upscaling");
-  if (isCurrentUiSession(sessionToken)) {
-    $("upscaleOutput").textContent = "Upscaling...";
+  const inflightKey = sessionToken || "__no_session__";
+  const existing = upscaleInFlightBySession.get(inflightKey);
+  if (existing) {
+    return existing;
   }
-  const t0 = performance.now();
-  // Upscale uses the DEDICATED upscale model selector — NOT the audio
-  // transcribe model. They're different tasks (text→text vs audio→text)
-  // and share nothing beyond the OpenRouter API key.
-  const upscaleModel = getUpscaleModelValue();
-  try {
-    const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", {
-      text: input,
-      preset_id: upscalePresetId(),
-      model: upscaleModel || undefined,
-    });
-    const out = String(r.text || "").trim();
-    if (!out) throw new Error("Upscale returned empty text");
+  const promise = (async (): Promise<string> => {
+    setStatusScoped(sessionToken, "Upscaling");
     if (isCurrentUiSession(sessionToken)) {
-      $("upscaleOutput").textContent = out;
-      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      $("upscaleOutput").textContent = "Upscaling...";
     }
-    setStatusScoped(sessionToken, "Done");
-    return out;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
-    if (isCurrentUiSession(sessionToken)) {
-      $("upscaleOutput").textContent = `Upscale failed: ${msg}\n\nUsing original transcript.`;
-      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+    const t0 = performance.now();
+    const upscaleModel = getUpscaleModelValue();
+    try {
+      const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", {
+        text: input,
+        preset_id: upscalePresetId(),
+        model: upscaleModel || undefined,
+      });
+      const out = String(r.text || "").trim();
+      if (!out) throw new Error("Upscale returned empty text");
+      if (isCurrentUiSession(sessionToken)) {
+        $("upscaleOutput").textContent = out;
+        $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      }
+      setStatusScoped(sessionToken, "Done");
+      return out;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
+      if (isCurrentUiSession(sessionToken)) {
+        $("upscaleOutput").textContent = `Upscale failed: ${msg}\n\nUsing original transcript.`;
+        $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      }
+      setStatusScoped(sessionToken, "Done");
+      return input;
+    } finally {
+      upscaleInFlightBySession.delete(inflightKey);
     }
-    setStatusScoped(sessionToken, "Done");
-    return input;
-  }
+  })();
+  upscaleInFlightBySession.set(inflightKey, promise);
+  return promise;
 }
 
 function queueUiPreferencesSave(): void {
@@ -3488,7 +3590,29 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   }
 }
 
+/**
+ * Atomic reset of EVERY window.__transcriptor* scalar the overlay
+ * reads. Called when a new recording begins or when an explicit
+ * ``resetOutputs()`` fires.
+ *
+ * The ``__transcriptorFinishedRecords`` history array is intentionally
+ * NOT cleared here — it's keyed by recordingId and bounded at 30
+ * entries, and the overlay uses it as a lookup table to recover the
+ * text for a specific finished recordingId even after newer sessions
+ * have overwritten the scalar pointers.
+ *
+ * Previously this function only reset Channel 2 (ui-final), leaving
+ * Channel 1 (paste-ready: LastFinishedText/At/RecordingId) pointing at
+ * the PREVIOUS session's transcript. During the startup window of a
+ * new recording, the overlay could observe stale paste-ready state
+ * and trigger an overlay transition keyed on it.
+ */
 function clearRecordingOutput(): void {
+  // Channel 1 — paste-ready scalars.
+  window.__transcriptorLastFinishedText = "";
+  window.__transcriptorLastFinishedAt = 0;
+  window.__transcriptorLastFinishedRecordingId = 0;
+  // Channel 2 — ui-final signal.
   window.__transcriptorLastUiFinalText = "";
   window.__transcriptorLastUiFinalAt = 0;
   window.__transcriptorLastUiFinalRecordingId = 0;
@@ -3715,6 +3839,38 @@ function pushCapturedFrame(input: Float32Array): void {
     chunks.length = 0;
     chunks.push(merged);
   }
+  // Hard recording-window limit: once the total PCM buffer exceeds
+  // this duration, rotate out the oldest samples. Without this cap,
+  // an accidentally-left-open session can grow the JS heap without
+  // bound (at 16kHz, 2h = ~460MB of Float32 data). The cap is large
+  // enough that all expected use-cases (short voice bursts, hour-long
+  // meetings) fit comfortably; a rotating window kicks in only for
+  // truly marathon sessions and preserves the most recent audio.
+  const PCM_WINDOW_SAMPLES = AUDIO_TOKENS.liveSampleRateHz * 60 * 120; // 2 hours
+  if (captureSampleCount > PCM_WINDOW_SAMPLES) {
+    // Consolidate (if we haven't just now) then slice the tail.
+    const total = chunks.reduce((a, c) => a + c.length, 0);
+    if (chunks.length > 1) {
+      const merged = new Float32Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        merged.set(c, off);
+        off += c.length;
+      }
+      chunks.length = 0;
+      chunks.push(merged);
+    }
+    const only = chunks[0];
+    const tail = only.subarray(only.length - PCM_WINDOW_SAMPLES);
+    chunks[0] = new Float32Array(tail);
+    captureSampleCount = chunks[0].length;
+    if (!window.__transcriptorPcmWindowRotated) {
+      window.__transcriptorPcmWindowRotated = true;
+      console.warn(
+        "PCM capture exceeded 2h window; rotating oldest audio. Session is still usable but the canonical WAV now covers only the trailing 2h.",
+      );
+    }
+  }
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const pcm = new ArrayBuffer(ds.length * 2);
   const dv = new DataView(pcm);
@@ -3737,17 +3893,23 @@ async function flushWorkletPort(timeoutMs = 350): Promise<void> {
   const token = `flush-${Date.now()}-${++flushRequestSeq}`;
   await new Promise<void>((resolve) => {
     let settled = false;
+    let timerId: number | null = null;
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
       pendingWorkletFlushes.delete(token);
       resolve();
     };
     pendingWorkletFlushes.set(token, finish);
-    window.setTimeout(finish, timeoutMs);
+    timerId = window.setTimeout(finish, timeoutMs);
     try {
       node.port.postMessage({ type: "flush", token });
-    } catch {
+    } catch (e) {
+      console.debug("flushWorkletPort: postMessage failed", e);
       finish();
     }
   });
@@ -3821,11 +3983,12 @@ async function startLive(): Promise<void> {
   // Recording started — transcription happens on stop via single sync call.
   window.__transcriptorIsRecording = true;
   window.__transcriptorLastFrameAt = Date.now();
-  window.__transcriptorLastFinishedText = "";
-  window.__transcriptorLastFinishedAt = 0;
-  window.__transcriptorCurrentRecordingId = currentRecordingId;
-  window.__transcriptorLastFinishedRecordingId = 0;
+  // Atomically clear every overlay-observable global BEFORE setting
+  // the new currentRecordingId, so the overlay can never observe
+  // "new currentRecordingId + old paste-ready text" in a transient
+  // race during startLive.
   clearRecordingFinalSignal();
+  window.__transcriptorCurrentRecordingId = currentRecordingId;
   setRecordButton(true);
   // Keep single mic button interactive while recording.
   ($("btnStart") as HTMLButtonElement).disabled = false;
@@ -3879,7 +4042,12 @@ async function startLive(): Promise<void> {
     patchCurrentRecordingSummary({ status: statusMsg, tone: "info" }, sessionUiToken);
   };
   ws.onerror = (ev) => {
-    console.warn("live ws transport error", ev);
+    // Scope the log to this session token so a stale socket from a
+    // prior recording can't confuse the developer into thinking the
+    // current session is broken. No state mutation — actual error
+    // surfacing happens through the higher-level 'error' message
+    // path from the backend or the onclose handler below.
+    console.warn(`live ws transport error [session=${sessionUiToken.slice(0, 8)}]`, ev);
   };
   ws.onclose = (ev) => {
     // A clean close (1000/1005) after finalize is expected. An unclean
@@ -3985,8 +4153,18 @@ async function startLive(): Promise<void> {
     recordedWebmChunks = [];
     try {
       mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+      // MediaRecorder emits one chunk per second (see ``start(1000)``
+      // below). The same 2h recording-window limit applies: if a
+      // session grows beyond that, rotate out the oldest chunks so
+      // we never end up holding tens of thousands of Blob references.
+      const WEBM_WINDOW_CHUNKS = 60 * 120; // 2 hours @ 1 chunk/s
       mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedWebmChunks.push(e.data);
+        if (e.data.size > 0) {
+          recordedWebmChunks.push(e.data);
+          if (recordedWebmChunks.length > WEBM_WINDOW_CHUNKS) {
+            recordedWebmChunks.splice(0, recordedWebmChunks.length - WEBM_WINDOW_CHUNKS);
+          }
+        }
       };
       mediaRecorder.start(1000);
     } catch (e) {
@@ -4059,21 +4237,31 @@ async function startLive(): Promise<void> {
       fallbackCaptureTimer = null;
     }
     fallbackCaptureTimer = window.setTimeout(() => {
-      if (!ac || !src || !isRecording) return;
+      // Capture mutable globals into locals so the compiler (and the
+      // reader) can be sure nothing reassigns them between the null
+      // guard and the dereference. Previously this callback read ``ac``
+      // and ``src`` directly; they are module-level ``let`` variables
+      // that stopLive() nulls out during cleanup, so in principle a
+      // race could crash with a null-dereference. In practice it was
+      // safe because everything below runs synchronously, but making
+      // the snapshot explicit eliminates the class of bug entirely.
+      const localAc = ac;
+      const localSrc = src;
+      if (!localAc || !localSrc || !isRecording) return;
       const noFrames = captureFrameCount < 3;
       if (!noFrames) return;
       try {
-        scriptNode = ac.createScriptProcessor(4096, 1, 1);
-        scriptSinkGain = ac.createGain();
+        scriptNode = localAc.createScriptProcessor(4096, 1, 1);
+        scriptSinkGain = localAc.createGain();
         scriptSinkGain.gain.value = 0;
         scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
           const ch = ev.inputBuffer.getChannelData(0);
           if (!ch || !ch.length) return;
           pushCapturedFrame(new Float32Array(ch));
         };
-        src.connect(scriptNode);
+        localSrc.connect(scriptNode);
         scriptNode.connect(scriptSinkGain);
-        scriptSinkGain.connect(ac.destination);
+        scriptSinkGain.connect(localAc.destination);
         if (shouldLivePreview()) {
           const cur = liveDraftDisplayText || "";
           if (!cur.includes("[Mic fallback engaged]")) {

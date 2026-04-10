@@ -1881,11 +1881,7 @@ async function showRecordingOverlay() {
                 overlayWaveMonitor = null;
               }
               appendMainLog(`[overlay-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
-              stopRecordingFromOverlay().catch((e) => {
-                appendMainLog(`[overlay-autostop-error] ${compactLogText(e?.message || e)}`);
-                overlayStopInFlight = false;
-                hideRecordingOverlay();
-              });
+              guardedStopFromOverlay("autostop");
             }
           } else {
             overlaySilenceStartedAt = 0;
@@ -1900,11 +1896,7 @@ async function showRecordingOverlay() {
               overlayWaveMonitor = null;
             }
             appendMainLog(`[overlay-autostop-stale] audio pipeline dead for 8s, forcing stop`);
-            stopRecordingFromOverlay().catch((e) => {
-              appendMainLog(`[overlay-autostop-stale-error] ${compactLogText(e?.message || e)}`);
-              overlayStopInFlight = false;
-              hideRecordingOverlay();
-            });
+            guardedStopFromOverlay("autostop-stale");
           }
         }
         overlayWin.webContents.executeJavaScript(
@@ -2180,6 +2172,44 @@ async function toggleRecordingFromShortcut() {
   } finally {
     shortcutToggleInFlight = false;
   }
+}
+
+/**
+ * Fire-and-forget wrapper for ``stopRecordingFromOverlay`` with a
+ * hard deadline. If the stop call hangs (e.g., renderer is
+ * unresponsive), the overlay state-machine would be stuck with
+ * ``overlayStopInFlight = true`` forever, permanently blocking new
+ * recordings. This wrapper clears the flag on EVERY exit path —
+ * resolve, reject, OR timeout — and hides the overlay if the stop
+ * never completed.
+ */
+function guardedStopFromOverlay(reason) {
+  const deadlineMs = 12000;
+  let settled = false;
+  const finish = (why, err) => {
+    if (settled) return;
+    settled = true;
+    overlayStopInFlight = false;
+    if (err) {
+      appendMainLog(`[overlay-${reason}-error] ${compactLogText(err?.message || err)}`);
+    } else if (why === "timeout") {
+      appendMainLog(`[overlay-${reason}-timeout] stopRecordingFromOverlay exceeded ${deadlineMs}ms deadline`);
+    }
+    if (why !== "resolve") {
+      hideRecordingOverlay();
+    }
+  };
+  const timer = setTimeout(() => finish("timeout"), deadlineMs);
+  stopRecordingFromOverlay().then(
+    () => {
+      clearTimeout(timer);
+      finish("resolve");
+    },
+    (err) => {
+      clearTimeout(timer);
+      finish("reject", err);
+    }
+  );
 }
 
 async function stopRecordingFromOverlay() {
@@ -2674,7 +2704,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     logPasteTrace("clipboard_write_failed", {});
     traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
     // Restore original clipboard.
-    if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+    if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
     return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
   }
   traceStep(trace, "clipboard_write_ok", {});
@@ -2764,7 +2794,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       if (check.ok && (check.stdout || "").trim().includes("OK:")) {
          traceEnd(trace, "success", { method: "powershell_paste", attempt: attempt + 1, reason: "powershell_success", verified: false });
          setTimeout(() => {
-           if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+           if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
          }, 1200);
          return { ok: true, reason: "OK:powershell_paste", method: "powershell_paste", verified: false };
       }
@@ -2807,13 +2837,13 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: false });
         // Restore previous clipboard cleanly since paste was successful
         setTimeout(() => {
-          if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+          if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
         }, 1200);
         return { ok: true, reason: out, method: "robust_paste", verified: false };
       }
       if (out === "ERR:secure-field") {
         traceEnd(trace, "failed", { reason: "secure-field" });
-        if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+        if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
         return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
       }
       if (out === "ERR:no-accessibility") {
@@ -2870,7 +2900,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     const out = String(menuRes.stdout || "").trim();
     if (out.startsWith("OK:")) {
       setTimeout(() => {
-        if (savedClipboard) { try { clipboard.writeText(savedClipboard); } catch { } }
+        if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
       }, 1200);
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: false });
       return { ok: true, reason: out, method: "menu-paste", verified: false };
@@ -3728,10 +3758,10 @@ function waitForHttp(url, timeoutMs) {
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
   win = new BrowserWindow({
-    width: 1340,
-    height: 760,
-    minWidth: 1060,
-    minHeight: 680,
+    width: 1420,
+    height: 780,
+    minWidth: 1140,
+    minHeight: 700,
     backgroundColor: "#1a1a1a",
     title: "Transcriptor",
     titleBarStyle: "hiddenInset",
@@ -3861,6 +3891,62 @@ app.on("activate", () => {
   ensureWindowVisible({ manual: true, force: true });
 });
 
+/**
+ * Robust backend termination — used from every exit path so the
+ * Python subprocess is never orphaned.
+ *
+ * Previously only ``before-quit`` called ``backend.kill()``. If the
+ * app crashed (``uncaughtException``), received a POSIX signal, or
+ * went through any exit path that doesn't fire ``before-quit``, the
+ * backend would keep running and hold on to its listening port.
+ *
+ * This helper sends SIGTERM first (graceful shutdown), then escalates
+ * to SIGKILL after 1500 ms if the process is still alive. It also
+ * tries to reap a stale PID via ``process.kill`` even after our local
+ * ``backend`` reference has been cleared.
+ */
+let backendTerminationInProgress = false;
+function killBackendHard(reason) {
+  if (backendTerminationInProgress) return;
+  backendTerminationInProgress = true;
+  const proc = backend;
+  backend = null;
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
+  }
+  if (!proc) {
+    backendTerminationInProgress = false;
+    return;
+  }
+  appendMainLog(`[backend-kill] reason=${reason} pid=${proc.pid}`);
+  let pidForFallback = proc.pid;
+  try {
+    proc.kill("SIGTERM");
+  } catch (e) {
+    appendMainLog(`[backend-kill] SIGTERM failed: ${e?.message || e}`);
+  }
+  // Hard-kill timeout — if the process ignores SIGTERM (e.g., blocked
+  // in a native call), SIGKILL it so we don't orphan it.
+  setTimeout(() => {
+    if (!pidForFallback) return;
+    try {
+      process.kill(pidForFallback, 0);
+      // Still alive — escalate to SIGKILL.
+      try {
+        process.kill(pidForFallback, "SIGKILL");
+        appendMainLog(`[backend-kill] escalated to SIGKILL pid=${pidForFallback}`);
+      } catch (e) {
+        appendMainLog(`[backend-kill] SIGKILL failed: ${e?.message || e}`);
+      }
+    } catch {
+      // ESRCH — process is already gone, nothing to do.
+    }
+    pidForFallback = null;
+    backendTerminationInProgress = false;
+  }, 1500);
+}
+
 app.on("before-quit", () => {
   isQuitting = true;
   globalShortcut.unregisterAll();
@@ -3872,28 +3958,48 @@ app.on("before-quit", () => {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
   }
+  if (overlayAutoStopTriggerTimer) {
+    clearTimeout(overlayAutoStopTriggerTimer);
+    overlayAutoStopTriggerTimer = null;
+  }
+  if (overlayTranscribingStatusTimer) {
+    clearTimeout(overlayTranscribingStatusTimer);
+    overlayTranscribingStatusTimer = null;
+  }
   hideRecordingOverlay();
   if (overlayWin && !overlayWin.isDestroyed()) {
     try {
       overlayWin.close();
-    } catch { }
+    } catch (e) {
+      appendMainLog(`[before-quit] overlay close failed: ${e?.message || e}`);
+    }
   }
   if (tray) {
     try {
       tray.destroy();
-    } catch { }
+    } catch (e) {
+      appendMainLog(`[before-quit] tray destroy failed: ${e?.message || e}`);
+    }
     tray = null;
   }
-  if (backend) {
-    try {
-      backend.kill();
-    } catch { }
-  }
-  if (backendRestartTimer) {
-    clearTimeout(backendRestartTimer);
-    backendRestartTimer = null;
-  }
+  killBackendHard("before-quit");
 });
+
+// Hook the raw node process exit events too — covers crashes and
+// external signals that bypass Electron's ``before-quit`` handler.
+process.on("exit", () => {
+  isQuitting = true;
+  killBackendHard("process-exit");
+});
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    appendMainLog(`[signal] ${sig}`);
+    isQuitting = true;
+    killBackendHard(`signal-${sig}`);
+    // Let Electron's own handler run; don't call app.exit() ourselves
+    // because that would skip before-quit cleanup.
+  });
+}
 
 app.whenReady().then(async () => {
   process.on("uncaughtException", (err) => {

@@ -10,9 +10,10 @@ import time
 import subprocess
 import mimetypes
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -57,7 +58,44 @@ for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Call Transcriptor")
+
+@asynccontextmanager
+async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
+    """FastAPI lifespan hook.
+
+    Replaces the deprecated ``@app.on_event("startup")`` pattern
+    (removed in an upcoming FastAPI release). Both startup tasks are
+    best-effort and kicked off in background daemon threads so they
+    cannot block the event loop from serving requests.
+
+    ``_warm_default_local_model`` and ``_retroactive_audio_retention``
+    are defined later in the module — Python resolves the names at
+    call time (when this lifespan enters), by which point the whole
+    module has been imported. No forward-declaration dance required.
+    """
+    threading.Thread(
+        target=_warm_default_local_model, daemon=True, name="warm-default-model"
+    ).start()
+
+    def _run_retroactive_retention() -> None:
+        try:
+            _retroactive_audio_retention()
+        except Exception:
+            logger.exception("retroactive audio retention startup task failed")
+
+    threading.Thread(
+        target=_run_retroactive_retention,
+        daemon=True,
+        name="retroactive-audio-retention",
+    ).start()
+
+    yield
+    # shutdown: nothing to actively release; daemon threads exit with the
+    # process and the rate-limit prune task is torn down via the global
+    # ``asyncio.get_event_loop()`` cancellation FastAPI handles for us.
+
+
+app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 jobs = JobStore(max_workers=2)
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
@@ -195,30 +233,6 @@ def _warm_default_local_model() -> None:
         logger.exception("default local model warmup failed")
 
 
-@app.on_event("startup")
-def _startup_warm_models() -> None:
-    threading.Thread(target=_warm_default_local_model, daemon=True).start()
-
-
-@app.on_event("startup")
-def _startup_retroactive_audio_retention() -> None:
-    """Prune legacy audio files left over from previous app versions.
-
-    Users upgrading from a build that kept audio-per-recording end up
-    with many .wav files cluttering the archive. We enforce the "one
-    audio per archive" rule on startup — it's cheap (single iterdir
-    pass) and runs off the event loop so backend responsiveness is
-    unaffected.
-    """
-    def _run() -> None:
-        try:
-            _retroactive_audio_retention()
-        except Exception as e:
-            logger.warning("retroactive audio retention startup task failed: %s", e)
-
-    threading.Thread(target=_run, daemon=True).start()
-
-
 def _origin_allowed(origin: str, request: Request) -> bool:
     parsed = urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
@@ -234,6 +248,47 @@ def _origin_allowed(origin: str, request: Request) -> bool:
     return origin_port == req_port
 
 
+_RATE_BUCKET_MAX_KEYS = 2048
+_rate_prune_watermark: dict[int, float] = {}
+
+
+def _prune_rate_bucket(bucket: dict[str, deque[float]], cutoff: float) -> None:
+    """Garbage-collect a rate-limit bucket.
+
+    Called under ``_rate_lock``. Walks every key and drops entries
+    whose deque is empty after the cutoff prune. Bounded work —
+    runs at most once per 30s per bucket, or immediately if the
+    bucket exceeds the hard-cap size.
+
+    Root cause for the previous leak: ``defaultdict(deque)`` created
+    a new entry for every unique IP address, but empty deques were
+    never removed. Over a long-running server, this grew unboundedly
+    (slow memory leak, DoS vector via flood of unique clients).
+    """
+    stale_keys: list[str] = []
+    for k, q in bucket.items():
+        while q and q[0] < cutoff:
+            q.popleft()
+        if not q:
+            stale_keys.append(k)
+    for k in stale_keys:
+        bucket.pop(k, None)
+
+    # If after pruning we're still over the hard cap, evict the
+    # oldest-touched keys. This bounds peak memory even under a burst
+    # of unique clients that haven't timed out yet.
+    if len(bucket) > _RATE_BUCKET_MAX_KEYS:
+        # Sort by most-recent timestamp ascending; drop the oldest
+        # until we're back under the cap.
+        ordered = sorted(
+            bucket.items(),
+            key=lambda kv: kv[1][-1] if kv[1] else 0.0,
+        )
+        excess = len(bucket) - _RATE_BUCKET_MAX_KEYS
+        for k, _ in ordered[:excess]:
+            bucket.pop(k, None)
+
+
 def _touch_rate_limit(bucket: dict[str, deque[float]], key: str, limit_per_min: int) -> bool:
     now = time.time()
     cutoff = now - 60.0
@@ -244,6 +299,16 @@ def _touch_rate_limit(bucket: dict[str, deque[float]], key: str, limit_per_min: 
         if len(q) >= limit_per_min:
             return False
         q.append(now)
+
+        # Opportunistic GC: runs at most once per 30s per bucket, or
+        # immediately if the bucket is over-full. O(n) in the number
+        # of tracked clients, amortized down to a few microseconds
+        # per touch even at cap size.
+        bucket_id = id(bucket)
+        last_prune = _rate_prune_watermark.get(bucket_id, 0.0)
+        if now - last_prune > 30.0 or len(bucket) > _RATE_BUCKET_MAX_KEYS:
+            _prune_rate_bucket(bucket, cutoff)
+            _rate_prune_watermark[bucket_id] = now
         return True
 
 
@@ -785,6 +850,22 @@ def _recording_path_or_404(name: str, target_dir: Optional[Path] = None) -> Path
 
 
 def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True) -> Path:
+    """Validate + resolve a user-supplied recordings archive path.
+
+    Security invariant: the *resolved* path (with symlinks followed
+    via ``Path.resolve()``) must be inside the user's home directory.
+    This blocks the classic symlink-escape bug where a path like
+    ``~/evil -> /etc/shadow`` looks innocuous but actually targets a
+    system file: ``resolve()`` returns ``/etc/shadow``, the
+    ``relative_to(home_dir)`` check then raises ``ValueError`` and
+    we surface a 403. The same logic also handles macOS's ``/var``
+    → ``/private/var`` symlinks safely.
+
+    Note that for a local Electron app the threat model is "protect
+    the app from misconfiguration", not "protect the user from
+    themselves" — this is defence against typos and stale paths, not
+    against a malicious local user.
+    """
     hint = str(archive_dir or "").strip()
     if not hint:
         resolved = _resolve_recordings_dir()
@@ -1351,11 +1432,22 @@ def _open_live_recovery(
     language: str,
     archive_dir: str,
 ) -> dict:
-    """Create a recovery PCM file + metadata for a live session."""
+    """Create a recovery PCM file + metadata for a live session.
+
+    Ordering is critical for leak-freedom:
+      1. Build ``meta_payload`` in memory (infallible).
+      2. Write metadata JSON to disk (cheap, fails fast on ENOSPC /
+         permission denied / etc.).
+      3. Only NOW open the PCM file for append. If any step before
+         this raises, there is no file handle to close.
+      4. If the function is about to succeed but a later step inside
+         this function raises, the local ``pcm_file`` is closed
+         before re-raising. Callers receive either a fully-usable
+         recovery context or an exception with nothing leaked.
+    """
     stem = f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}"
     pcm_path = LIVE_RECOVERY_DIR / f"{stem}.pcm16"
     meta_path = LIVE_RECOVERY_DIR / f"{stem}.json"
-    pcm_file = pcm_path.open("wb")
     meta_payload = {
         "session_id": session_id,
         "started_at": started_at.isoformat(),
@@ -1370,21 +1462,33 @@ def _open_live_recovery(
         "status": "recording",
         "provider": provider,
     }
+    # Metadata first — if this fails there is no file handle to leak.
     meta_path.write_text(
         json.dumps(meta_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    return {
-        "session_id": session_id,
-        "started_at": started_at,
-        "pcm_path": pcm_path,
-        "meta_path": meta_path,
-        "pcm_file": pcm_file,
-        "meta": meta_payload,
-        "bytes": 0,
-        "chunks": 0,
-        "had_error": False,
-    }
+
+    pcm_file = pcm_path.open("wb")
+    try:
+        return {
+            "session_id": session_id,
+            "started_at": started_at,
+            "pcm_path": pcm_path,
+            "meta_path": meta_path,
+            "pcm_file": pcm_file,
+            "meta": meta_payload,
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+    except BaseException:
+        # Closing the file before propagating so no FD leaks on an
+        # unexpected error constructing the return dict.
+        try:
+            pcm_file.close()
+        except OSError:
+            pass
+        raise
 
 
 def _record_recovery_chunk(recovery: dict, data: bytes) -> None:
