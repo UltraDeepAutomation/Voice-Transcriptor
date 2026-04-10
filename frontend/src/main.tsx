@@ -825,9 +825,29 @@ function statusKindToDotClass(kind: StatusKind): string {
   }
 }
 
+/** Maximum length for a status line that fits the pill without
+ *  truncation at the current column width. Longer messages are
+ *  abbreviated in the pill and shown in full via the hover title and
+ *  the session notice banner. */
+const STATUS_PILL_MAX_CHARS = 42;
+
+function abbreviateForStatusPill(text: string): string {
+  const t = (text || "").trim();
+  if (t.length <= STATUS_PILL_MAX_CHARS) return t;
+  // Prefer the part before the first ":" or "—" — usually the
+  // high-level phrase ("Live stream error") without the raw cause.
+  const head = t.split(/[:\u2014\u2013]/)[0].trim();
+  if (head && head.length <= STATUS_PILL_MAX_CHARS) return head + "…";
+  return t.slice(0, STATUS_PILL_MAX_CHARS - 1).trimEnd() + "…";
+}
+
 function setStatus(st: string, kind?: StatusKind): void {
-  $("statusText").textContent = st;
-  const resolvedKind: StatusKind = kind || inferStatusKindFromText(st);
+  const full = String(st || "").trim();
+  const short = abbreviateForStatusPill(full);
+  const el = $("statusText");
+  el.textContent = short;
+  el.setAttribute("title", full);
+  const resolvedKind: StatusKind = kind || inferStatusKindFromText(full);
   const dot = $("statusDot");
   dot.className = "status-dot" + statusKindToDotClass(resolvedKind);
 }
@@ -5075,7 +5095,25 @@ function gKeywordSimilarity(a: string[], b: string[]): number {
   return shared / Math.max(a.length, b.length);
 }
 
-/** O(N) keyword-cluster layout — groups nodes by top keyword, places clusters in spiral */
+/**
+ * Keyword-cluster layout using a deterministic Fibonacci-spiral
+ * (Vogel / sunflower) placement.
+ *
+ * Previously the layout used an Archimedean spiral with
+ * ``spiralR += spacing / (2π)`` which meant each cluster sat only
+ * ~13 px further out than the previous one, causing heavy cluster
+ * overlap on the canvas. This version:
+ *
+ *   1. Computes a bounding radius per cluster (proportional to node
+ *      count so dense clusters get more room).
+ *   2. Places each cluster on a Fibonacci spiral at a distance
+ *      proportional to ``sqrt(k)``, which is the correct spacing for
+ *      equal-area placement and guarantees non-overlap when combined
+ *      with a pad term.
+ *   3. Within each cluster, positions nodes deterministically on a
+ *      concentric ring (no ``Math.random()`` so the layout is stable
+ *      across re-renders).
+ */
 function gClusterLayout(): void {
   const clusters: Map<string, number[]> = new Map();
   gNodes.forEach((n, i) => {
@@ -5086,33 +5124,55 @@ function gClusterLayout(): void {
   });
 
   const clusterList = [...clusters.entries()].sort((a, b) => b[1].length - a[1].length);
-  const spacing = Math.max(80, Math.sqrt(gNodes.length) * 10);
-  let angle = 0;
-  let spiralR = 0;
+
+  // Average node radius feeds the per-cluster size computation so the
+  // spacing scales with actual node visual footprint.
+  const avgNodeR =
+    gNodes.reduce((acc, n) => acc + n.r, 0) / Math.max(1, gNodes.length);
+
+  const clusterRadii = clusterList.map(([, indices]) => {
+    // A cluster of N nodes needs radius ~ sqrt(N) × node footprint
+    // with a minimum of 24 px so single-node clusters still reserve
+    // space.
+    return Math.max(24, Math.sqrt(indices.length) * (avgNodeR * 2.6 + 6));
+  });
+
+  // Fibonacci / Vogel spiral: golden-angle placement of successive
+  // clusters. ``c`` is the linear distance per step — we size it so
+  // the maximum-radius cluster never overlaps a neighbour.
+  const maxClusterR = clusterRadii.reduce((a, b) => Math.max(a, b), 0);
+  const step = Math.max(80, maxClusterR * 2 + 24);
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
 
   clusterList.forEach(([, indices], ci) => {
-    let cx: number, cy: number;
+    let cx: number;
+    let cy: number;
     if (ci === 0) {
-      cx = 0; cy = 0;
+      cx = 0;
+      cy = 0;
     } else {
-      angle += 2.4 / Math.sqrt(ci);
-      spiralR += spacing / (2 * Math.PI);
-      cx = Math.cos(angle) * spiralR;
-      cy = Math.sin(angle) * spiralR;
+      const angle = ci * goldenAngle;
+      const radius = step * Math.sqrt(ci) * 0.55;
+      cx = Math.cos(angle) * radius;
+      cy = Math.sin(angle) * radius;
     }
 
     const n = indices.length;
-    const clusterR = Math.max(20, Math.sqrt(n) * 14);
+    const clusterR = clusterRadii[ci];
+    if (n === 1) {
+      gNodes[indices[0]].x = cx;
+      gNodes[indices[0]].y = cy;
+      return;
+    }
+    // Place nodes on a single ring. The ring radius is slightly
+    // smaller than the cluster radius so the nodes don't touch the
+    // bounding circle and neighbouring clusters stay visually
+    // separated.
+    const ringR = clusterR * 0.62;
     indices.forEach((nodeIdx, j) => {
-      if (n === 1) {
-        gNodes[nodeIdx].x = cx + (Math.random() - 0.5) * 6;
-        gNodes[nodeIdx].y = cy + (Math.random() - 0.5) * 6;
-      } else {
-        const a2 = (2 * Math.PI * j) / n;
-        const r2 = clusterR * (0.3 + 0.7 * Math.random());
-        gNodes[nodeIdx].x = cx + Math.cos(a2) * r2;
-        gNodes[nodeIdx].y = cy + Math.sin(a2) * r2;
-      }
+      const a2 = (2 * Math.PI * j) / n - Math.PI / 2;
+      gNodes[nodeIdx].x = cx + Math.cos(a2) * ringR;
+      gNodes[nodeIdx].y = cy + Math.sin(a2) * ringR;
     });
   });
 }

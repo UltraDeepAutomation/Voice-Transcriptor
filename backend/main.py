@@ -367,6 +367,10 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
         )
     finally:
         tmp_audio.unlink(missing_ok=True)
+    # Same retention policy as ``save_recording_with_audio``: recovered
+    # sessions are the new "latest", so older audio files in the archive
+    # get pruned.
+    _prune_old_recording_audio(target_dir, stem)
     _invalidate_recordings_cache()
     _delete_live_recovery(session_id)
     return {"name": text_out.name, "audio_name": audio_out.name, "archive_dir": str(target_dir)}
@@ -794,6 +798,70 @@ def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optio
         if candidate.exists() and candidate.is_file():
             return candidate
     return None
+
+
+_AUDIO_EXTS_FOR_RETENTION: tuple[str, ...] = (
+    ".wav",
+    ".m4a",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".aac",
+    ".mp4",
+    ".webm",
+)
+
+
+def _prune_old_recording_audio(
+    target_dir: Path, keep_stem: str
+) -> int:
+    """Retention policy: keep audio only for the *latest* recording.
+
+    Every recording still keeps its ``.txt`` transcript forever —
+    transcripts are cheap text and the user wants history. Audio files
+    are the expensive part (tens of MB each) and the user only ever
+    wants to re-listen to the MOST RECENT recording. This helper walks
+    the archive directory and deletes any audio whose stem does not
+    match ``keep_stem`` (the stem of the freshly-saved recording).
+
+    Returns the number of audio files deleted.
+    """
+    if not keep_stem:
+        return 0
+    deleted = 0
+    try:
+        entries = list(target_dir.iterdir())
+    except OSError as e:
+        logger.warning("audio retention scan failed for %s: %s", target_dir, e)
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            ext = entry.suffix.lower()
+            if ext not in _AUDIO_EXTS_FOR_RETENTION:
+                continue
+            if entry.stem == keep_stem:
+                continue
+            # Only delete if there's a sibling .txt — this guards
+            # against nuking an orphan audio file that might belong to
+            # an in-progress save from another process.
+            txt_sibling = entry.with_suffix(".txt")
+            if not txt_sibling.exists():
+                continue
+            try:
+                entry.unlink()
+                deleted += 1
+                logger.info(
+                    "audio retention: removed %s (keeping only %s)",
+                    entry.name,
+                    keep_stem,
+                )
+            except OSError as e:
+                logger.warning("audio retention: failed to remove %s: %s", entry, e)
+        except OSError as e:
+            logger.debug("audio retention: skip %s: %s", entry, e)
+    return deleted
 
 
 def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> dict[str, Any]:
@@ -2540,5 +2608,15 @@ async def save_recording_with_audio(
         tmp_audio.unlink(missing_ok=True)
     if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
         existing_audio.unlink(missing_ok=True)
+    # Audio retention: only the NEWEST recording keeps its audio file.
+    # Delete audio from every older recording in the same archive so
+    # the user never ends up with gigabytes of old takes piling up.
+    pruned = _prune_old_recording_audio(target_dir, stem)
     _invalidate_recordings_cache()
-    return {"ok": True, "name": out_text.name, "audio_name": out_audio.name, "archive_dir": str(target_dir)}
+    return {
+        "ok": True,
+        "name": out_text.name,
+        "audio_name": out_audio.name,
+        "archive_dir": str(target_dir),
+        "pruned_audio_count": pruned,
+    }

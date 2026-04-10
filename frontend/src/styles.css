@@ -97,6 +97,7 @@ body {
   --radius: 12px;
   --h-control: 40px;
   --h-topbar: 46px;
+  --h-topbar-control: 34px;
   --h-control-compact: 32px;
   --h-chip: 28px;
   --surface-bg: var(--bg-2);
@@ -460,9 +461,9 @@ body {
 }
 
 .mic-refresh-btn {
-  width: 34px;
-  height: 34px;
-  min-width: 34px;
+  width: var(--h-topbar-control);
+  height: var(--h-topbar-control);
+  min-width: var(--h-topbar-control);
   padding: 0;
 }
 
@@ -562,7 +563,7 @@ textarea:focus-visible,
 .topbar .status-pill,
 .topbar .mini-wave,
 .topbar .mic-btn {
-  height: 34px;
+  height: var(--h-topbar-control);
 }
 
 .topbar .top-item select {
@@ -652,6 +653,11 @@ textarea:focus-visible,
   border-radius: var(--control-radius);
   padding: 0 10px;
   height: var(--h-control);
+  /* Prevent long status messages (e.g. Deepgram error details) from
+     pushing the pill past its column and overlapping neighbours. */
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
   background: var(--surface-bg);
   box-shadow: none;
 }
@@ -682,8 +688,12 @@ textarea:focus-visible,
 .status-text {
   font-size: 11px;
   color: var(--text-2);
-  min-width: 44px;
+  min-width: 0;
+  max-width: 100%;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .timer {
@@ -1452,10 +1462,35 @@ textarea:focus-visible,
   text-overflow: ellipsis;
 }
 
-#currentRecordingAudio {
+#currentRecordingAudio,
+#recordingAudio {
   flex: 1 1 240px;
   min-width: 180px;
   max-width: 100%;
+  height: 32px;
+  border-radius: var(--control-radius);
+  /* Blend the native controls with the app's dark theme. On Chromium
+     the ``audio`` element respects ``color-scheme`` and we can tint
+     its chrome via background + filter. Without this override the
+     player renders a tall rounded light-gray pill that sticks out
+     from the rest of the dark UI. */
+  color-scheme: dark;
+  background: var(--bg-3);
+  border: 1px solid var(--surface-border);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+}
+
+#currentRecordingAudio::-webkit-media-controls-panel,
+#recordingAudio::-webkit-media-controls-panel {
+  background-color: var(--bg-3);
+}
+
+#currentRecordingAudio::-webkit-media-controls-current-time-display,
+#currentRecordingAudio::-webkit-media-controls-time-remaining-display,
+#recordingAudio::-webkit-media-controls-current-time-display,
+#recordingAudio::-webkit-media-controls-time-remaining-display {
+  color: var(--text-2);
+  font-size: 11px;
 }
 
 .pane-footer-actions {

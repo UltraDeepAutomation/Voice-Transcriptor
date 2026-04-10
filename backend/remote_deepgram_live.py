@@ -63,7 +63,15 @@ DEEPGRAM_LIVE_URL = "wss://api.deepgram.com/v1/listen"
 
 @dataclass
 class DeepgramLiveConfig:
-    """Typed configuration for a Deepgram live streaming session."""
+    """Typed configuration for a Deepgram live streaming session.
+
+    Parameter set is restricted to what Nova-3's ``/v1/listen`` live
+    endpoint actually accepts. ``detect_language`` is a pre-recorded
+    endpoint feature — the live endpoint uses ``language=multi`` for
+    multilingual auto-detection instead. ``numerals`` is pre-recorded
+    only; ``smart_format`` (which Nova-3 handles safely for the
+    multilingual model) covers number formatting at live time.
+    """
 
     model: str = "nova-3"
     language: str = "auto"
@@ -71,10 +79,7 @@ class DeepgramLiveConfig:
     channels: int = 1
     interim_results: bool = True
     punctuate: bool = True
-    numerals: bool = True
-    # smart_format strips punctuation for many non-English languages
-    # (notably Russian). We emulate the safe subset via individual flags.
-    smart_format: bool = False
+    smart_format: bool = True
     endpointing_ms: int = 300
     utterance_end_ms: int = 1200
     filler_words: bool = False
@@ -88,7 +93,6 @@ class DeepgramLiveConfig:
             "channels": str(int(self.channels)),
             "interim_results": _bool(self.interim_results),
             "punctuate": _bool(self.punctuate),
-            "numerals": _bool(self.numerals),
             "smart_format": _bool(self.smart_format),
             "filler_words": _bool(self.filler_words),
             "endpointing": str(int(self.endpointing_ms)),
@@ -97,10 +101,14 @@ class DeepgramLiveConfig:
         if self.diarize:
             params["diarize"] = "true"
         lang = (self.language or "").strip().lower()
-        if lang and lang not in ("auto", ""):
-            params["language"] = lang
+        if not lang or lang in ("auto", "multi"):
+            # Nova-3 multilingual mode — the model auto-detects the
+            # active language per utterance across 10 supported
+            # languages including Russian, Spanish, French, German,
+            # Hindi, Portuguese, Italian, Dutch, Japanese, English.
+            params["language"] = "multi"
         else:
-            params["detect_language"] = "true"
+            params["language"] = lang
         return urlencode(params)
 
 
@@ -212,12 +220,39 @@ class DeepgramLiveSession:
             )
         except InvalidStatus as e:
             status = getattr(e.response, "status_code", None)
-            body = ""
+            body_text = ""
+            detail = ""
             try:
-                body = (e.response.body or b"").decode("utf-8", errors="replace")[:300]
-            except Exception:
-                pass
-            if status == 401:
+                body_text = (e.response.body or b"").decode("utf-8", errors="replace")[:600]
+            except Exception as body_err:
+                logger.debug("deepgram-live: failed to read error body: %s", body_err)
+            # Deepgram returns structured JSON on 400: {"err_code": ...,
+            # "err_msg": ..., "request_id": ...}. Parse it so the user
+            # sees an actionable message instead of raw JSON.
+            if body_text:
+                try:
+                    parsed = json.loads(body_text)
+                    if isinstance(parsed, dict):
+                        detail = str(
+                            parsed.get("err_msg")
+                            or parsed.get("message")
+                            or parsed.get("reason")
+                            or ""
+                        ).strip()
+                        if not detail and parsed.get("err_code"):
+                            detail = f"code={parsed.get('err_code')}"
+                        req_id = str(parsed.get("request_id") or "")
+                        if req_id:
+                            detail = f"{detail} (request_id={req_id[:12]})" if detail else f"request_id={req_id[:12]}"
+                except (ValueError, TypeError):
+                    detail = body_text
+            if status == 400:
+                msg = (
+                    f"Deepgram rejected the live streaming parameters (HTTP 400): {detail}"
+                    if detail
+                    else "Deepgram rejected the live streaming parameters (HTTP 400)"
+                )
+            elif status == 401:
                 msg = "Deepgram rejected the API key (HTTP 401)"
             elif status == 402:
                 msg = "Deepgram account has insufficient credits (HTTP 402)"
@@ -226,10 +261,10 @@ class DeepgramLiveSession:
             elif status == 429:
                 msg = "Deepgram rate limit exceeded (HTTP 429). Try again in a moment."
             elif status:
-                msg = f"Deepgram handshake failed (HTTP {status}): {body}" if body else f"Deepgram handshake failed (HTTP {status})"
+                msg = f"Deepgram handshake failed (HTTP {status}): {detail}" if detail else f"Deepgram handshake failed (HTTP {status})"
             else:
                 msg = f"Deepgram handshake failed: {e}"
-            logger.error("deepgram-live: %s", msg)
+            logger.error("deepgram-live: %s (raw body=%s)", msg, body_text[:200])
             raise DeepgramLiveError(msg) from e
         except asyncio.TimeoutError as e:
             msg = f"Deepgram connect timed out after {open_timeout:.1f}s"
