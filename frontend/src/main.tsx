@@ -35,6 +35,7 @@ interface AppConfig {
       quick_settings_open?: boolean;
       upscale_enabled?: boolean;
       upscale_preset?: string;
+      upscale_model?: string;
       auto_send_enter?: boolean;
       auto_stop_silence_enabled?: boolean;
       auto_stop_silence_seconds?: number;
@@ -357,6 +358,23 @@ const OPENROUTER_AUDIO_MODELS = [
 ];
 const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
 
+/**
+ * Text-generation models suitable for upscaling a raw transcript into
+ * polished prose. These are separate from ``OPENROUTER_AUDIO_MODELS``
+ * — audio models like ``gpt-4o-audio-preview`` accept audio input but
+ * don't take the "text + instruction → text" shape that upscaling
+ * needs. The first entry is the default selection on fresh installs.
+ */
+const OPENROUTER_UPSCALE_MODELS = [
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-pro",
+  "openai/gpt-4o-mini",
+  "openai/gpt-4o",
+  "anthropic/claude-3.5-sonnet",
+  "anthropic/claude-haiku-4.5",
+];
+const DEFAULT_UPSCALE_MODEL = OPENROUTER_UPSCALE_MODELS[0];
+
 let isBusy = false;
 let isRecording = false;
 let mediaRecorder: MediaRecorder | null = null;
@@ -433,9 +451,6 @@ function latestRecordingAudioUrl(savedName = "", archiveDir = ""): string {
 function renderLatestSavedAudio(): void {
   const row = $("currentRecordingAudioRow");
   const audioEl = $("currentRecordingAudio") as HTMLAudioElement;
-  const labelEl = $("currentRecordingAudioRow").querySelector(".current-audio-label") as HTMLElement | null;
-  const openBtn = $("currentRecordingOpenBtn") as HTMLAnchorElement;
-  const downloadBtn = $("currentRecordingDownloadBtn") as HTMLAnchorElement;
   const metaEl = $("currentRecordingAudioMeta");
 
   audioEl.pause();
@@ -443,17 +458,16 @@ function renderLatestSavedAudio(): void {
 
   if (!latestSavedAudioState) {
     row.hidden = true;
-    if (labelEl) labelEl.textContent = "Audio";
     audioEl.removeAttribute("src");
     audioEl.load();
-    openBtn.href = "#";
-    downloadBtn.href = "#";
-    downloadBtn.removeAttribute("download");
     metaEl.textContent = "";
     return;
   }
 
-  const backendUrl = latestRecordingAudioUrl(latestSavedAudioState.savedName || "", latestSavedAudioState.archiveDir || "");
+  const backendUrl = latestRecordingAudioUrl(
+    latestSavedAudioState.savedName || "",
+    latestSavedAudioState.archiveDir || ""
+  );
   const playbackUrl = latestSavedAudioState.file
     ? URL.createObjectURL(latestSavedAudioState.file)
     : backendUrl;
@@ -461,9 +475,6 @@ function renderLatestSavedAudio(): void {
     row.hidden = true;
     audioEl.removeAttribute("src");
     audioEl.load();
-    openBtn.href = "#";
-    downloadBtn.href = "#";
-    downloadBtn.removeAttribute("download");
     metaEl.textContent = "";
     return;
   }
@@ -471,15 +482,6 @@ function renderLatestSavedAudio(): void {
   audioEl.src = playbackUrl;
   audioEl.load();
   row.hidden = false;
-  if (labelEl) {
-    labelEl.textContent = "Audio";
-  }
-  openBtn.href = backendUrl || playbackUrl;
-  downloadBtn.href = backendUrl || playbackUrl;
-  downloadBtn.download =
-    latestSavedAudioState.downloadName ||
-    latestSavedAudioState.file?.name ||
-    `${(latestSavedAudioState.savedName || "recording").replace(/\.txt$/i, "")}.wav`;
   metaEl.textContent = latestSavedAudioState.sizeBytes
     ? fmtBytes(latestSavedAudioState.sizeBytes)
     : latestSavedAudioState.title;
@@ -1075,6 +1077,18 @@ async function selectCanonicalCapturedAudio(opts: {
   if (opts.pcmSamples.length > 0) {
     const pcmDurationSec = opts.pcmSamples.length / opts.pcmSampleRate;
     const pcmFile = createWavFileFromSamples(opts.pcmSamples, opts.pcmSampleRate, `live-${Date.now()}.wav`);
+    // FAST PATH: if the PCM capture is complete (covers >= 95% of
+    // the expected duration), skip the slow WebM probing step
+    // altogether — PCM is our highest-fidelity source and loading
+    // a blob into an HTMLAudioElement just to read ``duration`` can
+    // take 1-3 seconds on long recordings. We only probe the WebM
+    // when PCM is clearly short (e.g. the worklet stalled and we
+    // need MediaRecorder's fallback).
+    const pcmCoverage =
+      expectedDurationSec > 0 ? pcmDurationSec / expectedDurationSec : 1;
+    if (pcmCoverage >= 0.95) {
+      return { file: pcmFile, durationSec: pcmDurationSec, kind: "pcm" };
+    }
     candidates.push({ file: pcmFile, durationSec: pcmDurationSec, kind: "pcm", fidelityBias: 0 });
   }
 
@@ -1148,9 +1162,25 @@ function getRemoteModelValue(provider: Provider): string {
   return ($("model") as HTMLSelectElement).value || "small";
 }
 
+function syncLiveLocalModelVisibility(): void {
+  const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const effective = resolveEffectiveProvider(provider);
+  const group = document.getElementById("liveLocalModelGroup");
+  const toolbarRow = document.getElementById("livePaneToolbarRow");
+  if (!group || !toolbarRow) return;
+  // The Whisper model selector is only meaningful when live transcription
+  // uses local faster-whisper. For Deepgram-as-primary mode the selector
+  // is a confusing leftover (it doesn't control Deepgram's model) so we
+  // hide it and collapse the row when nothing else lives there.
+  const shouldShow = effective === "local";
+  group.hidden = !shouldShow;
+  toolbarRow.hidden = !shouldShow;
+}
+
 function syncRemoteModelOptions(): void {
   const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const sel = $("remoteModelSelect") as HTMLSelectElement;
+  syncLiveLocalModelVisibility();
   if (provider === "local" || !provider) {
     sel.hidden = true;
     return;
@@ -1800,6 +1830,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     quick_settings_open: !$("quickSettingsPanel").hidden,
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
     upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
+    upscale_model: getUpscaleModelValue(),
     auto_send_enter: !!($("autoSendEnterToggle") as HTMLButtonElement).classList.contains("active"),
     auto_stop_silence_enabled: silence.enabled,
     auto_stop_silence_seconds: silence.seconds,
@@ -2036,6 +2067,32 @@ function closeUpscalePromptModal(): void {
   closeModal("upscalePromptModal");
 }
 
+function getUpscaleModelValue(): string {
+  const el = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
+  const fromDropdown = (el?.value || "").trim();
+  if (fromDropdown) return fromDropdown;
+  return DEFAULT_UPSCALE_MODEL;
+}
+
+function populateUpscaleModelOptions(): void {
+  const sel = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
+  if (!sel) return;
+  const preferred = (sel.value || "").trim() || DEFAULT_UPSCALE_MODEL;
+  // Keep any user-added custom model by merging it into the list.
+  const models = new Set<string>(OPENROUTER_UPSCALE_MODELS);
+  if (preferred) models.add(preferred);
+  sel.innerHTML = "";
+  for (const model of models) {
+    const opt = document.createElement("option");
+    opt.value = model;
+    opt.textContent = model;
+    sel.appendChild(opt);
+  }
+  sel.value = OPENROUTER_UPSCALE_MODELS.includes(preferred) || models.has(preferred)
+    ? preferred
+    : DEFAULT_UPSCALE_MODEL;
+}
+
 async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<string> {
   const input = String(text || "").trim();
   if (!input) return "";
@@ -2051,12 +2108,15 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
     $("upscaleOutput").textContent = "Upscaling...";
   }
   const t0 = performance.now();
-  const remoteModel = (($("remoteModelSelect") as HTMLSelectElement).value || ($("orModel") as HTMLInputElement).value || "").trim();
+  // Upscale uses the DEDICATED upscale model selector — NOT the audio
+  // transcribe model. They're different tasks (text→text vs audio→text)
+  // and share nothing beyond the OpenRouter API key.
+  const upscaleModel = getUpscaleModelValue();
   try {
     const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", {
       text: input,
       preset_id: upscalePresetId(),
-      model: remoteModel || undefined,
+      model: upscaleModel || undefined,
     });
     const out = String(r.text || "").trim();
     if (!out) throw new Error("Upscale returned empty text");
@@ -2185,6 +2245,14 @@ async function loadCfg(): Promise<void> {
     upscaleToggle.checked = ui.upscale_enabled === true;
     setAutoSendEnterEnabled(ui.auto_send_enter === true);
     pendingUpscalePresetId = String(ui.upscale_preset || "").trim();
+    // Restore persisted upscale model; populateUpscaleModelOptions
+    // merges it into the dropdown if it's not in the built-in list.
+    const storedUpscaleModel = String(ui.upscale_model || "").trim();
+    const upscaleModelSelectEl = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
+    if (upscaleModelSelectEl) {
+      upscaleModelSelectEl.value = storedUpscaleModel || DEFAULT_UPSCALE_MODEL;
+    }
+    populateUpscaleModelOptions();
     preferredMicId = String(ui.mic_id || "").trim();
     syncRemoteModelOptions();
     const remoteSel = $("remoteModelSelect") as HTMLSelectElement;
@@ -3851,9 +3919,12 @@ async function startLive(): Promise<void> {
       case "error": {
         liveStreamError = msg.error;
         console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
-        if (shouldLivePreview()) {
-          setLiveInterimText(`[${msg.error}]`);
-        }
+        // Only surface truly fatal errors to the user. Non-fatal
+        // stream drops (when we already have committed segments) are
+        // logged to the console but invisible in the pill — the
+        // recording keeps going, just not streaming to Deepgram
+        // anymore. stopLive picks up the committed text as the
+        // transcript so the user experience is seamless.
         if (msg.fatal) {
           patchCurrentRecordingSummary(
             {
@@ -3862,6 +3933,9 @@ async function startLive(): Promise<void> {
             },
             sessionUiToken
           );
+          if (shouldLivePreview()) {
+            setLiveInterimText(`[${msg.error}]`);
+          }
         }
         return;
       }
@@ -4092,6 +4166,16 @@ async function stopLive(enhance: boolean): Promise<void> {
   const sessionArchiveDir = String(activeLiveArchiveDir || currentArchiveDirSnapshot()).trim();
   const startupAbortReason = liveStartAbortReason;
   liveStartAbortReason = "";
+
+  // Timing instrumentation — each phase stamps a timestamp so we can
+  // see exactly where stopLive spends its milliseconds. Inspect via
+  // ``window.__transcriptorStopTimings`` in devtools after a stop.
+  const stopTimings: Array<[string, number]> = [];
+  const stopT0 = performance.now();
+  const mark = (label: string): void => {
+    stopTimings.push([label, performance.now() - stopT0]);
+  };
+
   setCurrentRecordingSummary({
     title: _smartTitle(sourceLiveText),
     status: "Finalizing recording and assembling the canonical audio file.",
@@ -4099,13 +4183,17 @@ async function stopLive(enhance: boolean): Promise<void> {
   }, sessionUiToken);
 
   await flushWorkletPort();
+  mark("flushWorkletPort");
   await waitForWorkletDrain();
+  mark("waitForWorkletDrain");
   await stopMediaRecorderAndFlush();
+  mark("stopMediaRecorderAndFlush");
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   } catch (e) {
     console.debug("MediaStream stop failed (non-fatal)", e);
   }
+  mark("stream.getTracks.stop");
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
@@ -4115,9 +4203,23 @@ async function stopLive(enhance: boolean): Promise<void> {
   // session token so that if the user starts a new recording before this
   // one finishes finalizing, we cannot accidentally read the new
   // session's envelope.
+  // Snapshot the committed live segments BEFORE the cleanup phase so the
+  // deepgram branch below can use them as a fast-path transcript even if
+  // the upstream socket errored mid-stream and the final envelope never
+  // arrives. 1500ms is plenty for a well-behaved Deepgram finalize; if
+  // it doesn't come back in that time, the committed segments we already
+  // have are our ground truth.
+  const committedSegmentsAtStop: TranscriptSegment[] = liveTranscriptSegments.slice();
+  const committedDisplayAtStop = liveCommittedDisplayCache;
+  const liveStreamErrorAtStop = liveStreamError;
+
   let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
   if (ws) {
-    const finalizeWaitMs = liveWsMode === "deepgram-stream" ? 8000 : 1500;
+    // 1500ms for every mode: Deepgram finalize round-trip is typically
+    // 200–500ms, local assist flush is <100ms. The 8s safety timeout
+    // we used to keep was the dominant source of "stop takes forever"
+    // because every session waited it out when the final arrived late.
+    const finalizeWaitMs = 1500;
     liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, finalizeWaitMs);
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -4129,12 +4231,14 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
 
   const mergedCapture = mergeCapturedChunks(chunks);
+  mark("mergeCapturedChunks");
   const canonicalCapture = await selectCanonicalCapturedAudio({
     pcmSamples: mergedCapture,
     pcmSampleRate: AUDIO_TOKENS.liveSampleRateHz,
     recordedChunks: recordedWebmChunks,
     expectedDurationSec: recordedSec,
   });
+  mark("selectCanonicalCapturedAudio");
   if (canonicalCapture.file) {
     savedAudioFile = canonicalCapture.file;
     transcribeInputFile = canonicalCapture.file;
@@ -4532,72 +4636,72 @@ async function stopLive(enhance: boolean): Promise<void> {
       const syncOut = await runLocalFinalPass();
       transcriptRaw = String(syncOut.text || "").trim();
     } else if (provider === "deepgram") {
-      // Deepgram streamed the full transcript in real time. We only need
-      // to await the final envelope that the backend dispatches after
-      // we sent {type:"finalize"} above. No file re-upload, no extra
-      // billing, no 10-second stall.
+      // Deepgram already streamed the transcript in real time. The
+      // committed segments we captured above are the ground truth —
+      // we use them immediately and only spend up to 1500ms waiting
+      // for any stragglers that might arrive after CloseStream. If
+      // the stream errored mid-way, we STILL use whatever we have
+      // without waiting at all.
       if (isCurrentUiSession(sessionUiToken)) {
-        $("progressFill").style.width = "80%";
-        $("progressText").textContent = "80%";
+        $("progressFill").style.width = "85%";
+        $("progressText").textContent = "85%";
       }
-      setStatusScoped(sessionUiToken, "Finalizing live stream");
-      patchCurrentRecordingSummary({
-        title: provisionalTitle,
-        status: "Waiting for Deepgram to flush the final segments.",
-        tone: "info",
-      }, sessionUiToken);
-      const envelope = liveFinalPromise ? await liveFinalPromise : null;
-      const envelopeError = envelope?.error || liveStreamError || "";
+      setStatusScoped(sessionUiToken, "Finalizing");
 
-      if (envelope && envelope.text && !envelopeError) {
-        transcriptRaw = envelope.text.trim();
-      } else if (envelope && envelope.segments.length && !envelopeError) {
-        transcriptRaw = joinTranscriptSegments(envelope.segments);
-      }
+      // Fast path: the live stream already errored before stop. Skip
+      // the finalize wait entirely and go straight to what we have.
+      if (liveStreamErrorAtStop) {
+        transcriptRaw = committedDisplayAtStop || joinTranscriptSegments(committedSegmentsAtStop);
+      } else {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "Sealing Deepgram stream…",
+          tone: "info",
+        }, sessionUiToken);
+        const envelope = liveFinalPromise ? await liveFinalPromise : null;
+        const envelopeError = envelope?.error || liveStreamError || "";
 
-      if (!transcriptRaw) {
-        // Live stream ran into trouble (connect fail, mid-stream drop,
-        // empty transcript, timeout). Try Deepgram REST on the saved
-        // canonical audio — it's the same service and gives us the
-        // same quality without any streaming-state coupling.
-        if (transcribeInputFile && isProviderKeyConfigured("deepgram")) {
-          const restStatus = envelopeError
-            ? `Live stream issue (${envelopeError}). Falling back to Deepgram REST on the saved audio.`
-            : "Live stream returned no transcript. Falling back to Deepgram REST on the saved audio.";
+        if (envelope && envelope.text && !envelopeError) {
+          transcriptRaw = envelope.text.trim();
+        } else if (envelope && envelope.segments.length && !envelopeError) {
+          transcriptRaw = joinTranscriptSegments(envelope.segments);
+        } else if (committedDisplayAtStop) {
+          // Envelope didn't come back in time (rare) but we still have
+          // all the committed segments from before stop — use them.
+          transcriptRaw = committedDisplayAtStop;
+        } else if (committedSegmentsAtStop.length) {
+          transcriptRaw = joinTranscriptSegments(committedSegmentsAtStop);
+        } else if (envelopeError) {
+          // Nothing committed, nothing final, only an error — try
+          // Deepgram REST on the saved audio as a last resort.
           patchCurrentRecordingSummary({
             title: provisionalTitle,
-            status: restStatus,
+            status: `Live stream issue (${envelopeError}). Falling back to Deepgram REST.`,
             tone: "warning",
           }, sessionUiToken);
-          try {
-            const fallback = await remoteJobSync(transcribeInputFile, {
-              provider: "deepgram",
-              language: languageValue,
-              diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-              openrouterModel: getRemoteModelValue("deepgram"),
-            });
-            transcriptRaw = String(fallback.text || "").trim();
-          } catch (e) {
-            console.warn("Deepgram REST fallback failed; using local full-audio pass", e);
-            patchCurrentRecordingSummary({
-              title: provisionalTitle,
-              status: "Deepgram REST fallback failed. Transcribing locally from the saved audio.",
-              tone: "warning",
-            }, sessionUiToken);
+          if (transcribeInputFile && isProviderKeyConfigured("deepgram")) {
             try {
-              const fallbackOut = await runLocalFinalPass();
-              transcriptRaw = String(fallbackOut.text || "").trim();
-            } catch (localError) {
-              console.error("Local fallback also failed", localError);
+              const fallback = await remoteJobSync(transcribeInputFile, {
+                provider: "deepgram",
+                language: languageValue,
+                diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+                openrouterModel: getRemoteModelValue("deepgram"),
+              });
+              transcriptRaw = String(fallback.text || "").trim();
+            } catch (e) {
+              console.warn("Deepgram REST fallback failed; using local full-audio pass", e);
+              try {
+                const fallbackOut = await runLocalFinalPass();
+                transcriptRaw = String(fallbackOut.text || "").trim();
+              } catch (localError) {
+                console.error("Local fallback also failed", localError);
+              }
             }
           }
         }
       }
 
-      // Last resort: whatever the local assist did capture during the
-      // session. For Deepgram mode there is no local assist (the WS
-      // ran deepgram proxy), so this is typically empty — but kept
-      // defensively so the user never sees a blank transcript.
+      // Very last resort: whatever the live source text captured.
       if (!transcriptRaw) {
         const committed = getCanonicalLiveSourceText();
         if (committed) transcriptRaw = committed;
@@ -4764,6 +4868,19 @@ async function stopLive(enhance: boolean): Promise<void> {
   } finally {
     clearLiveDraft();
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    mark("stopLive:done");
+    const totalMs = performance.now() - stopT0;
+    const labels = stopTimings
+      .map(([label, t], i) => {
+        const prev = i > 0 ? stopTimings[i - 1][1] : 0;
+        return `${label}: ${(t - prev).toFixed(0)}ms`;
+      })
+      .join(" → ");
+    console.info(`[stopLive] total=${totalMs.toFixed(0)}ms | ${labels}`);
+    (window as unknown as { __transcriptorStopTimings?: unknown }).__transcriptorStopTimings = {
+      totalMs,
+      phases: stopTimings,
+    };
   }
 }
 
@@ -5218,6 +5335,70 @@ function gComputeEdges(): void {
   gEdges = candidates.slice(0, MAX_EDGES).map((cc) => [cc.i, cc.j]);
 }
 
+/**
+ * Post-layout relaxation pass — nudges overlapping nodes apart.
+ *
+ * Even with the deterministic Fibonacci cluster layout, nodes from
+ * adjacent clusters (or from same-keyword clusters with many members)
+ * can end up within each other's radius. Rather than grow the
+ * cluster spacing (which leaves big gaps), we run ~12 iterations of
+ * simple pairwise repulsion using a spatial hash to keep the pass
+ * O(N) on average instead of O(N²). Two circles overlap iff the
+ * distance between their centres is less than the sum of their
+ * radii — we split the overlap 50/50 and push them apart along the
+ * separating axis.
+ */
+function gRelaxCollisions(iterations = 12, padding = 4): void {
+  if (gNodes.length < 2) return;
+  const cellSize = 64;
+  for (let iter = 0; iter < iterations; iter++) {
+    const grid: Map<string, number[]> = new Map();
+    for (let i = 0; i < gNodes.length; i++) {
+      const n = gNodes[i];
+      const gx = Math.floor(n.x / cellSize);
+      const gy = Math.floor(n.y / cellSize);
+      const key = `${gx},${gy}`;
+      let bucket = grid.get(key);
+      if (!bucket) {
+        bucket = [];
+        grid.set(key, bucket);
+      }
+      bucket.push(i);
+    }
+    let anyMove = false;
+    for (let i = 0; i < gNodes.length; i++) {
+      const a = gNodes[i];
+      const gx = Math.floor(a.x / cellSize);
+      const gy = Math.floor(a.y / cellSize);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const bucket = grid.get(`${gx + dx},${gy + dy}`);
+          if (!bucket) continue;
+          for (const j of bucket) {
+            if (j <= i) continue;
+            const b = gNodes[j];
+            const ddx = b.x - a.x;
+            const ddy = b.y - a.y;
+            const minDist = a.r + b.r + padding;
+            const distSq = ddx * ddx + ddy * ddy;
+            if (distSq >= minDist * minDist) continue;
+            const dist = Math.sqrt(distSq) || 0.0001;
+            const overlap = (minDist - dist) / 2;
+            const ux = ddx / dist;
+            const uy = ddy / dist;
+            a.x -= ux * overlap;
+            a.y -= uy * overlap;
+            b.x += ux * overlap;
+            b.y += uy * overlap;
+            anyMove = true;
+          }
+        }
+      }
+    }
+    if (!anyMove) break;
+  }
+}
+
 function gCenterView(): void {
   if (gNodes.length === 0) return;
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -5259,12 +5440,16 @@ async function loadGraphData(): Promise<void> {
       name: it.name, displayName: it.display_name,
       provider: it.provider || "unknown", keywords: it.keywords || [],
       x: 0, y: 0, vx: 0, vy: 0,
-      r: Math.max(3, Math.min(10, 3 + Math.sqrt(Math.max((it.keywords || []).length, 1)) * 1.5)),
+      // Larger baseline radius so clusters feel substantial. The
+      // log scale lets a "3-keyword" node and a "12-keyword" node
+      // differ visibly without the big one blotting out neighbours.
+      r: Math.max(5, Math.min(14, 5 + Math.log2(Math.max((it.keywords || []).length, 1) + 1) * 3)),
     }));
     $("graphInfoText").textContent = `${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}`;
     if (gNodes.length === 0) { gRender(); return; }
 
     gClusterLayout();
+    gRelaxCollisions();
     gComputeEdges();
     gCenterView();
     gRender();
@@ -5521,6 +5706,13 @@ void loadCfg()
   .catch(() => { });
 initQuickControls();
 syncRemoteModelOptions();
+populateUpscaleModelOptions();
+(document.getElementById("upscaleModelSelect") as HTMLSelectElement | null)?.addEventListener(
+  "change",
+  () => {
+    queueUiPreferencesSave();
+  }
+);
 void refreshNetworkState();
 window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());

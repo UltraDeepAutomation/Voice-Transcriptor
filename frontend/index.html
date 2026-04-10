@@ -102,15 +102,15 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Live Preview</span>
                 <div class="pane-actions">
-                  <label class="toggle-inline" title="Show live partial transcript while recording">
+                  <label class="toggle-inline toggle-green" title="Show live partial transcript while recording">
                     <input id="livePreviewToggle" type="checkbox" />
                   </label>
                 </div>
               </div>
-              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
+              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row" id="livePaneToolbarRow">
                 <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-live">
-                  <div class="pane-control-group pane-control-group-compact">
-                    <select id="model">
+                  <div class="pane-control-group pane-control-group-compact" id="liveLocalModelGroup" title="Whisper model for local live preview and offline fallback">
+                    <select id="model" aria-label="Local Whisper model">
                       <option value="tiny">tiny</option>
                       <option value="base">base</option>
                       <option value="small" selected>small</option>
@@ -129,7 +129,7 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Transcribe <span class="pane-latency" id="transcribeLatency">--</span></span>
                 <div class="pane-actions">
-                  <label class="toggle-inline" title="Auto transcribe after stopping recording">
+                  <label class="toggle-inline toggle-blue" title="Auto transcribe after stopping recording">
                     <input id="autoTranscribeToggle" type="checkbox" checked />
                   </label>
                 </div>
@@ -202,16 +202,13 @@
             <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
 
             <div class="pane-footer current-audio-row" id="currentRecordingAudioRow" hidden>
-              <div class="current-audio-copy">
-                <span class="current-audio-meta" id="currentRecordingAudioMeta"></span>
-              </div>
               <audio id="currentRecordingAudio" controls></audio>
-              <div class="pane-footer-actions current-audio-actions">
-                <a class="icon-btn" id="currentRecordingOpenBtn" href="#" target="_blank" rel="noopener" aria-label="Open audio"
-                  title="Open audio"><span aria-hidden="true">↗</span></a>
-                <a class="icon-btn" id="currentRecordingDownloadBtn" href="#" aria-label="Download audio"
-                  title="Download audio"><span aria-hidden="true">↓</span></a>
-              </div>
+              <span class="current-audio-meta" id="currentRecordingAudioMeta"></span>
+              <!-- ``Open`` and ``Download`` icon buttons removed: the
+                   native ``<audio controls>`` chrome already ships
+                   a three-dot menu with "Download" and the browser
+                   can open the object URL in a new tab. Having two
+                   redundant ways to do the same thing was clutter. -->
             </div>
 
             <div class="pane-footer resource-row" id="downloadRow" hidden>
@@ -225,7 +222,7 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Upscale <span class="pane-latency" id="upscaleLatency">--</span></span>
                 <div class="pane-actions">
-                  <label class="toggle-inline" title="Improve transcript before paste/save">
+                  <label class="toggle-inline toggle-purple" title="Improve transcript before paste/save">
                     <input id="upscaleToggle" type="checkbox" />
                   </label>
                 </div>
@@ -233,6 +230,7 @@
               <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
                 <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-upscale">
                   <div class="pane-control-group pane-control-group-primary">
+                    <select id="upscaleModelSelect" title="LLM used to rewrite the transcript" aria-label="Upscale model"></select>
                     <div class="upscale-preset-wrap" id="upscalePresetWrap">
                       <select id="upscalePresetSelect" title="Upscale preset"></select>
                       <button class="icon-btn preset-delete-btn" id="upscalePresetDeleteBtn" type="button"

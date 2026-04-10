@@ -3728,9 +3728,9 @@ function waitForHttp(url, timeoutMs) {
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
   win = new BrowserWindow({
-    width: 1240,
+    width: 1340,
     height: 760,
-    minWidth: 960,
+    minWidth: 1060,
     minHeight: 680,
     backgroundColor: "#1a1a1a",
     title: "Transcriptor",

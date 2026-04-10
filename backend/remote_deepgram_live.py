@@ -291,6 +291,10 @@ class DeepgramLiveSession:
 
         Silently no-ops when the session is already closed so callers can
         keep draining the mic until the consumer notices the close.
+        Mid-stream send failures are only treated as fatal when NO final
+        segments have been received yet — if we already have committed
+        text, the caller will use it and a send failure just means we
+        stop pushing new audio to an already-dead connection.
         """
         if self._closed or self._ws is None:
             return
@@ -299,11 +303,18 @@ class DeepgramLiveSession:
         try:
             await self._ws.send(chunk)
         except ConnectionClosed as e:
+            fatal = self.stats.segments_final == 0
             self._report_error(
-                f"Deepgram upstream closed while sending: {e}", fatal=True
+                f"Deepgram upstream closed while sending: {e}", fatal=fatal
             )
+            if not fatal:
+                logger.info(
+                    "deepgram-live: send after close, degrading gracefully (%d committed segs)",
+                    self.stats.segments_final,
+                )
         except WebSocketException as e:
-            self._report_error(f"Deepgram send failed: {e}", fatal=True)
+            fatal = self.stats.segments_final == 0
+            self._report_error(f"Deepgram send failed: {e}", fatal=fatal)
         else:
             self.stats.bytes_sent += len(chunk)
             self.stats.chunks_sent += 1
@@ -474,13 +485,31 @@ class DeepgramLiveSession:
             code = getattr(e, "code", None)
             reason = getattr(e, "reason", "") or ""
             logger.info(
-                "deepgram-live: upstream closed code=%s reason=%s",
+                "deepgram-live: upstream closed code=%s reason=%s finalize_sent=%s final_segs=%d",
                 code,
                 reason,
+                self._finalize_sent,
+                self.stats.segments_final,
             )
-            # Codes 1000/1001/1005 are normal closures. Anything else
-            # deserves an error so the caller can fall back.
-            if code not in (None, 1000, 1001, 1005) and not self._finalize_sent:
+            # Normal closure codes — nothing to report.
+            if code in (None, 1000, 1001, 1005) or self._finalize_sent:
+                pass
+            elif self.stats.segments_final > 0:
+                # Stream dropped mid-session, BUT we already committed
+                # some final segments. Don't raise a fatal error — the
+                # caller will use the committed text as the transcript.
+                # This is the common case when Deepgram closes an idle
+                # connection that we haven't managed to keep awake.
+                logger.warning(
+                    "deepgram-live: stream ended early with %d committed segments, using them as transcript",
+                    self.stats.segments_final,
+                )
+                self._last_error = (
+                    f"stream ended early (code={code}, reason={reason or 'none'})"
+                )
+            else:
+                # No committed text and the stream dropped — this IS a
+                # fatal error the caller must surface.
                 self._report_error(
                     f"Deepgram upstream closed unexpectedly (code={code}, reason={reason or 'none'})",
                     fatal=True,
@@ -488,8 +517,18 @@ class DeepgramLiveSession:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._report_error(f"Deepgram recv error: {e}", fatal=True)
-            logger.error("deepgram-live: recv_loop exception", exc_info=True)
+            # Same logic: if we have committed segments, don't scream
+            # at the user — use what we have.
+            if self.stats.segments_final > 0:
+                logger.warning(
+                    "deepgram-live: recv error after %d committed segments: %s",
+                    self.stats.segments_final,
+                    e,
+                )
+                self._last_error = f"recv error: {e}"
+            else:
+                self._report_error(f"Deepgram recv error: {e}", fatal=True)
+                logger.error("deepgram-live: recv_loop exception", exc_info=True)
         finally:
             self._closed = True
             try:

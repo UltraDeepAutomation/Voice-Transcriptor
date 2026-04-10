@@ -200,6 +200,25 @@ def _startup_warm_models() -> None:
     threading.Thread(target=_warm_default_local_model, daemon=True).start()
 
 
+@app.on_event("startup")
+def _startup_retroactive_audio_retention() -> None:
+    """Prune legacy audio files left over from previous app versions.
+
+    Users upgrading from a build that kept audio-per-recording end up
+    with many .wav files cluttering the archive. We enforce the "one
+    audio per archive" rule on startup — it's cheap (single iterdir
+    pass) and runs off the event loop so backend responsiveness is
+    unaffected.
+    """
+    def _run() -> None:
+        try:
+            _retroactive_audio_retention()
+        except Exception as e:
+            logger.warning("retroactive audio retention startup task failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _origin_allowed(origin: str, request: Request) -> bool:
     parsed = urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
@@ -862,6 +881,62 @@ def _prune_old_recording_audio(
         except OSError as e:
             logger.debug("audio retention: skip %s: %s", entry, e)
     return deleted
+
+
+def _retroactive_audio_retention(target_dir: Optional[Path] = None) -> int:
+    """Enforce the "one audio per archive" rule on an existing archive.
+
+    The per-save retention policy (_prune_old_recording_audio) only
+    runs when a NEW recording is saved. For users who accumulated
+    audio files from previous app versions, those stay on disk
+    forever. This helper walks the whole archive, finds the newest
+    ``.txt`` transcript, and deletes every audio file that doesn't
+    belong to that newest stem.
+
+    Called once on backend startup. Safe to call repeatedly — it
+    becomes a no-op when there's nothing to prune.
+    """
+    try:
+        root = target_dir or _resolve_recordings_dir()
+    except Exception as e:
+        logger.warning("retroactive audio retention: resolve dir failed: %s", e)
+        return 0
+    try:
+        entries = list(root.iterdir())
+    except OSError as e:
+        logger.warning("retroactive audio retention: iterdir failed: %s", e)
+        return 0
+
+    # Pick the newest .txt transcript by mtime; its stem is the one we
+    # keep audio for.
+    newest_txt: Optional[Path] = None
+    newest_mtime: float = -1.0
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() != ".txt":
+                continue
+            m = entry.stat().st_mtime
+            if m > newest_mtime:
+                newest_mtime = m
+                newest_txt = entry
+        except OSError as e:
+            logger.debug("retroactive audio retention: stat failed for %s: %s", entry, e)
+            continue
+
+    keep_stem = newest_txt.stem if newest_txt else ""
+    if not keep_stem:
+        # Nothing to keep; don't nuke everything.
+        return 0
+    pruned = _prune_old_recording_audio(root, keep_stem)
+    if pruned > 0:
+        logger.info(
+            "retroactive audio retention: pruned %d old audio files, kept %s",
+            pruned,
+            keep_stem,
+        )
+    return pruned
 
 
 def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> dict[str, Any]:
