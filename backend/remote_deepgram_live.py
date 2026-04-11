@@ -80,8 +80,24 @@ class DeepgramLiveConfig:
     interim_results: bool = True
     punctuate: bool = True
     smart_format: bool = True
-    endpointing_ms: int = 300
-    utterance_end_ms: int = 1200
+    # Endpointing is the silence threshold (in ms) Deepgram uses to
+    # decide a chunk is "complete enough" to seal as is_final=true.
+    # The old value (300 ms) was tuned for very short commands and
+    # produced grammatically-broken fragments for conversational
+    # speech — the user's "по чанкам не всегда грамотно отрабатывает"
+    # report. 700 ms matches Deepgram's own recommendation for
+    # dictation / long-form and lets Nova-3 build a full clause
+    # before finalizing, so segments land as proper sentences with
+    # punctuation instead of fragments like "I think that" → "we
+    # should do" → "this thing".
+    endpointing_ms: int = 700
+    # Utterance end is the silence threshold that triggers
+    # ``speech_final=true`` (end-of-utterance signal used downstream
+    # to decide when to emit a period). 1200 ms was too aggressive
+    # for conversational pauses (natural "um" breaks). 2000 ms is
+    # Deepgram's recommended long-form value and prevents a thought
+    # from splitting across two "final" events.
+    utterance_end_ms: int = 2000
     filler_words: bool = False
     diarize: bool = False
 

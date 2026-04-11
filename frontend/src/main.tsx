@@ -2678,7 +2678,14 @@ async function loadCfg(): Promise<void> {
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
     const livePreview = $("livePreviewToggle") as HTMLInputElement;
     auto.checked = ui.auto_transcribe !== false;
-    livePreview.checked = ui.live_preview === true;
+    // Live preview defaults to ON for new users. Previously this was
+    // ``ui.live_preview === true`` (strict equal) — which returned
+    // false for any fresh config without that key, leaving the user
+    // with an empty Live Preview pane they never saw fill in. The
+    // "live транскрипция не работает" report was caused by the
+    // default, not by broken streaming. Using ``!== false`` keeps
+    // backwards compatibility: explicit ``false`` stays off.
+    livePreview.checked = ui.live_preview !== false;
     const autoStopEnabledEl = $("autoStopSilenceEnabled") as HTMLInputElement;
     const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
@@ -3222,7 +3229,14 @@ function renderRecordingsList(): void {
     }
     btn.appendChild(title);
     btn.appendChild(meta);
-    if (badges.childElementCount > 0) btn.appendChild(badges);
+    // Always attach the badges container even when empty — its
+    // ``min-height: 22px`` rule gives every recording-item the same
+    // intrinsic content height, so old recordings (no provider,
+    // no language, no audio) render at the same size as new ones
+    // with full badge metadata. The "у старых записей огромного
+    // размера разросшиеся" report was caused by the mix of
+    // differently-tall items across new/old content.
+    btn.appendChild(badges);
     btn.onclick = () => void openRecording(it.name);
     list.appendChild(btn);
   });
@@ -3947,6 +3961,20 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   // current display.
   if (isCurrentUiSession(signal.sessionToken || "")) {
     $("finalOutput").textContent = domText;
+    // Channel 4: when a real transcript lands in the Transcribe pane,
+    // the Live Preview pane must no longer show the same text — two
+    // panes with identical content is the "перекрывающиеся транскрипции"
+    // bug the user reported. Clearing only happens for the
+    // ``transcript`` kind so status/error messages (which are
+    // intermediate) keep the live preview visible for context.
+    if (kind === "transcript" && pasteText) {
+      liveDraftText = "";
+      liveDraftDisplayText = "";
+      liveInterimText = "";
+      liveTranscriptSegments = [];
+      liveCommittedDisplayCache = "";
+      scheduleLiveOutputRender();
+    }
   }
 }
 
