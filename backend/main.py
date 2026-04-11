@@ -1851,6 +1851,48 @@ async def _run_deepgram_live_session(
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
+                        # Tail-preserving drain: the frontend stops the
+                        # microphone BEFORE sending ``finalize``, so on a
+                        # healthy connection there should be no more
+                        # bytes in flight. But the wire still has in-
+                        # transit frames — WebSocket MessageEvent delivery
+                        # is async, and if we ``return`` immediately any
+                        # bytes that arrived AFTER the finalize text
+                        # frame but BEFORE we drained the receive buffer
+                        # would be silently dropped. A short non-blocking
+                        # drain forwards those frames to Deepgram first;
+                        # finalize then happens with the full audio
+                        # already upstream. 250 ms covers the wire RTT
+                        # and any queued fragments; anything longer is a
+                        # network stall and not worth waiting for.
+                        drain_deadline = time.monotonic() + 0.25
+                        while time.monotonic() < drain_deadline:
+                            try:
+                                tail_msg = await asyncio.wait_for(
+                                    _ws_recv_next(websocket),
+                                    timeout=max(
+                                        0.0,
+                                        drain_deadline - time.monotonic(),
+                                    ),
+                                )
+                            except asyncio.TimeoutError:
+                                break
+                            tail_kind = tail_msg["kind"]
+                            if tail_kind == "bytes":
+                                if session.is_closed:
+                                    _record_recovery_chunk(
+                                        recovery, tail_msg["data"],
+                                    )
+                                    continue
+                                tail_data = tail_msg["data"]
+                                _record_recovery_chunk(recovery, tail_data)
+                                await session.send_pcm(tail_data)
+                                continue
+                            if tail_kind == "disconnect":
+                                break
+                            # Any non-bytes non-disconnect frame (stray
+                            # control msg, text, etc.) ends the drain.
+                            break
                         stop.set()
                         return
         except Exception as e:

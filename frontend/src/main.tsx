@@ -4719,18 +4719,61 @@ async function stopLive(enhance: boolean): Promise<void> {
     tone: "info",
   }, sessionUiToken);
 
-  await flushWorkletPort();
-  mark("flushWorkletPort");
-  await waitForWorkletDrain();
-  mark("waitForWorkletDrain");
-  await stopMediaRecorderAndFlush();
-  mark("stopMediaRecorderAndFlush");
+  // ── Tail-preserving stop sequence ───────────────────────────────────
+  //
+  // We want EVERY sample captured up to the instant the user pressed
+  // Stop to land in both the canonical WAV and the Deepgram transcript.
+  // Any reordering here directly translates into "last few seconds
+  // chopped off" reports.
+  //
+  // The enforced ordering is:
+  //
+  //   1. Stop the MediaStream tracks. This synchronously freezes the
+  //      microphone — no new AudioWorklet render quanta will ever be
+  //      produced after this returns.
+  //
+  //   2. flushWorkletPort + waitForWorkletDrain. The worklet has a
+  //      MessagePort queue; anything posted BEFORE step 1 returned is
+  //      still in flight. We barrier on it so every ``pushCapturedFrame``
+  //      callback that the worklet already scheduled runs before we
+  //      move on — this is the ONLY way to guarantee that the last
+  //      PCM sample is handed to pcmSink.append AND to ws.send.
+  //
+  //   3. Stop MediaRecorder and flush WebM chunks. Runs after the
+  //      mic is dead so we don't generate more audio while we're
+  //      waiting on the stop event.
+  //
+  //   4. pcmSink.finalize. After step 2 we know every captured frame
+  //      has been handed to sink.append — finalize just drains the
+  //      already-queued chunks.
+  //
+  //   5. Send {type:"finalize"} to backend. At this point ws has no
+  //      more PCM to send (mic is dead, worklet drained), so the
+  //      backend receiver sees the finalize message AFTER every byte
+  //      we intended to send. This is what tells Deepgram to close
+  //      its stream and return the final envelope covering ALL
+  //      audio — including the trailing clause the user was still
+  //      speaking.
+  //
+  // The old order was: flushWorkletPort → waitForWorkletDrain →
+  // stopMediaRecorderAndFlush (up to 3s!) → stream.stop() → finalize.
+  // That left the mic live for up to 3 seconds while MediaRecorder was
+  // being flushed, and those trailing frames could arrive at Deepgram
+  // AFTER CloseStream and get dropped. Reordering stream.stop() to
+  // step 1 fixes this at the root.
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   } catch (e) {
     console.debug("MediaStream stop failed (non-fatal)", e);
   }
   mark("stream.getTracks.stop");
+
+  await flushWorkletPort();
+  mark("flushWorkletPort");
+  await waitForWorkletDrain();
+  mark("waitForWorkletDrain");
+  await stopMediaRecorderAndFlush();
+  mark("stopMediaRecorderAndFlush");
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
@@ -4740,23 +4783,30 @@ async function stopLive(enhance: boolean): Promise<void> {
   // session token so that if the user starts a new recording before this
   // one finishes finalizing, we cannot accidentally read the new
   // session's envelope.
-  // Snapshot the committed live segments BEFORE the cleanup phase so the
-  // deepgram branch below can use them as a fast-path transcript even if
-  // the upstream socket errored mid-stream and the final envelope never
-  // arrives. 1500ms is plenty for a well-behaved Deepgram finalize; if
-  // it doesn't come back in that time, the committed segments we already
-  // have are our ground truth.
-  const committedSegmentsAtStop: TranscriptSegment[] = liveTranscriptSegments.slice();
-  const committedDisplayAtStop = liveCommittedDisplayCache;
+  //
+  // We snapshot ``liveStreamError`` only — the committed segments
+  // snapshot is NOT taken here. Instead we read the LIVE
+  // ``liveTranscriptSegments`` after awaiting ``liveFinalPromise`` so
+  // interim segments that arrive while the envelope is in flight
+  // (very common: Deepgram streams one more ``is_final`` message
+  // covering the tail of the utterance AFTER CloseStream) still make
+  // it into the transcript. The old code snapshotted BEFORE the wait
+  // and lost those trailing segments — that was the tail-cut bug.
   const liveStreamErrorAtStop = liveStreamError;
 
   let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
   if (ws) {
-    // 1500ms for every mode: Deepgram finalize round-trip is typically
-    // 200–500ms, local assist flush is <100ms. The 8s safety timeout
-    // we used to keep was the dominant source of "stop takes forever"
-    // because every session waited it out when the final arrived late.
-    const finalizeWaitMs = 1500;
+    // 4000 ms budget for the full round-trip after CloseStream:
+    //   endpointing silence threshold (700 ms)
+    //   + Deepgram server-side finalization (~500–2000 ms)
+    //   + network RTT (50–200 ms)
+    //   + backend session.finalize wait + forward (~200 ms)
+    //   + safety margin
+    // Nova-3 can take 1800–2500 ms to return the last is_final after
+    // CloseStream for a long utterance; the old 1500 ms was right on
+    // the edge and routinely timed out, forcing the fallback onto
+    // the stale committed segments — missing the trailing clause.
+    const finalizeWaitMs = 4000;
     liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, finalizeWaitMs);
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -5195,12 +5245,12 @@ async function stopLive(enhance: boolean): Promise<void> {
       const syncOut = await runLocalFinalPass();
       transcriptRaw = String(syncOut.text || "").trim();
     } else if (provider === "deepgram") {
-      // Deepgram already streamed the transcript in real time. The
-      // committed segments we captured above are the ground truth —
-      // we use them immediately and only spend up to 1500ms waiting
-      // for any stragglers that might arrive after CloseStream. If
-      // the stream errored mid-way, we STILL use whatever we have
-      // without waiting at all.
+      // Deepgram already streamed the transcript in real time. We
+      // wait up to 4000 ms for the final envelope after CloseStream
+      // because Nova-3 can take 1.8–2.5 s to emit the last is_final
+      // message for a long utterance's trailing clause. If the
+      // stream errored mid-way, we STILL use whatever committed
+      // segments we have without waiting at all.
       if (isCurrentUiSession(sessionUiToken)) {
         $("progressFill").style.width = "85%";
         $("progressText").textContent = "85%";
@@ -5210,7 +5260,8 @@ async function stopLive(enhance: boolean): Promise<void> {
       // Fast path: the live stream already errored before stop. Skip
       // the finalize wait entirely and go straight to what we have.
       if (liveStreamErrorAtStop) {
-        transcriptRaw = committedDisplayAtStop || joinTranscriptSegments(committedSegmentsAtStop);
+        transcriptRaw =
+          liveCommittedDisplayCache || joinTranscriptSegments(liveTranscriptSegments);
       } else {
         patchCurrentRecordingSummary({
           title: provisionalTitle,
@@ -5220,16 +5271,27 @@ async function stopLive(enhance: boolean): Promise<void> {
         const envelope = liveFinalPromise ? await liveFinalPromise : null;
         const envelopeError = envelope?.error || liveStreamError || "";
 
+        // IMPORTANT: read committed segments AFTER awaiting the
+        // envelope. Deepgram streams additional is_final events on
+        // the WebSocket between our CloseStream and the final
+        // envelope arriving — those land in ``liveTranscriptSegments``
+        // via the normal onmessage handler, but ONLY if we read
+        // them post-await. The old code snapshotted BEFORE the
+        // await and missed every trailing clause.
+        const fallbackDisplay = liveCommittedDisplayCache;
+        const fallbackSegments = liveTranscriptSegments.slice();
+
         if (envelope && envelope.text && !envelopeError) {
           transcriptRaw = envelope.text.trim();
         } else if (envelope && envelope.segments.length && !envelopeError) {
           transcriptRaw = joinTranscriptSegments(envelope.segments);
-        } else if (committedDisplayAtStop) {
-          // Envelope didn't come back in time (rare) but we still have
-          // all the committed segments from before stop — use them.
-          transcriptRaw = committedDisplayAtStop;
-        } else if (committedSegmentsAtStop.length) {
-          transcriptRaw = joinTranscriptSegments(committedSegmentsAtStop);
+        } else if (fallbackDisplay) {
+          // Envelope didn't come back in time but we still have all
+          // the committed segments, including any that arrived while
+          // we were waiting for the envelope.
+          transcriptRaw = fallbackDisplay;
+        } else if (fallbackSegments.length) {
+          transcriptRaw = joinTranscriptSegments(fallbackSegments);
         } else if (envelopeError) {
           // Nothing committed, nothing final, only an error — try
           // Deepgram REST on the saved audio as a last resort.
