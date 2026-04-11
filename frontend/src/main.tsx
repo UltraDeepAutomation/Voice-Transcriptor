@@ -1725,25 +1725,54 @@ async function recoverBackendAudioSessions(): Promise<void> {
   const items = Array.isArray(r.items) ? r.items : [];
   if (!items.length) return;
   const archiveDir = currentArchiveDirSnapshot();
+  // Process each recovery independently. A single failure (e.g. a
+  // spool file that's under the minimum duration threshold and hits
+  // a 400 "live recovery too short") must NOT abort the loop — the
+  // remaining recoveries still deserve to be promoted. We collect
+  // counts and surface a single notice at the end.
+  let succeeded = 0;
+  let failed = 0;
   for (const item of items) {
     const sessionId = String(item?.session_id || "").trim();
     if (!sessionId) continue;
-    const resp = await fetch(`/api/live/recoveries/${encodeURIComponent(sessionId)}/promote`, {
-      method: "POST",
-      headers: {
-        ...authHeaders(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(archiveDir ? { archive_dir: archiveDir } : {}),
-    });
-    if (!resp.ok) throw new Error(await parseError(resp));
+    try {
+      const resp = await fetch(`/api/live/recoveries/${encodeURIComponent(sessionId)}/promote`, {
+        method: "POST",
+        headers: {
+          ...authHeaders(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(archiveDir ? { archive_dir: archiveDir } : {}),
+      });
+      if (!resp.ok) {
+        failed += 1;
+        console.warn(
+          `Recovery promote failed for ${sessionId}:`,
+          await parseError(resp),
+        );
+        continue;
+      }
+      succeeded += 1;
+    } catch (e) {
+      failed += 1;
+      console.warn(`Recovery promote exception for ${sessionId}:`, e);
+    }
   }
-  showRecordSessionNotice(
-    `Recovered ${items.length} interrupted recording${items.length === 1 ? "" : "s"} into Recordings.`,
-    "success",
-    9000
-  );
-  loadRecordings(true).catch(() => { });
+  if (succeeded > 0) {
+    showRecordSessionNotice(
+      `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"} into Recordings.`,
+      "success",
+      9000,
+    );
+    loadRecordings(true).catch(() => { });
+  }
+  if (failed > 0 && succeeded === 0) {
+    showRecordSessionNotice(
+      `Could not recover ${failed} interrupted recording${failed === 1 ? "" : "s"}. Check the Recordings folder manually.`,
+      "warning",
+      9000,
+    );
+  }
 }
 
 function resolveFastLocalLanguage(language: string): string {
@@ -2593,6 +2622,23 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
   return promise;
 }
 
+// Serialized settings-save pipeline.
+//
+// ``queueUiPreferencesSave`` can be called many times per second
+// (slider drag, select change, toggle click). We debounce so only
+// the LAST change within ``settings.saveDebounceMs`` fires, but
+// two rapid bursts could still produce back-to-back fire events
+// whose apiPost calls overlap — and the backend ``save_config``
+// is not atomic against concurrent writes (load_config → merge →
+// tmp write → replace). Overlapping saves can lose fields or
+// serialize updates in the wrong order.
+//
+// We serialize with an in-flight chain: each new save awaits the
+// previous save's completion before issuing its own request. The
+// debounce still batches bursts, and the chain guarantees FIFO
+// ordering so the last write always wins.
+let uiPrefInFlightChain: Promise<void> = Promise.resolve();
+
 function queueUiPreferencesSave(): void {
   if (suppressUiPrefAutosave) return;
   if (uiPrefSaveTimer) {
@@ -2607,33 +2653,40 @@ function queueUiPreferencesSave(): void {
     const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
     const shouldRefreshRecordingsArchive = nextRecordingsDir !== configuredRecordingsDir;
     ($("orModel") as HTMLInputElement).value = openrouterModel;
-    void apiPost<{ ok: boolean }>("/api/config", {
+    const payload = {
       preferences: {
         recordings_dir: nextRecordingsDir,
         remote_provider: remoteProvider,
         openrouter: { model: openrouterModel || "google/gemini-2.5-flash" },
         ui: collectUiPreferences(),
       },
-    })
-      .then(() => {
-        configuredRecordingsDir = nextRecordingsDir;
-        if (!shouldRefreshRecordingsArchive) return;
-        activeResolvedRecordingsDir = "";
-        recordingsBootstrapReady = false;
-        const reloadTask = loadRecordings(false).catch((e) => {
-          console.warn("Recordings archive reload failed", e);
-        });
-        const trackedReloadPromise = reloadTask.finally(() => {
-          if (recordingsBootstrapPromise === trackedReloadPromise) {
-            recordingsBootstrapPromise = null;
-          }
-          recordingsBootstrapReady = !!currentArchiveDirSnapshot();
-          if (recordingsBootstrapReady) {
-          }
-        });
-        recordingsBootstrapPromise = trackedReloadPromise;
-      })
-      .catch(() => {
+    };
+    // Chain each save after the previous one's completion (success
+    // or failure — we don't want one transient 500 to block all
+    // future saves). The ``Promise.resolve()`` tail guarantees the
+    // chain never carries a rejected state forward.
+    uiPrefInFlightChain = uiPrefInFlightChain
+      .catch(() => { })
+      .then(async () => {
+        try {
+          await apiPost<{ ok: boolean }>("/api/config", payload);
+          configuredRecordingsDir = nextRecordingsDir;
+          if (!shouldRefreshRecordingsArchive) return;
+          activeResolvedRecordingsDir = "";
+          recordingsBootstrapReady = false;
+          const reloadTask = loadRecordings(false).catch((e) => {
+            console.warn("Recordings archive reload failed", e);
+          });
+          const trackedReloadPromise = reloadTask.finally(() => {
+            if (recordingsBootstrapPromise === trackedReloadPromise) {
+              recordingsBootstrapPromise = null;
+            }
+            recordingsBootstrapReady = !!currentArchiveDirSnapshot();
+          });
+          recordingsBootstrapPromise = trackedReloadPromise;
+        } catch {
+          // Swallow: a transient 500 will retry on the next change.
+        }
       });
   }, UI_TOKENS.settings.saveDebounceMs);
 }

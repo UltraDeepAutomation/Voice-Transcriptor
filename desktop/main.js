@@ -3291,27 +3291,70 @@ async function processPostStopTask(task) {
       clipboard.writeText(transcript);
     } catch { }
 
+    // Paste target resolution. The start-time snapshot
+    // (``task.targetName``/``task.targetPid``) captures the app the
+    // user was in when they pressed the RECORD shortcut, but the
+    // user may well have switched apps mid-recording — they pressed
+    // the shortcut in Telegram, then Cmd-Tab to Slack to look at
+    // something, speak, and press the shortcut again to stop + paste.
+    // In that case the correct target is the CURRENT frontmost app
+    // (Slack), not the app that was frontmost at record time
+    // (Telegram).
+    //
+    // Strategy (latest-wins with safe fallback):
+    //
+    //   1. Snapshot the current frontmost app.
+    //   2. If it is a real pasteable target (``shouldUsePasteTarget``
+    //      returns true — not Transcriptor/overlay/helper), use it.
+    //   3. Otherwise fall back to the start-time snapshot — the
+    //      overlay might be transiently in front after the user
+    //      clicked its Stop button, or some helper process might
+    //      have taken focus. The start snapshot is still a valid
+    //      best guess in that case.
+    //   4. If even the start snapshot is absent, try to re-activate
+    //      the start-time PID so whatever app was there when
+    //      recording began comes back and receives the paste.
     let effectiveTargetName = task.targetName || "";
     let effectiveTargetPid = Number(task.targetPid || 0);
     try {
       const currentFront = await getFrontmostAppInfo();
       const currentName = String(currentFront.name || "").trim();
       const currentPid = Number(currentFront.pid || 0);
-      if (effectiveTargetPid > 0 && currentPid > 0 && currentPid !== effectiveTargetPid) {
-        const stillRunning = await activateAppByPid(effectiveTargetPid);
-        if (!stillRunning && shouldUsePasteTarget(currentFront)) {
-          traceStep(trace, "target_refreshed", {
+      if (shouldUsePasteTarget(currentFront)) {
+        if (
+          effectiveTargetPid > 0 &&
+          currentPid > 0 &&
+          currentPid !== effectiveTargetPid
+        ) {
+          traceStep(trace, "target_refreshed_from_current_front", {
             oldName: effectiveTargetName,
             oldPid: effectiveTargetPid,
             newName: currentName,
             newPid: currentPid,
           });
-          effectiveTargetName = currentName;
-          effectiveTargetPid = currentPid;
         }
-      } else if (!effectiveTargetName && shouldUsePasteTarget(currentFront)) {
         effectiveTargetName = currentName;
         effectiveTargetPid = currentPid;
+      } else if (
+        effectiveTargetPid > 0 &&
+        currentPid !== effectiveTargetPid
+      ) {
+        // Front app is transcriptor/overlay/helper. Try to re-
+        // activate the start-time target so it receives the paste.
+        const stillRunning = await activateAppByPid(effectiveTargetPid);
+        if (stillRunning) {
+          traceStep(trace, "target_reactivated_start_pid", {
+            name: effectiveTargetName,
+            pid: effectiveTargetPid,
+          });
+        } else {
+          traceStep(trace, "target_lost", {
+            oldName: effectiveTargetName,
+            oldPid: effectiveTargetPid,
+          });
+          effectiveTargetName = "";
+          effectiveTargetPid = 0;
+        }
       }
     } catch { }
 
