@@ -137,15 +137,30 @@ print_step "Installing to $INSTALL_ROOT..."
 cp -R "$APP_PATH" "$INSTALL_ROOT/"
 print_ok "Installed: $TARGET_APP"
 
-# ── 7b. Verify ad-hoc signature ─────────────────────────────────────────
-# afterPack.js already validates the signature with ``codesign --verify
-# --deep --strict`` and aborts the build on failure. This second check
-# runs on the INSTALLED copy so we catch any bit-rot introduced by the
-# ``cp -R`` (unlikely but cheap to confirm). We also print the
-# authority line so the user can see the ad-hoc signer in the log.
+# ── 7b. Verify code signature on the installed copy ────────────────────
+# afterPack.js already runs ``codesign --verify --deep --strict`` on the
+# build staging copy. This second check runs on the INSTALLED copy so
+# we catch any bit-rot introduced by the ``cp -R`` (unlikely but cheap
+# to confirm). We also print the authority line so the user can see
+# who signed the app in the log.
+#
+# ``codesign -dv --verbose=2`` is required to surface the ``Authority=``
+# lines — plain ``-dv`` only prints format/hash metadata. We temporarily
+# disable ``pipefail`` around the authority extraction so that an
+# empty grep match (e.g. ad-hoc signature with no Authority field)
+# never aborts the build — the signature itself is already verified
+# by the ``codesign --verify`` call above.
 print_step "Verifying installed app signature..."
 if /usr/bin/codesign --verify --strict "$TARGET_APP" 2>/dev/null; then
-  AUTHORITY=$(/usr/bin/codesign -dv "$TARGET_APP" 2>&1 | grep -E "^Authority=|^Signature=" | head -2 | tr '\n' ' ')
+  set +o pipefail
+  AUTHORITY=$(/usr/bin/codesign -dv --verbose=2 "$TARGET_APP" 2>&1 \
+    | grep -E "^Authority=" \
+    | head -1 \
+    || true)
+  set -o pipefail
+  if [ -z "$AUTHORITY" ]; then
+    AUTHORITY="Authority=(ad-hoc)"
+  fi
   print_ok "Signature valid — $AUTHORITY"
 else
   print_warn "codesign --verify failed on the installed copy"
@@ -214,10 +229,12 @@ if [ ${#DMG_FILES[@]} -gt 0 ]; then
     echo -e "    ${CYAN}$REPO_DIST_DIR/$(basename "$src_dmg")${NC}"
   done
   echo ""
-  echo -e "  ${BOLD}Signature:${NC} each Transcriptor.app inside the DMG is ad-hoc"
-  echo -e "  signed (hardened runtime + entitlements). On another Mac the"
-  echo -e "  first launch still needs right-click → Open → Open because the"
-  echo -e "  signature has no trusted Apple authority — this is inherent to"
-  echo -e "  free code signing without a paid Developer ID."
+  echo -e "  ${BOLD}Signature:${NC} Transcriptor.app inside each DMG is signed with the"
+  echo -e "  local ${CYAN}${BOLD}$AUTHORITY${NC}${BOLD} certificate${NC} (hardened runtime + entitlements)."
+  echo -e "  On THIS Mac, permission grants persist across rebuilds because TCC"
+  echo -e "  anchors grants to the certificate + bundle identifier."
+  echo -e "  On OTHER Macs the first launch still needs right-click → Open → Open"
+  echo -e "  because the signing cert has no Apple-trusted root — this is inherent"
+  echo -e "  to local self-signed code signing without a paid Apple Developer ID."
 fi
 echo ""

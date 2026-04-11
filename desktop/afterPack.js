@@ -1,52 +1,69 @@
-// afterPack hook for electron-builder.
+// afterPack hook for electron-builder — code signing + TCC stability.
 //
-// Runs AFTER electron-builder has staged Transcriptor.app inside
-// ``dist/mac-arm64/`` or ``dist/mac/`` but BEFORE it packages the
-// .app into a DMG. We take over code signing here so we can do
-// ad-hoc signing (``codesign --sign -``) instead of relying on a
-// paid Apple Developer ID.
+// Runs AFTER electron-builder has staged ``Transcriptor.app`` inside
+// ``dist/mac-arm64/`` or ``dist/mac/`` but BEFORE the .app is packaged
+// into a DMG. We take over code signing here so we can pin a STABLE
+// signing identity across rebuilds — which is the only reliable way
+// to stop macOS TCC (Transparency, Consent, Control) from re-prompting
+// the user for Microphone / Accessibility / Apple Events permissions
+// on every rebuild.
 //
-// Strategy
-// --------
-// We use a single ``codesign --force --deep --sign -`` invocation
-// on the top-level ``.app`` bundle. The ``--deep`` flag walks every
-// nested framework, helper app, dylib, and Mach-O binary in the
-// right order (innermost first) and seals each one. Apple marks
-// ``--deep`` as deprecated for NOTARIZED distribution (Developer ID
-// + notarytool), but it remains the supported and reliable path
-// for ad-hoc signing — which is exactly what we need here.
+// Why rebuilds kept re-prompting
+// ------------------------------
+// macOS TCC indexes granted permissions by:
+//   1. The app's signing identifier (``-i`` / designated requirement), AND
+//   2. For ad-hoc signed apps, the CDHash of the whole .app bundle.
 //
-// An earlier version of this hook implemented a manual walker that
-// picked up only ``.dylib``/``.node``/``.so`` + ``.app``/``.framework``
-// /``.xpc`` bundles. That missed Mach-O executables with no file
-// extension (e.g. ``Electron Framework.framework/Versions/A/Helpers/
-// chrome_crashpad_handler``), so signing the enclosing framework
-// exploded with "code object is not signed at all In subcomponent".
-// ``codesign --deep`` identifies Mach-O binaries by file header
-// rather than filename and handles this path cleanly.
+// Ad-hoc signatures have no trusted authority, so TCC has nothing to
+// verify against except the CDHash. Every rebuild produces a new
+// CDHash (different Electron binary mtimes, different frontend asset
+// hashes, different entitlements seal), so TCC sees every rebuild as
+// a brand-new "unknown" app and blows away every prior grant.
 //
-// Ad-hoc signing semantics
-// ------------------------
-// - Produces a valid code signature with no trusted authority.
-// - Works without friction on the SAME Mac that built the app
-//   (quarantine xattr is stripped in BUILD.sh).
-// - On OTHER Macs the first launch still needs the right-click →
-//   Open confirmation because Gatekeeper cannot verify the
-//   signature against any trusted CA. This is inherent to free
-//   code signing; only a paid Apple Developer ID + notarization
-//   can give a fully frictionless first-launch experience.
+// With a STABLE self-signed certificate (``AntigravityTelegramDev``
+// in the local keychain), TCC anchors grants to the certificate
+// fingerprint + signing identifier pair. Rebuilds keep producing
+// different CDHashes, but TCC recognizes the cert as the same
+// authority and preserves the grant. The user now only sees each
+// permission prompt ONCE in the life of the installation.
 //
-// Why not rely on electron-builder's own signing?
-//   electron-builder resolves ``identity`` as a keychain certificate
-//   NAME. Passing ``"-"`` (the canonical ``codesign`` ad-hoc marker)
-//   fails because ``macCodeSign.js#findIdentity`` treats any non-null
-//   string as a certificate name and returns null when no match is
-//   found. Setting ``identity: null`` tells electron-builder to skip
-//   signing entirely — we pick it up here.
+// Identity selection
+// ------------------
+// The user's local keychain already has a self-signed code-signing
+// cert named "AntigravityTelegramDev" (10-year expiry, Code Signing
+// EKU). We use it as the default identity. If it's not present (fresh
+// machine, CI runner, etc.), we fall back to ad-hoc signing so the
+// build never fails — the user will just be re-prompted on each
+// rebuild like before. This graceful fallback keeps the build
+// reproducible across environments.
+//
+// Entitlements + hardened runtime
+// -------------------------------
+// We still enable ``--options runtime`` (hardened runtime) and pass
+// ``entitlements.mac.plist`` so microphone + Apple Events + JIT +
+// network-client permissions survive the signing step. The
+// entitlements file is the SSOT for what the app is allowed to do
+// after TCC grants permission.
+//
+// Why --deep
+// ----------
+// ``codesign --deep`` walks every nested framework, helper app,
+// dylib, and Mach-O binary in the right order (innermost first) and
+// seals each one with the same identity. Apple marks ``--deep`` as
+// deprecated for NOTARIZED distribution (Developer ID + notarytool),
+// but it remains the supported path for self-signed / ad-hoc local
+// signing. A manual bottom-up walker would miss Mach-O files with
+// no file extension (e.g. ``Helpers/chrome_crashpad_handler``).
 
-const { execFileSync } = require("node:child_process");
+const { execFileSync, execSync } = require("node:child_process");
 const { existsSync, statSync } = require("node:fs");
 const path = require("node:path");
+
+// Name of the preferred code-signing identity to look for in the
+// local keychain. If found, it is used; otherwise we drop to ad-hoc.
+// This specific cert was generated on the user's Mac with a 10-year
+// validity and the Code Signing EKU — perfect for local dev use.
+const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
 
 /**
  * Run ``codesign`` and stream output. Throws on non-zero exit so
@@ -55,6 +72,24 @@ const path = require("node:path");
  */
 function runCodesign(args) {
   execFileSync("/usr/bin/codesign", args, { stdio: "inherit" });
+}
+
+/**
+ * Return ``true`` if the preferred signing identity is currently
+ * available in the local keychain. We probe via ``security find-
+ * identity -v -p codesigning`` and look for the exact CN. An absent
+ * identity (or keychain read failure) yields ``false`` so the caller
+ * can fall back to ad-hoc signing.
+ */
+function hasPreferredIdentity() {
+  try {
+    const out = execSync("/usr/bin/security find-identity -v -p codesigning", {
+      encoding: "utf8",
+    });
+    return out.includes(`"${PREFERRED_SIGNING_IDENTITY}"`);
+  } catch {
+    return false;
+  }
 }
 
 exports.default = async function afterPack(context) {
@@ -78,36 +113,84 @@ exports.default = async function afterPack(context) {
     throw new Error(`afterPack: entitlements plist missing at ${entitlements}`);
   }
 
-  console.log(`[afterPack] Ad-hoc signing ${appPath}`);
-  console.log(`[afterPack] Entitlements: ${entitlements}`);
+  // Bundle identifier pinning
+  //
+  // ``--identifier`` forces the signed bundle's designated
+  // requirement to use the exact bundle ID declared in package.json,
+  // independent of whatever the Info.plist says. This is important
+  // because macOS TCC looks up permission grants keyed by the
+  // DESIGNATED REQUIREMENT's signing identifier, not by the
+  // CFBundleIdentifier string. Pinning both together guarantees that
+  // TCC has a stable key across rebuilds.
+  const bundleId = context.packager.appInfo.id || "local.transcriptor.app";
 
-  // Single deep walk from the top-level .app bundle. codesign
-  // handles the recursion order and identifies Mach-O binaries by
-  // file header, so helper executables without file extensions
-  // (e.g. ``chrome_crashpad_handler``) get signed correctly.
-  runCodesign([
+  // Pick signing identity: stable cert when available, ad-hoc otherwise.
+  const useStableIdentity = hasPreferredIdentity();
+  const signingIdentity = useStableIdentity ? PREFERRED_SIGNING_IDENTITY : "-";
+
+  if (useStableIdentity) {
+    console.log(
+      `[afterPack] Signing ${appPath} with stable identity "${PREFERRED_SIGNING_IDENTITY}"`,
+    );
+    console.log(
+      "[afterPack] TCC permissions (microphone, accessibility, Apple Events) will persist across rebuilds.",
+    );
+  } else {
+    console.log(
+      `[afterPack] Preferred identity "${PREFERRED_SIGNING_IDENTITY}" not in keychain — falling back to ad-hoc signing`,
+    );
+    console.log(
+      "[afterPack] NOTE: ad-hoc signed rebuilds invalidate TCC grants; the user will see permission prompts every build.",
+    );
+  }
+  console.log(`[afterPack] Entitlements: ${entitlements}`);
+  console.log(`[afterPack] Bundle identifier pinned: ${bundleId}`);
+
+  // Single deep walk from the top-level .app bundle. codesign handles
+  // the recursion order and identifies Mach-O binaries by file header,
+  // so helper executables without file extensions (e.g.
+  // ``chrome_crashpad_handler``) get signed correctly.
+  //
+  // For a STABLE identity we drop ``--timestamp=none`` — codesign
+  // falls back to the secure timestamp server when available, which
+  // is fine for local use and matches how Developer ID signed builds
+  // work. For ad-hoc signatures the timestamp flag is a no-op anyway
+  // (Apple's timestamp server only talks to real certs).
+  //
+  // ``--identifier`` pins the signing identifier to the bundle ID
+  // regardless of what's in Info.plist — TCC uses this string (not
+  // CDHash) to look up grants when the signature has a trusted
+  // authority.
+  const signArgs = [
     "--force",
     "--deep",
     "--sign",
-    "-",
-    "--timestamp=none",
+    signingIdentity,
+    "--identifier",
+    bundleId,
     "--options",
     "runtime",
     "--entitlements",
     entitlements,
-    appPath,
-  ]);
+  ];
+  if (!useStableIdentity) {
+    // Ad-hoc signatures can't use timestamps.
+    signArgs.push("--timestamp=none");
+  }
+  signArgs.push(appPath);
+  runCodesign(signArgs);
 
-  // Verify. ``--strict`` catches any resource envelope drift,
-  // ``--deep`` walks all nested items. On failure this throws and
-  // aborts the build, so a broken signature never silently
-  // propagates into the DMG.
+  // Verify. ``--strict`` catches any resource envelope drift, ``--deep``
+  // walks all nested items. On failure this throws and aborts the
+  // build, so a broken signature never silently propagates into the
+  // DMG.
   runCodesign(["--verify", "--deep", "--strict", "--verbose=2", appPath]);
 
   // Print the top-level signature so the build log shows the
-  // ad-hoc signer identity and hardened-runtime flag.
+  // signing identity, team identifier (if any), CDHash, and
+  // hardened-runtime flag.
   try {
-    execFileSync("/usr/bin/codesign", ["-dv", "--verbose=2", appPath], {
+    execFileSync("/usr/bin/codesign", ["-dv", "--verbose=4", appPath], {
       stdio: "inherit",
     });
   } catch {
