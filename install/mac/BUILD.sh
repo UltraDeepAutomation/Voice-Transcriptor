@@ -137,6 +137,20 @@ print_step "Installing to $INSTALL_ROOT..."
 cp -R "$APP_PATH" "$INSTALL_ROOT/"
 print_ok "Installed: $TARGET_APP"
 
+# ── 7b. Verify ad-hoc signature ─────────────────────────────────────────
+# afterPack.js already validates the signature with ``codesign --verify
+# --deep --strict`` and aborts the build on failure. This second check
+# runs on the INSTALLED copy so we catch any bit-rot introduced by the
+# ``cp -R`` (unlikely but cheap to confirm). We also print the
+# authority line so the user can see the ad-hoc signer in the log.
+print_step "Verifying installed app signature..."
+if /usr/bin/codesign --verify --strict "$TARGET_APP" 2>/dev/null; then
+  AUTHORITY=$(/usr/bin/codesign -dv "$TARGET_APP" 2>&1 | grep -E "^Authority=|^Signature=" | head -2 | tr '\n' ' ')
+  print_ok "Signature valid — $AUTHORITY"
+else
+  print_warn "codesign --verify failed on the installed copy"
+fi
+
 # ── 8. Collect DMG installers into repo-level dist/ ─────────────────────
 # electron-builder writes the .dmg files into ``desktop/dist/`` alongside
 # the .app staging directories. We copy them up to ``<repo>/dist/`` with
@@ -200,7 +214,10 @@ if [ ${#DMG_FILES[@]} -gt 0 ]; then
     echo -e "    ${CYAN}$REPO_DIST_DIR/$(basename "$src_dmg")${NC}"
   done
   echo ""
-  echo -e "  ${YELLOW}Note:${NC} these DMGs are unsigned. On another Mac the first"
-  echo -e "  open may require: right-click → Open → Open (to confirm)."
+  echo -e "  ${BOLD}Signature:${NC} each Transcriptor.app inside the DMG is ad-hoc"
+  echo -e "  signed (hardened runtime + entitlements). On another Mac the"
+  echo -e "  first launch still needs right-click → Open → Open because the"
+  echo -e "  signature has no trusted Apple authority — this is inherent to"
+  echo -e "  free code signing without a paid Developer ID."
 fi
 echo ""

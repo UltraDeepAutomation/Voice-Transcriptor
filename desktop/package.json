@@ -20,6 +20,7 @@
   "build": {
     "appId": "local.transcriptor.app",
     "productName": "Transcriptor",
+    "afterPack": "./afterPack.js",
     "files": [
       "main.js",
       "package.json"
