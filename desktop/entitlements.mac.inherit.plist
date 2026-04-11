@@ -2,6 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- See entitlements.mac.plist for a detailed rationale. Helper
+       processes also need disable-library-validation under the
+       hardened runtime when the app is signed with a self-signed
+       certificate, because each helper independently loads the
+       Electron Framework via the same dyld library-validation path.
+       Without this entitlement on the helpers, the GPU/Renderer/
+       Plugin processes crash at launch with the same "different
+       Team IDs" error as the main binary did. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
   <key>com.apple.security.cs.allow-jit</key>
   <true/>
   <key>com.apple.security.cs.allow-unsigned-executable-memory</key>

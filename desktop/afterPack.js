@@ -1,85 +1,70 @@
-// afterPack hook for electron-builder — code signing + TCC stability.
+// afterPack hook for electron-builder — code signing via @electron/osx-sign.
 //
 // Runs AFTER electron-builder has staged ``Transcriptor.app`` inside
-// ``dist/mac-arm64/`` or ``dist/mac/`` but BEFORE the .app is packaged
-// into a DMG. We take over code signing here so we can pin a STABLE
-// signing identity across rebuilds — which is the only reliable way
-// to stop macOS TCC (Transparency, Consent, Control) from re-prompting
-// the user for Microphone / Accessibility / Apple Events permissions
-// on every rebuild.
+// ``dist/mac-arm64/`` or ``dist/mac/`` but BEFORE the DMG wrapper is
+// built. We take over code signing so we can pin a stable identity
+// across rebuilds without re-triggering macOS TCC permission prompts.
 //
-// Why rebuilds kept re-prompting
-// ------------------------------
-// macOS TCC indexes granted permissions by:
-//   1. The app's signing identifier (``-i`` / designated requirement), AND
-//   2. For ad-hoc signed apps, the CDHash of the whole .app bundle.
+// Why @electron/osx-sign instead of raw codesign
+// ------------------------------------------------
+// Our previous attempt used ``codesign --deep --sign X --identifier
+// local.transcriptor.app`` which crashed the app at launch with:
 //
-// Ad-hoc signatures have no trusted authority, so TCC has nothing to
-// verify against except the CDHash. Every rebuild produces a new
-// CDHash (different Electron binary mtimes, different frontend asset
-// hashes, different entitlements seal), so TCC sees every rebuild as
-// a brand-new "unknown" app and blows away every prior grant.
+//     Library not loaded: @rpath/Electron Framework.framework/...
+//     mapping process and mapped file (non-platform) have different
+//     Team IDs
 //
-// With a STABLE self-signed certificate (``AntigravityTelegramDev``
-// in the local keychain), TCC anchors grants to the certificate
-// fingerprint + signing identifier pair. Rebuilds keep producing
-// different CDHashes, but TCC recognizes the cert as the same
-// authority and preserves the grant. The user now only sees each
-// permission prompt ONCE in the life of the installation.
+// Two root causes:
+//
+//   1. ``--deep --identifier Y`` clobbered the signing identifier of
+//      every nested Framework/helper/.app as well. After the pass,
+//      ``Electron Framework`` claimed the SAME identifier
+//      (``local.transcriptor.app``) as the main binary. Hardened
+//      runtime library validation refused to load a "framework"
+//      that identifies as the main app.
+//
+//   2. Each Electron helper (.app / Renderer / Plugin / GPU) needs
+//      its OWN entitlements subset (renderer gets cs.allow-jit only,
+//      the top-level bundle gets the full set including audio-input
+//      and automation). Passing one entitlements file to every
+//      nested item via ``--deep`` over-privileges helpers and still
+//      leaves the top-level bundle misconfigured.
+//
+// ``@electron/osx-sign`` is the canonical Electron signing tool
+// written specifically for this structure. It walks the bundle
+// innermost-first, preserves each nested item's natural identifier,
+// applies helper-specific default entitlements from its bundled
+// templates (``default.darwin.{renderer,plugin,gpu}.plist``), and
+// uses a full custom entitlements file only for the top-level .app.
+// Library validation passes because every item keeps its own
+// identifier and they all share the same signing authority.
 //
 // Identity selection
 // ------------------
-// The user's local keychain already has a self-signed code-signing
-// cert named "AntigravityTelegramDev" (10-year expiry, Code Signing
-// EKU). We use it as the default identity. If it's not present (fresh
-// machine, CI runner, etc.), we fall back to ad-hoc signing so the
-// build never fails — the user will just be re-prompted on each
-// rebuild like before. This graceful fallback keeps the build
-// reproducible across environments.
+// Probes the local keychain for ``AntigravityTelegramDev`` (the
+// user's self-signed 10-year code-signing certificate). When found,
+// uses it as the ``identity`` option. When absent (fresh machine,
+// CI runner), drops to ad-hoc via ``-`` and logs a warning — the
+// build never fails on a missing certificate.
 //
-// Entitlements + hardened runtime
-// -------------------------------
-// We still enable ``--options runtime`` (hardened runtime) and pass
-// ``entitlements.mac.plist`` so microphone + Apple Events + JIT +
-// network-client permissions survive the signing step. The
-// entitlements file is the SSOT for what the app is allowed to do
-// after TCC grants permission.
-//
-// Why --deep
-// ----------
-// ``codesign --deep`` walks every nested framework, helper app,
-// dylib, and Mach-O binary in the right order (innermost first) and
-// seals each one with the same identity. Apple marks ``--deep`` as
-// deprecated for NOTARIZED distribution (Developer ID + notarytool),
-// but it remains the supported path for self-signed / ad-hoc local
-// signing. A manual bottom-up walker would miss Mach-O files with
-// no file extension (e.g. ``Helpers/chrome_crashpad_handler``).
+// TCC persistence
+// ---------------
+// macOS TCC indexes permission grants by the signing certificate
+// fingerprint + bundle identifier. Using a stable keychain identity
+// (instead of ad-hoc ``-``) anchors grants to the certificate, so
+// rebuilds keep their Microphone / Accessibility / Apple Events
+// grants even though every rebuild produces a different CDHash.
 
 const { execFileSync, execSync } = require("node:child_process");
-const { existsSync, statSync } = require("node:fs");
+const { existsSync } = require("node:fs");
 const path = require("node:path");
 
-// Name of the preferred code-signing identity to look for in the
-// local keychain. If found, it is used; otherwise we drop to ad-hoc.
-// This specific cert was generated on the user's Mac with a 10-year
-// validity and the Code Signing EKU — perfect for local dev use.
 const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
 
 /**
- * Run ``codesign`` and stream output. Throws on non-zero exit so
- * the build fails loudly instead of silently producing an unsigned
- * .app.
- */
-function runCodesign(args) {
-  execFileSync("/usr/bin/codesign", args, { stdio: "inherit" });
-}
-
-/**
  * Return ``true`` if the preferred signing identity is currently
- * available in the local keychain. We probe via ``security find-
- * identity -v -p codesigning`` and look for the exact CN. An absent
- * identity (or keychain read failure) yields ``false`` so the caller
- * can fall back to ad-hoc signing.
+ * available in the local keychain. Probes via ``security find-
+ * identity -v -p codesigning``.
  */
 function hasPreferredIdentity() {
   try {
@@ -109,96 +94,172 @@ exports.default = async function afterPack(context) {
 
   const projectDir = context.packager.info.projectDir;
   const entitlements = path.join(projectDir, "entitlements.mac.plist");
+  const inheritEntitlements = path.join(projectDir, "entitlements.mac.inherit.plist");
   if (!existsSync(entitlements)) {
     throw new Error(`afterPack: entitlements plist missing at ${entitlements}`);
   }
+  if (!existsSync(inheritEntitlements)) {
+    throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
+  }
 
-  // Bundle identifier pinning
-  //
-  // ``--identifier`` forces the signed bundle's designated
-  // requirement to use the exact bundle ID declared in package.json,
-  // independent of whatever the Info.plist says. This is important
-  // because macOS TCC looks up permission grants keyed by the
-  // DESIGNATED REQUIREMENT's signing identifier, not by the
-  // CFBundleIdentifier string. Pinning both together guarantees that
-  // TCC has a stable key across rebuilds.
-  const bundleId = context.packager.appInfo.id || "local.transcriptor.app";
-
-  // Pick signing identity: stable cert when available, ad-hoc otherwise.
   const useStableIdentity = hasPreferredIdentity();
-  const signingIdentity = useStableIdentity ? PREFERRED_SIGNING_IDENTITY : "-";
+  const identity = useStableIdentity ? PREFERRED_SIGNING_IDENTITY : "-";
 
   if (useStableIdentity) {
     console.log(
-      `[afterPack] Signing ${appPath} with stable identity "${PREFERRED_SIGNING_IDENTITY}"`,
+      `[afterPack] Signing ${appPath} with stable identity "${PREFERRED_SIGNING_IDENTITY}" via @electron/osx-sign`,
     );
     console.log(
       "[afterPack] TCC permissions (microphone, accessibility, Apple Events) will persist across rebuilds.",
     );
   } else {
     console.log(
-      `[afterPack] Preferred identity "${PREFERRED_SIGNING_IDENTITY}" not in keychain — falling back to ad-hoc signing`,
+      `[afterPack] Preferred identity "${PREFERRED_SIGNING_IDENTITY}" not in keychain — using ad-hoc signing`,
     );
     console.log(
-      "[afterPack] NOTE: ad-hoc signed rebuilds invalidate TCC grants; the user will see permission prompts every build.",
+      "[afterPack] NOTE: ad-hoc rebuilds invalidate TCC grants; the user will see permission prompts every build.",
     );
   }
-  console.log(`[afterPack] Entitlements: ${entitlements}`);
-  console.log(`[afterPack] Bundle identifier pinned: ${bundleId}`);
+  console.log(`[afterPack] Top-level entitlements: ${entitlements}`);
 
-  // Single deep walk from the top-level .app bundle. codesign handles
-  // the recursion order and identifies Mach-O binaries by file header,
-  // so helper executables without file extensions (e.g.
-  // ``chrome_crashpad_handler``) get signed correctly.
+  // @electron/osx-sign is the canonical Electron signing tool. It
+  // walks the bundle innermost-first, preserves each nested item's
+  // natural signing identifier, and applies helper-specific default
+  // entitlements from its bundled templates. We pass:
   //
-  // For a STABLE identity we drop ``--timestamp=none`` — codesign
-  // falls back to the secure timestamp server when available, which
-  // is fine for local use and matches how Developer ID signed builds
-  // work. For ad-hoc signatures the timestamp flag is a no-op anyway
-  // (Apple's timestamp server only talks to real certs).
+  //   - ``app``                 : the .app bundle to sign
+  //   - ``identity``            : keychain cert name or "-" for ad-hoc
+  //   - ``identityValidation``  : false so it accepts our self-signed
+  //                                cert and the ad-hoc "-" marker
+  //                                without trying to validate them
+  //                                against Apple's cert chain
+  //   - ``optionsForFile``      : per-file hook. For the top-level
+  //                                .app we return our custom
+  //                                entitlements; every nested item
+  //                                gets the tool's default
+  //                                helper-specific entitlements
+  //                                (returning undefined from the hook
+  //                                triggers the default behaviour).
+  //   - ``preAutoEntitlements: false``
+  //                                disables the mas-specific sandbox
+  //                                entitlement injection (we are not
+  //                                targeting the Mac App Store).
+  //   - ``type: "distribution"`` the hardened-runtime code path.
+  //   - ``platform: "darwin"``  non-mas build.
   //
-  // ``--identifier`` pins the signing identifier to the bundle ID
-  // regardless of what's in Info.plist — TCC uses this string (not
-  // CDHash) to look up grants when the signature has a trusted
-  // authority.
-  const signArgs = [
-    "--force",
-    "--deep",
-    "--sign",
-    signingIdentity,
-    "--identifier",
-    bundleId,
-    "--options",
-    "runtime",
-    "--entitlements",
-    entitlements,
-  ];
-  if (!useStableIdentity) {
-    // Ad-hoc signatures can't use timestamps.
-    signArgs.push("--timestamp=none");
-  }
-  signArgs.push(appPath);
-  runCodesign(signArgs);
+  // Signing helpers with hardened runtime + their own (narrower)
+  // entitlements is what fixes the "different Team IDs" launch
+  // crash we hit with ``codesign --deep``: each framework keeps its
+  // own signing identifier, so library validation sees them as
+  // normal dylibs loaded by the main binary rather than duplicate
+  // main binaries.
 
-  // Verify. ``--strict`` catches any resource envelope drift, ``--deep``
-  // walks all nested items. On failure this throws and aborts the
-  // build, so a broken signature never silently propagates into the
-  // DMG.
-  runCodesign(["--verify", "--deep", "--strict", "--verbose=2", appPath]);
-
-  // Print the top-level signature so the build log shows the
-  // signing identity, team identifier (if any), CDHash, and
-  // hardened-runtime flag.
+  // Dynamically import @electron/osx-sign so a missing dep gives a
+  // clear error message instead of a cryptic MODULE_NOT_FOUND at
+  // afterPack time.
+  let osxSign;
   try {
-    execFileSync("/usr/bin/codesign", ["-dv", "--verbose=4", appPath], {
-      stdio: "inherit",
-    });
-  } catch {
-    // The verbose dump is informational only; do not fail on it.
+    osxSign = require("@electron/osx-sign");
+  } catch (e) {
+    throw new Error(
+      "afterPack: @electron/osx-sign is required for macOS signing. " +
+        "Run `npm --prefix desktop install` to install it. " +
+        `Underlying error: ${e && e.message ? e.message : String(e)}`,
+    );
+  }
+  const signApp = osxSign.signAsync || osxSign.sign;
+  if (typeof signApp !== "function") {
+    throw new Error(
+      "afterPack: @electron/osx-sign does not expose signAsync/sign — " +
+        "incompatible version installed.",
+    );
   }
 
-  const stat = statSync(appPath);
-  console.log(
-    `[afterPack] Signed ${appName}.app OK (mtime=${stat.mtime.toISOString()})`,
+  await signApp({
+    app: appPath,
+    identity,
+    identityValidation: false,
+    platform: "darwin",
+    type: "distribution",
+    hardenedRuntime: true,
+    preAutoEntitlements: false,
+    // Per-file entitlements hook.
+    //
+    // Top-level .app bundle gets the full entitlements
+    // (microphone, Apple Events, network client + disable-
+    // library-validation).
+    //
+    // Every helper (.app) and framework/dylib gets the INHERIT
+    // entitlements (allow-jit, allow-unsigned-executable-memory,
+    // audio-input, disable-library-validation).
+    //
+    // Why force our own entitlements on every nested item instead
+    // of letting osx-sign use its bundled defaults:
+    //
+    //   The default osx-sign templates (default.darwin.renderer.
+    //   plist, default.darwin.gpu.plist, default.darwin.plugin.
+    //   plist) do NOT contain disable-library-validation. Under
+    //   hardened runtime with a self-signed certificate that has
+    //   no Team ID, the helpers fail to load Electron Framework
+    //   via dyld4 library validation and crash at launch — the
+    //   exact "different Team IDs" crash we hit with a raw
+    //   codesign --deep pass. Passing our inherit plist
+    //   explicitly guarantees the entitlement lands on every
+    //   helper that might independently load the framework.
+    optionsForFile: (filePath) => {
+      if (filePath === appPath) {
+        return {
+          entitlements,
+          hardenedRuntime: true,
+        };
+      }
+      return {
+        entitlements: inheritEntitlements,
+        hardenedRuntime: true,
+      };
+    },
+  });
+
+  // Verify the finished signature. ``--strict`` catches any resource
+  // envelope drift, ``--deep`` walks all nested items. On failure
+  // this throws and aborts the build.
+  execFileSync(
+    "/usr/bin/codesign",
+    ["--verify", "--deep", "--strict", "--verbose=2", appPath],
+    { stdio: "inherit" },
   );
+
+  // Dump the top-level signature identity + authority + runtime flags
+  // so the build log shows exactly how the app was signed.
+  try {
+    execFileSync(
+      "/usr/bin/codesign",
+      ["-dv", "--verbose=4", appPath],
+      { stdio: "inherit" },
+    );
+  } catch {
+    // Informational only; do not fail on it.
+  }
+
+  // Also print the Electron Framework's identifier — if library
+  // validation fails at launch, this is the first thing to check.
+  const electronFw = path.join(
+    appPath,
+    "Contents",
+    "Frameworks",
+    "Electron Framework.framework",
+  );
+  if (existsSync(electronFw)) {
+    try {
+      execFileSync(
+        "/usr/bin/codesign",
+        ["-dv", "--verbose=2", electronFw],
+        { stdio: "inherit" },
+      );
+    } catch {
+      // Informational only.
+    }
+  }
+
+  console.log(`[afterPack] Signed ${appName}.app OK`);
 };

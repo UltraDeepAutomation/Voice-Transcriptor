@@ -2,6 +2,42 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+		Hardened runtime + self-signed Team ID workaround.
+
+		When the app is signed with a self-signed certificate (i.e. any
+		certificate that does NOT come from a paid Apple Developer ID
+		program), the TeamIdentifier field in every signature is empty.
+		dyld4 on macOS 13+ enforces library validation under the
+		hardened runtime and rejects cross-image loads whenever the
+		consuming process and the loaded framework do not share a
+		non-empty Team ID — treating two different "empty" Team IDs as
+		distinct. That is what produces:
+
+		    mapping process and mapped file (non-platform) have
+		    different Team IDs
+
+		at launch, even though Transcriptor.app and Electron Framework
+		are both signed by the same AntigravityTelegramDev certificate.
+
+		The official Apple-sanctioned way to opt out of library
+		validation is the com.apple.security.cs.disable-library-
+		validation entitlement. It is specifically designed for cases
+		where the main binary legitimately loads plug-ins or
+		frameworks that were signed by a different identity — which is
+		exactly our situation with self-signed code. Electron's own
+		documentation recommends this entitlement when shipping
+		outside a notarized Developer ID workflow.
+
+		Keeping this entitlement here is the SSOT: every signing run
+		(afterPack.js) passes entitlements.mac.plist to the top-level
+		bundle, so the flag is automatically sealed into the main
+		binary's code signature. The nested helpers do not need this
+		entitlement because they are loaded BY the main binary, not
+		the other way around — the check only runs on the consumer.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
