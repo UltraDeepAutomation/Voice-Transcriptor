@@ -2475,12 +2475,22 @@ function looksLikeAutomationPermissionError(reason) {
 
 function overlayStatusForPasteFailure(reason) {
   const r = String(reason || "").toLowerCase();
-  if (r.includes("no-accessibility")) return "Grant Access";
-  if (r.includes("secure-field")) return "Secure Field";
-  if (r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "No Text Focus";
+  // The transcript is ALWAYS written to the system clipboard before
+  // the paste attempt (see ``clipboard.writeText(transcript)`` in
+  // processPostStopTask), so every failure mode below still leaves
+  // the text available via Cmd+V. We prefer a status that tells the
+  // user their text is safe rather than one that just says
+  // "failed" — "In Clipboard" is the clearest signal that recovery
+  // is one keypress away. The explicit permission flows
+  // (no-accessibility, automation) still open System Settings via
+  // the separate callback path, so the user can grant access AND
+  // knows the text survived.
+  if (r.includes("no-accessibility")) return "In Clipboard · Grant Access";
+  if (r.includes("secure-field")) return "In Clipboard · Secure Field";
+  if (r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "In Clipboard · No Focus";
   if (r.includes("clipboard")) return "Clipboard Error";
-  if (looksLikeAutomationPermissionError(r)) return "Grant Access";
-  return "Paste Failed";
+  if (looksLikeAutomationPermissionError(r)) return "In Clipboard · Grant Access";
+  return "In Clipboard";
 }
 
 function openPrivacyAccessibilitySettings() {
@@ -3980,7 +3990,43 @@ async function createWindow(options = {}) {
     return allow;
   });
   win.webContents.on("render-process-gone", (_event, details) => {
-    appendMainLog(`[render-process-gone] reason=${details?.reason || "unknown"} exitCode=${details?.exitCode ?? ""}`);
+    const reason = String(details?.reason || "unknown");
+    const exitCode = details?.exitCode ?? "";
+    appendMainLog(`[render-process-gone] reason=${reason} exitCode=${exitCode}`);
+    // ``clean-exit`` happens on normal window close and does NOT
+    // require recovery. Every other reason (crashed, killed,
+    // oom, etc.) leaves the Electron main process holding stale
+    // references — the overlay state machine, any in-flight
+    // ``overlayStopInFlight`` flag, the ``pendingTranscriptionCount``
+    // counter, and the ``shortcutToggleInFlight`` guard — that
+    // would otherwise block every future hotkey press.
+    if (reason === "clean-exit") return;
+    // Reset the state machine so the NEXT hotkey press starts
+    // cleanly instead of short-circuiting on a stale flag.
+    overlayStopInFlight = false;
+    shortcutToggleInFlight = false;
+    pasteShortcutInFlight = false;
+    if (pendingTranscriptionCount > 0) {
+      appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
+      pendingTranscriptionCount = 0;
+    }
+    // Tear down the overlay: it may be in "Transcribing" state
+    // pointing at a transcript that will never arrive.
+    try {
+      hideRecordingOverlay();
+    } catch (e) {
+      appendMainLog(`[render-process-gone] hideRecordingOverlay failed: ${e?.message || e}`);
+    }
+    // The renderer is dead; ``reload()`` on a crashed webContents
+    // throws. Schedule a fresh load so the user sees a working UI
+    // on the next Spotlight/Dock click.
+    setTimeout(() => {
+      if (!win || win.isDestroyed() || !win.webContents) return;
+      const baseUrl = `${BASE_URL}/`;
+      win.loadURL(baseUrl).catch((e) => {
+        appendMainLog(`[render-process-gone] reload failed: ${e?.message || e}`);
+      });
+    }, 500);
   });
   win.webContents.on("did-fail-load", (_event, code, desc, url) => {
     appendMainLog(`[did-fail-load] code=${code} desc=${desc} url=${url}`);

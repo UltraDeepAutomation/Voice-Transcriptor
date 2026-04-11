@@ -1456,6 +1456,20 @@ async function selectCanonicalCapturedAudio(opts: {
   return { file: best.file, durationSec: best.durationSec, kind: best.kind };
 }
 
+// Hardwired local timeout for ``stopMediaRecorderAndFlush``.
+//
+// The old code reused ``UI_TOKENS.polling.remoteChunkSettleTimeoutMs``
+// (3000 ms) as a safety ceiling. That was sized for the old stop
+// order where MediaRecorder had to fully flush WHILE the mic stream
+// was still live — the recorder's ``stop`` event could take up to a
+// second on some platforms. After the tail-fix reorder, stream.stop()
+// runs BEFORE this function, so the MediaRecorder has no more data
+// coming and fires its ``stop`` event within a handful of
+// milliseconds. 500 ms is plenty of safety margin for any platform
+// hiccup and saves up to 2.5 seconds on the stop path in the worst
+// case.
+const MEDIA_RECORDER_STOP_FALLBACK_MS = 500;
+
 async function stopMediaRecorderAndFlush(): Promise<void> {
   const recorder = mediaRecorder;
   if (!recorder || recorder.state === "inactive") return;
@@ -1467,7 +1481,7 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
       resolve();
     };
     recorder.addEventListener("stop", finish, { once: true });
-    window.setTimeout(finish, UI_TOKENS.polling.remoteChunkSettleTimeoutMs);
+    window.setTimeout(finish, MEDIA_RECORDER_STOP_FALLBACK_MS);
     try {
       recorder.requestData();
     } catch (e) {
@@ -4583,6 +4597,18 @@ async function startLive(): Promise<void> {
       mediaRecorder.start(1000);
     } catch (e) {
       console.warn("MediaRecorder failed, falling back to WAV encoder", e);
+      // If ``.start(1000)`` threw AFTER the constructor succeeded we
+      // have a half-initialised MediaRecorder sitting on the module
+      // global. Null it so stopMediaRecorderAndFlush doesn't try to
+      // stop an object in a bad state (which would throw again and
+      // leave the recorder's state machine corrupted). The WebM path
+      // simply falls back to the PCM sink for canonical audio.
+      if (mediaRecorder) {
+        try {
+          mediaRecorder.ondataavailable = null;
+        } catch { }
+        mediaRecorder = null;
+      }
     }
     src = ac.createMediaStreamSource(stream);
     analyser = ac.createAnalyser();
@@ -4849,17 +4875,14 @@ async function stopLive(enhance: boolean): Promise<void> {
 
   let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
   if (ws) {
-    // 4000 ms budget for the full round-trip after CloseStream:
-    //   endpointing silence threshold (700 ms)
-    //   + Deepgram server-side finalization (~500–2000 ms)
-    //   + network RTT (50–200 ms)
-    //   + backend session.finalize wait + forward (~200 ms)
-    //   + safety margin
-    // Nova-3 can take 1800–2500 ms to return the last is_final after
-    // CloseStream for a long utterance; the old 1500 ms was right on
-    // the edge and routinely timed out, forcing the fallback onto
-    // the stale committed segments — missing the trailing clause.
-    const finalizeWaitMs = 4000;
+    // 2000 ms budget for the full round-trip after CloseStream.
+    // Covers the 700 ms endpointing threshold + Deepgram's server-
+    // side finalize (~500–1500 ms) + network RTT + backend forward.
+    // The FAST PATH in the Deepgram branch below short-circuits this
+    // ceiling entirely when committed segments already cover the
+    // recording tail — so this value is only a safety floor for
+    // pathologically slow finalizes, not the normal stop latency.
+    const finalizeWaitMs = 2000;
     liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, finalizeWaitMs);
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -5310,7 +5333,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
       setStatusScoped(sessionUiToken, "Finalizing");
 
-      // Fast path: the live stream already errored before stop. Skip
+      // Fast path 1: the live stream already errored before stop. Skip
       // the finalize wait entirely and go straight to what we have.
       if (liveStreamErrorAtStop) {
         transcriptRaw =
@@ -5321,6 +5344,50 @@ async function stopLive(enhance: boolean): Promise<void> {
           status: "Sealing Deepgram stream…",
           tone: "info",
         }, sessionUiToken);
+
+        // Fast path 2: poll ``liveTranscriptSegments`` for up to 700 ms.
+        // Deepgram streams additional ``is_final`` events on the same
+        // WebSocket between CloseStream and the final envelope arriving;
+        // those land in liveTranscriptSegments via the normal onmessage
+        // handler. If the last committed segment already covers the
+        // recording tail (end ≥ recordedSec - 0.4s tolerance), we have
+        // the complete transcript and can skip waiting for the envelope
+        // altogether.
+        //
+        // Why this matters: the full 2000 ms envelope ceiling is the
+        // WORST case. For a typical 10-second recording Deepgram
+        // commits the last is_final ~300–500 ms after CloseStream, so
+        // this fast path catches it within two polling intervals and
+        // returns immediately — eliminating the "stop adds a couple
+        // of seconds" regression from the tail fix.
+        //
+        // The envelope-based fallback below still runs if the fast path
+        // doesn't hit (e.g. very short recording where Deepgram hasn't
+        // committed anything yet, or a long utterance with a trailing
+        // clause that hasn't been sealed).
+        const fastPathDeadline = performance.now() + 700;
+        const fastPathTolerance = 0.4;
+        let fastPathTranscript = "";
+        while (performance.now() < fastPathDeadline) {
+          const segs = liveTranscriptSegments;
+          const last = segs.length > 0 ? segs[segs.length - 1] : null;
+          const covered =
+            !!last &&
+            recordedSec > 0 &&
+            last.end >= recordedSec - fastPathTolerance;
+          if (covered && liveCommittedDisplayCache) {
+            fastPathTranscript = liveCommittedDisplayCache;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+        if (fastPathTranscript) {
+          transcriptRaw = fastPathTranscript;
+          // Fall through to the post-transcription flow below without
+          // awaiting the envelope. The liveFinalPromise will resolve
+          // (or time out) in the background and be garbage collected.
+        }
+        if (!transcriptRaw) {
         const envelope = liveFinalPromise ? await liveFinalPromise : null;
         const envelopeError = envelope?.error || liveStreamError || "";
 
@@ -5373,6 +5440,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             }
           }
         }
+        } // close the ``if (!transcriptRaw)`` fast-path fall-through guard
       }
 
       // Very last resort: whatever the live source text captured.
