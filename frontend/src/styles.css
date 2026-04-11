@@ -827,7 +827,15 @@ textarea:focus-visible,
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 0.95fr 1.05fr 1.05fr;
+  /* Column ratios tuned to each pane's intrinsic toolbar width:
+     - Live Preview has a single narrow model select → 0.8fr
+     - Transcribe has provider+model selects + 2 icon buttons → 1.0fr
+     - Upscale has model+preset selects + preset wrap + 3 icon
+       buttons (~462px) and needs the widest column → 1.2fr
+     Previous 0.95/1.05/1.05 gave upscale ~401px at a 1420px shell,
+     which forced the toolbar flex-wrap onto a second row — the
+     "two rows" regression the user reported. */
+  grid-template-columns: 0.8fr 1.0fr 1.2fr;
   gap: 14px;
   padding: var(--page-gutter);
 }
@@ -985,7 +993,10 @@ textarea:focus-visible,
 }
 
 #upscalePresetSelect {
-  min-width: 108px;
+  /* Narrowed min to 96 so the upscale toolbar fits on a single row
+     even at the 1140px shell minWidth, while max-width still lets
+     the preset name show in full on wider screens. */
+  min-width: 96px;
   max-width: 148px;
   background-color: var(--control-bg);
   border-color: var(--control-border);
@@ -993,7 +1004,10 @@ textarea:focus-visible,
 }
 
 #upscaleModelSelect {
-  min-width: 118px;
+  /* Narrowed min to 104 so the Gemini/GPT/Claude short labels still
+     render without ellipsis while the upscale toolbar stays on a
+     single row at narrow viewports. */
+  min-width: 104px;
   max-width: 162px;
   background-color: var(--control-bg);
   border-color: var(--control-border);
@@ -1234,7 +1248,13 @@ textarea:focus-visible,
 }
 
 .toggle-inline input:checked::before {
-  transform: translate(14px, -50%);
+  /* Track is 34×18 border-box with 1px border → content box 32×16.
+     Thumb is 12×12 offset by `left: 2px` in OFF state (right gap 18).
+     For a symmetric ON state (right gap 2, left gap 18) the thumb's
+     target left edge is `32 - 2 - 12 = 18`, so the translate must be
+     `18 - 2 = 16`. The previous 14px value left a 5px right gap
+     against a 15px left gap — visible asymmetry the user noticed. */
+  transform: translate(16px, -50%);
   background: #ffffff;
 }
 
@@ -1719,6 +1739,16 @@ textarea:focus-visible,
   margin-bottom: 8px;
   transition: border-color var(--dur-base) ease, background var(--dur-base) ease, color var(--dur-base) ease;
   position: relative;
+  /* Stable uniform height regardless of badge count.
+     Title row (16px) + 4px gap + meta row (14px) + 7px gap +
+     badge row (22px) + 12px top/bottom padding * 2 = 75px.
+     We round up to 78 so focus-visible outlines do not push the
+     edge of the card. Cards with 0 badges use the same height via
+     ``display: flex; flex-direction: column`` + spacer. */
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  min-height: 78px;
 }
 
 .recording-item:hover {
@@ -1758,10 +1788,17 @@ textarea:focus-visible,
 }
 
 .recording-item .rec-badges {
+  /* Single-row layout with overflow hidden — keeps every card the
+     same height even when one has three badges and another has
+     zero. Previously ``flex-wrap: wrap`` caused taller cards with
+     many long badges (e.g. ``DEEPGRAM`` + ``EN`` + ``AUDIO``) to
+     tower over shorter ones and break alignment. */
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 5px;
   margin-top: 7px;
+  overflow: hidden;
+  min-height: 22px;
 }
 
 .recording-item .rec-provider {

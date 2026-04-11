@@ -2485,6 +2485,48 @@ function populateUpscaleModelOptions(): void {
   sel.value = ids.has(preferred) ? preferred : DEFAULT_UPSCALE_MODEL;
 }
 
+// Built-in upscale presets mirrored from ``BUILTIN_UPSCALE_PRESETS`` in
+// ``backend/main.py``. We keep a synchronous client-side copy so the
+// preset dropdown is never empty during the one round-trip window
+// between module init and the async ``/api/upscale/presets`` fetch.
+// The async ``loadUpscalePresets`` call overlays the authoritative
+// list (including user-created custom presets) when it resolves.
+const BUILTIN_UPSCALE_PRESETS: ReadonlyArray<{ id: string; name: string }> = [
+  { id: "builtin_clean", name: "Clean" },
+  { id: "builtin_business", name: "Business" },
+  { id: "builtin_ai_code", name: "AI & Code" },
+  { id: "builtin_refine", name: "Refine" },
+];
+
+function populateBuiltinUpscalePresetOptions(): void {
+  const sel = document.getElementById("upscalePresetSelect") as HTMLSelectElement | null;
+  if (!sel) return;
+  // Only seed if the select is empty — once ``loadUpscalePresets`` has
+  // run, its options are authoritative and we must not clobber them
+  // (they may contain custom presets the user created).
+  if (sel.options.length > 0) return;
+  const preferred = pendingUpscalePresetId || "builtin_clean";
+  sel.innerHTML = "";
+  for (const p of BUILTIN_UPSCALE_PRESETS) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name;
+    sel.appendChild(opt);
+  }
+  // Seed the in-memory list too so ``selectedUpscalePreset`` and
+  // other helpers do not see an empty array before the async load.
+  if (upscalePresets.length === 0) {
+    upscalePresets = BUILTIN_UPSCALE_PRESETS.map((p) => ({
+      id: p.id,
+      name: p.name,
+      builtin: true,
+    }));
+  }
+  sel.value = BUILTIN_UPSCALE_PRESETS.some((p) => p.id === preferred)
+    ? preferred
+    : "builtin_clean";
+}
+
 /**
  * Serialises upscale calls so the user can never accidentally fire
  * two concurrent requests on the same input (e.g., by stopping one
@@ -6037,16 +6079,60 @@ function gRender(): void {
   c.restore();
 
   // Legend
+  //
+  // The legend is drawn in the OUTER (un-panned, un-zoomed) coordinate
+  // space so it stays pinned to the top-right corner. Previously the
+  // coloured dots and text rendered directly on top of whatever nodes
+  // happened to land in that corner of the viewport — the user's
+  // "в графе все друг на друга наезжает" report. We paint a rounded
+  // backdrop rectangle first so the legend becomes a visually-isolated
+  // island instead of an invisible overlay.
   const providers = [...new Set(gNodes.map((n) => n.provider))];
-  let ly = 16;
-  c.textAlign = "right"; c.textBaseline = "middle";
-  c.font = "9px 'SF Pro Text', -apple-system, sans-serif";
-  for (const p of providers) {
-    const col = gColor(p);
-    const lx = W - 56;
-    c.beginPath(); c.arc(lx + 10, ly, 4, 0, Math.PI * 2); c.fillStyle = col; c.fill();
-    c.fillStyle = "#999"; c.fillText(GRAPH_PROVIDER_LABELS[p] || p, lx + 2, ly);
-    ly += 16;
+  if (providers.length > 0) {
+    const legendLineH = 16;
+    const legendPadX = 10;
+    const legendPadY = 8;
+    const legendW = 90;
+    const legendH = providers.length * legendLineH + legendPadY * 2 - 4;
+    const legendX = W - legendW - 10;
+    const legendY = 10;
+    // Rounded-rect backdrop. ``roundRect`` is a Canvas 2D method that
+    // shipped in Chromium 99+ — Electron (which we target) always
+    // has a newer rendering core, so this path is safe. A manual
+    // arc fallback exists below for paranoia.
+    c.beginPath();
+    if (typeof (c as CanvasRenderingContext2D & { roundRect?: (x: number, y: number, w: number, h: number, r: number) => void }).roundRect === "function") {
+      (c as CanvasRenderingContext2D & { roundRect: (x: number, y: number, w: number, h: number, r: number) => void }).roundRect(legendX, legendY, legendW, legendH, 8);
+    } else {
+      const r = 8;
+      c.moveTo(legendX + r, legendY);
+      c.arcTo(legendX + legendW, legendY, legendX + legendW, legendY + legendH, r);
+      c.arcTo(legendX + legendW, legendY + legendH, legendX, legendY + legendH, r);
+      c.arcTo(legendX, legendY + legendH, legendX, legendY, r);
+      c.arcTo(legendX, legendY, legendX + legendW, legendY, r);
+    }
+    c.fillStyle = "rgba(18, 18, 18, 0.82)";
+    c.fill();
+    c.strokeStyle = "rgba(255, 255, 255, 0.08)";
+    c.lineWidth = 1;
+    c.stroke();
+
+    // Legend items
+    c.textAlign = "left";
+    c.textBaseline = "middle";
+    c.font = "9px 'SF Pro Text', -apple-system, sans-serif";
+    let ly = legendY + legendPadY + 4;
+    for (const p of providers) {
+      const col = gColor(p);
+      const dotX = legendX + legendPadX;
+      c.beginPath();
+      c.arc(dotX, ly, 4, 0, Math.PI * 2);
+      c.fillStyle = col;
+      c.fill();
+      c.fillStyle = "#c0c0c0";
+      c.fillText(GRAPH_PROVIDER_LABELS[p] || p, dotX + 10, ly);
+      ly += legendLineH;
+    }
   }
 }
 
@@ -6220,6 +6306,10 @@ void loadCfg()
 initQuickControls();
 syncRemoteModelOptions();
 populateUpscaleModelOptions();
+// Seed the preset dropdown synchronously with the 4 built-in presets
+// so the upscale pane is never empty between module init and the
+// async ``loadUpscalePresets`` call inside ``loadCfg``.
+populateBuiltinUpscalePresetOptions();
 (document.getElementById("upscaleModelSelect") as HTMLSelectElement | null)?.addEventListener(
   "change",
   () => {
