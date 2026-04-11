@@ -264,7 +264,6 @@ declare global {
     __transcriptorLastUiFinalAt?: number;
     __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
-    __transcriptorPcmWindowRotated?: boolean;
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
@@ -1041,21 +1040,326 @@ function encodeWav(float32: Float32Array, sr: number): Blob {
   return new Blob([buf], { type: "audio/wav" });
 }
 
-function mergeCapturedChunks(frames: Float32Array[]): Float32Array {
-  if (!frames.length) return new Float32Array(0);
-  const total = frames.reduce((acc, chunk) => acc + chunk.length, 0);
-  const merged = new Float32Array(total);
-  let offset = 0;
-  for (const chunk of frames) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
-}
-
 function createWavFileFromSamples(samples: Float32Array, sampleRate: number, name: string): File {
   const audioBlob = encodeWav(samples, sampleRate);
   return new File([audioBlob], name, { type: audioBlob.type || "audio/wav" });
+}
+
+// ── PCM capture sink ──────────────────────────────────────────────────
+//
+// A bounded-memory replacement for the old ``chunks: Float32Array[]``
+// module-level array. Two implementations:
+//
+//   * ``OpfsPcmSink`` — spools PCM16LE samples to the Origin Private
+//     File System (``navigator.storage.getDirectory()``) in real time
+//     so the JS heap never holds more than a handful of milliseconds
+//     of audio at once. At finalize, a WAV header is prepended and a
+//     ``File`` backed by the concatenated [header + spooled bytes] is
+//     returned. Cleanup is explicit via ``destroy()``.
+//
+//   * ``MemoryPcmSink`` — in-memory fallback for environments without
+//     OPFS (old browsers, test harnesses) or when a mid-recording
+//     write fails. Keeps samples as ``Int16Array`` chunks (half the
+//     footprint of the old Float32Array path) and assembles a WAV
+//     ``File`` at finalize.
+//
+// The factory ``createPcmSink`` tries OPFS first and gracefully
+// degrades to memory on any failure, so callers never have to
+// branch. ``isDiskBacked`` lets the UI report which mode is active.
+//
+// Orphan cleanup: if the app crashes mid-recording, a ``.pcm16`` file
+// is left in ``pcm-spool/`` inside OPFS. ``cleanupOrphanPcmSpool``
+// runs once at module load and removes every file older than the
+// current session, so the cleanup window never grows without bound.
+
+interface PcmSink {
+  append(samples: Float32Array): void;
+  finalize(sampleRate: number, name?: string): Promise<File>;
+  destroy(): Promise<void>;
+  readonly totalSamples: number;
+  readonly isDiskBacked: boolean;
+  readonly lastWriteError: Error | null;
+}
+
+function floatSamplesToInt16LE(samples: Float32Array): Int16Array {
+  const out = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i];
+    const clamped = x < -1 ? -1 : x > 1 ? 1 : x;
+    out[i] = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
+  }
+  return out;
+}
+
+function buildWavHeader(sampleRate: number, dataBytes: number, channels = 1): ArrayBuffer {
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  // "RIFF" chunk
+  view.setUint32(0, 0x52494646, false);
+  view.setUint32(4, 36 + dataBytes, true);
+  view.setUint32(8, 0x57415645, false);
+  // "fmt " subchunk
+  view.setUint32(12, 0x666d7420, false);
+  view.setUint32(16, 16, true); // subchunk1Size (PCM)
+  view.setUint16(20, 1, true); // audioFormat = PCM
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * 2, true); // byteRate
+  view.setUint16(32, channels * 2, true); // blockAlign
+  view.setUint16(34, 16, true); // bitsPerSample
+  // "data" subchunk
+  view.setUint32(36, 0x64617461, false);
+  view.setUint32(40, dataBytes, true);
+  return header;
+}
+
+// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
+type OpfsFileSystemWritableFileStream = {
+  write(data: BufferSource): Promise<void>;
+  close(): Promise<void>;
+  abort?(reason?: unknown): Promise<void>;
+};
+interface OpfsFileSystemFileHandle {
+  name: string;
+  createWritable(options?: { keepExistingData?: boolean }): Promise<OpfsFileSystemWritableFileStream>;
+  getFile(): Promise<File>;
+}
+interface OpfsFileSystemDirectoryHandle {
+  getFileHandle(name: string, opts?: { create?: boolean }): Promise<OpfsFileSystemFileHandle>;
+  getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<OpfsFileSystemDirectoryHandle>;
+  removeEntry(name: string, opts?: { recursive?: boolean }): Promise<void>;
+  values(): AsyncIterableIterator<OpfsFileSystemFileHandle & { kind: "file" | "directory" }>;
+}
+
+const PCM_SPOOL_DIR = "pcm-spool";
+
+async function getPcmSpoolDir(create = true): Promise<OpfsFileSystemDirectoryHandle | null> {
+  // The built-in ``FileSystemDirectoryHandle`` type in some TS lib
+  // versions doesn't yet declare ``values()`` / ``getFileHandle()``
+  // with the exact shape we need, so we fence off the entire OPFS
+  // surface area as ``unknown`` and take ownership of the types via
+  // our ``OpfsFileSystem*`` interfaces. All subsequent calls are
+  // structurally typed against our contract and will fail loudly at
+  // runtime if the browser diverges (caught by the try/catch).
+  const navStorage = (navigator as { storage?: { getDirectory?: () => Promise<unknown> } }).storage;
+  if (!navStorage || typeof navStorage.getDirectory !== "function") {
+    return null;
+  }
+  try {
+    const root = (await navStorage.getDirectory()) as unknown as OpfsFileSystemDirectoryHandle;
+    return await root.getDirectoryHandle(PCM_SPOOL_DIR, { create });
+  } catch (e) {
+    console.debug("OPFS spool dir unavailable:", e);
+    return null;
+  }
+}
+
+async function cleanupOrphanPcmSpool(): Promise<void> {
+  const dir = await getPcmSpoolDir(true);
+  if (!dir) return;
+  try {
+    const victims: string[] = [];
+    for await (const entry of dir.values()) {
+      if (entry.kind === "file" && entry.name.endsWith(".pcm16")) {
+        victims.push(entry.name);
+      }
+    }
+    for (const name of victims) {
+      try {
+        await dir.removeEntry(name);
+      } catch (e) {
+        console.debug("pcm-spool: failed to remove orphan", name, e);
+      }
+    }
+    if (victims.length) {
+      console.info(`pcm-spool: cleaned ${victims.length} orphaned capture file(s)`);
+    }
+  } catch (e) {
+    console.debug("pcm-spool: orphan scan skipped:", e);
+  }
+}
+
+class OpfsPcmSink implements PcmSink {
+  private dir: OpfsFileSystemDirectoryHandle;
+  private fileHandle: OpfsFileSystemFileHandle;
+  private writable: OpfsFileSystemWritableFileStream | null;
+  private pendingChunks: Int16Array[] = [];
+  private pendingBytes = 0;
+  private flushInProgress = false;
+  private flushScheduled = false;
+  private destroyed = false;
+  totalSamples = 0;
+  readonly isDiskBacked = true;
+  lastWriteError: Error | null = null;
+
+  constructor(
+    dir: OpfsFileSystemDirectoryHandle,
+    fileHandle: OpfsFileSystemFileHandle,
+    writable: OpfsFileSystemWritableFileStream,
+  ) {
+    this.dir = dir;
+    this.fileHandle = fileHandle;
+    this.writable = writable;
+  }
+
+  static async create(sessionId: string): Promise<OpfsPcmSink | null> {
+    const dir = await getPcmSpoolDir(true);
+    if (!dir) return null;
+    try {
+      const safeId = sessionId.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 96) || `s${Date.now()}`;
+      const name = `${safeId}.pcm16`;
+      const handle = await dir.getFileHandle(name, { create: true });
+      const writable = await handle.createWritable({ keepExistingData: false });
+      return new OpfsPcmSink(dir, handle, writable);
+    } catch (e) {
+      console.warn("OpfsPcmSink: create failed, falling back to memory sink", e);
+      return null;
+    }
+  }
+
+  append(samples: Float32Array): void {
+    if (this.destroyed || this.lastWriteError) return;
+    if (!samples.length) return;
+    const int16 = floatSamplesToInt16LE(samples);
+    this.pendingChunks.push(int16);
+    this.pendingBytes += int16.byteLength;
+    this.totalSamples += int16.length;
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushScheduled) return;
+    this.flushScheduled = true;
+    queueMicrotask(() => {
+      this.flushScheduled = false;
+      void this.flushPending();
+    });
+  }
+
+  private async flushPending(): Promise<void> {
+    if (this.flushInProgress) return;
+    if (this.destroyed) return;
+    if (!this.writable) return;
+    if (!this.pendingChunks.length) return;
+    this.flushInProgress = true;
+    try {
+      const chunks = this.pendingChunks;
+      this.pendingChunks = [];
+      this.pendingBytes = 0;
+      const totalBytes = chunks.reduce((a, c) => a + c.byteLength, 0);
+      const merged = new Uint8Array(totalBytes);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(new Uint8Array(c.buffer, c.byteOffset, c.byteLength), offset);
+        offset += c.byteLength;
+      }
+      await this.writable.write(merged);
+    } catch (e) {
+      this.lastWriteError = e instanceof Error ? e : new Error(String(e));
+      console.warn("OpfsPcmSink: write failed — disk may be full or permissions revoked", e);
+    } finally {
+      this.flushInProgress = false;
+      if (this.pendingChunks.length && !this.lastWriteError) {
+        this.scheduleFlush();
+      }
+    }
+  }
+
+  async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
+    // Drain any pending chunks first.
+    await this.flushPending();
+    // Wait for any flush in progress to complete.
+    let guard = 0;
+    while (this.flushInProgress && guard < 200) {
+      await new Promise((r) => setTimeout(r, 5));
+      guard++;
+    }
+    // One more drain for anything that arrived during the wait.
+    await this.flushPending();
+
+    if (this.writable) {
+      try {
+        await this.writable.close();
+      } catch (e) {
+        console.debug("OpfsPcmSink: close failed", e);
+      }
+      this.writable = null;
+    }
+
+    if (this.lastWriteError) {
+      // The spool file may be truncated or corrupt. Return an empty
+      // File so the caller can fall back to the WebM container.
+      return new File([new Blob([], { type: "audio/wav" })], name, { type: "audio/wav" });
+    }
+
+    const spool = await this.fileHandle.getFile();
+    const dataBytes = spool.size;
+    const header = buildWavHeader(sampleRate, dataBytes);
+    const blob = new Blob([header, spool], { type: "audio/wav" });
+    return new File([blob], name, { type: "audio/wav" });
+  }
+
+  async destroy(): Promise<void> {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    if (this.writable) {
+      try {
+        await this.writable.close();
+      } catch (e) {
+        console.debug("OpfsPcmSink: destroy close failed", e);
+      }
+      this.writable = null;
+    }
+    try {
+      await this.dir.removeEntry(this.fileHandle.name);
+    } catch (e) {
+      console.debug("OpfsPcmSink: destroy remove failed", e);
+    }
+    this.pendingChunks = [];
+    this.pendingBytes = 0;
+  }
+}
+
+class MemoryPcmSink implements PcmSink {
+  private chunks: Int16Array[] = [];
+  private destroyed = false;
+  totalSamples = 0;
+  readonly isDiskBacked = false;
+  lastWriteError: Error | null = null;
+
+  append(samples: Float32Array): void {
+    if (this.destroyed) return;
+    if (!samples.length) return;
+    const int16 = floatSamplesToInt16LE(samples);
+    this.chunks.push(int16);
+    this.totalSamples += int16.length;
+  }
+
+  async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
+    const totalBytes = this.chunks.reduce((a, c) => a + c.byteLength, 0);
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const c of this.chunks) {
+      merged.set(new Uint8Array(c.buffer, c.byteOffset, c.byteLength), offset);
+      offset += c.byteLength;
+    }
+    const header = buildWavHeader(sampleRate, totalBytes);
+    const blob = new Blob([header, merged], { type: "audio/wav" });
+    return new File([blob], name, { type: "audio/wav" });
+  }
+
+  async destroy(): Promise<void> {
+    this.destroyed = true;
+    this.chunks = [];
+    this.totalSamples = 0;
+  }
+}
+
+async function createPcmSink(sessionId: string): Promise<PcmSink> {
+  const opfs = await OpfsPcmSink.create(sessionId);
+  if (opfs) return opfs;
+  console.info("PcmSink: OPFS unavailable, using in-memory sink");
+  return new MemoryPcmSink();
 }
 
 async function probeAudioFileDuration(file: File): Promise<number | null> {
@@ -1086,7 +1390,15 @@ async function probeAudioFileDuration(file: File): Promise<number | null> {
 }
 
 async function selectCanonicalCapturedAudio(opts: {
-  pcmSamples: Float32Array;
+  /** Pre-built WAV file returned by ``PcmSink.finalize``. The file
+   *  is either a Blob backed by an OPFS spool entry (disk-spilled)
+   *  or an in-memory Int16 buffer. Either way it's already a valid
+   *  WAV — no encoding happens here. */
+  pcmFile: File | null;
+  /** Total sample count reported by the sink. Used to derive
+   *  duration without loading the file back into an
+   *  ``HTMLAudioElement``. */
+  pcmSampleCount: number;
   pcmSampleRate: number;
   recordedChunks: Blob[];
   expectedDurationSec: number;
@@ -1094,16 +1406,16 @@ async function selectCanonicalCapturedAudio(opts: {
   const expectedDurationSec = Math.max(0, Number(opts.expectedDurationSec) || 0);
   const candidates: Array<{ file: File; durationSec: number; kind: "pcm" | "container"; fidelityBias: number }> = [];
 
-  if (opts.pcmSamples.length > 0) {
-    const pcmDurationSec = opts.pcmSamples.length / opts.pcmSampleRate;
-    const pcmFile = createWavFileFromSamples(opts.pcmSamples, opts.pcmSampleRate, `live-${Date.now()}.wav`);
+  // A valid WAV from the sink has header (44 bytes) + payload. Empty
+  // or header-only files indicate a sink write error; skip them and
+  // fall back to the WebM container candidate below.
+  if (opts.pcmFile && opts.pcmFile.size > 44 && opts.pcmSampleCount > 0) {
+    const pcmDurationSec = opts.pcmSampleCount / opts.pcmSampleRate;
+    const pcmFile = opts.pcmFile;
     // FAST PATH: if the PCM capture is complete (covers >= 95% of
     // the expected duration), skip the slow WebM probing step
-    // altogether — PCM is our highest-fidelity source and loading
-    // a blob into an HTMLAudioElement just to read ``duration`` can
-    // take 1-3 seconds on long recordings. We only probe the WebM
-    // when PCM is clearly short (e.g. the worklet stalled and we
-    // need MediaRecorder's fallback).
+    // altogether — the sink already produced a ready-to-play WAV
+    // and we know the exact sample count.
     const pcmCoverage =
       expectedDurationSec > 0 ? pcmDurationSec / expectedDurationSec : 1;
     if (pcmCoverage >= 0.95) {
@@ -3388,14 +3700,20 @@ let scriptSinkGain: GainNode | null = null;
 let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
 let startAt = 0;
-let chunks: Float32Array[] = [];
+/**
+ * PCM capture sink for the current recording session. Lazily created
+ * inside ``startLive`` once the mic has yielded its first frames,
+ * consumed by ``pushCapturedFrame``, drained at ``stopLive``, and
+ * destroyed in the teardown path. Replaces the old ``chunks:
+ * Float32Array[]`` module-level array that grew without bound.
+ */
+let pcmSink: PcmSink | null = null;
 let draftSaveTimer: number | null = null;
 let workletLastFrameAt = 0;
 let fallbackCaptureTimer: number | null = null;
 let captureFrameCount = 0;
 let captureRmsAccum = 0;
 let capturePeakMax = 0;
-let captureSampleCount = 0;
 let liveDraftText = "";
 let liveDraftDisplayText = "";
 let liveInterimText = "";
@@ -3813,64 +4131,24 @@ function pushCapturedFrame(input: Float32Array): void {
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
-  chunks.push(new Float32Array(ds));
-  captureSampleCount += ds.length;
-  // Enterprise memory management: consolidate fragments when either the
-  // fragment count or the total live-buffer size crosses a threshold.
-  // Without this, a long recording produces tens of thousands of tiny
-  // Float32Array allocations that each pin a separate ArrayBuffer in
-  // the JS heap, triggering GC pressure and slowing down the capture
-  // thread. Fragment count is the common case for short quick takes;
-  // the size floor catches aggressive downsampling (e.g., 48kHz input
-  // where each fragment is large) on long recordings.
-  const CONSOLIDATE_FRAGMENT_LIMIT = 256;
-  const CONSOLIDATE_SAMPLE_LIMIT = AUDIO_TOKENS.liveSampleRateHz * 30; // 30 s @ 16 kHz
-  if (
-    chunks.length > CONSOLIDATE_FRAGMENT_LIMIT ||
-    (chunks.length > 1 && captureSampleCount > CONSOLIDATE_SAMPLE_LIMIT)
-  ) {
-    const total = chunks.reduce((a, c) => a + c.length, 0);
-    const merged = new Float32Array(total);
-    let off = 0;
-    for (const c of chunks) {
-      merged.set(c, off);
-      off += c.length;
-    }
-    chunks.length = 0;
-    chunks.push(merged);
+
+  // ── Canonical-audio sink path ──────────────────────────────────────
+  // Samples go into the session's ``PcmSink``. The OPFS-backed
+  // variant spools them to disk as they arrive so the JS heap is
+  // never holding more than a few milliseconds of pending audio.
+  // The memory-backed fallback (OPFS unavailable) keeps Int16Array
+  // chunks — still half the footprint of the old Float32Array
+  // accumulator. Either way the old ``chunks: Float32Array[]``
+  // consolidation / 2h rotating-window dance is gone — the sink is
+  // bounded by definition.
+  if (pcmSink) {
+    pcmSink.append(ds);
   }
-  // Hard recording-window limit: once the total PCM buffer exceeds
-  // this duration, rotate out the oldest samples. Without this cap,
-  // an accidentally-left-open session can grow the JS heap without
-  // bound (at 16kHz, 2h = ~460MB of Float32 data). The cap is large
-  // enough that all expected use-cases (short voice bursts, hour-long
-  // meetings) fit comfortably; a rotating window kicks in only for
-  // truly marathon sessions and preserves the most recent audio.
-  const PCM_WINDOW_SAMPLES = AUDIO_TOKENS.liveSampleRateHz * 60 * 120; // 2 hours
-  if (captureSampleCount > PCM_WINDOW_SAMPLES) {
-    // Consolidate (if we haven't just now) then slice the tail.
-    const total = chunks.reduce((a, c) => a + c.length, 0);
-    if (chunks.length > 1) {
-      const merged = new Float32Array(total);
-      let off = 0;
-      for (const c of chunks) {
-        merged.set(c, off);
-        off += c.length;
-      }
-      chunks.length = 0;
-      chunks.push(merged);
-    }
-    const only = chunks[0];
-    const tail = only.subarray(only.length - PCM_WINDOW_SAMPLES);
-    chunks[0] = new Float32Array(tail);
-    captureSampleCount = chunks[0].length;
-    if (!window.__transcriptorPcmWindowRotated) {
-      window.__transcriptorPcmWindowRotated = true;
-      console.warn(
-        "PCM capture exceeded 2h window; rotating oldest audio. Session is still usable but the canonical WAV now covers only the trailing 2h.",
-      );
-    }
-  }
+
+  // ── Live WebSocket path ───────────────────────────────────────────
+  // Independent of the canonical sink: the PCM16 bytes are streamed
+  // to the backend /ws/transcribe in real time regardless of whether
+  // the sink succeeded or not.
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const pcm = new ArrayBuffer(ds.length * 2);
   const dv = new DataView(pcm);
@@ -3881,8 +4159,8 @@ function pushCapturedFrame(input: Float32Array): void {
   try {
     ws.send(pcm);
   } catch (e) {
-    // Harmless race when the socket closes mid-frame; the buffered audio
-    // has already been written to `chunks` for local canonical playback.
+    // Harmless race when the socket closes mid-frame; the sink has
+    // already captured the audio for local canonical playback.
     console.debug("live ws send skipped", e);
   }
 }
@@ -3966,14 +4244,27 @@ async function startLive(): Promise<void> {
     status: "Preparing microphone capture and session buffers.",
     tone: "info",
   }, sessionUiToken);
-  chunks = [];
+  // Tear down any previous sink BEFORE allocating the new one. If
+  // startLive was called twice without a clean stopLive in between
+  // (e.g. after a start-path error), the old sink is destroyed here.
+  if (pcmSink) {
+    const prior = pcmSink;
+    pcmSink = null;
+    void prior.destroy();
+  }
+  // Fresh session sink; OPFS-backed when available, memory otherwise.
+  // Created via an async factory so we kick it off and let it land
+  // before the first audio frame arrives (~1.3s of fallback init
+  // delay makes this a comfortable margin).
+  void createPcmSink(sessionUiToken).then((sink) => {
+    pcmSink = sink;
+  });
   workletLastFrameAt = 0;
   silenceStartedAtMs = 0;
   autoStopTriggered = false;
   captureFrameCount = 0;
   captureRmsAccum = 0;
   capturePeakMax = 0;
-  captureSampleCount = 0;
   resetLiveDraftState();
   clearLiveStreamState();
   liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
@@ -4406,10 +4697,24 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
   }
 
-  const mergedCapture = mergeCapturedChunks(chunks);
-  mark("mergeCapturedChunks");
+  // Drain the PCM sink. For OPFS-backed sinks this is ~O(disk IO
+  // for the final small chunk) — the bulk of the audio is already
+  // on disk. For memory-backed sinks it's O(n) but still fast
+  // because Int16 is half the Float32 footprint the old path used.
+  let pcmCanonicalFile: File | null = null;
+  let pcmCanonicalSampleCount = 0;
+  if (pcmSink) {
+    try {
+      pcmCanonicalSampleCount = pcmSink.totalSamples;
+      pcmCanonicalFile = await pcmSink.finalize(AUDIO_TOKENS.liveSampleRateHz);
+    } catch (e) {
+      console.warn("pcmSink.finalize failed; canonical audio will come from WebM fallback", e);
+    }
+  }
+  mark("pcmSink.finalize");
   const canonicalCapture = await selectCanonicalCapturedAudio({
-    pcmSamples: mergedCapture,
+    pcmFile: pcmCanonicalFile,
+    pcmSampleCount: pcmCanonicalSampleCount,
     pcmSampleRate: AUDIO_TOKENS.liveSampleRateHz,
     recordedChunks: recordedWebmChunks,
     expectedDurationSec: recordedSec,
@@ -4513,6 +4818,14 @@ async function stopLive(enhance: boolean): Promise<void> {
   ws = null;
   mediaRecorder = null;
   recordedWebmChunks = [];
+  // Destroy the PCM sink (removes the OPFS spool file). We release
+  // the reference BEFORE awaiting so a subsequent startLive can
+  // allocate a new sink concurrently.
+  if (pcmSink) {
+    const prior = pcmSink;
+    pcmSink = null;
+    void prior.destroy();
+  }
   activeLiveSessionId = "";
   activeLiveArchiveDir = "";
   activeLiveSessionSnapshot = null;
@@ -5889,6 +6202,10 @@ populateUpscaleModelOptions();
     queueUiPreferencesSave();
   }
 );
+// Sweep any orphan ``.pcm16`` spool files left from a crashed
+// previous session. Fire-and-forget; failures are logged inside
+// the helper and never block app startup.
+void cleanupOrphanPcmSpool();
 void refreshNetworkState();
 window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());
