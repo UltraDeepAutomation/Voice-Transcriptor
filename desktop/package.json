@@ -9,9 +9,9 @@
     "start": "electron .",
     "dev": "NODE_ENV=development electron .",
     "build:frontend": "npm --prefix ../frontend run build",
-    "dist": "npm run build:frontend && electron-builder --mac --dir --x64 --arm64",
-    "dist:win": "npm run build:frontend && electron-builder --win --x64",
-    "dist:dmg": "electron-builder --mac dmg"
+    "dist": "npm run build:frontend && electron-builder --mac dmg --x64 --arm64",
+    "dist:dir": "npm run build:frontend && electron-builder --mac --dir --x64 --arm64",
+    "dist:win": "npm run build:frontend && electron-builder --win --x64"
   },
   "devDependencies": {
     "electron": "30.5.1",
@@ -57,13 +57,34 @@
       "identity": null,
       "target": [
         {
-          "target": "dir",
+          "target": "dmg",
           "arch": [
             "arm64",
             "x64"
           ]
         }
       ]
+    },
+    "dmg": {
+      "title": "${productName} ${version}",
+      "window": {
+        "width": 540,
+        "height": 380
+      },
+      "contents": [
+        {
+          "x": 140,
+          "y": 180,
+          "type": "file"
+        },
+        {
+          "x": 400,
+          "y": 180,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ],
+      "writeUpdateInfo": false
     },
     "win": {
       "target": [

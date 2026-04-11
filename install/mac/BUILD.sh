@@ -55,7 +55,14 @@ print_ok "Node.js $(node --version), npm $(npm --version)"
 
 # ── 2. Clean stale builds ───────────────────────────────────────────────
 print_step "Cleaning stale build artifacts..."
-rm -rf "$ROOT_DIR/desktop/dist/mac" "$ROOT_DIR/desktop/dist/mac-arm64" 2>/dev/null || true
+rm -rf \
+  "$ROOT_DIR/desktop/dist/mac" \
+  "$ROOT_DIR/desktop/dist/mac-arm64" \
+  "$ROOT_DIR/desktop/dist"/*.dmg \
+  "$ROOT_DIR/desktop/dist"/*.dmg.blockmap \
+  "$ROOT_DIR/desktop/dist/builder-debug.yml" \
+  "$ROOT_DIR/desktop/dist/builder-effective-config.yaml" \
+  2>/dev/null || true
 print_ok "Clean"
 
 # ── 3. Frontend dependencies ────────────────────────────────────────────
@@ -79,8 +86,13 @@ else
 fi
 
 # ── 5. Build app ────────────────────────────────────────────────────────
+# NOTE: we stream the full electron-builder output instead of piping
+# through ``tail`` — a partial pipe hides the real error on failure
+# (you see the stack trace footer without the preceding message that
+# actually describes the cause). ``set -o pipefail`` is still active,
+# so any non-zero exit from ``npm run dist`` aborts the script.
 print_step "Building Electron app (this may take a minute)..."
-(cd "$ROOT_DIR/desktop" && npm run dist 2>&1 | tail -10)
+(cd "$ROOT_DIR/desktop" && npm run dist)
 
 # ── 6. Find built app ───────────────────────────────────────────────────
 APP_PATH=""
@@ -125,11 +137,53 @@ print_step "Installing to $INSTALL_ROOT..."
 cp -R "$APP_PATH" "$INSTALL_ROOT/"
 print_ok "Installed: $TARGET_APP"
 
-# ── 8. Cleanup ──────────────────────────────────────────────────────────
-print_step "Cleaning build artifacts..."
-rm -rf "$ROOT_DIR/desktop/dist/mac" "$ROOT_DIR/desktop/dist/mac-arm64" 2>/dev/null || true
+# ── 8. Collect DMG installers into repo-level dist/ ─────────────────────
+# electron-builder writes the .dmg files into ``desktop/dist/`` alongside
+# the .app staging directories. We copy them up to ``<repo>/dist/`` with
+# stable names so the user can share / install the DMG on any Mac by
+# double-clicking and dragging Transcriptor.app into Applications.
+print_step "Collecting DMG installers..."
+REPO_DIST_DIR="$ROOT_DIR/dist"
+mkdir -p "$REPO_DIST_DIR"
+# Clear any prior DMG copies so the dist/ directory only reflects the
+# latest successful build.
+rm -f "$REPO_DIST_DIR"/Transcriptor-*.dmg 2>/dev/null || true
+
+DMG_FILES=()
+while IFS= read -r dmg; do
+  [ -z "$dmg" ] && continue
+  DMG_FILES+=("$dmg")
+done < <(find "$ROOT_DIR/desktop/dist" -maxdepth 1 -type f -name "*.dmg" 2>/dev/null | sort)
+
+if [ ${#DMG_FILES[@]} -eq 0 ]; then
+  print_warn "No .dmg files produced — check electron-builder output above"
+else
+  for src_dmg in "${DMG_FILES[@]}"; do
+    dst_dmg="$REPO_DIST_DIR/$(basename "$src_dmg")"
+    cp -f "$src_dmg" "$dst_dmg"
+    # Strip the quarantine xattr on the local copy so double-click
+    # opens the DMG instantly on THIS machine. Shared DMGs will still
+    # receive quarantine from whatever delivery mechanism (AirDrop,
+    # email, download) and the recipient will need to confirm once.
+    xattr -rd com.apple.quarantine "$dst_dmg" 2>/dev/null || true
+    print_ok "$(basename "$dst_dmg") ($(du -h "$dst_dmg" | cut -f1))"
+  done
+fi
+
+# ── 9. Cleanup ──────────────────────────────────────────────────────────
+print_step "Cleaning intermediate build artifacts..."
+rm -rf \
+  "$ROOT_DIR/desktop/dist/mac" \
+  "$ROOT_DIR/desktop/dist/mac-arm64" \
+  "$ROOT_DIR/desktop/dist"/*.dmg.blockmap \
+  "$ROOT_DIR/desktop/dist/builder-debug.yml" \
+  "$ROOT_DIR/desktop/dist/builder-effective-config.yaml" \
+  2>/dev/null || true
+# Remove the staged DMGs from desktop/dist/ — the canonical copies now
+# live in <repo>/dist/ and duplicating them would be confusing.
+rm -f "$ROOT_DIR/desktop/dist"/*.dmg 2>/dev/null || true
 xattr -rd com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
-print_ok "Build artifacts cleaned, quarantine removed"
+print_ok "Intermediate artifacts cleaned, quarantine removed"
 
 # ── Done! ────────────────────────────────────────────────────────────────
 echo ""
@@ -137,6 +191,16 @@ echo -e "${GREEN}${BOLD}  ╔═════════════════
 echo -e "${GREEN}${BOLD}  ║     ✔ Build complete!                    ║${NC}"
 echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BOLD}Installed:${NC} $TARGET_APP"
-echo -e "  ${BOLD}You can now open Transcriptor from Dock, Spotlight, or Launchpad.${NC}"
+echo -e "  ${BOLD}Installed locally:${NC} $TARGET_APP"
+echo -e "  ${BOLD}Open from:${NC} Dock · Spotlight · Launchpad"
+if [ ${#DMG_FILES[@]} -gt 0 ]; then
+  echo ""
+  echo -e "  ${BOLD}DMG installers (drag-and-drop to Applications):${NC}"
+  for src_dmg in "${DMG_FILES[@]}"; do
+    echo -e "    ${CYAN}$REPO_DIST_DIR/$(basename "$src_dmg")${NC}"
+  done
+  echo ""
+  echo -e "  ${YELLOW}Note:${NC} these DMGs are unsigned. On another Mac the first"
+  echo -e "  open may require: right-click → Open → Open (to confirm)."
+fi
 echo ""
