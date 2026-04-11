@@ -196,6 +196,19 @@ _rate_lock = threading.Lock()
 _request_windows: dict[str, deque[float]] = defaultdict(deque)
 _ws_windows: dict[str, deque[float]] = defaultdict(deque)
 
+# Per-session recovery promotion serialization + idempotency cache.
+# Promotion reads the PCM, writes a WAV+text pair, then deletes the
+# PCM. A retry (double-click, UI refresh, transient 502) can land
+# while the first call is still running — without a lock both calls
+# race on the same WAV/text paths and pruning; without a cache the
+# retry returns 404 because the PCM has been deleted. The cache keeps
+# the successful result for ``_LIVE_PROMOTE_CACHE_TTL_SEC`` so retries
+# observe the same response.
+_live_promote_lock = threading.Lock()
+_live_promote_session_locks: dict[str, threading.Lock] = {}
+_live_promote_cache: dict[str, tuple[float, dict]] = {}
+_LIVE_PROMOTE_CACHE_TTL_SEC = 60.0
+
 
 def _load_or_create_api_token() -> str:
     env_token = os.environ.get("TRANSCRIPTOR_API_TOKEN", "").strip()
@@ -290,7 +303,11 @@ def _prune_rate_bucket(bucket: dict[str, deque[float]], cutoff: float) -> None:
 
 
 def _touch_rate_limit(bucket: dict[str, deque[float]], key: str, limit_per_min: int) -> bool:
-    now = time.time()
+    # Use monotonic() — rate limiting is an internal-only TTL check,
+    # and ``time.time()`` can jump backward on NTP correction or DST
+    # transitions, making a recent hit look "old" and briefly
+    # disabling the limiter. monotonic() is guaranteed to increase.
+    now = time.monotonic()
     cutoff = now - 60.0
     with _rate_lock:
         q = bucket[key]
@@ -321,11 +338,14 @@ def _cleanup_expired_files() -> None:
     global _last_cleanup_expired_at
     if RESULT_RETENTION_SEC <= 0:
         return
-    now = time.time()
-    if now - _last_cleanup_expired_at < _CLEANUP_DEBOUNCE_SEC:
+    # Debounce uses monotonic (clock-skew immune). File ``st_mtime``
+    # lives in wall-clock epoch seconds, so the cutoff for the actual
+    # age check uses ``time.time()`` separately.
+    debounce_now = time.monotonic()
+    if debounce_now - _last_cleanup_expired_at < _CLEANUP_DEBOUNCE_SEC:
         return
-    _last_cleanup_expired_at = now
-    cutoff = now - RESULT_RETENTION_SEC
+    _last_cleanup_expired_at = debounce_now
+    cutoff = time.time() - RESULT_RETENTION_SEC
     for base in (RESULTS_DIR, UPLOADS_DIR):
         for p in base.glob("*"):
             try:
@@ -341,11 +361,13 @@ def _cleanup_live_recovery_files() -> None:
     global _last_cleanup_recovery_at
     if LIVE_RECOVERY_RETENTION_SEC <= 0:
         return
-    now = time.time()
-    if now - _last_cleanup_recovery_at < _CLEANUP_DEBOUNCE_SEC:
+    # Same split as ``_cleanup_expired_files``: monotonic for debounce,
+    # wall-clock for the mtime comparison.
+    debounce_now = time.monotonic()
+    if debounce_now - _last_cleanup_recovery_at < _CLEANUP_DEBOUNCE_SEC:
         return
-    _last_cleanup_recovery_at = now
-    cutoff = now - LIVE_RECOVERY_RETENTION_SEC
+    _last_cleanup_recovery_at = debounce_now
+    cutoff = time.time() - LIVE_RECOVERY_RETENTION_SEC
     for p in LIVE_RECOVERY_DIR.glob("*"):
         try:
             if not p.is_file():
@@ -414,50 +436,124 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
     return records
 
 
-def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, Any]:
-    pcm_path, meta_path = _live_recovery_paths(session_id)
-    if pcm_path is None or meta_path is None or not pcm_path.exists():
-        raise HTTPException(status_code=404, detail="live recovery not found")
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        meta = {}
-    audio_bytes = pcm_path.read_bytes()
-    if len(audio_bytes) < 32000:
-        raise HTTPException(status_code=400, detail="live recovery too short")
+def _acquire_session_promote_lock(session_id: str) -> threading.Lock:
+    """Return a stable per-session lock.
 
-    pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    started_at = str(meta.get("started_at") or "").strip()
-    model = str(meta.get("model") or "small").strip() or "small"
-    language = str(meta.get("language") or "auto").strip() or "auto"
-    pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
-    title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    stem = _recording_stem(title)
-    target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
-    audio_out = target_dir / f"{stem}.wav"
-    text_out = target_dir / f"{stem}.txt"
-    tmp_audio = _atomic_temp_path(audio_out)
-    try:
-        write_wav(str(tmp_audio), pcm, 16000)
-        os.replace(tmp_audio, audio_out)
-        _write_recording_text_file(
-            out=text_out,
-            title=title,
-            source_text="[Recovered live audio capture]",
-            transcript_text="",
-            provider="local",
-            model=model,
-            language=language,
-        )
-    finally:
-        tmp_audio.unlink(missing_ok=True)
-    # Same retention policy as ``save_recording_with_audio``: recovered
-    # sessions are the new "latest", so older audio files in the archive
-    # get pruned.
-    _prune_old_recording_audio(target_dir, stem)
-    _invalidate_recordings_cache()
-    _delete_live_recovery(session_id)
-    return {"name": text_out.name, "audio_name": audio_out.name, "archive_dir": str(target_dir)}
+    The registry dict is protected by ``_live_promote_lock`` so two
+    concurrent callers never race to create their own lock instance.
+    """
+    with _live_promote_lock:
+        lock = _live_promote_session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _live_promote_session_locks[session_id] = lock
+        return lock
+
+
+def _release_session_promote_lock(session_id: str) -> None:
+    """Drop the per-session lock once the session has been fully
+    promoted (or proven absent). The cache entry survives the lock so
+    retries still hit a fast idempotent path."""
+    with _live_promote_lock:
+        _live_promote_session_locks.pop(session_id, None)
+
+
+def _lookup_live_promote_cache(session_id: str) -> Optional[dict]:
+    now = time.monotonic()
+    with _live_promote_lock:
+        # Opportunistic GC so the cache cannot grow without bound.
+        stale = [
+            sid
+            for sid, (ts, _) in _live_promote_cache.items()
+            if now - ts > _LIVE_PROMOTE_CACHE_TTL_SEC
+        ]
+        for sid in stale:
+            _live_promote_cache.pop(sid, None)
+        entry = _live_promote_cache.get(session_id)
+        if entry is None:
+            return None
+        ts, payload = entry
+        if now - ts > _LIVE_PROMOTE_CACHE_TTL_SEC:
+            _live_promote_cache.pop(session_id, None)
+            return None
+        return dict(payload)
+
+
+def _store_live_promote_cache(session_id: str, payload: dict) -> None:
+    with _live_promote_lock:
+        _live_promote_cache[session_id] = (time.monotonic(), dict(payload))
+
+
+def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, Any]:
+    # Fast path: a freshly cached success means we served this promotion
+    # recently. Return the stored result so UI retries are idempotent
+    # instead of producing a 404 or a duplicate WAV.
+    cached = _lookup_live_promote_cache(session_id)
+    if cached is not None:
+        return cached
+
+    session_lock = _acquire_session_promote_lock(session_id)
+    with session_lock:
+        # Re-check under the lock — a racing caller may have completed
+        # the promotion while we were waiting for the lock.
+        cached = _lookup_live_promote_cache(session_id)
+        if cached is not None:
+            return cached
+
+        pcm_path, meta_path = _live_recovery_paths(session_id)
+        if pcm_path is None or meta_path is None or not pcm_path.exists():
+            raise HTTPException(status_code=404, detail="live recovery not found")
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        audio_bytes = pcm_path.read_bytes()
+        if len(audio_bytes) < 32000:
+            raise HTTPException(status_code=400, detail="live recovery too short")
+
+        pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        started_at = str(meta.get("started_at") or "").strip()
+        model = str(meta.get("model") or "small").strip() or "small"
+        language = str(meta.get("language") or "auto").strip() or "auto"
+        pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
+        title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        stem = _recording_stem(title)
+        target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
+        audio_out = target_dir / f"{stem}.wav"
+        text_out = target_dir / f"{stem}.txt"
+        tmp_audio = _atomic_temp_path(audio_out)
+        try:
+            write_wav(str(tmp_audio), pcm, 16000)
+            os.replace(tmp_audio, audio_out)
+            _write_recording_text_file(
+                out=text_out,
+                title=title,
+                source_text="[Recovered live audio capture]",
+                transcript_text="",
+                provider="local",
+                model=model,
+                language=language,
+            )
+        finally:
+            tmp_audio.unlink(missing_ok=True)
+        # Same retention policy as ``save_recording_with_audio``: recovered
+        # sessions are the new "latest", so older audio files in the archive
+        # get pruned.
+        _prune_old_recording_audio(target_dir, stem)
+        _invalidate_recordings_cache()
+        _delete_live_recovery(session_id)
+        result = {
+            "name": text_out.name,
+            "audio_name": audio_out.name,
+            "archive_dir": str(target_dir),
+        }
+        _store_live_promote_cache(session_id, result)
+
+    # Drop the lock entry (outside the locked region) now that the
+    # session has been fully promoted and cached. A subsequent retry
+    # hits the TTL cache instead of the disk code path.
+    _release_session_promote_lock(session_id)
+    return result
 
 
 async def _require_api_auth(request: Request) -> None:
@@ -763,7 +859,8 @@ def _invalidate_recordings_dir_cache() -> None:
 
 def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
     global _rec_dir_cache, _rec_dir_cache_at
-    now = time.time()
+    # monotonic for TTL — internal cache check, immune to clock skew.
+    now = time.monotonic()
     if _rec_dir_cache is not None and (now - _rec_dir_cache_at) < _REC_DIR_CACHE_TTL and cfg is None:
         return _rec_dir_cache
 
@@ -1622,6 +1719,19 @@ async def _run_local_live_session(
                     if not await _ws_send_json(websocket, out):
                         stop.set()
                         return
+                    # A fatal error envelope from LiveSession means the
+                    # pipeline exceeded its retry budget and cannot
+                    # produce more segments. Mark the session as errored
+                    # so `_finalize_live_recovery` retains the PCM for
+                    # offline recovery, then let the receiver drain.
+                    if (
+                        isinstance(out, dict)
+                        and out.get("type") == "error"
+                        and out.get("fatal")
+                    ):
+                        recovery["had_error"] = True
+                        stop.set()
+                        return
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=0.2)
                 except asyncio.TimeoutError:
@@ -2363,7 +2473,16 @@ def get_config(_auth: None = Depends(_require_api_auth)):
 @app.post("/api/config")
 def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
     _validate_config_payload(payload)
-    save_config(payload)
+    try:
+        save_config(payload)
+    except OSError as e:
+        # save_config logs the underlying reason; surface a clean 500 so
+        # the renderer can show a meaningful toast instead of hanging on
+        # an uncaught server exception.
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to persist config: {e}",
+        )
     _invalidate_recordings_dir_cache()
     _invalidate_recordings_cache()
     return {"ok": True}
@@ -2445,7 +2564,7 @@ _LIST_CACHE_TTL = 5.0
 def list_recordings(_auth: None = Depends(_require_api_auth)):
     global _list_cache, _list_cache_at, _list_cache_key
     d = _resolve_recordings_dir()
-    now = time.time()
+    now = time.monotonic()
 
     # Build lightweight cache key: dir mtime + file count
     try:
@@ -2506,7 +2625,7 @@ def recordings_graph(_auth: None = Depends(_require_api_auth)):
     """Return recordings with extracted keywords for semantic graph visualization."""
     global _graph_cache, _graph_cache_at, _graph_cache_key
     d = _resolve_recordings_dir()
-    now = time.time()
+    now = time.monotonic()
 
     try:
         dir_mtime = d.stat().st_mtime
@@ -2614,7 +2733,7 @@ _STATS_CACHE_TTL = 30.0
 def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
     global _stats_cache, _stats_cache_at, _stats_cache_key
     d = _resolve_recordings_dir()
-    now = time.time()
+    now = time.monotonic()
 
     # Build a lightweight cache key: dir mtime + file count
     try:

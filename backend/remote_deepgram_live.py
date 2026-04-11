@@ -417,11 +417,15 @@ class DeepgramLiveSession:
             except Exception as e:
                 logger.debug("deepgram-live: close() ignored: %s", e)
 
-        # Ensure any consumer blocked on events() unblocks.
+        # Ensure any consumer blocked on events() unblocks. The queue
+        # is unbounded (``asyncio.Queue()`` default ``maxsize=0``), so
+        # ``put_nowait`` cannot raise ``QueueFull``. We still use a
+        # narrow catch for truly unexpected runtime state — e.g., the
+        # event loop is already shut down during interpreter exit.
         try:
             self._event_queue.put_nowait(self._QUEUE_SENTINEL)
-        except Exception:
-            pass
+        except RuntimeError as e:
+            logger.debug("deepgram-live: close sentinel put failed: %s", e)
 
     # ----- Accessors --------------------------------------------------------
 
@@ -448,7 +452,13 @@ class DeepgramLiveSession:
     # ----- Internals --------------------------------------------------------
 
     def _report_error(self, message: str, *, fatal: bool) -> None:
-        """Record an error and push a normalized error event to the queue."""
+        """Record an error and push a normalized error event to the queue.
+
+        The queue is unbounded so ``put_nowait`` cannot raise
+        ``QueueFull`` in normal operation. The narrow ``RuntimeError``
+        catch handles the edge case where the event loop is already
+        shut down (interpreter exit, CancelledError re-entry).
+        """
         self._last_error = message
         self._last_fatal = fatal or self._last_fatal
         logger.warning(
@@ -458,8 +468,8 @@ class DeepgramLiveSession:
             self._event_queue.put_nowait(
                 {"type": "error", "error": message, "fatal": bool(fatal)}
             )
-        except Exception:
-            pass
+        except RuntimeError as e:
+            logger.debug("deepgram-live: report_error put failed: %s", e)
         if fatal:
             self._closed = True
 
@@ -533,8 +543,8 @@ class DeepgramLiveSession:
             self._closed = True
             try:
                 self._event_queue.put_nowait(self._QUEUE_SENTINEL)
-            except Exception:
-                pass
+            except RuntimeError as e:
+                logger.debug("deepgram-live: recv finally sentinel failed: %s", e)
 
     async def _keepalive_loop(self) -> None:
         """Emit ``{"type":"KeepAlive"}`` on prolonged upstream idle.
@@ -592,21 +602,36 @@ class DeepgramLiveSession:
             logger.debug("deepgram-live: unknown message type=%s", mtype)
             return None
 
-        channel = msg.get("channel") or {}
-        alts = channel.get("alternatives") or []
-        if not alts:
+        channel = msg.get("channel")
+        if not isinstance(channel, dict):
             return None
-        alt = alts[0] or {}
+        alts = channel.get("alternatives")
+        if not isinstance(alts, list) or not alts:
+            return None
+        alt = alts[0]
+        if not isinstance(alt, dict):
+            return None
         text = str(alt.get("transcript") or "").strip()
         if not text:
             return None
 
-        start = float(msg.get("start") or 0.0)
-        duration = float(msg.get("duration") or 0.0)
+        # Defensive numeric coercion: a malformed upstream message
+        # (non-numeric ``start``/``duration``/``confidence``) must
+        # NEVER crash the recv loop, because that would terminate the
+        # whole recording session over a single stray frame. Invalid
+        # numerics degrade to 0.0 and the segment still renders.
+        def _as_float(value: object, default: float = 0.0) -> float:
+            try:
+                return float(value) if value is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        start = _as_float(msg.get("start"))
+        duration = _as_float(msg.get("duration"))
         end = start + duration
         is_final = bool(msg.get("is_final"))
         speech_final = bool(msg.get("speech_final"))
-        confidence = float(alt.get("confidence") or 0.0)
+        confidence = _as_float(alt.get("confidence"))
 
         # When diarization is enabled, Deepgram populates ``words`` with a
         # per-word ``speaker`` index (0, 1, 2, ...). We expose the

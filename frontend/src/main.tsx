@@ -6068,14 +6068,38 @@ function gShowTooltip(node: GraphNode, mx: number, my: number): void {
   $("graphTooltipTitle").textContent = node.displayName;
   $("graphTooltipMeta").textContent = node.provider + (node.keywords.length ? " · " + node.keywords.slice(0, 5).join(", ") : "");
   $("graphTooltipPreview").textContent = "";
+  // Measure the tooltip's real size after it is visible. The old
+  // code assumed fixed 280×80 dimensions, which broke whenever CSS
+  // changed the tooltip padding, font, or line wrapping — the
+  // tooltip either clipped off-canvas or left a gap near the edge.
+  // Measuring gives us an exact clamp envelope regardless of styling.
   tt.hidden = false;
   const rect = $("graphContainer").getBoundingClientRect();
-  let left = mx + 16, top = my - 10;
-  if (left + 280 > rect.width) left = mx - 290;
-  if (left < 4) left = 4;
-  if (top < 4) top = 4;
-  if (top + 80 > rect.height) top = rect.height - 84;
-  tt.style.left = left + "px"; tt.style.top = top + "px";
+  const ttRect = tt.getBoundingClientRect();
+  const ttW = Math.max(1, Math.round(ttRect.width));
+  const ttH = Math.max(1, Math.round(ttRect.height));
+  const margin = 6;
+
+  // Prefer right-of-cursor; fall back to left-of-cursor if the
+  // right side would overflow. Final clamp guarantees the tooltip
+  // stays inside [margin, containerSize - ttSize - margin].
+  let left = mx + 16;
+  if (left + ttW + margin > rect.width) {
+    left = mx - ttW - 16;
+  }
+  if (left + ttW + margin > rect.width) {
+    left = rect.width - ttW - margin;
+  }
+  if (left < margin) left = margin;
+
+  let top = my - 10;
+  if (top + ttH + margin > rect.height) {
+    top = rect.height - ttH - margin;
+  }
+  if (top < margin) top = margin;
+
+  tt.style.left = left + "px";
+  tt.style.top = top + "px";
 }
 
 function gHideTooltip(): void {

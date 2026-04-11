@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+logger = logging.getLogger(__name__)
+
 try:
     from cryptography.fernet import Fernet, InvalidToken
     _HAS_CRYPTO = True
@@ -21,7 +23,7 @@ except ImportError:
     _HAS_CRYPTO = False
     Fernet = None  # type: ignore[assignment,misc]
     InvalidToken = Exception  # type: ignore[assignment,misc]
-    logging.warning(
+    logger.warning(
         "cryptography package not installed — API keys will be stored in plain text. "
         "Run: pip3 install 'cryptography>=42.0.0' to enable encryption."
     )
@@ -65,21 +67,42 @@ def _load_or_create_fernet_key() -> bytes:
     if not _HAS_CRYPTO:
         return b""
     if _KEYFILE.exists():
-        raw = _KEYFILE.read_bytes().strip()
+        try:
+            raw = _KEYFILE.read_bytes().strip()
+        except OSError as e:
+            logger.error(
+                "encryption keyfile unreadable at %s: %s — regenerating",
+                _KEYFILE, e,
+            )
+            raw = b""
         if raw:
             try:
                 # Validate it is a real Fernet key.
                 Fernet(raw)
                 return raw
-            except Exception:
-                pass  # Corrupted — regenerate below.
+            except Exception as e:
+                logger.warning(
+                    "encryption keyfile at %s is corrupted (%s) — regenerating "
+                    "(previously-encrypted values will become unreadable)",
+                    _KEYFILE, e,
+                )
     key = Fernet.generate_key()
-    _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
-    _KEYFILE.write_bytes(key)
+    try:
+        _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
+        _KEYFILE.write_bytes(key)
+    except OSError as e:
+        logger.error(
+            "failed to persist encryption keyfile at %s: %s — "
+            "encryption will use an in-memory key for this session only",
+            _KEYFILE, e,
+        )
+        return key
     try:
         os.chmod(_KEYFILE, 0o600)
-    except Exception:
-        pass
+    except OSError as e:
+        # Non-POSIX filesystems (Windows, exFAT, network mounts): the
+        # keyfile still exists with default permissions.
+        logger.debug("encryption keyfile chmod skipped: %s", e)
     return key
 
 
@@ -182,9 +205,13 @@ def _migrate_legacy_data() -> None:
                         audio_dst = new_rec / audio_src.name
                         if audio_src.exists() and not audio_dst.exists():
                             shutil.copy2(audio_src, audio_dst)
-    except Exception:
-        # Non-fatal: app should continue even if migration fails.
-        pass
+    except OSError as e:
+        # Non-fatal: app should continue even if migration fails, but the
+        # user deserves a breadcrumb in the logs so they can recover data
+        # manually if needed.
+        logger.warning(
+            "legacy data migration from %s failed: %s", LEGACY_DATA_DIR, e,
+        )
 
 
 _migrate_legacy_data()
@@ -220,47 +247,101 @@ def load_config() -> Dict[str, Any]:
 
     If the on-disk config contains plain-text keys (pre-encryption era),
     they are transparently encrypted in-place on first read.
+
+    Failures are logged with the specific reason (``OSError``,
+    ``json.JSONDecodeError``, etc.) instead of being silently swallowed.
+    The function still returns ``DEFAULT_CONFIG`` on any failure so the
+    app can boot — but the log breadcrumb lets the user diagnose the
+    cause (permissions, corruption, full disk) and recover their keys.
     """
     if not CONFIG_PATH.exists():
         return dict(DEFAULT_CONFIG)
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return dict(DEFAULT_CONFIG)
-        merged = _deep_merge(DEFAULT_CONFIG, raw)
+        raw_text = CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.error(
+            "config unreadable at %s: %s — falling back to defaults", CONFIG_PATH, e,
+        )
+        return dict(DEFAULT_CONFIG)
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        logger.error(
+            "config at %s is not valid JSON (%s) — falling back to defaults. "
+            "The on-disk file is left untouched so you can recover it by hand.",
+            CONFIG_PATH, e,
+        )
+        return dict(DEFAULT_CONFIG)
+    if not isinstance(raw, dict):
+        logger.error(
+            "config at %s is not a JSON object (got %s) — falling back to defaults",
+            CONFIG_PATH, type(raw).__name__,
+        )
+        return dict(DEFAULT_CONFIG)
+    merged = _deep_merge(DEFAULT_CONFIG, raw)
 
-        # Auto-migrate: if any provider key is plain-text, encrypt it on disk.
-        needs_migration = False
-        providers = merged.get("providers")
-        if isinstance(providers, dict):
-            for prov in providers.values():
-                if isinstance(prov, dict) and "key" in prov:
-                    k = str(prov.get("key") or "").strip()
-                    if k and not k.startswith(_ENC_PREFIX):
-                        needs_migration = True
-                        break
-        if needs_migration:
+    # Auto-migrate: if any provider key is plain-text, encrypt it on disk.
+    needs_migration = False
+    providers = merged.get("providers")
+    if isinstance(providers, dict):
+        for prov in providers.values():
+            if isinstance(prov, dict) and "key" in prov:
+                k = str(prov.get("key") or "").strip()
+                if k and not k.startswith(_ENC_PREFIX):
+                    needs_migration = True
+                    break
+    if needs_migration:
+        try:
             encrypted_cfg = _encrypt_provider_keys(merged)
             payload = json.dumps(encrypted_cfg, ensure_ascii=False, indent=2)
             tmp = CONFIG_PATH.with_suffix(".tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(CONFIG_PATH)
+        except (OSError, ValueError, TypeError) as e:
+            # Migration write failed — the in-memory decrypted config is
+            # still valid, so we log and continue rather than dropping
+            # the user's keys.
+            logger.warning(
+                "config key encryption migration write failed at %s: %s — "
+                "keys remain usable this session but the on-disk file is "
+                "still in legacy plain-text form",
+                CONFIG_PATH, e,
+            )
 
+    try:
         return _decrypt_provider_keys(merged)
-    except Exception:
+    except (ValueError, TypeError) as e:
+        logger.error(
+            "config key decryption failed: %s — falling back to defaults", e,
+        )
         return dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    """Merge *cfg* into the current config and persist with encrypted keys."""
+    """Merge *cfg* into the current config and persist with encrypted keys.
+
+    Raises ``OSError`` on disk failures so callers (API endpoints) can
+    surface a 500 with a concrete reason instead of pretending the save
+    succeeded.
+    """
     current = load_config()
     merged_current = _deep_merge(current, cfg or {})
     merged = _deep_merge(DEFAULT_CONFIG, merged_current)
     encrypted = _encrypt_provider_keys(merged)
     payload = json.dumps(encrypted, ensure_ascii=False, indent=2)
     tmp = CONFIG_PATH.with_suffix(".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(CONFIG_PATH)
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(CONFIG_PATH)
+    except OSError as e:
+        logger.error("failed to persist config at %s: %s", CONFIG_PATH, e)
+        # Clean up the half-written temp file so it does not linger and
+        # confuse the next read cycle.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:

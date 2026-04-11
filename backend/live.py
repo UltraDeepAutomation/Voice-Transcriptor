@@ -20,6 +20,14 @@ class LiveConfig:
     emit_epsilon_sec: float = 0.05
 
 
+# Consecutive transcribe failures before we escalate to a fatal error.
+# Single transient errors (audio glitch, model hiccup) should not kill
+# the live session — but an unrecoverable failure (model unload, OOM,
+# corrupted state) repeats forever, so we bound retries and surface
+# a fatal event to the frontend.
+_LIVE_MAX_CONSECUTIVE_ERRORS = 3
+
+
 class LiveSession:
     def __init__(
         self,
@@ -37,6 +45,8 @@ class LiveSession:
         self._lock = asyncio.Lock()
         self._last_transcribe_sec = 0.0
         self._last_emitted_end = 0.0
+        self._consecutive_errors = 0
+        self._last_error_signature: Optional[str] = None
 
     def _get_last_samples(self, n: int) -> np.ndarray:
         if n <= 0 or self._ring_samples <= 0:
@@ -133,8 +143,31 @@ class LiveSession:
                 len(result.get('segments', [])),
             )
         except Exception as e:
-            logger.error("transcribe error: %s", e, exc_info=True)
-            return None
+            # Typed error envelope — bounded retries before escalating.
+            # The transcriber loop in main.py forwards this to the frontend
+            # via `_ws_send_json`, so the user sees what went wrong rather
+            # than watching a silent dead session.
+            self._consecutive_errors += 1
+            signature = f"{type(e).__name__}: {e}"
+            self._last_error_signature = signature
+            logger.error(
+                "transcribe error (%d/%d consecutive): %s",
+                self._consecutive_errors,
+                _LIVE_MAX_CONSECUTIVE_ERRORS,
+                signature,
+                exc_info=True,
+            )
+            fatal = self._consecutive_errors >= _LIVE_MAX_CONSECUTIVE_ERRORS
+            return {
+                "type": "error",
+                "error": signature,
+                "fatal": bool(fatal),
+            }
+
+        # Reset on any successful inference pass — transient hiccups
+        # should not count against us forever.
+        self._consecutive_errors = 0
+        self._last_error_signature = None
 
         new_segments = []
         for s in result.get("segments", []):

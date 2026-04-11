@@ -46,6 +46,11 @@ let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
+// Single-flight promise for ``startBackend``. Concurrent callers
+// (window creation, restart timer, tray re-open) all await the same
+// in-flight start instead of racing to spawn duplicate Python
+// subprocesses that leak PIDs when ``backend`` is overwritten.
+let backendStartInFlight = null;
 let micPermissionChecked = false;
 let loadedFrontendBuildSignature = "";
 const OVERLAY_FIXED_HEIGHT = 150;
@@ -1985,6 +1990,15 @@ function hideRecordingOverlay() {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
   }
+  // Safety net: when the overlay is fully dismissed and no worker is
+  // actively draining the post-stop queue, both the counter and the
+  // queue MUST be zero. If anything has drifted out of sync (e.g. a
+  // crash in the worker left residual state), reset them now so a
+  // future recording does not inherit a phantom "queued" indicator.
+  if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
+    appendMainLog(`[hide-overlay] reset-stale-pending=${pendingTranscriptionCount}`);
+    pendingTranscriptionCount = 0;
+  }
 }
 
 async function setOverlayStatus(text) {
@@ -2067,6 +2081,11 @@ async function toggleRecordingFromShortcut() {
   if (shortcutToggleInFlight) return;
   const trace = createTrace("toggle_hotkey", {});
   shortcutToggleInFlight = true;
+  // Track whether the captured paste target was consumed by an
+  // enqueued task. If not (any failure path, or a start-recording
+  // path), we clear it in the finally block so a stale target can
+  // never leak into the NEXT recording's post-stop task.
+  let pasteTargetConsumed = false;
   try {
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
@@ -2153,8 +2172,8 @@ async function toggleRecordingFromShortcut() {
         targetName: pasteTargetAppName,
         targetPid: pasteTargetAppPid,
       });
-      pasteTargetAppName = "";
-      pasteTargetAppPid = 0;
+      // The task holds its own copy — we can release the globals now.
+      pasteTargetConsumed = true;
       await syncOverlayQueueVisual(false);
       await showPostStopYellowThenTranscribing(700);
     } else {
@@ -2171,6 +2190,15 @@ async function toggleRecordingFromShortcut() {
     traceEnd(trace, "done", {});
   } finally {
     shortcutToggleInFlight = false;
+    // Guarantee no stale paste target leaks into a future session on
+    // ANY exit path — renderer-not-ready, app-loading, mic-denied,
+    // exception mid-flow, etc. The consumed flag means an enqueued
+    // task already copied the value, so we are safe to clear here
+    // regardless of which branch above ran.
+    pasteTargetAppName = "";
+    pasteTargetAppPid = 0;
+    // Silence unused-var warning if consumed flag is never flipped.
+    void pasteTargetConsumed;
   }
 }
 
@@ -2217,94 +2245,118 @@ async function stopRecordingFromOverlay() {
   if (!win || win.isDestroyed() || !win.webContents) return;
   if (win.isVisible()) win.hide();
 
-  const result = await win.webContents.executeJavaScript(
-    `
-    (() => {
-      const isRec = !!(window.__transcriptorIsRecording);
-      const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
-      const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-      const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
-      const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
-      if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
-      // Use dedicated stop event — avoids dual-path race with btnStop.click().
-      window.dispatchEvent(new Event('transcriptor-hotkey-stop'));
-      return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
-    })();
-    `,
-    true
-  );
-
-  await ensureOverlayVisible({ startTimer: false, resetTimer: false });
-  if (result?.timerText) {
-    await setOverlayTimer(result.timerText);
-  }
-  await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
-
-  if (result?.ok) {
-    await playOverlayCue("stop");
-    if (result.auto) {
-      enqueuePostStopTask({
-        autoTranscribe: true,
-        autoSendEnter: !!result.autoSendEnter,
-        stopRequestedAt: Date.now(),
-        recordingId: Number(result.recordingId || 0),
-        targetName: pasteTargetAppName,
-        targetPid: pasteTargetAppPid,
-      });
-      pasteTargetAppName = "";
-      pasteTargetAppPid = 0;
-      await syncOverlayQueueVisual(false);
-      await showPostStopYellowThenTranscribing(700);
-    } else {
-      pasteTargetAppName = "";
-      pasteTargetAppPid = 0;
-      await setOverlayStatus("Saved To App");
-      setTimeout(() => hideRecordingOverlay(), 1400);
-    }
-  } else {
-    await setOverlayStatus("Saved To App");
-    setTimeout(() => hideRecordingOverlay(), 1400);
-  }
-}
-
-async function queryRendererState() {
-  if (!win || win.isDestroyed() || !win.webContents) return null;
   try {
-    return await win.webContents.executeJavaScript(
+    const result = await win.webContents.executeJavaScript(
       `
       (() => {
-        const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
-        const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
-        const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
-        const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
-        const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
-        const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
-        const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
-        const status = (document.getElementById('statusText')?.textContent || '').trim();
-        const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
-        const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
-        const busy = !!document.getElementById('btnStart')?.disabled;
-        const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-        return {
-          finishedAt,
-          finishedRecordingId,
-          finishedText,
-          uiFinalAt,
-          uiFinalRecordingId,
-          uiFinalText,
-          uiFinalKind,
-          status,
-          finalText,
-          liveText,
-          busy,
-          progressVisible,
-        };
+        const isRec = !!(window.__transcriptorIsRecording);
+        const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
+        const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
+        const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
+        const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
+        if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
+        // Use dedicated stop event — avoids dual-path race with btnStop.click().
+        window.dispatchEvent(new Event('transcriptor-hotkey-stop'));
+        return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
       })();
       `,
       true
     );
+
+    await ensureOverlayVisible({ startTimer: false, resetTimer: false });
+    if (result?.timerText) {
+      await setOverlayTimer(result.timerText);
+    }
+    await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
+
+    if (result?.ok) {
+      await playOverlayCue("stop");
+      if (result.auto) {
+        enqueuePostStopTask({
+          autoTranscribe: true,
+          autoSendEnter: !!result.autoSendEnter,
+          stopRequestedAt: Date.now(),
+          recordingId: Number(result.recordingId || 0),
+          targetName: pasteTargetAppName,
+          targetPid: pasteTargetAppPid,
+        });
+        await syncOverlayQueueVisual(false);
+        await showPostStopYellowThenTranscribing(700);
+      } else {
+        await setOverlayStatus("Saved To App");
+        setTimeout(() => hideRecordingOverlay(), 1400);
+      }
+    } else {
+      await setOverlayStatus("Saved To App");
+      setTimeout(() => hideRecordingOverlay(), 1400);
+    }
+  } finally {
+    // Every exit path clears the paste target — the enqueued task
+    // already holds its own copy, and any early-return branch must
+    // not leak a stale target into the next recording.
+    pasteTargetAppName = "";
+    pasteTargetAppPid = 0;
+  }
+}
+
+// Maximum time we wait on the renderer for a state snapshot. If the
+// renderer is stuck (infinite loop, ongoing synchronous work, blocked
+// on a pending IPC), ``executeJavaScript`` never resolves — and the
+// overlay stop path sits forever waiting for getLatestTranscriptText.
+// 2 s is long enough for a healthy renderer under load but short
+// enough that a stuck renderer still lets the user stop cleanly.
+const RENDERER_STATE_QUERY_TIMEOUT_MS = 2000;
+
+async function queryRendererState() {
+  if (!win || win.isDestroyed() || !win.webContents) return null;
+  const queryPromise = win.webContents.executeJavaScript(
+    `
+    (() => {
+      const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
+      const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
+      const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
+      const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
+      const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
+      const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
+      const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
+      const status = (document.getElementById('statusText')?.textContent || '').trim();
+      const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
+      const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
+      const busy = !!document.getElementById('btnStart')?.disabled;
+      const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
+      return {
+        finishedAt,
+        finishedRecordingId,
+        finishedText,
+        uiFinalAt,
+        uiFinalRecordingId,
+        uiFinalText,
+        uiFinalKind,
+        status,
+        finalText,
+        liveText,
+        busy,
+        progressVisible,
+      };
+    })();
+    `,
+    true
+  );
+  let timeoutHandle;
+  const timeoutPromise = new Promise((resolve) => {
+    timeoutHandle = setTimeout(() => {
+      appendMainLog(
+        `[renderer-state-query-timeout] ms=${RENDERER_STATE_QUERY_TIMEOUT_MS}`,
+      );
+      resolve(null);
+    }, RENDERER_STATE_QUERY_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([queryPromise, timeoutPromise]);
   } catch {
     return null;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 }
 
@@ -2320,14 +2372,41 @@ function getLastTranscriptPath() {
   }
 }
 
+// Cache for the last-transcript file. Paste-last is triggered by a
+// global hotkey and can fire rapidly; without a cache every press
+// performed a synchronous stat + readFile + JSON.parse on the main
+// process, blocking the Electron event loop. We key on the file's
+// mtime so any external change (another process, manual edit,
+// saveLastTranscriptToDisk) invalidates the cache automatically.
+let _lastTranscriptCacheText = "";
+let _lastTranscriptCacheMtimeMs = -1;
+
 function loadLastTranscriptFromDisk() {
   const p = getLastTranscriptPath();
-  if (!p || !fs.existsSync(p)) return "";
+  if (!p) return "";
+  let stat;
+  try {
+    stat = fs.statSync(p);
+  } catch {
+    // File does not exist or stat failed — invalidate cache and return "".
+    _lastTranscriptCacheText = "";
+    _lastTranscriptCacheMtimeMs = -1;
+    return "";
+  }
+  const mtimeMs = stat.mtimeMs;
+  if (mtimeMs === _lastTranscriptCacheMtimeMs && _lastTranscriptCacheText) {
+    return _lastTranscriptCacheText;
+  }
   try {
     const raw = fs.readFileSync(p, "utf8");
     const parsed = JSON.parse(raw);
-    return String(parsed?.text || "").trim();
+    const text = String(parsed?.text || "").trim();
+    _lastTranscriptCacheText = text;
+    _lastTranscriptCacheMtimeMs = mtimeMs;
+    return text;
   } catch {
+    _lastTranscriptCacheText = "";
+    _lastTranscriptCacheMtimeMs = -1;
     return "";
   }
 }
@@ -2344,7 +2423,17 @@ function saveLastTranscriptToDisk(text) {
       JSON.stringify({ text: cleaned, updated_at: new Date().toISOString() }, null, 2),
       "utf8"
     );
-  } catch { }
+    // Warm the cache with the value we just wrote so the next
+    // ``loadLastTranscriptFromDisk`` does not need to re-read it.
+    _lastTranscriptCacheText = cleaned;
+    try {
+      _lastTranscriptCacheMtimeMs = fs.statSync(p).mtimeMs;
+    } catch {
+      _lastTranscriptCacheMtimeMs = -1;
+    }
+  } catch (e) {
+    appendMainLog(`[save-last-transcript-error] ${compactLogText(e?.message || e)}`);
+  }
 }
 
 function escapeAppleScriptString(s) {
@@ -3003,18 +3092,31 @@ async function runPostStopQueue() {
     while (postStopQueue.length > 0) {
       const task = postStopQueue.shift();
       if (!task) continue;
+      // One accounting block per task: the decrement is guaranteed
+      // to happen exactly once even if any step below throws, so the
+      // counter can never drift above the real number of pending
+      // tasks. The outer try/finally (at the function bottom) drains
+      // any remaining queue entries on catastrophic failure.
       try {
-        await processPostStopTask(task);
-      } catch (e) {
-        appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
-        await setOverlayStatus("Saved To App");
+        try {
+          await processPostStopTask(task);
+        } catch (e) {
+          appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
+          await setOverlayStatus("Saved To App").catch(() => { });
+        }
+      } finally {
+        pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       }
-      pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
-      const isRec = await isRendererRecording();
-      await syncOverlayQueueVisual(isRec);
+      let isRec = false;
+      try {
+        isRec = await isRendererRecording();
+      } catch (e) {
+        appendMainLog(`[post-stop-queue] isRec-error err="${compactLogText(e?.message || e)}"`);
+      }
+      await syncOverlayQueueVisual(isRec).catch(() => { });
       if (!isRec) {
         if (pendingTranscriptionCount > 0) {
-          await setOverlayStatus("Transcribing");
+          await setOverlayStatus("Transcribing").catch(() => { });
         } else {
           setTimeout(() => hideRecordingOverlay(), 1400);
         }
@@ -3026,6 +3128,15 @@ async function runPostStopQueue() {
       }
     }
   } finally {
+    // Catastrophic exit — drop any tasks the loop could not reach so
+    // the counter can never outlive the queue and produce a phantom
+    // "N queued" indicator the user cannot clear.
+    if (postStopQueue.length > 0) {
+      const dropped = postStopQueue.length;
+      postStopQueue = [];
+      pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - dropped);
+      appendMainLog(`[post-stop-queue] drained dropped=${dropped}`);
+    }
     postStopWorkerRunning = false;
   }
 }
@@ -3639,6 +3750,18 @@ async function ensureBackendRuntime(python, repoRoot) {
 
 async function startBackend() {
   if (backend) return;
+  if (backendStartInFlight) return backendStartInFlight;
+
+  // Absorb any queued crash-restart: the caller is asking for a
+  // backend NOW, so the deferred restart is redundant. Clearing the
+  // timer here also prevents it from firing mid-start and causing
+  // startBackend() to re-enter itself.
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
+  }
+
+  backendStartInFlight = (async () => {
   const repoRoot = getRepoRoot();
   setBackendBootStatus("Locating Python…");
   const python = await resolvePython(repoRoot);
@@ -3731,6 +3854,13 @@ async function startBackend() {
     backendBootError = err.message;
     appendMainLog(`[backend-error] ${err.message}`);
   });
+  })();
+
+  try {
+    await backendStartInFlight;
+  } finally {
+    backendStartInFlight = null;
+  }
 }
 
 function waitForHttp(url, timeoutMs) {
@@ -3757,6 +3887,22 @@ function waitForHttp(url, timeoutMs) {
 
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
+
+  // Idempotency guard: if we already own a live BrowserWindow, reuse
+  // it instead of spawning a second one. Creating a second window
+  // would leak the first's webContents listeners (render-process-gone,
+  // did-fail-load, did-finish-load) because nothing ever destroys the
+  // orphaned BrowserWindow. Every caller today already checks
+  // ``win && !win.isDestroyed()`` — this is a defense-in-depth guard
+  // so a future caller cannot silently trip the leak.
+  if (win && !win.isDestroyed()) {
+    if (showWindow && !win.isVisible()) {
+      win.show();
+      win.focus();
+    }
+    return;
+  }
+
   win = new BrowserWindow({
     width: 1420,
     height: 780,
@@ -3816,6 +3962,20 @@ async function createWindow(options = {}) {
   });
 
   win.on("closed", () => {
+    // Drop webContents listeners explicitly before releasing the ref
+    // so nothing can re-bind them through a stale closure. Electron
+    // GCs the BrowserWindow's native resources on its own, but
+    // JavaScript closures that captured ``win.webContents`` would
+    // still hold references to the old listener set.
+    try {
+      if (win && !win.isDestroyed() && win.webContents) {
+        win.webContents.removeAllListeners("render-process-gone");
+        win.webContents.removeAllListeners("did-fail-load");
+        win.webContents.removeAllListeners("did-finish-load");
+      }
+    } catch (e) {
+      appendMainLog(`[win-closed-listener-cleanup] ${e?.message || e}`);
+    }
     win = null;
   });
 
@@ -4112,6 +4272,21 @@ app.whenReady().then(async () => {
     return defaults;
   }
 
+  // Attempt to register an accelerator and return a normalized result.
+  // ``globalShortcut.register`` can return ``false`` (accelerator in
+  // use by another app) OR throw (malformed accelerator string from
+  // an edited config). Both paths become a non-fatal ``ok=false`` so
+  // the caller can log + surface the failure without crashing the
+  // Electron main process.
+  function safeRegisterShortcut(accelerator, handler) {
+    try {
+      const ok = globalShortcut.register(accelerator, handler);
+      return { ok: !!ok, error: ok ? "" : "already in use" };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e) };
+    }
+  }
+
   function registerGlobalShortcuts() {
     const shortcuts = readShortcutsFromConfig();
     // Unregister old shortcuts (keep devtools)
@@ -4121,29 +4296,71 @@ app.whenReady().then(async () => {
     if (registeredPasteHotkey) {
       try { globalShortcut.unregister(registeredPasteHotkey); } catch { }
     }
+    // Clear stored values up-front — only set them back after a
+    // successful registration, so a failed accelerator is never
+    // tracked as "active" (which would cause the next reload to
+    // unregister something that was never registered).
+    registeredRecordHotkey = "";
+    registeredPasteHotkey = "";
 
-    registeredRecordHotkey = shortcuts.record;
-    const hotkeyOk = globalShortcut.register(registeredRecordHotkey, () => {
+    const recordResult = safeRegisterShortcut(shortcuts.record, () => {
       toggleRecordingFromShortcut().catch((e) => {
         appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
         hideRecordingOverlay();
       });
     });
-    if (!hotkeyOk) {
-      appendMainLog(`[app] failed to register recording shortcut: ${registeredRecordHotkey}`);
+    if (recordResult.ok) {
+      registeredRecordHotkey = shortcuts.record;
+    } else {
+      appendMainLog(
+        `[app] failed to register recording shortcut: ${shortcuts.record} (${recordResult.error})`,
+      );
     }
 
-    registeredPasteHotkey = shortcuts.paste;
-    const pasteLastHotkeyOk = globalShortcut.register(registeredPasteHotkey, () => {
+    const pasteResult = safeRegisterShortcut(shortcuts.paste, () => {
       pasteLatestTranscriptFromShortcut().catch((e) => {
         appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
         hideRecordingOverlay();
       });
     });
-    if (!pasteLastHotkeyOk) {
-      appendMainLog(`[app] failed to register paste-last shortcut: ${registeredPasteHotkey}`);
+    if (pasteResult.ok) {
+      registeredPasteHotkey = shortcuts.paste;
+    } else {
+      appendMainLog(
+        `[app] failed to register paste-last shortcut: ${shortcuts.paste} (${pasteResult.error})`,
+      );
     }
-    appendMainLog(`[shortcuts] registered: record=${registeredRecordHotkey} paste=${registeredPasteHotkey}`);
+
+    // Surface registration status to the renderer so the Settings
+    // panel can show a red indicator next to any shortcut that the
+    // main process could not claim. Failures are common: stale
+    // accelerators from another running copy, malformed user input,
+    // OS-level reservations (e.g. Alt+Space on some locales).
+    if (win && !win.isDestroyed() && win.webContents) {
+      const status = {
+        record: {
+          desired: shortcuts.record,
+          active: recordResult.ok ? shortcuts.record : "",
+          error: recordResult.ok ? "" : recordResult.error,
+        },
+        paste: {
+          desired: shortcuts.paste,
+          active: pasteResult.ok ? shortcuts.paste : "",
+          error: pasteResult.ok ? "" : pasteResult.error,
+        },
+      };
+      win.webContents
+        .executeJavaScript(
+          `window.__transcriptorShortcutStatus = ${JSON.stringify(status)};`,
+          true,
+        )
+        .catch(() => { });
+    }
+
+    appendMainLog(
+      `[shortcuts] registered: record=${registeredRecordHotkey || "FAILED"} ` +
+      `paste=${registeredPasteHotkey || "FAILED"}`,
+    );
   }
 
   registerGlobalShortcuts();
