@@ -5182,8 +5182,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         showRecordSessionNotice("Recording audio is saved and available immediately.", "success", 6000, sessionUiToken);
         saveDone = true;
       } catch (e) {
-        console.warn(`Audio persistence attempt failed (archiveDir="${tryArchiveDir}")`, e);
-        if (tryArchiveDir === "") {
+        const errMsg = e instanceof Error ? e.message : String(e || "");
+        console.warn(`Audio persistence attempt failed (archiveDir="${tryArchiveDir}", fileSize=${savedAudioFile?.size || 0}, fileName=${savedAudioFile?.name || "?"})`, e);
+        if (tryArchiveDir === "" || saveDirs.length === 1) {
           // Both attempts failed — truly broken.
           patchCurrentRecordingSummary({
             title: provisionalTitle,
