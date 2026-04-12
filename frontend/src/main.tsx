@@ -5149,7 +5149,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     // (rename, permissions, external drive ejected). Retrying into the
     // default dir salvages the audio instead of silently losing it.
     let saveDone = false;
-    for (const tryArchiveDir of [sessionArchiveDir, ""]) {
+    // Build unique attempt list — if sessionArchiveDir is already ""
+    // the fallback would be identical, so skip the duplicate.
+    const saveDirs = sessionArchiveDir ? [sessionArchiveDir, ""] : [""];
+    for (const tryArchiveDir of saveDirs) {
       if (saveDone) break;
       try {
         const persisted = await saveRecordingText({
@@ -5450,58 +5453,41 @@ async function stopLive(enhance: boolean): Promise<void> {
         transcriptRaw =
           liveCommittedDisplayCache || joinTranscriptSegments(liveTranscriptSegments);
       } else {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "Sealing Deepgram stream…",
-          tone: "info",
-        }, sessionUiToken);
-
-        // Await the envelope that the backend sends after Deepgram
-        // drains its buffer. This is the authoritative source —
-        // ``session.finalize()`` on the backend sends ``CloseStream``
-        // which makes Deepgram finalize every buffered segment and
-        // return them in its final Results messages. The backend
-        // collects those into a ``{type:"final", text:..., segments:
-        // ...}`` envelope and forwards it to us.
+        // ── Instant transcript from committed + interim ───────────
         //
-        // The 2000 ms budget is a safety ceiling. In practice the
-        // envelope arrives in 300–1200 ms depending on how much
-        // audio Deepgram still had in its pipeline.
+        // The user reported 2–8 second delays on short recordings.
+        // Waiting for the Deepgram envelope (up to 2000 ms ceiling)
+        // is unnecessary when the streaming path has already delivered
+        // committed (is_final) segments plus the current interim word
+        // to the frontend. ``getCanonicalLiveSourceText()`` returns
+        // committed + interim — that IS the full transcript. Using it
+        // immediately gives an effective 0 ms transcription latency.
         //
-        // IMPORTANT: committed segments are read AFTER the await so
-        // any is_final events that streamed in during the wait are
-        // included in the fallback path.
-        const envelope = liveFinalPromise ? await liveFinalPromise : null;
-        const envelopeError = envelope?.error || liveStreamError || "";
-        // Read committed + interim AFTER the await so any segments
-        // that streamed in during the wait are included.
-        const fallbackFull = getCanonicalLiveSourceText();
-        const fallbackDisplay = liveCommittedDisplayCache;
-        const fallbackSegments = liveTranscriptSegments.slice();
-
-        if (envelope && envelope.text && !envelopeError) {
-          const envelopeTrimmed = envelope.text.trim();
-          // Use whichever is LONGER — envelope or the live committed +
-          // interim cache. The envelope is authoritative for FINALIZED
-          // segments, but the live cache may contain an interim tail
-          // word that Deepgram hadn't finalized by the time the
-          // envelope was assembled. Using max(envelope, committed+interim)
-          // guarantees we never lose the tail.
-          transcriptRaw =
-            fallbackFull.length > envelopeTrimmed.length
-              ? fallbackFull
-              : envelopeTrimmed;
-        } else if (envelope && envelope.segments.length && !envelopeError) {
-          const joined = joinTranscriptSegments(envelope.segments);
-          transcriptRaw =
-            fallbackFull.length > joined.length ? fallbackFull : joined;
-        } else if (fallbackFull) {
-          transcriptRaw = fallbackFull;
-        } else if (fallbackDisplay) {
-          transcriptRaw = fallbackDisplay;
-        } else if (fallbackSegments.length) {
-          transcriptRaw = joinTranscriptSegments(fallbackSegments);
-        } else if (envelopeError) {
+        // The envelope is fired-and-forgotten in the background. If
+        // it arrives later with a LONGER or better-quality text (e.g.
+        // Deepgram's CloseStream finalize corrected a word), a future
+        // enhancement could update the saved recording. For now, the
+        // committed + interim path is the SSOT and matches exactly
+        // what the Live Preview pane showed the user during recording.
+        const instantTranscript = getCanonicalLiveSourceText();
+        if (instantTranscript) {
+          transcriptRaw = instantTranscript;
+        } else {
+          // No committed segments at all (very short recording, or
+          // Deepgram hadn't returned any is_final yet). Fall back to
+          // the envelope await.
+          patchCurrentRecordingSummary({
+            title: provisionalTitle,
+            status: "Sealing Deepgram stream…",
+            tone: "info",
+          }, sessionUiToken);
+          const envelope = liveFinalPromise ? await liveFinalPromise : null;
+          const envelopeError = envelope?.error || liveStreamError || "";
+          if (envelope && envelope.text && !envelopeError) {
+            transcriptRaw = envelope.text.trim();
+          } else if (envelope && envelope.segments.length && !envelopeError) {
+            transcriptRaw = joinTranscriptSegments(envelope.segments);
+          } else if (envelopeError) {
           // Nothing committed, nothing final, only an error — try
           // Deepgram REST on the saved audio as a last resort.
           patchCurrentRecordingSummary({
@@ -5529,6 +5515,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             }
           }
         }
+        } // close ``else`` (no instantTranscript — envelope fallback)
       }
 
       // Very last resort: whatever the live source text captured.
