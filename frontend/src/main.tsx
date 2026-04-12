@@ -2420,14 +2420,31 @@ function syncUpscalePresetControls(): void {
   const editBtn = $("upscalePresetEditBtn") as HTMLButtonElement;
   const addBtn = $("upscalePresetAddBtn") as HTMLButtonElement;
   const delBtn = $("upscalePresetDeleteBtn") as HTMLButtonElement;
-  wrap.hidden = !upscaleEnabled;
+  // The preset dropdown (Clean / Business / AI & Code / Refine) must
+  // ALWAYS be visible so the user can see what upscale variations
+  // exist and choose one BEFORE turning the toggle on. Hiding the
+  // controls when upscale is off made the whole toolbar look empty
+  // and the user reported "вариации апскейла не отображаются". We
+  // now disable instead of hiding — the controls dim out at 0.5
+  // opacity when the toggle is off, signalling that they are
+  // inactive but still available, and become fully interactive the
+  // moment the toggle is flipped on.
+  wrap.hidden = false;
   sel.disabled = !upscaleEnabled;
-  editBtn.hidden = !upscaleEnabled;
-  addBtn.hidden = !upscaleEnabled;
-  delBtn.hidden = !upscaleEnabled;
+  editBtn.hidden = false;
+  editBtn.disabled = !upscaleEnabled;
+  addBtn.hidden = false;
+  addBtn.disabled = !upscaleEnabled;
+  delBtn.hidden = false;
   const canDelete = !!(selectedUpscalePreset() && !selectedUpscalePreset()!.builtin);
   delBtn.disabled = !upscaleEnabled || !canDelete;
   delBtn.classList.toggle("can-delete", upscaleEnabled && canDelete);
+  // Visual dimming for the entire toolbar when upscale is OFF.
+  const toolbar = wrap.closest(".pane-toolbar-actions-upscale") as HTMLElement | null;
+  if (toolbar) {
+    toolbar.style.opacity = upscaleEnabled ? "1" : "0.5";
+    toolbar.style.pointerEvents = upscaleEnabled ? "" : "";
+  }
 }
 
 async function loadUpscalePresets(preferredId = ""): Promise<void> {
@@ -4604,6 +4621,26 @@ async function startLive(): Promise<void> {
     }
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");
+    }
+    // Device disconnect mid-recording: when AirPods/USB mic disconnect,
+    // the audio track fires ``ended`` but nothing in the old code
+    // listened for it. The recording would continue in silence until
+    // the user manually pressed Stop — and the transcript would be
+    // missing everything after the disconnect. We now auto-stop on
+    // track ended so the user gets a clean transcript up to the
+    // disconnect point and a visible "Mic disconnected" status.
+    const capturedSessionToken = sessionUiToken;
+    for (const track of stream.getAudioTracks()) {
+      track.addEventListener("ended", () => {
+        if (!isRecording) return;
+        if (activeUiSessionToken !== capturedSessionToken) return;
+        console.warn("Audio track ended (device disconnect) — auto-stopping");
+        patchCurrentRecordingSummary(
+          { status: "Microphone disconnected. Saving what was captured.", tone: "warning" },
+          capturedSessionToken,
+        );
+        void stopLive(shouldAutoTranscribe());
+      }, { once: true });
     }
     ac = new AudioContext();
     if (ac.state !== "running") {
