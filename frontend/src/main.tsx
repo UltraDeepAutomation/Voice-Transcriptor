@@ -4082,6 +4082,12 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
       liveCommittedDisplayCache = "";
       scheduleLiveOutputRender();
     }
+    // Hide the audio player when the Transcribe pane has no text.
+    // Without this, a stale audio row from the previous recording
+    // stays visible in Idle state ("голосовуха все ещё старая висит").
+    if (!domText) {
+      setCurrentRecordingAudio(null);
+    }
   }
 }
 
