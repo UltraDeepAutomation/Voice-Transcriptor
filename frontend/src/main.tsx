@@ -1242,10 +1242,10 @@ class OpfsPcmSink implements PcmSink {
     if (!this.writable) return;
     if (!this.pendingChunks.length) return;
     this.flushInProgress = true;
+    const chunks = this.pendingChunks;
+    this.pendingChunks = [];
+    this.pendingBytes = 0;
     try {
-      const chunks = this.pendingChunks;
-      this.pendingChunks = [];
-      this.pendingBytes = 0;
       const totalBytes = chunks.reduce((a, c) => a + c.byteLength, 0);
       const merged = new Uint8Array(totalBytes);
       let offset = 0;
@@ -1256,6 +1256,11 @@ class OpfsPcmSink implements PcmSink {
       await this.writable.write(merged);
     } catch (e) {
       this.lastWriteError = e instanceof Error ? e : new Error(String(e));
+      // Re-enqueue the failed chunks so finalize() can still produce a
+      // WAV from in-memory data via the WebM fallback path. Without this
+      // the samples in ``chunks`` are GC'd and permanently lost.
+      this.pendingChunks = [...chunks, ...this.pendingChunks];
+      this.pendingBytes = this.pendingChunks.reduce((a, c) => a + c.byteLength, 0);
       console.warn("OpfsPcmSink: write failed — disk may be full or permissions revoked", e);
     } finally {
       this.flushInProgress = false;
@@ -3420,12 +3425,11 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
     } else {
       resetRecordingViewer(recordingsSearchQuery ? "No recordings match the current search." : "Choose a recording from the left list...");
     }
-  } catch (e) {
-    throw e;
   } finally {
-    if (requestSeq === recordingsLoadRequestSeq) {
-      setRecordingsUiLoading(false);
-    }
+    // Always clear loading state — even for superseded requests. The
+    // old code only cleared when requestSeq matched, which left the UI
+    // in a permanent loading state when a superseded request errored.
+    setRecordingsUiLoading(false);
   }
 }
 
@@ -4507,13 +4511,10 @@ async function startLive(): Promise<void> {
     pcmSink = null;
     void prior.destroy();
   }
-  // Fresh session sink; OPFS-backed when available, memory otherwise.
-  // Created via an async factory so we kick it off and let it land
-  // before the first audio frame arrives (~1.3s of fallback init
-  // delay makes this a comfortable margin).
-  void createPcmSink(sessionUiToken).then((sink) => {
-    pcmSink = sink;
-  });
+  // Await the sink so it is ready BEFORE the first audio frame. The
+  // old fire-and-forget path dropped frames that arrived before the
+  // async OPFS init resolved (~50 ms, but up to 500 ms on slow devices).
+  pcmSink = await createPcmSink(sessionUiToken);
   workletLastFrameAt = 0;
   silenceStartedAtMs = 0;
   autoStopTriggered = false;
