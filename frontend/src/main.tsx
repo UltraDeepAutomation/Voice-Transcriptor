@@ -1834,9 +1834,16 @@ function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
 }
 
 function getCanonicalLiveSourceText(): string {
+  // Include BOTH committed segments AND the current interim so the
+  // tail of the utterance (the word the user was still speaking
+  // when they pressed Stop) is never lost. The old code returned
+  // committed-only when committed was non-empty, which dropped
+  // every unfinalized word — that was the root cause of "последние
+  // несколько слов не вставляет".
   const committed = liveDraftText.trim();
-  if (committed) return committed;
-  return liveInterimText.trim();
+  const interim = liveInterimText.trim();
+  if (committed && interim) return `${committed} ${interim}`;
+  return committed || interim;
 }
 
 function getVisibleLivePreviewText(): string {
@@ -5455,13 +5462,30 @@ async function stopLive(enhance: boolean): Promise<void> {
         // included in the fallback path.
         const envelope = liveFinalPromise ? await liveFinalPromise : null;
         const envelopeError = envelope?.error || liveStreamError || "";
+        // Read committed + interim AFTER the await so any segments
+        // that streamed in during the wait are included.
+        const fallbackFull = getCanonicalLiveSourceText();
         const fallbackDisplay = liveCommittedDisplayCache;
         const fallbackSegments = liveTranscriptSegments.slice();
 
         if (envelope && envelope.text && !envelopeError) {
-          transcriptRaw = envelope.text.trim();
+          const envelopeTrimmed = envelope.text.trim();
+          // Use whichever is LONGER — envelope or the live committed +
+          // interim cache. The envelope is authoritative for FINALIZED
+          // segments, but the live cache may contain an interim tail
+          // word that Deepgram hadn't finalized by the time the
+          // envelope was assembled. Using max(envelope, committed+interim)
+          // guarantees we never lose the tail.
+          transcriptRaw =
+            fallbackFull.length > envelopeTrimmed.length
+              ? fallbackFull
+              : envelopeTrimmed;
         } else if (envelope && envelope.segments.length && !envelopeError) {
-          transcriptRaw = joinTranscriptSegments(envelope.segments);
+          const joined = joinTranscriptSegments(envelope.segments);
+          transcriptRaw =
+            fallbackFull.length > joined.length ? fallbackFull : joined;
+        } else if (fallbackFull) {
+          transcriptRaw = fallbackFull;
         } else if (fallbackDisplay) {
           transcriptRaw = fallbackDisplay;
         } else if (fallbackSegments.length) {
