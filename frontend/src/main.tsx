@@ -1834,16 +1834,42 @@ function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
 }
 
 function getCanonicalLiveSourceText(): string {
-  // Include BOTH committed segments AND the current interim so the
-  // tail of the utterance (the word the user was still speaking
-  // when they pressed Stop) is never lost. The old code returned
-  // committed-only when committed was non-empty, which dropped
-  // every unfinalized word — that was the root cause of "последние
-  // несколько слов не вставляет".
+  // Include BOTH committed segments AND the best available interim so
+  // the tail of the utterance is never lost.
+  //
+  // Why ``lastInterimSnapshot``: when Deepgram sends an ``is_final``
+  // event, ``appendLiveTranscriptSegments`` clears ``liveInterimText``
+  // (correct for live display — the interim is replaced by the final).
+  // But if Deepgram finalized only PART of what was in the interim
+  // (e.g. "последние" out of "последние слова"), the cleared interim
+  // loses "слова" and the committed cache only has "последние". By
+  // the time stopLive reads this function, the tail word is gone.
+  //
+  // ``lastInterimSnapshot`` preserves the interim text from just
+  // before the last clear. We pick whichever is LONGEST among:
+  //   1. Current ``liveInterimText`` (if Deepgram sent a fresh interim
+  //      after the last is_final)
+  //   2. ``lastInterimSnapshot`` (the interim just before the last
+  //      is_final wiped it)
+  //
+  // Deduplication: if the chosen interim is already a SUBSTRING of
+  // ``committed``, skip it to avoid "foo bar bar" artifacts.
   const committed = liveDraftText.trim();
-  const interim = liveInterimText.trim();
-  if (committed && interim) return `${committed} ${interim}`;
-  return committed || interim;
+  const currentInterim = liveInterimText.trim();
+  const snapshotInterim = lastInterimSnapshot.trim();
+  const interim =
+    currentInterim.length >= snapshotInterim.length
+      ? currentInterim
+      : snapshotInterim;
+  if (!interim) return committed;
+  if (!committed) return interim;
+  // Dedup: if committed already ends with the interim text, skip.
+  if (committed.endsWith(interim)) return committed;
+  // Dedup: if the interim is entirely contained in the committed tail,
+  // it was already finalized — skip.
+  const lastCommittedWords = committed.split(/\s+/).slice(-10).join(" ");
+  if (lastCommittedWords.includes(interim)) return committed;
+  return `${committed} ${interim}`;
 }
 
 function getVisibleLivePreviewText(): string {
@@ -4226,6 +4252,18 @@ function setLiveInterimText(text: string): void {
  * with well-behaved streaming providers but we guard for it).
  */
 let liveCommittedDisplayCache = "";
+// Snapshot of ``liveInterimText`` taken JUST BEFORE it is cleared by
+// an incoming ``is_final`` event. When the user presses Stop while
+// Deepgram is mid-utterance, the live interim may contain words that
+// Deepgram's ``is_final`` hasn't covered yet. The ``is_final`` handler
+// clears ``liveInterimText`` (correct for live display), but stopLive's
+// ``getCanonicalLiveSourceText()`` then sees an empty interim and loses
+// those trailing words.
+//
+// ``lastInterimSnapshot`` preserves the interim so stopLive can recover
+// it. It is reset to "" at the start of every new recording (startLive)
+// and updated every time ``appendLiveTranscriptSegments`` fires.
+let lastInterimSnapshot = "";
 
 function appendLiveTranscriptSegments(rawSegments: unknown[]): void {
   const nextSegments = Array.isArray(rawSegments)
@@ -4244,6 +4282,11 @@ function appendLiveTranscriptSegments(rawSegments: unknown[]): void {
     merged.slice(0, prevLen).every((seg, i) => seg === liveTranscriptSegments[i]);
 
   liveTranscriptSegments = merged;
+  // Snapshot the interim BEFORE clearing it so stopLive can recover
+  // trailing words that haven't been finalized yet.
+  if (liveInterimText) {
+    lastInterimSnapshot = liveInterimText;
+  }
   // Committed-final text is the SSOT. Clear any lingering interim so
   // the visible preview matches the committed stream.
   liveInterimText = "";
@@ -4477,6 +4520,7 @@ async function startLive(): Promise<void> {
   captureRmsAccum = 0;
   capturePeakMax = 0;
   captureRmsEma = 0;
+  lastInterimSnapshot = "";
   resetLiveDraftState();
   clearLiveStreamState();
   liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
