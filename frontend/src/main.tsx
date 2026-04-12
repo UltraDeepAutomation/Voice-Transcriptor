@@ -5246,8 +5246,6 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
     }
   }
-  stopTransitionInFlight = false;
-
   // NOW safe to destroy the OPFS spool file — saveRecordingText above
   // has already serialized the File blob into the FormData upload.
   if (deferredSinkDestroy) {
@@ -5677,8 +5675,6 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
     }
     const latencyMs = performance.now() - transcribeStartedAt;
-    if (isCurrentUiSession(sessionUiToken)) {
-    }
     patchCurrentRecordingSummary({
       title,
       status: finalSaveConflict
@@ -5729,8 +5725,6 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
     }
     const latencyMs = performance.now() - transcribeStartedAt;
-    if (isCurrentUiSession(sessionUiToken)) {
-    }
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       status: fallbackSaveConflict
@@ -5757,6 +5751,12 @@ async function stopLive(enhance: boolean): Promise<void> {
       phases: stopTimings,
     };
   }
+  // Only clear the in-flight guard at the very END of stopLive, AFTER
+  // all async work (transcription, save, upscale) has completed. The
+  // old code cleared it mid-function (before the async transcription
+  // work), allowing a new startLive → stopLive to race with the
+  // in-flight save/transcribe and corrupt module-level state.
+  stopTransitionInFlight = false;
 }
 
 function reportFileSelectionError(message: string): void {
@@ -5894,8 +5894,6 @@ async function transcribeSelectedFile(): Promise<void> {
         });
       }
       const latencyMs = performance.now() - transcribeStartedAt;
-      if (isCurrentUiSession(sessionUiToken)) {
-      }
       patchCurrentRecordingSummary({
         status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
         tone: "success",
@@ -5935,8 +5933,6 @@ async function transcribeSelectedFile(): Promise<void> {
         });
       }
       const latencyMs = performance.now() - transcribeStartedAt;
-      if (isCurrentUiSession(sessionUiToken)) {
-      }
       patchCurrentRecordingSummary({
         status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
         tone: "success",
@@ -6588,6 +6584,9 @@ async function initRecordingsBootstrap(): Promise<void> {
   });
 
   window.addEventListener("mousemove", (e: MouseEvent) => {
+    // Early exit when graph tab is hidden — avoids gHitTest loop +
+    // getBoundingClientRect on every mouse move in the entire app.
+    if (!!ct.closest("[hidden]") && !gDragging) return;
     if (gDragging) {
       const dx = e.clientX - gDragStartX, dy = e.clientY - gDragStartY;
       gDragDist = Math.sqrt(dx * dx + dy * dy);

@@ -414,7 +414,7 @@ class DeepgramLiveSession:
 
     async def close(self) -> None:
         """Idempotently release the upstream socket and background tasks."""
-        if self._closed and self._ws is None:
+        if self._closed:
             return
         self._closed = True
 
