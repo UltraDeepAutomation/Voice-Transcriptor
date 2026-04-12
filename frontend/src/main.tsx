@@ -3138,9 +3138,20 @@ function reconcileCurrentRecordingSummaryWithArchive(): void {
 
 function syncLatestSavedAudioFromRecordings(): void {
   reconcileCurrentRecordingSummaryWithArchive();
+  // If the current audio state holds an in-memory File blob from an
+  // active or just-completed stopLive session, do NOT overwrite it.
+  // The in-memory blob is the authoritative audio for the CURRENT
+  // recording and is always the freshest. Overwriting it with a
+  // backend-served URL from ``recordingItems`` can regress to a STALE
+  // recording if the recordings list hasn't refreshed yet or if audio
+  // retention hasn't pruned the old file. The user reported "старая
+  // голосовуха всё ещё висит" because this function ran from a fire-
+  // and-forget ``loadRecordings`` and replaced the fresh in-memory
+  // blob with a backend reference to the previous recording's audio.
+  if (latestSavedAudioState?.file) return;
+
   const freshestWithAudio = recordingItems.find((item) => item.has_audio);
   if (!freshestWithAudio) {
-    if (latestSavedAudioState?.file && !latestSavedAudioState.savedName) return;
     setLatestSavedAudio(null);
     return;
   }
@@ -4081,12 +4092,6 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
       liveTranscriptSegments = [];
       liveCommittedDisplayCache = "";
       scheduleLiveOutputRender();
-    }
-    // Hide the audio player when the Transcribe pane has no text.
-    // Without this, a stale audio row from the previous recording
-    // stays visible in Idle state ("голосовуха все ещё старая висит").
-    if (!domText) {
-      setCurrentRecordingAudio(null);
     }
   }
 }
