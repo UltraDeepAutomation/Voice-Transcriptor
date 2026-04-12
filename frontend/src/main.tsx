@@ -4245,6 +4245,20 @@ function resetOutputs(): void {
   $("progressText").textContent = "0%";
 }
 
+// EMA (exponential moving average) smoothing factor for
+// ``__transcriptorRmsLevel``. The overlay's silence detector polls
+// this value every 120 ms, but the worklet posts a frame every
+// ~2.67 ms (128 samples @ 48 kHz). Without smoothing, the overlay
+// samples ONE instantaneous 2.67 ms window and can catch a micro-
+// pause between syllables (natural in conversational speech) as
+// "silence", accumulate 2 s of intermittent dips, and trigger a
+// false auto-stop WHILE THE USER IS STILL SPEAKING. An EMA with
+// alpha ~0.06 gives a ~45-frame smoothing window (~120 ms) that
+// tracks speech energy faithfully but rides through inter-word
+// gaps without dropping to zero.
+let captureRmsEma = 0;
+const CAPTURE_RMS_EMA_ALPHA = 0.06;
+
 function pushCapturedFrame(input: Float32Array): void {
   if (!(input instanceof Float32Array) || !input.length) return;
   workletLastFrameAt = Date.now();
@@ -4261,10 +4275,14 @@ function pushCapturedFrame(input: Float32Array): void {
   captureFrameCount += 1;
   captureRmsAccum += rms;
   if (peak > capturePeakMax) capturePeakMax = peak;
+  // Smooth RMS via EMA so the overlay's silence detector sees the
+  // energy trend over ~120 ms, not a single 2.67 ms micro-window
+  // that might happen to land on an inter-syllable gap.
+  captureRmsEma = CAPTURE_RMS_EMA_ALPHA * rms + (1 - CAPTURE_RMS_EMA_ALPHA) * captureRmsEma;
   // CRITICAL: set __transcriptorRmsLevel here too, not just in setVU.
   // The overlay main process reads this for silence detection.
   // setVU runs in rAF which stalls when the window is hidden.
-  window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(rms) ? rms : 0);
+  window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(captureRmsEma) ? captureRmsEma : 0);
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
@@ -4402,6 +4420,7 @@ async function startLive(): Promise<void> {
   captureFrameCount = 0;
   captureRmsAccum = 0;
   capturePeakMax = 0;
+  captureRmsEma = 0;
   resetLiveDraftState();
   clearLiveStreamState();
   liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
@@ -5333,7 +5352,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
       setStatusScoped(sessionUiToken, "Finalizing");
 
-      // Fast path 1: the live stream already errored before stop. Skip
+      // Fast path: the live stream already errored before stop. Skip
       // the finalize wait entirely and go straight to what we have.
       if (liveStreamErrorAtStop) {
         transcriptRaw =
@@ -5345,59 +5364,23 @@ async function stopLive(enhance: boolean): Promise<void> {
           tone: "info",
         }, sessionUiToken);
 
-        // Fast path 2: poll ``liveTranscriptSegments`` for up to 700 ms.
-        // Deepgram streams additional ``is_final`` events on the same
-        // WebSocket between CloseStream and the final envelope arriving;
-        // those land in liveTranscriptSegments via the normal onmessage
-        // handler. If the last committed segment already covers the
-        // recording tail (end ≥ recordedSec - 0.4s tolerance), we have
-        // the complete transcript and can skip waiting for the envelope
-        // altogether.
+        // Await the envelope that the backend sends after Deepgram
+        // drains its buffer. This is the authoritative source —
+        // ``session.finalize()`` on the backend sends ``CloseStream``
+        // which makes Deepgram finalize every buffered segment and
+        // return them in its final Results messages. The backend
+        // collects those into a ``{type:"final", text:..., segments:
+        // ...}`` envelope and forwards it to us.
         //
-        // Why this matters: the full 2000 ms envelope ceiling is the
-        // WORST case. For a typical 10-second recording Deepgram
-        // commits the last is_final ~300–500 ms after CloseStream, so
-        // this fast path catches it within two polling intervals and
-        // returns immediately — eliminating the "stop adds a couple
-        // of seconds" regression from the tail fix.
+        // The 2000 ms budget is a safety ceiling. In practice the
+        // envelope arrives in 300–1200 ms depending on how much
+        // audio Deepgram still had in its pipeline.
         //
-        // The envelope-based fallback below still runs if the fast path
-        // doesn't hit (e.g. very short recording where Deepgram hasn't
-        // committed anything yet, or a long utterance with a trailing
-        // clause that hasn't been sealed).
-        const fastPathDeadline = performance.now() + 700;
-        const fastPathTolerance = 0.4;
-        let fastPathTranscript = "";
-        while (performance.now() < fastPathDeadline) {
-          const segs = liveTranscriptSegments;
-          const last = segs.length > 0 ? segs[segs.length - 1] : null;
-          const covered =
-            !!last &&
-            recordedSec > 0 &&
-            last.end >= recordedSec - fastPathTolerance;
-          if (covered && liveCommittedDisplayCache) {
-            fastPathTranscript = liveCommittedDisplayCache;
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 80));
-        }
-        if (fastPathTranscript) {
-          transcriptRaw = fastPathTranscript;
-          // Fall through to the post-transcription flow below without
-          // awaiting the envelope. The liveFinalPromise will resolve
-          // (or time out) in the background and be garbage collected.
-        }
-        if (!transcriptRaw) {
+        // IMPORTANT: committed segments are read AFTER the await so
+        // any is_final events that streamed in during the wait are
+        // included in the fallback path.
         const envelope = liveFinalPromise ? await liveFinalPromise : null;
         const envelopeError = envelope?.error || liveStreamError || "";
-
-        // IMPORTANT: read committed segments AFTER awaiting the
-        // envelope. Deepgram streams additional is_final events on
-        // the WebSocket between our CloseStream and the final
-        // envelope arriving — those land in ``liveTranscriptSegments``
-        // via the normal onmessage handler, but ONLY if we read
-        // them post-await. The old code snapshotted BEFORE the
-        // await and missed every trailing clause.
         const fallbackDisplay = liveCommittedDisplayCache;
         const fallbackSegments = liveTranscriptSegments.slice();
 
@@ -5406,9 +5389,6 @@ async function stopLive(enhance: boolean): Promise<void> {
         } else if (envelope && envelope.segments.length && !envelopeError) {
           transcriptRaw = joinTranscriptSegments(envelope.segments);
         } else if (fallbackDisplay) {
-          // Envelope didn't come back in time but we still have all
-          // the committed segments, including any that arrived while
-          // we were waiting for the envelope.
           transcriptRaw = fallbackDisplay;
         } else if (fallbackSegments.length) {
           transcriptRaw = joinTranscriptSegments(fallbackSegments);
@@ -5440,7 +5420,6 @@ async function stopLive(enhance: boolean): Promise<void> {
             }
           }
         }
-        } // close the ``if (!transcriptRaw)`` fast-path fall-through guard
       }
 
       // Very last resort: whatever the live source text captured.
