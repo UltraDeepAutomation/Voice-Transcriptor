@@ -4276,6 +4276,11 @@ function resetOutputs(): void {
   $("downloadRow").hidden = true;
   $("progressFill").style.width = "0%";
   $("progressText").textContent = "0%";
+  // Clear stale audio from the previous recording so the user
+  // never sees a 3-second "ghost" audio player while a new 52-second
+  // recording is in progress. The new session's audio will be
+  // rendered after stopLive persists it.
+  setCurrentRecordingAudio(null);
 }
 
 // EMA (exponential moving average) smoothing factor for

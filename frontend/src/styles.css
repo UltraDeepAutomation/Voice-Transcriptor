@@ -959,11 +959,19 @@ textarea:focus-visible,
 
 .pane-toolbar-actions {
   display: flex;
-  flex-wrap: wrap;
+  /* nowrap prevents the toolbar from jumping to two rows, which
+     the user called out as ugly ("на две строки переносятся все
+     символы"). With the narrowed min-widths on model/preset
+     selects (104/96 px) and the 0.8/1.0/1.2 grid split, the
+     primary + secondary groups fit on one line at the 1140 px
+     shell minWidth. If a pathologically small viewport squeezes
+     further, overflow:hidden clips the trailing controls cleanly
+     instead of wrapping. */
+  flex-wrap: nowrap;
   align-self: center;
   justify-content: flex-start;
   gap: var(--toolbar-group-gap);
-  overflow: visible;
+  overflow: hidden;
 }
 
 .pane-toolbar-actions-live {
