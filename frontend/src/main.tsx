@@ -2433,8 +2433,24 @@ function syncUpscalePresetControls(): void {
 async function loadUpscalePresets(preferredId = ""): Promise<void> {
   const sel = $("upscalePresetSelect") as HTMLSelectElement;
   const prev = preferredId || sel.value || pendingUpscalePresetId || "";
-  const r = await apiGet<{ items: UpscalePresetItem[] }>("/api/upscale/presets");
-  upscalePresets = Array.isArray(r.items) ? r.items : [];
+  let items: UpscalePresetItem[] = [];
+  try {
+    const r = await apiGet<{ items: UpscalePresetItem[] }>("/api/upscale/presets");
+    items = Array.isArray(r.items) ? r.items : [];
+  } catch (e) {
+    // Backend may still be booting or temporarily unreachable. Fall
+    // back to the client-side builtins so the dropdown is NEVER empty
+    // — the user can still choose a preset and record; the actual
+    // instruction text is resolved server-side at upscale time, so
+    // having only the id+name locally is enough.
+    console.warn("loadUpscalePresets: API call failed, using client-side builtins", e);
+    items = BUILTIN_UPSCALE_PRESETS.map((p) => ({
+      id: p.id,
+      name: p.name,
+      builtin: true,
+    }));
+  }
+  upscalePresets = items;
   sel.innerHTML = "";
   if (!upscalePresets.length) {
     const o = document.createElement("option");
@@ -5067,36 +5083,52 @@ async function stopLive(enhance: boolean): Promise<void> {
   let persistedRecordingArchiveDir = "";
   const provisionalTitle = _smartTitle(sourceLiveText);
   if (savedAudioFile) {
-    try {
-      const persisted = await saveRecordingText({
-        archiveDir: sessionArchiveDir,
-        title: provisionalTitle,
-        sourceText: sourceLiveText,
-        transcriptText: "",
-        provider: providerValue || "local",
-        model: modelValue,
-        language: languageValue,
-        audioFile: savedAudioFile,
-        refreshList: false,
-      });
-      persistedRecordingName = persisted.name;
-      persistedRecordingArchiveDir = persisted.archiveDir;
-      setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
-      await discardLiveRecovery(liveSessionId);
-      patchCurrentRecordingSummary({
-        title: provisionalTitle,
-        status: enhance && transcribeInputFile ? "Audio saved locally. Starting final transcription." : "Audio saved locally.",
-        tone: "success",
-        savedName: persistedRecordingName,
-      }, sessionUiToken);
-      showRecordSessionNotice("Recording audio is saved and available immediately.", "success", 6000, sessionUiToken);
-    } catch (e) {
-      console.warn("Initial audio persistence failed", e);
-      patchCurrentRecordingSummary({
-        title: provisionalTitle,
-        status: "Audio capture finished, but initial save failed. Final transcript may still complete.",
-        tone: "error",
-      }, sessionUiToken);
+    // Two-attempt save: first with the configured archive dir, then
+    // with the DEFAULT dir. The most common cause of "initial save
+    // failed" is a stale custom recordings_dir that became unwritable
+    // (rename, permissions, external drive ejected). Retrying into the
+    // default dir salvages the audio instead of silently losing it.
+    let saveDone = false;
+    for (const tryArchiveDir of [sessionArchiveDir, ""]) {
+      if (saveDone) break;
+      try {
+        const persisted = await saveRecordingText({
+          archiveDir: tryArchiveDir,
+          title: provisionalTitle,
+          sourceText: sourceLiveText,
+          transcriptText: "",
+          provider: providerValue || "local",
+          model: modelValue,
+          language: languageValue,
+          audioFile: savedAudioFile,
+          refreshList: false,
+        });
+        persistedRecordingName = persisted.name;
+        persistedRecordingArchiveDir = persisted.archiveDir;
+        setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
+        await discardLiveRecovery(liveSessionId);
+        const fallbackNote = tryArchiveDir !== sessionArchiveDir && sessionArchiveDir
+          ? " (saved to default folder — configured archive was unavailable)"
+          : "";
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: (enhance && transcribeInputFile ? "Audio saved locally. Starting final transcription." : "Audio saved locally.") + fallbackNote,
+          tone: "success",
+          savedName: persistedRecordingName,
+        }, sessionUiToken);
+        showRecordSessionNotice("Recording audio is saved and available immediately.", "success", 6000, sessionUiToken);
+        saveDone = true;
+      } catch (e) {
+        console.warn(`Audio persistence attempt failed (archiveDir="${tryArchiveDir}")`, e);
+        if (tryArchiveDir === "") {
+          // Both attempts failed — truly broken.
+          patchCurrentRecordingSummary({
+            title: provisionalTitle,
+            status: "Audio capture finished, but save failed. Check Recordings folder permissions.",
+            tone: "error",
+          }, sessionUiToken);
+        }
+      }
     }
   }
   stopTransitionInFlight = false;
