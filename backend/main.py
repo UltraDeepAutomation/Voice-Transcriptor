@@ -534,6 +534,15 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
                 model=model,
                 language=language,
             )
+        except Exception:
+            # Roll back: if the text write failed after the audio was
+            # already placed at its final path, delete the orphaned
+            # audio so it doesn't leak on disk with no .txt sibling.
+            try:
+                audio_out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         finally:
             tmp_audio.unlink(missing_ok=True)
         # Same retention policy as ``save_recording_with_audio``: recovered
@@ -630,7 +639,7 @@ async def transcribe_warmup(
 ):
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     state = await loop.run_in_executor(None, lambda: warm_model(model, probe=False))
     return {"ok": True, "model": model, "state": warm_state(model) or state}
 
@@ -1295,7 +1304,16 @@ def _upscale_preset_path(preset_id: str) -> Path:
 
 def _write_upscale_preset(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Atomic write: tmp → replace. A crash mid-write leaves the tmp
+    # file and the original preset intact instead of corrupting the
+    # .json and permanently losing the user's custom preset.
+    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}.json")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _ensure_builtin_upscale_presets() -> None:
@@ -2091,7 +2109,7 @@ async def transcribe_sync(
     upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
     await _save_upload_file(file, upload_path)
     lang_opt = _normalize_language(language)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(
             None,
@@ -2266,7 +2284,7 @@ async def remote_transcribe_sync(
     audio_bytes = await file.read()
     lang_opt = _normalize_language(language)
     cfg = load_config()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         # CRITICAL: run in thread pool so synchronous requests.request()
         # does NOT block the event loop. Without this, parallel chunk
@@ -2328,7 +2346,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
     used_model = candidates[0] if candidates else model
     out: Optional[dict[str, Any]] = None
     last_err: Optional[Exception] = None
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         for cand in candidates:
             used_model = cand

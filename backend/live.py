@@ -125,7 +125,7 @@ class LiveSession:
                 "transcribing %d samples (%.2fs)",
                 audio_window.shape[0], audio_window.shape[0] / sr,
             )
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: transcribe_audio(

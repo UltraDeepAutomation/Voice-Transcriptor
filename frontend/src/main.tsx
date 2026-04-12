@@ -3859,7 +3859,7 @@ function syncQuickSettingsVisibility(open: boolean): void {
 function applyQuickSettingsFromMain(open: boolean): boolean {
   const panel = $("quickSettingsPanel");
   const next = !!open;
-  const changed = panel.hidden === next;
+  const changed = panel.hidden !== next;
   syncQuickSettingsVisibility(next);
   if (changed) queueUiPreferencesSave();
   return changed;
@@ -3899,6 +3899,7 @@ let scriptNode: ScriptProcessorNode | null = null;
 let scriptSinkGain: GainNode | null = null;
 let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
+let vuIntervalId: ReturnType<typeof setInterval> | null = null;
 let startAt = 0;
 /**
  * PCM capture sink for the current recording session. Lazily created
@@ -4764,7 +4765,10 @@ async function startLive(): Promise<void> {
     // Use setInterval instead of requestAnimationFrame.
     // rAF throttles to ~0 fps when the Electron window is hidden (which it
     // always is during overlay recording). setInterval keeps firing reliably.
-    let vuIntervalId: ReturnType<typeof setInterval> | null = null;
+    // Promoted to module scope so stopLive can clear it deterministically.
+    // Previously local → leaked after stopLive because analyser null-check
+    // self-cleanup was best-effort and delayed by up to one tick.
+    if (vuIntervalId) { clearInterval(vuIntervalId); vuIntervalId = null; }
     const tick = (): void => {
       if (!analyser) {
         if (vuIntervalId) { clearInterval(vuIntervalId); vuIntervalId = null; }
@@ -5083,6 +5087,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     clearInterval(timer);
     timer = null;
   }
+  if (vuIntervalId) {
+    clearInterval(vuIntervalId);
+    vuIntervalId = null;
+  }
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
     draftSaveTimer = null;
@@ -5153,14 +5161,13 @@ async function stopLive(enhance: boolean): Promise<void> {
   ws = null;
   mediaRecorder = null;
   recordedWebmChunks = [];
-  // Destroy the PCM sink (removes the OPFS spool file). We release
-  // the reference BEFORE awaiting so a subsequent startLive can
-  // allocate a new sink concurrently.
-  if (pcmSink) {
-    const prior = pcmSink;
-    pcmSink = null;
-    void prior.destroy();
-  }
+  // Release the PCM sink reference so a subsequent startLive can
+  // allocate a new sink concurrently, but DO NOT destroy (delete the
+  // OPFS spool file) yet — the File blob from finalize() may still
+  // reference it. Destruction is deferred to after saveRecordingText
+  // serializes the blob into the FormData upload.
+  const deferredSinkDestroy = pcmSink;
+  pcmSink = null;
   activeLiveSessionId = "";
   activeLiveArchiveDir = "";
   activeLiveSessionSnapshot = null;
@@ -5240,6 +5247,12 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
   }
   stopTransitionInFlight = false;
+
+  // NOW safe to destroy the OPFS spool file — saveRecordingText above
+  // has already serialized the File blob into the FormData upload.
+  if (deferredSinkDestroy) {
+    void deferredSinkDestroy.destroy();
+  }
 
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureFrameCount === 0) {
     publishRecordingFinalSignal({
