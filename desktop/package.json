@@ -95,7 +95,9 @@
         }
       ],
       "icon": "icon.png",
-      "publisherName": "Transcriptor"
+      "publisherName": "Transcriptor",
+      "signAndEditExecutable": false,
+      "sign": null
     },
     "nsis": {
       "oneClick": true,

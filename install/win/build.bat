@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  Transcriptor — Windows Build
+REM  Transcriptor - Windows Build
 REM  Builds the Electron app as an NSIS .exe installer for Windows x64.
 REM  Usage: double-click build.bat or run from cmd/PowerShell
 REM ============================================================================
@@ -8,7 +8,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo   ========================================
-echo     Transcriptor — Windows Build
+echo     Transcriptor - Windows Build
 echo   ========================================
 echo.
 
