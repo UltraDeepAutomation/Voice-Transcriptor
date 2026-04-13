@@ -1,7 +1,7 @@
 {
   "name": "transcriptor",
   "version": "1.0.0",
-  "description": "Voice-to-text transcription with auto-paste for macOS",
+  "description": "Voice-to-text transcription with auto-paste",
   "author": "Transcriptor",
   "private": true,
   "main": "main.js",
@@ -94,7 +94,21 @@
           "arch": ["x64"]
         }
       ],
-      "icon": "icon.png"
+      "icon": "icon.png",
+      "publisherName": "Transcriptor"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "installerIcon": "icon.png",
+      "uninstallerIcon": "icon.png",
+      "installerHeaderIcon": "icon.png",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Transcriptor",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
     }
   }
 }
