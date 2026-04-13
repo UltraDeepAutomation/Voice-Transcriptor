@@ -2863,41 +2863,79 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   // Clipboard is already populated synchronously via Electron before we get here.
   
   if (process.platform === "win32") {
+    // Windows paste strategy:
+    //
+    // Method 1 (fast): Write a temporary .vbs script that calls
+    // WScript.Shell.SendKeys "^v" (Ctrl+V). This is instantaneous
+    // compared to the old PowerShell path which compiled C# inline
+    // on every attempt (~2-3 seconds per try, often timing out).
+    //
+    // Method 2 (fallback): PowerShell with SendKeys as a last resort
+    // if VBS is blocked by group policy.
+    //
+    // Both methods require the clipboard to be populated BEFORE the
+    // keypress fires, which we do via Electron's clipboard.writeText
+    // synchronously.
     for (let attempt = 0; attempt < 3; attempt++) {
       try { clipboard.writeText(String(text)); } catch { }
-      await sleep(45 + attempt * 40);
+      await sleep(30 + attempt * 30);
 
-      logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "powershell_paste" });
-      traceStep(trace, "method_begin", { method: "powershell_paste", attempt: attempt + 1 });
+      logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "win_paste" });
+      traceStep(trace, "method_begin", { method: "win_paste", attempt: attempt + 1 });
 
       const cmdStarted = Date.now();
-      
-      const targetHintStr = (effectiveTargetPid > 0) ? `Get-Process -Id ${effectiveTargetPid} -ErrorAction SilentlyContinue | Select-Object -First 1` : (effectiveTargetName ? `Get-Process -Name "${effectiveTargetName.replace(/"/g, '`"')}" -ErrorAction SilentlyContinue | Select-Object -First 1` : "");
-      
-      const pwsh = `
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type @"
-          using System;
-          using System.Runtime.InteropServices;
-          public class Window {
-            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-          }
-"@
-        ${targetHintStr ? `$proc = ${targetHintStr}; if ($proc -and $proc.MainWindowHandle) { [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 80; }` : ""}
-        [System.Windows.Forms.SendKeys]::SendWait("^{v}")
-        Write-Output "OK:powershell-paste"
-      `;
 
-      const check = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwsh], { timeoutMs: 3200 });
-      
-      if (check.ok && (check.stdout || "").trim().includes("OK:")) {
-         traceEnd(trace, "success", { method: "powershell_paste", attempt: attempt + 1, reason: "powershell_success", verified: false });
-         setTimeout(() => {
-           if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
-         }, 1200);
-         return { ok: true, reason: "OK:powershell_paste", method: "powershell_paste", verified: false };
+      // Fast path: VBS SendKeys — no compilation, no .NET assembly
+      // loading, executes in <100 ms on all Windows versions.
+      const vbsPath = path.join(app.getPath("temp"), `transcriptor_paste_${Date.now()}.vbs`);
+      try {
+        const vbsLines = [
+          'Set WshShell = CreateObject("WScript.Shell")',
+        ];
+        // Activate target window by PID if available
+        if (effectiveTargetPid > 0) {
+          vbsLines.push(`WshShell.AppActivate ${Math.trunc(effectiveTargetPid)}`);
+          vbsLines.push('WScript.Sleep 80');
+        } else if (effectiveTargetName) {
+          vbsLines.push(`WshShell.AppActivate "${effectiveTargetName.replace(/"/g, '""')}"`);
+          vbsLines.push('WScript.Sleep 80');
+        }
+        vbsLines.push('WScript.Sleep 30');
+        vbsLines.push('WshShell.SendKeys "^v"');
+        vbsLines.push('WScript.Echo "OK:vbs-paste"');
+
+        fs.writeFileSync(vbsPath, vbsLines.join("\r\n"), "utf8");
+        const check = await runCommand("cscript", ["//Nologo", "//B", vbsPath], { timeoutMs: 2500 });
+
+        // Clean up temp file
+        try { fs.unlinkSync(vbsPath); } catch { }
+
+        if (check.ok) {
+          traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: "vbs_success", verified: false });
+          setTimeout(() => {
+            if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+          }, 1200);
+          return { ok: true, reason: "OK:vbs_paste", method: "vbs_paste", verified: false };
+        }
+        lastReason = (check.stderr || check.stdout || "vbs-failed").trim();
+      } catch (e) {
+        try { fs.unlinkSync(vbsPath); } catch { }
+        lastReason = `vbs-error: ${e?.message || e}`;
       }
-      lastReason = (check.stderr || check.stdout || "powershell-failed").trim();
+
+      // Fallback: lightweight PowerShell (no C# compilation)
+      if (attempt === 2) {
+        const pwshSimple = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
+        const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], { timeoutMs: 3000 });
+        if (fallback.ok && (fallback.stdout || "").includes("OK:")) {
+          traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1 });
+          setTimeout(() => {
+            if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+          }, 1200);
+          return { ok: true, reason: "OK:pwsh_paste_fallback", method: "pwsh_paste_fallback", verified: false };
+        }
+        lastReason = (fallback.stderr || fallback.stdout || "pwsh-fallback-failed").trim();
+      }
     }
   } else {
     // macOS AppleScript 'key code 9'

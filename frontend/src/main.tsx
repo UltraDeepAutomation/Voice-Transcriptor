@@ -3914,6 +3914,12 @@ function initQuickControls(): void {
 });
 
 let ws: WebSocket | null = null;
+// Buffer for PCM frames that arrive while the WS is still CONNECTING.
+// Flushed in FIFO order on the first ``pushCapturedFrame`` call after
+// the socket transitions to OPEN. Prevents word loss at the start of
+// a recording when the AudioWorklet fires frames before the WS
+// handshake completes (50–300 ms window).
+let wsPendingFrames: ArrayBuffer[] = [];
 let ac: AudioContext | null = null;
 let stream: MediaStream | null = null;
 let analyser: AnalyserNode | null = null;
@@ -4427,20 +4433,40 @@ function pushCapturedFrame(input: Float32Array): void {
   // Independent of the canonical sink: the PCM16 bytes are streamed
   // to the backend /ws/transcribe in real time regardless of whether
   // the sink succeeded or not.
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  //
+  // IMPORTANT: if the WS is still CONNECTING (not yet OPEN), buffer
+  // the frame and flush the buffer once the socket opens. This fixes
+  // word loss at the START of a recording — the AudioWorklet starts
+  // producing frames immediately on mic connect, but the WS handshake
+  // can take 50-300 ms. Without buffering those early frames were
+  // silently dropped and Deepgram never heard the first syllables.
   const pcm = new ArrayBuffer(ds.length * 2);
   const dv = new DataView(pcm);
   for (let i = 0; i < ds.length; i++) {
     const x = Math.max(-1, Math.min(1, ds[i]));
     dv.setInt16(i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
   }
-  try {
-    ws.send(pcm);
-  } catch (e) {
-    // Harmless race when the socket closes mid-frame; the sink has
-    // already captured the audio for local canonical playback.
-    console.debug("live ws send skipped", e);
+  if (!ws) return;
+  if (ws.readyState === WebSocket.OPEN) {
+    // Flush any buffered frames first (FIFO order preserved).
+    while (wsPendingFrames.length > 0) {
+      const queued = wsPendingFrames.shift()!;
+      try { ws.send(queued); } catch { break; }
+    }
+    try {
+      ws.send(pcm);
+    } catch (e) {
+      console.debug("live ws send skipped", e);
+    }
+  } else if (ws.readyState === WebSocket.CONNECTING) {
+    // Buffer up to 2 seconds of audio (~62 frames @ 128 samples/frame
+    // at 16 kHz after downsampling). Beyond that the WS is likely
+    // stuck and we should not accumulate memory indefinitely.
+    if (wsPendingFrames.length < 500) {
+      wsPendingFrames.push(pcm);
+    }
   }
+  // CLOSING / CLOSED → silently drop (recording is ending).
 }
 
 async function flushWorkletPort(timeoutMs = 350): Promise<void> {
@@ -4542,6 +4568,7 @@ async function startLive(): Promise<void> {
   capturePeakMax = 0;
   captureRmsEma = 0;
   lastInterimSnapshot = "";
+  wsPendingFrames = [];
   resetLiveDraftState();
   clearLiveStreamState();
   liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
@@ -5179,6 +5206,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (ws) ws.close();
   });
   ws = null;
+  wsPendingFrames = [];
   mediaRecorder = null;
   recordedWebmChunks = [];
   // Release the PCM sink reference so a subsequent startLive can
