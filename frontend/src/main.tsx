@@ -3097,6 +3097,17 @@ $("shortcutPaste").addEventListener("click", (e) => {
   e.preventDefault();
   startShortcutRecording($("shortcutPaste") as HTMLButtonElement);
 });
+$("resetShortcutsBtn").addEventListener("click", () => {
+  currentShortcuts = { ...DEFAULT_SHORTCUTS };
+  updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
+  updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
+  // Push to main process for live reload.
+  (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
+    record: currentShortcuts.record,
+    paste: currentShortcuts.paste,
+  };
+  queueUiPreferencesSave();
+});
 
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";

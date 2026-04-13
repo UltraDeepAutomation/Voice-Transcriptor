@@ -2888,7 +2888,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         Write-Output "OK:powershell-paste"
       `;
 
-      const check = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 3200 });
+      const check = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwsh], { timeoutMs: 3200 });
       
       if (check.ok && (check.stdout || "").trim().includes("OK:")) {
          traceEnd(trace, "success", { method: "powershell_paste", attempt: attempt + 1, reason: "powershell_success", verified: false });
