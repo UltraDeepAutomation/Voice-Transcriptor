@@ -1951,7 +1951,15 @@ function switchView(view: ViewName): void {
   $("windowViewLabel").textContent =
     view === "settings" ? "Settings" : view === "recordings" ? "Recordings" : view === "graph" ? "Graph" : "Record";
   if (view === "recordings") {
-    void loadRecordings(true).catch(() => { });
+    // Only reload from the server if we have no cached items yet. If
+    // the list was already loaded (e.g. from initRecordingsBootstrap
+    // or a previous tab visit), just re-render without a network call
+    // to prevent the list "shaking" / reloading every time the user
+    // switches tabs. A manual Refresh button or a new recording save
+    // still triggers a full reload.
+    if (!recordingItems.length) {
+      void loadRecordings(true).catch(() => { });
+    }
   }
   if (view === "graph") {
     void loadGraphData();
@@ -3537,7 +3545,7 @@ async function openRecording(name: string): Promise<void> {
     $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}`;
     $("recordingContent").setAttribute("aria-busy", "false");
     $("recordingContent").setAttribute("data-placeholder", "Transcription will appear here...");
-    $("recordingContent").textContent = r.content || "";
+    $("recordingContent").textContent = (r as { display_text?: string }).display_text || r.content || "";
     const player = $("recordingAudio") as HTMLAudioElement;
     const audioRow = $("recordingAudioRow");
     if (r.has_audio) {

@@ -1739,6 +1739,7 @@ textarea:focus-visible,
   border: 0;
   border-radius: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 12px 14px 10px;
   background: transparent;
 }
@@ -1766,6 +1767,8 @@ textarea:focus-visible,
   flex-direction: column;
   justify-content: flex-start;
   min-height: 90px;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .recording-item:hover {

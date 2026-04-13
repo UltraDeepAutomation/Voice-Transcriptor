@@ -2759,11 +2759,17 @@ def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
 def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth)):
     p = _recording_path_or_404(recording_name)
     st = p.stat()
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    # ``display_text`` strips the file header (Title/Saved at/Language/
+    # Provider/Model) and returns only the transcript body. The raw
+    # ``content`` is still returned for backwards compat / export.
+    display = _extract_transcript_text(raw)
     return {
         "name": p.name,
         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
         "size_bytes": st.st_size,
-        "content": p.read_text(encoding="utf-8", errors="replace"),
+        "content": raw,
+        "display_text": display or raw,
         **_recording_audio_payload(p.name),
     }
 
