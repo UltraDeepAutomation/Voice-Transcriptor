@@ -504,6 +504,11 @@ function renderLatestSavedAudio(): void {
   metaEl.textContent = latestSavedAudioState.sizeBytes
     ? fmtBytes(latestSavedAudioState.sizeBytes)
     : latestSavedAudioState.title;
+  // Show Re-transcribe button when we have a saved audio file
+  const retranscribeBtn = document.getElementById("retranscribeBtn");
+  if (retranscribeBtn) {
+    retranscribeBtn.hidden = !latestSavedAudioState.savedName;
+  }
 }
 
 function setLatestSavedAudio(state: LatestSavedAudioState | null): void {
@@ -3750,6 +3755,63 @@ $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 $("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || "", "resultCopyBtn"));
 $("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || "", "upscaleCopyBtn"));
 
+// Re-transcribe button: sends the saved audio to Deepgram REST API
+// when streaming produced a poor result (bad connection, dropped packets).
+$("retranscribeBtn").addEventListener("click", async () => {
+  const btn = $("retranscribeBtn") as HTMLButtonElement;
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = "Re-transcribing...";
+  try {
+    const audioState = latestSavedAudioState;
+    if (!audioState?.savedName) {
+      $("finalOutput").textContent = "No saved audio to re-transcribe.";
+      return;
+    }
+    // Fetch the audio file from the backend
+    const audioUrl = latestRecordingAudioUrl(audioState.savedName, audioState.archiveDir || "");
+    const audioResp = await fetch(audioUrl, { headers: authHeaders() });
+    if (!audioResp.ok) throw new Error(`Audio fetch failed: ${audioResp.status}`);
+    const audioBlob = await audioResp.blob();
+    const audioFile = new File([audioBlob], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
+    const result = await remoteJobSync(audioFile, {
+      provider: "deepgram",
+      language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+      diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+      openrouterModel: getRemoteModelValue("deepgram"),
+    });
+    const text = String(result.text || "").trim();
+    if (text) {
+      $("finalOutput").textContent = text;
+      // Update the saved recording with the new transcript
+      try {
+        await saveRecordingText({
+          name: audioState.savedName,
+          archiveDir: audioState.archiveDir || "",
+          requireExisting: true,
+          title: text.split(/\s+/).slice(0, 8).join(" "),
+          sourceText: text,
+          transcriptText: text,
+          provider: "deepgram",
+          model: getRemoteModelValue("deepgram"),
+          language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+        });
+      } catch { }
+      patchCurrentRecordingSummary({
+        status: "Re-transcribed successfully via REST API.",
+        tone: "success",
+      });
+    } else {
+      $("finalOutput").textContent = "Re-transcribe returned empty result.";
+    }
+  } catch (e) {
+    $("finalOutput").textContent = `Re-transcribe failed: ${(e as Error).message || e}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Re-transcribe";
+  }
+});
+
 // ── Delete All recordings ──
 $("recordingsDeleteAllBtn").addEventListener("click", () => {
   openModal("deleteAllModal", "#deleteAllConfirmBtn");
@@ -5576,6 +5638,49 @@ async function stopLive(enhance: boolean): Promise<void> {
         const instantTranscript = getCanonicalLiveSourceText();
         if (instantTranscript) {
           transcriptRaw = instantTranscript;
+
+          // ── Auto REST re-transcribe on suspiciously short streaming result ──
+          //
+          // If the streaming transcript is much shorter than expected for
+          // the recording duration, the Deepgram WebSocket likely dropped
+          // packets due to a bad connection. The canonical audio file is
+          // ALWAYS complete (captured locally via PCM sink), so we can
+          // re-transcribe it via Deepgram's REST batch API to recover the
+          // full text. This is the "50 sec recording but only 10 words"
+          // scenario the user reported.
+          //
+          // Heuristic: expect ~2.5 words per second of speech. If the
+          // streaming result has less than 30% of the expected word count,
+          // trigger an automatic REST re-transcribe.
+          const wordCount = transcriptRaw.split(/\s+/).filter(Boolean).length;
+          const expectedWords = recordedSec * 2.5;
+          const isSuspiciouslyShort = recordedSec > 5 && wordCount < expectedWords * 0.3;
+          if (isSuspiciouslyShort && transcribeInputFile && isProviderKeyConfigured("deepgram")) {
+            patchCurrentRecordingSummary({
+              title: provisionalTitle,
+              status: `Streaming captured only ${wordCount} words for ${Math.round(recordedSec)}s. Re-transcribing via REST...`,
+              tone: "warning",
+            }, sessionUiToken);
+            try {
+              const restResult = await remoteJobSync(transcribeInputFile, {
+                provider: "deepgram",
+                language: languageValue,
+                diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+                openrouterModel: getRemoteModelValue("deepgram"),
+              });
+              const restText = String(restResult.text || "").trim();
+              if (restText && restText.split(/\s+/).length > wordCount) {
+                transcriptRaw = restText;
+                patchCurrentRecordingSummary({
+                  title: provisionalTitle,
+                  status: "REST re-transcribe recovered full text.",
+                  tone: "success",
+                }, sessionUiToken);
+              }
+            } catch (restErr) {
+              console.warn("Auto REST re-transcribe failed, keeping streaming result", restErr);
+            }
+          }
         } else {
           // No committed segments at all (very short recording, or
           // Deepgram hadn't returned any is_final yet). Fall back to
