@@ -803,6 +803,21 @@ def _is_broken_pipe_error(exc: Exception) -> bool:
         return True
     if "after sending 'websocket.close'" in msg:
         return True
+    # ``websockets`` library (used for the upstream Deepgram connection)
+    # raises this when ``send()`` fires after ``close()`` has already
+    # gone out. It's the same class of post-close race as the Starlette
+    # "after sending 'websocket.close'" message above, just from the
+    # opposite side of the socket. Treating it as harmless keeps
+    # production logs clean — previously it surfaced as a WARNING
+    # (``ws send failed: Cannot call "send" once a close message has
+    # been sent``) several times per recording during finalize.
+    if 'cannot call "send" once a close message has been sent' in msg:
+        return True
+    # Same class, different phrasing used by some websockets versions
+    # and by the ``ConnectionClosedOK``/``ConnectionClosedError``
+    # exception chain.
+    if "no close frame received or sent" in msg:
+        return True
     return False
 
 
