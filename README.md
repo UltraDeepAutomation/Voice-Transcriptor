@@ -21,22 +21,49 @@
 
 ## 🚀 Быстрая установка (одна команда)
 
-### Способ 1 — Двойной клик (самый простой)
+### macOS — двойной клик
 
-1. **Правый клик** на файл `setup.command`
-2. Нажмите **Открыть** (Open)
-3. В диалоге безопасности нажмите **Открыть** ещё раз
-4. ☕ Подождите 2–5 минут — всё установится автоматически
+1. **Правый клик** на `INSTALL.command` в корне репо → **Открыть**
+2. В диалоге безопасности — **Открыть** ещё раз
+3. ☕ Подождите 2–5 минут — всё установится автоматически и приложение запустится
 
-### Способ 2 — Терминал
+Альтернативный способ (готовый DMG, ничего строить не надо):
+```
+desktop/dist/Transcriptor-1.0.0-arm64.dmg   ← Apple Silicon
+desktop/dist/Transcriptor-1.0.0.dmg         ← Intel
+```
+Двойной клик на DMG → перетащить Transcriptor в Applications → запустить.
+
+### macOS — терминал
 
 ```bash
 cd "Voice Transcriptor"
-chmod +x setup.command
-./setup.command
+./INSTALL.command
 ```
 
-> 💡 Скрипт автоматически установит все зависимости (Homebrew, Python, Node.js, FFmpeg), соберёт приложение и установит его в `~/Applications`.
+Если уже установлено и нужно только пересобрать после обновления кода:
+```bash
+./BUILD.command
+```
+
+### Windows
+
+```cmd
+cd "Voice Transcriptor"
+install\win\setup.bat        :: первая установка
+install\win\build.bat        :: пересборка .exe installer
+```
+Готовый NSIS-инсталлер появится в `desktop\dist\Transcriptor Setup 1.0.0.exe`.
+
+### Linux
+
+```bash
+cd "Voice Transcriptor"
+install/linux/build.sh
+```
+Готовый AppImage в `desktop/dist/Transcriptor-1.0.0.AppImage` — `chmod +x && ./Transcriptor-1.0.0.AppImage`.
+
+> 💡 Скрипты автоматически устанавливают Homebrew / chocolatey-эквиваленты, Python, Node.js, FFmpeg, собирают фронтенд + Electron-приложение.
 
 ---
 
