@@ -108,69 +108,48 @@ else
   print_ok "Desktop deps present"
 fi
 
-# ── 6. Start backend server ─────────────────────────────────────────────
-print_step "Starting backend server..."
+# ── 6. Export env for Electron to spawn the backend ─────────────────────
+#
+# We deliberately do NOT start a uvicorn process here. Electron's main
+# process already knows how to spawn the backend (see desktop/main.js
+# ``startBackend``): it picks a free port via ``pickBackendPort``,
+# installs a stdin-pipe watchdog so the Python child dies when Electron
+# dies (SIGKILL-safe via ``_start_parent_death_watchdog`` in backend/
+# main.py), and plumbs stdout/stderr through ``appendMainLog``.
+#
+# The prior behaviour of ``run.command`` — spawn our OWN backend on
+# 8321, then ``npm start`` Electron which ALSO spawns its own backend
+# via ``startBackend`` — produced TWO Python processes per dev launch:
+# ours on 8321 and Electron's auto-picked fallback on 8322 (because
+# ``pickBackendPort`` found 8321 already bound and iterated). The
+# frontend talked to Electron's 8322 instance while ours on 8321 sat
+# orphan until this script's trap cleanup ran. Plus ``lsof -ti tcp:8321
+# | xargs kill -9`` risked killing an unrelated process that happened
+# to be bound to 8321.
+#
+# Correct contract: Electron owns backend lifecycle. We only export
+# the venv python path so ``resolvePython`` in desktop/main.js picks
+# it up on the first probe, and the data dir.
+print_step "Preparing dev launch..."
 
-# Find a free port (default 8321)
-BACKEND_PORT=8321
-BACKEND_PID=""
-
-# Kill any stale backend on the same port
-lsof -ti tcp:$BACKEND_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
-
-# Start backend in background
 DATA_DIR="$HOME/Library/Application Support/Transcriptor"
 mkdir -p "$DATA_DIR"
 
-export PYTHONPATH="$ROOT_DIR:$PYTHONPATH"
+export PYTHON="$VENV_PY"
 export TRANSCRIPTOR_DATA_DIR="$DATA_DIR"
 
-"$VENV_PY" -m uvicorn backend.main:app \
-  --host 127.0.0.1 \
-  --port $BACKEND_PORT \
-  --log-level warning \
-  &
-BACKEND_PID=$!
-
-# Cleanup: kill backend when this script exits
-cleanup() {
-  if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
-    echo -e "\n${CYAN}  Stopping backend (PID $BACKEND_PID)...${NC}"
-    kill "$BACKEND_PID" 2>/dev/null || true
-    wait "$BACKEND_PID" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT
-
-# ── 7. Wait for backend to be ready ─────────────────────────────────────
-print_step "Waiting for backend health check..."
-MAX_WAIT=30
-WAITED=0
-while [ $WAITED -lt $MAX_WAIT ]; do
-  if curl -s "http://127.0.0.1:$BACKEND_PORT/api/health" 2>/dev/null | grep -q '"ok"'; then
-    print_ok "Backend is healthy (port $BACKEND_PORT)"
-    break
-  fi
-  # Check if backend process died
-  if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
-    print_fail "Backend process died during startup. Check Python logs above."
-  fi
-  sleep 1
-  WAITED=$((WAITED + 1))
-done
-
-if [ $WAITED -ge $MAX_WAIT ]; then
-  print_fail "Backend did not become healthy after ${MAX_WAIT}s. Check logs."
-fi
-
-# ── 8. Launch Electron ───────────────────────────────────────────────────
+# ── 7. Launch Electron ───────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}  ║   Dev mode ready — launching Electron    ║${NC}"
 echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BOLD}Backend:${NC}  http://127.0.0.1:$BACKEND_PORT"
+echo -e "  ${BOLD}Python venv:${NC}  $VENV_PY"
+echo -e "  ${BOLD}Data dir:${NC}     $DATA_DIR"
 echo -e "  ${BOLD}Press Ctrl+C to stop everything${NC}"
 echo ""
 
+# Electron's ``before-quit`` + parent-death watchdog handle backend
+# shutdown cleanly regardless of how this script exits — no explicit
+# trap needed.
 (cd desktop && npm start)
