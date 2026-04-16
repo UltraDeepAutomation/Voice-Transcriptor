@@ -3155,14 +3155,37 @@ async function runPostStopQueue() {
       } finally {
         pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       }
-      let isRec = false;
+      // Read BOTH recording state and recordingId in one shot. We cannot
+      // trust ``__transcriptorIsRecording`` alone here: stopLive sets it
+      // to false LATE in its cleanup sequence (~line 5288), while
+      // processPostStopTask can complete much earlier (Deepgram returns
+      // committed segments within ~100 ms). During that window
+      // ``isRec`` reads true even though no recording is actually
+      // happening — the user perceives this as the overlay "auto-
+      // restarting" a new red recording after the blue transcribe.
+      //
+      // The fix: compare recordingId against the task's. A genuinely
+      // NEW recording bumps ``__transcriptorCurrentRecordingId`` via
+      // ``++liveRecordingSeq`` in startLive. If the id matches the
+      // task we just finished, we're still watching the old stopLive
+      // clean up — treat as not-recording and hide the overlay.
+      let rendererState = { recording: false, recordingId: 0 };
       try {
-        isRec = await isRendererRecording();
+        if (win && !win.isDestroyed() && win.webContents) {
+          rendererState = await win.webContents.executeJavaScript(
+            `(() => ({ recording: !!window.__transcriptorIsRecording, recordingId: Number(window.__transcriptorCurrentRecordingId || 0) }))();`,
+            true
+          );
+        }
       } catch (e) {
         appendMainLog(`[post-stop-queue] isRec-error err="${compactLogText(e?.message || e)}"`);
       }
-      await syncOverlayQueueVisual(isRec).catch(() => { });
-      if (!isRec) {
+      const taskRecId = Number(task.recordingId || 0);
+      const newRecordingStarted = !!rendererState.recording
+        && Number(rendererState.recordingId || 0) > 0
+        && Number(rendererState.recordingId || 0) !== taskRecId;
+      await syncOverlayQueueVisual(newRecordingStarted).catch(() => { });
+      if (!newRecordingStarted) {
         if (pendingTranscriptionCount > 0) {
           await setOverlayStatus("Transcribing").catch(() => { });
         } else {

@@ -45,22 +45,36 @@ class JobStore:
     def submit(self, fn, *args, **kwargs) -> None:
         self._pool.submit(fn, *args, **kwargs)
 
+    # All four setters use ``.get`` + None-guard instead of bracket access.
+    # _prune (invoked on every ``create``) evicts the oldest jobs when the
+    # store exceeds _max_jobs; a worker thread that is still updating an
+    # evicted job would hit KeyError and die mid-transcription, leaving the
+    # job permanently "running" from the client's perspective. Silently
+    # no-op'ing on a pruned id is the correct contract here: the result is
+    # already unreachable via the public ``get`` API, so there is nothing
+    # to preserve.
     def set_running(self, job_id: str) -> None:
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
             job.status = "running"
             job.progress = 0.01
 
     def set_progress(self, job_id: str, progress: float) -> None:
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
             job.progress = max(0.0, min(1.0, float(progress)))
 
     def set_done(
         self, job_id: str, result: Dict[str, Any], result_files: Dict[str, str]
     ) -> None:
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
             job.status = "done"
             job.progress = 1.0
             job.result = result
@@ -68,6 +82,8 @@ class JobStore:
 
     def set_error(self, job_id: str, error: str) -> None:
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
             job.status = "error"
             job.error = error

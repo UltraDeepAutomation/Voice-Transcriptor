@@ -2121,6 +2121,26 @@ textarea:focus-visible,
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.3 2.8h3.4l.52 1.54c.7.2 1.38.48 2.02.84l1.48-.74 2.4 2.4-.74 1.48c.36.64.64 1.32.84 2.02l1.54.52v3.4l-1.54.52a8.6 8.6 0 0 1-.84 2.02l.74 1.48-2.4 2.4-1.48-.74a8.6 8.6 0 0 1-2.02.84l-.52 1.54h-3.4l-.52-1.54a8.6 8.6 0 0 1-2.02-.84l-1.48.74-2.4-2.4.74-1.48a8.6 8.6 0 0 1-.84-2.02l-1.54-.52v-3.4l1.54-.52c.2-.7.48-1.38.84-2.02l-.74-1.48 2.4-2.4 1.48.74a8.6 8.6 0 0 1 2.02-.84L10.3 2.8Z' stroke='%23D2D2D2' stroke-width='1.2'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='%23D2D2D2' stroke-width='1.2'/%3E%3C/svg%3E");
 }
 
+.reload-ico {
+  width: 14px;
+  height: 14px;
+  display: inline-block;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 14px 14px;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M20 12a8 8 0 1 1-2.34-5.66' stroke='%23D2D2D2' stroke-width='1.8' stroke-linecap='round'/%3E%3Cpath d='M20 4v5h-5' stroke='%23D2D2D2' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  transition: transform 0.4s ease;
+}
+
+.icon-btn.is-busy .reload-ico {
+  animation: reload-spin 0.9s linear infinite;
+}
+
+@keyframes reload-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .settings {
   padding: var(--page-gutter);
   display: grid;

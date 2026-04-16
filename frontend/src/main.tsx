@@ -3760,20 +3760,40 @@ $("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upsc
 $("retranscribeBtn").addEventListener("click", async () => {
   const btn = $("retranscribeBtn") as HTMLButtonElement;
   if (btn.disabled) return;
+  const audioState = latestSavedAudioState;
+  if (!audioState?.savedName) {
+    $("finalOutput").textContent = "No saved audio to re-transcribe.";
+    return;
+  }
+  // The Re-transcribe button specifically targets Deepgram REST — it exists
+  // to recover a full transcript when the streaming WebSocket dropped
+  // packets. Without a Deepgram key, the REST call will fail with an
+  // opaque backend error; short-circuit here with a clear message so the
+  // user knows exactly what to configure instead of seeing a stack-trace.
+  if (!isProviderKeyConfigured("deepgram")) {
+    $("finalOutput").textContent = "Re-transcribe requires a Deepgram API key. Configure it in Settings.";
+    return;
+  }
   btn.disabled = true;
-  btn.textContent = "Re-transcribing...";
+  btn.classList.add("is-busy");
   try {
-    const audioState = latestSavedAudioState;
-    if (!audioState?.savedName) {
-      $("finalOutput").textContent = "No saved audio to re-transcribe.";
-      return;
+    // Prefer the in-memory blob captured during this session — it is the
+    // canonical PCM we just assembled and avoids a round-trip to the
+    // backend that could race with the recordings archive write. Fall
+    // back to fetching the saved file if the blob is absent (viewing a
+    // recording saved in a previous session, or after a page reload).
+    let audioFile: File;
+    if (audioState.file) {
+      audioFile = audioState.file instanceof File
+        ? audioState.file
+        : new File([audioState.file], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
+    } else {
+      const audioUrl = latestRecordingAudioUrl(audioState.savedName, audioState.archiveDir || "");
+      const audioResp = await fetch(audioUrl, { headers: authHeaders() });
+      if (!audioResp.ok) throw new Error(`Audio fetch failed: HTTP ${audioResp.status}`);
+      const audioBlob = await audioResp.blob();
+      audioFile = new File([audioBlob], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
     }
-    // Fetch the audio file from the backend
-    const audioUrl = latestRecordingAudioUrl(audioState.savedName, audioState.archiveDir || "");
-    const audioResp = await fetch(audioUrl, { headers: authHeaders() });
-    if (!audioResp.ok) throw new Error(`Audio fetch failed: ${audioResp.status}`);
-    const audioBlob = await audioResp.blob();
-    const audioFile = new File([audioBlob], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
     const result = await remoteJobSync(audioFile, {
       provider: "deepgram",
       language: (($("language") as HTMLSelectElement).value || "auto").trim(),
@@ -3808,7 +3828,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
     $("finalOutput").textContent = `Re-transcribe failed: ${(e as Error).message || e}`;
   } finally {
     btn.disabled = false;
-    btn.textContent = "Re-transcribe";
+    btn.classList.remove("is-busy");
   }
 });
 
@@ -4994,6 +5014,14 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (stopTransitionInFlight) return;
   if (!isRecording) return;
   stopTransitionInFlight = true;
+  // Wrap the entire body in try/finally so the in-flight guard is ALWAYS
+  // cleared, even if a pre-main-try await (flushWorkletPort / waitForWorklet
+  // Drain / stopMediaRecorderAndFlush / pcmSink.finalize / selectCanonical
+  // CapturedAudio) throws an uncaught exception before reaching the
+  // existing try at the "Assemble the authoritative transcript" block.
+  // Without this wrapper, any such throw would leave stopTransitionInFlight
+  // = true forever, permanently blocking all future stopLive calls.
+  try {
   const recordingId = currentRecordingId;
   const liveSessionId = activeLiveSessionId;
   const sessionUiToken = liveSessionId;
@@ -5904,12 +5932,15 @@ async function stopLive(enhance: boolean): Promise<void> {
       phases: stopTimings,
     };
   }
-  // Only clear the in-flight guard at the very END of stopLive, AFTER
-  // all async work (transcription, save, upscale) has completed. The
-  // old code cleared it mid-function (before the async transcription
-  // work), allowing a new startLive → stopLive to race with the
-  // in-flight save/transcribe and corrupt module-level state.
-  stopTransitionInFlight = false;
+  } finally {
+    // Cleared at the very END of stopLive so a new startLive → stopLive
+    // cannot race with in-flight save/transcribe/upscale work and corrupt
+    // module-level state. The outer try/finally guarantees the flag is
+    // cleared on EVERY exit path — including uncaught throws from the
+    // pre-main-try awaits — so a single crash never permanently bricks
+    // the stop state machine.
+    stopTransitionInFlight = false;
+  }
 }
 
 function reportFileSelectionError(message: string): void {

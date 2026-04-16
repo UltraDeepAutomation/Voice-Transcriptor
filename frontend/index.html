@@ -165,10 +165,6 @@
                       title="Copy result">
                       <span class="copy-ico" aria-hidden="true"></span>
                     </button>
-                    <button class="btn btn-ghost" id="retranscribeBtn" type="button"
-                      title="Re-transcribe saved audio via REST API" hidden>
-                      Re-transcribe
-                    </button>
                   </div>
                 </div>
               </div>
@@ -207,6 +203,11 @@
 
             <div class="pane-footer current-audio-row" id="currentRecordingAudioRow" hidden>
               <audio id="currentRecordingAudio" controls></audio>
+              <button class="icon-btn" id="retranscribeBtn" type="button"
+                aria-label="Re-transcribe saved audio via REST API"
+                title="Re-transcribe">
+                <span class="reload-ico" aria-hidden="true"></span>
+              </button>
               <span class="current-audio-meta" id="currentRecordingAudioMeta"></span>
               <!-- ``Open`` and ``Download`` icon buttons removed: the
                    native ``<audio controls>`` chrome already ships
