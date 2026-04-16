@@ -549,8 +549,22 @@ def _lookup_live_promote_cache(session_id: str) -> Optional[dict]:
 
 
 def _store_live_promote_cache(session_id: str, payload: dict) -> None:
+    # Mirror the opportunistic GC from ``_lookup_live_promote_cache``.
+    # Without it, a workload that only writes (recovery promotions with
+    # fresh session_ids never revisited by the client) grows the cache
+    # without bound — each entry survives until a lookup eventually
+    # walks over it. Adding the purge here makes the cache bounded by
+    # the recent-activity window regardless of read/write mix.
+    now = time.monotonic()
     with _live_promote_lock:
-        _live_promote_cache[session_id] = (time.monotonic(), dict(payload))
+        stale = [
+            sid
+            for sid, (ts, _) in _live_promote_cache.items()
+            if now - ts > _LIVE_PROMOTE_CACHE_TTL_SEC
+        ]
+        for sid in stale:
+            _live_promote_cache.pop(sid, None)
+        _live_promote_cache[session_id] = (now, dict(payload))
 
 
 def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, Any]:
@@ -739,20 +753,48 @@ def network_status(_auth: None = Depends(_require_api_auth)):
 
 
 async def _save_upload_file(upload: UploadFile, target: Path) -> int:
+    """Stream an UploadFile to disk with a hard MAX_UPLOAD_BYTES ceiling.
+
+    If the request exceeds the ceiling OR any other exception bubbles
+    out of the copy loop, the partially-written target is unlinked
+    before the exception propagates. Without the cleanup, a client
+    uploading a 2 GB file would leave up to 500 MB of orphaned bytes
+    on disk on every attempt, eventually filling the data volume.
+
+    The partial file is rendered unusable anyway (it's truncated at
+    the ceiling), and FastAPI endpoints always retry with a fresh
+    tmp path if needed, so deleting it here is safe.
+    """
     total = 0
-    with target.open("wb") as f:
-        while True:
-            chunk = await upload.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_UPLOAD_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
-                )
-            f.write(chunk)
-    return total
+    try:
+        with target.open("wb") as f:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+                    )
+                f.write(chunk)
+        return total
+    except BaseException:
+        # Partial upload cleanup. BaseException covers HTTPException,
+        # asyncio.CancelledError (client disconnected mid-upload), and
+        # unexpected OSErrors (disk full, permission change). In every
+        # case the file on disk is either truncated or incomplete —
+        # deleting it is the correct contract. ``missing_ok`` guards
+        # against the (rare) case where ``target.open`` itself threw
+        # before the file was ever created.
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as cleanup_err:
+            logger.warning(
+                "partial upload cleanup failed for %s: %s", target, cleanup_err
+            )
+        raise
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
