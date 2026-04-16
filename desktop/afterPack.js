@@ -175,6 +175,24 @@ exports.default = async function afterPack(context) {
     );
   }
 
+  // Disable Apple's RFC3161 timestamp service. The default
+  // @electron/osx-sign behaviour is ``--timestamp`` (no URL), which
+  // queries ``timestamp.apple.com``. When that service is
+  // unreachable (intermittent Apple outages, corporate firewalls,
+  // offline builds) codesign hard-fails with "The timestamp service
+  // is not available" and the whole build aborts. For a self-signed
+  // certificate like ``AntigravityTelegramDev`` — used exclusively
+  // for local TCC-grant persistence, not for distribution that
+  // Gatekeeper will validate — the timestamp is not meaningful
+  // (Gatekeeper skips it for non-Developer-ID identities anyway).
+  // Passing ``"none"`` in the per-file options sends
+  // ``--timestamp=none`` to codesign, making every build robust
+  // against Apple TS outages. osx-sign@1.0.5 only consumes
+  // ``timestamp`` from the per-file options returned by
+  // ``optionsForFile``; passing it at the top level is silently
+  // ignored (see node_modules/@electron/osx-sign/dist/esm/sign.js
+  // line 163 — top-level opts are merged against the tool's built-in
+  // defaultOptionsForFile, NOT our custom hook's return value).
   await signApp({
     app: appPath,
     identity,
@@ -211,11 +229,13 @@ exports.default = async function afterPack(context) {
         return {
           entitlements,
           hardenedRuntime: true,
+          timestamp: "none",
         };
       }
       return {
         entitlements: inheritEntitlements,
         hardenedRuntime: true,
+        timestamp: "none",
       };
     },
   });
