@@ -25,11 +25,47 @@
 | 1 | ⚠ PARTIAL | `backend/main.py:620` | `API_TOKEN` IS injected into the HTML. Practical impact is low because the token is randomised per app launch, bound to 127.0.0.1, and the only script on that origin is the app itself — an XSS exploit already has full API access via the same origin. Defense-in-depth move would be to drop the token into `sessionStorage` via a short-lived one-shot endpoint. Not a P0 for the current deployment shape. |
 | 2 | ⚠ PARTIAL | `backend/remote_deepgram_live.py:283` | `body_text[:200]` IS logged. Risk is theoretical — Deepgram's error bodies don't echo the key in standard responses. Low severity. |
 | 6 | ✗ FALSE | `backend/main.py:1443-1449` | Token check is at line 1443, rate-limit at 1447 — auth happens BEFORE the rate-limit slot is consumed. Agent inverted the order. |
+| 7 | ✗ FALSE | `backend/main.py:1767-1778` | Local-live transcribe tasks properly cancelled in `finally` with `await (CancelledError, Exception)`. |
+| 15 | ✗ FALSE | `backend/main.py:440-458` | `_live_promote_session_locks` protected by global `_live_promote_lock` — no race. |
+| 28 | ✗ FALSE | `backend/main.py:572` | GET requests ALSO require `API_TOKEN` — attacker cannot CSRF without knowing randomized token. |
+| 30 | ✗ FALSE | `backend/main.py:1298-1302` | `UPSCALE_PRESET_ID_RE = [A-Za-z0-9_-]{1,64}` rejects `\x00`, `/`, `.` — path traversal impossible. |
+| 32 | ⚠ PARTIAL | `backend/main.py:2955-2970` | Audio replace before text write. Multi-file atomic rename isn't POSIX; crash between = stale text + new audio. Rare; no data loss (old text preserved). |
 | 35 | ✗ FALSE | `frontend/src/main.tsx:2393,2405` | `handleShortcutKeydown` listener IS paired — added in `startShortcutRecording`, removed in `stopShortcutRecording`. |
 | 36 | 🛠 FIXED | `frontend/src/main.tsx:5013,5929` | `stopTransitionInFlight = false` was outside the outer try/finally — any throw in the pre-main-try awaits permanently bricked stop. Wrapped entire body in `try { … } finally { stopTransitionInFlight = false; }`. |
 | 39 | ✗ FALSE | `frontend/src/main.tsx:4860-4863` | `recordedWebmChunks` has a 2h sliding-window splice at line 4861 — not unbounded. |
+| 40 | ✗ FALSE | `frontend/src/main.tsx:6042` | `pollAbortController?.abort()` — optional chaining handles null. |
+| 42 | ✗ FALSE | `frontend/src/main.tsx:5312` | `tearDown("ac.close")` called unconditionally in stopLive. |
+| 43 | ✗ FALSE | `frontend/src/main.tsx:5308` | `tearDown("stream.getTracks.stop")` called unconditionally. |
+| 44 | ✗ FALSE | `frontend/src/main.tsx:4859-4870` | `capturedSessionToken` closure + `activeUiSessionToken` check correctly gates stale callbacks. |
+| 46 | ✗ FALSE | `frontend/src/main.tsx:2742-2747` | `uiPrefSaveTimer` cleared with `clearTimeout` before reuse. |
+| 47 | ✗ FALSE | `frontend/src/main.tsx:4861` | `stopTransitionInFlight` guard handles concurrent stopLive calls. |
+| 48 | 🛠 FIXED | `frontend/src/main.tsx:4553-4569` | `ws.send` silent break — added diagnostic log. REST fallback already recovers audio. |
 | 50 | ✗ FALSE | `frontend/src/main.tsx:5157-5173` | `ws` access at line 5157 is inside `if (ws)` guard; `ws.send` is in try/catch. No null-deref. |
+| 51 | ✗ FALSE | `frontend/src/main.tsx:1261` | OPFS `writable.write` in try/catch + re-enqueue failed chunks for WebM fallback. |
+| 54 | ✗ FALSE | `frontend/src/main.tsx:5266` | `waveAnimId` cancelled unconditionally in stopLive; now guarded by outer try/finally. |
+| 58 | ✗ FALSE | `frontend/src/main.tsx:6181` | Drag-drop listeners never need removal in SPA — elements not unmounted. |
+| 62/63 | 🛠 FIXED | `frontend/src/main.tsx:3257-3292` | `execCommand("copy")` now in try/catch/finally — `<textarea>` always removed from DOM. |
+| 64 | ✗ FALSE | `frontend/src/main.tsx:6146-6164` | Inner try/catch handles `transcribeSelectedFile` errors. |
+| 65 | ✗ FALSE | `frontend/src/main.tsx:1791` | `loadRecordings().catch()` ignores noise after explicit success notice. |
+| 74 | ✗ FALSE | `frontend/src/main.tsx:4886` | MediaRecorder start error → graceful PCM-sink fallback (canonical source). |
+| 77 | ✗ FALSE | `desktop/main.js:1823-1912` | Wave monitor has `.catch(() => {})` + destroyed-check. |
 | 78 | ✗ FALSE | `desktop/main.js:3148-3157` | `pendingTranscriptionCount` decrement IS in `finally` (line 3155) — agent missed the nested try/finally. |
+| 80 | 🛠 FIXED | `desktop/main.js:2919-2934` | VBS AppActivate: strip control chars (0x00-0x1f, 0x7f) + standard `"→""` escape — prevents CR/LF injection. |
+| 82 | ✗ FALSE | `desktop/main.js:350` | `executeJavaScript(..., true)` is async — `true` is userGesture flag, not sync-block. |
+| 83 | ⚠ PARTIAL | `desktop/main.js:3555-3579` | `pasteTargetAppPid` captured microseconds before paste — PID reuse race theoretical. |
+| 84 | ✗ FALSE | `desktop/main.js:2712-2745` | `askForMediaAccess` is interactive dialog; `micPermissionChecked` caches after first run. |
+| 85 | 🛠 FIXED | `desktop/main.js:2312-2344` | Late `executeJavaScript` settlement after timeout → attached `.catch(() => null)` to prevent unhandledRejection. |
+| 87 | ⚠ PARTIAL | `desktop/main.js:4482-4500` | `globalShortcut.unregister`+`register` has microsecond race; single-threaded main process → very narrow. |
+| 88 | ✗ FALSE | `backend/config.py:320-335` | Backend writes config via tmp→replace atomic. Partial read impossible. |
+| 89 | ✗ FALSE | `desktop/main.js:4097` | `render-process-gone` handler has `if (!win || win.isDestroyed())` guard. |
+| 91 | 🛠 FIXED | `desktop/main.js:2598` | PowerShell double-quoted `$(...)` subexpression → single-quoted + `'→''` escape. |
+| 92 | 🛠 FIXED | `desktop/main.js:2444-2456` | `escapeAppleScriptString` now strips control chars (CR/LF injection blocked). |
+| 93 | ✗ FALSE | `desktop/main.js:2944, 2955` | VBS temp file unlinked in both success and error paths. |
+| 94 | ⚠ PARTIAL | `desktop/main.js:2822` | Clipboard race window is microseconds + `savedClipboard` restore after 1200ms. |
+| 95 | ✗ FALSE | `desktop/main.js:2220` | `guardedStopFromOverlay` clears `overlayStopInFlight` on every exit (timeout/resolve/reject via `finish()`). |
+| 98 | ✗ FALSE | `desktop/main.js:4411-4423` | Tray menu only has Open/Quit — no model/language state to go stale. |
+| 100 | ✗ FALSE | `desktop/main.js:3647` | `runCommand` awaits `child.on("close")` — `unref()` not needed for awaited spawns. |
+| DG | 🛠 FIXED | `backend/remote_deepgram_live.py:207-368` | `Deepgram connect timed out after 10.0s` — bumped default to 15s + one silent retry on TimeoutError with 6s budget (not retried on 4xx/OSError). Worst-case 21s, typical <2s. |
 | R1 | 🛠 FIXED | `desktop/main.js:3158-3200` | Race where fast post-stop + slow stopLive cleanup caused overlay to flip back to "Recording" — now gated by `recordingId` comparison against `__transcriptorCurrentRecordingId`. |
 | UX | 🛠 FIXED | `frontend/src/main.tsx:3758-3832` | Re-transcribe button: Deepgram-key pre-check + in-memory blob fallback to avoid fetch race with archive write. |
 
