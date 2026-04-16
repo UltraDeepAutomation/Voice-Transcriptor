@@ -204,12 +204,33 @@ class DeepgramLiveSession:
 
     # ----- Lifecycle --------------------------------------------------------
 
-    async def connect(self, open_timeout: float = 10.0) -> None:
+    async def connect(self, open_timeout: float = 15.0) -> None:
         """Open the upstream Deepgram WebSocket and start the receive loop.
 
         Raises ``DeepgramLiveError`` on authentication / network failure.
         The session is unusable after a failed connect; construct a new
         one to retry.
+
+        Default ``open_timeout`` is 15s (was 10s) — enough for a
+        worst-case DNS-cold + TLS-handshake + WSS-upgrade on
+        tethered/mobile networks. The old 10s default produced false-
+        positive ``Deepgram connect timed out after 10.0s`` on
+        perfectly healthy connections that hit a cold DNS cache or a
+        transient TLS slowdown.
+
+        On ``asyncio.TimeoutError`` we perform ONE silent retry with
+        a shorter 6s budget:
+          - DNS miss on attempt 1 → attempt 2 hits a warm cache.
+          - Momentary TCP stall → new connection bypasses the stuck
+            half-open socket.
+          - Permanently dead network → attempt 2 also fails quickly,
+            worst-case total 21s not 30s.
+          - ``InvalidStatus`` (4xx) is NEVER retried: 401 = bad key,
+            403 = no streaming entitlement, 429 = rate-limit, all
+            permanent within the retry window.
+          - Transport errors (OSError / WebSocketException) also not
+            retried — the original error message is more actionable
+            than a second identical attempt.
         """
         if self._ws is not None:
             raise DeepgramLiveError("session already connected")
@@ -218,22 +239,40 @@ class DeepgramLiveSession:
         url = f"{DEEPGRAM_LIVE_URL}?{self._cfg.to_query_string()}"
         headers = [("Authorization", f"Token {self._api_key}")]
         logger.info(
-            "deepgram-live: connecting model=%s language=%s sr=%s",
+            "deepgram-live: connecting model=%s language=%s sr=%s timeout=%.1fs",
             self._cfg.model,
             self._cfg.language,
             self._cfg.sample_rate,
+            open_timeout,
         )
         started = time.perf_counter()
-        try:
-            self._ws = await ws_connect(
+
+        async def _attempt(budget: float):
+            return await ws_connect(
                 url,
                 additional_headers=headers,
-                open_timeout=open_timeout,
+                open_timeout=budget,
                 close_timeout=2.0,
                 max_size=2 * 1024 * 1024,
                 ping_interval=None,  # we manage liveness via KeepAlive frames
                 ping_timeout=None,
             )
+
+        retry_budget = 6.0
+        try:
+            try:
+                self._ws = await _attempt(open_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "deepgram-live: connect timeout attempt=1 budget=%.1fs — retrying once with budget=%.1fs",
+                    open_timeout,
+                    retry_budget,
+                )
+                self._ws = await _attempt(retry_budget)
+                logger.info(
+                    "deepgram-live: connected on retry after total_ms=%.0f",
+                    (time.perf_counter() - started) * 1000.0,
+                )
         except InvalidStatus as e:
             status = getattr(e.response, "status_code", None)
             body_text = ""
@@ -283,7 +322,16 @@ class DeepgramLiveSession:
             logger.error("deepgram-live: %s (raw body=%s)", msg, body_text[:200])
             raise DeepgramLiveError(msg) from e
         except asyncio.TimeoutError as e:
-            msg = f"Deepgram connect timed out after {open_timeout:.1f}s"
+            # This branch fires only if BOTH the initial attempt AND the
+            # retry timed out. Report the full budget we actually spent
+            # so the user knows the network is genuinely unreachable,
+            # not just slow.
+            total_budget = open_timeout + retry_budget
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            msg = (
+                f"Deepgram connect timed out after {total_budget:.1f}s "
+                f"(2 attempts, elapsed={elapsed_ms:.0f}ms)"
+            )
             logger.error("deepgram-live: %s", msg)
             raise DeepgramLiveError(msg) from e
         except (WebSocketException, OSError) as e:
