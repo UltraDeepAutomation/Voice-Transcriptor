@@ -60,7 +60,12 @@ def openrouter_transcribe(
     }
 
     logger.info("openrouter_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
-    r = request_with_retry("POST", url, headers=headers, json=payload, timeout=60)
+    # Split (connect, read) timeouts. The old single-int ``60`` applied to
+    # BOTH phases — on a broken DNS path the app wasted 60s per attempt
+    # (3 × 60 = 3 min) before declaring failure. 10s connect is plenty
+    # for any cold-cache lookup; the 60s read covers Gemini's audio
+    # latency including worst-case queueing.
+    r = request_with_retry("POST", url, headers=headers, json=payload, timeout=(10, 60))
 
     if r.status_code >= 400:
         error_text = r.text[:400]
@@ -119,7 +124,10 @@ def openrouter_upscale_text(
     }
 
     logger.info("openrouter_upscale: model=%s, text=%d chars", model, len(source_text))
-    r = request_with_retry("POST", url, headers=headers, json=payload, timeout=120)
+    # Same (connect, read) split as openrouter_transcribe. Upscale can
+    # be slower than transcribe (large Gemini generations), so read budget
+    # is 120s. Connect budget stays at 10s — DNS path is identical.
+    r = request_with_retry("POST", url, headers=headers, json=payload, timeout=(10, 120))
 
     if r.status_code >= 400:
         raise RemoteError(f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}")

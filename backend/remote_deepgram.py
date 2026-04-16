@@ -77,12 +77,21 @@ def deepgram_transcribe(
     }
 
     logger.info("deepgram_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
+    # ``timeout=(connect, read)`` tuple. ``10`` for connect: matches the
+    # live-WS handshake budget (``remote_deepgram_live.connect`` uses 15s
+    # with retry; REST has its own 3-attempt retry and shorter per-attempt
+    # budgets keep total latency bounded). The prior 5s connect budget
+    # fired false-positive timeouts on cold-DNS and mobile-tethered
+    # uplinks — exactly the scenario the live-WS fix targeted. ``60``
+    # for read: Deepgram REST returns quickly (<5s) for normal audio;
+    # the 60s ceiling is only for pathologically long files or
+    # upstream congestion.
     r = request_with_retry(
         "POST", url,
         headers=headers,
         params=params,
         data=audio_bytes,
-        timeout=(5, 30),
+        timeout=(10, 60),
         retries=3,
     )
 
