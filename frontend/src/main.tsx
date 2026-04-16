@@ -3257,15 +3257,27 @@ async function copyRecordingText(): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
   } catch {
+    // Fallback path for browsers that block ``navigator.clipboard`` (Safari
+    // private mode, http: origins on old Chromium, denied user permission).
+    // ``execCommand("copy")`` can itself throw in those same environments
+    // — wrap in try/finally so the detached <textarea> is guaranteed to be
+    // removed from the DOM even if the copy itself fails. Otherwise a
+    // repeated copy attempt accumulates invisible <textarea> ghosts that
+    // leak memory and can interfere with focus management.
     const ta = document.createElement("textarea");
     ta.value = text;
     ta.style.position = "fixed";
     ta.style.opacity = "0";
     document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
+    try {
+      ta.focus();
+      ta.select();
+      document.execCommand("copy");
+    } catch (e) {
+      console.warn("execCommand copy fallback failed", e);
+    } finally {
+      ta.remove();
+    }
   }
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
   flashButtonFeedback(btn, "Copied", "Copy recording text");
@@ -3277,15 +3289,22 @@ async function copyTextContent(text: string, btnId = ""): Promise<void> {
   try {
     await navigator.clipboard.writeText(value);
   } catch {
+    // See copyRecordingText for the rationale behind the try/finally
+    // wrapper — guarantees the fallback <textarea> is always removed.
     const ta = document.createElement("textarea");
     ta.value = value;
     ta.style.position = "fixed";
     ta.style.opacity = "0";
     document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
+    try {
+      ta.focus();
+      ta.select();
+      document.execCommand("copy");
+    } catch (e) {
+      console.warn("execCommand copy fallback failed", e);
+    } finally {
+      ta.remove();
+    }
   }
   if (btnId) {
     const btn = $(btnId) as HTMLButtonElement;
@@ -4530,10 +4549,21 @@ function pushCapturedFrame(input: Float32Array): void {
   }
   if (!ws) return;
   if (ws.readyState === WebSocket.OPEN) {
-    // Flush any buffered frames first (FIFO order preserved).
+    // Flush any buffered frames first (FIFO order preserved). A
+    // ``send`` throw here means the socket transitioned to CLOSING
+    // mid-flush (race between readyState read and the native send
+    // call). We log the reason once per recording so the tail-cut
+    // debugger knows why some frames never reached Deepgram, and
+    // stop flushing the rest — the REST-fallback in stopLive will
+    // recover any audio from the canonical PCM sink.
     while (wsPendingFrames.length > 0) {
       const queued = wsPendingFrames.shift()!;
-      try { ws.send(queued); } catch { break; }
+      try {
+        ws.send(queued);
+      } catch (e) {
+        console.debug("live ws flush interrupted", e);
+        break;
+      }
     }
     try {
       ws.send(pcm);

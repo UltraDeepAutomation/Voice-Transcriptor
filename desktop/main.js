@@ -2309,6 +2309,11 @@ const RENDERER_STATE_QUERY_TIMEOUT_MS = 2000;
 
 async function queryRendererState() {
   if (!win || win.isDestroyed() || !win.webContents) return null;
+  // Attach a no-op ``.catch`` to the executeJavaScript promise up-front so
+  // a late rejection (renderer crashes AFTER our Promise.race timeout
+  // already gave up waiting) doesn't surface as an unhandledRejection in
+  // the main process. We still return null via the timeoutPromise path —
+  // the queryPromise's eventual settlement is intentionally discarded.
   const queryPromise = win.webContents.executeJavaScript(
     `
     (() => {
@@ -2341,7 +2346,7 @@ async function queryRendererState() {
     })();
     `,
     true
-  );
+  ).catch(() => null);
   let timeoutHandle;
   const timeoutPromise = new Promise((resolve) => {
     timeoutHandle = setTimeout(() => {
@@ -2437,7 +2442,15 @@ function saveLastTranscriptToDisk(text) {
 }
 
 function escapeAppleScriptString(s) {
-  return String(s || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // AppleScript string literals terminate at CR/LF. A bare newline in a
+  // target app name would break out of the quoted string and inject
+  // arbitrary AppleScript. Strip all control characters AND escape
+  // backslashes + quotes. Backslash must be replaced FIRST so the
+  // subsequent ``"`` replacement doesn't double-escape its own slash.
+  return String(s || "")
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
 }
 
 function isBadActivationTarget(name) {
@@ -2582,6 +2595,15 @@ async function activateAppByName(name) {
   const appName = String(name || "").trim();
   if (!appName || isBadActivationTarget(appName)) return false;
   if (process.platform === "win32") {
+    // PowerShell single-quoted strings do NOT interpolate: ``$var``,
+    // ``$(expr)``, and backticks are all literal. Using single quotes
+    // plus the canonical single-quote doubling escape ('') is the only
+    // injection-safe way to embed untrusted data — here, an app name
+    // that could (in principle) come from a process named something
+    // like ``evil$(Invoke-Mimikatz)``. The previous double-quoted form
+    // only escaped ``"`` and left ``$(...)`` subexpression evaluation
+    // wide open.
+    const escapedName = appName.replace(/'/g, "''");
     const pwsh = `
       Add-Type @"
         using System;
@@ -2590,7 +2612,7 @@ async function activateAppByName(name) {
           [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         }
 "@
-      $proc = Get-Process -Name "${appName.replace(/"/g, '`"')}" -ErrorAction SilentlyContinue | Select-Object -First 1
+      $proc = Get-Process -Name '${escapedName}' -ErrorAction SilentlyContinue | Select-Object -First 1
       if ($proc -and $proc.MainWindowHandle) {
         [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
         Write-Output "1"
@@ -2897,7 +2919,18 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
           vbsLines.push(`WshShell.AppActivate ${Math.trunc(effectiveTargetPid)}`);
           vbsLines.push('WScript.Sleep 80');
         } else if (effectiveTargetName) {
-          vbsLines.push(`WshShell.AppActivate "${effectiveTargetName.replace(/"/g, '""')}"`);
+          // VBS string literals are terminated by CR/LF — a target name
+          // that contains a newline would break out of the quoted string
+          // and inject arbitrary VBS into the script. Doubling the ``"``
+          // is the standard VBS escape; stripping CR/LF + NUL + all other
+          // control characters prevents any line-break-based escape.
+          // effectiveTargetName comes from the Windows process table, so
+          // the attack surface is small (a process would have to register
+          // with a pathological name), but the one-line fix is free.
+          const sanitizedName = effectiveTargetName
+            .replace(/[\x00-\x1f\x7f]/g, "")
+            .replace(/"/g, '""');
+          vbsLines.push(`WshShell.AppActivate "${sanitizedName}"`);
           vbsLines.push('WScript.Sleep 80');
         }
         vbsLines.push('WScript.Sleep 30');
