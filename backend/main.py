@@ -59,6 +59,75 @@ for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
 logger = logging.getLogger(__name__)
 
 
+# ── Parent-death watchdog ───────────────────────────────────────────────────
+#
+# The Electron shell is our parent. When it quits cleanly it sends SIGTERM
+# (via ``backend.kill("SIGTERM")``) and we exit. But when the Electron
+# process is killed with SIGKILL (``kill -9``), crashes, or the OS force-
+# closes it, the ``before-quit`` handler cannot run and no signal reaches
+# us — we become an orphan Python process, still bound to our TCP port,
+# still holding whisper models in RAM, until the user manually tracks us
+# down with ``ps``.
+#
+# Solution: the parent opens an inherited stdin pipe to us. As long as
+# the parent is alive the pipe's write end stays open. When the parent
+# process table entry is reaped (normal exit, crash, SIGKILL, laptop
+# shutdown mid-session — ANY path), the kernel closes every fd it owned
+# including our stdin's read end. A blocking ``os.read(0, 1)`` then
+# returns 0 bytes (EOF), and we exit immediately.
+#
+# The watchdog lives in a daemon thread so it never blocks shutdown. It
+# uses ``os._exit`` (not ``sys.exit``) because uvicorn installs its own
+# signal handlers and a normal exit here would race with its shutdown
+# path — ``os._exit`` bypasses atexit + cleanup and is the only way to
+# GUARANTEE the orphan is reaped, which is the whole point of this
+# watchdog.
+#
+# ``TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG=1`` opts out for users who run
+# the backend standalone (``python -m uvicorn backend.main:app`` in a
+# dev shell without Electron parent), since reading stdin in a dev
+# shell would block on the terminal.
+def _start_parent_death_watchdog() -> None:
+    if os.environ.get("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG") == "1":
+        return
+    if not os.isatty(0):
+        # Only install the watchdog when stdin is a pipe (parent-spawned).
+        # An interactive terminal would have ``isatty(0) == True`` and
+        # reading a byte would block forever until the user types.
+        def _watch() -> None:
+            try:
+                while True:
+                    data = os.read(0, 1)
+                    if not data:
+                        # EOF — parent's write end closed. Could be a
+                        # graceful parent exit OR a kernel-forced close
+                        # because the parent process table entry was
+                        # reaped. Either way: we have no parent anymore.
+                        logger.warning(
+                            "parent-death-watchdog: stdin EOF, exiting immediately"
+                        )
+                        # Flush logging before hard exit so any pending
+                        # messages reach the parent's captured stderr.
+                        try:
+                            logging.shutdown()
+                        except Exception:
+                            pass
+                        os._exit(0)
+            except Exception:
+                # Unexpected — do NOT exit, because a read() failure on
+                # stdin is not proof the parent is dead; it could be a
+                # spurious EINTR or a misconfigured runtime. Just log
+                # and let uvicorn keep serving.
+                logger.exception("parent-death-watchdog: unexpected read error")
+
+        threading.Thread(
+            target=_watch, daemon=True, name="parent-death-watchdog"
+        ).start()
+
+
+_start_parent_death_watchdog()
+
+
 @asynccontextmanager
 async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     """FastAPI lifespan hook.

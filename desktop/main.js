@@ -3961,9 +3961,20 @@ async function startBackend() {
     "--log-level", "info"
   ];
 
+  // stdin is a ``pipe`` (not ``ignore``) so the backend's parent-death
+  // watchdog can detect EOF when this Electron process dies. Without
+  // this, a SIGKILL / crash of Electron leaves the Python backend
+  // running as an orphan: still bound to the TCP port, still holding
+  // whisper models in RAM, visible only via ``ps``. With the pipe open,
+  // the kernel closes our write-end when we exit (for ANY reason,
+  // including SIGKILL), the backend's watchdog thread sees EOF on its
+  // stdin, and calls ``os._exit(0)`` — guaranteed cleanup.
+  //
+  // We explicitly NEVER write to backend.stdin; the pipe's sole purpose
+  // is liveness signalling via close-on-exit.
   backend = spawn(python, args, {
     cwd: repoRoot,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
       PYTHONUNBUFFERED: "1",
@@ -3971,6 +3982,13 @@ async function startBackend() {
       TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
     }
   });
+  // Ignore any stdin errors — the pipe is only used for EOF-on-parent-
+  // exit detection. If the write end gets EPIPE for some reason (backend
+  // crashed, fd was closed), Node would otherwise emit an unhandled
+  // 'error' event and crash the main process.
+  if (backend.stdin) {
+    backend.stdin.on("error", () => { /* intentional no-op */ });
+  }
 
   backend.stdout.on("data", (d) => {
     const msg = d.toString();
