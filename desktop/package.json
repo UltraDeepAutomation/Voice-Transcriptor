@@ -95,7 +95,7 @@
           "arch": ["x64"]
         }
       ],
-      "icon": "icon.png",
+      "icon": "icon.ico",
       "publisherName": "Transcriptor",
       "signAndEditExecutable": false,
       "sign": null
@@ -118,9 +118,9 @@
       "oneClick": true,
       "perMachine": false,
       "allowToChangeInstallationDirectory": false,
-      "installerIcon": "icon.png",
-      "uninstallerIcon": "icon.png",
-      "installerHeaderIcon": "icon.png",
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "installerHeaderIcon": "icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Transcriptor",
