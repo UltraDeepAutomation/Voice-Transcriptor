@@ -520,12 +520,19 @@ class DeepgramLiveSession:
     def _enqueue_event(self, event: object, *, is_critical: bool) -> None:
         """Put an event on the bounded queue with smart overflow handling.
 
-        ``is_critical=True`` means the event must never be dropped (final
-        segments, errors, sentinels). When the queue is full and the event
-        is critical, we drop the OLDEST interim event to make room.  If
-        ``is_critical=False`` (interim segments), we simply drop the new
-        event on overflow.
+        Priority (highest → lowest):
+
+        1. ``QUEUE_SENTINEL`` — drains the entire queue if necessary to
+           land. Its whole purpose is consumer termination, so dropping
+           queued data is the correct trade-off; without this guarantee
+           ``events()`` would hang on pathological queue saturation.
+        2. ``is_critical=True`` (finals, errors) — evicts the oldest
+           interim to make room. If no interim exists the critical event
+           is unavoidably dropped with an error log.
+        3. ``is_critical=False`` (interim segments) — drops on overflow
+           and logs a one-shot warning.
         """
+        # Fast path: queue has room.
         try:
             self._event_queue.put_nowait(event)
             return
@@ -533,6 +540,22 @@ class DeepgramLiveSession:
             pass
         except RuntimeError as e:
             logger.debug("deepgram-live: enqueue runtime error: %s", e)
+            return
+        # --- Overflow path ---
+        if event is self._QUEUE_SENTINEL:
+            # Sentinel MUST land. Drain the queue (up to current size)
+            # and re-enqueue. This only fires on close()/recv-exit, so
+            # any queued interim or final is being discarded during
+            # session-end anyway — consumer termination is paramount.
+            for _ in range(self._event_queue.qsize() + 1):
+                try:
+                    self._event_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                self._event_queue.put_nowait(event)
+            except (asyncio.QueueFull, RuntimeError) as e:
+                logger.error("deepgram-live: sentinel land failed after drain: %s", e)
             return
         if not is_critical:
             # Slow consumer — drop this interim.
@@ -543,16 +566,16 @@ class DeepgramLiveSession:
                     self._event_queue.maxsize,
                 )
             return
-        # Critical: try to evict one oldest interim and re-enqueue.
+        # Critical (non-sentinel): try to evict one oldest interim and re-enqueue.
         try:
             victim = self._event_queue.get_nowait()
             if isinstance(victim, dict) and victim.get("type") == "interim":
                 # Discarded an interim; event loop progressed.
                 pass
             else:
-                # Put the critical victim back and give up — don't drop
-                # finals/errors. This means the new critical event is
-                # silently dropped, which is worse than the warning below.
+                # Put the non-interim victim back and give up — don't
+                # drop finals/errors blindly. Log at ERROR so operators
+                # see that the queue is saturated with critical events.
                 self._event_queue.put_nowait(victim)
                 logger.error(
                     "deepgram-live: queue full with no interim to evict; "

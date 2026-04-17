@@ -49,6 +49,7 @@ def deepgram_transcribe(
     filename: str,
     model: str = "nova-3",
     language: Optional[str] = None,
+    diarize: bool = False,
 ) -> Dict[str, Any]:
     """Transcribe audio using Deepgram's pre-recorded API.
 
@@ -72,6 +73,12 @@ def deepgram_transcribe(
         "numerals": "true",
         "filler_words": "false",
     }
+    if diarize:
+        # Deepgram REST flag for speaker labelling. The response adds
+        # ``words[...].speaker`` which we ignore for the simple text
+        # path — caller receives the full transcript and can inspect
+        # ``raw`` for speaker segmentation.
+        params["diarize"] = "true"
     if language and language.lower() not in ("auto", ""):
         params["language"] = language
     else:

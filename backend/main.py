@@ -157,6 +157,18 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
         name="retroactive-audio-retention",
     ).start()
 
+    def _run_tmp_sweep() -> None:
+        try:
+            _sweep_orphan_tmp_files()
+        except Exception:
+            logger.exception("tmp-file sweep startup task failed")
+
+    threading.Thread(
+        target=_run_tmp_sweep,
+        daemon=True,
+        name="tmp-sweep",
+    ).start()
+
     yield
     # shutdown: nothing to actively release; daemon threads exit with the
     # process and the rate-limit prune task is torn down via the global
@@ -311,6 +323,53 @@ def _load_or_create_api_token() -> str:
 
 
 API_TOKEN = _load_or_create_api_token()
+
+
+# Match pattern used by every atomic writer in this module:
+#   _atomic_write_text / _write_upscale_preset / _atomic_temp_path /
+#   save_recording_with_audio — all suffix the destination with
+#   ".tmp-<hex>" or ".tmp-<uuid>.json". On crash between write and
+#   os.replace the tmp file is orphaned; this sweep cleans them up
+#   across restarts. Only files matching this exact regex are unlinked,
+#   never anything else.
+_TMP_ORPHAN_RE = re.compile(r"\.tmp-[0-9a-f][0-9a-f\-\.]*$", re.IGNORECASE)
+
+
+def _sweep_orphan_tmp_files() -> None:
+    """Delete orphan ``*.tmp-*`` files from DATA_DIR and every archive dir.
+
+    Runs once at backend startup. Tmp files from the current process
+    (still being written) have not yet been renamed into place, so their
+    mtime is very recent — we skip anything modified in the last 60 s
+    to avoid racing with a concurrent write from a parallel worker.
+    """
+    cutoff = time.time() - 60.0
+    targets: list[Path] = [DATA_DIR, UPSCALE_PRESETS_DIR]
+    try:
+        targets.extend(_get_known_archive_dirs())
+    except Exception:
+        pass
+    removed = 0
+    for root in targets:
+        try:
+            if not root.exists() or not root.is_dir():
+                continue
+            for p in root.iterdir():
+                if not p.is_file():
+                    continue
+                if not _TMP_ORPHAN_RE.search(p.name):
+                    continue
+                try:
+                    if p.stat().st_mtime > cutoff:
+                        continue
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    if removed > 0:
+        logger.info("tmp-sweep: removed %d orphan *.tmp-* files", removed)
 
 
 def _warm_default_local_model() -> None:
@@ -1015,19 +1074,30 @@ _rec_dir_cache_at = 0.0
 _REC_DIR_CACHE_TTL = 10.0
 
 
+# Single lock guards all three (result, timestamp, key) triples for the
+# list/graph/stats caches below. The GIL makes each individual assignment
+# atomic, but the three-write mutation sequence can interleave across
+# concurrent FastAPI workers, leaving cache globals in an inconsistent
+# state (new data + old key → persistent cache miss until TTL). Each
+# cache's read/write paths acquire this lock; contention is minimal
+# because the critical sections are a handful of scalar writes.
+_recordings_caches_lock = threading.Lock()
+
+
 def _invalidate_recordings_cache() -> None:
     global _list_cache, _list_cache_at, _list_cache_key
     global _graph_cache, _graph_cache_at, _graph_cache_key
     global _stats_cache, _stats_cache_at, _stats_cache_key
-    _list_cache = None
-    _list_cache_at = 0.0
-    _list_cache_key = None
-    _graph_cache = None
-    _graph_cache_at = 0.0
-    _graph_cache_key = None
-    _stats_cache = None
-    _stats_cache_at = 0.0
-    _stats_cache_key = None
+    with _recordings_caches_lock:
+        _list_cache = None
+        _list_cache_at = 0.0
+        _list_cache_key = None
+        _graph_cache = None
+        _graph_cache_at = 0.0
+        _graph_cache_key = None
+        _stats_cache = None
+        _stats_cache_at = 0.0
+        _stats_cache_key = None
 
 
 def _invalidate_recordings_dir_cache() -> None:
@@ -1262,9 +1332,19 @@ def _register_archive_dir(path: Path) -> None:
     abs_str = str(path.resolve())
     with _archive_dir_registry_lock:
         try:
-            existing: list[str] = (
+            parsed = (
                 json.loads(_ARCHIVE_DIR_REGISTRY_PATH.read_text(encoding="utf-8"))
                 if _ARCHIVE_DIR_REGISTRY_PATH.exists()
+                else []
+            )
+            # Defend against a corrupted registry (manual edit, partial
+            # write from an old build): anything other than a list of
+            # strings is treated as empty and rewritten from scratch on
+            # the next append. We never raise on bad data — retention
+            # sweeps must not crash because one JSON file is malformed.
+            existing: list[str] = (
+                [str(x) for x in parsed if isinstance(x, str)]
+                if isinstance(parsed, list)
                 else []
             )
         except Exception:
@@ -1294,9 +1374,15 @@ def _get_known_archive_dirs() -> list[Path]:
         logger.warning("known_archive_dirs: default dir resolve failed: %s", exc)
     with _archive_dir_registry_lock:
         try:
-            raw_list: list[str] = (
+            parsed = (
                 json.loads(_ARCHIVE_DIR_REGISTRY_PATH.read_text(encoding="utf-8"))
                 if _ARCHIVE_DIR_REGISTRY_PATH.exists()
+                else []
+            )
+            # Defend against a corrupted registry — see _register_archive_dir.
+            raw_list: list[str] = (
+                [str(x) for x in parsed if isinstance(x, str)]
+                if isinstance(parsed, list)
                 else []
             )
         except Exception:
@@ -1666,7 +1752,18 @@ async def ws_transcribe(websocket: WebSocket):
     """
     # Kick the recovery cleanup off the event loop — the websocket
     # handshake must not wait for a directory scan on slow filesystems.
-    asyncio.get_running_loop().run_in_executor(None, _cleanup_live_recovery_files)
+    # Attach a done-callback so exceptions (permission denied, disk full)
+    # surface in the log instead of being silently lost by the executor.
+    _cleanup_future = asyncio.get_running_loop().run_in_executor(
+        None, _cleanup_live_recovery_files
+    )
+
+    def _log_cleanup_error(fut: "asyncio.Future[None]") -> None:
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning("live recovery cleanup failed: %s", exc)
+
+    _cleanup_future.add_done_callback(_log_cleanup_error)
     token = (websocket.query_params.get("token") or "").strip()
     if token != API_TOKEN:
         await websocket.close(code=4401, reason="unauthorized")
@@ -2418,6 +2515,7 @@ def _run_remote_transcribe_once(
             filename=orig_name,
             model=model,
             language=language,
+            diarize=bool(diarize),
         )
         return {
             "provider": "deepgram",
@@ -2894,12 +2992,13 @@ def list_recordings(_auth: None = Depends(_require_api_auth)):
         file_count = -1
     cache_key = (str(d), dir_mtime, file_count)
 
-    if (
-        _list_cache is not None
-        and _list_cache_key == cache_key
-        and (now - _list_cache_at) < _LIST_CACHE_TTL
-    ):
-        return _list_cache
+    with _recordings_caches_lock:
+        if (
+            _list_cache is not None
+            and _list_cache_key == cache_key
+            and (now - _list_cache_at) < _LIST_CACHE_TTL
+        ):
+            return _list_cache
 
     items = []
     for p in d.glob("*.txt"):
@@ -2927,9 +3026,10 @@ def list_recordings(_auth: None = Depends(_require_api_auth)):
             continue
     items.sort(key=lambda x: x["modified_at"], reverse=True)
     result = {"items": items, "directory": str(d)}
-    _list_cache = result
-    _list_cache_at = now
-    _list_cache_key = cache_key
+    with _recordings_caches_lock:
+        _list_cache = result
+        _list_cache_at = now
+        _list_cache_key = cache_key
     return result
 
 
@@ -2954,12 +3054,13 @@ def recordings_graph(_auth: None = Depends(_require_api_auth)):
         file_count = -1
     cache_key = (str(d), dir_mtime, file_count)
 
-    if (
-        _graph_cache is not None
-        and _graph_cache_key == cache_key
-        and (now - _graph_cache_at) < _GRAPH_CACHE_TTL
-    ):
-        return _graph_cache
+    with _recordings_caches_lock:
+        if (
+            _graph_cache is not None
+            and _graph_cache_key == cache_key
+            and (now - _graph_cache_at) < _GRAPH_CACHE_TTL
+        ):
+            return _graph_cache
 
     nodes = []
     for p in d.glob("*.txt"):
@@ -2990,9 +3091,10 @@ def recordings_graph(_auth: None = Depends(_require_api_auth)):
             continue
 
     result = {"nodes": nodes}
-    _graph_cache = result
-    _graph_cache_at = now
-    _graph_cache_key = cache_key
+    with _recordings_caches_lock:
+        _graph_cache = result
+        _graph_cache_at = now
+        _graph_cache_key = cache_key
     return result
 
 
@@ -3002,6 +3104,12 @@ def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
     # recordings saved to custom directories are fully removed. Without
     # this, only the TXT files in the default dir were deleted while
     # audio files and TXT files in custom dirs were left on disk.
+    # Invalidate the list/graph/stats caches BEFORE the delete loop AND
+    # after — a concurrent GET /api/recordings landing mid-delete would
+    # otherwise repopulate the cache with stale entries that survive
+    # until the next invalidation. Double-invalidate is cheap and
+    # closes the race window entirely.
+    _invalidate_recordings_cache()
     deleted = 0
     failed = 0
     for d in _get_known_archive_dirs():
@@ -3073,12 +3181,13 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         file_count = -1
     cache_key = (str(d), dir_mtime, file_count)
 
-    if (
-        _stats_cache is not None
-        and _stats_cache_key == cache_key
-        and (now - _stats_cache_at) < _STATS_CACHE_TTL
-    ):
-        return _stats_cache
+    with _recordings_caches_lock:
+        if (
+            _stats_cache is not None
+            and _stats_cache_key == cache_key
+            and (now - _stats_cache_at) < _STATS_CACHE_TTL
+        ):
+            return _stats_cache
 
     files = sorted(d.glob("*.txt"))
     total_recordings = len(files)
@@ -3128,9 +3237,10 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         "providers": [{"name": k, "count": v} for k, v in sorted(providers.items(), key=lambda kv: kv[1], reverse=True)],
         "languages": [{"name": k, "count": v} for k, v in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)],
     }
-    _stats_cache = result
-    _stats_cache_at = now
-    _stats_cache_key = cache_key
+    with _recordings_caches_lock:
+        _stats_cache = result
+        _stats_cache_at = now
+        _stats_cache_key = cache_key
     return result
 
 

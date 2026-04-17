@@ -3966,7 +3966,10 @@ $("deleteAllCancelBtn").addEventListener("click", () => {
 });
 $("deleteAllConfirmBtn").addEventListener("click", async () => {
   try {
-    const r = await fetch(`/api/recordings?token=${encodeURIComponent(apiToken())}`, { method: "DELETE" });
+    // Use Authorization header instead of ?token= query param: query
+    // params are logged by uvicorn's access log at INFO level, which
+    // leaks the API token into plaintext logs on every delete.
+    const r = await fetch("/api/recordings", { method: "DELETE", headers: authHeaders() });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     setLatestSavedAudio(null);
@@ -5014,7 +5017,7 @@ async function startLive(): Promise<void> {
               // fallback container is rolling-windowed.
               showRecordSessionNotice(
                 "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 h. Canonical PCM audio is unaffected.",
-                "warn",
+                "warning",
                 9000
               );
             }

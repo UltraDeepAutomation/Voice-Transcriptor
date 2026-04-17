@@ -32,6 +32,12 @@ let overlayQuickSettingsInitialized = false;
 let overlaySilenceStartedAt = 0;
 let overlayAutoStopConfig = { enabled: false, seconds: 2, thresholdDb: -42 };
 let overlayAutoStopConfigRefreshAt = 0;
+// Generation counter for overlayAutoStopConfig async refreshes. Each
+// scheduled refresh captures this value; when the Promise resolves it
+// checks that the generation still matches before writing — so a
+// resolve from a PREVIOUS session (after the overlay was hidden and a
+// new recording started) cannot clobber the new session's config.
+let overlayAutoStopConfigGen = 0;
 let overlayRecordingStartedAt = 0;
 let overlaySeenAudioFrames = false;
 let overlayAutoStopTriggerTimer = null;
@@ -1337,20 +1343,34 @@ function createOverlayHtml() {
                 ? 'autostop'
                 : (activeWave ? 'recording' : 'idle')));
           stateIcon.className = '';
-          if (raw === 'starting' || raw === 'recording') {
+          // Strip the composite "In Clipboard · <reason>" suffix before
+          // matching — every clipboard-recovery variant counts as an OK
+          // final state (text is safe in the clipboard), not a failure.
+          const rawKey = raw.startsWith('in clipboard') ? 'in clipboard' : raw;
+          if (rawKey === 'starting' || rawKey === 'recording') {
             stateIcon.classList.add('rec');
-          } else if (raw === 'transcribing') {
+          } else if (rawKey === 'transcribing' || rawKey === 'pasting') {
             stateIcon.classList.add('transcribing');
-          } else if (raw === 'upscaling') {
+          } else if (rawKey === 'upscaling') {
             stateIcon.classList.add('upscaling');
-          } else if (raw === 'auto stop') {
+          } else if (rawKey === 'auto stop') {
             stateIcon.classList.add('autostop');
-          } else if (raw === 'paste sent' || raw === 'pasted' || raw === 'sent' || raw === 'done' || raw === 'saved to app') {
+          } else if (
+            rawKey === 'paste sent' || rawKey === 'pasted' || rawKey === 'sent' ||
+            rawKey === 'done' || rawKey === 'saved to app' || rawKey === 'in clipboard'
+          ) {
             stateIcon.classList.add('ok');
-          } else if (raw === 'paste failed' || raw === 'grant access' || raw === 'secure field' || raw === 'no text focus' || raw === 'clipboard error') {
+          } else if (
+            rawKey === 'paste failed' || rawKey === 'grant access' ||
+            rawKey === 'secure field' || rawKey === 'no text focus' ||
+            rawKey === 'clipboard error' || rawKey === 'no text' ||
+            rawKey === 'app not ready' || rawKey === 'app loading'
+          ) {
             stateIcon.classList.add('fail');
           } else {
-            stateIcon.classList.add('fail');
+            // Unknown status — default to transcribing spinner so the
+            // overlay doesn't lie about success/failure.
+            stateIcon.classList.add('transcribing');
           }
         };
         window.setQuickOpen = (open) => {
@@ -1847,8 +1867,15 @@ async function showRecordingOverlay() {
         if (safeLastFrameAt > 0) overlaySeenAudioFrames = true;
         if (now - overlayAutoStopConfigRefreshAt > 1200) {
           overlayAutoStopConfigRefreshAt = now;
+          const gen = ++overlayAutoStopConfigGen;
           getRendererAutoStopSilenceConfig().then((nextCfg) => {
-            overlayAutoStopConfig = nextCfg;
+            // Drop the result if a new recording session bumped the
+            // generation while we were awaiting — the old config would
+            // otherwise overwrite freshly set values from the new
+            // session's showRecordingOverlay.
+            if (gen === overlayAutoStopConfigGen) {
+              overlayAutoStopConfig = nextCfg;
+            }
           }).catch(() => { });
         }
         if (!isRec || !cfg.enabled || overlayStopInFlight) {
@@ -1991,6 +2018,9 @@ function hideRecordingOverlay() {
   overlayStopInFlight = false;
   overlaySilenceStartedAt = 0;
   overlayAutoStopConfigRefreshAt = 0;
+  // Bump the generation so any in-flight getRendererAutoStopSilenceConfig
+  // Promise from this session cannot clobber the next session's config.
+  overlayAutoStopConfigGen++;
   overlayRecordingStartedAt = 0;
   overlaySeenAudioFrames = false;
   if (overlayAutoStopTriggerTimer) {
@@ -2390,6 +2420,27 @@ function getLastTranscriptPath() {
   } catch {
     return "";
   }
+}
+
+/**
+ * Sweep stale `last_transcript.json.tmp-*` files from userData on boot.
+ * saveLastTranscriptToDisk writes via tmp+rename for atomicity; if
+ * Electron crashes between write and rename, the tmp file lingers.
+ * Over many crashes these accumulate. Called once at app.whenReady.
+ */
+function cleanupStaleTranscriptTmpFiles() {
+  const p = getLastTranscriptPath();
+  if (!p) return;
+  const dir = path.dirname(p);
+  const prefix = `${LAST_TRANSCRIPT_FILE}.tmp-`;
+  try {
+    const entries = fs.readdirSync(dir);
+    for (const name of entries) {
+      if (name.startsWith(prefix)) {
+        try { fs.unlinkSync(path.join(dir, name)); } catch { }
+      }
+    }
+  } catch { }
 }
 
 // Cache for the last-transcript file. Paste-last is triggered by a
@@ -2981,8 +3032,20 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         vbsLines.push('WshShell.SendKeys "^v"');
         vbsLines.push('WScript.Echo "OK:vbs-paste"');
 
-        fs.writeFileSync(vbsPath, vbsLines.join("\r\n"), "utf8");
-        const check = await runCommand("cscript", ["//Nologo", "//B", vbsPath], { timeoutMs: 2500 });
+        // Write as UTF-16 LE with BOM. Windows cscript/wscript decode
+        // .vbs files using the system's ANSI code page (CP-1251 / CP-932
+        // / Windows-1252) unless the file starts with a UTF-16 LE BOM.
+        // A Russian user targeting a window titled "Телеграм" would
+        // otherwise see UTF-8 bytes interpreted as CP-1251 gibberish,
+        // AppActivate fails silently, and SendKeys hits whichever
+        // process is foreground — usually the overlay itself.
+        const vbsSource = vbsLines.join("\r\n");
+        const vbsBuf = Buffer.concat([
+          Buffer.from([0xFF, 0xFE]),           // UTF-16 LE BOM
+          Buffer.from(vbsSource, "utf16le"),
+        ]);
+        fs.writeFileSync(vbsPath, vbsBuf);
+        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], { timeoutMs: 2500 });
 
         // Clean up temp file
         try { fs.unlinkSync(vbsPath); } catch { }
@@ -4568,6 +4631,7 @@ app.whenReady().then(async () => {
     appendMainLog(`[unhandledRejection] ${String(reason)}`);
     console.error("[unhandledRejection]", reason);
   });
+  cleanupStaleTranscriptTmpFiles();
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
     app.setActivationPolicy("regular");
