@@ -4233,11 +4233,9 @@ function logger_warn_client(message: string): void {
  *      that need to know what the UI is currently showing. This is also
  *      what drives the ``$finalOutput`` DOM element.
  *
- * Historically these lived in two separate helpers (``publishFinishedRecording``
- * and ``publishRecordingFinalSignal``) and were always called in pairs at
- * almost every site. That made it trivial to update one channel and
- * silently forget the other. ``publishRecordingOutput`` is the new SSOT:
- * one call, one atomic update of both channels plus the DOM.
+ * All callers go through ``publishRecordingFinalSignal`` (which passes a
+ * session token) or ``publishRecordingOutput`` directly. One call = one
+ * atomic update of both channels plus the DOM.
  */
 interface RecordingOutputSignal {
   recordingId: number;
@@ -4343,15 +4341,6 @@ function clearRecordingOutput(): void {
   window.__transcriptorLastUiFinalAt = 0;
   window.__transcriptorLastUiFinalRecordingId = 0;
   window.__transcriptorLastUiFinalKind = "";
-}
-
-/**
- * Legacy shims — kept so the existing call sites don't need to move in
- * the same patch. They route through ``publishRecordingOutput`` so all
- * three channels stay consistent.
- */
-function publishFinishedRecording(recordingId: number, text: string): void {
-  publishRecordingOutput({ recordingId, pasteText: text, kind: "transcript" });
 }
 
 function clearRecordingFinalSignal(): void {
@@ -5921,7 +5910,6 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (transcriptRaw) {
       transcriptForPaste = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
       pasteReadyText = transcriptForPaste || transcriptRaw;
-      publishFinishedRecording(recordingId, pasteReadyText);
       publishRecordingFinalSignal({
         recordingId,
         signalText: pasteReadyText,
@@ -6167,7 +6155,6 @@ async function transcribeSelectedFile(): Promise<void> {
       setStatusScoped(sessionUiToken, "Done");
       if (transcriptRaw) {
         const pasteReadyText = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
-        publishFinishedRecording(0, pasteReadyText || transcriptRaw);
         publishRecordingFinalSignal({
           recordingId: 0,
           signalText: pasteReadyText || transcriptRaw,
@@ -6206,7 +6193,6 @@ async function transcribeSelectedFile(): Promise<void> {
       setStatusScoped(sessionUiToken, "Done");
       if (transcriptRaw) {
         const pasteReadyText = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
-        publishFinishedRecording(0, pasteReadyText || transcriptRaw);
         publishRecordingFinalSignal({
           recordingId: 0,
           signalText: pasteReadyText || transcriptRaw,
