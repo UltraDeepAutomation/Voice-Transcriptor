@@ -2982,18 +2982,22 @@ def recordings_graph(_auth: None = Depends(_require_api_auth)):
 
 @app.delete("/api/recordings")
 def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
-    d = _resolve_recordings_dir()
+    # Scan ALL known archive dirs — not just the default one — so that
+    # recordings saved to custom directories are fully removed. Without
+    # this, only the TXT files in the default dir were deleted while
+    # audio files and TXT files in custom dirs were left on disk.
     deleted = 0
     failed = 0
-    for p in list(d.glob("*.txt")):
-        try:
-            p.unlink()
-            audio_path = _recording_audio_path(p.name)
-            if audio_path is not None:
-                audio_path.unlink(missing_ok=True)
-            deleted += 1
-        except Exception:
-            failed += 1
+    for d in _get_known_archive_dirs():
+        for p in list(d.glob("*.txt")):
+            try:
+                p.unlink()
+                audio_path = _recording_audio_path(p.name, target_dir=d)
+                if audio_path is not None:
+                    audio_path.unlink(missing_ok=True)
+                deleted += 1
+            except Exception:
+                failed += 1
     _invalidate_recordings_cache()
     return {"deleted": deleted, "failed": failed}
 
