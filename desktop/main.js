@@ -2970,6 +2970,107 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         lastReason = (fallback.stderr || fallback.stdout || "pwsh-fallback-failed").trim();
       }
     }
+  } else if (process.platform === "linux") {
+    // ─ Linux paste cascade ─────────────────────────────────────────
+    //
+    // Linux has no single canonical paste API — the active display
+    // server dictates which tool can send synthesised keystrokes:
+    //
+    //   * X11: xdotool (well-established, installed by setup.sh).
+    //   * Wayland (GNOME/KDE/Sway/wlroots): wtype — stateless Wayland
+    //     virtual-keyboard injector. Works on most compositors that
+    //     expose the virtual-keyboard-v1 protocol.
+    //   * Wayland fallback when wtype is blocked: ydotool — userland
+    //     uinput driver; requires the user to be in the ``input``
+    //     group but bypasses the compositor protocol entirely.
+    //
+    // The cascade: wtype → xdotool → ydotool. Each tool's exit code
+    // tells us truthfully whether the keystroke landed; we don't
+    // second-guess via focus polling (Linux has no stable per-window
+    // "activate and paste" API like AppleScript's ``tell process``).
+    //
+    // Window activation: if ``effectiveTargetPid`` is known we use
+    // ``wmctrl -ia`` on X11 (activates and raises). On Wayland there
+    // is no standard cross-compositor window activation — we rely on
+    // whatever already has focus (the user typically tab-ed to the
+    // target before pressing the paste hotkey).
+    const isWayland = !!process.env.WAYLAND_DISPLAY && !process.env.DISPLAY;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { clipboard.writeText(String(text)); } catch { }
+      await sleep(30 + attempt * 30);
+
+      logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "linux_paste" });
+      traceStep(trace, "method_begin", { method: "linux_paste", attempt: attempt + 1, wayland: isWayland });
+
+      // Try to focus the target window on X11. ``wmctrl -ia <id>``
+      // wants a window id, but ``wmctrl -a <name>`` works by
+      // substring match — safer because we already have the name.
+      // Failure here is non-fatal: if the target can't be raised,
+      // paste still lands in whatever has keyboard focus.
+      if (!isWayland && effectiveTargetName) {
+        const sanitized = String(effectiveTargetName).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 120);
+        if (sanitized) {
+          await runCommand("wmctrl", ["-a", sanitized], { timeoutMs: 800 }).catch(() => {});
+          await sleep(60);
+        }
+      }
+
+      const attempts = [];
+      if (isWayland) {
+        // Wayland: try wtype first (GNOME/KDE/wlroots), then ydotool.
+        attempts.push({
+          method: "wtype",
+          cmd: "wtype",
+          args: ["-M", "ctrl", "v", "-m", "ctrl"],
+          timeoutMs: 2000,
+        });
+        attempts.push({
+          method: "ydotool",
+          cmd: "ydotool",
+          args: ["key", "29:1", "47:1", "47:0", "29:0"], // Ctrl down, V down, V up, Ctrl up (linux input event codes)
+          timeoutMs: 2000,
+        });
+      } else {
+        // X11: xdotool is the ubiquitous answer. Fall through to
+        // wtype and ydotool for hybrid XWayland-under-Wayland
+        // setups where $DISPLAY is set but ``$WAYLAND_DISPLAY``
+        // is ALSO present (GNOME with XWayland apps).
+        attempts.push({
+          method: "xdotool",
+          cmd: "xdotool",
+          args: ["key", "--clearmodifiers", "ctrl+v"],
+          timeoutMs: 2000,
+        });
+      }
+
+      let methodOk = false;
+      let lastPasteErr = "";
+      for (const a of attempts) {
+        const cmdStarted = Date.now();
+        const res = await runCommand(a.cmd, a.args, { timeoutMs: a.timeoutMs });
+        traceStep(trace, "method_result", {
+          method: a.method,
+          attempt: attempt + 1,
+          ms: Date.now() - cmdStarted,
+          ok: !!res.ok,
+          code: res.code,
+          stderr: compactLogText(res.stderr),
+        });
+        if (res.ok) {
+          methodOk = true;
+          traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: false });
+          setTimeout(() => {
+            if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+          }, 1200);
+          return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: false };
+        }
+        lastPasteErr = (res.stderr || res.stdout || `${a.method}-failed`).trim();
+      }
+      if (!methodOk) {
+        lastReason = lastPasteErr || "linux-paste-failed";
+      }
+    }
   } else {
     // macOS AppleScript 'key code 9'
     for (let attempt = 0; attempt < 3; attempt++) {
