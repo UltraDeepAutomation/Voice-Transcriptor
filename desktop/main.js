@@ -48,6 +48,10 @@ let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
 let backendRestartAttempts = 0;
+// Set at app.whenReady, cleared on before-quit so shutdown doesn't
+// produce unhandledRejection noise from executeJavaScript against a
+// destroyed webContents.
+let shortcutPollTimer = null;
 // Single-flight promise for ``startBackend``. Concurrent callers
 // (window creation, restart timer, tray re-open) all await the same
 // in-flight start instead of racing to spawn duplicate Python
@@ -1645,11 +1649,12 @@ function ensureOverlayWindow() {
       if (win && !win.isDestroyed() && win.isVisible()) {
         safeExecSync("overlay_stop:winHide", () => win.hide());
       }
-      stopRecordingFromOverlay().catch((e) => {
-        appendMainLog(`[overlay] stop failed: ${e?.message || e}`);
-        overlayStopInFlight = false;
-        hideRecordingOverlay();
-      });
+      // Route through guardedStopFromOverlay (same as autostop) so a
+      // renderer that hangs never leaves overlayStopInFlight=true
+      // forever. The direct-Promise path only cleared the flag on
+      // rejection; a promise that never settles (IPC hung) would
+      // permanently brick the overlay until app restart.
+      guardedStopFromOverlay("overlay-click");
       return;
     }
     if (raw.startsWith("__overlay_settings__")) {
@@ -2427,18 +2432,29 @@ function getLastTranscriptPath() {
  * saveLastTranscriptToDisk writes via tmp+rename for atomicity; if
  * Electron crashes between write and rename, the tmp file lingers.
  * Over many crashes these accumulate. Called once at app.whenReady.
+ *
+ * Files modified within the last 60 s are preserved: the single-instance
+ * lock prevents two Electron Transcriptor processes from running
+ * concurrently, but a second-instance launch that loses the lock may
+ * still have fired whenReady before app.quit() took effect. An mtime
+ * floor ensures we never delete an in-flight tmp from the primary.
  */
 function cleanupStaleTranscriptTmpFiles() {
   const p = getLastTranscriptPath();
   if (!p) return;
   const dir = path.dirname(p);
   const prefix = `${LAST_TRANSCRIPT_FILE}.tmp-`;
+  const cutoff = Date.now() - 60_000;
   try {
     const entries = fs.readdirSync(dir);
     for (const name of entries) {
-      if (name.startsWith(prefix)) {
-        try { fs.unlinkSync(path.join(dir, name)); } catch { }
-      }
+      if (!name.startsWith(prefix)) continue;
+      const full = path.join(dir, name);
+      try {
+        const st = fs.statSync(full);
+        if (st.mtimeMs > cutoff) continue;
+        fs.unlinkSync(full);
+      } catch { }
     }
   } catch { }
 }
@@ -2821,6 +2837,8 @@ function snapshotClipboard() {
 function restoreClipboard(snap) {
   try {
     if (!snap || !snap.formats || snap.formats.length === 0) {
+      // Original clipboard was genuinely empty — clear so we don't
+      // leave the transcript pinned.
       clipboard.clear();
       return;
     }
@@ -2832,11 +2850,17 @@ function restoreClipboard(snap) {
     if (snap.bookmark && (snap.bookmark.title || snap.bookmark.url)) writeObj.bookmark = snap.bookmark;
     if (Object.keys(writeObj).length > 0) {
       clipboard.write(writeObj);
-    } else {
-      clipboard.clear();
+      return;
     }
+    // Original clipboard held formats we can't read back (file URLs,
+    // CF_HDROP, custom MIME types). Calling clipboard.clear() here
+    // would destroy the user's file/URL reference — worse than
+    // leaving our transcript pinned. Log and leave the clipboard as is.
+    appendMainLog(
+      `[clipboard-restore] unrecognised formats=${snap.formats.join(",")}; keeping transcript`
+    );
   } catch {
-    try { clipboard.clear(); } catch { }
+    // Swallow any unexpected write/clear errors — we cannot recover.
   }
 }
 
@@ -4575,6 +4599,10 @@ function killBackendHard(reason) {
 app.on("before-quit", () => {
   isQuitting = true;
   globalShortcut.unregisterAll();
+  if (shortcutPollTimer) {
+    clearInterval(shortcutPollTimer);
+    shortcutPollTimer = null;
+  }
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
@@ -4827,9 +4855,14 @@ app.whenReady().then(async () => {
 
   registerGlobalShortcuts();
 
-  // Poll for live shortcut changes from the renderer settings UI
-  setInterval(async () => {
-    if (!win || win.isDestroyed() || !win.webContents) return;
+  // Poll for live shortcut changes from the renderer settings UI.
+  // Skip when the window is hidden — users edit shortcuts only with
+  // the Settings pane visible. Handle is cleared in before-quit so a
+  // late tick can never executeJavaScript against a torn-down
+  // webContents (which otherwise produces [unhandledRejection] noise
+  // in the shutdown log).
+  shortcutPollTimer = setInterval(async () => {
+    if (!win || win.isDestroyed() || !win.webContents || !win.isVisible()) return;
     try {
       const pending = await win.webContents.executeJavaScript(
         `(() => { const p = window.__transcriptorPendingShortcuts; if (p) { delete window.__transcriptorPendingShortcuts; return p; } return null; })()`,

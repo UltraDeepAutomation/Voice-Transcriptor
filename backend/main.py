@@ -325,14 +325,21 @@ def _load_or_create_api_token() -> str:
 API_TOKEN = _load_or_create_api_token()
 
 
-# Match pattern used by every atomic writer in this module:
-#   _atomic_write_text / _write_upscale_preset / _atomic_temp_path /
-#   save_recording_with_audio — all suffix the destination with
-#   ".tmp-<hex>" or ".tmp-<uuid>.json". On crash between write and
-#   os.replace the tmp file is orphaned; this sweep cleans them up
-#   across restarts. Only files matching this exact regex are unlinked,
-#   never anything else.
-_TMP_ORPHAN_RE = re.compile(r"\.tmp-[0-9a-f][0-9a-f\-\.]*$", re.IGNORECASE)
+# Match tmp files produced by every atomic writer in this module:
+#
+#   _atomic_write_text     → "recording.txt.tmp-<hex>"
+#   _atomic_temp_path      → "recording.tmp-<hex>.wav" / ".txt" / ".m4a"
+#   _write_upscale_preset  → "builtin_clean.tmp-<hex>.json"
+#   save_recording_with_audio → same shape as _atomic_temp_path
+#
+# The hex portion is always 32 chars (uuid4().hex) — require at least 6
+# so a real file named e.g. "backup.tmp-x.wav" never accidentally matches.
+# The optional trailing ``.<ext>`` catches the in-middle tmp pattern.
+# Anchored to ``$`` so a user file legitimately containing ".tmp-" in
+# the middle (unusual but legal) is not matched.
+_TMP_ORPHAN_RE = re.compile(
+    r"\.tmp-[0-9a-f]{6,}(?:\.[A-Za-z0-9]+)?$", re.IGNORECASE
+)
 
 
 def _sweep_orphan_tmp_files() -> None:
@@ -619,6 +626,24 @@ def _lookup_live_promote_cache(session_id: str) -> Optional[dict]:
         if now - ts > _LIVE_PROMOTE_CACHE_TTL_SEC:
             _live_promote_cache.pop(session_id, None)
             return None
+        # Validate that the promoted files still exist on disk. If the
+        # user ran DELETE /api/recordings between the original promote
+        # and this retry, returning the cached success would claim a
+        # nonexistent recording and the frontend's audio fetch would
+        # 404. Treat a missing file as a cache miss so the promoter
+        # re-runs and recreates the entry.
+        name = str(payload.get("name") or "")
+        archive_dir_str = str(payload.get("archive_dir") or "")
+        if name and archive_dir_str:
+            try:
+                if not (Path(archive_dir_str) / name).exists():
+                    _live_promote_cache.pop(session_id, None)
+                    return None
+            except OSError:
+                # Path computation failed (invalid chars, permission);
+                # treat as cache miss and re-run promoter.
+                _live_promote_cache.pop(session_id, None)
+                return None
         return dict(payload)
 
 
@@ -1148,6 +1173,23 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                 save_config(cfg)
             except OSError as e:
                 logger.warning("volatile config reset failed: %s", e)
+            _rec_dir_cache = default_dir
+            _rec_dir_cache_at = now
+            return default_dir
+
+        # Security: mirror the containment check in
+        # _resolve_recordings_target_dir. A config-driven path outside
+        # the user's home dir (manual edit, migration bug, attacker
+        # with write access to config.json) would otherwise let the
+        # backend create directories under /tmp, /var, /etc — anywhere
+        # the process can write. Fall back to the default when unsafe.
+        try:
+            p.relative_to(Path.home().resolve())
+        except ValueError:
+            logger.warning(
+                "recordings_dir %s is outside home; falling back to default %s",
+                p, default_dir,
+            )
             _rec_dir_cache = default_dir
             _rec_dir_cache_at = now
             return default_dir
@@ -3360,9 +3402,15 @@ async def save_recording_with_audio(
     # the frontend makes — if the app crashes between those two events,
     # the recovery would otherwise be promoted at next startup and create
     # a duplicate archive entry.
-    safe_sid = _normalize_live_session_id(str(live_session_id or "").strip())
-    if safe_sid and LIVE_SESSION_ID_RE.fullmatch(safe_sid):
-        _delete_live_recovery(safe_sid)
+    # Only delete a recovery when the client actually supplied a session
+    # id. _normalize_live_session_id would otherwise mint a fresh uuid4,
+    # and while the subsequent _delete_live_recovery no-ops for a
+    # non-existent session, the contract should be explicit: empty ⇒
+    # skip.  This also closes a vanishingly small but real risk that the
+    # fresh uuid collides with a concurrent live recovery and nukes it.
+    raw_sid = str(live_session_id or "").strip()
+    if raw_sid and LIVE_SESSION_ID_RE.fullmatch(raw_sid):
+        _delete_live_recovery(raw_sid)
     return {
         "ok": True,
         "name": out_text.name,

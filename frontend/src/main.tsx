@@ -2413,23 +2413,42 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   if (["Alt", "Control", "Meta", "Shift"].includes(e.key)) return null;
 
   const parts: string[] = [];
-  if (e.ctrlKey || e.metaKey) parts.push("CommandOrControl");
+  // Separate Control (Ctrl) from Command (Meta/Cmd) unless BOTH are
+  // held (extremely rare; fall back to the generic CommandOrControl).
+  // The old `ctrlKey || metaKey → CommandOrControl` collapse silently
+  // hijacked Cmd+X bindings on macOS users who meant Ctrl+X, and vice
+  // versa. Electron accepts all three forms; this produces the most
+  // precise binding the user actually pressed.
+  if (e.ctrlKey && e.metaKey) parts.push("CommandOrControl");
+  else if (e.metaKey) parts.push("Command");
+  else if (e.ctrlKey) parts.push("Control");
   if (e.altKey) parts.push("Alt");
   if (e.shiftKey) parts.push("Shift");
 
-  // Map the key
+  // Map the key. Reject any unrecognised or non-ASCII key so the
+  // caller can surface a clear error. A user pressing Alt+Shift+ж on
+  // a Cyrillic keyboard layout previously produced an accelerator
+  // string Electron's globalShortcut.register would silently reject,
+  // so the hotkey appeared saved in the UI but never fired.
   const key = e.key;
-  if (key === "ArrowLeft") parts.push("Left");
-  else if (key === "ArrowRight") parts.push("Right");
-  else if (key === "ArrowUp") parts.push("Up");
-  else if (key === "ArrowDown") parts.push("Down");
-  else if (key === " ") parts.push("Space");
-  else if (key === "Enter") parts.push("Enter");
-  else if (key === "Backspace") parts.push("Backspace");
-  else if (key === "Delete") parts.push("Delete");
-  else if (key === "Tab") parts.push("Tab");
-  else if (key.length === 1) parts.push(key.toUpperCase());
-  else parts.push(key);
+  let mapped: string | null = null;
+  if (key === "ArrowLeft") mapped = "Left";
+  else if (key === "ArrowRight") mapped = "Right";
+  else if (key === "ArrowUp") mapped = "Up";
+  else if (key === "ArrowDown") mapped = "Down";
+  else if (key === " ") mapped = "Space";
+  else if (key === "Enter") mapped = "Enter";
+  else if (key === "Backspace") mapped = "Backspace";
+  else if (key === "Delete") mapped = "Delete";
+  else if (key === "Tab") mapped = "Tab";
+  else if (key === "Escape") mapped = "Escape";
+  else if (/^F\d{1,2}$/.test(key)) mapped = key;
+  else if (
+    key.length === 1 &&
+    /^[A-Za-z0-9!@#$%^&*()[\]{};:'",.<>/?\\|`~\-=_+]$/.test(key)
+  ) mapped = key.toUpperCase();
+  if (!mapped) return null;
+  parts.push(mapped);
 
   return parts.join("+");
 }

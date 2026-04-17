@@ -12,6 +12,7 @@ Accepts raw audio bytes (WAV/MP3/etc.) as the request body.
 """
 
 import logging
+import mimetypes
 from typing import Any, Dict, Optional
 
 from backend.http_retry import RemoteError, request_with_retry
@@ -84,7 +85,12 @@ def deepgram_transcribe(
     else:
         params["detect_language"] = "true"
 
-    # Detect content type from filename
+    # Detect content type from filename. All extensions admitted by
+    # ALLOWED_AUDIO_EXTS in main.py must be mapped here; anything not
+    # in the explicit table falls through to mimetypes.guess_type and
+    # finally to application/octet-stream (Deepgram accepts it for
+    # every common codec). The old "audio/wav" default caused silent
+    # 400s when an AAC or MP4 upload was mislabelled as WAV.
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
     mime_map = {
         "wav": "audio/wav",
@@ -93,8 +99,10 @@ def deepgram_transcribe(
         "webm": "audio/webm",
         "flac": "audio/flac",
         "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+        "aac": "audio/aac",
     }
-    content_type = mime_map.get(ext, "audio/wav")
+    content_type = mime_map.get(ext) or (mimetypes.guess_type(filename)[0] or "application/octet-stream")
 
     headers = {
         "Authorization": f"Token {api_key}",
