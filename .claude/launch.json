@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend-live",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "while true; do sleep 60; done"],
+      "port": 8321
+    }
+  ]
+}

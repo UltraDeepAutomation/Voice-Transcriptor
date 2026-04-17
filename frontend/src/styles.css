@@ -2495,6 +2495,20 @@ canvas,
     flex-direction: column;
   }
 
+  /*
+   * When the topbar inner stacks vertically, the fixed ``--h-topbar``
+   * (45 px) can't contain the 58.5 px column — the net-pill overflows
+   * downwards and visually collides with the first section below. The
+   * 760 px media query already knew to release the fixed height; the
+   * 1180 px breakpoint now does the same (symmetric vertical padding
+   * so the column centres naturally).
+   */
+  .window-topbar {
+    height: auto;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
   .topbar {
     overflow-x: auto;
   }
@@ -2627,6 +2641,19 @@ canvas,
   .pane-toolbar-actions {
     width: 100%;
     justify-content: flex-start;
+    /*
+     * Below 760 px we drop the ``nowrap + overflow:hidden`` desktop
+     * rule. On a desktop narrow viewport the designer chose clipping
+     * over wrapping to avoid the "все символы переносятся на две
+     * строки" look. But on a genuinely small viewport (phone,
+     * half-split window) clipping silently removes copy/preset
+     * buttons — users can't tell they exist. Wrapping onto a second
+     * toolbar row is the lesser evil here because the content below
+     * is already scrolling vertically anyway.
+     */
+    flex-wrap: wrap;
+    overflow: visible;
+    row-gap: var(--toolbar-row-gap);
   }
 
   .section-summary-row,
