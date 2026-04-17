@@ -670,15 +670,16 @@ function resetRecordSessionNotice(): void {
 
 function showRecordSessionNotice(message: string, tone: UiTone = "info", timeoutMs = 7000, sessionToken = ""): void {
   if (!isCurrentUiSession(sessionToken)) return;
-  if (tone === "info" || tone === "success") {
-    resetRecordSessionNotice();
-    return;
-  }
   const text = String(message || "").trim();
   if (!text) {
     resetRecordSessionNotice();
     return;
   }
+  // Show ALL tones (info, success, warning, error) — previously info/success
+  // would silently call resetRecordSessionNotice() and return without showing
+  // the message, which also dismissed any active warning banner. Now every
+  // tone with a non-empty message is surfaced; warnings/errors stay until
+  // their timer fires rather than being killed by a subsequent success event.
   if (recordSessionNoticeTimer) {
     window.clearTimeout(recordSessionNoticeTimer);
     recordSessionNoticeTimer = null;
@@ -758,6 +759,10 @@ function renderCurrentRecordingSummary(
     lastRenderedStatusTone = "neutral";
     lastNoticedStatusKey = "";
     lastRenderedLatencyMs = null;
+    // Also clear the DOM pill — previously only internal state was reset,
+    // leaving the previous session's status text (e.g. "Done", "Upscaling")
+    // visible in the header after recording ended.
+    setStatus("", "neutral");
     return;
   }
   const status = String(summary.status || "").trim();
@@ -1137,6 +1142,10 @@ interface OpfsFileSystemDirectoryHandle {
 }
 
 const PCM_SPOOL_DIR = "pcm-spool";
+/** All `.pcm16` file names that are currently being written to by an
+ *  active recording session. `cleanupOrphanPcmSpool` skips these so
+ *  it never deletes a spool file that is still in use. */
+const _activePcmSpoolNames = new Set<string>();
 
 async function getPcmSpoolDir(create = true): Promise<OpfsFileSystemDirectoryHandle | null> {
   // The built-in ``FileSystemDirectoryHandle`` type in some TS lib
@@ -1166,6 +1175,8 @@ async function cleanupOrphanPcmSpool(): Promise<void> {
     const victims: string[] = [];
     for await (const entry of dir.values()) {
       if (entry.kind === "file" && entry.name.endsWith(".pcm16")) {
+        // Skip any file that belongs to an active recording session.
+        if (_activePcmSpoolNames.has(entry.name)) continue;
         victims.push(entry.name);
       }
     }
@@ -1215,6 +1226,9 @@ class OpfsPcmSink implements PcmSink {
     try {
       const safeId = sessionId.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 96) || `s${Date.now()}`;
       const name = `${safeId}.pcm16`;
+      // Register BEFORE creating the file handle so the cleanup scan
+      // never races with the file's existence on disk.
+      _activePcmSpoolNames.add(name);
       const handle = await dir.getFileHandle(name, { create: true });
       const writable = await handle.createWritable({ keepExistingData: false });
       return new OpfsPcmSink(dir, handle, writable);
@@ -1303,6 +1317,9 @@ class OpfsPcmSink implements PcmSink {
       }
       this.writable = null;
     }
+    // Spool file is no longer being written; remove from the active set
+    // so a subsequent cleanupOrphanPcmSpool call can delete it.
+    _activePcmSpoolNames.delete(this.fileHandle.name);
 
     if (this.lastWriteError) {
       // The spool file may be truncated or corrupt. Return an empty
@@ -1320,6 +1337,7 @@ class OpfsPcmSink implements PcmSink {
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    _activePcmSpoolNames.delete(this.fileHandle.name);
     if (this.writable) {
       try {
         await this.writable.close();
@@ -2988,8 +3006,6 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 }
 
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
-($("recordingsDirInput") as HTMLInputElement).addEventListener("input", () => {
-});
 ($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => {
   queueUiPreferencesSave();
 });

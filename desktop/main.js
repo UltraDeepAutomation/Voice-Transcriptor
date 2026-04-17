@@ -37,7 +37,6 @@ let overlayAutoStopConfigRefreshAt = 0;
 let overlayRecordingStartedAt = 0;
 let overlaySeenAudioFrames = false;
 let overlaySpeechRecoveryStartedAt = 0;
-let overlayAutoStopYellowSince = 0;
 let overlayAutoStopTriggerTimer = null;
 let overlayTranscribingStatusTimer = null;
 let lastOverlayUiInteractionAt = 0;
@@ -415,7 +414,11 @@ async function getRendererQuickSettingsOpen() {
   if (!win || win.isDestroyed() || !win.webContents) return null;
   try {
     const open = await win.webContents.executeJavaScript(
-      `(() => { const p = document.getElementById('quickSettingsPanel'); return !!(p && !p.hidden); })();`,
+      // Use getComputedStyle instead of .hidden: the panel is hidden via
+      // CSS display:none (not via the HTML hidden attribute), so p.hidden
+      // is always false even when the element is invisible, causing the
+      // overlay to always think quick-settings is open.
+      `(() => { const p = document.getElementById('quickSettingsPanel'); if (!p) return false; return getComputedStyle(p).display !== 'none'; })();`,
       true
     );
     return !!open;
@@ -1770,7 +1773,6 @@ async function showRecordingOverlay() {
   overlayRecordingStartedAt = Date.now();
   overlaySeenAudioFrames = false;
   overlaySpeechRecoveryStartedAt = 0;
-  overlayAutoStopYellowSince = 0;
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
     overlayAutoStopTriggerTimer = null;
@@ -1982,7 +1984,6 @@ function hideRecordingOverlay() {
   overlayRecordingStartedAt = 0;
   overlaySeenAudioFrames = false;
   overlaySpeechRecoveryStartedAt = 0;
-  overlayAutoStopYellowSince = 0;
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
     overlayAutoStopTriggerTimer = null;
@@ -2522,35 +2523,6 @@ function openPrivacyAutomationSettings() {
   runCommand("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"], {
     timeoutMs: 5000
   }).catch(() => { });
-}
-
-async function getFrontmostAppName() {
-  if (process.platform === "win32") {
-    const pwsh = `
-      Add-Type @"
-        using System;
-        using System.Runtime.InteropServices;
-        public class Window {
-          [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-          [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
-        }
-"@
-      $hwnd = [Window]::GetForegroundWindow()
-      $pid = 0
-      [Window]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-      $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-      if ($proc) { Write-Output $proc.Name } else { Write-Output "" }
-    `;
-    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
-    return res.ok ? (res.stdout || "").trim() : "";
-  }
-  const res = await runCommand(
-    "osascript",
-    ["-e", 'tell application "System Events" to get name of first process whose frontmost is true'],
-    { timeoutMs: 5000 }
-  );
-  if (!res.ok) return "";
-  return (res.stdout || "").trim();
 }
 
 async function getFrontmostAppInfo() {

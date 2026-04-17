@@ -1496,39 +1496,6 @@ def _extract_meta_field(content: str, field: str) -> str:
     return (m.group(1).strip() if m else "")
 
 
-def _upscale_instruction(preset: str) -> str:
-    p = (preset or "clean").strip().lower()
-    if p == "business":
-        return (
-            "Rewrite transcript into clear business style. Keep key facts, remove filler words, "
-            "fix grammar and punctuation."
-        )
-    if p == "concise":
-        return (
-            "Rewrite transcript into concise compact style. Keep only important points, "
-            "remove repetitions and fillers."
-        )
-    if p == "formal":
-        return (
-            "Rewrite transcript into formal polished style. Keep structure and meaning, "
-            "fix grammar and punctuation."
-        )
-    if p in {"ai_code", "code", "programming"}:
-        return (
-            "Improve transcript for software engineering context. Preserve technical terms, commands, "
-            "identifiers, and model/tool names exactly; fix punctuation and grammar."
-        )
-    if p == "refine":
-        return (
-            "Refine transcript readability without changing meaning: keep the same language, preserve wording and facts, "
-            "fix obvious punctuation, and split text into natural readable paragraphs."
-        )
-    return (
-        "Clean transcript text: fix punctuation and grammar, remove stutters/fillers, "
-        "keep original meaning and language."
-    )
-
-
 def _upscale_preset_path(preset_id: str) -> Path:
     raw = (preset_id or "").strip()
     if not UPSCALE_PRESET_ID_RE.fullmatch(raw):
@@ -2514,8 +2481,18 @@ async def remote_transcribe_sync(
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
-    # Read audio bytes directly into memory — skip disk I/O for speed.
-    audio_bytes = await file.read()
+    # Read audio bytes into memory for speed, but enforce the same
+    # MAX_UPLOAD_BYTES ceiling that _save_upload_file uses — without
+    # this a 2 GB file would be fully loaded into the Python heap,
+    # causing an OOM that kills the backend and all ongoing sessions.
+    audio_bytes = b""
+    async for chunk in file:
+        audio_bytes += chunk
+        if len(audio_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+            )
     lang_opt = _normalize_language(language)
     cfg = load_config()
     loop = asyncio.get_running_loop()
