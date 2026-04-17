@@ -18,8 +18,26 @@ from backend.http_retry import RemoteError, request_with_retry
 
 logger = logging.getLogger(__name__)
 
-# Re-export for backward compatibility
-DeepgramRemoteError = RemoteError
+
+class DeepgramRemoteError(RemoteError):
+    """Deepgram-specific remote failure (REST / pre-recorded API).
+
+    Subclass of ``RemoteError`` so callers can catch provider-specific
+    failures (``except DeepgramRemoteError`` → switch to OpenRouter or
+    local Whisper) or a generic remote failure (``except RemoteError``).
+
+    Previously this was a bare ``DeepgramRemoteError = RemoteError``
+    alias — ``main.py`` imported it as ``DgRemoteError`` which gave
+    zero provider discrimination at the catch site (``except
+    (OrRemoteError, DgRemoteError)`` was equivalent to catching
+    ``RemoteError`` twice).
+    """
+
+
+# ``raise RemoteError(...)`` inside this module must now produce the
+# Deepgram subclass. The assignment replaces the locally-bound name
+# without touching the base class in http_retry.
+RemoteError = DeepgramRemoteError  # type: ignore[misc]
 
 DEEPGRAM_API_BASE = "https://api.deepgram.com/v1"
 

@@ -14,6 +14,27 @@ from backend.http_retry import RemoteError, request_with_retry
 logger = logging.getLogger(__name__)
 
 
+class OpenRouterError(RemoteError):
+    """OpenRouter-specific remote failure.
+
+    Subclass of the generic ``RemoteError`` so callers can either:
+      * catch ``OpenRouterError`` specifically (retry, fall back to
+        local Whisper, pick a different OpenRouter model), or
+      * catch ``RemoteError`` to handle any provider failure uniformly.
+
+    Prior to this subclass, ``main.py`` imported the base ``RemoteError``
+    under the alias ``OrRemoteError`` and pretended it was a distinct
+    type — catching ``(OrRemoteError, DgRemoteError)`` was just
+    catching ``RemoteError`` twice with no provider discrimination.
+    """
+
+
+# Re-export under the legacy name so any downstream import that used
+# ``from backend.remote_openrouter import RemoteError`` keeps working.
+# New code should import ``OpenRouterError`` directly.
+RemoteError = OpenRouterError  # type: ignore[misc]
+
+
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 

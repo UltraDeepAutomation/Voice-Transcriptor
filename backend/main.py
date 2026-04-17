@@ -37,10 +37,8 @@ from backend.audio import AudioError, ensure_wav_16k, split_channels, write_wav
 from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
 from backend.live import LiveSession
 from backend.jobs import JobStore
-from backend.remote_openrouter import RemoteError as OrRemoteError
-from backend.remote_openrouter import openrouter_transcribe, openrouter_upscale_text
-from backend.remote_deepgram import RemoteError as DgRemoteError
-from backend.remote_deepgram import deepgram_transcribe
+from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
+from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
 from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveError,
@@ -2475,7 +2473,7 @@ async def create_remote_job(
                     "txt": str(result_txt_path),
                 },
             )
-        except (OrRemoteError, DgRemoteError) as e:
+        except (OpenRouterError, DeepgramRemoteError) as e:
             jobs.set_error(job_id, str(e))
         except Exception as e:
             jobs.set_error(job_id, f"Remote transcription failed: {e}")
@@ -2528,7 +2526,7 @@ async def remote_transcribe_sync(
             ),
         )
         return {"ok": True, "result": result}
-    except (OrRemoteError, DgRemoteError) as e:
+    except (OpenRouterError, DeepgramRemoteError) as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Remote transcription failed: {e}")
@@ -2586,7 +2584,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
                     ),
                 )
                 break
-            except OrRemoteError as e:
+            except OpenRouterError as e:
                 last_err = e
                 msg = str(e)
                 # Retry with fallback models only for invalid/non-existing model issues.
@@ -2595,7 +2593,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
                 raise
         if out is None:
             raise last_err or RuntimeError("upscale failed")
-    except OrRemoteError as e:
+    except OpenRouterError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return {
         "ok": True,
