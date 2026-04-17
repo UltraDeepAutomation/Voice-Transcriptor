@@ -17,24 +17,36 @@ if not exist "%VENV_PY%" (
     exit /b 1
 )
 
-echo [*] Starting Backend via uvicorn...
+:: Export env vars so Electron's main.js picks up the venv python
+:: on its first ``findSystemPython`` probe (desktop/main.js:3727) and
+:: writes data to the same dir setup.bat provisioned.
+::
+:: We deliberately do NOT spawn our own uvicorn here. Electron's
+:: main process already owns backend lifecycle end-to-end:
+::
+::   * ``pickBackendPort`` in desktop/main.js:3699 selects a free port
+::     (default 8321, iterates if taken — so no collision with
+::     whatever else might be on 8321).
+::   * ``startBackend`` in desktop/main.js:3905 spawns Python with
+::     ``stdio: ["pipe", ...]``; the parent-death watchdog thread in
+::     backend/main.py:90-128 sees EOF on stdin when Electron dies
+::     for ANY reason (SIGKILL, crash, Taskmgr "End task", BSOD
+::     reboot) and calls ``os._exit(0)``. Zero orphans guaranteed.
+::
+:: The prior code path spawned uvicorn ourselves on hard-coded 8321,
+:: then ``npm start`` Electron which spawned ANOTHER uvicorn via
+:: pickBackendPort (found 8321 taken by us, fell through to 8322).
+:: Result: two Python processes per launch, frontend only talked to
+:: Electron's on 8322, ours on 8321 sat orphan until the taskkill
+:: at the end of this script. Plus the final
+:: ``netstat | find "8321" | taskkill`` killed WHATEVER was on 8321,
+:: including unrelated processes.
 set "TRANSCRIPTOR_DATA_DIR=%APPDATA%\Transcriptor"
 set "PYTHONPATH=%ROOT_DIR%;%PYTHONPATH%"
+set "PYTHON=%VENV_PY%"
 
-:: Kill existing uvicorn on port 8321 if possible (using bare bone python if needed, or simply let it fail gracefully)
-:: It's hard to reliably kill by port in bash-less Windows cleanly without external tools, 
-:: so we just rely on uvicorn taking it over or user closing old console.
-
-start "Transcriptor Backend" /b "%VENV_PY%" -m uvicorn backend.main:app --host 127.0.0.1 --port 8321 --log-level warning
-
-echo [*] Waiting for backend to initialize...
-timeout /t 3 /nobreak >nul
-
-echo [*] Starting Electron...
+echo [*] Starting Electron (backend spawned by main process)...
 cd desktop
 call npm start
-
-:: Clean up backend process bound to port 8321
-for /f "tokens=5" %%a in ('netstat -aon ^| find "8321" ^| find "LISTENING"') do taskkill /F /PID %%a 2>nul
 
 echo [*] Exiting.
