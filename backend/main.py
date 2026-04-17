@@ -202,6 +202,12 @@ COMMON_STOPWORDS = {
 UPSCALE_PRESETS = {"clean", "business", "ai_code", "refine"}
 UPSCALE_PRESETS_DIR = DATA_DIR / "upscale_presets"
 UPSCALE_MAX_CUSTOM_PRESETS = 3
+
+# Persistent registry of every archive directory ever used for an
+# audio-bearing save.  Written atomically each time a new custom dir
+# is first encountered so ``_retroactive_audio_retention`` can clean
+# up *all* archives on the next startup, not just the current default.
+_ARCHIVE_DIR_REGISTRY_PATH = DATA_DIR / "known_archive_dirs.json"
 UPSCALE_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
@@ -263,6 +269,7 @@ frontend_assets_dir = frontend_dist_dir / "assets"
 API_TOKEN_PATH = DATA_DIR / "api_token.txt"
 _rate_lock = threading.Lock()
 _request_windows: dict[str, deque[float]] = defaultdict(deque)
+_archive_dir_registry_lock = threading.Lock()
 _ws_windows: dict[str, deque[float]] = defaultdict(deque)
 
 # Per-session recovery promotion serialization + idempotency cache.
@@ -602,6 +609,7 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
         title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         stem = _recording_stem(title)
         target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
+        _register_archive_dir(target_dir)
         audio_out = target_dir / f"{stem}.wav"
         text_out = target_dir / f"{stem}.txt"
         tmp_audio = _atomic_temp_path(audio_out)
@@ -1196,6 +1204,88 @@ def _prune_old_recording_audio(
     return deleted
 
 
+def _register_archive_dir(path: Path) -> None:
+    """Persist *path* in the known-archive-dirs registry.
+
+    Only custom dirs (those that differ from the current default) need
+    to be registered — the default dir is always scanned by
+    ``_retroactive_audio_retention`` without any registry entry.
+
+    The registry file is a JSON array of absolute path strings stored
+    at ``_ARCHIVE_DIR_REGISTRY_PATH``.  Writes are serialised by
+    ``_archive_dir_registry_lock`` and executed atomically via a
+    temp-file rename so a crash mid-write never produces a corrupt
+    registry.
+    """
+    try:
+        default = _resolve_recordings_dir()
+        if path.resolve() == default.resolve():
+            return  # Default dir always included — no need to register
+    except Exception:
+        pass  # Can't compare; register defensively
+    abs_str = str(path.resolve())
+    with _archive_dir_registry_lock:
+        try:
+            existing: list[str] = (
+                json.loads(_ARCHIVE_DIR_REGISTRY_PATH.read_text(encoding="utf-8"))
+                if _ARCHIVE_DIR_REGISTRY_PATH.exists()
+                else []
+            )
+        except Exception:
+            existing = []
+        if abs_str in existing:
+            return  # Already known — no write needed
+        existing.append(abs_str)
+        try:
+            _atomic_write_text(_ARCHIVE_DIR_REGISTRY_PATH, json.dumps(sorted(existing)))
+        except Exception as exc:
+            logger.warning("register_archive_dir: write failed for %s: %s", abs_str, exc)
+
+
+def _get_known_archive_dirs() -> list[Path]:
+    """Return all archive dirs that should be scanned for audio retention.
+
+    Always includes the current default recordings dir.  Additionally
+    includes every custom dir persisted by ``_register_archive_dir``,
+    filtering out entries that no longer exist on disk (e.g. removable
+    drives that are not currently mounted).  Duplicates (resolved) are
+    deduplicated.
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.append(_resolve_recordings_dir())
+    except Exception as exc:
+        logger.warning("known_archive_dirs: default dir resolve failed: %s", exc)
+    with _archive_dir_registry_lock:
+        try:
+            raw_list: list[str] = (
+                json.loads(_ARCHIVE_DIR_REGISTRY_PATH.read_text(encoding="utf-8"))
+                if _ARCHIVE_DIR_REGISTRY_PATH.exists()
+                else []
+            )
+        except Exception:
+            raw_list = []
+    for s in raw_list:
+        try:
+            p = Path(s)
+            if p.exists() and p.is_dir():
+                candidates.append(p)
+        except Exception:
+            continue
+    # Deduplicate by resolved absolute path.
+    seen: set[str] = set()
+    result: list[Path] = []
+    for d in candidates:
+        try:
+            key = str(d.resolve())
+        except Exception:
+            key = str(d)
+        if key not in seen:
+            seen.add(key)
+            result.append(d)
+    return result
+
+
 def _retroactive_audio_retention(target_dir: Optional[Path] = None) -> int:
     """Enforce the "one audio per archive" rule on an existing archive.
 
@@ -1206,14 +1296,23 @@ def _retroactive_audio_retention(target_dir: Optional[Path] = None) -> int:
     ``.txt`` transcript, and deletes every audio file that doesn't
     belong to that newest stem.
 
-    Called once on backend startup. Safe to call repeatedly — it
-    becomes a no-op when there's nothing to prune.
+    Called once on backend startup with no argument: scans ALL known
+    archive dirs (default + every custom dir persisted via
+    ``_register_archive_dir``).  Can also be called with a specific
+    ``target_dir`` for single-directory retention (used internally by
+    the multi-dir loop below).
+
+    Safe to call repeatedly — it becomes a no-op when there's nothing
+    to prune.
     """
-    try:
-        root = target_dir or _resolve_recordings_dir()
-    except Exception as e:
-        logger.warning("retroactive audio retention: resolve dir failed: %s", e)
-        return 0
+    # Multi-dir startup sweep: iterate every known archive dir.
+    if target_dir is None:
+        total = 0
+        for d in _get_known_archive_dirs():
+            total += _retroactive_audio_retention(target_dir=d)
+        return total
+
+    root = target_dir
     try:
         entries = list(root.iterdir())
     except OSError as e:
@@ -3067,6 +3166,9 @@ async def save_recording_with_audio(
     ext = Path(orig_name).suffix.lower() or ".wav"
 
     target_dir = _resolve_recordings_target_dir(archive_dir, create=not bool(require_existing))
+    # Persist this dir so startup retroactive retention covers it even if
+    # the user changes their default recordings_dir between app launches.
+    _register_archive_dir(target_dir)
     if existing_name:
         if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
