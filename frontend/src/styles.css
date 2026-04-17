@@ -527,6 +527,14 @@ textarea:focus-visible,
   outline-offset: 2px;
 }
 
+/* Toolbar selects (provider, model, lang, upscale) are styled via
+   border-color on :focus — a second focus-ring outline is redundant
+   and creates a double-ring artefact on macOS / some GTK themes. */
+.pane-toolbar-actions select:focus-visible,
+.topbar select:focus-visible {
+  outline: none;
+}
+
 .top-item select,
 .top-item .status-pill,
 .top-item .mini-wave,

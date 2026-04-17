@@ -3795,23 +3795,16 @@ $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 $("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || "", "resultCopyBtn"));
 $("upscaleCopyBtn").addEventListener("click", () => void copyTextContent($("upscaleOutput").textContent || "", "upscaleCopyBtn"));
 
-// Re-transcribe button: sends the saved audio to Deepgram REST API
-// when streaming produced a poor result (bad connection, dropped packets).
+// Re-transcribe button: re-runs transcription on the saved audio file.
+// Prefers Deepgram REST when a key is configured (best quality for
+// recordings that had a bad streaming connection). Falls back to local
+// Whisper automatically — no key needed, always available.
 $("retranscribeBtn").addEventListener("click", async () => {
   const btn = $("retranscribeBtn") as HTMLButtonElement;
   if (btn.disabled) return;
   const audioState = latestSavedAudioState;
   if (!audioState?.savedName) {
     $("finalOutput").textContent = "No saved audio to re-transcribe.";
-    return;
-  }
-  // The Re-transcribe button specifically targets Deepgram REST — it exists
-  // to recover a full transcript when the streaming WebSocket dropped
-  // packets. Without a Deepgram key, the REST call will fail with an
-  // opaque backend error; short-circuit here with a clear message so the
-  // user knows exactly what to configure instead of seeing a stack-trace.
-  if (!isProviderKeyConfigured("deepgram")) {
-    $("finalOutput").textContent = "Re-transcribe requires a Deepgram API key. Configure it in Settings.";
     return;
   }
   btn.disabled = true;
@@ -3834,16 +3827,41 @@ $("retranscribeBtn").addEventListener("click", async () => {
       const audioBlob = await audioResp.blob();
       audioFile = new File([audioBlob], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
     }
-    const result = await remoteJobSync(audioFile, {
-      provider: "deepgram",
-      language: (($("language") as HTMLSelectElement).value || "auto").trim(),
-      diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-      openrouterModel: getRemoteModelValue("deepgram"),
-    });
-    const text = String(result.text || "").trim();
+    const lang = (($("language") as HTMLSelectElement).value || "auto").trim();
+    let text = "";
+    let usedProvider: Provider = "local";
+
+    // 1. Try Deepgram REST — higher accuracy than local Whisper for most
+    //    languages. Only attempted when the user has a key configured.
+    if (isProviderKeyConfigured("deepgram")) {
+      try {
+        const result = await remoteJobSync(audioFile, {
+          provider: "deepgram",
+          language: lang,
+          diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+          openrouterModel: getRemoteModelValue("deepgram"),
+        });
+        text = String(result.text || "").trim();
+        usedProvider = "deepgram";
+      } catch (deepgramErr) {
+        // Network timeout, rate-limit, bad key — log and fall through to
+        // local Whisper so the user still gets a usable transcript.
+        console.warn("Re-transcribe: Deepgram REST failed, trying local Whisper:", deepgramErr);
+      }
+    }
+
+    // 2. Local Whisper fallback — always available, no API key required.
+    if (!text) {
+      const model = ($("model") as HTMLSelectElement).value || "small";
+      const localResult = await transcribeCanonicalAudioLocally(audioFile, lang, model);
+      text = localResult.text.trim();
+      usedProvider = "local";
+    }
+
     if (text) {
       $("finalOutput").textContent = text;
-      // Update the saved recording with the new transcript
+      // Persist the new transcript over the previous save so the
+      // Recordings view reflects the improved result.
       try {
         await saveRecordingText({
           name: audioState.savedName,
@@ -3852,13 +3870,17 @@ $("retranscribeBtn").addEventListener("click", async () => {
           title: text.split(/\s+/).slice(0, 8).join(" "),
           sourceText: text,
           transcriptText: text,
-          provider: "deepgram",
-          model: getRemoteModelValue("deepgram"),
-          language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+          provider: usedProvider,
+          model: usedProvider === "deepgram"
+            ? getRemoteModelValue("deepgram")
+            : (($("model") as HTMLSelectElement).value || "small"),
+          language: lang,
         });
       } catch { }
       patchCurrentRecordingSummary({
-        status: "Re-transcribed successfully via REST API.",
+        status: usedProvider === "deepgram"
+          ? "Re-transcribed via Deepgram REST."
+          : "Re-transcribed via local Whisper.",
         tone: "success",
       });
     } else {
