@@ -1873,12 +1873,22 @@ function getCanonicalLiveSourceText(): string {
       : snapshotInterim;
   if (!interim) return committed;
   if (!committed) return interim;
-  // Dedup: if committed already ends with the interim text, skip.
+  // Dedup: if committed already ends with the exact interim text, skip.
   if (committed.endsWith(interim)) return committed;
-  // Dedup: if the interim is entirely contained in the committed tail,
-  // it was already finalized — skip.
-  const lastCommittedWords = committed.split(/\s+/).slice(-10).join(" ");
-  if (lastCommittedWords.includes(interim)) return committed;
+  // Dedup: word-normalised comparison so "world." vs "world" or
+  // "world!" vs "world" do not produce "hello world world!" artifacts.
+  // Strip punctuation from both sides and compare at word level.
+  const normalizeWords = (s: string): string[] =>
+    s.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/).filter(Boolean);
+  const interimWords = normalizeWords(interim);
+  if (interimWords.length === 0) return committed;
+  const lastCommittedWords = committed.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
+  const lastCommittedNorm = normalizeWords(lastCommittedWords).join(" ");
+  const interimNorm = interimWords.join(" ");
+  // Substring check on normalised forms covers: exact match, punctuation
+  // variation ("world." == "world"), and phrase inclusion ("bar foo" in
+  // "hello world foo bar" correctly NOT matching because the join order differs).
+  if (lastCommittedNorm.endsWith(interimNorm)) return committed;
   return `${committed} ${interim}`;
 }
 
@@ -2511,11 +2521,21 @@ function syncUpscalePresetControls(): void {
   const canDelete = !!(selectedUpscalePreset() && !selectedUpscalePreset()!.builtin);
   delBtn.disabled = !upscaleEnabled || !canDelete;
   delBtn.classList.toggle("can-delete", upscaleEnabled && canDelete);
+  // The model select is a sibling of the preset-wrap, not inside it,
+  // so it must be toggled separately. Previously this was omitted —
+  // the model dropdown stayed fully interactive even when the entire
+  // upscale toolbar was at 0.5 opacity, confusing users into thinking
+  // they could configure upscale while it was disabled.
+  const modelSel = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
+  if (modelSel) modelSel.disabled = !upscaleEnabled;
   // Visual dimming for the entire toolbar when upscale is OFF.
+  // pointer-events: none prevents cursor/hover artefacts on the
+  // dimmed row; individual disabled attributes still block keyboard.
+  // The copy-paste bug (both branches were "") is fixed here.
   const toolbar = wrap.closest(".pane-toolbar-actions-upscale") as HTMLElement | null;
   if (toolbar) {
     toolbar.style.opacity = upscaleEnabled ? "1" : "0.5";
-    toolbar.style.pointerEvents = upscaleEnabled ? "" : "";
+    toolbar.style.pointerEvents = upscaleEnabled ? "" : "none";
   }
 }
 
@@ -4819,6 +4839,12 @@ async function startLive(): Promise<void> {
     });
   };
   ws.onmessage = (ev: MessageEvent<string>) => {
+    // Guard: drop messages from a stale socket if this session's token
+    // no longer matches the active UI session. In the normal flow this
+    // never fires because stopLive closes the socket before setBusy(false)
+    // allows a new startLive, but a browser-buffered frame or a re-entrant
+    // auto-stop edge case can slip through without it.
+    if (activeUiSessionToken !== sessionUiToken) return;
     const msg = parseLiveWsMessage(ev.data);
     if (!msg) return;
     switch (msg.type) {

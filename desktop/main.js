@@ -56,7 +56,13 @@ let loadedFrontendBuildSignature = "";
 const OVERLAY_FIXED_HEIGHT = 150;
 
 const HOST = "127.0.0.1";
-let PORT = 8321;
+// Backend port default. pickBackendPort iterates up if occupied, so
+// collisions with other local services on 8321 are non-fatal — the
+// actual port the backend bound is stored in mutable ``PORT`` below.
+// All four previous hardcoded 8321 literals now reference this constant
+// so a future port change is a one-line edit.
+const DEFAULT_BACKEND_PORT = 8321;
+let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
@@ -3797,8 +3803,8 @@ function canBindPort(host, port) {
   });
 }
 
-async function pickBackendPort(host, preferred = 8321) {
-  const start = Number(preferred || 8321);
+async function pickBackendPort(host, preferred = DEFAULT_BACKEND_PORT) {
+  const start = Number(preferred || DEFAULT_BACKEND_PORT);
   for (let p = start; p < start + 24; p += 1) {
     // eslint-disable-next-line no-await-in-loop
     if (await canBindPort(host, p)) return p;
@@ -4049,7 +4055,7 @@ async function startBackend() {
 
   setBackendBootStatus("Starting backend…");
 
-  const preferredPort = Number(process.env.TRANSCRIPTOR_PORT || 8321) || 8321;
+  const preferredPort = Number(process.env.TRANSCRIPTOR_PORT || DEFAULT_BACKEND_PORT) || DEFAULT_BACKEND_PORT;
   PORT = await pickBackendPort(HOST, preferredPort);
   BASE_URL = `http://${HOST}:${PORT}`;
   appendMainLog(`[backend-start] python="${python}" host=${HOST} port=${PORT} repo="${repoRoot}"`);
