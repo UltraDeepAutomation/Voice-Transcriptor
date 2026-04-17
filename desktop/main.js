@@ -39,6 +39,7 @@ let overlaySeenAudioFrames = false;
 let overlaySpeechRecoveryStartedAt = 0;
 let overlayAutoStopTriggerTimer = null;
 let overlayTranscribingStatusTimer = null;
+let overlayHideTimer = null;
 let lastOverlayUiInteractionAt = 0;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
@@ -1972,7 +1973,28 @@ async function setOverlayTimer(text) {
   );
 }
 
+/**
+ * Schedule a single hideRecordingOverlay() call after `ms` milliseconds.
+ * Any previously scheduled call is cancelled first, so multiple in-flight
+ * code paths converge on exactly one hide — eliminating the stacked-timer
+ * race where a late second fire kills the wave monitor of a freshly started
+ * new recording session.
+ */
+function scheduleOverlayHide(ms) {
+  if (overlayHideTimer !== null) {
+    clearTimeout(overlayHideTimer);
+  }
+  overlayHideTimer = setTimeout(() => {
+    overlayHideTimer = null;
+    hideRecordingOverlay();
+  }, ms);
+}
+
 function hideRecordingOverlay() {
+  if (overlayHideTimer !== null) {
+    clearTimeout(overlayHideTimer);
+    overlayHideTimer = null;
+  }
   if (!overlayWin || overlayWin.isDestroyed()) return;
   if (overlayLoaded) {
     overlayWin.webContents.executeJavaScript(`window.setQueueVisible && window.setQueueVisible(false);`, true).catch(() => { });
@@ -2111,7 +2133,7 @@ async function toggleRecordingFromShortcut() {
     if (!micGranted) {
       traceStep(trace, "mic_permission_denied", {});
       await setOverlayStatus("Grant Access");
-      setTimeout(() => hideRecordingOverlay(), 1200);
+      scheduleOverlayHide(1200);
       traceEnd(trace, "failed", { reason: "mic-permission-denied" });
       return;
     }
@@ -2119,7 +2141,7 @@ async function toggleRecordingFromShortcut() {
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
       await setOverlayStatus("App Not Ready");
-      setTimeout(() => hideRecordingOverlay(), 1200);
+      scheduleOverlayHide(1200);
       traceEnd(trace, "failed", { reason: "window-not-ready" });
       return;
     }
@@ -2128,7 +2150,7 @@ async function toggleRecordingFromShortcut() {
     traceStep(trace, "renderer_ready_check", { ready: !!ready });
     if (!ready) {
       await setOverlayStatus("App Loading");
-      setTimeout(() => hideRecordingOverlay(), 1300);
+      scheduleOverlayHide(1300);
       traceEnd(trace, "failed", { reason: "renderer-not-ready" });
       return;
     }
@@ -2151,7 +2173,7 @@ async function toggleRecordingFromShortcut() {
     if (!result?.ok) {
       traceStep(trace, "renderer_toggle_failed", { result: result || null });
       await setOverlayStatus("App Loading");
-      setTimeout(() => hideRecordingOverlay(), 1300);
+      scheduleOverlayHide(1300);
       traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
       return;
     }
@@ -2192,7 +2214,7 @@ async function toggleRecordingFromShortcut() {
       }
       await playOverlayCue("stop");
       await setOverlayStatus("Saved To App");
-      setTimeout(() => hideRecordingOverlay(), 1400);
+      scheduleOverlayHide(1400);
     }
     traceEnd(trace, "done", {});
   } finally {
@@ -2291,11 +2313,11 @@ async function stopRecordingFromOverlay() {
         await showPostStopYellowThenTranscribing(700);
       } else {
         await setOverlayStatus("Saved To App");
-        setTimeout(() => hideRecordingOverlay(), 1400);
+        scheduleOverlayHide(1400);
       }
     } else {
       await setOverlayStatus("Saved To App");
-      setTimeout(() => hideRecordingOverlay(), 1400);
+      scheduleOverlayHide(1400);
     }
   } finally {
     // Every exit path clears the paste target — the enqueued task
@@ -2723,6 +2745,62 @@ async function requestMacMicrophonePermissionOnce() {
   return false;
 }
 
+/**
+ * Snapshot every clipboard format that Electron exposes so we can restore
+ * the ORIGINAL clipboard after a paste — even when it held an image, RTF,
+ * or a browser bookmark rather than plain text.
+ *
+ * If the original clipboard was completely empty the snapshot records
+ * { formats: [] } and restoreClipboard will call clipboard.clear() instead
+ * of leaving the transcript pinned on the clipboard permanently.
+ */
+function snapshotClipboard() {
+  try {
+    const formats = clipboard.availableFormats();
+    const snap = { formats: formats || [] };
+    if (!formats || formats.length === 0) return snap;
+    snap.text = clipboard.readText();
+    if (formats.some(f => /html/i.test(f))) { try { snap.html = clipboard.readHTML(); } catch { } }
+    if (formats.some(f => /rtf/i.test(f))) { try { snap.rtf = clipboard.readRTF(); } catch { } }
+    if (formats.some(f => /image|png|bitmap|tiff/i.test(f))) {
+      try {
+        const img = clipboard.readImage();
+        if (img && !img.isEmpty()) { snap.image = img; snap.hasImage = true; }
+      } catch { }
+    }
+    // macOS bookmark (URL + display title) — clipboard.readBookmark is macOS-only.
+    if (formats.some(f => /url|bookmark/i.test(f))) {
+      try { snap.bookmark = clipboard.readBookmark(); } catch { }
+    }
+    return snap;
+  } catch {
+    return { formats: [] };
+  }
+}
+
+/** Restore a clipboard snapshot produced by snapshotClipboard(). */
+function restoreClipboard(snap) {
+  try {
+    if (!snap || !snap.formats || snap.formats.length === 0) {
+      clipboard.clear();
+      return;
+    }
+    const writeObj = {};
+    if (snap.text) writeObj.text = snap.text;
+    if (snap.html) writeObj.html = snap.html;
+    if (snap.rtf) writeObj.rtf = snap.rtf;
+    if (snap.hasImage && snap.image) writeObj.image = snap.image;
+    if (snap.bookmark && (snap.bookmark.title || snap.bookmark.url)) writeObj.bookmark = snap.bookmark;
+    if (Object.keys(writeObj).length > 0) {
+      clipboard.write(writeObj);
+    } else {
+      clipboard.clear();
+    }
+  } catch {
+    try { clipboard.clear(); } catch { }
+  }
+}
+
 async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
   const originalTargetName = String(targetAppName || "").trim();
   const originalTargetPid = Number(targetAppPid || 0);
@@ -2792,10 +2870,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     frontBeforePid: frontBefore.pid || 0,
     textLen: String(text).length,
   });
-  let savedClipboard = "";
-  try {
-    savedClipboard = clipboard.readText() || "";
-  } catch { }
+  const savedClipboard = snapshotClipboard();
   try {
     clipboard.writeText(String(text));
   } catch {
@@ -2803,16 +2878,19 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     logPasteTrace("clipboard_write_failed", {});
     traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
     // Restore original clipboard.
-    if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+    safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
     return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
   const escapedApp = escapeAppleScriptString(effectiveTargetName);
-  const pid = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
+  const rawPid = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
+  // Defense-in-depth: reject any value that is not a safe non-negative integer
+  // before interpolating it into the AppleScript source string.
+  const pid = (Number.isFinite(rawPid) && rawPid >= 0 && rawPid < 2 ** 31) ? Math.trunc(rawPid) : 0;
   const robustPasteScript = `
     set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
+    set targetPid to ${pid}
     tell application "System Events"
       if UI elements enabled is false then return "ERR:no-accessibility"
       set p to missing value
@@ -2924,7 +3002,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         if (check.ok) {
           traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: "vbs_success", verified: false });
           setTimeout(() => {
-            if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+            safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
           }, 1200);
           return { ok: true, reason: "OK:vbs_paste", method: "vbs_paste", verified: false };
         }
@@ -2941,7 +3019,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         if (fallback.ok && (fallback.stdout || "").includes("OK:")) {
           traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1 });
           setTimeout(() => {
-            if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+            safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
           }, 1200);
           return { ok: true, reason: "OK:pwsh_paste_fallback", method: "pwsh_paste_fallback", verified: false };
         }
@@ -3057,7 +3135,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
           methodOk = true;
           traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: false });
           setTimeout(() => {
-            if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+            safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
           }, 1200);
           return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: false };
         }
@@ -3104,13 +3182,13 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: false });
         // Restore previous clipboard cleanly since paste was successful
         setTimeout(() => {
-          if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+          safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
         }, 1200);
         return { ok: true, reason: out, method: "robust_paste", verified: false };
       }
       if (out === "ERR:secure-field") {
         traceEnd(trace, "failed", { reason: "secure-field" });
-        if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+        safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
         return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
       }
       if (out === "ERR:no-accessibility") {
@@ -3167,7 +3245,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     const out = String(menuRes.stdout || "").trim();
     if (out.startsWith("OK:")) {
       setTimeout(() => {
-        if (savedClipboard) { safeExecSync("paste:clipboardRestore", () => clipboard.writeText(savedClipboard)); }
+        safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
       }, 1200);
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: false });
       return { ok: true, reason: out, method: "menu-paste", verified: false };
@@ -3195,10 +3273,8 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     reason: compactLogText(lastReason),
     finalMethod: "failed",
   });
-  // BUG-5: Restore original clipboard if all paste methods failed.
-  if (savedClipboard) {
-    try { clipboard.writeText(savedClipboard); } catch { }
-  }
+  // Restore original clipboard whether paste succeeded or all methods failed.
+  try { restoreClipboard(savedClipboard); } catch { }
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
@@ -3319,7 +3395,7 @@ async function runPostStopQueue() {
         if (pendingTranscriptionCount > 0) {
           await setOverlayStatus("Transcribing").catch(() => { });
         } else {
-          setTimeout(() => hideRecordingOverlay(), 1400);
+          scheduleOverlayHide(1400);
         }
       } else if (pendingTranscriptionCount === 0) {
         await overlayWin?.webContents.executeJavaScript(
@@ -3659,7 +3735,7 @@ async function pasteLatestTranscriptFromShortcut() {
     if (!text) {
       traceStep(trace, "no_text_available", {});
       await setOverlayStatus("No Text");
-      setTimeout(() => hideRecordingOverlay(), 1200);
+      scheduleOverlayHide(1200);
       pasteTargetAppName = "";
       pasteTargetAppPid = 0;
       return;
@@ -3692,7 +3768,7 @@ async function pasteLatestTranscriptFromShortcut() {
     }
     pasteTargetAppName = "";
     pasteTargetAppPid = 0;
-    setTimeout(() => hideRecordingOverlay(), 1300);
+    scheduleOverlayHide(1300);
   } finally {
     pasteShortcutInFlight = false;
     traceEnd(trace, "done", {});

@@ -5440,6 +5440,9 @@ async function stopLive(enhance: boolean): Promise<void> {
   isRecording = false;
   silenceStartedAtMs = 0;
   autoStopTriggered = false;
+  // currentRecordingId / window.__transcriptorCurrentRecordingId are also
+  // cleared in the outer finally below so they are guaranteed to reset on
+  // every exit path — including uncaught throws before this point.
   currentRecordingId = 0;
   window.__transcriptorIsRecording = false;
   window.__transcriptorRmsLevel = 0;
@@ -6068,6 +6071,13 @@ async function stopLive(enhance: boolean): Promise<void> {
     // pre-main-try awaits — so a single crash never permanently bricks
     // the stop state machine.
     stopTransitionInFlight = false;
+    // Guarantee id is 0 even if an uncaught throw happened before the
+    // in-body reset above — a stale id would confuse the overlay's
+    // post-stop task guard on the next recording start.
+    if (currentRecordingId !== 0) {
+      currentRecordingId = 0;
+      window.__transcriptorCurrentRecordingId = 0;
+    }
   }
 }
 
@@ -6977,9 +6987,19 @@ void refreshNetworkState();
 window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());
 window.addEventListener("offline", () => void refreshNetworkState());
-recordingsBootstrapPromise = initRecordingsBootstrap().finally(() => {
-  recordingsBootstrapPromise = null;
-});
+// Race bootstrap against a 15-second wall-clock timeout so a stalled
+// network mount or slow FS does not hang the boot overlay forever — the
+// promise must settle for any caller that `await recordingsBootstrapPromise`
+// to resume. On timeout the recordings list stays empty; the user can still
+// record and the list reloads on the next manual refresh.
+recordingsBootstrapPromise = Promise.race([
+  initRecordingsBootstrap(),
+  new Promise<void>((_, rej) =>
+    setTimeout(() => rej(new Error("recordings bootstrap timeout (15 s)")), 15000)
+  ),
+])
+  .catch((e) => { console.warn("[bootstrap]", e?.message ?? e); })
+  .finally(() => { recordingsBootstrapPromise = null; });
 draw();
 syncMode();
 setStatus("Idle");

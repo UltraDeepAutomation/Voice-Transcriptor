@@ -26,9 +26,19 @@ class JobStore:
     def _prune(self) -> None:
         if len(self._jobs) <= self._max_jobs:
             return
-        ordered = sorted(self._jobs.values(), key=lambda j: j.created_at)
+        # Never evict jobs whose worker thread is still running or whose
+        # result has not yet been polled.  Evicting a running/queued job
+        # silently loses its result because set_done / set_error no-op on
+        # unknown ids, leaving the client stuck polling a 404 forever.
+        # Only candidates from the completed (done / error) pool are dropped;
+        # if the pool is exhausted the store silently stays over the soft cap
+        # rather than destroying in-flight work.
+        evictable = sorted(
+            [j for j in self._jobs.values() if j.status in ("done", "error")],
+            key=lambda j: j.created_at,
+        )
         drop = len(self._jobs) - self._max_jobs
-        for job in ordered[:drop]:
+        for job in evictable[:drop]:
             self._jobs.pop(job.id, None)
 
     def create(self, job_id: str) -> Job:

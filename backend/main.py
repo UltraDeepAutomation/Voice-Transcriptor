@@ -505,7 +505,10 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                     "duration_sec": round(bytes_count / 32000.0, 2),
                 }
             )
-        except Exception:
+        except Exception as _list_err:
+            logger.warning(
+                "_list_live_recoveries: skipping %s — %s", pcm_path, _list_err
+            )
             continue
     return records
 
@@ -581,76 +584,76 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
         return cached
 
     session_lock = _acquire_session_promote_lock(session_id)
-    with session_lock:
-        # Re-check under the lock — a racing caller may have completed
-        # the promotion while we were waiting for the lock.
-        cached = _lookup_live_promote_cache(session_id)
-        if cached is not None:
-            return cached
+    try:
+        with session_lock:
+            # Re-check under the lock — a racing caller may have completed
+            # the promotion while we were waiting for the lock.
+            cached = _lookup_live_promote_cache(session_id)
+            if cached is not None:
+                return cached
 
-        pcm_path, meta_path = _live_recovery_paths(session_id)
-        if pcm_path is None or meta_path is None or not pcm_path.exists():
-            raise HTTPException(status_code=404, detail="live recovery not found")
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            meta = {}
-        audio_bytes = pcm_path.read_bytes()
-        if len(audio_bytes) < 32000:
-            raise HTTPException(status_code=400, detail="live recovery too short")
-
-        pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        started_at = str(meta.get("started_at") or "").strip()
-        model = str(meta.get("model") or "small").strip() or "small"
-        language = str(meta.get("language") or "auto").strip() or "auto"
-        pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
-        title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        stem = _recording_stem(title)
-        target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
-        _register_archive_dir(target_dir)
-        audio_out = target_dir / f"{stem}.wav"
-        text_out = target_dir / f"{stem}.txt"
-        tmp_audio = _atomic_temp_path(audio_out)
-        try:
-            write_wav(str(tmp_audio), pcm, 16000)
-            os.replace(tmp_audio, audio_out)
-            _write_recording_text_file(
-                out=text_out,
-                title=title,
-                source_text="[Recovered live audio capture]",
-                transcript_text="",
-                provider="local",
-                model=model,
-                language=language,
-            )
-        except Exception:
-            # Roll back: if the text write failed after the audio was
-            # already placed at its final path, delete the orphaned
-            # audio so it doesn't leak on disk with no .txt sibling.
+            pcm_path, meta_path = _live_recovery_paths(session_id)
+            if pcm_path is None or meta_path is None or not pcm_path.exists():
+                raise HTTPException(status_code=404, detail="live recovery not found")
             try:
-                audio_out.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        finally:
-            tmp_audio.unlink(missing_ok=True)
-        # Same retention policy as ``save_recording_with_audio``: recovered
-        # sessions are the new "latest", so older audio files in the archive
-        # get pruned.
-        _prune_old_recording_audio(target_dir, stem)
-        _invalidate_recordings_cache()
-        _delete_live_recovery(session_id)
-        result = {
-            "name": text_out.name,
-            "audio_name": audio_out.name,
-            "archive_dir": str(target_dir),
-        }
-        _store_live_promote_cache(session_id, result)
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            audio_bytes = pcm_path.read_bytes()
+            if len(audio_bytes) < 32000:
+                raise HTTPException(status_code=400, detail="live recovery too short")
 
-    # Drop the lock entry (outside the locked region) now that the
-    # session has been fully promoted and cached. A subsequent retry
-    # hits the TTL cache instead of the disk code path.
-    _release_session_promote_lock(session_id)
+            pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            started_at = str(meta.get("started_at") or "").strip()
+            model = str(meta.get("model") or "small").strip() or "small"
+            language = str(meta.get("language") or "auto").strip() or "auto"
+            pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
+            title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            stem = _recording_stem(title)
+            target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
+            _register_archive_dir(target_dir)
+            audio_out = target_dir / f"{stem}.wav"
+            text_out = target_dir / f"{stem}.txt"
+            tmp_audio = _atomic_temp_path(audio_out)
+            try:
+                write_wav(str(tmp_audio), pcm, 16000)
+                os.replace(tmp_audio, audio_out)
+                _write_recording_text_file(
+                    out=text_out,
+                    title=title,
+                    source_text="[Recovered live audio capture]",
+                    transcript_text="",
+                    provider="local",
+                    model=model,
+                    language=language,
+                )
+            except Exception:
+                # Roll back: if the text write failed after the audio was
+                # already placed at its final path, delete the orphaned
+                # audio so it doesn't leak on disk with no .txt sibling.
+                try:
+                    audio_out.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            finally:
+                tmp_audio.unlink(missing_ok=True)
+            # Same retention policy as ``save_recording_with_audio``: recovered
+            # sessions are the new "latest", so older audio files in the archive
+            # get pruned.
+            _prune_old_recording_audio(target_dir, stem)
+            _invalidate_recordings_cache()
+            _delete_live_recovery(session_id)
+            result = {
+                "name": text_out.name,
+                "audio_name": audio_out.name,
+                "archive_dir": str(target_dir),
+            }
+            _store_live_promote_cache(session_id, result)
+    finally:
+        # Always release the per-session lock entry so the dict does not
+        # grow unbounded when callers hit 404/400 and never retry.
+        _release_session_promote_lock(session_id)
     return result
 
 
@@ -817,7 +820,11 @@ async def _save_upload_file(upload: UploadFile, target: Path) -> int:
 def _atomic_write_text(path: Path, content: str) -> None:
     tmp_path = path.with_suffix(path.suffix + f".tmp-{uuid.uuid4().hex}")
     tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
+    try:
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _normalize_filename(name: str) -> str:
@@ -1660,16 +1667,19 @@ async def ws_transcribe(websocket: WebSocket):
     diarize = str(qp.get("diarize") or "").strip().lower() in ("1", "true", "yes", "on")
 
     started_at = datetime.now()
-    recovery_ctx = _open_live_recovery(
-        session_id=session_id,
-        started_at=started_at,
-        provider=provider,
-        model=model or ("nova-3" if provider == "deepgram" else "small"),
-        language=lang_opt or "auto",
-        archive_dir=archive_dir,
-    )
-
+    recovery_ctx: Optional[dict] = None
     try:
+        # Open inside the try so that any filesystem error (ENOSPC,
+        # EACCES, stale network mount) is caught by the finally below
+        # and the accepted WebSocket is still closed cleanly.
+        recovery_ctx = _open_live_recovery(
+            session_id=session_id,
+            started_at=started_at,
+            provider=provider,
+            model=model or ("nova-3" if provider == "deepgram" else "small"),
+            language=lang_opt or "auto",
+            archive_dir=archive_dir,
+        )
         if provider == "deepgram":
             dg_cfg = load_config()
             dg_key = (((dg_cfg.get("providers") or {}).get("deepgram") or {}).get("key") or "").strip()
@@ -1693,7 +1703,8 @@ async def ws_transcribe(websocket: WebSocket):
                         "error": "Deepgram API key is not configured",
                     },
                 )
-                recovery_ctx["had_error"] = True
+                if recovery_ctx is not None:
+                    recovery_ctx["had_error"] = True
                 return
             await _run_deepgram_live_session(
                 websocket=websocket,
@@ -1714,7 +1725,8 @@ async def ws_transcribe(websocket: WebSocket):
         pass
     except Exception as e:
         if not _is_broken_pipe_error(e):
-            recovery_ctx["had_error"] = True
+            if recovery_ctx is not None:
+                recovery_ctx["had_error"] = True
             logger.error("ws/transcribe fatal error: %s", e, exc_info=True)
             await _ws_send_json(
                 websocket,
@@ -1723,7 +1735,8 @@ async def ws_transcribe(websocket: WebSocket):
         else:
             logger.warning("ws/transcribe transient broken pipe: %s", e)
     finally:
-        _finalize_live_recovery(recovery_ctx)
+        if recovery_ctx is not None:
+            _finalize_live_recovery(recovery_ctx)
 
 
 def _normalize_live_provider(raw: Optional[str]) -> str:
@@ -2485,14 +2498,20 @@ async def remote_transcribe_sync(
     # MAX_UPLOAD_BYTES ceiling that _save_upload_file uses — without
     # this a 2 GB file would be fully loaded into the Python heap,
     # causing an OOM that kills the backend and all ongoing sessions.
-    audio_bytes = b""
+    # Use a bytearray (O(N) amortised append) instead of immutable bytes
+    # concatenation (O(N²) — reallocates the full prefix on every chunk).
+    # For a 500 MB file that difference is ~125 GB of transient heap vs
+    # ~500 MB, which the OOM killer resolves before the ceiling guard fires.
+    _upload_buf = bytearray()
     async for chunk in file:
-        audio_bytes += chunk
-        if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        _upload_buf.extend(chunk)
+        if len(_upload_buf) > MAX_UPLOAD_BYTES:
             raise HTTPException(
                 status_code=413,
                 detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
             )
+    audio_bytes = bytes(_upload_buf)
+    del _upload_buf
     lang_opt = _normalize_language(language)
     cfg = load_config()
     loop = asyncio.get_running_loop()
