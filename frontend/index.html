@@ -8,6 +8,25 @@
 </head>
 
 <body>
+  <!--
+    Boot overlay — visible by default on every page load. Hidden by
+    main.tsx once the backend answers /api/health 200. ``aria-live``
+    lets screen readers announce status transitions. Error state uses
+    a ``data-state="error"`` attribute so CSS can swap colors + show
+    the retry button without requiring class mutation from JS.
+  -->
+  <div class="boot-overlay" id="bootOverlay" aria-live="polite" data-state="loading">
+    <div class="boot-overlay-card">
+      <div class="boot-overlay-spinner" aria-hidden="true"></div>
+      <div class="boot-overlay-title">Transcriptor</div>
+      <div class="boot-overlay-status" id="bootOverlayStatus">Starting…</div>
+      <div class="boot-overlay-detail" id="bootOverlayDetail" hidden></div>
+      <button class="btn btn-primary boot-overlay-retry" id="bootOverlayRetry" type="button" hidden>
+        Retry
+      </button>
+    </div>
+  </div>
+
   <div class="shell">
     <nav class="sidebar">
       <div class="sb-nav">

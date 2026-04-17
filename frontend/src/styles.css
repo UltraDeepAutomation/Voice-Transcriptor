@@ -2874,3 +2874,136 @@ canvas,
   font-weight: 600;
   line-height: 1.45;
 }
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Boot overlay — enterprise-grade first-launch UX.
+ *
+ * The app shell plus all panes are rendered by main.tsx on import, so
+ * they fire DOMContentLoaded before the Python backend's /api/health
+ * responds (cold-start can be 2-10s while Whisper models warm up and
+ * venv dependencies verify). Without this overlay the user sees fully-
+ * rendered UI that silently fails on any interaction until the backend
+ * wakes up.
+ *
+ * Pattern: fullscreen fixed overlay starts visible (data-state="loading"),
+ * transitions to "error" on boot failure, "success" when hidden. Card
+ * uses the same surface tokens as the main app so it feels native, not
+ * bolted-on. Spinner is a pure-CSS conic gradient — no asset load.
+ * ────────────────────────────────────────────────────────────────── */
+
+.boot-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(11, 12, 14, 0.92);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 220ms ease;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.boot-overlay[hidden] {
+  opacity: 0;
+  pointer-events: none;
+  display: flex; /* keep flex during fade — display:none jumps; use visibility transition instead */
+}
+
+.boot-overlay-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 40px 56px;
+  border-radius: 16px;
+  background: rgba(22, 23, 26, 0.96);
+  border: 1px solid var(--surface-border);
+  box-shadow: 0 30px 60px -20px rgba(0, 0, 0, 0.6);
+  min-width: 300px;
+  max-width: 420px;
+  text-align: center;
+}
+
+.boot-overlay-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text);
+  margin-top: 2px;
+}
+
+.boot-overlay-status {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.5;
+  min-height: 20px;
+  font-feature-settings: "tnum";
+}
+
+.boot-overlay-detail {
+  font-size: 11px;
+  color: var(--text-3, #999);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.5;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  /* Monospace output (tracebacks, python paths) MUST be left-aligned —
+     the card's ``text-align: center`` inherited onto this element
+     broke per-line readability by centring each wrapped line. */
+  text-align: left;
+  width: 100%;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow: auto;
+}
+
+/* Pure-CSS spinner — conic gradient with rotating mask. No image. */
+.boot-overlay-spinner {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 240deg,
+    #7a50c8 300deg,
+    #b892ff 360deg
+  );
+  mask: radial-gradient(circle, transparent 12px, black 13px);
+  -webkit-mask: radial-gradient(circle, transparent 12px, black 13px);
+  animation: boot-spin 900ms linear infinite;
+}
+
+@keyframes boot-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Error state — spinner frozen red, retry button revealed. */
+.boot-overlay[data-state="error"] .boot-overlay-spinner {
+  animation: none;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 260deg,
+    #c56060 320deg,
+    #ff8080 360deg
+  );
+}
+
+.boot-overlay[data-state="error"] .boot-overlay-status {
+  color: #ff9090;
+}
+
+.boot-overlay-retry {
+  margin-top: 6px;
+  min-width: 120px;
+}
+

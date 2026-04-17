@@ -1981,6 +1981,10 @@ async function refreshNetworkState(): Promise<void> {
   try {
     const health = await fetch("/api/health");
     if (!health.ok) throw new Error(`health ${health.status}`);
+    // First successful /api/health means the Python backend is up and
+    // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
+    // so later refreshes don't re-trigger work after the first success.
+    hideBootOverlayOnce();
     // /api/network is public for UI indicator; token issues should not force Offline.
     const netResp = await fetch("/api/network");
     if (!netResp.ok) {
@@ -1992,6 +1996,23 @@ async function refreshNetworkState(): Promise<void> {
   } catch {
     setNetworkState(false, null);
   }
+}
+
+// Idempotent boot-overlay-hide hook. Called from ``refreshNetworkState``
+// on first successful /api/health. Defined as function declaration so it
+// hoists above refreshNetworkState's invocations.
+let _bootOverlayHidden = false;
+function hideBootOverlayOnce(): void {
+  if (_bootOverlayHidden) return;
+  _bootOverlayHidden = true;
+  const overlay = document.getElementById("bootOverlay");
+  if (!overlay) return;
+  overlay.dataset.state = "success";
+  const statusEl = document.getElementById("bootOverlayStatus");
+  if (statusEl) statusEl.textContent = "Ready";
+  // Fade out, then fully hide after CSS transition finishes so pointer
+  // events stop intercepting clicks into the app behind it.
+  overlay.hidden = true;
 }
 
 document.querySelectorAll(".sb-item").forEach((e) => {
@@ -6893,13 +6914,54 @@ resetRecordingViewer();
 updateRecordingCopyState();
 
 // ── Backend boot status / error display ──
+//
+// The boot overlay (``#bootOverlay``) starts visible (HTML default) and
+// is hidden by ``hideBootOverlayOnce`` on the first successful
+// /api/health response inside ``refreshNetworkState``. During cold
+// start (2-10 s while the Python backend spawns + Whisper models warm),
+// the overlay dominates the viewport instead of leaving the user
+// staring at a silently-unresponsive UI.
+
 window.__setBackendBootStatus = (msg: string) => {
-  if (msg) {
-    setStatus(msg);
-  }
+  if (!msg) return;
+  const statusEl = document.getElementById("bootOverlayStatus");
+  if (statusEl) statusEl.textContent = msg;
+  // Mirror into the topbar status pill as a secondary signal — some
+  // users keep the app on a second monitor and miss the overlay.
+  setStatus(msg);
 };
+
 window.__setBackendBootError = (msg: string) => {
+  const detail = String(msg || "").trim();
+  const overlay = document.getElementById("bootOverlay");
+  if (overlay) {
+    overlay.dataset.state = "error";
+    overlay.hidden = false;
+  }
+  const statusEl = document.getElementById("bootOverlayStatus");
+  if (statusEl) statusEl.textContent = "Backend failed to start.";
+  const detailEl = document.getElementById("bootOverlayDetail");
+  if (detailEl) {
+    detailEl.textContent = detail || "Unknown startup failure — check the main.log in the data directory.";
+    detailEl.hidden = !detail;
+  }
+  const retryBtn = document.getElementById("bootOverlayRetry") as HTMLButtonElement | null;
+  if (retryBtn) retryBtn.hidden = false;
   setStatus("Backend Error");
   ($("statusDot") as HTMLElement).className = "status-dot error";
-  $("liveOutput").textContent = msg || "Backend failed to start.";
+  $("liveOutput").textContent = detail || "Backend failed to start.";
 };
+
+// Retry: reload the renderer; Electron's main process keeps the
+// backend running (parent-death watchdog already cleaned any previous
+// zombie) and the fresh render cycle will wait on /api/health again.
+const _bootRetry = document.getElementById("bootOverlayRetry");
+if (_bootRetry) {
+  _bootRetry.addEventListener("click", () => {
+    const statusEl = document.getElementById("bootOverlayStatus");
+    if (statusEl) statusEl.textContent = "Reloading…";
+    const overlay = document.getElementById("bootOverlay");
+    if (overlay) overlay.dataset.state = "loading";
+    window.location.reload();
+  });
+}
