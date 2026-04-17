@@ -1424,7 +1424,7 @@ function createOverlayHtml() {
         window.setAutoStopConfig = (enabled, seconds) => {
           const on = !!enabled;
           if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
-          const sec = Math.min(20, Math.max(1, Math.round(Number(seconds) || 2)));
+          const sec = Math.min(120, Math.max(1, Math.round(Number(seconds) || 2)));
           if (Number(quickAutoStopSecs.value) !== sec) quickAutoStopSecs.value = sec;
         };
         quickAutoStopToggle.addEventListener('change', () => {
@@ -1434,7 +1434,7 @@ function createOverlayHtml() {
           document.title = '__overlay_input_focus__';
         });
         quickAutoStopSecs.addEventListener('blur', () => {
-          const v = Math.min(20, Math.max(1, Math.round(Number(quickAutoStopSecs.value) || 2)));
+          const v = Math.min(120, Math.max(1, Math.round(Number(quickAutoStopSecs.value) || 2)));
           quickAutoStopSecs.value = v;
           document.title = '__overlay_autostop_secs__' + v;
           setTimeout(() => { document.title = '__overlay_input_blur__'; }, 50);
@@ -1680,7 +1680,7 @@ function ensureOverlayWindow() {
     }
     if (raw.startsWith("__overlay_autostop_secs__")) {
       const secStr = raw.replace("__overlay_autostop_secs__", "");
-      const sec = Math.min(20, Math.max(1, Math.round(Number(secStr) || 2)));
+      const sec = Math.min(120, Math.max(1, Math.round(Number(secStr) || 2)));
       overlayAutoStopConfig = { ...overlayAutoStopConfig, seconds: sec };
       lastOverlayUiInteractionAt = Date.now();
       // Sync to renderer
@@ -3000,7 +3000,13 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     // is no standard cross-compositor window activation — we rely on
     // whatever already has focus (the user typically tab-ed to the
     // target before pressing the paste hotkey).
-    const isWayland = !!process.env.WAYLAND_DISPLAY && !process.env.DISPLAY;
+    // $WAYLAND_DISPLAY is set on any Wayland session (pure Wayland or
+    // XWayland hybrid). GNOME and KDE on Wayland set BOTH WAYLAND_DISPLAY
+    // and DISPLAY — the old check (&&!DISPLAY) incorrectly treated them
+    // as X11-only and never tried wtype. Correct check: Wayland whenever
+    // WAYLAND_DISPLAY is present, X11-only when only DISPLAY is set.
+    const isWayland = !!process.env.WAYLAND_DISPLAY;
+    const hasX11 = !!process.env.DISPLAY;
 
     for (let attempt = 0; attempt < 3; attempt++) {
       try { clipboard.writeText(String(text)); } catch { }
@@ -3009,12 +3015,9 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "linux_paste" });
       traceStep(trace, "method_begin", { method: "linux_paste", attempt: attempt + 1, wayland: isWayland });
 
-      // Try to focus the target window on X11. ``wmctrl -ia <id>``
-      // wants a window id, but ``wmctrl -a <name>`` works by
-      // substring match — safer because we already have the name.
-      // Failure here is non-fatal: if the target can't be raised,
-      // paste still lands in whatever has keyboard focus.
-      if (!isWayland && effectiveTargetName) {
+      // Try to focus the target window on X11 (wmctrl is X11-only).
+      // Skip on pure Wayland to avoid spawning a process that will fail.
+      if (hasX11 && effectiveTargetName) {
         const sanitized = String(effectiveTargetName).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 120);
         if (sanitized) {
           await runCommand("wmctrl", ["-a", sanitized], { timeoutMs: 800 }).catch(() => {});
@@ -3022,9 +3025,11 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         }
       }
 
+      // Build ordered cascade for the detected session type.
+      // Wayland (pure or hybrid): wtype → ydotool → xdotool (for XWayland apps).
+      // X11 only: xdotool → ydotool (fallback).
       const attempts = [];
       if (isWayland) {
-        // Wayland: try wtype first (GNOME/KDE/wlroots), then ydotool.
         attempts.push({
           method: "wtype",
           cmd: "wtype",
@@ -3034,18 +3039,31 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         attempts.push({
           method: "ydotool",
           cmd: "ydotool",
-          args: ["key", "29:1", "47:1", "47:0", "29:0"], // Ctrl down, V down, V up, Ctrl up (linux input event codes)
+          args: ["key", "29:1", "47:1", "47:0", "29:0"],
           timeoutMs: 2000,
         });
+        // On XWayland hybrid sessions the target may be an X11 app —
+        // xdotool works for those even inside a Wayland compositor.
+        if (hasX11) {
+          attempts.push({
+            method: "xdotool",
+            cmd: "xdotool",
+            args: ["key", "--clearmodifiers", "ctrl+v"],
+            timeoutMs: 2000,
+          });
+        }
       } else {
-        // X11: xdotool is the ubiquitous answer. Fall through to
-        // wtype and ydotool for hybrid XWayland-under-Wayland
-        // setups where $DISPLAY is set but ``$WAYLAND_DISPLAY``
-        // is ALSO present (GNOME with XWayland apps).
+        // Pure X11 session.
         attempts.push({
           method: "xdotool",
           cmd: "xdotool",
           args: ["key", "--clearmodifiers", "ctrl+v"],
+          timeoutMs: 2000,
+        });
+        attempts.push({
+          method: "ydotool",
+          cmd: "ydotool",
+          args: ["key", "29:1", "47:1", "47:0", "29:0"],
           timeoutMs: 2000,
         });
       }

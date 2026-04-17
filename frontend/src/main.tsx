@@ -352,8 +352,8 @@ const ALLOWED_AUDIO_MIME = new Set([
 const ALLOWED_AUDIO_EXT = new Set(["wav", "mp3", "m4a", "flac", "ogg", "aac", "mp4", "webm"]);
 const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
 const OPENROUTER_AUDIO_MODELS = [
-  "google/gemini-3.1-flash-lite-preview",
   "google/gemini-2.5-flash",
+  "google/gemini-2.0-flash-lite",
   "openai/gpt-4o-audio-preview",
 ];
 const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
@@ -421,7 +421,7 @@ let recordSessionNoticeTimer: number | null = null;
 let busyScopeToken = "";
 let liveStartAbortReason = "";
 const remoteModelByProvider: Record<RemoteProvider, string> = {
-  openrouter: OPENROUTER_AUDIO_MODELS[1],
+  openrouter: OPENROUTER_AUDIO_MODELS[0],
   deepgram: DEEPGRAM_AUDIO_MODELS[0],
 };
 const MASKED_KEY_VALUE = "••••••••••••••••••••••••••••••••••••••••";
@@ -1191,6 +1191,8 @@ class OpfsPcmSink implements PcmSink {
   private pendingChunks: Int16Array[] = [];
   private pendingBytes = 0;
   private flushInProgress = false;
+  /** Awaitable handle for the currently-running flush; resolves when done. */
+  private flushDone: Promise<void> = Promise.resolve();
   private flushScheduled = false;
   private destroyed = false;
   totalSamples = 0;
@@ -1247,6 +1249,10 @@ class OpfsPcmSink implements PcmSink {
     if (!this.writable) return;
     if (!this.pendingChunks.length) return;
     this.flushInProgress = true;
+    // Record a promise that outer callers (finalize) can await instead
+    // of polling flushInProgress with a bounded busy-wait.
+    let _resolveDone!: () => void;
+    this.flushDone = new Promise<void>((r) => { _resolveDone = r; });
     const chunks = this.pendingChunks;
     this.pendingChunks = [];
     this.pendingBytes = 0;
@@ -1269,6 +1275,8 @@ class OpfsPcmSink implements PcmSink {
       console.warn("OpfsPcmSink: write failed — disk may be full or permissions revoked", e);
     } finally {
       this.flushInProgress = false;
+      _resolveDone();
+      this.flushDone = Promise.resolve();
       if (this.pendingChunks.length && !this.lastWriteError) {
         this.scheduleFlush();
       }
@@ -1278,14 +1286,14 @@ class OpfsPcmSink implements PcmSink {
   async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
     // Drain any pending chunks first.
     await this.flushPending();
-    // Wait for any flush in progress to complete.
-    let guard = 0;
-    while (this.flushInProgress && guard < 200) {
-      await new Promise((r) => setTimeout(r, 5));
-      guard++;
-    }
+    // If a flush was already in-progress when we called flushPending()
+    // (it returned early because flushInProgress was true), wait for
+    // the live flush Promise to settle — no busy-wait, no timeout.
+    await this.flushDone;
     // One more drain for anything that arrived during the wait.
     await this.flushPending();
+    // Final barrier: wait for that drain to settle too.
+    await this.flushDone;
 
     if (this.writable) {
       try {
@@ -1509,7 +1517,7 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
 function getRemoteModelValue(provider: Provider): string {
   if (provider === "openrouter") {
     const v = (remoteModelByProvider.openrouter || "").trim();
-    return v || OPENROUTER_AUDIO_MODELS[1];
+    return v || OPENROUTER_AUDIO_MODELS[0];
   }
   if (provider === "deepgram") {
     const v = (remoteModelByProvider.deepgram || "").trim();
@@ -1555,7 +1563,7 @@ function syncRemoteModelOptions(): void {
     remoteModelByProvider.deepgram = sel.value;
     return;
   }
-  const preferred = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+  const preferred = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[0];
   const models = new Set<string>(OPENROUTER_AUDIO_MODELS);
   if (preferred) models.add(preferred);
   sel.hidden = false;
@@ -1878,8 +1886,10 @@ function getCanonicalLiveSourceText(): string {
   // Dedup: word-normalised comparison so "world." vs "world" or
   // "world!" vs "world" do not produce "hello world world!" artifacts.
   // Strip punctuation from both sides and compare at word level.
+  // Unicode-aware: \p{L} matches any letter (Latin, Cyrillic, CJK, Arabic …),
+  // \p{N} any digit — so Russian and other non-ASCII scripts are NOT stripped.
   const normalizeWords = (s: string): string[] =>
-    s.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/).filter(Boolean);
+    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
   const interimWords = normalizeWords(interim);
   if (interimWords.length === 0) return committed;
   const lastCommittedWords = committed.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
@@ -2338,7 +2348,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_stop_silence_enabled: silence.enabled,
     auto_stop_silence_seconds: silence.seconds,
     auto_stop_silence_db: silence.thresholdDb,
-    remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1],
+    remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[0],
     remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0],
     shortcut_record: currentShortcuts.record,
     shortcut_paste: currentShortcuts.paste,
@@ -2788,7 +2798,7 @@ function queueUiPreferencesSave(): void {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
     const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
-    const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+    const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[0];
     const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
     const shouldRefreshRecordingsArchive = nextRecordingsDir !== configuredRecordingsDir;
     ($("orModel") as HTMLInputElement).value = openrouterModel;
@@ -2849,7 +2859,7 @@ async function loadCfg(): Promise<void> {
     configuredRecordingsDir = (cfg.preferences || {}).recordings_dir || "";
     ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;
     const ui = (cfg.preferences || {}).ui || {};
-    remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+    remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || OPENROUTER_AUDIO_MODELS[0];
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEEPGRAM_AUDIO_MODELS[0] || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
     const languageSel = $("language") as HTMLSelectElement;
     const providerSel = $("providerSelect") as HTMLSelectElement;
@@ -3111,7 +3121,7 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
     });
 });
 ($("orModel") as HTMLInputElement).addEventListener("change", () => {
-  remoteModelByProvider.openrouter = (($("orModel") as HTMLInputElement).value || "").trim() || OPENROUTER_AUDIO_MODELS[1];
+  remoteModelByProvider.openrouter = (($("orModel") as HTMLInputElement).value || "").trim() || OPENROUTER_AUDIO_MODELS[0];
   syncRemoteModelOptions();
   queueUiPreferencesSave();
 });
@@ -3519,7 +3529,15 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
 
 async function loadRecordingsStats(): Promise<void> {
   const requestSeq = ++recordingsStatsRequestSeq;
-  const s = await apiGet<RecordingsStats>("/api/recordings/stats/summary");
+  let s: RecordingsStats;
+  try {
+    s = await apiGet<RecordingsStats>("/api/recordings/stats/summary");
+  } catch (e) {
+    // Stats are decorative — a backend error must not abort the caller
+    // (loadRecordings) or leave the panel in a permanent loading state.
+    console.warn("loadRecordingsStats: stats fetch failed (non-fatal)", e);
+    return;
+  }
   if (requestSeq !== recordingsStatsRequestSeq) return;
   $("statsTotal").textContent = String(s.total_recordings || 0);
   $("statsWords").textContent = String(s.total_words || 0);
@@ -3664,6 +3682,11 @@ async function saveRecordingText(opts: {
   model: string;
   language: string;
   audioFile?: File | null;
+  /** When set, the backend atomically discards the live-recovery spool
+   *  for this session ID immediately after the audio is persisted —
+   *  closing the race window between a successful save and the
+   *  separate discardLiveRecovery() call in the frontend. */
+  liveSessionId?: string;
   refreshList?: boolean;
 }): Promise<SavedRecordingRef> {
   if (!opts.archiveDir && !recordingsBootstrapReady) {
@@ -3692,6 +3715,7 @@ async function saveRecordingText(opts: {
     fd.set("provider", opts.provider);
     fd.set("model", opts.model);
     fd.set("language", opts.language);
+    if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
     const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
     if (!r.ok) throw new Error(await parseError(r));
     const js = (await r.json()) as { name?: string; archive_dir?: string };
@@ -5441,6 +5465,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           model: modelValue,
           language: languageValue,
           audioFile: savedAudioFile,
+          liveSessionId: liveSessionId,
           refreshList: false,
         });
         persistedRecordingName = persisted.name;

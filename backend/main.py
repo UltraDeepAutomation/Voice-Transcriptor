@@ -734,28 +734,39 @@ async def transcribe_warmup(
 
 
 @app.get("/api/network")
-def network_status(_auth: None = Depends(_require_api_auth)):
+async def network_status(_auth: None = Depends(_require_api_auth)):
+    """Probe public URLs for connectivity.
+
+    Runs in a thread pool via asyncio.to_thread so the blocking
+    urllib calls never stall the FastAPI event loop — without this,
+    3 × 2.5 s sequential probes would freeze all concurrent WS
+    frames and recording saves for up to 7.5 s.
+    """
     probes = (
         "https://openrouter.ai",
         "https://www.google.com/generate_204",
         "https://www.cloudflare.com/cdn-cgi/trace",
     )
-    best_latency_ms: Optional[int] = None
-    online = False
-    for url in probes:
-        started = time.perf_counter()
-        try:
-            with urlopen(url, timeout=2.5) as resp:
-                code = getattr(resp, "status", 200) or 200
-                ok = int(code) < 500
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            if ok:
-                online = True
-                if best_latency_ms is None or elapsed_ms < best_latency_ms:
-                    best_latency_ms = elapsed_ms
-        except Exception:
-            continue
-    return {"online": online, "latency_ms": best_latency_ms if online else None}
+
+    def _probe_sync() -> dict:
+        best_latency_ms: Optional[int] = None
+        online = False
+        for url in probes:
+            started = time.perf_counter()
+            try:
+                with urlopen(url, timeout=2.5) as resp:
+                    code = getattr(resp, "status", 200) or 200
+                    ok = int(code) < 500
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                if ok:
+                    online = True
+                    if best_latency_ms is None or elapsed_ms < best_latency_ms:
+                        best_latency_ms = elapsed_ms
+            except Exception:
+                continue
+        return {"online": online, "latency_ms": best_latency_ms if online else None}
+
+    return await asyncio.to_thread(_probe_sync)
 
 
 async def _save_upload_file(upload: UploadFile, target: Path) -> int:
@@ -2773,7 +2784,8 @@ def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_aut
 
 @app.post("/api/recordings/pick-folder")
 def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
-    if os.name != "posix":
+    # os.name == "posix" on both macOS AND Linux; osascript only exists on macOS.
+    if sys.platform != "darwin":
         raise HTTPException(status_code=400, detail="folder picker supported on macOS only")
     try:
         result = subprocess.run(
@@ -2825,13 +2837,21 @@ def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: No
         d.mkdir(parents=True, exist_ok=True)
     else:
         d = _resolve_recordings_dir()
-    if os.name != "posix":
-        raise HTTPException(status_code=400, detail="open folder is supported on macOS only")
+    # Pick the right open-folder command per platform.
+    if sys.platform == "darwin":
+        open_cmd = ["open", str(d)]
+    elif sys.platform.startswith("linux"):
+        open_cmd = ["xdg-open", str(d)]
+    else:
+        raise HTTPException(status_code=400, detail="open folder is not supported on this platform")
     try:
-        subprocess.run(["open", str(d)], check=True, capture_output=True, text=True, timeout=15)
+        subprocess.run(open_cmd, check=True, capture_output=True, text=True, timeout=15)
         return {"ok": True, "path": str(d)}
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="open folder timed out")
+    except FileNotFoundError:
+        tool = open_cmd[0]
+        raise HTTPException(status_code=500, detail=f"open folder failed: '{tool}' not found")
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
         raise HTTPException(status_code=500, detail=f"open folder failed: {stderr or 'unknown error'}")
@@ -3148,6 +3168,7 @@ async def save_recording_with_audio(
     provider: str = Form(""),
     model: str = Form(""),
     language: str = Form(""),
+    live_session_id: str = Form(""),
 ):
     existing_name = os.path.basename(str(name or "").strip())
     safe_title = _sanitize_name(str(title or "recording"))
@@ -3203,6 +3224,15 @@ async def save_recording_with_audio(
     # the user never ends up with gigabytes of old takes piling up.
     pruned = _prune_old_recording_audio(target_dir, stem)
     _invalidate_recordings_cache()
+    # Atomically discard the live recovery spool now that the audio is
+    # safely on disk. This closes the race window between a successful
+    # save and the separate /api/live/recoveries/{id}/discard call that
+    # the frontend makes — if the app crashes between those two events,
+    # the recovery would otherwise be promoted at next startup and create
+    # a duplicate archive entry.
+    safe_sid = _normalize_live_session_id(str(live_session_id or "").strip())
+    if safe_sid and LIVE_SESSION_ID_RE.fullmatch(safe_sid):
+        _delete_live_recovery(safe_sid)
     return {
         "ok": True,
         "name": out_text.name,

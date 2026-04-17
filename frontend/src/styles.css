@@ -42,6 +42,7 @@ body {
   --status-rec: #d8d8d8;
   --status-done: #c6c6c6;
   --status-process: #a1a1a1;
+  --status-warn: #c8a23a;
   --net-neutral: #7a7a7a;
   --net-online: #79b88a;
   --net-offline: #b87878;
@@ -672,6 +673,10 @@ textarea:focus-visible,
 
 .status-dot.error {
   background: var(--danger-dot);
+}
+
+.status-dot.warn {
+  background: var(--status-warn);
 }
 
 .status-text {
