@@ -4155,6 +4155,13 @@ let liveTranscriptSegments: TranscriptSegment[] = [];
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 let stopTransitionInFlight = false;
+// Synchronous guard set at the top of startLive BEFORE any await.  This
+// prevents a second startLive call from racing through the same
+// `if (isBusy)` check while the first call is still awaiting the
+// archive-ready promise.  Without this, two concurrent starts would
+// allocate two PcmSinks / WebSockets / MediaRecorders and the second's
+// globals would silently leak the first.
+let startLiveInFlight = false;
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
 let liveWsMode: LiveWsMode = "local-assist";
@@ -4709,7 +4716,17 @@ function micErrorTag(e: unknown): string {
 }
 
 async function startLive(): Promise<void> {
-  if (isBusy || stopTransitionInFlight) return;
+  // Single-flight guard. isBusy is only set AFTER the first await below
+  // (ensureRecordingsArchiveReady), which means two concurrent startLive
+  // calls — e.g. rapid hotkey double-press, hotkey + button click — could
+  // both pass the isBusy check and race to allocate two PcmSinks, two
+  // WebSockets, and two MediaRecorders. The second start would overwrite
+  // the first pcmSink without destroying it, leaking the OPFS file handle
+  // and leaving the old sink orphaned in the OPFS quota.
+  // Set the in-flight flag synchronously BEFORE any await.
+  if (isBusy || stopTransitionInFlight || startLiveInFlight) return;
+  startLiveInFlight = true;
+  try {
   let sessionArchiveDir = "";
   try {
     sessionArchiveDir = await ensureRecordingsArchiveReady();
@@ -4983,11 +5000,24 @@ async function startLive(): Promise<void> {
       // session grows beyond that, rotate out the oldest chunks so
       // we never end up holding tens of thousands of Blob references.
       const WEBM_WINDOW_CHUNKS = 60 * 120; // 2 hours @ 1 chunk/s
+      let webmTruncationWarned = false;
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
           recordedWebmChunks.push(e.data);
           if (recordedWebmChunks.length > WEBM_WINDOW_CHUNKS) {
             recordedWebmChunks.splice(0, recordedWebmChunks.length - WEBM_WINDOW_CHUNKS);
+            if (!webmTruncationWarned) {
+              webmTruncationWarned = true;
+              // Surface ONCE per session — subsequent truncations are
+              // expected and don't need to spam the user. PCM canonical
+              // audio (the OPFS spool) is unaffected; only the WebM
+              // fallback container is rolling-windowed.
+              showRecordSessionNotice(
+                "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 h. Canonical PCM audio is unaffected.",
+                "warn",
+                9000
+              );
+            }
           }
         }
       };
@@ -5123,6 +5153,9 @@ async function startLive(): Promise<void> {
       tone: "error",
     }, sessionUiToken);
     await stopLive(false);
+  }
+  } finally {
+    startLiveInFlight = false;
   }
 }
 
@@ -5421,7 +5454,17 @@ async function stopLive(enhance: boolean): Promise<void> {
   src = null;
   analyser = null;
   tearDown("ws.close", () => {
-    if (ws) ws.close();
+    if (ws) {
+      // Null the handlers BEFORE close(): late onclose/onerror fires
+      // from the socket keep closures over sessionUiToken alive until the
+      // socket is GC'd. Nulling them releases those closures immediately
+      // and prevents stale handlers from touching post-teardown state.
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      ws.close();
+    }
   });
   ws = null;
   wsPendingFrames = [];

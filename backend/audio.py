@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import subprocess
+import uuid
 from typing import Optional, Tuple
 
 import numpy as np
@@ -82,8 +83,19 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
         raise AudioError(
             f"Audio has {data.shape[1]} channel(s), but {channels} required (install ffmpeg to convert)."
         )
-    # Copy as-is
-    shutil.copyfile(path_in, path_out)
+    # Copy atomically: write to tmp then rename. A raw copyfile()
+    # leaves the destination truncated on ENOSPC, and a subsequent
+    # transcribe would silently use the fragment.
+    tmp_out = f"{path_out}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        shutil.copyfile(path_in, tmp_out)
+        os.replace(tmp_out, path_out)
+    except Exception:
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
+        raise
     return path_out
 
 

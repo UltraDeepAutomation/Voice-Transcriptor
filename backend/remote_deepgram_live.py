@@ -193,7 +193,13 @@ class DeepgramLiveSession:
         self._ws: Optional[ClientConnection] = None
         self._recv_task: Optional[asyncio.Task[None]] = None
         self._keepalive_task: Optional[asyncio.Task[None]] = None
-        self._event_queue: asyncio.Queue[object] = asyncio.Queue()
+        # Bounded queue: a pathological slow consumer (browser throttled,
+        # renderer hung) must not be allowed to accumulate interim segments
+        # unboundedly at ~15 Hz. On QueueFull, the put path drops the
+        # oldest interim entry and re-enqueues; finals and errors are never
+        # dropped.  See _enqueue_event below.
+        self._event_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=1024)
+        self._queue_overflow_warned: bool = False
         self._finalized_segments: list[dict] = []
         self._latest_interim: Optional[dict] = None
         self._closed = False
@@ -481,15 +487,11 @@ class DeepgramLiveSession:
             except Exception as e:
                 logger.debug("deepgram-live: close() ignored: %s", e)
 
-        # Ensure any consumer blocked on events() unblocks. The queue
-        # is unbounded (``asyncio.Queue()`` default ``maxsize=0``), so
-        # ``put_nowait`` cannot raise ``QueueFull``. We still use a
-        # narrow catch for truly unexpected runtime state — e.g., the
-        # event loop is already shut down during interpreter exit.
-        try:
-            self._event_queue.put_nowait(self._QUEUE_SENTINEL)
-        except RuntimeError as e:
-            logger.debug("deepgram-live: close sentinel put failed: %s", e)
+        # Ensure any consumer blocked on events() unblocks. The sentinel
+        # is routed through _enqueue_event so it survives overflow — if
+        # the queue is full of interim events, one is evicted to make
+        # room, guaranteeing the consumer sees termination.
+        self._enqueue_event(self._QUEUE_SENTINEL, is_critical=True)
 
     # ----- Accessors --------------------------------------------------------
 
@@ -515,25 +517,67 @@ class DeepgramLiveSession:
 
     # ----- Internals --------------------------------------------------------
 
-    def _report_error(self, message: str, *, fatal: bool) -> None:
-        """Record an error and push a normalized error event to the queue.
+    def _enqueue_event(self, event: object, *, is_critical: bool) -> None:
+        """Put an event on the bounded queue with smart overflow handling.
 
-        The queue is unbounded so ``put_nowait`` cannot raise
-        ``QueueFull`` in normal operation. The narrow ``RuntimeError``
-        catch handles the edge case where the event loop is already
-        shut down (interpreter exit, CancelledError re-entry).
+        ``is_critical=True`` means the event must never be dropped (final
+        segments, errors, sentinels). When the queue is full and the event
+        is critical, we drop the OLDEST interim event to make room.  If
+        ``is_critical=False`` (interim segments), we simply drop the new
+        event on overflow.
         """
+        try:
+            self._event_queue.put_nowait(event)
+            return
+        except asyncio.QueueFull:
+            pass
+        except RuntimeError as e:
+            logger.debug("deepgram-live: enqueue runtime error: %s", e)
+            return
+        if not is_critical:
+            # Slow consumer — drop this interim.
+            if not self._queue_overflow_warned:
+                self._queue_overflow_warned = True
+                logger.warning(
+                    "deepgram-live: event queue full (cap=%d); dropping interim segments",
+                    self._event_queue.maxsize,
+                )
+            return
+        # Critical: try to evict one oldest interim and re-enqueue.
+        try:
+            victim = self._event_queue.get_nowait()
+            if isinstance(victim, dict) and victim.get("type") == "interim":
+                # Discarded an interim; event loop progressed.
+                pass
+            else:
+                # Put the critical victim back and give up — don't drop
+                # finals/errors. This means the new critical event is
+                # silently dropped, which is worse than the warning below.
+                self._event_queue.put_nowait(victim)
+                logger.error(
+                    "deepgram-live: queue full with no interim to evict; "
+                    "critical event dropped: %r",
+                    event,
+                )
+                return
+        except (asyncio.QueueEmpty, RuntimeError):
+            return
+        try:
+            self._event_queue.put_nowait(event)
+        except (asyncio.QueueFull, RuntimeError) as e:
+            logger.error("deepgram-live: critical event re-enqueue failed: %s", e)
+
+    def _report_error(self, message: str, *, fatal: bool) -> None:
+        """Record an error and push a normalized error event to the queue."""
         self._last_error = message
         self._last_fatal = fatal or self._last_fatal
         logger.warning(
             "deepgram-live: error (fatal=%s): %s", fatal, message
         )
-        try:
-            self._event_queue.put_nowait(
-                {"type": "error", "error": message, "fatal": bool(fatal)}
-            )
-        except RuntimeError as e:
-            logger.debug("deepgram-live: report_error put failed: %s", e)
+        self._enqueue_event(
+            {"type": "error", "error": message, "fatal": bool(fatal)},
+            is_critical=True,
+        )
         if fatal:
             self._closed = True
 
@@ -554,7 +598,11 @@ class DeepgramLiveSession:
                 self.stats.last_recv_at = time.monotonic()
                 event = self._process_deepgram_message(msg)
                 if event is not None:
-                    self._event_queue.put_nowait(event)
+                    # Finals, errors, and segment events are critical;
+                    # interims can be dropped under back-pressure.
+                    ev_type = event.get("type") if isinstance(event, dict) else ""
+                    is_interim = ev_type == "interim"
+                    self._enqueue_event(event, is_critical=not is_interim)
         except ConnectionClosed as e:
             code = getattr(e, "code", None)
             reason = getattr(e, "reason", "") or ""
@@ -605,10 +653,7 @@ class DeepgramLiveSession:
                 logger.error("deepgram-live: recv_loop exception", exc_info=True)
         finally:
             self._closed = True
-            try:
-                self._event_queue.put_nowait(self._QUEUE_SENTINEL)
-            except RuntimeError as e:
-                logger.debug("deepgram-live: recv finally sentinel failed: %s", e)
+            self._enqueue_event(self._QUEUE_SENTINEL, is_critical=True)
 
     async def _keepalive_loop(self) -> None:
         """Emit ``{"type":"KeepAlive"}`` on prolonged upstream idle.

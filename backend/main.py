@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import asyncio
 import uuid
 import re
@@ -166,6 +167,12 @@ app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 jobs = JobStore(max_workers=2)
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+# Hard ceiling on recovery-promote PCM reads. A 10-hour 16 kHz/16-bit PCM
+# spool is 1.15 GB; loading it into a numpy float32 array allocates ~4.6 GB
+# on top of the raw bytes, which OOM-kills the backend on 8-16 GB hosts.
+# Any recovery file larger than this is rejected with 413 and left on disk
+# so the user can retrieve it manually from LIVE_RECOVERY_DIR.
+MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
 RATE_LIMIT_PER_MIN = 120
 WS_CONNECT_LIMIT_PER_MIN = 20
 RESULT_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_RESULT_RETENTION_SEC", "86400"))
@@ -599,9 +606,22 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 meta = {}
-            audio_bytes = pcm_path.read_bytes()
-            if len(audio_bytes) < 32000:
+            # Reject oversized spool files BEFORE the read to avoid OOM:
+            # np.frombuffer + astype(float32) materialises 3× the raw PCM
+            # size in RAM simultaneously.
+            pcm_size = pcm_path.stat().st_size
+            if pcm_size < 32000:
                 raise HTTPException(status_code=400, detail="live recovery too short")
+            if pcm_size > MAX_RECOVERY_PROMOTE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"live recovery too large (max "
+                        f"{MAX_RECOVERY_PROMOTE_BYTES // (1024 * 1024)} MB); "
+                        f"spool left at {pcm_path}"
+                    ),
+                )
+            audio_bytes = pcm_path.read_bytes()
 
             pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             started_at = str(meta.get("started_at") or "").strip()

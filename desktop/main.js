@@ -8,7 +8,6 @@ const fs = require("fs");
 let backend = null;
 let win = null;
 let overlayWin = null;
-let overlayMonitor = null;
 let overlayWaveMonitor = null;
 let overlayLoaded = false;
 let tray = null;
@@ -32,15 +31,12 @@ let overlayQuickAutoSendInitialized = false;
 let overlayQuickSettingsInitialized = false;
 let overlaySilenceStartedAt = 0;
 let overlayAutoStopConfig = { enabled: false, seconds: 2, thresholdDb: -42 };
-let overlayAutoStopUiActive = false;
 let overlayAutoStopConfigRefreshAt = 0;
 let overlayRecordingStartedAt = 0;
 let overlaySeenAudioFrames = false;
-let overlaySpeechRecoveryStartedAt = 0;
 let overlayAutoStopTriggerTimer = null;
 let overlayTranscribingStatusTimer = null;
 let overlayHideTimer = null;
-let lastOverlayUiInteractionAt = 0;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
@@ -1640,7 +1636,6 @@ function ensureOverlayWindow() {
       overlayQuickSettingsOpen = raw.endsWith("1");
       overlayQuickSettingsInitialized = true;
       applyOverlayWindowSize();
-      lastOverlayUiInteractionAt = Date.now();
       if (win && !win.isDestroyed() && win.isVisible()) {
         safeExecSync("overlay_settings:winHide", () => win.hide());
       }
@@ -1650,14 +1645,12 @@ function ensureOverlayWindow() {
     if (raw.startsWith("__overlay_upscale_enabled__")) {
       const v = raw.endsWith("1");
       overlayQuickUpscaleEnabled = !!v;
-      lastOverlayUiInteractionAt = Date.now();
       void setRendererUpscaleEnabledChoice(v);
       return;
     }
     if (raw.startsWith("__overlay_upscale__")) {
       const v = String(decodeURIComponent(raw.replace("__overlay_upscale__", "")) || "").trim();
       overlayQuickUpscalePreset = v;
-      lastOverlayUiInteractionAt = Date.now();
       void setRendererUpscalePresetChoice(v);
       return;
     }
@@ -1665,14 +1658,12 @@ function ensureOverlayWindow() {
       const v = raw.endsWith("1");
       overlayQuickAutoSend = !!v;
       overlayQuickAutoSendInitialized = true;
-      lastOverlayUiInteractionAt = Date.now();
       void setRendererAutoSendEnterChoice(v);
       return;
     }
     if (raw.startsWith("__overlay_autostop_enabled__")) {
       const v = raw.endsWith("1");
       overlayAutoStopConfig = { ...overlayAutoStopConfig, enabled: !!v };
-      lastOverlayUiInteractionAt = Date.now();
       // Sync to renderer
       if (win && !win.isDestroyed() && win.webContents) {
         win.webContents.executeJavaScript(
@@ -1686,7 +1677,6 @@ function ensureOverlayWindow() {
       const secStr = raw.replace("__overlay_autostop_secs__", "");
       const sec = Math.min(120, Math.max(1, Math.round(Number(secStr) || 2)));
       overlayAutoStopConfig = { ...overlayAutoStopConfig, seconds: sec };
-      lastOverlayUiInteractionAt = Date.now();
       // Sync to renderer
       if (win && !win.isDestroyed() && win.webContents) {
         win.webContents.executeJavaScript(
@@ -1773,7 +1763,6 @@ async function showRecordingOverlay() {
   overlayAutoStopConfigRefreshAt = 0;
   overlayRecordingStartedAt = Date.now();
   overlaySeenAudioFrames = false;
-  overlaySpeechRecoveryStartedAt = 0;
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
     overlayAutoStopTriggerTimer = null;
@@ -1803,7 +1792,6 @@ async function showRecordingOverlay() {
     overlayQuickAutoSendInitialized = true;
   }
   overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
-  overlayAutoStopUiActive = false;
   if (!overlayQuickSettingsInitialized) {
     const rendererQuickOpen = await getRendererQuickSettingsOpen();
     if (rendererQuickOpen !== null) {
@@ -2005,7 +1993,6 @@ function hideRecordingOverlay() {
   overlayAutoStopConfigRefreshAt = 0;
   overlayRecordingStartedAt = 0;
   overlaySeenAudioFrames = false;
-  overlaySpeechRecoveryStartedAt = 0;
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
     overlayAutoStopTriggerTimer = null;
@@ -2014,7 +2001,6 @@ function hideRecordingOverlay() {
     clearTimeout(overlayTranscribingStatusTimer);
     overlayTranscribingStatusTimer = null;
   }
-  overlayAutoStopUiActive = false;
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
@@ -2450,15 +2436,16 @@ function saveLastTranscriptToDisk(text) {
   if (!cleaned) return;
   const p = getLastTranscriptPath();
   if (!p) return;
+  const payload = JSON.stringify({ text: cleaned, updated_at: new Date().toISOString() }, null, 2);
+  // Atomic write: temp file in the SAME directory (same filesystem,
+  // avoiding EXDEV on cross-volume rename), then fs.renameSync which is
+  // atomic on POSIX and Windows. A crash mid-write leaves the tmp file
+  // behind as garbage but the real file stays consistent.
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(
-      p,
-      JSON.stringify({ text: cleaned, updated_at: new Date().toISOString() }, null, 2),
-      "utf8"
-    );
-    // Warm the cache with the value we just wrote so the next
-    // ``loadLastTranscriptFromDisk`` does not need to re-read it.
+    fs.writeFileSync(tmp, payload, "utf8");
+    fs.renameSync(tmp, p);
     _lastTranscriptCacheText = cleaned;
     try {
       _lastTranscriptCacheMtimeMs = fs.statSync(p).mtimeMs;
@@ -2466,6 +2453,7 @@ function saveLastTranscriptToDisk(text) {
       _lastTranscriptCacheMtimeMs = -1;
     }
   } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { }
     appendMainLog(`[save-last-transcript-error] ${compactLogText(e?.message || e)}`);
   }
 }
@@ -3814,14 +3802,38 @@ function getPythonCandidates(repoRoot) {
 
 function runCommand(cmd, args, options = {}) {
   const timeoutMs = options.timeoutMs || 30000;
+  // On Windows, PowerShell emits stdout in the system OEM code page
+  // (CP866/CP1251/CP932/…) by default. When we read it as UTF-8 the
+  // non-ASCII bytes become mojibake, breaking app-name detection for
+  // users whose window titles contain Cyrillic/CJK characters. Inject
+  // a prelude that forces [Console]::OutputEncoding to UTF-8 so the
+  // bytes we read back are decoded correctly.
+  let effectiveArgs = args;
+  const cmdLc = String(cmd || "").toLowerCase();
+  if (cmdLc === "powershell" || cmdLc === "pwsh") {
+    const cmdIdx = args.findIndex((a) => String(a || "").toLowerCase() === "-command");
+    if (cmdIdx >= 0 && cmdIdx + 1 < args.length) {
+      const script = args[cmdIdx + 1];
+      const prelude = "$OutputEncoding=[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;";
+      if (typeof script === "string" && !script.startsWith(prelude)) {
+        effectiveArgs = args.slice();
+        effectiveArgs[cmdIdx + 1] = prelude + script;
+      }
+    }
+  }
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
-    const child = spawn(cmd, args, {
+    const child = spawn(cmd, effectiveArgs, {
       cwd: options.cwd,
       env: options.env || process.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
+    // Force UTF-8 decoding on the streams. This is the default on macOS
+    // and Linux, but explicit here so a platform quirk cannot silently
+    // switch the encoding.
+    try { child.stdout.setEncoding("utf8"); } catch { }
+    try { child.stderr.setEncoding("utf8"); } catch { }
 
     const timer = setTimeout(() => {
       try {
@@ -4366,6 +4378,15 @@ async function createWindow(options = {}) {
       await startBackend();
     }
     await waitForHttp(`${BASE_URL}/api/health`, 120_000);
+    // Backend is healthy — treat this as a successful recovery signal
+    // and clear the restart-attempt counter. Without this reset the
+    // counter only decayed on a clean `exit code 0`, which never fires
+    // outside shutdown, so the exponential backoff compounded across
+    // sessions making the log delay misleading.
+    if (backendRestartAttempts !== 0) {
+      appendMainLog(`[backend-recovery] healthy after ${backendRestartAttempts} attempt(s); resetting counter`);
+      backendRestartAttempts = 0;
+    }
     await refreshWindowForFrontendBuild(true);
     await win.loadURL(url);
     if (showWindow) {
@@ -4491,10 +4512,6 @@ function killBackendHard(reason) {
 app.on("before-quit", () => {
   isQuitting = true;
   globalShortcut.unregisterAll();
-  if (overlayMonitor) {
-    clearInterval(overlayMonitor);
-    overlayMonitor = null;
-  }
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
