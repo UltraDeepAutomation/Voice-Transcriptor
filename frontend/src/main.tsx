@@ -4623,9 +4623,9 @@ function pushCapturedFrame(input: Float32Array): void {
       console.debug("live ws send skipped", e);
     }
   } else if (ws.readyState === WebSocket.CONNECTING) {
-    // Buffer up to 2 seconds of audio (~62 frames @ 128 samples/frame
-    // at 16 kHz after downsampling). Beyond that the WS is likely
-    // stuck and we should not accumulate memory indefinitely.
+    // Buffer up to 4 seconds of audio (500 frames × 128 samples/frame
+    // at 16 kHz after downsampling = 64 000 samples). Beyond that the
+    // WS is likely stuck and we should not accumulate indefinitely.
     if (wsPendingFrames.length < 500) {
       wsPendingFrames.push(pcm);
     }
