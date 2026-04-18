@@ -36,9 +36,22 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
         try:
             info = sf.info(path_in)
             if info.samplerate == 16000 and info.channels == channels and info.subtype == "PCM_16":
-                # Already perfect — just copy (or symlink) to output path.
+                # Already perfect — copy atomically via tmp+rename so a
+                # disk-full mid-copy leaves the destination untouched
+                # (the fallback path below already does this; symmetry
+                # prevents truncated-WAV transcribe silently succeeding
+                # with garbage audio).
                 if os.path.abspath(path_in) != os.path.abspath(path_out):
-                    shutil.copyfile(path_in, path_out)
+                    tmp_out = f"{path_out}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+                    try:
+                        shutil.copyfile(path_in, tmp_out)
+                        os.replace(tmp_out, path_out)
+                    except Exception:
+                        try:
+                            os.unlink(tmp_out)
+                        except OSError:
+                            pass
+                        raise
                 return path_out
         except Exception:
             pass  # Fall through to ffmpeg conversion

@@ -14,7 +14,14 @@ from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
 
-_MODEL_LOCK = threading.Lock()
+# Per-model locks: loading model A must not serialise with loading
+# model B. A global lock caused a first-time large-v3 request to block
+# every concurrent transcription (even for already-loaded models) for
+# the 10+ seconds of the large model load. Double-checked locking: fast
+# path reads the cache dict directly (atomic under the GIL), slow path
+# acquires a per-name lock to prevent duplicate loads of the SAME model.
+_MODEL_LOCK = threading.Lock()  # Guards the name→lock registry.
+_MODEL_NAME_LOCKS: Dict[str, threading.Lock] = {}
 _MODEL_CACHE: Dict[str, WhisperModel] = {}
 _MODEL_WARM_STATE: Dict[str, Dict[str, float]] = {}
 _CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -58,25 +65,37 @@ def _empty_transcribe_result(duration: float = 0.0) -> Dict[str, Any]:
 
 def _model(model_name: str) -> WhisperModel:
     # CPU default tuned for typical laptops.
+    # Fast path: hot cache hit with no lock held (dict reads are
+    # atomic under the GIL). Prevents parallel users of model A from
+    # blocking on a concurrent first-time load of model B.
+    m = _MODEL_CACHE.get(model_name)
+    if m is not None:
+        return m
+    # Per-name lock registry. The registry dict itself is guarded by
+    # _MODEL_LOCK so two callers can't race to create the per-name lock.
     with _MODEL_LOCK:
+        per_lock = _MODEL_NAME_LOCKS.setdefault(model_name, threading.Lock())
+    # Slow path: serialise only duplicate loads of the SAME model.
+    with per_lock:
         m = _MODEL_CACHE.get(model_name)
-        if m is None:
-            started = time.perf_counter()
-            m = WhisperModel(
-                model_name,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=_DEFAULT_CPU_THREADS,
-                num_workers=_DEFAULT_NUM_WORKERS,
-            )
-            _MODEL_CACHE[model_name] = m
-            logger.info(
-                "whisper model loaded: model=%s cpu_threads=%d num_workers=%d load_ms=%d",
-                model_name,
-                _DEFAULT_CPU_THREADS,
-                _DEFAULT_NUM_WORKERS,
-                int((time.perf_counter() - started) * 1000),
-            )
+        if m is not None:
+            return m
+        started = time.perf_counter()
+        m = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=_DEFAULT_CPU_THREADS,
+            num_workers=_DEFAULT_NUM_WORKERS,
+        )
+        _MODEL_CACHE[model_name] = m
+        logger.info(
+            "whisper model loaded: model=%s cpu_threads=%d num_workers=%d load_ms=%d",
+            model_name,
+            _DEFAULT_CPU_THREADS,
+            _DEFAULT_NUM_WORKERS,
+            int((time.perf_counter() - started) * 1000),
+        )
         return m
 
 
@@ -239,8 +258,22 @@ def merge_channel_transcripts(t1: Dict[str, Any], t2: Dict[str, Any]) -> Dict[st
         t = (s.get("text") or "").strip()
         if t:
             text.append(f"{s.get('speaker', '?')}: {t}")
+    # Preserve the full result-dict shape so callers can rely on
+    # ``duration`` and ``language_probability`` being present whether
+    # the file was mono or stereo. The mono path (via _build_result)
+    # already sets both keys; stereo merge must match to prevent
+    # caller-side KeyError / None fallthroughs for duration-based
+    # telemetry and auto-detect confidence.
     return {
         "language": t1.get("language") or t2.get("language"),
+        "language_probability": max(
+            float(t1.get("language_probability") or 0.0),
+            float(t2.get("language_probability") or 0.0),
+        ),
+        "duration": max(
+            float(t1.get("duration") or 0.0),
+            float(t2.get("duration") or 0.0),
+        ),
         "channel_mode": "stereo_split",
         "segments": merged,
         "text": "\n".join(text).strip(),

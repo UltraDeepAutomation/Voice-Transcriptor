@@ -203,6 +203,16 @@ class DeepgramLiveSession:
         self._finalized_segments: list[dict] = []
         self._latest_interim: Optional[dict] = None
         self._closed = False
+        # Separate "consumer-visible closed" (self._closed, flipped by
+        # recv_loop.finally as soon as the upstream drops so events()
+        # consumers see termination) from "close() has been called"
+        # (self._close_ran, used as the idempotency guard inside close()).
+        # Without this split, when recv_loop sets _closed=True on its
+        # exit path and THEN a caller invokes close(), the early-return
+        # at the top of close() fired, leaking the upstream WebSocket
+        # socket (never sent the WS close frame) and the keepalive task
+        # (never cancelled). TCP FIN-WAITs piled up until OS reclaim.
+        self._close_ran = False
         self._finalize_sent = False
         self._last_error: Optional[str] = None
         self._last_fatal: bool = False
@@ -468,8 +478,9 @@ class DeepgramLiveSession:
 
     async def close(self) -> None:
         """Idempotently release the upstream socket and background tasks."""
-        if self._closed:
+        if self._close_ran:
             return
+        self._close_ran = True
         self._closed = True
 
         if self._keepalive_task is not None and not self._keepalive_task.done():

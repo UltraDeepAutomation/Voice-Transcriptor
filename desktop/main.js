@@ -1,9 +1,32 @@
-const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard } = require("electron");
+const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, session } = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
 const net = require("net");
 const path = require("path");
 const fs = require("fs");
+
+// Register process-level crash handlers IMMEDIATELY — the previous
+// registration happened inside app.whenReady().then(...), meaning any
+// module-load-time crash (in requestSingleInstanceLock, createOverlayHtml,
+// top-level fs/path calls) terminated the process with no log trace
+// because appendMainLog requires app.getPath('userData') which isn't
+// ready yet. Fall back to console.error for the pre-ready window.
+process.on("uncaughtException", (err) => {
+  try {
+    if (typeof appendMainLog === "function") {
+      appendMainLog(`[uncaughtException] ${err?.stack || err?.message || String(err)}`);
+    }
+  } catch { /* appendMainLog may not be defined yet during early boot */ }
+  try { console.error("[uncaughtException]", err); } catch { }
+});
+process.on("unhandledRejection", (reason) => {
+  try {
+    if (typeof appendMainLog === "function") {
+      appendMainLog(`[unhandledRejection] ${String(reason)}`);
+    }
+  } catch { }
+  try { console.error("[unhandledRejection]", reason); } catch { }
+});
 
 let backend = null;
 let win = null;
@@ -4220,7 +4243,18 @@ async function startBackend() {
 
   setBackendBootStatus("Starting backend…");
 
-  const preferredPort = Number(process.env.TRANSCRIPTOR_PORT || DEFAULT_BACKEND_PORT) || DEFAULT_BACKEND_PORT;
+  // Validate TRANSCRIPTOR_PORT: must be a user-space TCP port
+  // (1024-65535). A bogus value (0, negative, non-integer, >65535)
+  // silently fell through pickBackendPort's iteration and produced an
+  // OS-assigned random port — deviation from the user's configured
+  // port with no log trace.
+  let preferredPort = Number(process.env.TRANSCRIPTOR_PORT);
+  if (!Number.isInteger(preferredPort) || preferredPort < 1024 || preferredPort > 65535) {
+    if (process.env.TRANSCRIPTOR_PORT) {
+      appendMainLog(`[backend-start] invalid TRANSCRIPTOR_PORT=${process.env.TRANSCRIPTOR_PORT}; using default ${DEFAULT_BACKEND_PORT}`);
+    }
+    preferredPort = DEFAULT_BACKEND_PORT;
+  }
   PORT = await pickBackendPort(HOST, preferredPort);
   BASE_URL = `http://${HOST}:${PORT}`;
   appendMainLog(`[backend-start] python="${python}" host=${HOST} port=${PORT} repo="${repoRoot}"`);
@@ -4250,7 +4284,10 @@ async function startBackend() {
     env: {
       ...process.env,
       PYTHONUNBUFFERED: "1",
-      PYTHONPATH: repoRoot + (process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : ""),
+      // path.delimiter is ";" on Windows, ":" elsewhere. Hardcoding
+      // ":" caused Windows PYTHONPATH to be malformed, making every
+      // pre-existing Python path entry unimportable.
+      PYTHONPATH: repoRoot + (process.env.PYTHONPATH ? `${path.delimiter}${process.env.PYTHONPATH}` : ""),
       TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
     }
   });
@@ -4279,8 +4316,19 @@ async function startBackend() {
         clearTimeout(backendRestartTimer);
         backendRestartTimer = null;
       }
-      const attempt = Math.min(backendRestartAttempts + 1, 8);
+      const attempt = backendRestartAttempts + 1;
       backendRestartAttempts = attempt;
+      // Hard cap: after 8 attempts, stop scheduling. A deterministically
+      // broken backend (corrupt config, missing dep, port conflict we
+      // can't escape) would otherwise restart every 5s forever, growing
+      // the log file unboundedly and masking the real failure. The user
+      // sees a permanent backend error in the renderer instead.
+      if (attempt > 8) {
+        backendBootError = `Backend exited with code ${code} after ${attempt - 1} restart attempts — giving up.`;
+        setBackendBootStatus("");
+        appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
+        return;
+      }
       const delay = Math.min(800 * attempt, 5000);
       appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
       backendRestartTimer = setTimeout(() => {
@@ -4361,7 +4409,32 @@ async function createWindow(options = {}) {
       contextIsolation: true,
       nodeIntegration: false,
       enableRemoteModule: false,
-      webSecurity: true
+      webSecurity: true,
+      // Sandbox: renderer has no Node.js access even in worst case
+      // (a preload script exploit would not break out of sandbox).
+      sandbox: true,
+    }
+  });
+
+  // Refuse navigation to any origin other than the backend. A
+  // transcript containing an <a href="https://evil..."> that's clicked
+  // must NOT navigate the renderer to an attacker-controlled origin —
+  // hand it off to the OS default browser via shell.openExternal.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (typeof url === "string" && (url.startsWith(BASE_URL) || url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:"))) {
+      return { action: "allow" };
+    }
+    if (typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"))) {
+      try { shell.openExternal(url); } catch { }
+    }
+    return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (e, url) => {
+    if (typeof url !== "string") { e.preventDefault(); return; }
+    if (url.startsWith(BASE_URL) || url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:")) return;
+    e.preventDefault();
+    if (url.startsWith("http://") || url.startsWith("https://")) {
+      try { shell.openExternal(url); } catch { }
     }
   });
 
@@ -4651,14 +4724,9 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 }
 
 app.whenReady().then(async () => {
-  process.on("uncaughtException", (err) => {
-    appendMainLog(`[uncaughtException] ${err?.stack || err?.message || String(err)}`);
-    console.error("[uncaughtException]", err);
-  });
-  process.on("unhandledRejection", (reason) => {
-    appendMainLog(`[unhandledRejection] ${String(reason)}`);
-    console.error("[unhandledRejection]", reason);
-  });
+  // Process-level uncaughtException / unhandledRejection handlers are
+  // already registered at module top-level so pre-whenReady crashes are
+  // captured. No duplicate registration needed here.
   cleanupStaleTranscriptTmpFiles();
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {

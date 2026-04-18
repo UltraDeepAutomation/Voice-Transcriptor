@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict
 
@@ -294,7 +295,12 @@ def load_config() -> Dict[str, Any]:
         try:
             encrypted_cfg = _encrypt_provider_keys(merged)
             payload = json.dumps(encrypted_cfg, ensure_ascii=False, indent=2)
-            tmp = CONFIG_PATH.with_suffix(".tmp")
+            # Unique tmp suffix prevents two concurrent writers from
+            # clobbering each other's in-progress writes. Matches the
+            # atomic-writer convention used elsewhere in the backend
+            # (_atomic_write_text / _atomic_temp_path / _write_upscale_preset)
+            # and is recognised by _sweep_orphan_tmp_files for crash cleanup.
+            tmp = CONFIG_PATH.with_suffix(f".tmp-{uuid.uuid4().hex}")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(CONFIG_PATH)
         except (OSError, ValueError, TypeError) as e:
@@ -329,7 +335,10 @@ def save_config(cfg: Dict[str, Any]) -> None:
     merged = _deep_merge(DEFAULT_CONFIG, merged_current)
     encrypted = _encrypt_provider_keys(merged)
     payload = json.dumps(encrypted, ensure_ascii=False, indent=2)
-    tmp = CONFIG_PATH.with_suffix(".tmp")
+    # Unique tmp suffix: prevents two concurrent save_config / migration
+    # writers from truncating each other's in-progress file. Matches
+    # _atomic_write_text / _atomic_temp_path convention in main.py.
+    tmp = CONFIG_PATH.with_suffix(f".tmp-{uuid.uuid4().hex}")
     try:
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(CONFIG_PATH)

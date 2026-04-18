@@ -53,9 +53,20 @@ if %errorlevel% neq 0 (
         pause
         exit /b 1
     )
-    REM PATH is not refreshed within the current cmd session — point to
-    REM the standard winget install location for the rest of this run.
-    set "PATH=%LOCALAPPDATA%\Programs\Python\Python312;%LOCALAPPDATA%\Programs\Python\Python312\Scripts;%PATH%"
+    REM PATH is not refreshed within the current cmd session. winget
+    REM install location varies by version and user settings, so enumerate
+    REM known install roots for any Python 3.x and prepend the first hit
+    REM to PATH instead of hard-coding Python312.
+    set "PYTHON_EXE="
+    for /f "delims=" %%P in ('dir /b /s "%LOCALAPPDATA%\Programs\Python\Python3*\python.exe" 2^>nul') do if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
+    for /f "delims=" %%P in ('dir /b /s "%ProgramFiles%\Python3*\python.exe" 2^>nul') do if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
+    for /f "delims=" %%P in ('dir /b /s "%ProgramFiles(x86)%\Python3*\python.exe" 2^>nul') do if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
+    if defined PYTHON_EXE (
+        for %%D in ("!PYTHON_EXE!") do set "PATH=%%~dpD;%%~dpDScripts;!PATH!"
+    ) else (
+        REM Fallback to the documented winget user-install location.
+        set "PATH=%LOCALAPPDATA%\Programs\Python\Python312;%LOCALAPPDATA%\Programs\Python\Python312\Scripts;%PATH%"
+    )
 )
 echo   [OK] Python:
 python --version
@@ -93,11 +104,14 @@ if %errorlevel% neq 0 (
 
 REM ── 5. Create app-scoped venv ────────────────────────────────────────────
 REM Matches the Windows userData location that Electron's
-REM ``app.getPath('userData')`` resolves to on Win (=%APPDATA%\transcriptor).
-REM We lowercase ``transcriptor`` to match Electron's productName-derived
-REM path; setup puts venv in ``%APPDATA%\Transcriptor\.venv`` today but
-REM we use lowercase here to keep symmetry with the rest of the stack.
-set "DATA_DIR=%APPDATA%\transcriptor"
+REM ``app.getPath('userData')`` resolves to on Win. When ``productName``
+REM is set in package.json (it is: "Transcriptor"), Electron uses that
+REM as the userData directory NAME (not the lowercase ``name`` field).
+REM So the canonical path is ``%APPDATA%\Transcriptor`` — matching the
+REM casing run.bat uses. On case-sensitive NTFS (Win 10 1803+, opt-in
+REM per-directory) a mismatched casing would create a second directory
+REM and break backend-venv discovery at launch.
+set "DATA_DIR=%APPDATA%\Transcriptor"
 set "APP_VENV=%DATA_DIR%\.venv"
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 

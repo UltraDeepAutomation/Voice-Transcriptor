@@ -91,18 +91,29 @@ def deepgram_transcribe(
     # finally to application/octet-stream (Deepgram accepts it for
     # every common codec). The old "audio/wav" default caused silent
     # 400s when an AAC or MP4 upload was mislabelled as WAV.
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
+    # Extension-less filenames (common for browser-downloaded files that
+    # lost their suffix) previously defaulted to "audio/wav" which
+    # triggered silent 400s when the body was actually webm/m4a. Default
+    # to application/octet-stream — Deepgram sniffs the container bytes
+    # and accepts any common codec that way.
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime_map = {
         "wav": "audio/wav",
         "mp3": "audio/mpeg",
         "ogg": "audio/ogg",
+        "oga": "audio/ogg",
+        "opus": "audio/ogg",  # Opus in Ogg container
         "webm": "audio/webm",
         "flac": "audio/flac",
         "m4a": "audio/mp4",
         "mp4": "audio/mp4",
         "aac": "audio/aac",
     }
-    content_type = mime_map.get(ext) or (mimetypes.guess_type(filename)[0] or "application/octet-stream")
+    content_type = (
+        mime_map.get(ext)
+        or (mimetypes.guess_type(filename)[0] if ext else None)
+        or "application/octet-stream"
+    )
 
     headers = {
         "Authorization": f"Token {api_key}",

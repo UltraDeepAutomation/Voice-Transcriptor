@@ -187,8 +187,28 @@ MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
 RATE_LIMIT_PER_MIN = 120
 WS_CONNECT_LIMIT_PER_MIN = 20
-RESULT_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_RESULT_RETENTION_SEC", "86400"))
-LIVE_RECOVERY_RETENTION_SEC = int(os.environ.get("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", "86400"))
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer env var with graceful fallback.
+
+    A non-numeric value (e.g., ``TRANSCRIPTOR_RESULT_RETENTION_SEC=1h``)
+    would otherwise crash module import with ValueError before FastAPI
+    ever starts, and Electron would see the backend child die
+    repeatedly with no diagnostic. Degrade to the documented default
+    with a warning so the backend boots and the misconfiguration is
+    visible in the log.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid integer env %s=%r; using default=%d", name, raw, default)
+        return default
+
+
+RESULT_RETENTION_SEC = _env_int("TRANSCRIPTOR_RESULT_RETENTION_SEC", 86400)
+LIVE_RECOVERY_RETENTION_SEC = _env_int("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", 86400)
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 ALLOWED_REMOTE_PROVIDERS = {"openrouter", "deepgram"}
 ALLOWED_AUDIO_EXTS = {
@@ -307,12 +327,34 @@ def _load_or_create_api_token() -> str:
     env_token = os.environ.get("TRANSCRIPTOR_API_TOKEN", "").strip()
     if env_token:
         return env_token
+    # The token path lives under DATA_DIR; if the user has permission or
+    # filesystem issues (read-only mount, sandbox denial, anti-virus
+    # lock), a bare read/write would raise OSError at module import
+    # time and the backend would never start. Guard each FS op so we
+    # degrade to an in-memory-only token for this session — recordings
+    # still work, only the persistence of the token across restarts is
+    # lost until the filesystem recovers.
     if API_TOKEN_PATH.exists():
-        token = API_TOKEN_PATH.read_text(encoding="utf-8").strip()
+        try:
+            token = API_TOKEN_PATH.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            logger.warning(
+                "api token unreadable at %s: %s — regenerating",
+                API_TOKEN_PATH, e,
+            )
+            token = ""
         if token:
             return token
     token = secrets.token_urlsafe(32)
-    API_TOKEN_PATH.write_text(token, encoding="utf-8")
+    try:
+        API_TOKEN_PATH.write_text(token, encoding="utf-8")
+    except OSError as e:
+        logger.error(
+            "api token persist failed at %s: %s — using in-memory token "
+            "for this session only (will re-generate on restart)",
+            API_TOKEN_PATH, e,
+        )
+        return token
     try:
         os.chmod(API_TOKEN_PATH, 0o600)
     except OSError as e:
@@ -2521,9 +2563,13 @@ def _run_remote_transcribe_once(
 ) -> dict[str, Any]:
     if cfg is None:
         cfg = load_config()
+    # Defensive `or {}` — `cfg.get("preferences", {})` returns None when
+    # the key IS present with a null value (hand-edited config.json).
+    # The rest of the module uses the `or {}` pattern; mirror it here
+    # so a ``"preferences": null`` config doesn't crash with AttributeError.
     prov = (
         provider_norm
-        or cfg.get("preferences", {}).get("remote_provider")
+        or ((cfg.get("preferences") or {}).get("remote_provider"))
         or "openrouter"
     ).strip()
 
@@ -2958,7 +3004,20 @@ def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
         selected = (result.stdout or "").strip()
         if not selected:
             raise HTTPException(status_code=400, detail="no folder selected")
-        p = Path(selected).expanduser()
+        p = Path(selected).expanduser().resolve()
+        # Containment invariant (matches _resolve_recordings_target_dir):
+        # reject paths outside the user's home directory so the config
+        # cannot be persisted with a value the resolver will later
+        # reject — UX failure where the user "selected" a folder that
+        # silently falls back to the default on next load.
+        home_dir = Path.home().resolve()
+        try:
+            p.relative_to(home_dir)
+        except ValueError:
+            raise HTTPException(
+                status_code=403,
+                detail="recordings folder must live inside your home directory",
+            )
         p.mkdir(parents=True, exist_ok=True)
         return {"path": str(p)}
     except subprocess.TimeoutExpired:
@@ -3378,15 +3437,28 @@ async def save_recording_with_audio(
     try:
         await _save_upload_file(file, tmp_audio)
         os.replace(tmp_audio, out_audio)
-        _write_recording_text_file(
-            out=out_text,
-            title=safe_title,
-            source_text=safe_source_text,
-            transcript_text=safe_transcript_text,
-            provider=safe_provider,
-            model=safe_model,
-            language=safe_language,
-        )
+        try:
+            _write_recording_text_file(
+                out=out_text,
+                title=safe_title,
+                source_text=safe_source_text,
+                transcript_text=safe_transcript_text,
+                provider=safe_provider,
+                model=safe_model,
+                language=safe_language,
+            )
+        except Exception:
+            # Text-write failed AFTER the audio reached its final path.
+            # _prune_old_recording_audio requires a sibling .txt to
+            # keep an audio file, so without a rollback the .wav/.m4a
+            # would sit on disk forever as an orphan that no retention
+            # rule ever cleans. Mirror the rollback pattern used in
+            # _promote_live_recovery for symmetric safety.
+            try:
+                out_audio.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
     finally:
         tmp_audio.unlink(missing_ok=True)
     if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():

@@ -4,7 +4,9 @@ Centralised retry logic with exponential backoff — used by both
 ``remote_openrouter`` and ``remote_deepgram`` modules.
 """
 
+import datetime as _dt
 import time
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import requests
@@ -18,8 +20,42 @@ class RemoteError(RuntimeError):
 
 
 _SESSION = requests.Session()
-_SESSION.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0))
-_SESSION.mount("http://", HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0))
+# pool_maxsize=64 comfortably covers FastAPI's default 40-thread executor
+# plus burst; pool_block=True makes high-concurrency uploaders wait for a
+# free slot instead of silently discarding and re-handshaking TLS (the
+# default behaviour emits "Connection pool is full" warnings and adds
+# 100-300 ms per call for the fresh handshake).
+_SESSION.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=True))
+_SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=True))
+
+
+# Max seconds we will honour from a Retry-After header before capping.
+# A hostile or buggy upstream could otherwise stall a user request for
+# hours with a malicious Retry-After value.
+_RETRY_AFTER_CAP_SEC = 30.0
+
+
+def _parse_retry_after(raw: Optional[str]) -> float:
+    """Parse a ``Retry-After`` header to delta-seconds.
+
+    RFC 7231 allows either an integer delta-seconds or an HTTP-date.
+    Returns 0.0 for missing / unparseable values.
+    """
+    if not raw:
+        return 0.0
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return 0.0
+        now = _dt.datetime.now(dt.tzinfo) if dt.tzinfo else _dt.datetime.now()
+        return max(0.0, (dt - now).total_seconds())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # HTTP status codes that indicate a transient upstream condition where
@@ -63,7 +99,16 @@ def request_with_retry(
             resp = _SESSION.request(method, url, timeout=timeout, **kwargs)
             if resp.status_code in _TRANSIENT_HTTP_STATUS and attempt < retries - 1:
                 last_resp = resp
-                time.sleep(backoff_base if attempt == 0 else backoff_base * (attempt + 1))
+                delay = backoff_base if attempt == 0 else backoff_base * (attempt + 1)
+                # Honour Retry-After per RFC 7231. Providers
+                # (OpenRouter, Deepgram) emit this on 429/503 to signal
+                # the correct wait time; ignoring it hammers the
+                # provider, gets throttled harder, and reports a false
+                # hard failure when 5 seconds would have recovered.
+                ra_sec = _parse_retry_after(resp.headers.get("Retry-After"))
+                if ra_sec > 0:
+                    delay = max(delay, min(ra_sec, _RETRY_AFTER_CAP_SEC))
+                time.sleep(delay)
                 continue
             return resp
         except RequestException as e:

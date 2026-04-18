@@ -1044,7 +1044,12 @@ function encodeWav(float32: Float32Array, sr: number): Blob {
   let off = 44;
   for (let i = 0; i < n; i++) {
     const x = Math.max(-1, Math.min(1, float32[i]));
-    v.setInt16(off, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+    // Explicit Math.round — setInt16 truncates toward zero on a raw
+    // float multiply, introducing a systematic ~0.5-LSB negative bias
+    // on positive samples. floatSamplesToInt16LE already rounds; this
+    // path must match to produce bit-identical output for the same
+    // input samples.
+    v.setInt16(off, Math.round(x < 0 ? x * 0x8000 : x * 0x7fff), true);
     off += 2;
   }
   return new Blob([buf], { type: "audio/wav" });
@@ -1714,7 +1719,7 @@ function closeModal(modalId: string): void {
 
 async function localJobSync(
   file: File,
-  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean }
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal }
 ): Promise<LocalTranscriptionResult> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
@@ -1722,7 +1727,12 @@ async function localJobSync(
   fd.set("model", opts.model || "small");
   fd.set("split_stereo", String(!!opts.splitStereo));
   fd.set("word_timestamps", String(!!opts.wordTimestamps));
-  const r = await fetch("/api/transcribe-sync", { method: "POST", body: fd, headers: authHeaders() });
+  const r = await fetch("/api/transcribe-sync", {
+    method: "POST",
+    body: fd,
+    headers: authHeaders(),
+    signal: opts.signal,
+  });
   if (!r.ok) throw new Error(await parseError(r));
   const js = (await r.json()) as {
     ok?: boolean;
@@ -2766,7 +2776,13 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
     }
     return input;
   }
-  const inflightKey = sessionToken || "__no_session__";
+  // When caller omits sessionToken, two concurrent file-transcription
+  // paths would share the placeholder key and the second call would
+  // receive the FIRST call's upscaled text — writing the wrong result
+  // into the second session's DOM. Make the placeholder unique per
+  // invocation so coalescing only happens for a genuine same-session
+  // duplicate (which always carries an explicit token).
+  const inflightKey = sessionToken || `__no_session__:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
   const existing = upscaleInFlightBySession.get(inflightKey);
   if (existing) {
     return existing;
@@ -4169,6 +4185,11 @@ let workletLastFrameAt = 0;
 let fallbackCaptureTimer: number | null = null;
 let captureFrameCount = 0;
 let captureRmsAccum = 0;
+// Running sum of squared per-frame RMS. Average RMS over a session is
+// the square root of the mean of the SQUARED sample-level RMS — not the
+// mean of the per-frame RMS (which systematically underestimates energy
+// in dynamic audio and inflates false-silence classification).
+let captureRmsSqAccum = 0;
 let capturePeakMax = 0;
 let liveDraftText = "";
 let liveDraftDisplayText = "";
@@ -4625,6 +4646,7 @@ function pushCapturedFrame(input: Float32Array): void {
   const rms = Math.sqrt(sum / input.length);
   captureFrameCount += 1;
   captureRmsAccum += rms;
+  captureRmsSqAccum += rms * rms;
   if (peak > capturePeakMax) capturePeakMax = peak;
   // Smooth RMS via EMA so the overlay's silence detector sees the
   // energy trend over ~120 ms, not a single 2.67 ms micro-window
@@ -4808,6 +4830,7 @@ async function startLive(): Promise<void> {
   autoStopTriggered = false;
   captureFrameCount = 0;
   captureRmsAccum = 0;
+  captureRmsSqAccum = 0;
   capturePeakMax = 0;
   captureRmsEma = 0;
   lastInterimSnapshot = "";
@@ -5230,7 +5253,14 @@ async function stopLive(enhance: boolean): Promise<void> {
   const effectiveProvider = liveSnapshot.effectiveProvider;
   const modelValue = liveSnapshot.model;
   const sourceLiveText = getCanonicalLiveSourceText();
-  const avgCaptureRms = captureFrameCount > 0 ? captureRmsAccum / captureFrameCount : 0;
+  // True session-level RMS is sqrt(mean of per-frame squared RMS),
+  // not mean of per-frame RMS. The mean-of-RMS metric underestimates
+  // dynamic-signal energy (speech peaks get diluted by inter-syllable
+  // gaps) and produced false-positive silence classifications on real
+  // recordings shorter than ~2.5 s.
+  const avgCaptureRms = captureFrameCount > 0
+    ? Math.sqrt(captureRmsSqAccum / captureFrameCount)
+    : 0;
   const noLiveText = !sourceLiveText;
   const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
   const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.003 && capturePeakMax < 0.045;
@@ -6254,6 +6284,7 @@ async function transcribeSelectedFile(): Promise<void> {
         model: ($("model") as HTMLSelectElement).value,
         splitStereo: ($("splitStereoCheck") as HTMLInputElement).checked,
         wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
+        signal: pollAbortController.signal,
       });
       const transcriptRaw = String(syncOut.text || "").trim();
       publishRecordingFinalSignal({
@@ -6292,6 +6323,7 @@ async function transcribeSelectedFile(): Promise<void> {
         language: ($("language") as HTMLSelectElement).value,
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,
         openrouterModel: getRemoteModelValue(provider),
+        signal: pollAbortController.signal,
       });
       const transcriptRaw = String(syncOut.text || "").trim();
       publishRecordingFinalSignal({
@@ -6923,6 +6955,10 @@ function gNavToRecording(node: GraphNode): void {
   ($("recordingsSearchInput") as HTMLInputElement).value = "";
   selectedRecordingName = node.name;
   switchView("recordings");
+  // switchView only refreshes the list when it was empty; without an
+  // explicit openRecording call, the detail pane keeps showing whatever
+  // was open before, so the click "navigates" but shows the wrong content.
+  void openRecording(node.name);
 }
 
 async function initRecordingsBootstrap(): Promise<void> {
@@ -6968,10 +7004,12 @@ async function initRecordingsBootstrap(): Promise<void> {
     gDragPanStartX = gPanX; gDragPanStartY = gPanY;
   });
 
-  window.addEventListener("mousemove", (e: MouseEvent) => {
-    // Early exit when graph tab is hidden — avoids gHitTest loop +
-    // getBoundingClientRect on every mouse move in the entire app.
-    if (!!ct.closest("[hidden]") && !gDragging) return;
+  // Graph-local mousemove/mouseup. Previously these were window-scoped,
+  // which forced a hit-test evaluation on EVERY mouse movement anywhere
+  // in the app for the lifetime of the page. Scope to the graph
+  // container; keep a parallel window-level mouseup to catch drag end
+  // when the cursor leaves the container before button release.
+  ct.addEventListener("mousemove", (e: MouseEvent) => {
     if (gDragging) {
       const dx = e.clientX - gDragStartX, dy = e.clientY - gDragStartY;
       gDragDist = Math.sqrt(dx * dx + dy * dy);
@@ -6993,6 +7031,15 @@ async function initRecordingsBootstrap(): Promise<void> {
     } else if (hit) {
       gShowTooltip(hit, mx, my);
     }
+  });
+  // Window-level drag-pan continuation: user may drag outside the
+  // container; keep updating pan until mouseup.
+  window.addEventListener("mousemove", (e: MouseEvent) => {
+    if (!gDragging) return;
+    const dx = e.clientX - gDragStartX, dy = e.clientY - gDragStartY;
+    gDragDist = Math.sqrt(dx * dx + dy * dy);
+    gPanX = gDragPanStartX + dx; gPanY = gDragPanStartY + dy;
+    gRender();
   });
 
   window.addEventListener("mouseup", () => { gDragging = false; });
