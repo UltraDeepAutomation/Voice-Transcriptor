@@ -4688,7 +4688,12 @@ function pushCapturedFrame(input: Float32Array): void {
   const dv = new DataView(pcm);
   for (let i = 0; i < ds.length; i++) {
     const x = Math.max(-1, Math.min(1, ds[i]));
-    dv.setInt16(i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+    // Math.round: setInt16 truncates toward zero on a raw float
+    // multiply, producing a ~0.5 LSB systematic negative bias on
+    // positive samples. Must match encodeWav and floatSamplesToInt16LE
+    // so the live-WS PCM stream and the canonical WAV written at
+    // stop contain bit-identical samples for the same input.
+    dv.setInt16(i * 2, Math.round(x < 0 ? x * 0x8000 : x * 0x7fff), true);
   }
   if (!ws) return;
   if (ws.readyState === WebSocket.OPEN) {
@@ -7006,15 +7011,16 @@ async function initRecordingsBootstrap(): Promise<void> {
 
   // Graph-local mousemove/mouseup. Previously these were window-scoped,
   // which forced a hit-test evaluation on EVERY mouse movement anywhere
-  // in the app for the lifetime of the page. Scope to the graph
-  // container; keep a parallel window-level mouseup to catch drag end
-  // when the cursor leaves the container before button release.
+  // in the app for the lifetime of the page. Container handler owns
+  // the hit-test (hover) path; window handler owns the drag-pan path
+  // so the user can drag outside the container bounds. The container
+  // handler early-returns on drag to avoid double-processing the event
+  // when the cursor is still inside the container (two handlers, one
+  // event = two gRender() calls per mouse move without this guard).
   ct.addEventListener("mousemove", (e: MouseEvent) => {
     if (gDragging) {
-      const dx = e.clientX - gDragStartX, dy = e.clientY - gDragStartY;
-      gDragDist = Math.sqrt(dx * dx + dy * dy);
-      gPanX = gDragPanStartX + dx; gPanY = gDragPanStartY + dy;
-      gRender();
+      // Let the window-level handler own drag updates; bail to avoid
+      // double-computing gPanX/gPanY and double-rendering per event.
       return;
     }
     const rect = ct.getBoundingClientRect();

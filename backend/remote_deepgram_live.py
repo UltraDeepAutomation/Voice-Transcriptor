@@ -498,6 +498,23 @@ class DeepgramLiveSession:
             except Exception as e:
                 logger.debug("deepgram-live: close() ignored: %s", e)
 
+        # Also cancel and await the recv task. Without this, if the
+        # upstream TCP connection is wedged such that `ws.close()`
+        # returns before the peer actually closes, `_recv_loop`
+        # continues running until the OS-level RST eventually lands —
+        # potentially seconds. During that window, _recv_task holds
+        # references to the socket, queue, and closures, leaking the
+        # whole session object well past the caller's lifetime.
+        # Mirror finalize()'s bounded cancel pattern.
+        if self._recv_task is not None and not self._recv_task.done():
+            self._recv_task.cancel()
+            try:
+                await asyncio.wait_for(self._recv_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger.debug("deepgram-live: close() recv_task await: %s", e)
+
         # Ensure any consumer blocked on events() unblocks. The sentinel
         # is routed through _enqueue_event so it survives overflow — if
         # the queue is full of interim events, one is evicted to make

@@ -3434,6 +3434,18 @@ async def save_recording_with_audio(
     out_audio = target_dir / f"{stem}{ext}"
     tmp_audio = _atomic_temp_path(out_audio)
     existing_audio = _recording_audio_path(f"{stem}.txt", target_dir=target_dir)
+    # Backup the pre-existing audio at out_audio (if any) so the
+    # text-write-failure rollback can restore it instead of destroying
+    # user data on the edit-existing-recording path. The rollback
+    # previously did `out_audio.unlink()` unconditionally, which for
+    # the edit path erased audio the user ALREADY had.
+    audio_backup: Optional[Path] = None
+    if out_audio.exists():
+        try:
+            audio_backup = out_audio.with_name(f"{out_audio.name}.backup-{uuid.uuid4().hex}")
+            os.replace(out_audio, audio_backup)
+        except OSError:
+            audio_backup = None  # Couldn't backup — rollback will only be safe for new-recording path
     try:
         await _save_upload_file(file, tmp_audio)
         os.replace(tmp_audio, out_audio)
@@ -3449,18 +3461,31 @@ async def save_recording_with_audio(
             )
         except Exception:
             # Text-write failed AFTER the audio reached its final path.
-            # _prune_old_recording_audio requires a sibling .txt to
-            # keep an audio file, so without a rollback the .wav/.m4a
-            # would sit on disk forever as an orphan that no retention
-            # rule ever cleans. Mirror the rollback pattern used in
-            # _promote_live_recovery for symmetric safety.
+            # _prune_old_recording_audio requires a sibling .txt to keep
+            # an audio file, so without a rollback the .wav/.m4a would
+            # sit on disk forever as an orphan that no retention rule
+            # ever cleans. Delete the failed-write audio, then restore
+            # the pre-existing one from backup if we have it.
             try:
                 out_audio.unlink(missing_ok=True)
             except OSError:
                 pass
+            if audio_backup is not None and audio_backup.exists():
+                try:
+                    os.replace(audio_backup, out_audio)
+                    audio_backup = None  # Restored, don't clean up below.
+                except OSError:
+                    pass
             raise
     finally:
         tmp_audio.unlink(missing_ok=True)
+        # Remove any orphaned backup after a successful save. The
+        # backup only survives here on the happy path (no rollback).
+        if audio_backup is not None and audio_backup.exists():
+            try:
+                audio_backup.unlink(missing_ok=True)
+            except OSError:
+                pass
     if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
         existing_audio.unlink(missing_ok=True)
     # Audio retention: only the NEWEST recording keeps its audio file.
