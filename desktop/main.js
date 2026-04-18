@@ -379,161 +379,165 @@ function normalizeLocalModelChoice(value) {
   return allowed.has(v) ? v : "small";
 }
 
-async function getRendererProviderChoice() {
-  if (!win || win.isDestroyed() || !win.webContents) return "local";
+/**
+ * Race win.webContents.executeJavaScript(code) against a timeout.
+ *
+ * Every overlay-lifecycle renderer probe (`getRendererProviderChoice`,
+ * `getRendererLocalModelChoice`, `getRendererQuickSettingsOpen`,
+ * `getRendererUpscalePresetContext`, etc.) previously awaited the
+ * executeJavaScript Promise unconditionally. If the renderer was
+ * stuck (long synchronous work, layout lock, extension interaction),
+ * the main process would hang in `showRecordingOverlay` forever —
+ * `shortcutToggleInFlight` stayed true and the user could not re-fire
+ * the hotkey until process restart. This wrapper guarantees a
+ * bounded wait per probe.
+ *
+ * Returns ``fallback`` if:
+ *   - win is destroyed / webContents is gone
+ *   - executeJavaScript rejects
+ *   - the timeout (default 2000ms) elapses before the Promise settles
+ */
+async function execRendererJsWithTimeout(code, fallback, timeoutMs = 2000) {
+  if (!win || win.isDestroyed() || !win.webContents) return fallback;
+  let timer = null;
   try {
-    const v = await win.webContents.executeJavaScript(
-      `(() => String((document.getElementById('providerSelect')?.value || 'local')).trim())();`,
-      true
-    );
-    return normalizeProviderChoice(v);
-  } catch {
-    return "local";
+    const result = await Promise.race([
+      win.webContents.executeJavaScript(code, true),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error(`renderer probe timeout after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+    return result;
+  } catch (e) {
+    try { appendMainLog(`[renderer-probe] fallback: ${e?.message || e}`); } catch { }
+    return fallback;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
+async function getRendererProviderChoice() {
+  const v = await execRendererJsWithTimeout(
+    `(() => String((document.getElementById('providerSelect')?.value || 'local')).trim())();`,
+    "local",
+  );
+  return normalizeProviderChoice(v);
+}
+
 async function getRendererLocalModelChoice() {
-  if (!win || win.isDestroyed() || !win.webContents) return "small";
-  try {
-    const v = await win.webContents.executeJavaScript(
-      `(() => String((document.getElementById('model')?.value || 'small')).trim())();`,
-      true
-    );
-    return normalizeLocalModelChoice(v);
-  } catch {
-    return "small";
-  }
+  const v = await execRendererJsWithTimeout(
+    `(() => String((document.getElementById('model')?.value || 'small')).trim())();`,
+    "small",
+  );
+  return normalizeLocalModelChoice(v);
 }
 
 async function getRendererModelContext() {
   if (!win || win.isDestroyed() || !win.webContents) {
     return { provider: "local", model: "small", models: [...LOCAL_MODELS] };
   }
-  try {
-    const state = await win.webContents.executeJavaScript(
-      `
-      (() => {
-        const provider = String((document.getElementById('providerSelect')?.value || 'local')).trim();
-        const modelSel = document.getElementById('model');
-        const remoteSel = document.getElementById('remoteModelSelect');
-        const orModel = document.getElementById('orModel');
-        const localModel = String(modelSel?.value || 'small').trim();
-        const remoteModel = String(remoteSel?.value || orModel?.value || '').trim();
-        const localOptions = Array.from(modelSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
-        const remoteOptions = Array.from(remoteSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
-        const models = provider === 'local'
-          ? (localOptions.length ? localOptions : ${JSON.stringify(LOCAL_MODELS)})
-          : (remoteOptions.length ? remoteOptions : (remoteModel ? [remoteModel] : []));
-        const model = provider === 'local' ? localModel : remoteModel;
-        return { provider, model, models };
-      })();
-      `,
-      true
-    );
-    return {
-      provider: normalizeProviderChoice(state?.provider),
-      model: String(state?.model || "").trim() || "small",
-      models: Array.isArray(state?.models) ? state.models.map((x) => String(x || "").trim()).filter(Boolean) : [...LOCAL_MODELS],
-    };
-  } catch {
-    return { provider: "local", model: "small", models: [...LOCAL_MODELS] };
-  }
+  const DEFAULT_CONTEXT = { provider: "local", model: "small", models: [...LOCAL_MODELS] };
+  const state = await execRendererJsWithTimeout(
+    `
+    (() => {
+      const provider = String((document.getElementById('providerSelect')?.value || 'local')).trim();
+      const modelSel = document.getElementById('model');
+      const remoteSel = document.getElementById('remoteModelSelect');
+      const orModel = document.getElementById('orModel');
+      const localModel = String(modelSel?.value || 'small').trim();
+      const remoteModel = String(remoteSel?.value || orModel?.value || '').trim();
+      const localOptions = Array.from(modelSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
+      const remoteOptions = Array.from(remoteSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
+      const models = provider === 'local'
+        ? (localOptions.length ? localOptions : ${JSON.stringify(LOCAL_MODELS)})
+        : (remoteOptions.length ? remoteOptions : (remoteModel ? [remoteModel] : []));
+      const model = provider === 'local' ? localModel : remoteModel;
+      return { provider, model, models };
+    })();
+    `,
+    null,
+  );
+  if (!state) return DEFAULT_CONTEXT;
+  return {
+    provider: normalizeProviderChoice(state.provider),
+    model: String(state.model || "").trim() || "small",
+    models: Array.isArray(state.models) ? state.models.map((x) => String(x || "").trim()).filter(Boolean) : [...LOCAL_MODELS],
+  };
 }
 
 async function getRendererQuickSettingsOpen() {
-  if (!win || win.isDestroyed() || !win.webContents) return null;
-  try {
-    const open = await win.webContents.executeJavaScript(
-      // Use getComputedStyle instead of .hidden: the panel is hidden via
-      // CSS display:none (not via the HTML hidden attribute), so p.hidden
-      // is always false even when the element is invisible, causing the
-      // overlay to always think quick-settings is open.
-      `(() => { const p = document.getElementById('quickSettingsPanel'); if (!p) return false; return getComputedStyle(p).display !== 'none'; })();`,
-      true
-    );
-    return !!open;
-  } catch {
-    return null;
-  }
+  // Use getComputedStyle instead of .hidden: the panel is hidden via
+  // CSS display:none (not via the HTML hidden attribute), so p.hidden
+  // is always false even when the element is invisible, causing the
+  // overlay to always think quick-settings is open.
+  return await execRendererJsWithTimeout(
+    `(() => { const p = document.getElementById('quickSettingsPanel'); if (!p) return false; return getComputedStyle(p).display !== 'none'; })();`,
+    null,
+  );
 }
 
 async function getRendererUpscalePresetContext() {
-  if (!win || win.isDestroyed() || !win.webContents) {
-    return { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
-  }
-  try {
-    const out = await win.webContents.executeJavaScript(
-      `
-      (() => {
-        const sel = document.getElementById('upscalePresetSelect');
-        const en = document.getElementById('upscaleToggle');
-        const selected = String(sel?.value || 'builtin_clean').trim();
-        const enabled = !!(en && en.checked);
-        const presets = Array.from(sel?.options || []).map((o) => ({
-          id: String(o.value || '').trim(),
-          name: String(o.textContent || o.value || '').trim(),
-        })).filter((x) => x.id);
-        return { selected, enabled, presets };
-      })();
-      `,
-      true
-    );
-    const presets = Array.isArray(out?.presets) ? out.presets : [];
-    const selected = String(out?.selected || "builtin_clean").trim() || "builtin_clean";
-    const enabled = !!out?.enabled;
-    return { selected, enabled, presets: presets.length ? presets : [{ id: "builtin_clean", name: "Clean" }] };
-  } catch {
-    return { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
-  }
+  const DEFAULT_CONTEXT = { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
+  const out = await execRendererJsWithTimeout(
+    `
+    (() => {
+      const sel = document.getElementById('upscalePresetSelect');
+      const en = document.getElementById('upscaleToggle');
+      const selected = String(sel?.value || 'builtin_clean').trim();
+      const enabled = !!(en && en.checked);
+      const presets = Array.from(sel?.options || []).map((o) => ({
+        id: String(o.value || '').trim(),
+        name: String(o.textContent || o.value || '').trim(),
+      })).filter((x) => x.id);
+      return { selected, enabled, presets };
+    })();
+    `,
+    null,
+  );
+  if (!out) return DEFAULT_CONTEXT;
+  const presets = Array.isArray(out.presets) ? out.presets : [];
+  const selected = String(out.selected || "builtin_clean").trim() || "builtin_clean";
+  const enabled = !!out.enabled;
+  return { selected, enabled, presets: presets.length ? presets : [{ id: "builtin_clean", name: "Clean" }] };
 }
 
 async function getRendererAutoSendEnterEnabled() {
-  if (!win || win.isDestroyed() || !win.webContents) return false;
-  try {
-    const out = await win.webContents.executeJavaScript(
-      `
-      (() => {
-        const btn = document.getElementById('autoSendEnterToggle');
-        return !!(btn && btn.classList.contains('active'));
-      })();
-      `,
-      true
-    );
-    return !!out;
-  } catch {
-    return false;
-  }
+  const out = await execRendererJsWithTimeout(
+    `
+    (() => {
+      const btn = document.getElementById('autoSendEnterToggle');
+      return !!(btn && btn.classList.contains('active'));
+    })();
+    `,
+    false,
+  );
+  return !!out;
 }
 
 async function getRendererAutoStopSilenceConfig() {
-  if (!win || win.isDestroyed() || !win.webContents) {
-    return { enabled: false, seconds: 2, thresholdDb: -42 };
-  }
-  try {
-    const out = await win.webContents.executeJavaScript(
-      `
-      (() => {
-        const enabledEl = document.getElementById('autoStopSilenceEnabled');
-        const secEl = document.getElementById('autoStopSilenceSeconds');
-        const dbEl = document.getElementById('autoStopSilenceDb');
-        const enabled = !!(enabledEl && enabledEl.checked);
-        const secRaw = Number(secEl ? secEl.value : 2);
-        const dbRaw = Number(dbEl ? dbEl.value : -42);
-        const seconds = Math.min(120, Math.max(1, Number.isFinite(secRaw) ? Math.round(secRaw) : 2));
-        const thresholdDb = Math.min(-10, Math.max(-80, Number.isFinite(dbRaw) ? Math.round(dbRaw) : -42));
-        return { enabled, seconds, thresholdDb };
-      })();
-      `,
-      true
-    );
-    return {
-      enabled: !!out?.enabled,
-      seconds: Number.isFinite(Number(out?.seconds)) ? Number(out.seconds) : 2,
-      thresholdDb: Number.isFinite(Number(out?.thresholdDb)) ? Number(out.thresholdDb) : -42,
-    };
-  } catch {
-    return { enabled: false, seconds: 2, thresholdDb: -42 };
-  }
+  const DEFAULT_CONFIG = { enabled: false, seconds: 2, thresholdDb: -42 };
+  const out = await execRendererJsWithTimeout(
+    `
+    (() => {
+      const enabledEl = document.getElementById('autoStopSilenceEnabled');
+      const secEl = document.getElementById('autoStopSilenceSeconds');
+      const dbEl = document.getElementById('autoStopSilenceDb');
+      const enabled = !!(enabledEl && enabledEl.checked);
+      const secRaw = Number(secEl ? secEl.value : 2);
+      const dbRaw = Number(dbEl ? dbEl.value : -42);
+      const seconds = Math.min(120, Math.max(1, Number.isFinite(secRaw) ? Math.round(secRaw) : 2));
+      const thresholdDb = Math.min(-10, Math.max(-80, Number.isFinite(dbRaw) ? Math.round(dbRaw) : -42));
+      return { enabled, seconds, thresholdDb };
+    })();
+    `,
+    null,
+  );
+  if (!out) return DEFAULT_CONFIG;
+  return {
+    enabled: !!out.enabled,
+    seconds: Number.isFinite(Number(out.seconds)) ? Number(out.seconds) : 2,
+    thresholdDb: Number.isFinite(Number(out.thresholdDb)) ? Number(out.thresholdDb) : -42,
+  };
 }
 
 async function setRendererUpscalePresetChoice(presetId) {
@@ -1660,9 +1664,19 @@ function ensureOverlayWindow() {
   });
   // Allow clicks to pass through transparent regions around the capsule pill.
   // The overlay HTML reports mouse enter/leave on the pill so we toggle this.
-  overlayWin.setIgnoreMouseEvents(true, { forward: true });
+  // The `{ forward: true }` option is macOS-only per Electron docs; passing it
+  // on Windows/Linux is silently ignored in some versions and throws in others.
+  if (process.platform === "darwin") {
+    overlayWin.setIgnoreMouseEvents(true, { forward: true });
+  } else {
+    overlayWin.setIgnoreMouseEvents(true);
+  }
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  overlayWin.setAlwaysOnTop(true, "screen-saver");
+  // "screen-saver" level puts the pill above legitimate fullscreen
+  // content (games, video). "floating" still sits above normal windows
+  // — above every app the user cares about paste targeting — but below
+  // true fullscreen apps where the pill overlay is intrusive.
+  overlayWin.setAlwaysOnTop(true, "floating");
   overlayWin.on("page-title-updated", (event, title) => {
     const raw = String(title || "");
     if (!raw.startsWith("__overlay_")) return;
