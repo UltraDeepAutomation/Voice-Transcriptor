@@ -2984,49 +2984,98 @@ def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_aut
     return {"ok": True}
 
 
+def _resolve_picker_command() -> tuple[list[str], str]:
+    """Pick a folder-selection command for the current platform.
+
+    Returns (cmd_list, platform_kind). The "platform_kind" tag lets the
+    caller parse the output correctly — osascript prints the path raw,
+    zenity/kdialog print it newline-terminated, PowerShell's
+    FolderBrowserDialog prints it with Windows-style line endings.
+    """
+    if sys.platform == "darwin":
+        return (
+            ["osascript", "-e",
+             'POSIX path of (choose folder with prompt "Select folder for recordings")'],
+            "mac",
+        )
+    if sys.platform == "win32":
+        # PowerShell FolderBrowserDialog — ships with Windows, no external
+        # deps. The script prints the selected path or "CANCEL" on cancel.
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "$f.Description = 'Select folder for recordings';"
+            "$f.ShowNewFolderButton = $true;"
+            "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ Write-Output $f.SelectedPath } else { Write-Output 'CANCEL' }"
+        )
+        return (
+            ["powershell", "-NoProfile", "-STA", "-Command", ps_script],
+            "win",
+        )
+    # Linux: prefer zenity (GNOME/most distros), fall back to kdialog (KDE).
+    import shutil as _sh
+    if _sh.which("zenity"):
+        return (
+            ["zenity", "--file-selection", "--directory",
+             "--title=Select folder for recordings"],
+            "linux",
+        )
+    if _sh.which("kdialog"):
+        return (
+            ["kdialog", "--getexistingdirectory", str(Path.home()),
+             "--title", "Select folder for recordings"],
+            "linux",
+        )
+    # No picker tool found — caller handles this.
+    return ([], "none")
+
+
 @app.post("/api/recordings/pick-folder")
 def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
-    # os.name == "posix" on both macOS AND Linux; osascript only exists on macOS.
-    if sys.platform != "darwin":
-        raise HTTPException(status_code=400, detail="folder picker supported on macOS only")
+    cmd, kind = _resolve_picker_command()
+    if kind == "none":
+        raise HTTPException(
+            status_code=400,
+            detail="No folder picker available. Install 'zenity' or 'kdialog' "
+                   "(sudo apt install zenity) and try again, or type the path manually.",
+        )
     try:
         result = subprocess.run(
-            [
-                "osascript",
-                "-e",
-                'POSIX path of (choose folder with prompt "Select folder for recordings")',
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
+            cmd, check=True, capture_output=True, text=True, timeout=120,
         )
-        selected = (result.stdout or "").strip()
-        if not selected:
-            raise HTTPException(status_code=400, detail="no folder selected")
-        p = Path(selected).expanduser().resolve()
-        # Containment invariant (matches _resolve_recordings_target_dir):
-        # reject paths outside the user's home directory so the config
-        # cannot be persisted with a value the resolver will later
-        # reject — UX failure where the user "selected" a folder that
-        # silently falls back to the default on next load.
-        home_dir = Path.home().resolve()
-        try:
-            p.relative_to(home_dir)
-        except ValueError:
-            raise HTTPException(
-                status_code=403,
-                detail="recordings folder must live inside your home directory",
-            )
-        p.mkdir(parents=True, exist_ok=True)
-        return {"path": str(p)}
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="folder picker timed out")
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
+        # zenity returns exit code 1 on Cancel — treat as "no folder selected".
+        if kind == "linux" and e.returncode == 1:
+            raise HTTPException(status_code=400, detail="selection canceled")
         if "User canceled" in stderr:
             raise HTTPException(status_code=400, detail="selection canceled")
         raise HTTPException(status_code=500, detail=f"folder picker failed: {stderr or 'unknown error'}")
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=f"folder picker command missing: {e}")
+
+    selected = (result.stdout or "").strip()
+    # PowerShell FolderBrowserDialog encodes cancel as literal "CANCEL".
+    if not selected or selected == "CANCEL":
+        raise HTTPException(status_code=400, detail="no folder selected")
+    p = Path(selected).expanduser().resolve()
+    # Containment invariant: recordings must live inside the user's home
+    # directory. _resolve_recordings_target_dir enforces this at load time;
+    # the picker enforces it at write time so a user can't persist a path
+    # the resolver will later silently reject.
+    home_dir = Path.home().resolve()
+    try:
+        p.relative_to(home_dir)
+    except ValueError:
+        raise HTTPException(
+            status_code=403,
+            detail="recordings folder must live inside your home directory",
+        )
+    p.mkdir(parents=True, exist_ok=True)
+    return {"path": str(p)}
 
 
 @app.post("/api/recordings/open-folder")
@@ -3055,10 +3104,18 @@ def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: No
     # Pick the right open-folder command per platform.
     if sys.platform == "darwin":
         open_cmd = ["open", str(d)]
+    elif sys.platform == "win32":
+        # os.startfile is the canonical Explorer opener on Windows.
+        # It returns immediately and raises OSError on failure.
+        try:
+            os.startfile(str(d))  # type: ignore[attr-defined]
+            return {"ok": True, "path": str(d)}
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"open folder failed: {e}")
     elif sys.platform.startswith("linux"):
         open_cmd = ["xdg-open", str(d)]
     else:
-        raise HTTPException(status_code=400, detail="open folder is not supported on this platform")
+        raise HTTPException(status_code=400, detail=f"open folder not implemented for platform {sys.platform}")
     try:
         subprocess.run(open_cmd, check=True, capture_output=True, text=True, timeout=15)
         return {"ok": True, "path": str(d)}

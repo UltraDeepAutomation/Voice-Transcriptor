@@ -121,11 +121,12 @@ pm_install() {
 
 # ── 2. Paste tooling (display-server-aware) ───────────────────────────────
 #
-# X11: xdotool is the ubiquitous paste driver. Wayland: xdotool does
-# not work (different IPC). wtype covers most Wayland sessions (GNOME,
-# KDE, wlroots). ydotool is a userland alternative that works on any
-# Wayland compositor but requires a systemd service + uinput group.
-# We install BOTH for Wayland so the paste code path can fall through.
+# X11: xdotool handles key injection and wmctrl handles window
+# activation/raising. Wayland: xdotool/wmctrl only work for XWayland
+# windows, while wtype/ydotool cover native Wayland compositors.
+# We therefore install the full compatible set for the detected session
+# so runtime focus + paste flows match macOS semantics as closely as
+# Linux allows.
 print_step "Detecting display server..."
 DISPLAY_SERVER="unknown"
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
@@ -133,15 +134,19 @@ if [ -n "${WAYLAND_DISPLAY:-}" ]; then
 elif [ -n "${DISPLAY:-}" ]; then
   DISPLAY_SERVER="x11"
 fi
+HAS_X11_COMPAT=0
+if [ -n "${DISPLAY:-}" ]; then
+  HAS_X11_COMPAT=1
+fi
 print_ok "Display server: $DISPLAY_SERVER"
 
 PASTE_PKGS=""
 case "$DISPLAY_SERVER" in
   x11)
     case "$PM" in
-      apt-get|dnf|zypper) PASTE_PKGS="xdotool" ;;
-      pacman)             PASTE_PKGS="xdotool" ;;
-      apk)                PASTE_PKGS="xdotool" ;;
+      apt-get|dnf|zypper) PASTE_PKGS="xdotool wmctrl" ;;
+      pacman)             PASTE_PKGS="xdotool wmctrl" ;;
+      apk)                PASTE_PKGS="xdotool wmctrl" ;;
     esac
     ;;
   wayland)
@@ -152,11 +157,14 @@ case "$DISPLAY_SERVER" in
       zypper)  PASTE_PKGS="wtype ydotool" ;;
       apk)     PASTE_PKGS="wtype" ;;  # ydotool may not be in alpine
     esac
+    if [ "$HAS_X11_COMPAT" -eq 1 ]; then
+      PASTE_PKGS="$PASTE_PKGS xdotool wmctrl"
+    fi
     ;;
   *)
-    # Headless / unknown — install xdotool as least-common-denominator;
+    # Headless / unknown — install X11 tooling as least-common-denominator;
     # user can plug in a keyboard-driver later.
-    PASTE_PKGS="xdotool"
+    PASTE_PKGS="xdotool wmctrl"
     ;;
 esac
 

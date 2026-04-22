@@ -2385,7 +2385,13 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
 
 // ── Keyboard Shortcut Picker ────────────────────────────────────────────────
 
-const DEFAULT_SHORTCUTS = { record: "Alt+Left", paste: "Alt+Shift+7" };
+// Cross-platform safe defaults. Function keys F9/F10 have no built-in
+// binding in Chrome/Firefox/Safari, macOS Mission Control, or Windows
+// Explorer — unlike Alt+Left (browser "Back") and Alt+Shift+N (Windows
+// input-language switcher, also impossible to press on US keyboards
+// because Shift+digit produces punctuation). Users can still rebind
+// via Settings → Shortcuts.
+const DEFAULT_SHORTCUTS = { record: "F9", paste: "F10" };
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 
@@ -2435,28 +2441,50 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   if (e.altKey) parts.push("Alt");
   if (e.shiftKey) parts.push("Shift");
 
-  // Map the key. Reject any unrecognised or non-ASCII key so the
-  // caller can surface a clear error. A user pressing Alt+Shift+ж on
-  // a Cyrillic keyboard layout previously produced an accelerator
-  // string Electron's globalShortcut.register would silently reject,
-  // so the hotkey appeared saved in the UI but never fired.
-  const key = e.key;
+  // Prefer KeyboardEvent.code for layout-stable keys so the shortcut
+  // survives non-Latin keyboard layouts and remains consistent across
+  // macOS / Windows / Linux. For punctuation we still accept the
+  // actual emitted ASCII symbol first because Electron accelerators
+  // are defined in terms of symbols, not DOM code names.
+  const code = String(e.code || "").trim();
+  const key = String(e.key || "").trim();
   let mapped: string | null = null;
-  if (key === "ArrowLeft") mapped = "Left";
-  else if (key === "ArrowRight") mapped = "Right";
-  else if (key === "ArrowUp") mapped = "Up";
-  else if (key === "ArrowDown") mapped = "Down";
-  else if (key === " ") mapped = "Space";
-  else if (key === "Enter") mapped = "Enter";
-  else if (key === "Backspace") mapped = "Backspace";
-  else if (key === "Delete") mapped = "Delete";
-  else if (key === "Tab") mapped = "Tab";
-  else if (key === "Escape") mapped = "Escape";
-  else if (/^F\d{1,2}$/.test(key)) mapped = key;
-  else if (
-    key.length === 1 &&
-    /^[A-Za-z0-9!@#$%^&*()[\]{};:'",.<>/?\\|`~\-=_+]$/.test(key)
-  ) mapped = key.toUpperCase();
+  if (/^Key[A-Z]$/.test(code)) mapped = code.slice(3);
+  else if (/^Digit[0-9]$/.test(code)) mapped = code.slice(5);
+  else if (/^Numpad[0-9]$/.test(code)) mapped = `num${code.slice(6)}`;
+  else if (code === "NumpadDecimal") mapped = "numdec";
+  else if (code === "NumpadAdd") mapped = "numadd";
+  else if (code === "NumpadSubtract") mapped = "numsub";
+  else if (code === "NumpadMultiply") mapped = "nummult";
+  else if (code === "NumpadDivide") mapped = "numdiv";
+  else if (key === "ArrowLeft" || code === "ArrowLeft") mapped = "Left";
+  else if (key === "ArrowRight" || code === "ArrowRight") mapped = "Right";
+  else if (key === "ArrowUp" || code === "ArrowUp") mapped = "Up";
+  else if (key === "ArrowDown" || code === "ArrowDown") mapped = "Down";
+  else if (key === " " || code === "Space") mapped = "Space";
+  else if (key === "Enter" || code === "Enter" || code === "NumpadEnter") mapped = "Enter";
+  else if (key === "Backspace" || code === "Backspace") mapped = "Backspace";
+  else if (key === "Delete" || code === "Delete") mapped = "Delete";
+  else if (key === "Insert" || code === "Insert") mapped = "Insert";
+  else if (key === "Home" || code === "Home") mapped = "Home";
+  else if (key === "End" || code === "End") mapped = "End";
+  else if (key === "PageUp" || code === "PageUp") mapped = "PageUp";
+  else if (key === "PageDown" || code === "PageDown") mapped = "PageDown";
+  else if (key === "Tab" || code === "Tab") mapped = "Tab";
+  else if (key === "Escape" || code === "Escape") mapped = "Escape";
+  else if (/^F\d{1,2}$/.test(key)) mapped = key.toUpperCase();
+  else if (key.length === 1 && /^[!@#$%^&*()_+\-=\[\]{}\\|;:'",.<>/?`~]$/.test(key)) mapped = key;
+  else if (code === "Backquote") mapped = "`";
+  else if (code === "Minus") mapped = "-";
+  else if (code === "Equal") mapped = "=";
+  else if (code === "BracketLeft") mapped = "[";
+  else if (code === "BracketRight") mapped = "]";
+  else if (code === "Backslash") mapped = "\\";
+  else if (code === "Semicolon") mapped = ";";
+  else if (code === "Quote") mapped = "'";
+  else if (code === "Comma") mapped = ",";
+  else if (code === "Period") mapped = ".";
+  else if (code === "Slash") mapped = "/";
   if (!mapped) return null;
   parts.push(mapped);
 
@@ -2469,6 +2497,33 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
   const keysSpan = btn.querySelector(".shortcut-keys");
   if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
 }
+
+/**
+ * Poll `window.__transcriptorShortcutStatus` (published by Electron main
+ * after every globalShortcut.register) and toggle a conflict class on
+ * the shortcut buttons. Without this, a shortcut that the OS refused
+ * (already bound by another app) looks "saved" in Settings but does
+ * nothing at all — the user has no way to know.
+ */
+function refreshShortcutConflictState(): void {
+  const status = (window as unknown as {
+    __transcriptorShortcutStatus?: {
+      record?: { active?: string; error?: string };
+      paste?: { active?: string; error?: string };
+    };
+  }).__transcriptorShortcutStatus;
+  if (!status) return;
+  for (const id of ["record", "paste"] as const) {
+    const entry = status[id];
+    if (!entry) continue;
+    const btn = document.getElementById(`shortcut${id[0].toUpperCase()}${id.slice(1)}`) as HTMLButtonElement | null;
+    if (!btn) continue;
+    const active = !!entry.active;
+    btn.classList.toggle("shortcut-conflict", !active);
+    btn.title = active ? "" : `Not registered: ${entry.error || "unknown reason"}`;
+  }
+}
+setInterval(refreshShortcutConflictState, 2000);
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
   // Cancel any existing recording
@@ -2509,6 +2564,20 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
 
   if (!activeShortcutBtn) return;
   const id = activeShortcutBtn.dataset.shortcutId;
+  const otherId = id === "record" ? "paste" : "record";
+  // Reject duplicates: if the user rebinds one action to the SAME
+  // accelerator as the other, only one globalShortcut.register call
+  // succeeds (the second overwrites/fails), leaving the first action
+  // silently broken. Surface the conflict and revert instead.
+  if (accelerator === currentShortcuts[otherId as "record" | "paste"]) {
+    showRecordSessionNotice(
+      `That shortcut is already bound to "${otherId === "record" ? "Record" : "Paste"}". Pick a different combination.`,
+      "warning",
+      6000,
+    );
+    stopShortcutRecording(true);
+    return;
+  }
   if (id === "record") {
     currentShortcuts.record = accelerator;
   } else if (id === "paste") {
@@ -2525,7 +2594,7 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
   queueUiPreferencesSave();
 
   // Signal the Electron main process to reload shortcuts
-  (window as any).__transcriptorPendingShortcuts = {
+  (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
     record: currentShortcuts.record,
     paste: currentShortcuts.paste,
   };

@@ -2479,6 +2479,17 @@ textarea:focus-visible,
   50% { box-shadow: 0 0 0 4px rgba(108, 144, 198, 0.35); }
 }
 
+/* Shortcut conflict indicator — shown when Electron main could not
+ * register the accelerator (already claimed by another app, malformed
+ * string, OS reservation). Hover for the exact reason in `.title`. */
+.shortcut-btn.shortcut-conflict {
+  border-color: var(--status-error, #c54646);
+  box-shadow: 0 0 0 1px var(--status-error, #c54646) inset;
+}
+.shortcut-btn.shortcut-conflict .shortcut-keys {
+  color: var(--status-error, #c54646);
+}
+
 .shortcut-keys {
   font-family: "SF Mono", "Menlo", "Monaco", monospace;
   font-size: 12.5px;

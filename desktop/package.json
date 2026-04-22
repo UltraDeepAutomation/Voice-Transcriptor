@@ -24,7 +24,9 @@
     "afterPack": "./afterPack.js",
     "files": [
       "main.js",
-      "package.json"
+      "package.json",
+      "icon.png",
+      "icon.ico"
     ],
     "extraResources": [
       {

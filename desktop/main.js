@@ -2639,6 +2639,195 @@ function openPrivacyAutomationSettings() {
   }).catch(() => { });
 }
 
+function isLinuxWaylandSession() {
+  return process.platform === "linux" && !!process.env.WAYLAND_DISPLAY;
+}
+
+function hasLinuxX11Session() {
+  return process.platform === "linux" && !!process.env.DISPLAY;
+}
+
+function normalizeLinuxWindowId(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  const parsed = raw.startsWith("0x")
+    ? Number.parseInt(raw.slice(2), 16)
+    : Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return "";
+  return `0x${parsed.toString(16)}`;
+}
+
+function linuxWindowIdToDecimal(value) {
+  const normalized = normalizeLinuxWindowId(value);
+  if (!normalized) return "";
+  const parsed = Number.parseInt(normalized.slice(2), 16);
+  if (!Number.isFinite(parsed) || parsed <= 0) return "";
+  return String(parsed);
+}
+
+function parseLinuxWmClass(value) {
+  const raw = String(value || "").trim();
+  const [instanceName = "", className = ""] = raw.split(".", 2);
+  return {
+    wmClass: raw,
+    instanceName: instanceName.trim(),
+    className: className.trim(),
+  };
+}
+
+function normalizeLinuxMatchValue(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function scoreLinuxTargetCandidate(candidate, target) {
+  const c = normalizeLinuxMatchValue(candidate);
+  const t = normalizeLinuxMatchValue(target);
+  if (!c || !t) return 0;
+  if (c === t) return 40;
+  if (c.startsWith(`${t}.`) || c.endsWith(`.${t}`)) return 32;
+  if (c.includes(t)) return 24;
+  if (t.includes(c) && c.length >= 4) return 12;
+  return 0;
+}
+
+async function getLinuxProcessName(pid) {
+  const n = Number(pid || 0);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const res = await runCommand("ps", ["-p", String(Math.trunc(n)), "-o", "comm="], {
+    timeoutMs: 1500
+  });
+  if (!res.ok) return "";
+  return String(res.stdout || "").trim();
+}
+
+async function listLinuxWindows() {
+  if (!hasLinuxX11Session()) return [];
+  const res = await runCommand("wmctrl", ["-lpGx"], { timeoutMs: 2000 });
+  if (!res.ok) return [];
+  const windows = [];
+  const lines = String(res.stdout || "").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const m = trimmed.match(/^(0x[0-9a-fA-F]+)\s+(-?\d+)\s+(\d+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s*(.*)$/);
+    if (!m) continue;
+    const wmClassInfo = parseLinuxWmClass(m[9]);
+    windows.push({
+      windowId: normalizeLinuxWindowId(m[1]),
+      desktop: Number.parseInt(m[2], 10) || 0,
+      pid: Number.parseInt(m[3], 10) || 0,
+      host: String(m[8] || "").trim(),
+      wmClass: wmClassInfo.wmClass,
+      instanceName: wmClassInfo.instanceName,
+      className: wmClassInfo.className,
+      title: String(m[10] || "").trim(),
+    });
+  }
+  return windows;
+}
+
+function pickLinuxTargetName(windowInfo, processName = "") {
+  const className = String(windowInfo?.className || "").trim();
+  if (className) return className;
+  const instanceName = String(windowInfo?.instanceName || "").trim();
+  if (instanceName) return instanceName;
+  const proc = String(processName || "").trim();
+  if (proc) return proc;
+  return String(windowInfo?.title || "").trim();
+}
+
+function scoreLinuxWindowMatch(windowInfo, targetName) {
+  const weightedFields = [
+    { value: windowInfo?.className, weight: 400 },
+    { value: windowInfo?.instanceName, weight: 340 },
+    { value: windowInfo?.wmClass, weight: 280 },
+    { value: windowInfo?.title, weight: 180 },
+  ];
+  let best = 0;
+  for (const field of weightedFields) {
+    const score = scoreLinuxTargetCandidate(field.value, targetName);
+    if (score > 0) {
+      best = Math.max(best, field.weight + score);
+    }
+  }
+  return best;
+}
+
+async function findLinuxWindowByPid(pid) {
+  const n = Number(pid || 0);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const windows = await listLinuxWindows();
+  const matches = windows.filter((w) => Number(w.pid || 0) === Math.trunc(n));
+  if (matches.length === 0) return null;
+  return matches.sort((a, b) => {
+    const aScore = (a.title ? 10 : 0) + (a.className ? 5 : 0);
+    const bScore = (b.title ? 10 : 0) + (b.className ? 5 : 0);
+    return bScore - aScore;
+  })[0] || null;
+}
+
+async function findLinuxWindowByName(name) {
+  const targetName = String(name || "").trim();
+  if (!targetName) return null;
+  const windows = await listLinuxWindows();
+  let bestWindow = null;
+  let bestScore = 0;
+  for (const winInfo of windows) {
+    const score = scoreLinuxWindowMatch(winInfo, targetName);
+    if (score > bestScore) {
+      bestScore = score;
+      bestWindow = winInfo;
+    }
+  }
+  return bestWindow;
+}
+
+async function activateLinuxWindowById(windowId) {
+  const normalizedId = normalizeLinuxWindowId(windowId);
+  if (!normalizedId || !hasLinuxX11Session()) return false;
+  const wmctrlRes = await runCommand("wmctrl", ["-ia", normalizedId], { timeoutMs: 1500 });
+  if (wmctrlRes.ok) {
+    await sleep(180);
+    return true;
+  }
+  const decimalId = linuxWindowIdToDecimal(normalizedId);
+  if (!decimalId) return false;
+  const xdotoolRes = await runCommand("xdotool", ["windowactivate", "--sync", decimalId], {
+    timeoutMs: 1500
+  });
+  if (!xdotoolRes.ok) return false;
+  await sleep(180);
+  return true;
+}
+
+async function getLinuxFrontmostAppInfo() {
+  if (!hasLinuxX11Session()) return { name: "", pid: 0 };
+  const activeRes = await runCommand("xdotool", ["getactivewindow"], { timeoutMs: 1500 });
+  if (!activeRes.ok) return { name: "", pid: 0 };
+  const activeWindowId = normalizeLinuxWindowId(activeRes.stdout || "");
+  if (!activeWindowId) return { name: "", pid: 0 };
+  const windows = await listLinuxWindows();
+  const winInfo = windows.find((w) => w.windowId === activeWindowId) || null;
+  const activeWindowDec = linuxWindowIdToDecimal(activeWindowId);
+  let pid = Number(winInfo?.pid || 0);
+  if (pid <= 0 && activeWindowDec) {
+    const pidRes = await runCommand("xdotool", ["getwindowpid", activeWindowDec], { timeoutMs: 1500 });
+    if (pidRes.ok) {
+      pid = Number.parseInt(String(pidRes.stdout || "").trim(), 10) || 0;
+    }
+  }
+  let title = String(winInfo?.title || "").trim();
+  if (!title && activeWindowDec) {
+    const titleRes = await runCommand("xdotool", ["getwindowname", activeWindowDec], { timeoutMs: 1500 });
+    if (titleRes.ok) {
+      title = String(titleRes.stdout || "").trim();
+    }
+  }
+  const processName = pid > 0 ? await getLinuxProcessName(pid) : "";
+  const name = pickLinuxTargetName({ ...winInfo, title }, processName);
+  return { name, pid };
+}
+
 async function getFrontmostAppInfo() {
   if (process.platform === "win32") {
     const pwsh = `
@@ -2664,6 +2853,9 @@ async function getFrontmostAppInfo() {
       name: String(name || "").trim(),
       pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0
     };
+  }
+  if (process.platform === "linux") {
+    return getLinuxFrontmostAppInfo();
   }
   const script = `
     tell application "System Events"
@@ -2715,6 +2907,11 @@ async function activateAppByName(name) {
     await sleep(350);
     return true;
   }
+  if (process.platform === "linux") {
+    const winInfo = await findLinuxWindowByName(appName);
+    if (!winInfo) return false;
+    return activateLinuxWindowById(winInfo.windowId);
+  }
   const escaped = escapeAppleScriptString(appName);
   const res = await runCommand("osascript", ["-e", `tell application "${escaped}" to activate`], {
     timeoutMs: 5000
@@ -2745,6 +2942,11 @@ async function activateAppByPid(pid) {
     const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
     if (!res.ok) return false;
     return String(res.stdout || "").trim() === "1";
+  }
+  if (process.platform === "linux") {
+    const winInfo = await findLinuxWindowByPid(n);
+    if (!winInfo) return false;
+    return activateLinuxWindowById(winInfo.windowId);
   }
   const script = `
     tell application "System Events"
@@ -3124,9 +3326,23 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         lastReason = `vbs-error: ${e?.message || e}`;
       }
 
-      // Fallback: lightweight PowerShell (no C# compilation)
+      // Fallback: lightweight PowerShell (no C# compilation).
+      // Activate the captured target PID FIRST via SetForegroundWindow
+      // — otherwise SendKeys fires at whatever has focus when the
+      // hotkey was pressed (typically the overlay itself), and the
+      // text lands in the wrong window.
       if (attempt === 2) {
-        const pwshSimple = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
+        const pidNum = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
+        const safePid = (Number.isFinite(pidNum) && pidNum > 0 && pidNum < 2 ** 31) ? Math.trunc(pidNum) : 0;
+        const activateBlock = safePid > 0 ? (
+          `Add-Type @\"\n` +
+          `using System;\n` +
+          `using System.Runtime.InteropServices;\n` +
+          `public class W { [DllImport(\\"user32.dll\\")] public static extern bool SetForegroundWindow(IntPtr h); }\n` +
+          `\"@;\n` +
+          `try { $p = Get-Process -Id ${safePid} -ErrorAction Stop; [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
+        ) : "";
+        const pwshSimple = `${activateBlock}Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
         const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], { timeoutMs: 3000 });
         if (fallback.ok && (fallback.stdout || "").includes("OK:")) {
           traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1 });
@@ -3177,14 +3393,12 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "linux_paste" });
       traceStep(trace, "method_begin", { method: "linux_paste", attempt: attempt + 1, wayland: isWayland });
 
-      // Try to focus the target window on X11 (wmctrl is X11-only).
-      // Skip on pure Wayland to avoid spawning a process that will fail.
-      if (hasX11 && effectiveTargetName) {
-        const sanitized = String(effectiveTargetName).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 120);
-        if (sanitized) {
-          await runCommand("wmctrl", ["-a", sanitized], { timeoutMs: 800 }).catch(() => {});
-          await sleep(60);
-        }
+      if (effectiveTargetPid > 0) {
+        await activateAppByPid(effectiveTargetPid).catch(() => false);
+        await sleep(60);
+      } else if (effectiveTargetName) {
+        await activateAppByName(effectiveTargetName).catch(() => false);
+        await sleep(60);
       }
 
       // Build ordered cascade for the detected session type.
@@ -3404,13 +3618,62 @@ async function sendCommandEnterToFocusedApp(targetAppName = "", targetAppPid = 0
   if (process.platform === "win32") {
       const pwsh = `
         Add-Type -AssemblyName System.Windows.Forms
-        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        [System.Windows.Forms.SendKeys]::SendWait("^{ENTER}")
       `;
       const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 3200 });
       if (res.ok) {
-        return { ok: true, reason: "powershell-enter-sent" };
+        return { ok: true, reason: "powershell-ctrl-enter-sent" };
       }
-      return { ok: false, reason: String(res.stderr || res.stdout || "powershell-enter-failed") };
+      return { ok: false, reason: String(res.stderr || res.stdout || "powershell-ctrl-enter-failed") };
+  }
+
+  if (process.platform === "linux") {
+    const attempts = [];
+    if (isLinuxWaylandSession()) {
+      attempts.push({
+        method: "wtype-ctrl-enter",
+        cmd: "wtype",
+        args: ["-M", "ctrl", "-P", "Return", "-p", "Return", "-m", "ctrl"],
+        timeoutMs: 2000,
+      });
+      attempts.push({
+        method: "ydotool-ctrl-enter",
+        cmd: "ydotool",
+        args: ["key", "29:1", "28:1", "28:0", "29:0"],
+        timeoutMs: 2000,
+      });
+      if (hasLinuxX11Session()) {
+        attempts.push({
+          method: "xdotool-ctrl-enter",
+          cmd: "xdotool",
+          args: ["key", "--clearmodifiers", "ctrl+Return"],
+          timeoutMs: 2000,
+        });
+      }
+    } else {
+      attempts.push({
+        method: "xdotool-ctrl-enter",
+        cmd: "xdotool",
+        args: ["key", "--clearmodifiers", "ctrl+Return"],
+        timeoutMs: 2000,
+      });
+      attempts.push({
+        method: "ydotool-ctrl-enter",
+        cmd: "ydotool",
+        args: ["key", "29:1", "28:1", "28:0", "29:0"],
+        timeoutMs: 2000,
+      });
+    }
+
+    let lastReason = "linux-ctrl-enter-no-attempt";
+    for (const attempt of attempts) {
+      const res = await runCommand(attempt.cmd, attempt.args, { timeoutMs: attempt.timeoutMs });
+      if (res.ok) {
+        return { ok: true, reason: attempt.method };
+      }
+      lastReason = String(res.stderr || res.stdout || `${attempt.method}-failed`).trim();
+    }
+    return { ok: false, reason: lastReason };
   }
 
   const primary = `
@@ -4409,6 +4672,14 @@ async function createWindow(options = {}) {
     return;
   }
 
+  // Window icon for Windows taskbar + Linux panel. On macOS the dock
+  // icon comes from the .app bundle's Info.plist (set by electron-builder
+  // via mac.icon), so no runtime assignment is needed there. On Windows
+  // the BrowserWindow takes an .ico (multi-resolution); the .png is
+  // used on Linux.
+  const appIconPath = process.platform === "win32"
+    ? path.join(__dirname, "icon.ico")
+    : path.join(__dirname, "icon.png");
   win = new BrowserWindow({
     width: 1420,
     height: 780,
@@ -4416,8 +4687,9 @@ async function createWindow(options = {}) {
     minHeight: 700,
     backgroundColor: "#1a1a1a",
     title: "Transcriptor",
-    titleBarStyle: "hiddenInset",
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     trafficLightPosition: { x: 14, y: 14 },
+    icon: process.platform !== "darwin" ? appIconPath : undefined,
     show: false,
     webPreferences: {
       contextIsolation: true,
@@ -4826,7 +5098,9 @@ app.whenReady().then(async () => {
   let registeredPasteHotkey = "";
 
   function readShortcutsFromConfig() {
-    const defaults = { record: "Alt+Left", paste: "Alt+Shift+7" };
+    // Must match DEFAULT_SHORTCUTS in frontend/src/main.tsx. F9/F10 are
+    // cross-platform-safe: no built-in app binding on Win/Mac/Linux.
+    const defaults = { record: "F9", paste: "F10" };
     try {
       const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
       const cfgPath = path.join(dataDir, "config.json");
