@@ -2612,7 +2612,11 @@ def _run_remote_transcribe_once(
             "raw": out.get("raw"),
         }
 
-    raise Exception(f"Unknown provider: {prov}")
+    # Bad input → ValueError (translates to HTTP 400 at the endpoints).
+    # Bare Exception would have been caught by the generic "Remote
+    # transcription failed" branch and surfaced as 500, misleading
+    # the client into retrying an unrecoverable validation error.
+    raise ValueError(f"Unknown provider: {prov!r}")
 
 
 @app.post("/api/remote/jobs")
@@ -2670,6 +2674,8 @@ async def create_remote_job(
                     "txt": str(result_txt_path),
                 },
             )
+        except ValueError as e:
+            jobs.set_error(job_id, f"bad_request: {e}")
         except (OpenRouterError, DeepgramRemoteError) as e:
             jobs.set_error(job_id, str(e))
         except Exception as e:
@@ -2739,6 +2745,8 @@ async def remote_transcribe_sync(
             ),
         )
         return {"ok": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except (OpenRouterError, DeepgramRemoteError) as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
@@ -3040,9 +3048,24 @@ def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
             detail="No folder picker available. Install 'zenity' or 'kdialog' "
                    "(sudo apt install zenity) and try again, or type the path manually.",
         )
+    # Force UTF-8 encoding on Windows. PowerShell's default stdout
+    # encoding is the system OEM/ANSI codepage (cp1252/cp1251/cp932)
+    # unless $OutputEncoding is set. Without forcing UTF-8 on BOTH the
+    # producer (PowerShell) and consumer (subprocess.run) sides, a
+    # folder path containing Cyrillic/CJK/accented chars is mojibaked
+    # into unreadable bytes — Path().resolve() then either raises or
+    # points at a phantom directory.
+    if kind == "win":
+        cmd = list(cmd)
+        cmd[-1] = (
+            "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            + cmd[-1]
+        )
     try:
         result = subprocess.run(
             cmd, check=True, capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="folder picker timed out")

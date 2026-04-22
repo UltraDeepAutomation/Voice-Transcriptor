@@ -156,8 +156,15 @@ body {
   border-right: 1px solid var(--line);
   display: flex;
   flex-direction: column;
-  padding: 56px 12px 14px;
+  /* Default padding for platforms with a native title bar
+   * (Windows/Linux). macOS uses titleBarStyle: "hiddenInset" which
+   * overlays traffic-light controls on the first ~40px of content;
+   * the body.platform-darwin override below reserves space for them. */
+  padding: 14px 12px 14px;
   -webkit-app-region: drag;
+}
+body.platform-darwin .sidebar {
+  padding-top: 56px;
 }
 
 .sb-nav {

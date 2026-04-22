@@ -1956,21 +1956,18 @@ function scheduleLocalWarmup(): void {
   });
 }
 
+// Formerly toggled between "live recording" and "file upload" modes
+// based on a switch that no longer exists — live mode is the only
+// supported surface. Keep the DOM-visibility side effects so existing
+// callers don't need to change; the dead upload-mode branches are
+// removed.
 function syncMode(): void {
-  const live = true;
-
-  $("livePane").hidden = !live;
-  $("splitGap").hidden = !live;
-  $("waveCanvas").hidden = !live;
-  $("uploadPanel").hidden = live;
-  $("btnStart").style.display = live ? "inline-flex" : "none";
-
-  if (!live && isRecording) {
-    void stopLive(false);
-  }
-  if (live) {
-    setSelectedFile(null);
-  }
+  $("livePane").hidden = false;
+  $("splitGap").hidden = false;
+  $("waveCanvas").hidden = false;
+  $("uploadPanel").hidden = true;
+  $("btnStart").style.display = "inline-flex";
+  setSelectedFile(null);
 }
 
 function setNetworkState(online: boolean, latencyMs: number | null = null): void {
@@ -2747,7 +2744,13 @@ function openUpscalePromptModal(): void {
   openModal("upscalePromptModal", "#upscalePromptInstructionInput");
 }
 
+let upscalePromptSaveCloseTimer: number | null = null;
+
 function closeUpscalePromptModal(): void {
+  if (upscalePromptSaveCloseTimer !== null) {
+    clearTimeout(upscalePromptSaveCloseTimer);
+    upscalePromptSaveCloseTimer = null;
+  }
   closeModal("upscalePromptModal");
 }
 
@@ -3050,11 +3053,32 @@ async function loadCfg(): Promise<void> {
     }
     await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
-    // Load keyboard shortcuts
-    if (ui.shortcut_record) currentShortcuts.record = ui.shortcut_record;
-    if (ui.shortcut_paste) currentShortcuts.paste = ui.shortcut_paste;
+    // Load keyboard shortcuts, migrating deprecated 1.0-alpha defaults.
+    // Alt+Left silently hijacked the browser "Back" navigation; Alt+Shift+7
+    // is literally unpressable on US/UK layouts (Shift+7 produces '&'
+    // not '7') and collides with the Windows Alt+Shift input-language
+    // switcher. Users upgrading from a build where those were defaults
+    // must be migrated to the new F9/F10 defaults, otherwise their
+    // persisted config values ride forward and the shortcut feature
+    // remains broken for them forever.
+    const LEGACY_DEPRECATED_SHORTCUTS = new Set(["Alt+Left", "Alt+Shift+7"]);
+    const rawRecord = String(ui.shortcut_record || "").trim();
+    const rawPaste = String(ui.shortcut_paste || "").trim();
+    const recordIsLegacy = rawRecord && LEGACY_DEPRECATED_SHORTCUTS.has(rawRecord);
+    const pasteIsLegacy = rawPaste && LEGACY_DEPRECATED_SHORTCUTS.has(rawPaste);
+    if (rawRecord && !recordIsLegacy) currentShortcuts.record = rawRecord;
+    if (rawPaste && !pasteIsLegacy) currentShortcuts.paste = rawPaste;
     updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
     updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
+    if (recordIsLegacy || pasteIsLegacy) {
+      // Persist the migration so Electron's shortcut poll picks up the
+      // new defaults and the user doesn't re-migrate every launch.
+      (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
+        record: currentShortcuts.record,
+        paste: currentShortcuts.paste,
+      };
+      queueUiPreferencesSave();
+    }
   } catch (configError) {
     console.warn("Initial config load failed, retrying with built-in preset", configError);
     try {
@@ -3200,7 +3224,15 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
       await loadUpscalePresets(presetId);
       queueUiPreferencesSave();
       msg.textContent = "Saved";
-      setTimeout(() => closeUpscalePromptModal(), 220);
+      // Cancellable — closeUpscalePromptModal clears this handle if the
+      // user dismisses the modal manually (Esc, click-outside) before
+      // the 220ms elapses, preventing the timer from firing on an
+      // already-closed or freshly-reopened modal.
+      if (upscalePromptSaveCloseTimer !== null) clearTimeout(upscalePromptSaveCloseTimer);
+      upscalePromptSaveCloseTimer = window.setTimeout(() => {
+        upscalePromptSaveCloseTimer = null;
+        closeUpscalePromptModal();
+      }, 220);
     })
     .catch((e: Error) => {
       msg.textContent = e.message;
@@ -7187,6 +7219,17 @@ recordingsBootstrapPromise = Promise.race([
 ])
   .catch((e) => { console.warn("[bootstrap]", e?.message ?? e); })
   .finally(() => { recordingsBootstrapPromise = null; });
+// Platform marker on <body> so the stylesheet can gate macOS-specific
+// chrome offsets (traffic-light padding under hiddenInset). Without
+// this, Windows/Linux users see a 42px dead zone at the top of the
+// sidebar reserved for a title-bar area their OS already renders.
+try {
+  const ua = String(navigator.userAgent || "").toLowerCase();
+  const platform = ua.includes("mac os x") || ua.includes("macintosh")
+    ? "darwin"
+    : (ua.includes("windows") ? "win32" : "linux");
+  document.body.classList.add(`platform-${platform}`);
+} catch { /* non-browser contexts — harmless */ }
 draw();
 syncMode();
 setStatus("Idle");

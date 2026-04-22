@@ -135,7 +135,12 @@ const OVERLAY_TOKENS = Object.freeze({
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
-  app.quit();
+  // app.quit() is async and allows module-level code to keep running
+  // (startBackend, BrowserWindow creation, globalShortcut registration),
+  // so the duplicate instance briefly races the primary for port 8321
+  // and the F9/F10 hotkeys before finally exiting. app.exit(0) is
+  // synchronous — nothing after this line runs.
+  app.exit(0);
 }
 
 app.on("second-instance", () => {
@@ -2577,22 +2582,27 @@ function escapeAppleScriptString(s) {
 function isBadActivationTarget(name) {
   const n = String(name || "").trim().toLowerCase();
   if (!n) return true;
-  return (
-    n === "electron" ||
-    n === "electron helper" ||
-    n.includes("electron helper") ||
-    n.includes("helper (renderer)") ||
-    n.includes("helper (gpu)") ||
-    n.includes("helper (plugin)") ||
-    n.includes("transcriptor")
-  );
+  // Exact matches only for our own process family. Previous substring
+  // check on "transcriptor" would exclude third-party apps whose name
+  // or window title contains the word (e.g. "Audio Transcriptor Pro",
+  // a browser tab titled "Transcriptor tutorial", another voice tool).
+  // Electron helpers have deterministic suffixes that substring match
+  // is correct for.
+  if (n === "electron" || n === "transcriptor" || n === "transcriptor helper") return true;
+  if (n.includes("helper (renderer)") ||
+      n.includes("helper (gpu)") ||
+      n.includes("helper (plugin)") ||
+      n.includes("electron helper")) return true;
+  return false;
 }
 
 function shouldUsePasteTarget(front) {
   const pid = Number(front?.pid || 0);
   const name = String(front?.name || "").trim().toLowerCase();
   if (pid > 0 && pid === process.pid) return false;
-  if (name.includes("transcriptor")) return false;
+  // Exact match for our own app; substring would block legitimate
+  // third-party apps with "transcriptor" in their window title.
+  if (name === "transcriptor" || name === "transcriptor helper") return false;
   if (!name && pid <= 0) return false;
   return true;
 }
@@ -3334,12 +3344,19 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       if (attempt === 2) {
         const pidNum = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
         const safePid = (Number.isFinite(pidNum) && pidNum > 0 && pidNum < 2 ** 31) ? Math.trunc(pidNum) : 0;
+        // Inside a JS template literal (backtick-delimited), `"` is not
+        // a special character and MUST NOT be escaped. The over-escaped
+        // `\\"user32.dll\\"` version produced literal `\"user32.dll\"`
+        // in the PowerShell source, which was then invalid C# inside
+        // Add-Type (CS1056: unexpected character '\'). See the sibling
+        // PowerShell blocks in getFrontmostAppInfo / getFrontmostAppName
+        // for the correct unescaped form.
         const activateBlock = safePid > 0 ? (
-          `Add-Type @\"\n` +
+          `Add-Type @"\n` +
           `using System;\n` +
           `using System.Runtime.InteropServices;\n` +
-          `public class W { [DllImport(\\"user32.dll\\")] public static extern bool SetForegroundWindow(IntPtr h); }\n` +
-          `\"@;\n` +
+          `public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }\n` +
+          `"@;\n` +
           `try { $p = Get-Process -Id ${safePid} -ErrorAction Stop; [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
         ) : "";
         const pwshSimple = `${activateBlock}Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
