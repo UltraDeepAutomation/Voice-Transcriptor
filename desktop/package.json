@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Transcriptor",
   "private": true,

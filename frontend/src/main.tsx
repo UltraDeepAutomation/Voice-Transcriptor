@@ -953,6 +953,41 @@ function syncKeyActionButton(provider: KeyProvider): void {
 // Auto-stop silence detection is handled exclusively by the overlay main process
 // (desktop/main.js showRecordingOverlay waveMonitor). No frontend-side auto-stop.
 
+/**
+ * Translate a raw fetch/network error into a user-actionable message.
+ *
+ * The native "Failed to fetch" / "NetworkError when attempting to
+ * fetch" / "ECONNREFUSED" strings are developer jargon. End users need
+ * to know: (1) is the internet down, (2) is the provider blocked, or
+ * (3) is our local backend dead. This helper inspects the error and
+ * surfaces one of those three actionable diagnoses.
+ */
+function explainNetworkError(err: unknown, context = ""): string {
+  const raw = String((err as Error)?.message || err || "").trim();
+  const low = raw.toLowerCase();
+  const isFetchFail =
+    low === "failed to fetch" ||
+    low.includes("networkerror") ||
+    low.includes("typeerror: fetch") ||
+    low.includes("load failed") ||
+    low.includes("err_internet_disconnected") ||
+    low.includes("err_name_not_resolved") ||
+    low.includes("err_connection_refused") ||
+    low.includes("err_connection_reset");
+  if (!isFetchFail) return raw;
+  const online = typeof navigator !== "undefined" ? navigator.onLine : true;
+  if (!online) {
+    return context
+      ? `${context}: the computer appears to be offline. Check your internet connection and try again.`
+      : "The computer appears to be offline. Check your internet connection and try again.";
+  }
+  // Online but request failed — could be our backend, or the provider
+  // (Deepgram/OpenRouter). Give the user the most likely fix.
+  return context
+    ? `${context}: the network request failed. If this is a remote provider (Deepgram/OpenRouter), it may be unreachable from your region — try a VPN, or switch Provider to "local" in Settings.`
+    : "Network request failed. If this is a remote provider, it may be unreachable from your region — try a VPN, or switch Provider to \"local\" in Settings.";
+}
+
 async function parseError(r: Response): Promise<string> {
   let details = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
   try {
@@ -4083,7 +4118,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
       $("finalOutput").textContent = "Re-transcribe returned empty result.";
     }
   } catch (e) {
-    $("finalOutput").textContent = `Re-transcribe failed: ${(e as Error).message || e}`;
+    $("finalOutput").textContent = explainNetworkError(e, "Re-transcribe failed");
   } finally {
     btn.disabled = false;
     btn.classList.remove("is-busy");

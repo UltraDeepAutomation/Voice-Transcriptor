@@ -35,6 +35,14 @@ let overlayWaveMonitor = null;
 let overlayLoaded = false;
 let tray = null;
 let backendBootError = "";
+// Ring buffer of the last ~4 KB of backend stderr. When the fallback
+// HTML fires "Backend did not start in time" / "exited with code N
+// after 8 restart attempts", we include the tail of stderr so the user
+// and support can SEE what actually failed — ImportError, missing
+// module, module-level crash, port collision, etc. Without this the
+// error page is actionable only by a developer with log-file access.
+let backendStderrTail = "";
+const BACKEND_STDERR_TAIL_MAX = 4096;
 let isQuitting = false;
 let shortcutToggleInFlight = false;
 let pasteTargetAppName = "";
@@ -4600,6 +4608,10 @@ async function startBackend() {
   backend.stderr.on("data", (d) => {
     const msg = d.toString();
     appendMainLog(`[backend-stderr] ${compactLogText(msg, 1400)}`);
+    // Keep the last ~4 KB of stderr so the fallback error page can
+    // show the actual failure reason instead of a generic "did not
+    // start in time" message.
+    backendStderrTail = (backendStderrTail + msg).slice(-BACKEND_STDERR_TAIL_MAX);
   });
 
   backend.on("exit", (code) => {
@@ -4888,9 +4900,11 @@ async function createWindow(options = {}) {
       win.focus();
     }
   } catch (err) {
+    const stderrTail = (backendStderrTail || "").trim();
     const details = [
       err.message,
       backendBootError,
+      stderrTail ? `— Backend stderr (last ${stderrTail.length} chars) —\n${stderrTail}` : "",
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -4930,8 +4944,9 @@ async function createWindow(options = {}) {
       );
     }
     await win.loadURL(
-      `data:text/html,${encodeURIComponent(`
+      `data:text/html;charset=utf-8,${encodeURIComponent(`
       <html>
+        <head><meta charset="utf-8"></head>
         <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system,Segoe UI,Arial;padding:28px;line-height:1.6">
           <h2 style="margin:0 0 16px 0">Transcriptor — Backend startup failed</h2>
           <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333;margin-bottom:20px">${escapeHtml(details)}</pre>
