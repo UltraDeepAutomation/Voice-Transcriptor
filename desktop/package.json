@@ -131,14 +131,7 @@
       "synopsis": "Voice-to-text transcription with auto-paste",
       "desktop": {
         "StartupWMClass": "Transcriptor"
-      },
-      "extraResources": [
-        {
-          "from": "runtime/linux-x64",
-          "to": "runtime",
-          "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
-        }
-      ]
+      }
     },
     "nsis": {
       "oneClick": true,
