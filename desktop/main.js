@@ -4376,8 +4376,64 @@ async function ensureAppVenv(repoRoot) {
   return null;
 }
 
+/**
+ * Absolute path to the bundled Python interpreter that ships with the
+ * installer, or null if not present (dev checkout or prior releases).
+ *
+ * When the app is packaged by electron-builder with the bundled runtime,
+ * extraResources places the Python install at
+ * `process.resourcesPath/runtime/python/`. Windows layout:
+ *   runtime/python/python.exe
+ * Unix layout:
+ *   runtime/python/bin/python3
+ *
+ * The bundled runtime contains Python 3.12 + all requirements.txt deps
+ * pre-installed into site-packages + a static ffmpeg binary. Using it
+ * means zero user setup — no winget install, no pip, no internet.
+ */
+function getBundledPythonPath() {
+  const resDir = (typeof process !== "undefined" && process.resourcesPath) || "";
+  if (!resDir) return null;
+  const candidate = process.platform === "win32"
+    ? path.join(resDir, "runtime", "python", "python.exe")
+    : path.join(resDir, "runtime", "python", "bin", "python3");
+  return fileExists(candidate) ? candidate : null;
+}
+
+/**
+ * Absolute path to the bundled ffmpeg binary, or null if not bundled.
+ * Appended to PATH when the backend is spawned so audio conversion
+ * works offline without a system ffmpeg install.
+ */
+function getBundledFfmpegDir() {
+  const resDir = (typeof process !== "undefined" && process.resourcesPath) || "";
+  if (!resDir) return null;
+  const dir = path.join(resDir, "runtime", "ffmpeg", "bin");
+  const ffmpeg = process.platform === "win32"
+    ? path.join(dir, "ffmpeg.exe")
+    : path.join(dir, "ffmpeg");
+  return fileExists(ffmpeg) ? dir : null;
+}
+
 async function resolvePython(repoRoot) {
-  // 1) Try app venv (highest priority)
+  // 0) Bundled runtime (ships with release installer). Preferred over
+  // everything else because it is known-good + fully self-contained —
+  // the user doesn't need a system Python, a venv, pip, or network
+  // access to first-launch the app.
+  const bundled = getBundledPythonPath();
+  if (bundled) {
+    const check = await runCommand(bundled, ["-c", "import sys; print(sys.executable)"], {
+      cwd: repoRoot, timeoutMs: 8000
+    });
+    if (check.ok) {
+      appendMainLog(`[resolvePython] using bundled runtime: ${bundled}`);
+      return bundled;
+    }
+    appendMainLog(`[resolvePython] bundled runtime failed probe: ${(check.stderr || "").trim()}`);
+  }
+
+  // 1) Try app venv (used by install scripts on Mac/Linux when user
+  // ran setup.command/setup.sh; older Windows installs prior to 1.1.0).
   const appVenvPy = process.platform === "win32"
     ? path.join(getAppVenvDir(), "Scripts", "python.exe")
     : path.join(getAppVenvDir(), "bin", "python3");
@@ -4399,7 +4455,8 @@ async function resolvePython(repoRoot) {
     if (check.ok) return (check.stdout || "").trim() || devVenvPy;
   }
 
-  // 3) Create app venv from system Python
+  // 3) Create app venv from system Python (legacy fallback for
+  // installs without a bundled runtime).
   setBackendBootStatus("Setting up Python environment…");
   const created = await ensureAppVenv(repoRoot);
   if (created) return created;
@@ -4580,11 +4637,20 @@ async function startBackend() {
   //
   // We explicitly NEVER write to backend.stdin; the pipe's sole purpose
   // is liveness signalling via close-on-exit.
+  // Prepend the bundled ffmpeg directory to PATH so backend/audio.py
+  // finds `ffmpeg` for format conversion even on a user system that
+  // has no ffmpeg installed. On dev / non-release runs the bundled
+  // path doesn't exist and we fall through to the existing PATH.
+  const ffmpegDir = getBundledFfmpegDir();
+  const envPath = ffmpegDir
+    ? `${ffmpegDir}${path.delimiter}${process.env.PATH || ""}`
+    : (process.env.PATH || "");
   backend = spawn(python, args, {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
+      PATH: envPath,
       PYTHONUNBUFFERED: "1",
       // path.delimiter is ";" on Windows, ":" elsewhere. Hardcoding
       // ":" caused Windows PYTHONPATH to be malformed, making every

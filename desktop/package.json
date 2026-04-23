@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Transcriptor",
   "private": true,
@@ -22,6 +22,9 @@
     "appId": "local.transcriptor.app",
     "productName": "Transcriptor",
     "afterPack": "./afterPack.js",
+    "asarUnpack": [
+      "runtime/**/*"
+    ],
     "files": [
       "main.js",
       "package.json",
@@ -59,6 +62,13 @@
       "entitlementsInherit": "entitlements.mac.inherit.plist",
       "hardenedRuntime": false,
       "identity": null,
+      "extraResources": [
+        {
+          "from": "runtime/mac-${arch}",
+          "to": "runtime",
+          "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+        }
+      ],
       "target": [
         {
           "target": "dmg",
@@ -100,7 +110,14 @@
       "icon": "icon.ico",
       "publisherName": "Transcriptor",
       "signAndEditExecutable": false,
-      "sign": null
+      "sign": null,
+      "extraResources": [
+        {
+          "from": "runtime/win-x64",
+          "to": "runtime",
+          "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+        }
+      ]
     },
     "linux": {
       "target": [
@@ -114,7 +131,14 @@
       "synopsis": "Voice-to-text transcription with auto-paste",
       "desktop": {
         "StartupWMClass": "Transcriptor"
-      }
+      },
+      "extraResources": [
+        {
+          "from": "runtime/linux-x64",
+          "to": "runtime",
+          "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+        }
+      ]
     },
     "nsis": {
       "oneClick": true,

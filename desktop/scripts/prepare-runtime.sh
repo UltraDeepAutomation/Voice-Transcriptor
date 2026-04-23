@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  prepare-runtime.sh — download & assemble a bundled Python runtime for one
+#  platform of the Transcriptor app.
+#
+#  Output: desktop/runtime/<platform>/ containing
+#    - python/           (standalone cpython install; bin/python3 or python.exe)
+#    - ffmpeg/bin/ffmpeg (static binary, where available)
+#
+#  Usage:  prepare-runtime.sh win-x64
+#          prepare-runtime.sh mac-arm64
+#          prepare-runtime.sh mac-x64
+#          prepare-runtime.sh linux-x64
+#          prepare-runtime.sh all
+#
+#  The script runs on the release host (macOS in our case) and uses
+#  pip's cross-platform install (``--platform`` + ``--only-binary=:all:``)
+#  to download Windows/Linux wheels onto the Mac without executing them.
+# ============================================================================
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+SCRIPT_DIR="$(pwd)"
+ROOT_DIR="$(cd .. && pwd)"
+REQS="${ROOT_DIR}/requirements.txt"
+RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+CACHE_DIR="${SCRIPT_DIR}/runtime/.cache"
+mkdir -p "${RUNTIME_DIR}" "${CACHE_DIR}"
+
+# python-build-standalone tag (pinned so release builds are reproducible).
+PBS_TAG="20260414"
+PBS_PYVER="3.12.13"
+
+# ffmpeg sources.
+FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+FFMPEG_MAC_URL="https://evermeet.cx/ffmpeg/ffmpeg-7.1.zip"
+FFMPEG_LINUX_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+
+log()  { printf '\033[1;36m[prep]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[prep]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[prep]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# -----------------------------------------------------------------------------
+# Download a file to CACHE_DIR once; reuse on subsequent runs.
+# -----------------------------------------------------------------------------
+fetch() {
+  local url="$1" dest="$2"
+  if [ -f "${dest}" ] && [ -s "${dest}" ]; then
+    log "cached  ${dest##*/}"
+    return 0
+  fi
+  log "fetching ${url}"
+  curl -fSL --retry 3 --retry-delay 2 -o "${dest}.part" "${url}"
+  mv "${dest}.part" "${dest}"
+}
+
+# -----------------------------------------------------------------------------
+# Download + extract python-build-standalone for the target triple.
+#   $1 = runtime platform dir (e.g. runtime/win-x64)
+#   $2 = triple (e.g. x86_64-pc-windows-msvc)
+# -----------------------------------------------------------------------------
+install_python() {
+  local out_dir="$1" triple="$2"
+  local tarball="cpython-${PBS_PYVER}+${PBS_TAG}-${triple}-install_only_stripped.tar.gz"
+  local url="https://github.com/indygreg/python-build-standalone/releases/download/${PBS_TAG}/${tarball}"
+  local cached="${CACHE_DIR}/${tarball}"
+  fetch "${url}" "${cached}"
+  rm -rf "${out_dir}"
+  mkdir -p "${out_dir}"
+  log "extracting python for ${triple}"
+  # The tarball already contains a top-level "python/" directory with the
+  # full runtime layout (python.exe + Lib/ on Windows, bin/python3 + lib/
+  # on Unix). Extract as-is so the final path is out_dir/python/...
+  tar -xzf "${cached}" -C "${out_dir}"
+  [ -d "${out_dir}/python" ] || die "expected ${out_dir}/python after extract"
+}
+
+# -----------------------------------------------------------------------------
+# Install all requirements.txt wheels into the bundled Python's site-packages
+# via cross-platform pip download + install-to-target. Falls back to running
+# the bundled Python's own pip when we're on that native platform.
+# -----------------------------------------------------------------------------
+install_wheels() {
+  local out_dir="$1" python_tag="${2:-cp312}"
+  shift 2
+  # All remaining args are --platform values that pip will union.
+  local target_dir
+  if [ -d "${out_dir}/python/Lib/site-packages" ]; then
+    target_dir="${out_dir}/python/Lib/site-packages"
+  elif [ -d "${out_dir}/python/lib/python3.12/site-packages" ]; then
+    target_dir="${out_dir}/python/lib/python3.12/site-packages"
+  else
+    die "could not find site-packages in ${out_dir}/python"
+  fi
+
+  log "installing wheels into ${target_dir#${ROOT_DIR}/}"
+
+  # Multiple --platform flags allowed: pip takes the union of compatible
+  # wheels across all tags. Needed because one dep may ship
+  # manylinux_2_28 wheels (onnxruntime) while another ships only
+  # manylinux_2_17 / manylinux2014 (tokenizers). Without the union,
+  # picking --platform manylinux_2_28_x86_64 alone loses the older-
+  # tagged wheels.
+  local pip_args=(
+    --disable-pip-version-check
+    --no-compile
+    --only-binary=:all:
+    --python-version 3.12
+    --implementation cp
+    --abi "${python_tag}"
+    --target "${target_dir}"
+    --timeout 180
+    --retries 5
+  )
+  for p in "$@"; do
+    pip_args+=(--platform "${p}")
+  done
+  pip_args+=(-r "${REQS}")
+
+  python3 -m pip install "${pip_args[@]}"
+}
+
+# -----------------------------------------------------------------------------
+# Install ffmpeg into out_dir/ffmpeg/bin/ffmpeg(.exe)
+# -----------------------------------------------------------------------------
+install_ffmpeg_win() {
+  local out_dir="$1"
+  local zip="${CACHE_DIR}/ffmpeg-win64.zip"
+  fetch "${FFMPEG_WIN_URL}" "${zip}"
+  rm -rf "${out_dir}/ffmpeg"
+  mkdir -p "${out_dir}/ffmpeg/bin"
+  # Extract only ffmpeg.exe from the archive.
+  local tmp
+  tmp="$(mktemp -d)"
+  unzip -q "${zip}" -d "${tmp}"
+  find "${tmp}" -name "ffmpeg.exe" -exec cp {} "${out_dir}/ffmpeg/bin/ffmpeg.exe" \;
+  rm -rf "${tmp}"
+  [ -f "${out_dir}/ffmpeg/bin/ffmpeg.exe" ] || die "ffmpeg.exe not found in archive"
+  log "ffmpeg.exe installed"
+}
+
+install_ffmpeg_mac() {
+  local out_dir="$1"
+  local zip="${CACHE_DIR}/ffmpeg-mac.zip"
+  fetch "${FFMPEG_MAC_URL}" "${zip}"
+  rm -rf "${out_dir}/ffmpeg"
+  mkdir -p "${out_dir}/ffmpeg/bin"
+  unzip -q -o "${zip}" -d "${out_dir}/ffmpeg/bin/"
+  chmod +x "${out_dir}/ffmpeg/bin/ffmpeg"
+  [ -x "${out_dir}/ffmpeg/bin/ffmpeg" ] || die "ffmpeg binary not executable"
+  log "ffmpeg (mac) installed"
+}
+
+install_ffmpeg_linux() {
+  local out_dir="$1"
+  local tar="${CACHE_DIR}/ffmpeg-linux.tar.xz"
+  fetch "${FFMPEG_LINUX_URL}" "${tar}"
+  rm -rf "${out_dir}/ffmpeg"
+  mkdir -p "${out_dir}/ffmpeg/bin"
+  local tmp
+  tmp="$(mktemp -d)"
+  tar -xJf "${tar}" -C "${tmp}"
+  # `find -executable` is GNU-only; portable check is `-perm -u+x`.
+  # There may be multiple `ffmpeg` entries in the archive (nested
+  # bin/ + symlinks); pick the largest one which is the real binary.
+  local best=""
+  local best_size=0
+  while IFS= read -r -d '' f; do
+    local sz
+    sz=$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f")
+    if [ "$sz" -gt "$best_size" ]; then
+      best="$f"
+      best_size="$sz"
+    fi
+  done < <(find "${tmp}" -name "ffmpeg" -type f -perm -u+x -print0)
+  [ -n "$best" ] || die "ffmpeg binary not found in linux archive"
+  cp "$best" "${out_dir}/ffmpeg/bin/ffmpeg"
+  rm -rf "${tmp}"
+  chmod +x "${out_dir}/ffmpeg/bin/ffmpeg"
+  log "ffmpeg (linux) installed"
+}
+
+# -----------------------------------------------------------------------------
+# Platform recipes
+# -----------------------------------------------------------------------------
+build_win_x64() {
+  local out_dir="${RUNTIME_DIR}/win-x64"
+  log "=== Windows x64 ==="
+  install_python "${out_dir}" "x86_64-pc-windows-msvc"
+  install_wheels "${out_dir}" "cp312" "win_amd64"
+  install_ffmpeg_win "${out_dir}"
+  du -sh "${out_dir}" | awk '{print "size:", $1}'
+}
+
+build_mac_arm64() {
+  local out_dir="${RUNTIME_DIR}/mac-arm64"
+  log "=== macOS arm64 ==="
+  install_python "${out_dir}" "aarch64-apple-darwin"
+  # Floor macOS 11 for our own deps, but onnxruntime universal2 wheel
+  # requires tag 13_0 — union both so pip can pick from either.
+  install_wheels "${out_dir}" "cp312" \
+    "macosx_13_0_arm64" "macosx_12_0_arm64" "macosx_11_0_arm64"
+  install_ffmpeg_mac "${out_dir}"
+  du -sh "${out_dir}" | awk '{print "size:", $1}'
+}
+
+build_mac_x64() {
+  local out_dir="${RUNTIME_DIR}/mac-x64"
+  log "=== macOS x64 (Intel) ==="
+  install_python "${out_dir}" "x86_64-apple-darwin"
+  install_wheels "${out_dir}" "cp312" \
+    "macosx_13_0_x86_64" "macosx_12_0_x86_64" "macosx_10_13_x86_64"
+  install_ffmpeg_mac "${out_dir}"
+  du -sh "${out_dir}" | awk '{print "size:", $1}'
+}
+
+build_linux_x64() {
+  local out_dir="${RUNTIME_DIR}/linux-x64"
+  log "=== Linux x64 ==="
+  install_python "${out_dir}" "x86_64-unknown-linux-gnu"
+  # Union modern and legacy manylinux tags so onnxruntime (2_28),
+  # tokenizers (2_17 / manylinux2014), and everyone else get a match.
+  install_wheels "${out_dir}" "cp312" \
+    "manylinux_2_28_x86_64" "manylinux_2_17_x86_64" "manylinux2014_x86_64"
+  install_ffmpeg_linux "${out_dir}"
+  du -sh "${out_dir}" | awk '{print "size:", $1}'
+}
+
+target="${1:-}"
+case "${target}" in
+  win-x64)    build_win_x64 ;;
+  mac-arm64)  build_mac_arm64 ;;
+  mac-x64)    build_mac_x64 ;;
+  linux-x64)  build_linux_x64 ;;
+  all)
+    build_win_x64
+    build_mac_arm64
+    build_mac_x64
+    build_linux_x64
+    ;;
+  *)
+    die "usage: $0 <win-x64|mac-arm64|mac-x64|linux-x64|all>"
+    ;;
+esac
+
+log "done"

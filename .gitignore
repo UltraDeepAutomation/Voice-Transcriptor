@@ -62,3 +62,11 @@ temp/
 *.zip
 *.dmg
 *.app
+
+# Bundled Python runtimes assembled by desktop/scripts/prepare-runtime.sh.
+# Each subdirectory is 100-600 MB and is ONLY needed at release build time.
+desktop/runtime/win-x64/
+desktop/runtime/mac-arm64/
+desktop/runtime/mac-x64/
+desktop/runtime/linux-x64/
+desktop/runtime/.cache/

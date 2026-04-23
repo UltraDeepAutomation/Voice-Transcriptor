@@ -560,6 +560,23 @@ function countWords(text: string): number {
 function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   const raw = normalizeTranscriptWhitespace(String((error as Error)?.message || error || ""));
   if (!raw) return fallback;
+  // Promote raw network failures (TypeError "Failed to fetch",
+  // NetworkError, ECONNREFUSED) into the human-readable offline /
+  // VPN-needed message BEFORE the sanitize pass would filter them
+  // as generic "TypeError".
+  const lowRaw = raw.toLowerCase();
+  if (
+    lowRaw === "failed to fetch" ||
+    lowRaw.includes("typeerror: failed to fetch") ||
+    lowRaw.includes("networkerror") ||
+    lowRaw.includes("err_internet_disconnected") ||
+    lowRaw.includes("err_name_not_resolved") ||
+    lowRaw.includes("err_connection_refused") ||
+    lowRaw.includes("err_connection_reset") ||
+    lowRaw.includes("load failed")
+  ) {
+    return explainNetworkError(error);
+  }
   const cleaned = raw
     .replace(/^(referenceerror|typeerror|error):\s*/i, "")
     .replace(/\s+/g, " ")
@@ -6229,7 +6246,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         ? "Transcript is ready in memory, but the original archive changed before the final save completed."
         : transcriptRaw
           ? "Final transcript is ready. Audio and transcript are both available."
-          : "Transcription completed, but no spoken words were detected.",
+          : "Recording completed, no speech detected.",
       tone: finalSaveConflict ? "warning" : "success",
       transcribeLatencyMs: latencyMs,
       ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
@@ -6453,7 +6470,7 @@ async function transcribeSelectedFile(): Promise<void> {
       }
       const latencyMs = performance.now() - transcribeStartedAt;
       patchCurrentRecordingSummary({
-        status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
+        status: transcriptRaw ? "File transcript is ready." : "Recording completed, no speech detected.",
         tone: "success",
         transcribeLatencyMs: latencyMs,
       }, sessionUiToken);
@@ -6492,7 +6509,7 @@ async function transcribeSelectedFile(): Promise<void> {
       }
       const latencyMs = performance.now() - transcribeStartedAt;
       patchCurrentRecordingSummary({
-        status: transcriptRaw ? "File transcript is ready." : "Transcription completed, but no spoken words were detected.",
+        status: transcriptRaw ? "File transcript is ready." : "Recording completed, no speech detected.",
         tone: "success",
         transcribeLatencyMs: latencyMs,
       }, sessionUiToken);

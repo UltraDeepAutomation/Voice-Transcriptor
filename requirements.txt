@@ -1,5 +1,10 @@
 fastapi==0.115.6
-uvicorn[standard]==0.30.6
+# uvicorn without [standard] extras — the `standard` extra pulls
+# uvloop (non-Windows only) which breaks cross-platform `pip install
+# --platform=win_amd64` from a Mac build host. We pin websockets +
+# httptools directly below so the WS upgrade path still works.
+uvicorn==0.30.6
+httptools>=0.5.0
 python-multipart==0.0.12
 faster-whisper==1.0.3
 soundfile==0.12.1
