@@ -235,6 +235,15 @@ body.platform-darwin .sidebar {
   gap: 6px;
 }
 
+/* Version badge in Settings header. Kept subtle — the number is
+ * what support cares about, not the visual weight. */
+.screen-header-version {
+  font-size: 12px;
+  color: var(--text-muted, #9ca3af);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
 .screen-header-actions {
   display: flex;
   flex-wrap: wrap;

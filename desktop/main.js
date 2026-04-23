@@ -4797,6 +4797,37 @@ async function createWindow(options = {}) {
   });
   win.webContents.on("did-fail-load", (_event, code, desc, url) => {
     appendMainLog(`[did-fail-load] code=${code} desc=${desc} url=${url}`);
+    // -3 = ERR_ABORTED (internal, usually benign — new nav cancelled old).
+    // Everything else is a real load failure that leaves the renderer
+    // blank, so surface a native diagnostic dialog with the log path.
+    // Users on Windows most commonly see this when the backend hasn't
+    // finished bootstrapping but the window was shown via a second
+    // instance / tray click before loadURL completed.
+    if (Number(code) === -3) return;
+    if (String(url || "").startsWith("data:")) return;
+    const logPath = path.join(app.getPath("userData"), "main.log");
+    const msg =
+      "Transcriptor could not load the app window.\n\n" +
+      `Error: ${desc} (${code})\n\n` +
+      `Log file: ${logPath}\n\n` +
+      "This is usually a one-time startup hiccup. Try closing and " +
+      "reopening Transcriptor. If it keeps happening, send the log " +
+      "file to support.";
+    try {
+      dialog.showMessageBox({
+        type: "error",
+        title: "Transcriptor — startup error",
+        message: "The app window failed to load",
+        detail: msg,
+        buttons: ["Copy log path", "OK"],
+        defaultId: 1,
+        cancelId: 1,
+      }).then((res) => {
+        if (res.response === 0) {
+          try { clipboard.writeText(logPath); } catch { }
+        }
+      }).catch(() => { });
+    } catch { }
   });
   win.webContents.on("did-finish-load", async () => {
     loadedFrontendBuildSignature = (await getFrontendBuildSignature()) || "";
@@ -4864,18 +4895,48 @@ async function createWindow(options = {}) {
       .filter(Boolean)
       .join("\n\n");
 
+    // Platform-specific recovery instructions. The old fallback HTML
+    // hardcoded `setup.command` (macOS-only), leaving Windows/Linux
+    // users with irrelevant instructions.
+    const logPath = path.join(app.getPath("userData"), "main.log");
+    let recoveryHtml;
+    if (process.platform === "win32") {
+      recoveryHtml = (
+        `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
+        `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
+        `<li>Close Transcriptor fully and reopen it (sometimes the Python venv needs an extra minute on first launch).</li>` +
+        `<li>Make sure Python 3.12 is installed: <code style="background:#333;padding:2px 6px;border-radius:4px">winget install Python.Python.3.12</code></li>` +
+        `<li>If the problem persists, reinstall from the Setup .exe.</li>` +
+        `</ol>` +
+        `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+      );
+    } else if (process.platform === "linux") {
+      recoveryHtml = (
+        `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
+        `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
+        `<li>Install missing system deps: <code style="background:#333;padding:2px 6px;border-radius:4px">sudo apt install python3 python3-venv python3-pip ffmpeg xdotool zenity</code></li>` +
+        `<li>Close and relaunch the AppImage.</li>` +
+        `</ol>` +
+        `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+      );
+    } else {
+      recoveryHtml = (
+        `<h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>` +
+        `<p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>` +
+        `<p style="color:#ddd;margin:8px 0"><b>→ Right-click</b> on <code style="background:#333;padding:2px 6px;border-radius:4px">setup.command</code> → <b>Open</b> → <b>Open</b></p>` +
+        `<p style="color:#666;font-size:12px;margin:12px 0 4px">Or paste in Terminal:</p>` +
+        `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">bash ~/Downloads/Voice\\\\ Transcriptor/setup.command</pre>` +
+        `<p style="color:#888;font-size:12px;margin-top:14px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+      );
+    }
     await win.loadURL(
       `data:text/html,${encodeURIComponent(`
       <html>
-        <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system;padding:28px;line-height:1.6">
+        <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system,Segoe UI,Arial;padding:28px;line-height:1.6">
           <h2 style="margin:0 0 16px 0">Transcriptor — Backend startup failed</h2>
           <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333;margin-bottom:20px">${escapeHtml(details)}</pre>
           <div id="status" style="padding:10px 14px;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:16px;color:#7defa0;font-size:13px">⏳ Checking if backend is starting...</div>
-          <h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>
-          <p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>
-          <p style="color:#ddd;margin:8px 0"><b>→ Right-click</b> on <code style="background:#333;padding:2px 6px;border-radius:4px">setup.command</code> → <b>Open</b> → <b>Open</b></p>
-          <p style="color:#666;font-size:12px;margin:12px 0 4px">Or paste in Terminal:</p>
-          <pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">bash ~/Downloads/Voice\\\\ Transcriptor/setup.command</pre>
+          ${recoveryHtml}
           <script>
             let attempt = 0;
             function checkHealth() {

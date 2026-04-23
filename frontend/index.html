@@ -5,6 +5,84 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Transcriptor</title>
+  <!--
+    CRITICAL: inline fallback styles for the boot overlay.
+    The external stylesheet may fail to load on a slow filesystem,
+    on an upgraded install where cached asset hashes mismatch, or
+    during the first-launch backend-bootstrap window. Without these
+    inline rules the user sees a completely black empty window with
+    no indication that the app is alive. The inline rules are
+    intentionally minimal (no animations, no fancy gradients) — just
+    enough to surface "Starting…" text on a dark background.
+  -->
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #1a1a1a;
+      color: #e5e7eb;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "Helvetica Neue", Arial, sans-serif;
+    }
+    #bootOverlay {
+      position: fixed;
+      inset: 0;
+      z-index: 99999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #1a1a1a;
+    }
+    #bootOverlay[hidden] { display: none; }
+    #bootOverlay .boot-overlay-card {
+      max-width: 460px;
+      padding: 24px 32px;
+      text-align: center;
+    }
+    #bootOverlay .boot-overlay-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    #bootOverlay .boot-overlay-status {
+      font-size: 14px;
+      color: #9ca3af;
+      margin-bottom: 4px;
+    }
+    #bootOverlay .boot-overlay-detail {
+      font-size: 12px;
+      color: #ef4444;
+      margin-top: 12px;
+      white-space: pre-wrap;
+      text-align: left;
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.2);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    #bootOverlay .boot-overlay-detail[hidden] { display: none; }
+    #bootOverlay .boot-overlay-retry {
+      margin-top: 14px;
+      padding: 8px 18px;
+      font-size: 13px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    #bootOverlay .boot-overlay-retry[hidden] { display: none; }
+    #bootOverlay .boot-overlay-spinner {
+      width: 24px;
+      height: 24px;
+      margin: 0 auto 16px;
+      border: 2px solid rgba(255,255,255,0.15);
+      border-top-color: #60a5fa;
+      border-radius: 50%;
+      animation: boot-spin 0.9s linear infinite;
+    }
+    @keyframes boot-spin { to { transform: rotate(360deg); } }
+  </style>
 </head>
 
 <body>
@@ -406,6 +484,9 @@
           <div class="screen-header">
             <div class="screen-header-copy">
               <h2>Settings</h2>
+              <div class="screen-header-version" id="appVersionBadge" aria-live="polite">
+                Transcriptor v<span id="appVersionNumber">1.0.1</span>
+              </div>
             </div>
           </div>
           <div class="settings">
