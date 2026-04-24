@@ -582,7 +582,12 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
     lowRaw.includes("err_internet_disconnected") ||
     lowRaw.includes("err_name_not_resolved") ||
     lowRaw.includes("err_connection_refused") ||
-    lowRaw.includes("err_connection_reset")
+    lowRaw.includes("err_connection_reset") ||
+    // Any Deepgram-shaped backend error — file-transcription path
+    // (via sanitizeUiErrorMessage) must get the same VPN/region
+    // guidance as the live-stream path. Without this, Deepgram
+    // REST errors leak raw into the file-transcribe UI.
+    lowRaw.startsWith("deepgram ")
   ) {
     return explainNetworkError(error);
   }
@@ -992,18 +997,29 @@ function explainNetworkError(err: unknown, context = ""): string {
   const raw = String((err as Error)?.message || err || "").trim();
   const low = raw.toLowerCase();
   // Provider-specific branches before the generic fetch-fail catch.
-  // backend/remote_deepgram_live.py raises ``RemoteError("Deepgram
-  // connect failed: <underlying>")`` for any Deepgram WS handshake
-  // failure — which on Cloudflare-backed regions (e.g. Russia without
-  // VPN) surfaces as "did not receive a valid HTTP response". Without
-  // this branch the raw Python message leaks into the status pill;
-  // user doesn't know to try a VPN.
-  if (low.startsWith("deepgram connect failed") ||
-      low.startsWith("deepgram connect timed out") ||
-      low.startsWith("deepgram upstream closed unexpectedly")) {
-    return context
-      ? `${context}: Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to "local" in Settings.`
-      : "Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to \"local\" in Settings.";
+  // Catch ANY message whose payload starts with "Deepgram " — the
+  // backend emits ~8 different RemoteError shapes from
+  // remote_deepgram_live.py and remote_deepgram.py, not just the
+  // three from the pass-13 fix. Branch on HTTP sub-status first
+  // so each failure mode gets its most actionable message; fall
+  // through to the generic region-block hint for everything else.
+  if (low.startsWith("deepgram ")) {
+    const base = context ? `${context}: ` : "";
+    if (/\bhttp\s*40[12]\b/.test(low) || low.includes("rejected the api key")) {
+      return `${base}Deepgram rejected the API key. Open Settings → API Keys → Deepgram and verify your key.`;
+    }
+    if (/\bhttp\s*429\b/.test(low) || low.includes("rate limit")) {
+      return `${base}Deepgram rate limit exceeded. Wait a moment and try again, or switch Provider to "local".`;
+    }
+    if (/\bhttp\s*402\b/.test(low) || low.includes("insufficient credits") || low.includes("out of credits")) {
+      return `${base}Deepgram account is out of credits. Top up, or switch Provider to "local".`;
+    }
+    if (/\bhttp\s*5\d{2}\b/.test(low)) {
+      return `${base}Deepgram is temporarily unavailable (provider-side error). Try again in a minute, or switch Provider to "local".`;
+    }
+    // Generic: unreachable / timeout / handshake / upstream-closed —
+    // most likely a regional block. Point to VPN or local fallback.
+    return `${base}Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to "local" in Settings.`;
   }
   const isFetchFail =
     low === "failed to fetch" ||
@@ -2955,14 +2971,21 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       });
       const out = String(r.text || "").trim();
       if (!out) throw new Error("Upscale returned empty text");
-      // Always clear the GLOBAL upscaleOutput element on completion
-      // (not just when session matches). Previous `isCurrentUiSession`
-      // guard meant: user records A → upscale A starts → user starts
-      // B → A's upscale completes on dead token → output stuck showing
-      // "Upscaling..." while B hasn't upscaled yet. The element is
-      // global, not per-session, so always render the latest result.
-      $("upscaleOutput").textContent = out;
-      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      // Session-aware success write. Asymmetric with the error
+      // path (which requires the session to still be current): for
+      // successes we ALSO write if the element is still showing our
+      // own "Upscaling..." placeholder — that case covers pass-12's
+      // stuck-on-placeholder bug. But we do NOT clobber if a newer
+      // session has since written its own output or error, which is
+      // what a naked unguarded write did before (clobber user's
+      // current recording's upscale output with a stale previous
+      // recording's text).
+      const currentUpscaleOutput = $("upscaleOutput").textContent || "";
+      const isStuckOnOurPlaceholder = currentUpscaleOutput === "Upscaling...";
+      if (isCurrentUiSession(sessionToken) || isStuckOnOurPlaceholder) {
+        $("upscaleOutput").textContent = out;
+        $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      }
       setStatusScoped(sessionToken, "Done");
       return out;
     } catch (e) {
@@ -2973,19 +2996,28 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       // to open Settings → API Keys → OpenRouter and paste a key.
       let friendly: string;
       const low = rawMsg.toLowerCase();
-      // Match 401 only as a standalone HTTP status token, NOT a bare
-      // substring — a request id, timestamp, or unrelated payload
-      // could contain "401" as four digits and wrongly tell the user
-      // their API key is missing. The backend emits "HTTP 401" or
-      // "401 Unauthorized" — anchor on those exact token shapes.
+      // Match HTTP status tokens only as standalone words, not bare
+      // substrings — a request id, timestamp, or unrelated payload
+      // could contain "401" / "429" as four digits and wrongly map
+      // to the wrong branch. Backend emits "HTTP 4XX" shape tokens.
       if (
         low.includes("openrouter key is not configured") ||
         /\bhttp\s*401\b/.test(low) ||
         /\b401\s+(unauthorized|forbidden)\b/.test(low)
       ) {
         friendly = "Upscale needs an OpenRouter API key.\n\nOpen Settings → API Keys → OpenRouter and paste your key, then try again.";
+      } else if (/\bhttp\s*429\b/.test(low) || low.includes("rate limit")) {
+        friendly = "Upscale hit the OpenRouter rate limit.\n\nWait a moment and try again, or pick a less-busy model in Settings → Upscale.\n\nUsing original transcript.";
+      } else if (/\bhttp\s*402\b/.test(low) || low.includes("insufficient credit") || low.includes("out of credit") || low.includes("quota exceeded")) {
+        friendly = "OpenRouter account is out of credits.\n\nTop up at openrouter.ai/credits or switch the upscale model to a free-tier option in Settings → Upscale.\n\nUsing original transcript.";
+      } else if (/\bhttp\s*404\b/.test(low) || low.includes("model not found") || low.includes("no endpoints found for")) {
+        friendly = "Upscale model is unavailable.\n\nYou may have picked a paid-tier model without a paid OpenRouter account. Open Settings → Upscale and pick a different model.\n\nUsing original transcript.";
+      } else if (/\bhttp\s*5\d{2}\b/.test(low) || low.includes("service unavailable") || low.includes("bad gateway")) {
+        friendly = "OpenRouter is temporarily unavailable (provider-side error).\n\nTry again in a minute, or switch upscale model in Settings → Upscale.\n\nUsing original transcript.";
+      } else if (low.includes("content filter") || low.includes("content policy") || low.includes("refused to")) {
+        friendly = "Upscale model refused to process this text (content filter).\n\nThe original transcript is used as-is.";
       } else if (low.includes("failed to fetch") || low.includes("networkerror") || low === "load failed") {
-        friendly = "Upscale request failed: the OpenRouter API is unreachable. Check your internet connection or try a VPN.\n\nUsing original transcript.";
+        friendly = "Upscale request failed: the OpenRouter API is unreachable.\n\nCheck your internet connection or try a VPN. OpenRouter is sometimes blocked in certain regions.\n\nUsing original transcript.";
       } else if (low.includes("unsupported upscale preset")) {
         friendly = "Upscale preset is missing.\n\nOpen Settings → Upscale and re-select a preset.";
       } else {

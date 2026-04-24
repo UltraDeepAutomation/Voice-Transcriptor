@@ -172,6 +172,12 @@ function rotateMainLogIfNeeded() {
     if (st.size < MAIN_LOG_MAX_BYTES) return;
     const archived = mainLogFilePath + ".1";
     const pending = mainLogFilePath + ".rotating";
+    // Defensive: clean up any orphaned .rotating from a prior crashed
+    // rotation BEFORE attempting this one. On Windows, renameSync
+    // throws EEXIST when the target exists — a stale .rotating would
+    // permanently block every subsequent rotation attempt until
+    // someone manually cleared it, defeating the whole mechanism.
+    try { fs.unlinkSync(pending); } catch { /* normal: no orphan */ }
     // Rename-first, unlink-after. Previous order (unlink archive →
     // rename current → archive) destroyed the previous archive
     // PERMANENTLY if the rename failed (Windows: file handle held by
@@ -195,9 +201,12 @@ function rotateMainLogIfNeeded() {
       mainLogSizeCached = 0;
     } catch {
       // Promotion failed. Restore the log to its original name so
-      // appendFile keeps working. If restore also fails the .rotating
-      // file is orphaned (cleaned up on next startup sweep).
-      try { fs.renameSync(pending, mainLogFilePath); } catch { /* give up */ }
+      // appendFile keeps working. If THAT also fails, drop the
+      // .rotating blob — we've already lost this cycle's data and
+      // don't want to leak a permanent orphan.
+      try { fs.renameSync(pending, mainLogFilePath); } catch {
+        try { fs.unlinkSync(pending); } catch { /* give up */ }
+      }
     }
   } catch { /* stat failed — nothing to rotate */ }
 }
@@ -1599,7 +1608,14 @@ function createOverlayHtml() {
         window.setAutoStopConfig = (enabled, seconds) => {
           const on = !!enabled;
           if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
-          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, Math.round(Number(seconds) || 2)));
+          // Mirror emitSecs: NaN → default, let the clamp's floor
+          // provide the minimum. The previous `|| 2` trick coerced
+          // a legitimate 0 (if ever passed) to 2 BEFORE the clamp
+          // could floor it to 1 — same anti-pattern the sibling
+          // emitSecs fn was fixed for. Keep both consistent.
+          const raw = Number(seconds);
+          const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
+          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
           if (Number(quickAutoStopSecs.textContent) !== sec) {
             quickAutoStopSecs.textContent = String(sec);
           }
@@ -1607,16 +1623,45 @@ function createOverlayHtml() {
         quickAutoStopToggle.addEventListener('change', () => {
           document.title = '__overlay_autostop_enabled__' + (quickAutoStopToggle.checked ? '1' : '0');
         });
-        quickAutoStopMinus.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          emitSecs(readSecs() - 1);
-        });
-        quickAutoStopPlus.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          emitSecs(readSecs() + 1);
-        });
+        // Click-and-hold auto-repeat: first pointerdown fires one
+        // tick immediately, then after a 400 ms dwell the value
+        // ticks every 60 ms. After 20 ticks (~1.2 s of holding)
+        // we accelerate to 20 ms/tick so large adjustments
+        // (2 → 30, 2 → 60) don't require dozens of discrete
+        // clicks. Released on pointerup / pointerleave / pointer
+        // cancel so the user can bail by dragging off the button.
+        const attachHoldRepeat = (btn, delta) => {
+          let holdTimeout = null;
+          let repeatInterval = null;
+          let tickCount = 0;
+          const tick = () => {
+            emitSecs(readSecs() + delta);
+            tickCount += 1;
+            if (tickCount === 20 && repeatInterval !== null) {
+              clearInterval(repeatInterval);
+              repeatInterval = setInterval(tick, 20);
+            }
+          };
+          const stop = () => {
+            if (holdTimeout !== null) { clearTimeout(holdTimeout); holdTimeout = null; }
+            if (repeatInterval !== null) { clearInterval(repeatInterval); repeatInterval = null; }
+            tickCount = 0;
+          };
+          btn.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            stop(); // reset any lingering state from a prior press
+            emitSecs(readSecs() + delta); // immediate first tick
+            holdTimeout = setTimeout(() => {
+              repeatInterval = setInterval(tick, 60);
+            }, 400);
+          });
+          btn.addEventListener('pointerup', stop);
+          btn.addEventListener('pointerleave', stop);
+          btn.addEventListener('pointercancel', stop);
+        };
+        attachHoldRepeat(quickAutoStopMinus, -1);
+        attachHoldRepeat(quickAutoStopPlus, +1);
         window.setTimer = (t) => {
           const str = String(t || '').trim();
           if (/^\\d{2}:\\d{2}$/.test(str)) {

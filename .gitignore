@@ -65,8 +65,33 @@ temp/
 
 # Bundled Python runtimes assembled by desktop/scripts/prepare-runtime.sh.
 # Each subdirectory is 100-600 MB and is ONLY needed at release build time.
-desktop/runtime/win-x64/
-desktop/runtime/mac-arm64/
-desktop/runtime/mac-x64/
-desktop/runtime/linux-x64/
-desktop/runtime/.cache/
+# Catch every runtime/<anything>/ dir (new platforms are dropped in here by
+# the script), plus the download cache.
+desktop/runtime/
+!desktop/scripts/prepare-runtime.sh
+
+# electron-builder intermediate output
+desktop/dist/
+desktop/out/
+desktop/build/
+*.exe
+*.AppImage
+*.blockmap
+*.snap
+*.deb
+*.rpm
+
+# Signature + release staging
+/dist/
+release/
+Release/
+Transcriptor-Release-*/
+
+# Backend caches / state (in case user opens a venv in-tree)
+backend/__pycache__/
+backend/*.egg-info/
+backend/.pytest_cache/
+
+# macOS metadata
+**/.DS_Store
+**/__MACOSX/
