@@ -27,23 +27,23 @@
 **1.1.0+ идёт с Python 3.12 + ffmpeg внутри инсталлятора для Windows и macOS.** Никаких предварительных установок (winget / brew / pip / setup-скриптов) больше не нужно — двойной клик, и всё работает.
 
 ### Windows x64 (~201 MB)
-1. Скачать `Transcriptor Setup 1.1.0.exe`
+1. Скачать `Transcriptor Setup 1.1.1.exe`
 2. Двойной клик → SmartScreen **"Подробнее"** → **"Выполнить в любом случае"**
 3. Через ~30 секунд приложение запущено. Разрешить микрофон при запросе Windows
 
 ### macOS Apple Silicon M1-M4 (~220 MB)
-1. Скачать `Transcriptor-1.1.0-mac-arm64.dmg`
+1. Скачать `Transcriptor-1.1.1-mac-arm64.dmg`
 2. Открыть DMG, перетащить Transcriptor.app в Applications
 3. **macOS Sonoma 14+ / Sequoia 15+:** System Settings → Privacy & Security → прокрутить вниз → **"Open Anyway"** рядом с предупреждением Transcriptor → потом двойной клик → **"Open"**
 4. Разрешить 3 permissions: Microphone, Accessibility, Input Monitoring
 
 ### macOS Intel (~257 MB)
-То же, но `Transcriptor-1.1.0-mac-intel.dmg`.
+То же, но `Transcriptor-1.1.1-mac-intel.dmg`.
 
 ### Linux x64 (~101 MB, AppImage)
 ```bash
-chmod +x Transcriptor-1.1.0.AppImage
-./Transcriptor-1.1.0.AppImage
+chmod +x Transcriptor-1.1.1.AppImage
+./Transcriptor-1.1.1.AppImage
 ```
 
 На Linux AppImage **всё ещё нужны системные зависимости** (Python 3.10+ и ffmpeg), потому что bundling Python на Linux упирается в PyPI timeout. Установить заранее:
