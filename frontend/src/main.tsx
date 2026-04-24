@@ -5124,14 +5124,20 @@ async function startLive(): Promise<void> {
         if (msg.fatal) {
           patchCurrentRecordingSummary(
             {
-              status: `Live stream error: ${msg.error}`,
+              status: `Live stream error: ${explainNetworkError(new Error(msg.error))}`,
               tone: "error",
             },
             sessionUiToken
           );
-          if (shouldLivePreview()) {
-            setLiveInterimText(`[${msg.error}]`);
-          }
+          // DO NOT pipe the error message through setLiveInterimText:
+          // that path feeds into `sourceLiveText` at stopLive time,
+          // which then becomes the saved transcript + the clipboard-
+          // paste content. A user in a region that blocks Deepgram
+          // would otherwise see a raw "[Deepgram connect failed: did
+          // not receive a valid HTTP response]" pasted into Slack /
+          // Telegram / wherever. The status pill carries the error;
+          // transcript stays empty so the paste code path treats it
+          // as "nothing to paste".
         }
         return;
       }

@@ -155,10 +155,39 @@ app.on("second-instance", () => {
   ensureWindowVisible({ manual: true });
 });
 
+// Rotate main.log when it exceeds this size. Prior code appended
+// forever — a heavy trace-log session (hotkey fires ~200 events per
+// recording start/stop cycle) grew the file to 35+ MB over a few
+// days, making the log unusable for support triage and unnecessarily
+// consuming userData disk.
+const MAIN_LOG_MAX_BYTES = 5 * 1024 * 1024;
+let mainLogSizeCached = -1;
+let mainLogCheckCounter = 0;
+
+function rotateMainLogIfNeeded() {
+  if (!mainLogFilePath) return;
+  try {
+    const st = fs.statSync(mainLogFilePath);
+    mainLogSizeCached = st.size;
+    if (st.size < MAIN_LOG_MAX_BYTES) return;
+    const archived = mainLogFilePath + ".1";
+    // Overwrite any prior archive — we keep exactly one rotation of
+    // history (main.log + main.log.1), bounded at 10 MB combined.
+    try { fs.unlinkSync(archived); } catch { /* missing is fine */ }
+    fs.renameSync(mainLogFilePath, archived);
+    mainLogSizeCached = 0;
+  } catch { /* stat failed — nothing to rotate */ }
+}
+
 function appendMainLog(message) {
   try {
     if (!mainLogFilePath) {
       mainLogFilePath = path.join(app.getPath("userData"), "main.log");
+    }
+    // Amortised rotation check — stat every 200 appends so a
+    // high-frequency trace loop doesn't statSync per-line.
+    if ((++mainLogCheckCounter & 0xff) === 0) {
+      rotateMainLogIfNeeded();
     }
     fs.appendFile(mainLogFilePath, `[${new Date().toISOString()}] ${message}\n`, "utf8", () => { });
   } catch (e) {
