@@ -3280,40 +3280,35 @@ _list_cache: Optional[dict] = None
 _list_cache_at = 0.0
 _list_cache_key: Optional[tuple] = None
 _LIST_CACHE_TTL = 5.0
+# Serialises concurrent rebuilds of the /api/recordings cache so two
+# simultaneous cache misses run ONE scan instead of N. The previous
+# implementation held the sync `_recordings_caches_lock` only when
+# READING and WRITING the cache globals — the scan itself ran fully
+# unserialised, so on a cold-cache burst every worker ran a full
+# duplicate scan (each ~300 ms on 5 k recordings), which multiplied
+# disk I/O and blocked threadpool slots.
+#
+# `asyncio.Lock` cooperates with the event loop — waiters yield to
+# other awaitables while a single rebuild runs. Double-checked
+# locking pattern: first look wakes up the fast path, second look
+# inside the lock confirms another waiter didn't just populate it.
+_list_cache_rebuild_lock: Optional[asyncio.Lock] = None
 
 
-@app.get("/api/recordings")
-def list_recordings(_auth: None = Depends(_require_api_auth)):
-    global _list_cache, _list_cache_at, _list_cache_key
-    d = _resolve_recordings_dir()
-    now = time.monotonic()
+def _build_recordings_list_payload(d: "Path") -> dict:
+    """Expensive sync scan — runs in a thread pool via asyncio.to_thread.
 
-    # Build lightweight cache key: dir mtime + file count
-    try:
-        dir_mtime = d.stat().st_mtime
-        file_count = sum(1 for _ in d.glob("*.txt"))
-    except Exception:
-        dir_mtime = 0.0
-        file_count = -1
-    cache_key = (str(d), dir_mtime, file_count)
-
-    with _recordings_caches_lock:
-        if (
-            _list_cache is not None
-            and _list_cache_key == cache_key
-            and (now - _list_cache_at) < _LIST_CACHE_TTL
-        ):
-            return _list_cache
-
+    Extracted so the async route above can offload it cleanly. Kept
+    sync because Path.glob / stat / read_text are synchronous and
+    there's no async stdlib equivalent.
+    """
     items = []
     for p in d.glob("*.txt"):
         try:
             st = p.stat()
             raw = p.read_text(encoding="utf-8", errors="replace")
-            # Smart display_name: first words of transcript text
             first = _first_words(raw)
             display = first if first else p.stem
-            # Extract metadata from file header
             provider = _extract_meta_field(raw, "Provider").lower() or ""
             language = _extract_meta_field(raw, "Language").lower() or ""
             items.append(
@@ -3330,12 +3325,68 @@ def list_recordings(_auth: None = Depends(_require_api_auth)):
         except Exception:
             continue
     items.sort(key=lambda x: x["modified_at"], reverse=True)
-    result = {"items": items, "directory": str(d)}
+    return {"items": items, "directory": str(d)}
+
+
+@app.get("/api/recordings")
+async def list_recordings(_auth: None = Depends(_require_api_auth)):
+    """Return the current recordings list, cached with mtime+count key.
+
+    Now ``async`` so FastAPI does NOT silently dispatch the route to
+    a thread pool worker. On cache hit the response returns within
+    microseconds (lock + dict lookup, no I/O). On miss the scan runs
+    via ``asyncio.to_thread`` so the event loop stays responsive for
+    other requests; concurrent misses all await the same rebuild via
+    ``_list_cache_rebuild_lock`` (double-checked).
+    """
+    global _list_cache, _list_cache_at, _list_cache_key, _list_cache_rebuild_lock
+    d = _resolve_recordings_dir()
+    now = time.monotonic()
+
+    # Cache key probe — cheap (1 stat + 1 glob), kept sync.
+    try:
+        dir_mtime = d.stat().st_mtime
+        file_count = sum(1 for _ in d.glob("*.txt"))
+    except Exception:
+        dir_mtime = 0.0
+        file_count = -1
+    cache_key = (str(d), dir_mtime, file_count)
+
+    # Fast path: cache hit.
     with _recordings_caches_lock:
-        _list_cache = result
-        _list_cache_at = now
-        _list_cache_key = cache_key
-    return result
+        if (
+            _list_cache is not None
+            and _list_cache_key == cache_key
+            and (now - _list_cache_at) < _LIST_CACHE_TTL
+        ):
+            return _list_cache
+
+    # Lazy-init the async lock — cannot live at module scope because
+    # some stdlib versions bind it to the loop at creation time, and
+    # module import may predate loop creation in certain test harnesses.
+    if _list_cache_rebuild_lock is None:
+        _list_cache_rebuild_lock = asyncio.Lock()
+
+    async with _list_cache_rebuild_lock:
+        # Double-checked: another awaiter may have populated the cache
+        # while we waited for the lock.
+        now = time.monotonic()
+        with _recordings_caches_lock:
+            if (
+                _list_cache is not None
+                and _list_cache_key == cache_key
+                and (now - _list_cache_at) < _LIST_CACHE_TTL
+            ):
+                return _list_cache
+        # Genuine miss — run the scan in a worker thread so other
+        # awaitables (WS transcription frames, /api/health, etc.) keep
+        # making progress during the ~300 ms scan.
+        result = await asyncio.to_thread(_build_recordings_list_payload, d)
+        with _recordings_caches_lock:
+            _list_cache = result
+            _list_cache_at = time.monotonic()
+            _list_cache_key = cache_key
+        return result
 
 
 _graph_cache: Optional[dict] = None

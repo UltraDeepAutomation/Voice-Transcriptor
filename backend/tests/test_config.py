@@ -146,6 +146,52 @@ class TestConfigLifecycle(unittest.TestCase):
         self.assertEqual(cfg["schema_version"], 99)
         self.assertEqual(cfg["mystery_future_field"], {"nested": 42})
 
+    def test_legacy_no_schema_with_encrypted_keys_gets_stamped(self):
+        """Regression for pass-23 M.
+
+        1.1.0-beta shipped without `schema_version` in its config.
+        If a user of that build had ALREADY encrypted their keys
+        (or manually wrote an encrypted value), the key-migration
+        branch in `load_config` did not trigger, so the stamp path
+        was the only route to add `schema_version=2` to disk. But
+        that branch compared `raw["schema_version"]` AFTER
+        _migrate_schema mutated it to the current value — so the
+        comparison was always False and the stamp never fired.
+        Self-heals on the first save_config, but leaves load_config's
+        idempotency contract broken: a fresh boot re-runs the
+        v1→v2 migration pass (cheap but wasteful).
+
+        After pass-23 M: the pre-migration version is captured and
+        used for the comparison, so the stamp fires correctly.
+        """
+        # Seed a 1.1.0-beta-shaped config: encrypted keys, no
+        # schema_version. Use the encrypt_value helper so the key
+        # shape is legit (otherwise it'd fall into the re-encryption
+        # branch, not the stamp branch, and we wouldn't exercise M).
+        self.config_mod.load_config()  # initialize encryption_key
+        encrypted = self.config_mod.encrypt_value("sk-pretend-encrypted-key-12345")
+        legacy = {
+            "providers": {"openrouter": {"key": encrypted}},
+            "preferences": {"remote_provider": "openrouter"},
+            # schema_version deliberately absent
+        }
+        self.config_mod.CONFIG_PATH.write_text(
+            json.dumps(legacy),
+            encoding="utf-8",
+        )
+        # Pre-load: on-disk has NO schema_version
+        raw = json.loads(self.config_mod.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("schema_version", raw)
+        # Trigger load — should stamp the version to disk
+        self.config_mod.load_config()
+        # Post-load: on-disk MUST now have schema_version = SCHEMA_VERSION
+        raw_after = json.loads(self.config_mod.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw_after.get("schema_version"),
+            self.config_mod.SCHEMA_VERSION,
+            "M regression — schema_version not stamped to disk",
+        )
+
     def test_encryption_keyfile_created_atomically(self):
         """First `load_config` on a fresh data dir must persist a
         non-empty .encryption_key. A zero-length keyfile would

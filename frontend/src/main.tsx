@@ -7484,22 +7484,39 @@ async function initRecordingsBootstrap(): Promise<void> {
     gDragging = true; gDragDist = 0;
     gDragStartX = e.clientX; gDragStartY = e.clientY;
     gDragPanStartX = gPanX; gDragPanStartY = gPanY;
+    // Install drag-continuation handlers ONLY for the duration of
+    // this drag. Previously they lived on `window` permanently and
+    // fired `if (!gDragging) return;` on EVERY mouse move anywhere
+    // in the app for the lifetime of the page — wasted hit-test
+    // cost that accrues linearly with session length (100+ Hz on a
+    // modern pointer × 6h = ~2M wasted no-op calls). Scope-binding
+    // to the drag means zero overhead outside an active drag.
+    const onDragMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - gDragStartX, dy = ev.clientY - gDragStartY;
+      gDragDist = Math.sqrt(dx * dx + dy * dy);
+      gPanX = gDragPanStartX + dx; gPanY = gDragPanStartY + dy;
+      gRender();
+    };
+    const onDragEnd = () => {
+      gDragging = false;
+      window.removeEventListener("mousemove", onDragMove);
+      window.removeEventListener("mouseup", onDragEnd);
+      // Defensive safety net: if some OS-level focus loss or
+      // fullscreen transition swallows the mouseup event, a final
+      // blur tear-down prevents the drag state from sticking.
+      window.removeEventListener("blur", onDragEnd);
+    };
+    window.addEventListener("mousemove", onDragMove);
+    window.addEventListener("mouseup", onDragEnd);
+    window.addEventListener("blur", onDragEnd);
   });
 
-  // Graph-local mousemove/mouseup. Previously these were window-scoped,
-  // which forced a hit-test evaluation on EVERY mouse movement anywhere
-  // in the app for the lifetime of the page. Container handler owns
-  // the hit-test (hover) path; window handler owns the drag-pan path
-  // so the user can drag outside the container bounds. The container
-  // handler early-returns on drag to avoid double-processing the event
-  // when the cursor is still inside the container (two handlers, one
-  // event = two gRender() calls per mouse move without this guard).
+  // Graph-local hover mousemove. Stays container-scoped (not window)
+  // so hit-test evaluation only runs when the cursor is genuinely
+  // over the graph. Early-returns on active drag so the drag handler
+  // owns the render path unambiguously.
   ct.addEventListener("mousemove", (e: MouseEvent) => {
-    if (gDragging) {
-      // Let the window-level handler own drag updates; bail to avoid
-      // double-computing gPanX/gPanY and double-rendering per event.
-      return;
-    }
+    if (gDragging) return;
     const rect = ct.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     if (mx < 0 || my < 0 || mx > rect.width || my > rect.height) {
@@ -7515,17 +7532,6 @@ async function initRecordingsBootstrap(): Promise<void> {
       gShowTooltip(hit, mx, my);
     }
   });
-  // Window-level drag-pan continuation: user may drag outside the
-  // container; keep updating pan until mouseup.
-  window.addEventListener("mousemove", (e: MouseEvent) => {
-    if (!gDragging) return;
-    const dx = e.clientX - gDragStartX, dy = e.clientY - gDragStartY;
-    gDragDist = Math.sqrt(dx * dx + dy * dy);
-    gPanX = gDragPanStartX + dx; gPanY = gDragPanStartY + dy;
-    gRender();
-  });
-
-  window.addEventListener("mouseup", () => { gDragging = false; });
 
   gc.addEventListener("click", (e: MouseEvent) => {
     if (gDragDist > G_DRAG_THRESHOLD) return;

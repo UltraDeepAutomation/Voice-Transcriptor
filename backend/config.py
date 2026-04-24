@@ -482,10 +482,27 @@ def load_config() -> Dict[str, Any]:
     """
     raw: Dict[str, Any] = {}
     source: str = "defaults"
+    # Capture the ORIGINAL on-disk ``schema_version`` BEFORE ``_migrate_schema``
+    # mutates it. The stamp-back-to-disk branch below (`elif source ==
+    # "primary":`) compares this value to ``SCHEMA_VERSION`` to decide
+    # whether the on-disk file needs re-writing with the current version
+    # field. Previously the check read `raw.get("schema_version")` AFTER
+    # migration, which always returned SCHEMA_VERSION and made the stamp
+    # path inert — so a 1.1.0-beta config written without a version field
+    # but with encrypted keys (no key-migration triggers) would stay
+    # unstamped forever. Self-heals on the first save_config, but leaves
+    # load_config's idempotency invariant broken.
+    original_schema_version: int | None = None
     if CONFIG_PATH.exists():
         try:
             raw = _read_json_file(CONFIG_PATH)
             source = "primary"
+            _v = raw.get("schema_version")
+            # Accept ints only — invalid shapes (str, float, bool) are
+            # treated as "missing" so they go through the same migration
+            # path a legacy-v1 config does.
+            if isinstance(_v, int) and not isinstance(_v, bool) and _v > 0:
+                original_schema_version = _v
         except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.error(
                 "primary config at %s is unusable (%s); trying backup",
@@ -558,12 +575,19 @@ def load_config() -> Dict[str, Any]:
         # lacked schema_version (an older 1.1.0-beta that shipped
         # without the field), write it back WITH the new field so the
         # next boot doesn't re-run the v1→v2 migration unnecessarily.
-        on_disk_version = raw.get("schema_version")
-        if on_disk_version != SCHEMA_VERSION and CONFIG_PATH.exists():
+        #
+        # ``original_schema_version`` is the PRE-migration value captured
+        # above. Do NOT read `raw["schema_version"]` here — _migrate_schema
+        # has already mutated it to SCHEMA_VERSION, so the comparison
+        # would always be False and the stamp would never run.
+        if original_schema_version != SCHEMA_VERSION and CONFIG_PATH.exists():
             try:
                 _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
                 _atomic_write_json(CONFIG_PATH, _encrypt_provider_keys(merged))
-                logger.info("config schema stamped with version=%d at %s", SCHEMA_VERSION, CONFIG_PATH)
+                logger.info(
+                    "config schema stamped with version=%d at %s (was: %r)",
+                    SCHEMA_VERSION, CONFIG_PATH, original_schema_version,
+                )
             except OSError as e:
                 logger.warning("schema-version stamp write failed at %s: %s", CONFIG_PATH, e)
 

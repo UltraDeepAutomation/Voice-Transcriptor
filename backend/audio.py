@@ -8,15 +8,60 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from typing import Optional, Tuple
 
 import numpy as np
 import soundfile as sf
 
+logger = logging.getLogger(__name__)
+
+
+# Hard cap on ffmpeg stderr retained in memory. ffmpeg is normally
+# quiet under ``-loglevel error``, but on a corrupt input ("malformed
+# sample rate in moov", "Invalid data found when processing input")
+# it can emit a multi-MB stderr that we DON'T need beyond the first
+# few hundred bytes for diagnostics. Without this cap, a crash-loop
+# upload could OOM the backend.
+_FFMPEG_STDERR_CAP_BYTES = 64 * 1024
+
 
 class AudioError(RuntimeError):
     pass
+
+
+def _bounded_stderr_reader(pipe, cap: int) -> list[str]:
+    """Read lines off *pipe* until EOF, keeping at most *cap* bytes.
+
+    Continues consuming past the cap so the writer (ffmpeg) is not
+    blocked on a full OS pipe buffer — dropping beyond-cap bytes
+    silently. Returned list preserves original ordering of the
+    retained prefix.
+
+    Runs on a helper thread because the main thread needs to
+    ``proc.wait(timeout=...)`` concurrently; calling ``proc.stderr.read()``
+    directly would dead-lock a chatty ffmpeg against the OS pipe
+    buffer limit (~64 KB on Linux, ~4 KB on some Windows versions).
+    """
+    collected: list[str] = []
+    size = 0
+    try:
+        for line in pipe:
+            if size < cap:
+                if size + len(line) > cap:
+                    remaining = cap - size
+                    collected.append(line[:remaining])
+                    size = cap
+                else:
+                    collected.append(line)
+                    size += len(line)
+            # Past the cap: keep reading so ffmpeg isn't blocked on
+            # a full pipe, but drop the content.
+    except ValueError:
+        # Pipe closed mid-read (proc killed); benign.
+        pass
+    return collected
 
 
 def _has_ffmpeg() -> bool:
@@ -79,13 +124,57 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             "pcm_s16le",
             path_out,
         ]
+        # Bounded-memory ffmpeg call: stderr routed through a helper
+        # thread that caps the retained prefix at _FFMPEG_STDERR_CAP_BYTES
+        # while continuing to drain the OS pipe so ffmpeg is never blocked
+        # on a full pipe buffer. The previous `subprocess.run(...
+        # capture_output=True)` implementation buffered unbounded stderr
+        # into a Python string; a crash-loop ffmpeg (malformed container,
+        # missing codec) could fill gigabytes of RAM before the 5-minute
+        # timeout fired.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        collected: list[str] = []
+        reader = threading.Thread(
+            target=lambda: collected.extend(
+                _bounded_stderr_reader(proc.stderr, _FFMPEG_STDERR_CAP_BYTES)
+            ),
+            name="ffmpeg-stderr-reader",
+            daemon=True,
+        )
+        reader.start()
         try:
-            subprocess.run(cmd, check=True, timeout=300, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            msg = (e.stderr or e.stdout or str(e)).strip()
-            raise AudioError(f"ffmpeg failed to convert audio: {msg}")
-        except subprocess.TimeoutExpired:
-            raise AudioError("ffmpeg conversion timed out")
+            try:
+                proc.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                # Give the kill a moment to propagate before giving up;
+                # the reader thread will exit when the pipe closes.
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise AudioError("ffmpeg conversion timed out")
+            reader.join(timeout=5)
+        finally:
+            # Defensive close in case the reader thread already drained
+            # the pipe — Popen's stderr remains open until explicitly closed.
+            try:
+                if proc.stderr is not None and not proc.stderr.closed:
+                    proc.stderr.close()
+            except Exception:
+                pass
+        if proc.returncode != 0:
+            msg = "".join(collected).strip() or f"ffmpeg exited with code {proc.returncode}"
+            # Log the full (capped) stderr locally for operator
+            # debugging; surface only a compact prefix in the
+            # exception that callers may echo back over HTTP.
+            logger.warning("ffmpeg failed (rc=%d): %s", proc.returncode, msg)
+            raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
         return path_out
 
     if ext != ".wav":
@@ -105,7 +194,13 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     # Copy atomically: write to tmp then rename. A raw copyfile()
     # leaves the destination truncated on ENOSPC, and a subsequent
     # transcribe would silently use the fragment.
-    tmp_out = f"{path_out}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    # Tmp name MUST match the hex-only convention `\.tmp-[0-9a-f]{6,}`
+    # used by `_sweep_orphan_tmp_files` in backend/main.py. The old
+    # `{os.getpid()}-{uuid}` form contained decimal PID digits and
+    # broke the sweep regex, so crashed writers left permanent
+    # orphan tmps in DATA_DIR. uuid4.hex alone is already globally
+    # unique (128-bit space); the PID prefix bought nothing.
+    tmp_out = f"{path_out}.tmp-{uuid.uuid4().hex}"
     try:
         shutil.copyfile(path_in, tmp_out)
         os.replace(tmp_out, path_out)

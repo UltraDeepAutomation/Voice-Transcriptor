@@ -126,22 +126,61 @@ class LiveSession:
                 audio_window.shape[0], audio_window.shape[0] / sr,
             )
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: transcribe_audio(
-                    audio_window,
-                    self.model_name,
-                    language=self.language,
-                    vad_filter=True,
-                    word_timestamps=False,
-                    beam_size=1,
-                    best_of=1,
+            # Wrap in `asyncio.wait_for` with a hard 60 s ceiling. A wedged
+            # Whisper worker (CUDA OOM hang, ctranslate2 deadlock on a
+            # corrupt model file, stalled disk IO during first-load of a
+            # new model) would otherwise block this coroutine forever,
+            # which in turn freezes the WS forwarder loop in main.py that
+            # invokes `maybe_transcribe` in a tight cycle — the user would
+            # see an alive socket with NO further transcription output
+            # and no error event to recover from. 60 s is ~12× a realistic
+            # CPU inference of a 30 s window on small; a genuinely slow
+            # machine (old Mac Intel on large-v3) stays well under budget.
+            #
+            # Note on cancellation semantics: `wait_for` cancels the
+            # FUTURE, but threads in the default executor cannot be
+            # forcibly interrupted in Python — the worker thread keeps
+            # running until the native call returns. The coroutine here
+            # returns an error envelope immediately regardless, so the
+            # WS session can escalate via `_consecutive_errors` instead
+            # of hanging. Leaked worker thread is acceptable on the
+            # already-unrecoverable CUDA-hang path.
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: transcribe_audio(
+                        audio_window,
+                        self.model_name,
+                        language=self.language,
+                        vad_filter=True,
+                        word_timestamps=False,
+                        beam_size=1,
+                        best_of=1,
+                    ),
                 ),
+                timeout=60.0,
             )
             logger.info(
                 "transcribe result: %d segments",
                 len(result.get('segments', [])),
             )
+        except asyncio.TimeoutError:
+            # Surface as a typed error; same escalation as other
+            # transcribe failures (bounded retries before fatal).
+            self._consecutive_errors += 1
+            signature = "LocalTranscribeTimeout: inference exceeded 60 s"
+            self._last_error_signature = signature
+            logger.error(
+                "transcribe timeout (%d/%d consecutive)",
+                self._consecutive_errors,
+                _LIVE_MAX_CONSECUTIVE_ERRORS,
+            )
+            fatal = self._consecutive_errors >= _LIVE_MAX_CONSECUTIVE_ERRORS
+            return {
+                "type": "error",
+                "error": signature,
+                "fatal": bool(fatal),
+            }
         except Exception as e:
             # Typed error envelope — bounded retries before escalating.
             # The transcriber loop in main.py forwards this to the frontend
