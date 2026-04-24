@@ -1005,6 +1005,17 @@ function explainNetworkError(err: unknown, context = ""): string {
   // through to the generic region-block hint for everything else.
   if (low.startsWith("deepgram ")) {
     const base = context ? `${context}: ` : "";
+    // Missing API key takes precedence over all HTTP / network
+    // branches. Backend emits "Deepgram API key is not configured"
+    // (from remote_deepgram.py + main.py) or "Deepgram API key is
+    // required" (from remote_deepgram_live.py). These are
+    // configuration problems, not network/region problems — a VPN
+    // would NOT help. The user needs to open Settings → API Keys.
+    if (low.includes("api key is not configured") ||
+        low.includes("api key is required") ||
+        low.includes("api key is missing")) {
+      return `${base}Deepgram API key is not configured. Open Settings → API Keys → Deepgram and paste your key, or switch Provider to "local" in Settings.`;
+    }
     if (/\bhttp\s*40[12]\b/.test(low) || low.includes("rejected the api key")) {
       return `${base}Deepgram rejected the API key. Open Settings → API Keys → Deepgram and verify your key.`;
     }
@@ -2956,10 +2967,19 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
   if (existing) {
     return existing;
   }
+  // Per-invocation nonce for the DOM's placeholder ownership.
+  // Passed alongside the "Upscaling..." write via dataset so a late
+  // completing session can check "is the DOM still showing MY
+  // placeholder, or did someone else write something since?". Text-
+  // equality to "Upscaling..." is too weak — pass-14 used it and
+  // collided because two sessions write the identical literal.
+  const placeholderNonce = `${inflightKey}:${Math.random().toString(36).slice(2, 10)}`;
+  const upscaleOutputEl = $("upscaleOutput") as HTMLElement;
   const promise = (async (): Promise<string> => {
     setStatusScoped(sessionToken, "Upscaling");
     if (isCurrentUiSession(sessionToken)) {
-      $("upscaleOutput").textContent = "Upscaling...";
+      upscaleOutputEl.textContent = "Upscaling...";
+      upscaleOutputEl.dataset.upscaleNonce = placeholderNonce;
     }
     const t0 = performance.now();
     const upscaleModel = getUpscaleModelValue();
@@ -2971,19 +2991,19 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       });
       const out = String(r.text || "").trim();
       if (!out) throw new Error("Upscale returned empty text");
-      // Session-aware success write. Asymmetric with the error
-      // path (which requires the session to still be current): for
-      // successes we ALSO write if the element is still showing our
-      // own "Upscaling..." placeholder — that case covers pass-12's
-      // stuck-on-placeholder bug. But we do NOT clobber if a newer
-      // session has since written its own output or error, which is
-      // what a naked unguarded write did before (clobber user's
-      // current recording's upscale output with a stale previous
-      // recording's text).
-      const currentUpscaleOutput = $("upscaleOutput").textContent || "";
-      const isStuckOnOurPlaceholder = currentUpscaleOutput === "Upscaling...";
-      if (isCurrentUiSession(sessionToken) || isStuckOnOurPlaceholder) {
-        $("upscaleOutput").textContent = out;
+      // Session-aware success write. We write if EITHER:
+      //   (a) this session is still the current UI session, OR
+      //   (b) the DOM is still showing OUR specific placeholder
+      //       (dataset.upscaleNonce === placeholderNonce). This
+      //       covers the pass-12 stuck-on-placeholder case without
+      //       letting session A clobber session B's IDENTICAL
+      //       "Upscaling..." string (pass-14's text-equality sentinel
+      //       collided because both sessions wrote the same literal).
+      const isStillOurPlaceholder =
+        upscaleOutputEl.dataset.upscaleNonce === placeholderNonce;
+      if (isCurrentUiSession(sessionToken) || isStillOurPlaceholder) {
+        upscaleOutputEl.textContent = out;
+        upscaleOutputEl.dataset.upscaleNonce = "";
         $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
       }
       setStatusScoped(sessionToken, "Done");
@@ -3023,17 +3043,16 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       } else {
         friendly = `Upscale failed: ${rawMsg}\n\nUsing original transcript.`;
       }
-      // Error path MUST be session-guarded (asymmetric with success).
-      // Success unguarding was justified by the stuck-on-Upscaling...
-      // recovery case. Errors do NOT have that need: the placeholder
-      // was only written when the session matched at START time;
-      // a stale session reaching its catch block later must not
-      // clobber a newer session's successful upscale output. Without
-      // this guard, user records A → stops → starts B → A fails late
-      // (e.g. network flake) → B's good output gets replaced by A's
-      // error. Keep the placeholder-clear asymmetry narrow.
-      if (isCurrentUiSession(sessionToken)) {
-        $("upscaleOutput").textContent = friendly;
+      // Error-path write: same nonce-gated logic as success. If the
+      // DOM still shows OUR placeholder (no newer session has
+      // overwritten), render the friendly error so the user sees
+      // feedback — even for a session that has moved on. Otherwise
+      // skip silently (don't clobber a newer session's result).
+      const isStillOurPlaceholderErr =
+        upscaleOutputEl.dataset.upscaleNonce === placeholderNonce;
+      if (isCurrentUiSession(sessionToken) || isStillOurPlaceholderErr) {
+        upscaleOutputEl.textContent = friendly;
+        upscaleOutputEl.dataset.upscaleNonce = "";
         $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
       }
       setStatusScoped(sessionToken, "Done");
@@ -4854,6 +4873,10 @@ function resetOutputs(): void {
   resetLiveDraftState();
   publishRecordingOutput({ recordingId: 0, pasteText: "", domText: "", kind: "" });
   $("upscaleOutput").textContent = "";
+  // Reset the placeholder-ownership nonce so any still-in-flight
+  // upscale from a prior session sees "not my placeholder anymore"
+  // and declines to clobber the freshly-cleared DOM.
+  ($("upscaleOutput") as HTMLElement).dataset.upscaleNonce = "";
   $("transcribeLatency").textContent = "--";
   $("upscaleLatency").textContent = "--";
   $("timer").textContent = "00:00";

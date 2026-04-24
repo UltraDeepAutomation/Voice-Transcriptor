@@ -1659,6 +1659,18 @@ function createOverlayHtml() {
           btn.addEventListener('pointerup', stop);
           btn.addEventListener('pointerleave', stop);
           btn.addEventListener('pointercancel', stop);
+          // Safety net: if the user drags the pointer off the
+          // overlay while holding, the stack mouseleave handler
+          // flips the overlay into setIgnoreMouseEvents(true,
+          // {forward:true}) and on some Electron builds the button
+          // never receives pointerleave / pointerup, leaving the
+          // interval ticking until the user re-enters the overlay.
+          // Document-level listeners fire regardless of ignore-
+          // mouse state because they're in the renderer's own
+          // event stream, not the compositor's hit-test.
+          document.addEventListener('pointerup', stop);
+          document.addEventListener('pointercancel', stop);
+          window.addEventListener('blur', stop);
         };
         attachHoldRepeat(quickAutoStopMinus, -1);
         attachHoldRepeat(quickAutoStopPlus, +1);
