@@ -56,7 +56,7 @@
 // grants even though every rebuild produces a different CDHash.
 
 const { execFileSync, execSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { existsSync, readdirSync, statSync } = require("node:fs");
 const path = require("node:path");
 
 const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
@@ -175,6 +175,58 @@ exports.default = async function afterPack(context) {
     );
   }
 
+  // STEP 1 — sign bundled runtime binaries BEFORE @electron/osx-sign
+  // walks the app. If we sign them after, the Resources envelope
+  // (_CodeSignature/CodeResources) computed by osx-sign captures
+  // hashes of the still-unsigned files, and the later signing
+  // invalidates those hashes → verify --deep --strict fails.
+  // Signing first means osx-sign's envelope hashes the final signed
+  // bytes of every runtime file.
+  const runtimeRoot = path.join(appPath, "Contents", "Resources", "runtime");
+  if (existsSync(runtimeRoot)) {
+    console.log(`[afterPack] Pre-signing bundled runtime binaries under ${runtimeRoot}`);
+    let signedCount = 0;
+    const signOne = (filePath) => {
+      try {
+        execFileSync(
+          "/usr/bin/codesign",
+          [
+            "--force",
+            "--sign", identity,
+            "--timestamp=none",
+            "--options", "runtime",
+            "--entitlements", inheritEntitlements,
+            filePath,
+          ],
+          { stdio: ["ignore", "ignore", "pipe"] },
+        );
+        signedCount += 1;
+      } catch (e) {
+        console.warn(`[afterPack] codesign skipped ${filePath}: ${e.message || e}`);
+      }
+    };
+    const walk = (dir) => {
+      let entries;
+      try { entries = readdirSync(dir); } catch { return; }
+      for (const name of entries) {
+        const full = path.join(dir, name);
+        let st;
+        try { st = statSync(full); } catch { continue; }
+        if (st.isSymbolicLink()) continue;
+        if (st.isDirectory()) { walk(full); continue; }
+        if (!st.isFile()) continue;
+        const isExec = (st.mode & 0o111) !== 0;
+        const isMacho = /\.(so|dylib)$/.test(name) || isExec;
+        if (!isMacho) continue;
+        signOne(full);
+      }
+    };
+    walk(runtimeRoot);
+    console.log(`[afterPack] Pre-signed ${signedCount} runtime binaries`);
+  }
+
+  // STEP 2 — main @electron/osx-sign pass (bundle walk + envelope).
+  //
   // Disable Apple's RFC3161 timestamp service. The default
   // @electron/osx-sign behaviour is ``--timestamp`` (no URL), which
   // queries ``timestamp.apple.com``. When that service is

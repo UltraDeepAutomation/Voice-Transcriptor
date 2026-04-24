@@ -4183,7 +4183,17 @@ function escapeHtml(text) {
 }
 
 function fileExists(p) {
-  return !!p && p.startsWith("/") && fs.existsSync(p);
+  // Accept BOTH POSIX absolute paths ("/…") AND Windows drive paths
+  // ("C:\…"). The original "/"-prefix gate was a defence against bare
+  // PATH names slipping through into fs.existsSync — preserve that
+  // intent via path.isAbsolute which handles both conventions.
+  // Without this, every bundled-runtime discovery on Windows returned
+  // false because paths start with a drive letter, and 1.1.0's
+  // "zero user setup" promise was silently inverted into a guaranteed
+  // "Python not found" boot failure.
+  if (!p) return false;
+  if (!path.isAbsolute(p)) return false;
+  try { return fs.existsSync(p); } catch { return false; }
 }
 
 function getPythonCandidates(repoRoot) {
@@ -4392,7 +4402,12 @@ async function ensureAppVenv(repoRoot) {
  * means zero user setup — no winget install, no pip, no internet.
  */
 function getBundledPythonPath() {
-  const resDir = (typeof process !== "undefined" && process.resourcesPath) || "";
+  // Only a packaged app ships the bundled runtime. In dev mode
+  // process.resourcesPath points at Electron's OWN Resources dir
+  // (node_modules/electron/.../Resources); a stray runtime/ folder
+  // there would be picked up by accident.
+  if (!app.isPackaged) return null;
+  const resDir = process.resourcesPath || "";
   if (!resDir) return null;
   const candidate = process.platform === "win32"
     ? path.join(resDir, "runtime", "python", "python.exe")
@@ -4406,7 +4421,8 @@ function getBundledPythonPath() {
  * works offline without a system ffmpeg install.
  */
 function getBundledFfmpegDir() {
-  const resDir = (typeof process !== "undefined" && process.resourcesPath) || "";
+  if (!app.isPackaged) return null;
+  const resDir = process.resourcesPath || "";
   if (!resDir) return null;
   const dir = path.join(resDir, "runtime", "ffmpeg", "bin");
   const ffmpeg = process.platform === "win32"
@@ -4486,6 +4502,28 @@ async function ensureBackendRuntime(python, repoRoot) {
   );
 
   if (importCheck.ok) return { ok: true };
+
+  // If the selected Python IS the bundled runtime, deps are pre-installed
+  // into its site-packages at release build time. An import failure here
+  // means the bundle is corrupted (AV quarantined a .pyd / .so, user
+  // deleted a file, disk error). `pip install --user` would write to a
+  // dir OUTSIDE the app bundle (~/Library/Python/3.12/ or
+  // %APPDATA%\Python\Python312\), persist across uninstalls, and shadow
+  // the pinned versions on every future launch — a worse state than
+  // the failure itself. Surface the error with the stderr so the user
+  // can report it.
+  const bundled = getBundledPythonPath();
+  if (bundled && path.resolve(python) === path.resolve(bundled)) {
+    return {
+      ok: false,
+      details: [
+        "Bundled Python runtime is missing one or more pre-installed dependencies.",
+        "This usually means an antivirus quarantined a file inside the app bundle.",
+        `python: ${python}`,
+        (importCheck.stderr || importCheck.stdout || "").trim(),
+      ].filter(Boolean).join("\n"),
+    };
+  }
 
   const requirementsPath = path.join(repoRoot, "requirements.txt");
   if (!fs.existsSync(requirementsPath)) {
@@ -4618,9 +4656,16 @@ async function startBackend() {
   BASE_URL = `http://${HOST}:${PORT}`;
   appendMainLog(`[backend-start] python="${python}" host=${HOST} port=${PORT} repo="${repoRoot}"`);
 
+  // --app-dir tells uvicorn where to find the "backend.main" module
+  // WITHOUT polluting PYTHONPATH globally. The previous PYTHONPATH=
+  // repoRoot approach made the bundled standalone Python willing to
+  // import any top-level name from resources/ (including `runtime`
+  // and `frontend`) which invites silent import shadowing on any
+  // refactor.
   const args = [
     "-m", "uvicorn",
     "backend.main:app",
+    "--app-dir", repoRoot,
     "--host", HOST,
     "--port", String(PORT),
     "--log-level", "info"

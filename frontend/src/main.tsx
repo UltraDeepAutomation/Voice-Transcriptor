@@ -565,15 +565,24 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   // VPN-needed message BEFORE the sanitize pass would filter them
   // as generic "TypeError".
   const lowRaw = raw.toLowerCase();
-  if (
+  // "Load failed" is Safari/WebKit's generic message for an aborted
+  // or CORS-blocked fetch — but it ALSO appears inside legitimate
+  // backend errors like "failed to load model 'large-v3': file not
+  // found". Substring-matching the phrase wrongly redirected a model-
+  // missing error into the "offline, try VPN" explainer. Gate it on
+  // a full-string match instead so only the real generic WebKit
+  // network failure gets promoted.
+  const isGenericNetworkFail =
     lowRaw === "failed to fetch" ||
+    lowRaw === "load failed" ||
+    lowRaw === "networkerror when attempting to fetch resource.";
+  if (
+    isGenericNetworkFail ||
     lowRaw.includes("typeerror: failed to fetch") ||
-    lowRaw.includes("networkerror") ||
     lowRaw.includes("err_internet_disconnected") ||
     lowRaw.includes("err_name_not_resolved") ||
     lowRaw.includes("err_connection_refused") ||
-    lowRaw.includes("err_connection_reset") ||
-    lowRaw.includes("load failed")
+    lowRaw.includes("err_connection_reset")
   ) {
     return explainNetworkError(error);
   }
