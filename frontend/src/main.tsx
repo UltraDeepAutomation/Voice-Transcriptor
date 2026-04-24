@@ -995,7 +995,13 @@ function explainNetworkError(err: unknown, context = ""): string {
     low === "failed to fetch" ||
     low.includes("networkerror") ||
     low.includes("typeerror: fetch") ||
-    low.includes("load failed") ||
+    // "Load failed" is WebKit's generic fetch-failure message. Match
+    // it ONLY as a whole message or paired with TypeError — as a
+    // substring it wrongly catches backend errors like "failed to
+    // load model 'large-v3'" and tells the user to turn on a VPN.
+    // Must stay in lockstep with sanitizeUiErrorMessage above.
+    low === "load failed" ||
+    low === "typeerror: load failed" ||
     low.includes("err_internet_disconnected") ||
     low.includes("err_name_not_resolved") ||
     low.includes("err_connection_refused") ||

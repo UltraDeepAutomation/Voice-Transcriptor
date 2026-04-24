@@ -56,7 +56,9 @@
 // grants even though every rebuild produces a different CDHash.
 
 const { execFileSync, execSync } = require("node:child_process");
-const { existsSync, readdirSync, statSync } = require("node:fs");
+const {
+  existsSync, readdirSync, lstatSync, openSync, readSync, closeSync,
+} = require("node:fs");
 const path = require("node:path");
 
 const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
@@ -186,43 +188,99 @@ exports.default = async function afterPack(context) {
   if (existsSync(runtimeRoot)) {
     console.log(`[afterPack] Pre-signing bundled runtime binaries under ${runtimeRoot}`);
     let signedCount = 0;
-    const signOne = (filePath) => {
+    let execCount = 0;
+    let dylibCount = 0;
+
+    // Read first 16 bytes to detect Mach-O filetype.
+    //   magic (u32) + cputype (u32) + cpusubtype (u32) + filetype (u32)
+    //   MH_EXECUTE = 2, MH_DYLIB = 6, MH_BUNDLE = 8
+    // codesign REJECTS --entitlements / --options runtime on MH_DYLIB /
+    // MH_BUNDLE. Passing them to a plain .so silently fails ("invalid
+    // format for a code signature"), leaving the file unsigned and the
+    // site-packages extension unloadable under hardened runtime.
+    const classifyMacho = (filePath) => {
+      let fd;
       try {
-        execFileSync(
-          "/usr/bin/codesign",
-          [
-            "--force",
-            "--sign", identity,
-            "--timestamp=none",
-            "--options", "runtime",
-            "--entitlements", inheritEntitlements,
-            filePath,
-          ],
-          { stdio: ["ignore", "ignore", "pipe"] },
-        );
-        signedCount += 1;
-      } catch (e) {
-        console.warn(`[afterPack] codesign skipped ${filePath}: ${e.message || e}`);
+        fd = openSync(filePath, "r");
+      } catch { return "non-macho"; }
+      try {
+        const buf = Buffer.alloc(16);
+        const n = readSync(fd, buf, 0, 16, 0);
+        if (n < 16) return "non-macho";
+        const magic = buf.readUInt32LE(0);
+        // Accept both 64-bit (feedfacf) and 32-bit (feedface), plus
+        // fat binaries (cafebabe / cafebabf) which we treat as executable
+        // for entitlements purposes — though our bundled Python ships
+        // thin arm64 or x86_64 builds only.
+        if (magic === 0xfeedfacf || magic === 0xfeedface) {
+          const filetype = buf.readUInt32LE(12);
+          if (filetype === 2) return "executable";
+          if (filetype === 6 || filetype === 8) return "dylib";
+          return "macho-other";
+        }
+        if (magic === 0xcafebabe || magic === 0xcafebabf ||
+            magic === 0xbebafeca || magic === 0xbfbafeca) {
+          return "executable";  // treat fat as executable; conservative
+        }
+        return "non-macho";
+      } finally {
+        try { closeSync(fd); } catch { /* ignore */ }
       }
     };
+
+    const signOne = (filePath, kind) => {
+      // Executables get hardened-runtime + entitlements.
+      // Dylibs / bundles get a bare signature (entitlements aren't valid
+      // on shared libraries and codesign errors out when passed here).
+      const args = ["--force", "--sign", identity, "--timestamp=none"];
+      if (kind === "executable") {
+        args.push("--options", "runtime", "--entitlements", inheritEntitlements);
+        execCount += 1;
+      } else {
+        dylibCount += 1;
+      }
+      args.push(filePath);
+      try {
+        execFileSync("/usr/bin/codesign", args,
+          { stdio: ["ignore", "ignore", "pipe"] });
+        signedCount += 1;
+      } catch (e) {
+        const stderr = e && e.stderr ? e.stderr.toString() : "";
+        // HARD FAIL. A silently-unsigned .dylib under hardened runtime
+        // crashes the Python interpreter at first `import` with "code
+        // signature in ... not valid for use in process" — better to
+        // abort the build here than ship a broken DMG.
+        throw new Error(
+          `afterPack: codesign failed for ${filePath}\n${stderr || (e.message || e)}`
+        );
+      }
+    };
+
     const walk = (dir) => {
       let entries;
       try { entries = readdirSync(dir); } catch { return; }
       for (const name of entries) {
         const full = path.join(dir, name);
         let st;
-        try { st = statSync(full); } catch { continue; }
+        // lstat, NOT stat — statSync follows symlinks so
+        // isSymbolicLink() would be permanently false and we'd sign
+        // the same target twice via different names, corrupting the
+        // resource envelope.
+        try { st = lstatSync(full); } catch { continue; }
         if (st.isSymbolicLink()) continue;
         if (st.isDirectory()) { walk(full); continue; }
         if (!st.isFile()) continue;
-        const isExec = (st.mode & 0o111) !== 0;
-        const isMacho = /\.(so|dylib)$/.test(name) || isExec;
-        if (!isMacho) continue;
-        signOne(full);
+        const kind = classifyMacho(full);
+        if (kind === "non-macho" || kind === "macho-other") continue;
+        signOne(full, kind);
       }
     };
+
     walk(runtimeRoot);
-    console.log(`[afterPack] Pre-signed ${signedCount} runtime binaries`);
+    console.log(
+      `[afterPack] Pre-signed ${signedCount} runtime binaries ` +
+      `(${execCount} executables + ${dylibCount} dylibs/bundles)`
+    );
   }
 
   // STEP 2 — main @electron/osx-sign pass (bundle walk + envelope).

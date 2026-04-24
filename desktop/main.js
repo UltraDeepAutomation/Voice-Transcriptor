@@ -4198,22 +4198,33 @@ function fileExists(p) {
 
 function getPythonCandidates(repoRoot) {
   const fromEnv = (process.env.PYTHON || "").trim();
-  const appVenvPy = path.join(getAppVenvDir(), "bin", "python3");
+  const winAppVenvPy = path.join(getAppVenvDir(), "Scripts", "python.exe");
+  const unixAppVenvPy = path.join(getAppVenvDir(), "bin", "python3");
+  const appVenvPy = process.platform === "win32" ? winAppVenvPy : unixAppVenvPy;
+  const winDevVenvPy = path.join(repoRoot, ".venv", "Scripts", "python.exe");
+  const unixDevVenvPy = path.join(repoRoot, ".venv", "bin", "python3");
   const candidates = [
     fromEnv,
     appVenvPy,
-    path.join(repoRoot, ".venv", "bin", "python3"),
-    path.join(repoRoot, ".venv", "bin", "python"),
-    "/opt/homebrew/bin/python3",
-    "/usr/local/bin/python3",
-    "/usr/bin/python3",
+    process.platform === "win32" ? winDevVenvPy : unixDevVenvPy,
+    ...(process.platform === "win32" ? [] : [
+      path.join(repoRoot, ".venv", "bin", "python"),
+      "/opt/homebrew/bin/python3",
+      "/usr/local/bin/python3",
+      "/usr/bin/python3",
+    ]),
     "python3",
-    "python"
+    "python",
   ].filter(Boolean);
 
   const out = [];
   for (const c of candidates) {
-    if (c.startsWith("/")) {
+    // path.isAbsolute handles BOTH POSIX absolute ("/…") AND Windows
+    // drive paths ("C:\…"). The previous startsWith("/") gate filtered
+    // Windows paths into the "bare name" branch, letting bogus
+    // non-existent C:\…\python.exe paths leak through and crash at
+    // spawn() time with ENOENT instead of being filtered out here.
+    if (path.isAbsolute(c)) {
       if (fileExists(c)) out.push(c);
       continue;
     }
@@ -4342,7 +4353,10 @@ async function findSystemPython(repoRoot) {
     "python"
   ].filter(Boolean);
   for (const py of sysCandidates) {
-    if (py.startsWith("/") && !fileExists(py)) continue;
+    // path.isAbsolute matches both POSIX "/…" and Windows "C:\…".
+    // Previous startsWith("/") let non-existent Windows paths slip
+    // through to spawn() with ENOENT.
+    if (path.isAbsolute(py) && !fileExists(py)) continue;
     const check = await runCommand(py, ["-c", "import sys; print(sys.version_info.major)"], {
       cwd: repoRoot, timeoutMs: 8000
     });
@@ -4532,8 +4546,16 @@ async function ensureBackendRuntime(python, repoRoot) {
 
   setBackendBootStatus("Installing dependencies (first launch)…");
 
-  // If Python is inside app venv, install directly (no --user needed)
-  const isAppVenv = python.startsWith(getAppVenvDir());
+  // If Python is inside the app venv, install directly (no --user needed).
+  // Compare normalized absolute paths with a separator-boundary check
+  // so we can't (a) match a sibling directory by raw prefix
+  // ("/…/.venvold" matching "/…/.venv"), or (b) miss due to mixed
+  // separators after Python normalizes its own `sys.executable`.
+  const venvDirNormalized = path.resolve(getAppVenvDir());
+  const pythonResolved = path.resolve(python);
+  const isAppVenv =
+    pythonResolved === venvDirNormalized ||
+    pythonResolved.startsWith(venvDirNormalized + path.sep);
   const pipArgs = ["-m", "pip", "install", "-r", requirementsPath];
   if (!isAppVenv) {
     pipArgs.splice(3, 0, "--user");
@@ -4690,19 +4712,23 @@ async function startBackend() {
   const envPath = ffmpegDir
     ? `${ffmpegDir}${path.delimiter}${process.env.PATH || ""}`
     : (process.env.PATH || "");
+  // Child env. `--app-dir repoRoot` (above, in args) already inserts
+  // repoRoot into sys.path for uvicorn's module resolution, so
+  // exporting PYTHONPATH=repoRoot would double-inject the same dir
+  // AND expose every sibling top-level dir (runtime/, frontend/) as
+  // importable. We deliberately do NOT export PYTHONPATH here;
+  // the caller's own PYTHONPATH (if set) is passed through via
+  // ...process.env spread above.
+  const childEnv = {
+    ...process.env,
+    PATH: envPath,
+    PYTHONUNBUFFERED: "1",
+    TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
+  };
   backend = spawn(python, args, {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      PATH: envPath,
-      PYTHONUNBUFFERED: "1",
-      // path.delimiter is ";" on Windows, ":" elsewhere. Hardcoding
-      // ":" caused Windows PYTHONPATH to be malformed, making every
-      // pre-existing Python path entry unimportable.
-      PYTHONPATH: repoRoot + (process.env.PYTHONPATH ? `${path.delimiter}${process.env.PYTHONPATH}` : ""),
-      TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
-    }
+    env: childEnv,
   });
   // Ignore any stdin errors — the pipe is only used for EOF-on-parent-
   // exit detection. If the write end gets EPIPE for some reason (backend
