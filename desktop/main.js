@@ -136,8 +136,6 @@ let backendStderrTail = "";
 const BACKEND_STDERR_TAIL_MAX = 4096;
 let isQuitting = false;
 let shortcutToggleInFlight = false;
-let pasteTargetAppName = "";
-let pasteTargetAppPid = 0;
 let overlayStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
@@ -182,6 +180,7 @@ let backendStartInFlight = null;
 let micPermissionChecked = false;
 let loadedFrontendBuildSignature = "";
 const OVERLAY_FIXED_HEIGHT = 150;
+let pasteTarget = emptyCapturedPasteTarget();
 
 const HOST = "127.0.0.1";
 // Backend port default. pickBackendPort iterates up if occupied, so
@@ -2142,13 +2141,9 @@ async function showRecordingOverlay() {
     clearTimeout(overlayTranscribingStatusTimer);
     overlayTranscribingStatusTimer = null;
   }
-  pasteTargetAppName = "";
-  pasteTargetAppPid = 0;
+  clearCapturedPasteTarget();
   const front = await getFrontmostAppInfo();
-  if (shouldUsePasteTarget(front)) {
-    pasteTargetAppName = front.name || "";
-    pasteTargetAppPid = front.pid || 0;
-  }
+  setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
   if (!overlayLoaded) {
@@ -2477,23 +2472,14 @@ async function toggleRecordingFromShortcut() {
   if (shortcutToggleInFlight) return;
   const trace = createTrace("toggle_hotkey", {});
   shortcutToggleInFlight = true;
-  // Track whether the captured paste target was consumed by an
-  // enqueued task. If not (any failure path, or a start-recording
-  // path), we clear it in the finally block so a stale target can
-  // never leak into the NEXT recording's post-stop task.
-  let pasteTargetConsumed = false;
+  let keepCapturedTarget = false;
   try {
-    pasteTargetAppName = "";
-    pasteTargetAppPid = 0;
     const front = await getFrontmostAppInfo();
     traceStep(trace, "front_before", {
       name: front.name || "",
       pid: front.pid || 0,
+      windowTitle: compactLogText(front.windowTitle || "", 80),
     });
-    if (shouldUsePasteTarget(front)) {
-      pasteTargetAppName = front.name || "";
-      pasteTargetAppPid = front.pid || 0;
-    }
     await ensureOverlayVisible({ status: pendingTranscriptionCount > 0 ? null : "Starting", resetTimer: false, startTimer: false });
     traceStep(trace, "overlay_visible", { status: "Starting" });
     const micGranted = await requestMacMicrophonePermissionOnce();
@@ -2546,6 +2532,11 @@ async function toggleRecordingFromShortcut() {
     }
 
     if (result.recording) {
+      setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
+      keepCapturedTarget = true;
+      traceStep(trace, "target_captured", {
+        target: pasteTargetSummary(pasteTarget),
+      });
       traceStep(trace, "recording_started", { auto: !!result.auto, timerText: result.timerText || "" });
       await showRecordingOverlay();
       traceEnd(trace, "recording-started", {});
@@ -2565,11 +2556,8 @@ async function toggleRecordingFromShortcut() {
         autoSendEnter: !!result.autoSendEnter,
         stopRequestedAt: Date.now(),
         recordingId: Number(result.recordingId || 0),
-        targetName: pasteTargetAppName,
-        targetPid: pasteTargetAppPid,
+        target: pasteTarget,
       });
-      // The task holds its own copy — we can release the globals now.
-      pasteTargetConsumed = true;
       await syncOverlayQueueVisual(false);
       await showPostStopYellowThenTranscribing(700);
     } else {
@@ -2586,15 +2574,9 @@ async function toggleRecordingFromShortcut() {
     traceEnd(trace, "done", {});
   } finally {
     shortcutToggleInFlight = false;
-    // Guarantee no stale paste target leaks into a future session on
-    // ANY exit path — renderer-not-ready, app-loading, mic-denied,
-    // exception mid-flow, etc. The consumed flag means an enqueued
-    // task already copied the value, so we are safe to clear here
-    // regardless of which branch above ran.
-    pasteTargetAppName = "";
-    pasteTargetAppPid = 0;
-    // Silence unused-var warning if consumed flag is never flipped.
-    void pasteTargetConsumed;
+    if (!keepCapturedTarget) {
+      clearCapturedPasteTarget();
+    }
   }
 }
 
@@ -2673,8 +2655,7 @@ async function stopRecordingFromOverlay() {
           autoSendEnter: !!result.autoSendEnter,
           stopRequestedAt: Date.now(),
           recordingId: Number(result.recordingId || 0),
-          targetName: pasteTargetAppName,
-          targetPid: pasteTargetAppPid,
+          target: pasteTarget,
         });
         await syncOverlayQueueVisual(false);
         await showPostStopYellowThenTranscribing(700);
@@ -2687,11 +2668,7 @@ async function stopRecordingFromOverlay() {
       scheduleOverlayHide(1400);
     }
   } finally {
-    // Every exit path clears the paste target — the enqueued task
-    // already holds its own copy, and any early-return branch must
-    // not leak a stale target into the next recording.
-    pasteTargetAppName = "";
-    pasteTargetAppPid = 0;
+    clearCapturedPasteTarget();
   }
 }
 
@@ -2763,6 +2740,71 @@ async function queryRendererState() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function emptyCapturedPasteTarget() {
+  return {
+    appName: "",
+    pid: 0,
+    windowTitle: "",
+    windowId: "",
+    hwnd: "",
+    className: "",
+    instanceName: "",
+  };
+}
+
+function normalizeCapturedPasteTarget(target) {
+  const src = target && typeof target === "object" ? target : {};
+  return {
+    appName: String(src.appName ?? src.name ?? src.targetName ?? "").trim(),
+    pid: Number.parseInt(String(src.pid ?? src.targetPid ?? 0), 10) || 0,
+    windowTitle: String(src.windowTitle || "").trim(),
+    windowId: normalizeLinuxWindowId(src.windowId || ""),
+    hwnd: normalizeWindowsHwnd(src.hwnd || ""),
+    className: String(src.className || "").trim(),
+    instanceName: String(src.instanceName || "").trim(),
+  };
+}
+
+function cloneCapturedPasteTarget(target) {
+  return normalizeCapturedPasteTarget(target);
+}
+
+function hasCapturedPasteTarget(target) {
+  const normalized = normalizeCapturedPasteTarget(target);
+  return (
+    normalized.pid > 0 ||
+    !!normalized.appName ||
+    !!normalized.windowId ||
+    !!normalized.hwnd
+  );
+}
+
+function setCapturedPasteTarget(target) {
+  pasteTarget = cloneCapturedPasteTarget(target);
+}
+
+function clearCapturedPasteTarget() {
+  pasteTarget = emptyCapturedPasteTarget();
+}
+
+function capturePasteTargetFromFrontInfo(front) {
+  if (!shouldUsePasteTarget(front)) return emptyCapturedPasteTarget();
+  return normalizeCapturedPasteTarget({
+    appName: front?.name,
+    pid: front?.pid,
+    windowTitle: front?.windowTitle,
+    windowId: front?.windowId,
+    hwnd: front?.hwnd,
+    className: front?.className,
+    instanceName: front?.instanceName,
+  });
+}
+
+function pasteTargetSummary(target) {
+  const normalized = normalizeCapturedPasteTarget(target);
+  return `app="${normalized.appName}" pid=${normalized.pid} windowTitle="${compactLogText(normalized.windowTitle, 80)}" windowId="${normalized.windowId}" hwnd="${normalized.hwnd}" class="${normalized.className}" instance="${normalized.instanceName}"`;
 }
 
 function getLastTranscriptPath() {
@@ -2961,6 +3003,14 @@ function hasLinuxX11Session() {
   return process.platform === "linux" && !!process.env.DISPLAY;
 }
 
+function normalizeWindowsHwnd(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  const hex = raw.startsWith("0x") ? raw.slice(2) : raw;
+  if (!/^[0-9a-f]+$/i.test(hex)) return "";
+  return `0x${hex.replace(/^0+/, "") || "0"}`;
+}
+
 function normalizeLinuxWindowId(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return "";
@@ -3139,7 +3189,14 @@ async function getLinuxFrontmostAppInfo() {
   }
   const processName = pid > 0 ? await getLinuxProcessName(pid) : "";
   const name = pickLinuxTargetName({ ...winInfo, title }, processName);
-  return { name, pid };
+  return {
+    name,
+    pid,
+    windowId: activeWindowId,
+    windowTitle: title,
+    className: String(winInfo?.className || "").trim(),
+    instanceName: String(winInfo?.instanceName || "").trim(),
+  };
 }
 
 async function getFrontmostAppInfo() {
@@ -3148,25 +3205,45 @@ async function getFrontmostAppInfo() {
       Add-Type @"
         using System;
         using System.Runtime.InteropServices;
+        using System.Text;
         public class Window {
           [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
           [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+          [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+          [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
         }
 "@
       $hwnd = [Window]::GetForegroundWindow()
       $pid = 0
       [Window]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
       $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-      if ($proc) { Write-Output ($proc.Name + "||" + $pid) } else { Write-Output "||0" }
+      $titleSb = New-Object System.Text.StringBuilder 4096
+      [Window]::GetWindowText($hwnd, $titleSb, $titleSb.Capacity) | Out-Null
+      $classSb = New-Object System.Text.StringBuilder 512
+      [Window]::GetClassName($hwnd, $classSb, $classSb.Capacity) | Out-Null
+      $result = @{
+        name = if ($proc) { $proc.Name } else { "" }
+        pid = if ($proc) { $pid } else { 0 }
+        hwnd = if ($hwnd -ne [IntPtr]::Zero) { ('0x{0:X}' -f ([Int64]$hwnd)) } else { "" }
+        windowTitle = $titleSb.ToString()
+        className = $classSb.ToString()
+      }
+      $result | ConvertTo-Json -Compress
     `;
     const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
     if (!res.ok) return { name: "", pid: 0 };
-    const raw = String(res.stdout || "").trim();
-    const [name, pidText] = raw.split("||");
-    return {
-      name: String(name || "").trim(),
-      pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0
-    };
+    try {
+      const parsed = JSON.parse(String(res.stdout || "").trim() || "{}");
+      return {
+        name: String(parsed?.name || "").trim(),
+        pid: Number.parseInt(String(parsed?.pid || "0").trim(), 10) || 0,
+        hwnd: normalizeWindowsHwnd(parsed?.hwnd || ""),
+        windowTitle: String(parsed?.windowTitle || "").trim(),
+        className: String(parsed?.className || "").trim(),
+      };
+    } catch {
+      return { name: "", pid: 0 };
+    }
   }
   if (process.platform === "linux") {
     return getLinuxFrontmostAppInfo();
@@ -3176,16 +3253,22 @@ async function getFrontmostAppInfo() {
       set p to first process whose frontmost is true
       set n to name of p
       set u to unix id of p
-      return (n as text) & "||" & (u as text)
+      set d to ASCII character 30
+      set w to ""
+      try
+        set w to name of front window of p
+      end try
+      return (n as text) & d & (u as text) & d & (w as text)
     end tell
   `;
   const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
   if (!res.ok) return { name: "", pid: 0 };
   const raw = String(res.stdout || "").trim();
-  const [name, pidText] = raw.split("||");
+  const [name, pidText, windowTitle] = raw.split(String.fromCharCode(30));
   return {
     name: String(name || "").trim(),
-    pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0
+    pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0,
+    windowTitle: String(windowTitle || "").trim(),
   };
 }
 
@@ -3274,6 +3357,119 @@ async function activateAppByPid(pid) {
   const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
   if (!res.ok) return false;
   return String(res.stdout || "").trim() === "1";
+}
+
+async function activateWindowsWindowByHwnd(hwnd) {
+  const normalized = normalizeWindowsHwnd(hwnd);
+  if (!normalized) return false;
+  const hex = normalized.slice(2);
+  const pwsh = `
+    Add-Type @"
+      using System;
+      using System.Runtime.InteropServices;
+      public class Window {
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+      }
+"@
+    $hwnd = [IntPtr]::new([Int64]::Parse('${hex}', [System.Globalization.NumberStyles]::AllowHexSpecifier))
+    if ([Window]::IsWindow($hwnd)) {
+      [Window]::ShowWindowAsync($hwnd, 5) | Out-Null
+      [Window]::SetForegroundWindow($hwnd) | Out-Null
+      Write-Output "1"
+    } else {
+      Write-Output "0"
+    }
+  `;
+  const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+  if (!res.ok) return false;
+  await sleep(180);
+  return String(res.stdout || "").trim() === "1";
+}
+
+async function activateMacCapturedWindow(target) {
+  const normalized = normalizeCapturedPasteTarget(target);
+  const escapedApp = escapeAppleScriptString(normalized.appName);
+  const escapedTitle = escapeAppleScriptString(normalized.windowTitle);
+  const pid = Number(normalized.pid || 0);
+  const script = `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${pid > 0 ? Math.trunc(pid) : 0}
+    set targetWindowTitle to "${escapedTitle}"
+    tell application "System Events"
+      set p to missing value
+      if targetPid > 0 then
+        try
+          if exists (first process whose unix id is targetPid) then
+            set p to first process whose unix id is targetPid
+          end if
+        end try
+      end if
+      if p is missing value and targetApp is not "" then
+        try
+          if exists process targetApp then
+            set p to process targetApp
+          end if
+        end try
+      end if
+      if p is missing value then return "0"
+      set frontmost of p to true
+      delay 0.08
+      if targetWindowTitle is not "" then
+        try
+          if exists (first window of p whose name is targetWindowTitle) then
+            set w to first window of p whose name is targetWindowTitle
+            try
+              perform action "AXRaise" of w
+            end try
+            try
+              set value of attribute "AXMain" of w to true
+            end try
+            delay 0.08
+          end if
+        end try
+      end if
+      return "1"
+    end tell
+  `;
+  const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
+  if (!res.ok) return false;
+  return String(res.stdout || "").trim() === "1";
+}
+
+async function activateCapturedPasteTarget(target) {
+  const normalized = normalizeCapturedPasteTarget(target);
+  if (!hasCapturedPasteTarget(normalized)) return false;
+  if (process.platform === "win32") {
+    if (normalized.hwnd) {
+      const byHwnd = await activateWindowsWindowByHwnd(normalized.hwnd);
+      if (byHwnd) return true;
+    }
+    if (normalized.pid > 0) {
+      const byPid = await activateAppByPid(normalized.pid);
+      if (byPid) return true;
+    }
+    if (normalized.appName) {
+      return activateAppByName(normalized.appName);
+    }
+    return false;
+  }
+  if (process.platform === "linux") {
+    if (normalized.windowId) {
+      const byWindow = await activateLinuxWindowById(normalized.windowId);
+      if (byWindow) return true;
+    }
+    if (normalized.pid > 0) {
+      const byPid = await activateAppByPid(normalized.pid);
+      if (byPid) return true;
+    }
+    if (normalized.appName) {
+      return activateAppByName(normalized.appName);
+    }
+    return false;
+  }
+  return activateMacCapturedWindow(normalized);
 }
 
 async function requestMacPastePermissionsOnce() {
@@ -3473,14 +3669,11 @@ function restoreClipboard(snap) {
   }
 }
 
-async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0) {
-  const originalTargetName = String(targetAppName || "").trim();
-  const originalTargetPid = Number(targetAppPid || 0);
-  let effectiveTargetName = originalTargetName;
-  let effectiveTargetPid = originalTargetPid;
+async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget()) {
+  const originalTarget = normalizeCapturedPasteTarget(target);
+  let effectiveTarget = cloneCapturedPasteTarget(originalTarget);
   const trace = createTrace("paste", {
-    targetAppName: originalTargetName,
-    targetAppPid: originalTargetPid,
+    target: pasteTargetSummary(originalTarget),
     textLen: String(text || "").length,
     textDigest: textDigest(text),
     textPreview: compactLogText(text, 120),
@@ -3498,46 +3691,39 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   traceStep(trace, "front_before", {
     frontBeforeName: frontBefore.name || "",
     frontBeforePid: frontBefore.pid || 0,
+    frontBeforeWindowTitle: compactLogText(frontBefore.windowTitle || "", 80),
   });
-  const targetLooksGenericElectron = /^electron$/i.test(effectiveTargetName);
+  const targetLooksGenericElectron = /^electron$/i.test(effectiveTarget.appName);
   if (targetLooksGenericElectron && shouldUsePasteTarget(frontBefore)) {
-    effectiveTargetName = String(frontBefore.name || "").trim();
-    effectiveTargetPid = Number(frontBefore.pid || 0);
+    effectiveTarget = capturePasteTargetFromFrontInfo(frontBefore);
     traceStep(trace, "target_normalized_from_front", {
-      fromName: originalTargetName,
-      fromPid: originalTargetPid,
-      toName: effectiveTargetName,
-      toPid: effectiveTargetPid,
+      from: pasteTargetSummary(originalTarget),
+      to: pasteTargetSummary(effectiveTarget),
       reason: "generic-electron-target",
     });
   } else if (targetLooksGenericElectron) {
     // Avoid routing by generic app name when we don't have a safe concrete pid.
-    effectiveTargetName = "";
+    effectiveTarget.appName = "";
     traceStep(trace, "target_name_cleared", {
-      fromName: originalTargetName,
+      from: pasteTargetSummary(originalTarget),
       reason: "generic-electron-without-safe-front",
     });
   }
-  const targetHint = `${effectiveTargetName} ${String(frontBefore.name || "")}`.toLowerCase();
-  const genericElectronTarget = /^electron$/i.test(effectiveTargetName);
+  const targetHint = `${effectiveTarget.appName} ${effectiveTarget.windowTitle} ${String(frontBefore.name || "")}`.toLowerCase();
+  const genericElectronTarget = /^electron$/i.test(effectiveTarget.appName);
   if (genericElectronTarget) {
     // For Electron-based third-party apps, process-level targeting can hit the shell process
     // instead of the real focused webview/editor. Force global frontmost route.
     traceStep(trace, "target_route_override", {
-      fromName: effectiveTargetName,
-      fromPid: effectiveTargetPid,
-      toName: "",
-      toPid: 0,
+      from: pasteTargetSummary(effectiveTarget),
       reason: "generic-electron-use-frontmost-global",
     });
-    effectiveTargetName = "";
-    effectiveTargetPid = 0;
+    effectiveTarget = emptyCapturedPasteTarget();
   }
   const preferTypedFirst = false;
   traceStep(trace, "paste_strategy", { preferTypedFirst, targetHint: compactLogText(targetHint, 80) });
   logPasteTrace("start", {
-    targetAppName: effectiveTargetName,
-    targetAppPid: effectiveTargetPid,
+    target: pasteTargetSummary(effectiveTarget),
     frontBeforeName: frontBefore.name || "",
     frontBeforePid: frontBefore.pid || 0,
     textLen: String(text).length,
@@ -3555,14 +3741,25 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
-  const escapedApp = escapeAppleScriptString(effectiveTargetName);
-  const rawPid = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
+  if (hasCapturedPasteTarget(effectiveTarget)) {
+    try {
+      const restored = await activateCapturedPasteTarget(effectiveTarget);
+      traceStep(trace, restored ? "target_activated" : "target_activation_failed", {
+        target: pasteTargetSummary(effectiveTarget),
+      });
+      await sleep(80);
+    } catch { }
+  }
+  const escapedApp = escapeAppleScriptString(effectiveTarget.appName);
+  const escapedWindowTitle = escapeAppleScriptString(effectiveTarget.windowTitle);
+  const rawPid = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
   // Defense-in-depth: reject any value that is not a safe non-negative integer
   // before interpolating it into the AppleScript source string.
   const pid = (Number.isFinite(rawPid) && rawPid >= 0 && rawPid < 2 ** 31) ? Math.trunc(rawPid) : 0;
   const robustPasteScript = `
     set targetApp to "${escapedApp}"
     set targetPid to ${pid}
+    set targetWindowTitle to "${escapedWindowTitle}"
     tell application "System Events"
       if UI elements enabled is false then return "ERR:no-accessibility"
       set p to missing value
@@ -3593,6 +3790,20 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       -- for several seconds and it makes the overlay look "stuck on transcribing".
       set frontmost of p to true
       delay 0.08
+      if targetWindowTitle is not "" then
+        try
+          if exists (first window of p whose name is targetWindowTitle) then
+            set w to first window of p whose name is targetWindowTitle
+            try
+              perform action "AXRaise" of w
+            end try
+            try
+              set value of attribute "AXMain" of w to true
+            end try
+            delay 0.05
+          end if
+        end try
+      end if
       
       -- Perform physical V key press (key code 9) + Cmd
       -- This bypasses keyboard layout issues (like Russian "м") where keystroke "v" fails
@@ -3629,6 +3840,10 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     for (let attempt = 0; attempt < 3; attempt++) {
       try { clipboard.writeText(String(text)); } catch { }
       await sleep(30 + attempt * 30);
+      if (hasCapturedPasteTarget(effectiveTarget)) {
+        await activateCapturedPasteTarget(effectiveTarget).catch(() => false);
+        await sleep(70);
+      }
 
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "win_paste" });
       traceStep(trace, "method_begin", { method: "win_paste", attempt: attempt + 1 });
@@ -3642,20 +3857,21 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         const vbsLines = [
           'Set WshShell = CreateObject("WScript.Shell")',
         ];
-        // Activate target window by PID if available
-        if (effectiveTargetPid > 0) {
-          vbsLines.push(`WshShell.AppActivate ${Math.trunc(effectiveTargetPid)}`);
+        // Activate target window by PID/name only when we do not have an
+        // exact HWND-level restore already performed above.
+        if (!effectiveTarget.hwnd && effectiveTarget.pid > 0) {
+          vbsLines.push(`WshShell.AppActivate ${Math.trunc(effectiveTarget.pid)}`);
           vbsLines.push('WScript.Sleep 80');
-        } else if (effectiveTargetName) {
+        } else if (!effectiveTarget.hwnd && effectiveTarget.appName) {
           // VBS string literals are terminated by CR/LF — a target name
           // that contains a newline would break out of the quoted string
           // and inject arbitrary VBS into the script. Doubling the ``"``
           // is the standard VBS escape; stripping CR/LF + NUL + all other
           // control characters prevents any line-break-based escape.
-          // effectiveTargetName comes from the Windows process table, so
+          // effectiveTarget.appName comes from the Windows process table, so
           // the attack surface is small (a process would have to register
           // with a pathological name), but the one-line fix is free.
-          const sanitizedName = effectiveTargetName
+          const sanitizedName = effectiveTarget.appName
             .replace(/[\x00-\x1f\x7f]/g, "")
             .replace(/"/g, '""');
           vbsLines.push(`WshShell.AppActivate "${sanitizedName}"`);
@@ -3700,8 +3916,10 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       // hotkey was pressed (typically the overlay itself), and the
       // text lands in the wrong window.
       if (attempt === 2) {
-        const pidNum = Number.parseInt(String(effectiveTargetPid || 0), 10) || 0;
+        const pidNum = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
         const safePid = (Number.isFinite(pidNum) && pidNum > 0 && pidNum < 2 ** 31) ? Math.trunc(pidNum) : 0;
+        const safeHwnd = normalizeWindowsHwnd(effectiveTarget.hwnd || "");
+        const hwndHex = safeHwnd ? safeHwnd.slice(2) : "";
         // Inside a JS template literal (backtick-delimited), `"` is not
         // a special character and MUST NOT be escaped. The over-escaped
         // `\\"user32.dll\\"` version produced literal `\"user32.dll\"`
@@ -3709,7 +3927,14 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         // Add-Type (CS1056: unexpected character '\'). See the sibling
         // PowerShell blocks in getFrontmostAppInfo / getFrontmostAppName
         // for the correct unescaped form.
-        const activateBlock = safePid > 0 ? (
+        const activateBlock = safeHwnd ? (
+          `Add-Type @"\n` +
+          `using System;\n` +
+          `using System.Runtime.InteropServices;\n` +
+          `public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int cmd); }\n` +
+          `"@;\n` +
+          `try { $h = [IntPtr]::new([Int64]::Parse('${hwndHex}', [System.Globalization.NumberStyles]::AllowHexSpecifier)); [W]::ShowWindowAsync($h, 5) | Out-Null; [W]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
+        ) : safePid > 0 ? (
           `Add-Type @"\n` +
           `using System;\n` +
           `using System.Runtime.InteropServices;\n` +
@@ -3746,11 +3971,10 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
     // second-guess via focus polling (Linux has no stable per-window
     // "activate and paste" API like AppleScript's ``tell process``).
     //
-    // Window activation: if ``effectiveTargetPid`` is known we use
-    // ``wmctrl -ia`` on X11 (activates and raises). On Wayland there
-    // is no standard cross-compositor window activation — we rely on
-    // whatever already has focus (the user typically tab-ed to the
-    // target before pressing the paste hotkey).
+      // Window activation: for captured X11 targets we restore the
+      // exact window id first; on Wayland there is no standard cross-
+      // compositor restore API, so we rely on the compositor's current
+      // focus and then send the paste keystroke.
     // $WAYLAND_DISPLAY is set on any Wayland session (pure Wayland or
     // XWayland hybrid). GNOME and KDE on Wayland set BOTH WAYLAND_DISPLAY
     // and DISPLAY — the old check (&&!DISPLAY) incorrectly treated them
@@ -3766,11 +3990,8 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "linux_paste" });
       traceStep(trace, "method_begin", { method: "linux_paste", attempt: attempt + 1, wayland: isWayland });
 
-      if (effectiveTargetPid > 0) {
-        await activateAppByPid(effectiveTargetPid).catch(() => false);
-        await sleep(60);
-      } else if (effectiveTargetName) {
-        await activateAppByName(effectiveTargetName).catch(() => false);
+      if (hasCapturedPasteTarget(effectiveTarget)) {
+        await activateCapturedPasteTarget(effectiveTarget).catch(() => false);
         await sleep(60);
       }
 
@@ -3971,14 +4192,10 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
-async function sendCommandEnterToFocusedApp(targetAppName = "", targetAppPid = 0) {
-  const targetName = String(targetAppName || "").trim();
-  const targetPid = Number(targetAppPid || 0);
-  if (targetPid > 0) {
-    await activateAppByPid(targetPid);
-    await sleep(110);
-  } else if (targetName && !isBadActivationTarget(targetName)) {
-    await activateAppByName(targetName);
+async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget()) {
+  const normalized = normalizeCapturedPasteTarget(target);
+  if (hasCapturedPasteTarget(normalized)) {
+    await activateCapturedPasteTarget(normalized);
     await sleep(110);
   }
   
@@ -4071,13 +4288,12 @@ function enqueuePostStopTask(options = {}) {
     autoSendEnter: !!options.autoSendEnter,
     stopRequestedAt: Number(options.stopRequestedAt || Date.now()),
     recordingId: Number(options.recordingId || 0),
-    targetName: String(options.targetName || ""),
-    targetPid: Number(options.targetPid || 0),
+    target: normalizeCapturedPasteTarget(options.target),
   };
   if (!task.autoTranscribe) return;
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
-  appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} target="${task.targetName}" pid=${task.targetPid}`);
+  appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
   void runPostStopQueue();
 }
 
@@ -4317,74 +4533,35 @@ async function processPostStopTask(task) {
       clipboard.writeText(transcript);
     } catch { }
 
-    // Paste target resolution. The start-time snapshot
-    // (``task.targetName``/``task.targetPid``) captures the app the
-    // user was in when they pressed the RECORD shortcut, but the
-    // user may well have switched apps mid-recording — they pressed
-    // the shortcut in Telegram, then Cmd-Tab to Slack to look at
-    // something, speak, and press the shortcut again to stop + paste.
-    // In that case the correct target is the CURRENT frontmost app
-    // (Slack), not the app that was frontmost at record time
-    // (Telegram).
-    //
-    // Strategy (latest-wins with safe fallback):
-    //
-    //   1. Snapshot the current frontmost app.
-    //   2. If it is a real pasteable target (``shouldUsePasteTarget``
-    //      returns true — not Transcriptor/overlay/helper), use it.
-    //   3. Otherwise fall back to the start-time snapshot — the
-    //      overlay might be transiently in front after the user
-    //      clicked its Stop button, or some helper process might
-    //      have taken focus. The start snapshot is still a valid
-    //      best guess in that case.
-    //   4. If even the start snapshot is absent, try to re-activate
-    //      the start-time PID so whatever app was there when
-    //      recording began comes back and receives the paste.
-    let effectiveTargetName = task.targetName || "";
-    let effectiveTargetPid = Number(task.targetPid || 0);
-    try {
-      const currentFront = await getFrontmostAppInfo();
-      const currentName = String(currentFront.name || "").trim();
-      const currentPid = Number(currentFront.pid || 0);
-      if (shouldUsePasteTarget(currentFront)) {
-        if (
-          effectiveTargetPid > 0 &&
-          currentPid > 0 &&
-          currentPid !== effectiveTargetPid
-        ) {
-          traceStep(trace, "target_refreshed_from_current_front", {
-            oldName: effectiveTargetName,
-            oldPid: effectiveTargetPid,
-            newName: currentName,
-            newPid: currentPid,
-          });
+    // Paste target resolution is start-target-first. We preserve the
+    // window/app snapshot captured when recording began and only fall
+    // back to the current frontmost target when no valid start target
+    // exists. That matches the product contract: paste back into the
+    // place where recording started, not wherever focus happens to be
+    // when the transcript finishes.
+    let effectiveTarget = normalizeCapturedPasteTarget(task.target);
+    if (!hasCapturedPasteTarget(effectiveTarget)) {
+      try {
+        effectiveTarget = capturePasteTargetFromFrontInfo(await getFrontmostAppInfo());
+        traceStep(trace, "target_fallback_current_front", {
+          target: pasteTargetSummary(effectiveTarget),
+        });
+      } catch { }
+    } else {
+      try {
+        const restored = await activateCapturedPasteTarget(effectiveTarget);
+        traceStep(trace, restored ? "target_restored" : "target_restore_failed", {
+          target: pasteTargetSummary(effectiveTarget),
+        });
+        if (!restored) {
+          effectiveTarget = emptyCapturedPasteTarget();
         }
-        effectiveTargetName = currentName;
-        effectiveTargetPid = currentPid;
-      } else if (
-        effectiveTargetPid > 0 &&
-        currentPid !== effectiveTargetPid
-      ) {
-        // Front app is transcriptor/overlay/helper. Try to re-
-        // activate the start-time target so it receives the paste.
-        const stillRunning = await activateAppByPid(effectiveTargetPid);
-        if (stillRunning) {
-          traceStep(trace, "target_reactivated_start_pid", {
-            name: effectiveTargetName,
-            pid: effectiveTargetPid,
-          });
-        } else {
-          traceStep(trace, "target_lost", {
-            oldName: effectiveTargetName,
-            oldPid: effectiveTargetPid,
-          });
-          effectiveTargetName = "";
-          effectiveTargetPid = 0;
-        }
+      } catch {
+        effectiveTarget = emptyCapturedPasteTarget();
       }
-    } catch { }
+    }
 
-    const pasted = await tryPasteToFocusedField(transcript, effectiveTargetName, effectiveTargetPid);
+    const pasted = await tryPasteToFocusedField(transcript, effectiveTarget);
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
       method: pasted.method || "unknown",
@@ -4392,7 +4569,7 @@ async function processPostStopTask(task) {
       reason: compactLogText(pasted.reason || ""),
     });
     appendMainLog(
-      `[paste-auto] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
+      `[paste-auto] ${pasteTargetSummary(effectiveTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
     if (pasted.ok) {
       // Show success immediately once the paste actually happened.
@@ -4400,13 +4577,13 @@ async function processPostStopTask(task) {
     }
     if (pasted.ok && task.autoSendEnter) {
       await sleep(220);
-      const sent = await sendCommandEnterToFocusedApp(effectiveTargetName, effectiveTargetPid);
+      const sent = await sendCommandEnterToFocusedApp(effectiveTarget);
       traceStep(trace, "cmd_enter_result", {
         ok: !!sent.ok,
         reason: compactLogText(sent.reason || ""),
       });
       appendMainLog(
-        `[cmd-enter] target="${effectiveTargetName}" pid=${effectiveTargetPid} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
+        `[cmd-enter] ${pasteTargetSummary(effectiveTarget)} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
       );
       if (sent.ok) {
         await setOverlayStatus("Sent");
@@ -4459,17 +4636,14 @@ async function pasteLatestTranscriptFromShortcut() {
   const trace = createTrace("paste_last", {});
   pasteShortcutInFlight = true;
   try {
-    pasteTargetAppName = "";
-    pasteTargetAppPid = 0;
+    clearCapturedPasteTarget();
     const front = await getFrontmostAppInfo();
     traceStep(trace, "front_before", {
       name: front.name || "",
       pid: front.pid || 0,
+      windowTitle: compactLogText(front.windowTitle || "", 80),
     });
-    if (shouldUsePasteTarget(front)) {
-      pasteTargetAppName = front.name || "";
-      pasteTargetAppPid = front.pid || 0;
-    }
+    setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
     await ensureOverlayVisible({ status: "Pasting", resetTimer: false, startTimer: false });
     await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
 
@@ -4478,8 +4652,7 @@ async function pasteLatestTranscriptFromShortcut() {
       traceStep(trace, "no_text_available", {});
       await setOverlayStatus("No Text");
       scheduleOverlayHide(1200);
-      pasteTargetAppName = "";
-      pasteTargetAppPid = 0;
+      clearCapturedPasteTarget();
       return;
     }
     traceStep(trace, "text_ready", {
@@ -4491,7 +4664,7 @@ async function pasteLatestTranscriptFromShortcut() {
       clipboard.writeText(text);
     } catch { }
 
-    const pasted = await tryPasteToFocusedField(text, pasteTargetAppName, pasteTargetAppPid);
+    const pasted = await tryPasteToFocusedField(text, pasteTarget);
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
       method: pasted.method || "unknown",
@@ -4499,7 +4672,7 @@ async function pasteLatestTranscriptFromShortcut() {
       reason: compactLogText(pasted.reason || ""),
     });
     appendMainLog(
-      `[paste-last] target="${pasteTargetAppName}" pid=${pasteTargetAppPid} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
+      `[paste-last] ${pasteTargetSummary(pasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
     await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
@@ -4508,10 +4681,10 @@ async function pasteLatestTranscriptFromShortcut() {
       }
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
-    pasteTargetAppName = "";
-    pasteTargetAppPid = 0;
+    clearCapturedPasteTarget();
     scheduleOverlayHide(1300);
   } finally {
+    clearCapturedPasteTarget();
     pasteShortcutInFlight = false;
     traceEnd(trace, "done", {});
   }

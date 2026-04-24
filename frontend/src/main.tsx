@@ -4824,6 +4824,8 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     ? signal.kind || "transcript"
     : signal.kind || "";
   const now = Date.now();
+  const uiFinalText = domText;
+  const hasUiFinal = !!kind && !!uiFinalText;
 
   // Channel 1: paste-ready history (only for valid transcripts).
   if (pasteText && !recordingOutputIsInvalidTranscript(pasteText)) {
@@ -4842,10 +4844,10 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
 
   // Channel 2: UI-final signal (always updated so the overlay can track
   // both transcript and error/status states).
-  window.__transcriptorLastUiFinalText = pasteText;
-  window.__transcriptorLastUiFinalAt = pasteText ? now : 0;
-  window.__transcriptorLastUiFinalRecordingId = pasteText ? rid : 0;
-  window.__transcriptorLastUiFinalKind = kind;
+  window.__transcriptorLastUiFinalText = hasUiFinal ? uiFinalText : "";
+  window.__transcriptorLastUiFinalAt = hasUiFinal ? now : 0;
+  window.__transcriptorLastUiFinalRecordingId = hasUiFinal ? rid : 0;
+  window.__transcriptorLastUiFinalKind = hasUiFinal ? kind : "";
 
   // Channel 3: the DOM itself. Respects the active UI session so that a
   // stale async handler from a previous recording cannot clobber the
