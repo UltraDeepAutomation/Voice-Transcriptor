@@ -779,9 +779,11 @@ function createOverlayHtml() {
             <div id="quickAutoStopCapsule" title="Auto stop on silence">
               <input id="quickAutoStopToggle" type="checkbox" />
               <span class="capsuleLabel">Stop</span>
-              <label id="quickAutoStopSecsLabel">
-                <input id="quickAutoStopSecs" type="text" inputmode="numeric" pattern="[0-9]*" value="2" style="ime-mode:disabled" />
-              </label>
+              <div id="quickAutoStopSecsLabel">
+                <button id="quickAutoStopSecsMinus" type="button" aria-label="Decrease seconds">&minus;</button>
+                <span id="quickAutoStopSecs" aria-live="polite">2</span>
+                <button id="quickAutoStopSecsPlus" type="button" aria-label="Increase seconds">+</button>
+              </div>
             </div>
             <div id="quickUpscaleCapsule" title="Upscale settings">
               <input id="quickUpscaleToggle" type="checkbox" />
@@ -1006,32 +1008,45 @@ function createOverlayHtml() {
         #quickAutoStopSecsLabel{
           display:inline-flex;
           align-items:center;
-          gap:1px;
-          margin-left:0;
+          gap:2px;
+          margin-left:2px;
+          background:#2a2818;
+          border:1px solid #4a4428;
+          border-radius:8px;
+          padding:1px 3px;
+          height:18px;
         }
         #quickAutoStopSecs{
-          appearance:none;
-          -moz-appearance:textfield;
-          width:24px;
-          height:18px;
-          border:1px solid #4a4428;
-          border-radius:6px;
-          background:#2a2818;
+          display:inline-block;
+          min-width:18px;
+          text-align:center;
           color:#e0dcc0;
           font-size:10px;
           font-weight:700;
-          text-align:center;
-          padding:0 1px;
-          outline:none;
           font-family:Menlo,ui-monospace,monospace;
+          line-height:1;
+          padding:0 2px;
         }
-        #quickAutoStopSecs::-webkit-inner-spin-button,
-        #quickAutoStopSecs::-webkit-outer-spin-button{
-          appearance:none;
-          margin:0;
+        #quickAutoStopSecsMinus, #quickAutoStopSecsPlus{
+          all:unset;
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          width:16px;
+          height:16px;
+          border-radius:4px;
+          color:#d4c888;
+          font-size:12px;
+          font-weight:700;
+          cursor:pointer;
+          user-select:none;
+          transition:background 80ms ease;
         }
-        #quickAutoStopSecs:focus{
-          border-color:#8a7a3a;
+        #quickAutoStopSecsMinus:hover, #quickAutoStopSecsPlus:hover{
+          background:#4a4428;
+        }
+        #quickAutoStopSecsMinus:active, #quickAutoStopSecsPlus:active{
+          background:#5a5438;
         }
         .secsUnit{
           font-size:9px;
@@ -1514,28 +1529,47 @@ function createOverlayHtml() {
         });
         const quickAutoStopToggle = document.getElementById('quickAutoStopToggle');
         const quickAutoStopSecs = document.getElementById('quickAutoStopSecs');
+        const quickAutoStopMinus = document.getElementById('quickAutoStopSecsMinus');
+        const quickAutoStopPlus = document.getElementById('quickAutoStopSecsPlus');
+        // Replaced the tiny (24x18 px) text input with a span + +/-
+        // buttons. The input had two hard UX problems:
+        //   1. On Apple Silicon macOS the overlay window is created
+        //      with focusable:false; setFocusable(true) runs AFTER
+        //      the click lands, so keystrokes went to the prior
+        //      focused window (Claude / Slack / Cursor), not the
+        //      overlay input.
+        //   2. 24 pixels wide is below the comfortable click target
+        //      minimum; users reliably missed the field.
+        // Buttons sidestep both issues — no keyboard input required,
+        // each button is a 16x16 hit target that doesn't need window
+        // focus to fire its click handler.
+        const secsBounds = { min: 1, max: 120 };
+        const emitSecs = (v) => {
+          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, Math.round(v) || 2));
+          quickAutoStopSecs.textContent = String(sec);
+          document.title = '__overlay_autostop_secs__' + sec;
+        };
+        const readSecs = () => Number(quickAutoStopSecs.textContent) || 2;
         window.setAutoStopConfig = (enabled, seconds) => {
           const on = !!enabled;
           if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
-          const sec = Math.min(120, Math.max(1, Math.round(Number(seconds) || 2)));
-          if (Number(quickAutoStopSecs.value) !== sec) quickAutoStopSecs.value = sec;
+          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, Math.round(Number(seconds) || 2)));
+          if (Number(quickAutoStopSecs.textContent) !== sec) {
+            quickAutoStopSecs.textContent = String(sec);
+          }
         };
         quickAutoStopToggle.addEventListener('change', () => {
           document.title = '__overlay_autostop_enabled__' + (quickAutoStopToggle.checked ? '1' : '0');
         });
-        quickAutoStopSecs.addEventListener('focus', () => {
-          document.title = '__overlay_input_focus__';
+        quickAutoStopMinus.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          emitSecs(readSecs() - 1);
         });
-        quickAutoStopSecs.addEventListener('blur', () => {
-          const v = Math.min(120, Math.max(1, Math.round(Number(quickAutoStopSecs.value) || 2)));
-          quickAutoStopSecs.value = v;
-          document.title = '__overlay_autostop_secs__' + v;
-          setTimeout(() => { document.title = '__overlay_input_blur__'; }, 50);
-        });
-        quickAutoStopSecs.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') {
-            quickAutoStopSecs.blur();
-          }
+        quickAutoStopPlus.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          emitSecs(readSecs() + 1);
         });
         window.setTimer = (t) => {
           const str = String(t || '').trim();

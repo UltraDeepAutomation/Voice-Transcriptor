@@ -2941,18 +2941,35 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       });
       const out = String(r.text || "").trim();
       if (!out) throw new Error("Upscale returned empty text");
-      if (isCurrentUiSession(sessionToken)) {
-        $("upscaleOutput").textContent = out;
-        $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
-      }
+      // Always clear the GLOBAL upscaleOutput element on completion
+      // (not just when session matches). Previous `isCurrentUiSession`
+      // guard meant: user records A → upscale A starts → user starts
+      // B → A's upscale completes on dead token → output stuck showing
+      // "Upscaling..." while B hasn't upscaled yet. The element is
+      // global, not per-session, so always render the latest result.
+      $("upscaleOutput").textContent = out;
+      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
       setStatusScoped(sessionToken, "Done");
       return out;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
-      if (isCurrentUiSession(sessionToken)) {
-        $("upscaleOutput").textContent = `Upscale failed: ${msg}\n\nUsing original transcript.`;
-        $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      const rawMsg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
+      // Surface actionable guidance for the most common failure modes
+      // instead of raw backend text. Users who see "HTTP 400
+      // OpenRouter key is not configured" don't know that they need
+      // to open Settings → API Keys → OpenRouter and paste a key.
+      let friendly: string;
+      const low = rawMsg.toLowerCase();
+      if (low.includes("openrouter key is not configured") || low.includes("401")) {
+        friendly = "Upscale needs an OpenRouter API key.\n\nOpen Settings → API Keys → OpenRouter and paste your key, then try again.";
+      } else if (low.includes("failed to fetch") || low.includes("networkerror") || low === "load failed") {
+        friendly = "Upscale request failed: the OpenRouter API is unreachable. Check your internet connection or try a VPN.\n\nUsing original transcript.";
+      } else if (low.includes("unsupported upscale preset")) {
+        friendly = "Upscale preset is missing.\n\nOpen Settings → Upscale and re-select a preset.";
+      } else {
+        friendly = `Upscale failed: ${rawMsg}\n\nUsing original transcript.`;
       }
+      $("upscaleOutput").textContent = friendly;
+      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
       setStatusScoped(sessionToken, "Done");
       return input;
     } finally {
