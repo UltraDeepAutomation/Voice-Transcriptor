@@ -2,68 +2,83 @@
 
 **Голосовой транскриптор с живой записью, AI-улучшением текста и auto-paste для macOS, Windows и Linux.**
 
-> Нажмите глобальную горячую клавишу из любого приложения — Transcriptor запишет речь, транскрибирует её и автоматически вставит текст в активное поле ввода.
+> Нажмите **F9** из любого приложения — Transcriptor запишет речь, транскрибирует её и автоматически вставит текст в активное поле ввода.
+> **F10** вставит последний транскрипт повторно. Обе клавиши настраиваются в Settings.
 
 ---
 
 ## ✨ Возможности
 
 - 🎤 **Live-транскрипция** — запись с микрофона в реальном времени с промежуточными результатами
-- 🤖 **AI Upscale** — улучшение текста через OpenRouter (Gemini, GPT-4o) с пресетами: Clean, Business, AI & Code
+- 🤖 **AI Upscale** — улучшение текста через OpenRouter (Gemini, GPT-4o, Claude) с пресетами: Clean, Business, AI & Code
 - 📋 **Auto-paste** — автоматическая вставка результата в активное приложение с платформенными шорткатами (`Cmd+V` / `Ctrl+V`, затем `Cmd+Enter` / `Ctrl+Enter`, если включён auto-send)
-- ⌨️ **Глобальная горячая клавиша** — Option+Left для старта/стопа записи из любого приложения
-- 🔇 **Auto-stop по тишине** — автоматическая остановка записи при паузе в речи
-- 🌐 **3 провайдера** — локальный Whisper (offline), OpenRouter, Deepgram Nova-3
+- ⌨️ **Глобальная горячая клавиша** — F9 старт/стоп записи, F10 вставить последний транскрипт. Переназначаются в Settings
+- 🔇 **Auto-stop по тишине** — автоматическая остановка записи при паузе в речи (настраивается прямо в overlay-капсуле во время записи: +/- кнопки с click-and-hold)
+- 🌐 **3 провайдера** — локальный Whisper (offline, работает без интернета), OpenRouter, Deepgram Nova-3
 - 💊 **Overlay** — компактный pill-виджет поверх всех окон с таймером, VU-метром и быстрыми настройками
 - 📁 **История записей** — все транскрипции сохраняются с поиском и статистикой
+- 🔐 **Zero telemetry** — приложение не отправляет никаких данных на сервера. Логи пишутся только локально в userData
+- 📦 **Bundled Python** — Windows + macOS инсталляторы уже содержат Python 3.12 + все зависимости + ffmpeg. Никаких winget/brew/pip/setup-скриптов
 
 ---
 
-## 🚀 Быстрая установка (одна команда)
+## 🚀 Установка (для конечных пользователей)
 
-### macOS — двойной клик
+**1.1.0+ идёт с Python 3.12 + ffmpeg внутри инсталлятора для Windows и macOS.** Никаких предварительных установок (winget / brew / pip / setup-скриптов) больше не нужно — двойной клик, и всё работает.
 
-1. **Правый клик** на `INSTALL.command` в корне репо → **Открыть**
-2. В диалоге безопасности — **Открыть** ещё раз
-3. ☕ Подождите 2–5 минут — всё установится автоматически и приложение запустится
+### Windows x64 (~201 MB)
+1. Скачать `Transcriptor Setup 1.1.0.exe`
+2. Двойной клик → SmartScreen **"Подробнее"** → **"Выполнить в любом случае"**
+3. Через ~30 секунд приложение запущено. Разрешить микрофон при запросе Windows
 
-Альтернативный способ (готовый DMG, ничего строить не надо):
+### macOS Apple Silicon M1-M4 (~220 MB)
+1. Скачать `Transcriptor-1.1.0-mac-arm64.dmg`
+2. Открыть DMG, перетащить Transcriptor.app в Applications
+3. **macOS Sonoma 14+ / Sequoia 15+:** System Settings → Privacy & Security → прокрутить вниз → **"Open Anyway"** рядом с предупреждением Transcriptor → потом двойной клик → **"Open"**
+4. Разрешить 3 permissions: Microphone, Accessibility, Input Monitoring
+
+### macOS Intel (~257 MB)
+То же, но `Transcriptor-1.1.0-mac-intel.dmg`.
+
+### Linux x64 (~101 MB, AppImage)
+```bash
+chmod +x Transcriptor-1.1.0.AppImage
+./Transcriptor-1.1.0.AppImage
 ```
-desktop/dist/Transcriptor-1.0.0-arm64.dmg   ← Apple Silicon
-desktop/dist/Transcriptor-1.0.0.dmg         ← Intel
-```
-Двойной клик на DMG → перетащить Transcriptor в Applications → запустить.
 
-### macOS — терминал
+На Linux AppImage **всё ещё нужны системные зависимости** (Python 3.10+ и ffmpeg), потому что bundling Python на Linux упирается в PyPI timeout. Установить заранее:
+
+```bash
+# Ubuntu / Debian (X11)
+sudo apt install python3 python3-venv python3-pip ffmpeg xdotool wmctrl zenity
+
+# Ubuntu / Debian (Wayland)
+sudo apt install python3 python3-venv python3-pip ffmpeg wtype ydotool zenity
+sudo usermod -aG input $USER  # потом выйти и войти заново
+```
+
+---
+
+## 🛠️ Для разработчиков — сборка из исходников
 
 ```bash
 cd "Voice Transcriptor"
-./INSTALL.command
-```
 
-Если уже установлено и нужно только пересобрать после обновления кода:
-```bash
-./BUILD.command
-```
+# macOS
+./INSTALL.command          # первая установка: venv + deps + DMG
+./BUILD.command            # пересборка .dmg после git pull
 
-### Windows
+# Windows
+install\win\setup.bat
+install\win\build.bat
 
-```cmd
-cd "Voice Transcriptor"
-install\win\setup.bat        :: первая установка
-install\win\build.bat        :: пересборка .exe installer
-```
-Готовый NSIS-инсталлер появится в `desktop\dist\Transcriptor Setup 1.0.0.exe`.
-
-### Linux
-
-```bash
-cd "Voice Transcriptor"
+# Linux
 install/linux/build.sh
 ```
-Готовый AppImage в `desktop/dist/Transcriptor-1.0.0.AppImage` — `chmod +x && ./Transcriptor-1.0.0.AppImage`.
 
-> 💡 Скрипты автоматически устанавливают Homebrew / chocolatey-эквиваленты, Python, Node.js, FFmpeg, собирают фронтенд + Electron-приложение.
+Эти скрипты — для **разработчиков**, собирающих приложение из исходников. Для конечных пользователей достаточно скачать готовый инсталлятор (см. выше).
+
+Release build: см. `desktop/scripts/prepare-runtime.sh` + `npm run dist` / `npm run dist:win` / `npm run dist:linux` в папке `desktop/`.
 
 ---
 
