@@ -33,7 +33,12 @@ PBS_PYVER="3.12.13"
 
 # ffmpeg sources.
 FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
-FFMPEG_MAC_URL="https://evermeet.cx/ffmpeg/ffmpeg-7.1.zip"
+# evermeet.cx only publishes x86_64 Mac ffmpeg — running it on Apple
+# Silicon requires Rosetta 2 (not installed by default on clean macOS
+# installs). osxexperts.net publishes an arm64-native ffmpeg 7.1
+# separately so arm64 users get a native binary.
+FFMPEG_MAC_X64_URL="https://evermeet.cx/ffmpeg/ffmpeg-7.1.zip"
+FFMPEG_MAC_ARM64_URL="https://www.osxexperts.net/ffmpeg71arm.zip"
 FFMPEG_LINUX_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
 
 log()  { printf '\033[1;36m[prep]\033[0m %s\n' "$*"; }
@@ -140,15 +145,41 @@ install_ffmpeg_win() {
 }
 
 install_ffmpeg_mac() {
-  local out_dir="$1"
-  local zip="${CACHE_DIR}/ffmpeg-mac.zip"
-  fetch "${FFMPEG_MAC_URL}" "${zip}"
+  local out_dir="$1" arch="$2"
+  local url cache_name
+  if [ "${arch}" = "arm64" ]; then
+    url="${FFMPEG_MAC_ARM64_URL}"
+    cache_name="ffmpeg-mac-arm64.zip"
+  else
+    url="${FFMPEG_MAC_X64_URL}"
+    cache_name="ffmpeg-mac-x64.zip"
+  fi
+  local zip="${CACHE_DIR}/${cache_name}"
+  fetch "${url}" "${zip}"
   rm -rf "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
-  unzip -q -o "${zip}" -d "${out_dir}/ffmpeg/bin/"
+  # osxexperts arm zip contains __MACOSX/ metadata junk; extract only
+  # the actual ffmpeg binary and discard the rest.
+  local tmp
+  tmp="$(mktemp -d)"
+  unzip -q -o "${zip}" -d "${tmp}"
+  # Prefer a top-level "ffmpeg" file; fall back to any "ffmpeg" in the tree.
+  if [ -f "${tmp}/ffmpeg" ]; then
+    cp "${tmp}/ffmpeg" "${out_dir}/ffmpeg/bin/ffmpeg"
+  else
+    find "${tmp}" -name "ffmpeg" -type f -not -path "*/__MACOSX/*" -print0 \
+      | head -z -n 1 | xargs -0 -I {} cp {} "${out_dir}/ffmpeg/bin/ffmpeg"
+  fi
+  rm -rf "${tmp}"
   chmod +x "${out_dir}/ffmpeg/bin/ffmpeg"
   [ -x "${out_dir}/ffmpeg/bin/ffmpeg" ] || die "ffmpeg binary not executable"
-  log "ffmpeg (mac) installed"
+  # Verify arch matches target to catch future URL regressions early.
+  local actual_arch
+  actual_arch="$(/usr/bin/file -b "${out_dir}/ffmpeg/bin/ffmpeg" | grep -oE '(arm64|x86_64)' | head -1)"
+  if [ -n "${actual_arch}" ] && [ "${actual_arch}" != "${arch}" ]; then
+    die "ffmpeg arch mismatch: expected ${arch}, got ${actual_arch} from ${url}"
+  fi
+  log "ffmpeg (mac/${arch}) installed"
 }
 
 install_ffmpeg_linux() {
@@ -200,7 +231,7 @@ build_mac_arm64() {
   # requires tag 13_0 — union both so pip can pick from either.
   install_wheels "${out_dir}" "cp312" \
     "macosx_13_0_arm64" "macosx_12_0_arm64" "macosx_11_0_arm64"
-  install_ffmpeg_mac "${out_dir}"
+  install_ffmpeg_mac "${out_dir}" "arm64"
   du -sh "${out_dir}" | awk '{print "size:", $1}'
 }
 
@@ -210,7 +241,7 @@ build_mac_x64() {
   install_python "${out_dir}" "x86_64-apple-darwin"
   install_wheels "${out_dir}" "cp312" \
     "macosx_13_0_x86_64" "macosx_12_0_x86_64" "macosx_10_13_x86_64"
-  install_ffmpeg_mac "${out_dir}"
+  install_ffmpeg_mac "${out_dir}" "x86_64"
   du -sh "${out_dir}" | awk '{print "size:", $1}'
 }
 

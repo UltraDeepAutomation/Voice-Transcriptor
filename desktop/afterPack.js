@@ -207,20 +207,37 @@ exports.default = async function afterPack(context) {
         const buf = Buffer.alloc(16);
         const n = readSync(fd, buf, 0, 16, 0);
         if (n < 16) return "non-macho";
-        const magic = buf.readUInt32LE(0);
-        // Accept both 64-bit (feedfacf) and 32-bit (feedface), plus
-        // fat binaries (cafebabe / cafebabf) which we treat as executable
-        // for entitlements purposes — though our bundled Python ships
-        // thin arm64 or x86_64 builds only.
-        if (magic === 0xfeedfacf || magic === 0xfeedface) {
+        const magicLE = buf.readUInt32LE(0);
+        const magicBE = buf.readUInt32BE(0);
+        // Thin Mach-O: both 64-bit (feedfacf) and 32-bit (feedface).
+        // filetype at offset 12: MH_EXECUTE=2, MH_DYLIB=6, MH_BUNDLE=8
+        if (magicLE === 0xfeedfacf || magicLE === 0xfeedface) {
           const filetype = buf.readUInt32LE(12);
           if (filetype === 2) return "executable";
           if (filetype === 6 || filetype === 8) return "dylib";
           return "macho-other";
         }
-        if (magic === 0xcafebabe || magic === 0xcafebabf ||
-            magic === 0xbebafeca || magic === 0xbfbafeca) {
-          return "executable";  // treat fat as executable; conservative
+        // Fat Mach-O: magic is BE (cafebabe / cafebabf). Read one
+        // nested arch's thin header to determine the REAL filetype.
+        // Prior code assumed fat = executable; that sent runtime
+        // hardening + entitlements into fat DYLIBS (onnxruntime,
+        // cryptography _rust, numpy libgcc_s) where neither has
+        // any effect and where a future macOS codesign hardening
+        // could reject the combination.
+        if (magicBE === 0xcafebabe || magicBE === 0xcafebabf) {
+          const fatHdr = Buffer.alloc(24); // magic(4)+nfat(4)+first fat_arch(16)
+          if (readSync(fd, fatHdr, 0, 24, 0) < 24) return "macho-other";
+          const firstOff = fatHdr.readUInt32BE(16);
+          const thinHdr = Buffer.alloc(16);
+          if (readSync(fd, thinHdr, 0, 16, firstOff) < 16) return "macho-other";
+          const thinMagic = thinHdr.readUInt32LE(0);
+          if (thinMagic !== 0xfeedfacf && thinMagic !== 0xfeedface) {
+            return "macho-other";
+          }
+          const filetype = thinHdr.readUInt32LE(12);
+          if (filetype === 2) return "executable";
+          if (filetype === 6 || filetype === 8) return "dylib";
+          return "macho-other";
         }
         return "non-macho";
       } finally {

@@ -4212,9 +4212,23 @@ function getPythonCandidates(repoRoot) {
       "/opt/homebrew/bin/python3",
       "/usr/local/bin/python3",
       "/usr/bin/python3",
+      // Versioned absolute paths — some minimal Debian/Alpine/RHEL
+      // images ship only `/usr/bin/python3.12` without a generic
+      // `python3` symlink. Probe explicitly so Linux AppImage users
+      // on those systems get a working fallback instead of "Python
+      // 3 interpreter was not found".
+      "/usr/bin/python3.12",
+      "/usr/bin/python3.11",
+      "/usr/bin/python3.10",
+      "/usr/bin/python3.9",
+      "/opt/homebrew/bin/python3.12",
+      "/opt/homebrew/bin/python3.11",
+      "/usr/local/bin/python3.12",
+      "/usr/local/bin/python3.11",
     ]),
     "python3",
     "python",
+    ...(process.platform === "win32" ? [] : ["python3.12", "python3.11", "python3.10"]),
   ].filter(Boolean);
 
   const out = [];
@@ -4551,11 +4565,22 @@ async function ensureBackendRuntime(python, repoRoot) {
   // so we can't (a) match a sibling directory by raw prefix
   // ("/…/.venvold" matching "/…/.venv"), or (b) miss due to mixed
   // separators after Python normalizes its own `sys.executable`.
+  // On case-insensitive filesystems (macOS APFS default, Windows NTFS)
+  // also compare case-insensitively so a user dir recorded in
+  // different case by the OS doesn't produce a false negative that
+  // scatters pip packages outside the app sandbox.
   const venvDirNormalized = path.resolve(getAppVenvDir());
   const pythonResolved = path.resolve(python);
+  const caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin";
+  const pathEq = (a, b) => caseInsensitiveFs
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+  const pathStartsWith = (a, prefix) => caseInsensitiveFs
+    ? a.toLowerCase().startsWith(prefix.toLowerCase())
+    : a.startsWith(prefix);
   const isAppVenv =
-    pythonResolved === venvDirNormalized ||
-    pythonResolved.startsWith(venvDirNormalized + path.sep);
+    pathEq(pythonResolved, venvDirNormalized) ||
+    pathStartsWith(pythonResolved, venvDirNormalized + path.sep);
   const pipArgs = ["-m", "pip", "install", "-r", requirementsPath];
   if (!isAppVenv) {
     pipArgs.splice(3, 0, "--user");
@@ -4723,6 +4748,17 @@ async function startBackend() {
     ...process.env,
     PATH: envPath,
     PYTHONUNBUFFERED: "1",
+    // CRITICAL on macOS: prevent Python from writing .pyc bytecode
+    // cache files into the signed .app bundle at runtime. Python
+    // eagerly caches compiled bytecode next to .py source files on
+    // every import; those writes invalidate the bundle's Resources
+    // envelope (codesign --verify --deep reports them as "file
+    // added") and amfi on every subsequent backend spawn re-checks
+    // the envelope — eventually breaking launch after enough
+    // imports accumulated. Setting this env var makes Python run
+    // entirely from source; the ~5-10ms first-import overhead is
+    // negligible vs. the invariant of a stable on-disk signature.
+    PYTHONDONTWRITEBYTECODE: "1",
     TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
   };
   backend = spawn(python, args, {
