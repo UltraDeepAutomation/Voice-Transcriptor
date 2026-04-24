@@ -1,9 +1,41 @@
-"""Application configuration: data directory, config file, and API key encryption.
+"""Application configuration — the single source of truth.
 
 Configuration is stored as JSON in ~/Library/Application Support/Transcriptor/config.json
 (macOS) or ~/.config/Transcriptor/config.json (Linux). API keys are encrypted at rest
 using Fernet symmetric encryption when the cryptography package is available; otherwise
 keys are stored in plain text with a warning logged at startup.
+
+SSOT (Single Source of Truth) guarantees provided by this module:
+
+    1.  ATOMICITY — writes are crash-safe. ``_atomic_write_json`` writes
+        to a unique temp file, ``fsync()``s its contents, ``replace()``s
+        the target in one syscall, then ``fsync()``s the parent dir on
+        POSIX so the rename survives a power loss. The previous
+        implementation was atomic in the rename-only sense but could
+        land an empty file after a kernel crash because the temp's
+        payload was never flushed.
+
+    2.  RECOVERY — every save rotates the previous on-disk config to
+        ``config.json.bak`` BEFORE writing the new version. ``load_config``
+        falls back to ``.bak`` on parse failure, so a corrupt write
+        (disk I/O error mid-fsync, malformed future-version, or a bug
+        in a migration) never loses the user's API keys.
+
+    3.  SCHEMA VERSIONING — every config carries an integer
+        ``schema_version`` field. Configs from older versions are
+        migrated through a deterministic pipeline on read. New-version
+        fields are always present; missing or invalid subtrees are
+        dropped-with-warning and replaced from ``DEFAULT_CONFIG``
+        (valid existing subtrees survive untouched).
+
+    4.  ENCAPSULATION — all mutation flows through ``save_config``.
+        Direct file writes from elsewhere in the backend are forbidden.
+        Callers never see the raw disk format; they see the decrypted,
+        migrated, validated structure only.
+
+    5.  ENCRYPTION AT REST — provider keys are Fernet-encrypted with
+        a per-machine key file (``chmod 0600``). Plain-text legacy keys
+        are transparently re-encrypted on first load.
 """
 
 import json
@@ -16,6 +48,12 @@ from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
+
+# Bump this integer whenever a breaking schema change is introduced,
+# AND add a `_migrate_vN_to_vM` branch in `_migrate_schema` to upgrade
+# older configs. Never re-use a previously-shipped version number —
+# downgrade detection relies on this being monotonic.
+SCHEMA_VERSION = 2
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -219,6 +257,7 @@ _migrate_legacy_data()
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "schema_version": SCHEMA_VERSION,
     "providers": {
         "openrouter": {"key": ""},
         "deepgram": {"key": ""},
@@ -233,6 +272,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+# On-disk filenames associated with the config's SSOT contract. All of
+# them live under DATA_DIR; changes touch ALL three in sync via
+# `_atomic_write_json` + backup-rotation so a crash at any point
+# leaves the system recoverable from at least one of {config, .bak}.
+_CONFIG_BACKUP_PATH = CONFIG_PATH.with_suffix(".json.bak")
+
+
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     for k, v in (overlay or {}).items():
@@ -243,77 +289,350 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
-def load_config() -> Dict[str, Any]:
-    """Load config and return it with decrypted provider keys.
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Crash-safe JSON write.
 
-    If the on-disk config contains plain-text keys (pre-encryption era),
-    they are transparently encrypted in-place on first read.
+    Writes to a unique ``.tmp-<uuid>`` file, explicitly ``fsync()``s
+    the temp's contents to storage, ``replace()``s the target in a
+    single syscall, then ``fsync()``s the parent directory on POSIX
+    so the rename itself is durable across power loss. The previous
+    ``tmp.write_text(); tmp.replace()`` pattern was only atomic in the
+    rename-landing sense — after a kernel crash the tmp could land
+    intact but EMPTY because its payload bytes were still in the
+    page cache and never flushed to the platter.
 
-    Failures are logged with the specific reason (``OSError``,
-    ``json.JSONDecodeError``, etc.) instead of being silently swallowed.
-    The function still returns ``DEFAULT_CONFIG`` on any failure so the
-    app can boot — but the log breadcrumb lets the user diagnose the
-    cause (permissions, corruption, full disk) and recover their keys.
+    Raises ``OSError`` on any failure. Cleans up the tmp on failure.
     """
-    if not CONFIG_PATH.exists():
-        return dict(DEFAULT_CONFIG)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = path.with_suffix(path.suffix + f".tmp-{uuid.uuid4().hex}")
     try:
-        raw_text = CONFIG_PATH.read_text(encoding="utf-8")
+        # Use `open + fsync` rather than `write_text` so we can force
+        # the contents to storage BEFORE the rename lands. The tmp is
+        # opened with mode="w" (not "x") even though uuid-unique names
+        # make collisions astronomically unlikely — the existing
+        # `_sweep_orphan_tmp_files` housekeeper handles stale tmps
+        # from prior crashes without our help.
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        # `Path.replace` maps to `os.replace` → atomic rename on both
+        # POSIX (same-filesystem `rename(2)`) and Windows
+        # (`MoveFileExW` with MOVEFILE_REPLACE_EXISTING).
+        tmp.replace(path)
+        # On POSIX, fsync the PARENT DIRECTORY so the rename metadata
+        # reaches the platter. Without this, the rename can be lost
+        # in a power-loss scenario even though the target file's data
+        # was fsync'd. Windows has no public dir-fsync API; rely on
+        # NTFS journaling for rename durability there.
+        if os.name != "nt":
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError as e:
+                # Dir fsync failure is non-fatal — the file data is
+                # already on disk; we lose only the "rename is durable"
+                # guarantee. Log so operators can spot flaky storage.
+                logger.warning("config dir fsync skipped at %s: %s", path.parent, e)
+    except OSError:
+        # Half-written tmp lingering around confuses the sweep
+        # housekeeper and wastes inode space — drop it. Swallow any
+        # unlink error and re-raise the original write exception.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _rotate_backup(path: Path, backup: Path) -> None:
+    """Copy the current on-disk config to ``.bak`` before overwriting.
+
+    Used as the pre-step of every successful ``save_config``. If the
+    new save turns out to be corrupt (a bug, a disk IO error mid-
+    write, a future-version migration we misimplemented), ``load_config``
+    detects the corruption and transparently falls back to ``.bak``.
+    """
+    if not path.exists():
+        return
+    try:
+        # shutil.copy2 preserves metadata; fine for a readable JSON.
+        # We use copy, not rename, so the backup stays reachable even
+        # if the atomic write below fails partway.
+        shutil.copy2(path, backup)
     except OSError as e:
-        logger.error(
-            "config unreadable at %s: %s — falling back to defaults", CONFIG_PATH, e,
-        )
+        logger.warning("config backup rotation failed at %s: %s", backup, e)
+        # Non-fatal — we'd rather persist the new config than abort
+        # because of a backup hiccup.
+
+
+def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
+    """Return *cfg* reduced to a well-typed canonical shape.
+
+    Unknown top-level keys are preserved (forward-compatibility with
+    older backends reading newer configs), but known-but-wrongly-typed
+    subtrees are DROPPED with a warning and replaced from
+    ``DEFAULT_CONFIG`` so a buggy writer cannot poison the config by
+    writing e.g. ``"providers": "oops-a-string"``.
+
+    This function is deliberately defensive because the on-disk
+    config is the boundary between users / external tools / bugs and
+    the running backend — rejecting the whole file on first type
+    error (the "strict" stance) would punish the user for a minor
+    malformation; silently merging anything (the "permissive" stance)
+    lets bad data propagate forever. We take a middle path: invalid
+    subtree → reset that subtree to default, keep the rest.
+    """
+    if not isinstance(cfg, dict):
+        logger.warning("config is not a JSON object (got %s) — using defaults", type(cfg).__name__)
         return dict(DEFAULT_CONFIG)
+    out: Dict[str, Any] = dict(cfg)  # preserve unknown keys
+    # providers block
+    providers = out.get("providers")
+    if providers is None:
+        out["providers"] = dict(DEFAULT_CONFIG["providers"])
+    elif not isinstance(providers, dict):
+        logger.warning("config.providers has invalid type (%s); resetting", type(providers).__name__)
+        out["providers"] = dict(DEFAULT_CONFIG["providers"])
+    else:
+        fixed_providers: Dict[str, Any] = {}
+        for name, prov in providers.items():
+            if not isinstance(prov, dict):
+                logger.warning("config.providers.%s is not an object (got %s); dropping", name, type(prov).__name__)
+                continue
+            key_val = prov.get("key")
+            if key_val is not None and not isinstance(key_val, str):
+                logger.warning("config.providers.%s.key is not a string (got %s); dropping key", name, type(key_val).__name__)
+                prov = dict(prov)
+                prov["key"] = ""
+            fixed_providers[name] = prov
+        out["providers"] = fixed_providers
+    # preferences block
+    preferences = out.get("preferences")
+    if preferences is None:
+        out["preferences"] = dict(DEFAULT_CONFIG["preferences"])
+    elif not isinstance(preferences, dict):
+        logger.warning("config.preferences has invalid type (%s); resetting", type(preferences).__name__)
+        out["preferences"] = dict(DEFAULT_CONFIG["preferences"])
+    else:
+        # Narrow checks on individual preference fields.
+        rec_dir = preferences.get("recordings_dir")
+        if rec_dir is not None and not isinstance(rec_dir, str):
+            logger.warning("config.preferences.recordings_dir must be string; resetting")
+            preferences = dict(preferences)
+            preferences["recordings_dir"] = ""
+            out["preferences"] = preferences
+        remote_provider = preferences.get("remote_provider")
+        if remote_provider is not None and not isinstance(remote_provider, str):
+            logger.warning("config.preferences.remote_provider must be string; resetting")
+            preferences = dict(preferences)
+            preferences["remote_provider"] = DEFAULT_CONFIG["preferences"]["remote_provider"]
+            out["preferences"] = preferences
+    # schema_version: must be a positive int if present.
+    sv = out.get("schema_version")
+    if sv is not None and not (isinstance(sv, int) and sv > 0 and not isinstance(sv, bool)):
+        logger.warning("config.schema_version must be positive int; resetting to 1 (pre-schema legacy)")
+        out["schema_version"] = 1
+    return out
+
+
+def _migrate_schema(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade *cfg* through every schema version up to ``SCHEMA_VERSION``.
+
+    Runs each ``_migrate_vN_to_vM`` transformation deterministically in
+    order. Any migration failure is surfaced via log + a return of the
+    unchanged input so the caller can still boot (missing migrations
+    manifest as "newer fields are absent" rather than "config lost").
+
+    Contract:
+      * ``schema_version`` absent ⇒ treated as v1 (1.0.x configs).
+      * Target version always ``SCHEMA_VERSION``; downgrades (cfg
+        written by a NEWER client) are left untouched — we preserve
+        forward-compat by not clobbering unknown future-version fields.
+    """
+    cfg = dict(cfg)
     try:
-        raw = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        logger.error(
-            "config at %s is not valid JSON (%s) — falling back to defaults. "
-            "The on-disk file is left untouched so you can recover it by hand.",
-            CONFIG_PATH, e,
+        version = int(cfg.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version > SCHEMA_VERSION:
+        # Newer-than-us config — do NOT downgrade. Running 1.1.0 over
+        # a config written by a hypothetical 1.2.0 build just means
+        # we read the fields we know and ignore the rest. The
+        # `_deep_merge` with DEFAULT_CONFIG later ensures all v=current
+        # fields are present.
+        logger.info(
+            "config schema_version=%d is newer than this build's %d; "
+            "preserving unknown fields, using known fields as-is",
+            version, SCHEMA_VERSION,
         )
+        return cfg
+    while version < SCHEMA_VERSION:
+        try:
+            if version == 1:
+                cfg = _migrate_v1_to_v2(cfg)
+            # Future: `elif version == 2: cfg = _migrate_v2_to_v3(cfg)`
+            # — keep branches in ascending order, one per version step.
+            else:
+                logger.error(
+                    "no migration registered from schema v%d to v%d; "
+                    "config will be written with v=%d and may lose newer-format-specific data",
+                    version, version + 1, version,
+                )
+                break
+        except Exception as e:  # noqa: BLE001 — migration bugs must not kill boot
+            logger.exception("migration v%d → v%d failed: %s (keeping config at v%d)", version, version + 1, e, version)
+            break
+        version += 1
+        cfg["schema_version"] = version
+    return cfg
+
+
+def _migrate_v1_to_v2(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate 1.0.x (implicit v1) configs to v2 (1.1.0+).
+
+    1.0.x had no ``schema_version`` field at all. v2 is structurally
+    identical — the bump is a soft barrier so future breaking changes
+    (splitting providers into a list, moving upscale presets inline,
+    etc.) can key off the version field rather than ad-hoc shape
+    probes. This migration therefore just stamps the version and is
+    a no-op otherwise; future migrations will do the real work.
+    """
+    out = dict(cfg)
+    out["schema_version"] = 2
+    return out
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    """Read and parse a JSON file, raising specific errors the caller handles.
+
+    Separated from ``load_config`` so the ``.bak`` fallback path can
+    reuse the same read+parse with identical error semantics.
+    """
+    raw_text = path.read_text(encoding="utf-8")
+    obj = json.loads(raw_text)
+    if not isinstance(obj, dict):
+        raise ValueError(f"JSON root must be an object (got {type(obj).__name__})")
+    return obj
+
+
+def load_config() -> Dict[str, Any]:
+    """Load config and return a migrated, validated, decrypted view.
+
+    Pipeline (in order):
+      1. Read ``config.json``; on read / JSON / shape failure, fall
+         back to ``config.json.bak`` (the pre-previous-save snapshot).
+         If both are unusable, return ``DEFAULT_CONFIG`` so the app
+         still boots — the user can re-enter their keys.
+      2. Schema-migrate through every registered version step up to
+         ``SCHEMA_VERSION``.
+      3. Structurally validate (``_validate_config_shape``): wrongly-
+         typed subtrees get reset to defaults with a log warning;
+         unknown top-level keys are preserved for forward-compat.
+      4. Deep-merge with ``DEFAULT_CONFIG`` so every current-version
+         field is guaranteed present (a missing ``preferences.openrouter``
+         branch shouldn't crash a caller that reads ``cfg["preferences"]["openrouter"]["model"]``).
+      5. Transparently re-encrypt any plain-text legacy provider keys
+         on disk (no-op if already encrypted). Uses the same atomic +
+         backup-rotating writer as ``save_config``.
+      6. Decrypt provider keys for the returned view (on-disk stays
+         encrypted; callers never see the on-disk form).
+
+    Returns ``DEFAULT_CONFIG`` on catastrophic failure. Never raises.
+    """
+    raw: Dict[str, Any] = {}
+    source: str = "defaults"
+    if CONFIG_PATH.exists():
+        try:
+            raw = _read_json_file(CONFIG_PATH)
+            source = "primary"
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            logger.error(
+                "primary config at %s is unusable (%s); trying backup",
+                CONFIG_PATH, e,
+            )
+            if _CONFIG_BACKUP_PATH.exists():
+                try:
+                    raw = _read_json_file(_CONFIG_BACKUP_PATH)
+                    source = "backup"
+                    logger.warning(
+                        "recovered config from backup at %s — the primary "
+                        "file is corrupt and will be overwritten on the next save",
+                        _CONFIG_BACKUP_PATH,
+                    )
+                except (OSError, json.JSONDecodeError, ValueError) as e2:
+                    logger.error(
+                        "backup config at %s is also unusable (%s); using defaults",
+                        _CONFIG_BACKUP_PATH, e2,
+                    )
+                    return dict(DEFAULT_CONFIG)
+            else:
+                logger.error(
+                    "no backup available at %s — using defaults. The user's "
+                    "API keys and preferences are lost; the corrupt primary "
+                    "file is left on disk for manual recovery.",
+                    _CONFIG_BACKUP_PATH,
+                )
+                return dict(DEFAULT_CONFIG)
+    else:
         return dict(DEFAULT_CONFIG)
-    if not isinstance(raw, dict):
-        logger.error(
-            "config at %s is not a JSON object (got %s) — falling back to defaults",
-            CONFIG_PATH, type(raw).__name__,
-        )
-        return dict(DEFAULT_CONFIG)
+
+    # 2. Migrate schema (v1 → v2 → …). Never crashes boot — a
+    # migration bug reverts to the pre-bump config and logs.
+    raw = _migrate_schema(raw)
+    # 3. Validate + repair shape.
+    raw = _validate_config_shape(raw)
+    # 4. Fill in missing defaults so callers can rely on a full tree.
     merged = _deep_merge(DEFAULT_CONFIG, raw)
 
-    # Auto-migrate: if any provider key is plain-text, encrypt it on disk.
-    needs_migration = False
+    # 5. Plain-text → encrypted migration for legacy (pre-Fernet) configs.
+    needs_key_migration = False
     providers = merged.get("providers")
     if isinstance(providers, dict):
         for prov in providers.values():
             if isinstance(prov, dict) and "key" in prov:
                 k = str(prov.get("key") or "").strip()
                 if k and not k.startswith(_ENC_PREFIX):
-                    needs_migration = True
+                    needs_key_migration = True
                     break
-    if needs_migration:
+    if needs_key_migration:
         try:
             encrypted_cfg = _encrypt_provider_keys(merged)
-            payload = json.dumps(encrypted_cfg, ensure_ascii=False, indent=2)
-            # Unique tmp suffix prevents two concurrent writers from
-            # clobbering each other's in-progress writes. Matches the
-            # atomic-writer convention used elsewhere in the backend
-            # (_atomic_write_text / _atomic_temp_path / _write_upscale_preset)
-            # and is recognised by _sweep_orphan_tmp_files for crash cleanup.
-            tmp = CONFIG_PATH.with_suffix(f".tmp-{uuid.uuid4().hex}")
-            tmp.write_text(payload, encoding="utf-8")
-            tmp.replace(CONFIG_PATH)
+            _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
+            _atomic_write_json(CONFIG_PATH, encrypted_cfg)
+            logger.info(
+                "migrated plain-text provider keys to Fernet-encrypted form at %s",
+                CONFIG_PATH,
+            )
         except (OSError, ValueError, TypeError) as e:
-            # Migration write failed — the in-memory decrypted config is
-            # still valid, so we log and continue rather than dropping
-            # the user's keys.
+            # In-memory decrypted config is still valid — we return it
+            # below. The on-disk form stays in legacy plain-text; next
+            # save will re-encrypt.
             logger.warning(
-                "config key encryption migration write failed at %s: %s — "
-                "keys remain usable this session but the on-disk file is "
-                "still in legacy plain-text form",
+                "provider-key encryption migration write failed at %s: %s — "
+                "keys remain usable this session",
                 CONFIG_PATH, e,
             )
+    elif source == "primary":
+        # If we're on current-version schema but the on-disk file
+        # lacked schema_version (an older 1.1.0-beta that shipped
+        # without the field), write it back WITH the new field so the
+        # next boot doesn't re-run the v1→v2 migration unnecessarily.
+        on_disk_version = raw.get("schema_version")
+        if on_disk_version != SCHEMA_VERSION and CONFIG_PATH.exists():
+            try:
+                _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
+                _atomic_write_json(CONFIG_PATH, _encrypt_provider_keys(merged))
+                logger.info("config schema stamped with version=%d at %s", SCHEMA_VERSION, CONFIG_PATH)
+            except OSError as e:
+                logger.warning("schema-version stamp write failed at %s: %s", CONFIG_PATH, e)
 
+    # 6. Return the decrypted view (keys are plain-text for callers;
+    # on-disk always encrypted).
     try:
         return _decrypt_provider_keys(merged)
     except (ValueError, TypeError) as e:
@@ -324,32 +643,40 @@ def load_config() -> Dict[str, Any]:
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    """Merge *cfg* into the current config and persist with encrypted keys.
+    """Merge *cfg* into the current config and persist it atomically.
 
-    Raises ``OSError`` on disk failures so callers (API endpoints) can
-    surface a 500 with a concrete reason instead of pretending the save
-    succeeded.
+    Contract:
+      * Input is a PARTIAL config — only the keys to update need be
+        present (same shape as what the frontend POSTs). Missing keys
+        keep their current on-disk values via deep-merge.
+      * The result is validated, schema-stamped, encrypted, and
+        written via ``_atomic_write_json`` with crash-safe fsync +
+        parent-dir fsync (POSIX).
+      * The existing config is rotated to ``.bak`` BEFORE the new
+        write, so a corrupt new save can be recovered automatically
+        by the next ``load_config``.
+      * Raises ``OSError`` on disk failures so API endpoints can
+        surface a meaningful 500.
     """
     current = load_config()
     merged_current = _deep_merge(current, cfg or {})
     merged = _deep_merge(DEFAULT_CONFIG, merged_current)
+    # Always stamp the current schema version on write — callers may
+    # POST partial configs without it; _deep_merge already inserted
+    # DEFAULT_CONFIG['schema_version'], but explicit is safer.
+    merged["schema_version"] = SCHEMA_VERSION
+    # Shape-validate merged result so we never persist a structurally
+    # broken config just because a migration or caller went wrong.
+    merged = _validate_config_shape(merged)
     encrypted = _encrypt_provider_keys(merged)
-    payload = json.dumps(encrypted, ensure_ascii=False, indent=2)
-    # Unique tmp suffix: prevents two concurrent save_config / migration
-    # writers from truncating each other's in-progress file. Matches
-    # _atomic_write_text / _atomic_temp_path convention in main.py.
-    tmp = CONFIG_PATH.with_suffix(f".tmp-{uuid.uuid4().hex}")
+    # Rotate the current on-disk file to .bak BEFORE the write. If the
+    # new write fails mid-flight, load_config's fallback recovers from
+    # the backup on the next boot.
+    _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
     try:
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(CONFIG_PATH)
+        _atomic_write_json(CONFIG_PATH, encrypted)
     except OSError as e:
         logger.error("failed to persist config at %s: %s", CONFIG_PATH, e)
-        # Clean up the half-written temp file so it does not linger and
-        # confuse the next read cycle.
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise
 
 
