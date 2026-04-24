@@ -2336,6 +2336,16 @@ textarea:focus-visible,
   box-shadow: none;
 }
 
+/* Surface save/validation errors on the key input itself so the user
+   sees the problem inline, not just in the status pill. The red ring
+   is cleared automatically on focus / input in the save-error handler. */
+.key-row input.has-error,
+.key-row input[aria-invalid="true"] {
+  border-color: var(--danger-border, #ef4444);
+  box-shadow: 0 0 0 1px var(--danger-border, #ef4444) inset;
+  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
+}
+
 .key-row input[data-masked="1"] {
   color: var(--text-3);
   letter-spacing: 0.25em;

@@ -1,5 +1,5 @@
 const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, session } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const net = require("net");
 const path = require("path");
@@ -35,6 +35,13 @@ let overlayWaveMonitor = null;
 let overlayLoaded = false;
 let tray = null;
 let backendBootError = "";
+// Cache the last shortcut-registration status so we can replay it to
+// any renderer window created AFTER the registration happened.
+// `registerGlobalShortcuts` runs during app startup before createWindow,
+// so the very first window misses the live injection and would render
+// with no awareness that its F9 hotkey is unclaimed. Cached here,
+// replayed from `did-finish-load`.
+let lastShortcutStatus = null;
 // Ring buffer of the last ~4 KB of backend stderr. When the fallback
 // HTML fires "Backend did not start in time" / "exited with code N
 // after 8 restart attempts", we include the tail of stderr so the user
@@ -1957,11 +1964,58 @@ function ensureOverlayWindow() {
 
 function positionOverlayWindow() {
   if (!overlayWin || overlayWin.isDestroyed()) return;
-  const wa = screen.getPrimaryDisplay().workArea;
+  // Choose the display that currently CONTAINS the overlay, not
+  // blindly the primary. Without this, users who undock their external
+  // monitor mid-session (or change primary display via System Settings)
+  // get the overlay positioned on a screen that no longer exists,
+  // leaving it invisible forever.
   const [w, h] = overlayWin.getSize();
+  let wa;
+  try {
+    const bounds = overlayWin.getBounds();
+    // Use the display matching the overlay's current center point;
+    // fall back to the primary when the window has no usable bounds
+    // (e.g. first call before show()).
+    const probe = {
+      x: bounds.x + Math.floor(bounds.width / 2),
+      y: bounds.y + Math.floor(bounds.height / 2),
+    };
+    const display = screen.getDisplayNearestPoint(probe) || screen.getPrimaryDisplay();
+    wa = display.workArea;
+  } catch {
+    wa = screen.getPrimaryDisplay().workArea;
+  }
   const x = Math.round(wa.x + (wa.width - w) / 2);
   const y = Math.round(wa.y + wa.height - h - OVERLAY_TOKENS.window.bottomOffset);
   overlayWin.setPosition(x, y, false);
+}
+
+// React to display topology changes so the overlay doesn't strand
+// itself off-screen. Fires in three scenarios:
+//   1. User unplugs a monitor while the overlay was visible on it.
+//   2. User plugs in a new monitor and macOS/Windows re-arranges the
+//      primary workspace origin.
+//   3. User changes the scale factor / resolution of the current
+//      display (which shifts workArea by a few pixels).
+// In all three cases we re-measure and re-pin the overlay to the
+// bottom-center of the display it currently (or most recently) lived
+// on. Cheap and idempotent — no-op when overlayWin is null.
+function registerDisplayTopologyListeners() {
+  const reposition = () => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    try {
+      positionOverlayWindow();
+    } catch (e) {
+      appendMainLog(`[display-topology] reposition failed: ${e?.message || e}`);
+    }
+  };
+  try {
+    screen.on("display-metrics-changed", reposition);
+    screen.on("display-added", reposition);
+    screen.on("display-removed", reposition);
+  } catch (e) {
+    appendMainLog(`[display-topology] listener install failed: ${e?.message || e}`);
+  }
 }
 
 function getOverlayWindowWidth() {
@@ -5175,6 +5229,22 @@ async function createWindow(options = {}) {
   win.webContents.on("did-finish-load", async () => {
     loadedFrontendBuildSignature = (await getFrontendBuildSignature()) || "";
     appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
+    // Replay the cached shortcut status. If the initial
+    // registerGlobalShortcuts() call happened before this window
+    // existed (the usual case — shortcuts register during app.whenReady
+    // before createWindow), the renderer would otherwise render with
+    // its "hotkey" Settings panel showing the configured accelerator
+    // as healthy when in fact registration silently failed.
+    if (lastShortcutStatus && win && !win.isDestroyed() && win.webContents) {
+      try {
+        await win.webContents.executeJavaScript(
+          `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
+          true,
+        );
+      } catch (e) {
+        appendMainLog(`[did-finish-load] shortcut replay failed: ${e?.message || e}`);
+      }
+    }
   });
 
   win.on("close", (event) => {
@@ -5353,6 +5423,38 @@ function killBackendHard(reason) {
   }
   appendMainLog(`[backend-kill] reason=${reason} pid=${proc.pid}`);
   let pidForFallback = proc.pid;
+
+  // On Windows, Node's ``proc.kill("SIGTERM")`` maps to TerminateProcess
+  // on the IMMEDIATE child only — uvicorn workers, ffmpeg subprocesses,
+  // and any Python-spawned helpers survive as orphans holding port 8321
+  // and whisper models in RAM. The kernel's ``taskkill /T /F`` tree-
+  // kill primitive walks the PID tree and is the correct fix. We still
+  // rely on the parent-death stdin watchdog (backend/main.py) as a
+  // belt-and-braces backup for crash-exit paths where we don't get to
+  // run this function.
+  if (process.platform === "win32") {
+    try {
+      const r = spawnSync("taskkill", ["/pid", String(pidForFallback), "/t", "/f"], {
+        windowsHide: true,
+        timeout: 5000,
+      });
+      if (r.status === 0) {
+        appendMainLog(`[backend-kill] taskkill tree-killed pid=${pidForFallback}`);
+      } else {
+        appendMainLog(
+          `[backend-kill] taskkill exit=${r.status} stderr=${(r.stderr || "").toString().trim()}`
+        );
+      }
+    } catch (e) {
+      appendMainLog(`[backend-kill] taskkill failed: ${e?.message || e}`);
+      // Fall through to the POSIX path — better than no kill at all.
+      try { proc.kill(); } catch { }
+    }
+    pidForFallback = null;
+    backendTerminationInProgress = false;
+    return;
+  }
+
   try {
     proc.kill("SIGTERM");
   } catch (e) {
@@ -5439,11 +5541,41 @@ app.whenReady().then(async () => {
   // captured. No duplicate registration needed here.
   cleanupStaleTranscriptTmpFiles();
   lastTranscriptText = loadLastTranscriptFromDisk();
+  registerDisplayTopologyListeners();
   if (process.platform === "darwin") {
     app.setActivationPolicy("regular");
   }
   if (process.platform === "darwin" && app.dock) {
     app.dock.show();
+  }
+  // macOS-only: poll Accessibility permission. Users who recorded
+  // successfully once, then revoked the permission via System Settings
+  // would otherwise see their F9 become a silent no-op on the next
+  // session. `globalShortcut.register` returns true even when the
+  // handler has been made non-functional by revocation — there is no
+  // event to listen for, so we poll at 30 s intervals and surface the
+  // state to the renderer. Non-Darwin platforms no-op.
+  if (process.platform === "darwin") {
+    let lastTrusted = null;
+    const checkAccessibility = () => {
+      try {
+        const trusted = !!systemPreferences.isTrustedAccessibilityClient(false);
+        if (trusted !== lastTrusted) {
+          lastTrusted = trusted;
+          appendMainLog(`[accessibility] trusted=${trusted}`);
+          if (win && !win.isDestroyed() && win.webContents) {
+            win.webContents
+              .executeJavaScript(
+                `window.__transcriptorAccessibilityStatus = ${JSON.stringify({ trusted })};`,
+                true,
+              )
+              .catch(() => { });
+          }
+        }
+      } catch { }
+    };
+    checkAccessibility();
+    setInterval(checkAccessibility, 30000);
   }
   // Create a 5-bar sound wave tray icon matching the app icon (icon.png).
   // 32×32 @2x retina, template image auto-adapts to light/dark menu bar.
@@ -5606,19 +5738,30 @@ app.whenReady().then(async () => {
     // main process could not claim. Failures are common: stale
     // accelerators from another running copy, malformed user input,
     // OS-level reservations (e.g. Alt+Space on some locales).
+    //
+    // IMPORTANT: `registerGlobalShortcuts` is invoked DURING app startup
+    // (see the bottom of this file, before createWindow). At that
+    // moment `win` is null and the injection below no-ops, so the
+    // renderer never learns that its hotkey is unclaimed — the most
+    // common real-world failure mode (corp user, F9 owned by another
+    // app) becomes silent. We cache the latest status in a module var
+    // and replay it from `did-finish-load` so every window creation
+    // sees the current state, including the very first window ever
+    // created.
+    const status = {
+      record: {
+        desired: shortcuts.record,
+        active: recordResult.ok ? shortcuts.record : "",
+        error: recordResult.ok ? "" : recordResult.error,
+      },
+      paste: {
+        desired: shortcuts.paste,
+        active: pasteResult.ok ? shortcuts.paste : "",
+        error: pasteResult.ok ? "" : pasteResult.error,
+      },
+    };
+    lastShortcutStatus = status;
     if (win && !win.isDestroyed() && win.webContents) {
-      const status = {
-        record: {
-          desired: shortcuts.record,
-          active: recordResult.ok ? shortcuts.record : "",
-          error: recordResult.ok ? "" : recordResult.error,
-        },
-        paste: {
-          desired: shortcuts.paste,
-          active: pasteResult.ok ? shortcuts.paste : "",
-          error: pasteResult.ok ? "" : pasteResult.error,
-        },
-      };
       win.webContents
         .executeJavaScript(
           `window.__transcriptorShortcutStatus = ${JSON.stringify(status)};`,

@@ -95,3 +95,4 @@ backend/.pytest_cache/
 # macOS metadata
 **/.DS_Store
 **/__MACOSX/
+.claude/

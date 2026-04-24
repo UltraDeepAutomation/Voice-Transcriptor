@@ -178,6 +178,50 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 jobs = JobStore(max_workers=2)
 
+
+# Paths we consider "sensitive" — present in raw exception text from
+# OSError/FileNotFoundError/ffmpeg stderr and get echoed back to the
+# client if we include `str(e)` verbatim in HTTP response bodies or
+# persisted job errors. The redact happens BEFORE the string is handed
+# to anything external; full exceptions are still written to main.log
+# via `logger.exception` for operator debugging.
+_ERROR_PATH_REDACT_RE = re.compile(
+    r"(?:"
+    # POSIX user/system paths — Macs, Linux, WSL. Capture up to the next
+    # whitespace / quote / colon so we strip the whole filename.
+    r"/(?:Users|home|root|var|tmp|private|opt|Applications|System)/[^\s\"'`]*"
+    r"|"
+    # Windows user/system paths — both `\` and forward-slashed variants.
+    r"[A-Za-z]:\\(?:Users|Windows|Temp|ProgramData|Program Files)\\[^\s\"'`]*"
+    r")",
+    re.IGNORECASE,
+)
+# Crude API-key shapes that should never end up in an error body. We
+# don't need to match every provider — just the ones we use.
+_ERROR_TOKEN_REDACT_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{20,}|[a-f0-9]{40,})\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
+    """Render an exception (or arbitrary string) safely for external reporting.
+
+    Redacts absolute filesystem paths and obvious token shapes, then
+    truncates. The full, unredacted exception should be logged
+    separately via ``logger.exception`` so operators retain the detail
+    needed for debugging; only what this function returns should appear
+    in HTTP response bodies or stored job errors.
+    """
+    text = str(exc) if not isinstance(exc, str) else exc
+    if not text:
+        return exc.__class__.__name__ if isinstance(exc, BaseException) else "error"
+    text = _ERROR_PATH_REDACT_RE.sub("<path>", text)
+    text = _ERROR_TOKEN_REDACT_RE.sub("<token>", text)
+    if len(text) > max_len:
+        text = text[:max_len].rstrip() + "…"
+    return text
+
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 # Hard ceiling on recovery-promote PCM reads. A 10-hour 16 kHz/16-bit PCM
 # spool is 1.15 GB; loading it into a numpy float32 array allocates ~4.6 GB
@@ -185,6 +229,16 @@ MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 # Any recovery file larger than this is rejected with 413 and left on disk
 # so the user can retrieve it manually from LIVE_RECOVERY_DIR.
 MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
+# Hard ceiling on the live-recovery SPOOL (distinct from the promote
+# ceiling above). 16 kHz mono PCM16 = 32 KB/s, so 1 GB ≈ 8.7 h of
+# continuous audio — longer than any realistic dictation session.
+# Without this cap, a user who leaves a tab open and crashes Electron
+# while still recording can write the spool indefinitely and fill a
+# small SSD. When crossed we stop writing further chunks (logged once)
+# but keep the WebSocket session alive so live transcription continues;
+# recovery is best-effort, the finalized transcript is already persisted
+# via the streaming path.
+MAX_LIVE_RECOVERY_BYTES = 2 * MAX_UPLOAD_BYTES
 RATE_LIMIT_PER_MIN = 120
 WS_CONNECT_LIMIT_PER_MIN = 20
 def _env_int(name: str, default: int) -> int:
@@ -739,12 +793,21 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
             if pcm_size < 32000:
                 raise HTTPException(status_code=400, detail="live recovery too short")
             if pcm_size > MAX_RECOVERY_PROMOTE_BYTES:
+                # Do NOT interpolate `pcm_path` into the response body —
+                # the absolute filesystem path (containing the user's OS
+                # profile name + data dir layout) would leak to any API
+                # consumer. Log the path locally; clients get the session
+                # id only and can retrieve the spool via the authenticated
+                # session-metadata endpoint if needed.
+                logger.warning(
+                    "live recovery too large (%d B, max %d B); spool left at %s",
+                    pcm_size, MAX_RECOVERY_PROMOTE_BYTES, pcm_path,
+                )
                 raise HTTPException(
                     status_code=413,
                     detail=(
                         f"live recovery too large (max "
-                        f"{MAX_RECOVERY_PROMOTE_BYTES // (1024 * 1024)} MB); "
-                        f"spool left at {pcm_path}"
+                        f"{MAX_RECOVERY_PROMOTE_BYTES // (1024 * 1024)} MB)"
                     ),
                 )
             audio_bytes = pcm_path.read_bytes()
@@ -807,7 +870,11 @@ async def _require_api_auth(request: Request) -> None:
     if request.url.path in {"/api/health", "/api/network"}:
         return
     provided = (request.headers.get("x-api-token") or request.query_params.get("token") or "").strip()
-    if not provided or provided != API_TOKEN:
+    # Constant-time comparison — prevents a timing-attack-based byte-by-byte
+    # recovery of API_TOKEN over the loopback/LAN. secrets.compare_digest
+    # requires both operands to be the same type; encode to bytes so a
+    # unicode-only user input cannot panic the comparison.
+    if not provided or not secrets.compare_digest(provided.encode("utf-8"), API_TOKEN.encode("utf-8")):
         raise HTTPException(status_code=401, detail="unauthorized")
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
@@ -1849,7 +1916,10 @@ async def ws_transcribe(websocket: WebSocket):
 
     _cleanup_future.add_done_callback(_log_cleanup_error)
     token = (websocket.query_params.get("token") or "").strip()
-    if token != API_TOKEN:
+    # Constant-time comparison — matches the HTTP auth path (see
+    # `_require_api_auth`). Without this a local attacker can recover
+    # API_TOKEN one byte at a time by measuring WS close latency.
+    if not token or not secrets.compare_digest(token.encode("utf-8"), API_TOKEN.encode("utf-8")):
         await websocket.close(code=4401, reason="unauthorized")
         return
     client_key = websocket.client.host if websocket.client else "unknown"
@@ -2022,6 +2092,20 @@ def _open_live_recovery(
 
 
 def _record_recovery_chunk(recovery: dict, data: bytes) -> None:
+    # Hard cap on the per-session recovery spool. Without this a user
+    # who leaves a tab streaming overnight (or a runaway reconnect loop)
+    # can fill a small SSD. We stop writing silently once the ceiling is
+    # reached — the live-transcription stream itself is unaffected and
+    # the finalized transcript lands in recordings/ normally.
+    if recovery["bytes"] >= MAX_LIVE_RECOVERY_BYTES:
+        if not recovery.get("over_limit"):
+            recovery["over_limit"] = True
+            logger.warning(
+                "live recovery byte cap reached (%d B >= %d B); "
+                "dropping further recovery writes for this session",
+                recovery["bytes"], MAX_LIVE_RECOVERY_BYTES,
+            )
+        return
     recovery["chunks"] += 1
     recovery["bytes"] += len(data)
     try:
@@ -2493,9 +2577,14 @@ async def create_job(
                 },
             )
         except AudioError as e:
-            jobs.set_error(job_id, str(e))
+            jobs.set_error(job_id, _safe_error_text(e))
         except Exception as e:
-            jobs.set_error(job_id, f"Transcription failed: {e}")
+            # Log the full exception locally so operators still have
+            # the trace (paths, ffmpeg stderr, etc.), but redact before
+            # persisting to the job store — job errors are returned
+            # verbatim to the renderer.
+            logger.exception("local transcription job failed (job_id=%s)", job_id)
+            jobs.set_error(job_id, f"Transcription failed: {_safe_error_text(e)}")
         finally:
             try:
                 os.remove(upload_path)
@@ -2539,9 +2628,12 @@ async def transcribe_sync(
         )
         return {"ok": True, "result": result}
     except AudioError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_error_text(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+        # Log the full trace locally; redact the response so the
+        # HTTP body never carries absolute paths or ffmpeg stderr.
+        logger.exception("transcribe_sync failed")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {_safe_error_text(e)}")
     finally:
         try:
             os.remove(upload_path)
@@ -2675,11 +2767,12 @@ async def create_remote_job(
                 },
             )
         except ValueError as e:
-            jobs.set_error(job_id, f"bad_request: {e}")
+            jobs.set_error(job_id, f"bad_request: {_safe_error_text(e)}")
         except (OpenRouterError, DeepgramRemoteError) as e:
-            jobs.set_error(job_id, str(e))
+            jobs.set_error(job_id, _safe_error_text(e))
         except Exception as e:
-            jobs.set_error(job_id, f"Remote transcription failed: {e}")
+            logger.exception("remote transcription job failed (job_id=%s)", job_id)
+            jobs.set_error(job_id, f"Remote transcription failed: {_safe_error_text(e)}")
         finally:
             try:
                 os.remove(upload_path)
@@ -2746,11 +2839,12 @@ async def remote_transcribe_sync(
         )
         return {"ok": True, "result": result}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_error_text(e))
     except (OpenRouterError, DeepgramRemoteError) as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail=_safe_error_text(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Remote transcription failed: {e}")
+        logger.exception("remote_transcribe_sync failed")
+        raise HTTPException(status_code=500, detail=f"Remote transcription failed: {_safe_error_text(e)}")
 
 
 @app.post("/api/upscale")

@@ -3260,13 +3260,57 @@ async function loadCfg(): Promise<void> {
   }
 }
 
+/**
+ * Light client-side validation before POSTing a provider key.
+ *
+ * Catches the obvious user mistakes (empty, pasted with surrounding
+ * quotes / whitespace, "Bearer " prefix, way too short) with a clear
+ * inline error instead of letting the wrong value hit the provider
+ * later and surface as a confusing HTTP 401 during transcription. We
+ * deliberately do NOT enforce provider-specific regex shapes beyond
+ * this — providers rotate their key formats (Deepgram already moved
+ * from hex-only to JWT-style in 2024) and a too-strict frontend
+ * rejects legitimate new-format keys.
+ */
+function validateProviderKey(raw: string): { ok: true; value: string } | { ok: false; error: string } {
+  let v = (raw || "").trim();
+  // Strip common paste-from-email artefacts.
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  // Strip an accidental "Bearer " prefix that users copy from API docs.
+  if (/^bearer\s+/i.test(v)) {
+    v = v.replace(/^bearer\s+/i, "").trim();
+  }
+  if (!v) return { ok: false, error: "Key is empty. Paste your API key and try again." };
+  if (v.includes(" ") || v.includes("\t") || v.includes("\n")) {
+    return { ok: false, error: "Key contains whitespace. API keys should be a single token with no spaces." };
+  }
+  if (v.length < 16) {
+    return { ok: false, error: "Key looks too short. Make sure you copied the full key from the provider dashboard." };
+  }
+  return { ok: true, value: v };
+}
+
 async function saveProviderKey(provider: KeyProvider): Promise<void> {
   const input = keyInput(provider);
-  const value = isMaskedKeyInput(input) ? "" : input.value.trim();
-  if (!value) return;
+  const raw = isMaskedKeyInput(input) ? "" : input.value;
+  if (!raw && isMaskedKeyInput(input)) {
+    // Masked placeholder state — nothing to save, stay silent (user
+    // opened Settings but didn't edit). Same behaviour as before the
+    // validation hook.
+    return;
+  }
+  const v = validateProviderKey(raw);
+  if (!v.ok) {
+    throw new Error(v.error);
+  }
+  // Reflect the sanitized value back into the input so the user sees
+  // exactly what we saved (e.g., if we stripped surrounding quotes).
+  input.value = v.value;
   await apiPost<{ ok: boolean }>("/api/config", {
     providers: {
-      [provider]: { key: value },
+      [provider]: { key: v.value },
     },
   });
   if (provider === "openrouter") {
@@ -3328,7 +3372,28 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
   });
   btn.addEventListener("click", () => {
     void handleKeyAction(provider).catch((e: Error) => {
-      console.error(e.message);
+      // Surface failures to the user. Pre-fix, a bad key / network
+      // error was logged to the devtools console only — the Save
+      // button would silently revert and the user had no idea why
+      // transcription still complained about "key not configured".
+      console.error(e?.message || e);
+      const providerLabel = provider === "openrouter" ? "OpenRouter" : "Deepgram";
+      const detail = sanitizeUiErrorMessage(e, "Could not save the key.");
+      setStatus(`Could not save ${providerLabel} key: ${detail}`, "error");
+      // Visual marker on the input so the user sees where the
+      // problem is, even if they've scrolled away from the status
+      // pill. Cleared automatically on the next focus/input event.
+      const inputEl = keyInput(provider);
+      inputEl.setAttribute("aria-invalid", "true");
+      inputEl.classList.add("has-error");
+      const clearError = () => {
+        inputEl.removeAttribute("aria-invalid");
+        inputEl.classList.remove("has-error");
+        inputEl.removeEventListener("focus", clearError);
+        inputEl.removeEventListener("input", clearError);
+      };
+      inputEl.addEventListener("focus", clearError);
+      inputEl.addEventListener("input", clearError);
       syncKeyActionButton(provider);
     });
   });
@@ -4172,6 +4237,12 @@ $("retranscribeBtn").addEventListener("click", async () => {
     $("finalOutput").textContent = "No saved audio to re-transcribe.";
     return;
   }
+  // Capture the UI session token at the START of the retranscribe job.
+  // If the user presses F9 mid-retranscribe, activeUiSessionToken
+  // advances, and all our writes after that point must be gated by
+  // `isCurrentUiSession(capturedToken)` — otherwise the stale retranscribe
+  // clobbers the fresh live session's final output / upscale placeholder.
+  const capturedToken = activeUiSessionToken || "";
   btn.disabled = true;
   btn.classList.add("is-busy");
   try {
@@ -4224,9 +4295,16 @@ $("retranscribeBtn").addEventListener("click", async () => {
     }
 
     if (text) {
-      $("finalOutput").textContent = text;
+      // Session-gated writes: if the user started a new live recording
+      // while we were transcribing, the new session owns `finalOutput`
+      // and we must NOT overwrite it.
+      if (isCurrentUiSession(capturedToken)) {
+        $("finalOutput").textContent = text;
+      }
       // Persist the new transcript over the previous save so the
-      // Recordings view reflects the improved result.
+      // Recordings view reflects the improved result. This is safe to
+      // do regardless of session state — it's archive-side state, not
+      // live UI state.
       try {
         await saveRecordingText({
           name: audioState.savedName,
@@ -4242,17 +4320,38 @@ $("retranscribeBtn").addEventListener("click", async () => {
           language: lang,
         });
       } catch { }
-      patchCurrentRecordingSummary({
-        status: usedProvider === "deepgram"
-          ? "Re-transcribed via Deepgram REST."
-          : "Re-transcribed via local Whisper.",
-        tone: "success",
-      });
+      if (isCurrentUiSession(capturedToken)) {
+        patchCurrentRecordingSummary({
+          status: usedProvider === "deepgram"
+            ? "Re-transcribed via Deepgram REST."
+            : "Re-transcribed via local Whisper.",
+          tone: "success",
+        }, capturedToken);
+      }
+      // AI Upscale: if the user has upscale enabled, the re-transcript
+      // should get the same rewrite treatment as a fresh live session.
+      // Without this, re-transcribe produces a raw transcript that
+      // visibly differs from what live recording produces for the same
+      // audio — surprising inconsistency. `runUpscaleIfEnabled` is a
+      // no-op when the toggle is off, and already session-guards its
+      // own DOM writes via the placeholderNonce pattern.
+      try {
+        await runUpscaleIfEnabled(text, capturedToken);
+      } catch (upscaleErr) {
+        // runUpscaleIfEnabled handles its own UI error states;
+        // swallow here so retranscribe's overall success status is
+        // preserved for the user.
+        console.warn("Re-transcribe: upscale step failed:", upscaleErr);
+      }
     } else {
-      $("finalOutput").textContent = "Re-transcribe returned empty result.";
+      if (isCurrentUiSession(capturedToken)) {
+        $("finalOutput").textContent = "Re-transcribe returned empty result.";
+      }
     }
   } catch (e) {
-    $("finalOutput").textContent = explainNetworkError(e, "Re-transcribe failed");
+    if (isCurrentUiSession(capturedToken)) {
+      $("finalOutput").textContent = explainNetworkError(e, "Re-transcribe failed");
+    }
   } finally {
     btn.disabled = false;
     btn.classList.remove("is-busy");
@@ -7435,25 +7534,110 @@ window.__setBackendBootStatus = (msg: string) => {
   setStatus(msg);
 };
 
+/**
+ * Map a raw backend-startup error string to a user-actionable message.
+ *
+ * The backend sends us ``uvicorn`` stderr tails verbatim via
+ * ``__setBackendBootError`` — those can include absolute filesystem
+ * paths, Python tracebacks, or obscure OS error codes (``EADDRINUSE``,
+ * ``WinError 10013``). Rendering them raw is (a) scary to non-technical
+ * users, (b) info-leaky to anyone who photographs the window. We
+ * classify the known families into actionable copy and keep the raw
+ * text behind a "Show details" disclosure for anyone debugging.
+ */
+function classifyBootError(raw: string): { headline: string; detail: string } {
+  const low = (raw || "").toLowerCase();
+  if (!low) {
+    return {
+      headline: "Backend failed to start.",
+      detail: "Unknown startup failure — check the main.log in the data directory.",
+    };
+  }
+  if (low.includes("address already in use") ||
+      low.includes("eaddrinuse") ||
+      low.includes("winerror 10048") ||
+      low.includes("only one usage of each socket address")) {
+    return {
+      headline: "Port 8321 is already in use.",
+      detail: "Another copy of Transcriptor is still running. Close it via the tray icon (or reboot if that doesn't work) and try again.",
+    };
+  }
+  if (low.includes("permission denied") ||
+      low.includes("eacces") ||
+      low.includes("winerror 5")) {
+    return {
+      headline: "Transcriptor couldn't access its data directory.",
+      detail: "Check that Transcriptor's data directory is writable by your user account. On Windows, verify no antivirus is blocking %APPDATA%\\Transcriptor.",
+    };
+  }
+  if (low.includes("no module named") || low.includes("modulenotfounderror")) {
+    return {
+      headline: "A Python dependency is missing.",
+      detail: "The bundled runtime is incomplete. Reinstall Transcriptor from the same installer (.exe / .dmg / .AppImage) to restore it.",
+    };
+  }
+  if (low.includes("python 3 interpreter was not found") ||
+      low.includes("python: not found") ||
+      low.includes("python was not found")) {
+    return {
+      headline: "Python 3 is required.",
+      detail: "Install Python 3.10+ from python.org, then reopen Transcriptor. Linux users: `sudo apt install python3 python3-venv python3-pip`.",
+    };
+  }
+  // Unknown family — generic copy + let the user open the log.
+  return {
+    headline: "Backend failed to start.",
+    detail: "Open the log file from the support section below and share the tail with support, or reinstall from the latest installer.",
+  };
+}
+
 window.__setBackendBootError = (msg: string) => {
-  const detail = String(msg || "").trim();
+  const raw = String(msg || "").trim();
+  const { headline, detail } = classifyBootError(raw);
   const overlay = document.getElementById("bootOverlay");
   if (overlay) {
     overlay.dataset.state = "error";
     overlay.hidden = false;
   }
   const statusEl = document.getElementById("bootOverlayStatus");
-  if (statusEl) statusEl.textContent = "Backend failed to start.";
+  if (statusEl) statusEl.textContent = headline;
   const detailEl = document.getElementById("bootOverlayDetail");
   if (detailEl) {
-    detailEl.textContent = detail || "Unknown startup failure — check the main.log in the data directory.";
-    detailEl.hidden = !detail;
+    // Render the friendly detail as the primary message, and expose
+    // the raw stderr via a click-to-expand disclosure so debuggers
+    // still have full context without the scary default.
+    detailEl.innerHTML = "";
+    const friendly = document.createElement("div");
+    friendly.textContent = detail;
+    detailEl.appendChild(friendly);
+    if (raw && raw !== detail) {
+      const details = document.createElement("details");
+      details.style.marginTop = "8px";
+      details.style.fontSize = "12px";
+      details.style.opacity = "0.75";
+      const summary = document.createElement("summary");
+      summary.textContent = "Show technical details";
+      summary.style.cursor = "pointer";
+      const pre = document.createElement("pre");
+      pre.textContent = raw;
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.wordBreak = "break-word";
+      pre.style.marginTop = "6px";
+      details.appendChild(summary);
+      details.appendChild(pre);
+      detailEl.appendChild(details);
+    }
+    detailEl.hidden = false;
   }
   const retryBtn = document.getElementById("bootOverlayRetry") as HTMLButtonElement | null;
   if (retryBtn) retryBtn.hidden = false;
-  setStatus("Backend Error");
+  setStatus("Backend Error", "error");
   ($("statusDot") as HTMLElement).className = "status-dot error";
-  $("liveOutput").textContent = detail || "Backend failed to start.";
+  // Replace liveOutput with the friendly headline only — the raw
+  // detail already lives in the boot overlay's disclosure. Previously
+  // we wrote the raw stderr tail into the live-transcript pane which
+  // leaked paths into the paste/copy buffer on the first Cmd+V.
+  $("liveOutput").textContent = headline;
 };
 
 // Retry: reload the renderer; Electron's main process keeps the

@@ -58,7 +58,7 @@
       "icon": "icon.png",
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.inherit.plist",
-      "hardenedRuntime": false,
+      "hardenedRuntime": true,
       "identity": null,
       "extraResources": [
         {
