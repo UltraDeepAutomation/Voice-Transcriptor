@@ -171,11 +171,34 @@ function rotateMainLogIfNeeded() {
     mainLogSizeCached = st.size;
     if (st.size < MAIN_LOG_MAX_BYTES) return;
     const archived = mainLogFilePath + ".1";
-    // Overwrite any prior archive — we keep exactly one rotation of
-    // history (main.log + main.log.1), bounded at 10 MB combined.
-    try { fs.unlinkSync(archived); } catch { /* missing is fine */ }
-    fs.renameSync(mainLogFilePath, archived);
-    mainLogSizeCached = 0;
+    const pending = mainLogFilePath + ".rotating";
+    // Rename-first, unlink-after. Previous order (unlink archive →
+    // rename current → archive) destroyed the previous archive
+    // PERMANENTLY if the rename failed (Windows: file handle held by
+    // Notepad / Event Viewer / antivirus scan). Correct order is:
+    //   1. Move current log to a side tmp name (fails gracefully
+    //      if locked — leaves main.log intact for next attempt).
+    //   2. Only AFTER step 1 succeeded, unlink the old archive.
+    //   3. Promote tmp → archive.
+    // On step-3 failure, restore tmp → main.log so we don't orphan.
+    try {
+      fs.renameSync(mainLogFilePath, pending);
+    } catch {
+      // Current log is locked — skip rotation this cycle. Next
+      // amortised-counter tick will retry. main.log keeps growing
+      // past 5 MB until the lock is released.
+      return;
+    }
+    try { fs.unlinkSync(archived); } catch { /* archive missing is fine */ }
+    try {
+      fs.renameSync(pending, archived);
+      mainLogSizeCached = 0;
+    } catch {
+      // Promotion failed. Restore the log to its original name so
+      // appendFile keeps working. If restore also fails the .rotating
+      // file is orphaned (cleaned up on next startup sweep).
+      try { fs.renameSync(pending, mainLogFilePath); } catch { /* give up */ }
+    }
   } catch { /* stat failed — nothing to rotate */ }
 }
 
@@ -184,12 +207,23 @@ function appendMainLog(message) {
     if (!mainLogFilePath) {
       mainLogFilePath = path.join(app.getPath("userData"), "main.log");
     }
-    // Amortised rotation check — stat every 200 appends so a
-    // high-frequency trace loop doesn't statSync per-line.
+    const line = `[${new Date().toISOString()}] ${message}\n`;
+    // Amortised rotation check — stat every 256 appends (& 0xff).
+    // Must come BEFORE the append so we rotate the CURRENT main.log
+    // and the just-generated line lands in the fresh file rather
+    // than getting buffered into the about-to-be-renamed inode.
     if ((++mainLogCheckCounter & 0xff) === 0) {
       rotateMainLogIfNeeded();
     }
-    fs.appendFile(mainLogFilePath, `[${new Date().toISOString()}] ${message}\n`, "utf8", () => { });
+    // appendFileSync (not appendFile): the async form buffers the
+    // write and can race with a synchronous renameSync inside
+    // rotateMainLogIfNeeded — on POSIX the pending write lands in
+    // the NOW-RENAMED inode (the .rotating / .1 file), then the
+    // next rotation cycle unlinks it, losing data. Synchronous
+    // appends cost ~0.5-1ms per line on local SSD; trace logging
+    // peaks at ~20 lines/second which is still well under 2% of
+    // main-process time. Acceptable cost for log durability.
+    fs.appendFileSync(mainLogFilePath, line, "utf8");
   } catch (e) {
     // Last-resort: the logger itself failed. Fall back to stderr so
     // we never silently lose signal.
@@ -1545,11 +1579,23 @@ function createOverlayHtml() {
         // focus to fire its click handler.
         const secsBounds = { min: 1, max: 120 };
         const emitSecs = (v) => {
-          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, Math.round(v) || 2));
+          // Must NOT use ``|| 2`` fallback on the rounded value —
+          // that turns a legitimate Math.round(0) into 2 AFTER the
+          // clamp's floor is supposed to take over. Scenario: user
+          // at value 1 clicks minus → readSecs=1 → 1-1=0 → Math.round(0)=0
+          // → 0||2 → 2. Sign-inverted: the minus button INCREMENTS
+          // the value at the min boundary. Handle NaN explicitly
+          // instead, so the clamp does its own floor.
+          const raw = Number(v);
+          const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
+          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
           quickAutoStopSecs.textContent = String(sec);
           document.title = '__overlay_autostop_secs__' + sec;
         };
-        const readSecs = () => Number(quickAutoStopSecs.textContent) || 2;
+        const readSecs = () => {
+          const n = Number(quickAutoStopSecs.textContent);
+          return Number.isFinite(n) && n > 0 ? n : 2;
+        };
         window.setAutoStopConfig = (enabled, seconds) => {
           const on = !!enabled;
           if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
@@ -1824,21 +1870,13 @@ function ensureOverlayWindow() {
       }
       return;
     }
-    if (raw === "__overlay_input_focus__") {
-      // User clicked into an input field — make overlay temporarily focusable for keyboard.
-      if (overlayWin && !overlayWin.isDestroyed()) {
-        overlayWin.setFocusable(true);
-        overlayWin.focus();
-      }
-      return;
-    }
-    if (raw === "__overlay_input_blur__") {
-      // User left the input field — restore non-focusable overlay state.
-      if (overlayWin && !overlayWin.isDestroyed()) {
-        overlayWin.setFocusable(false);
-      }
-      return;
-    }
+    // NOTE: the prior `__overlay_input_focus__` / `__overlay_input_blur__`
+    // handlers flipped overlayWin.setFocusable(true/false) for the
+    // tiny seconds text-input in the auto-stop capsule. That input
+    // was replaced with +/- buttons (which don't need keyboard
+    // focus), so no current overlay element emits these signals.
+    // If a new text input is ever added to the overlay, restore the
+    // emit-side in createOverlayHtml AND this handler atomically.
     if (raw === "__overlay_mouse_enter__") {
       // Mouse entered the pill — capture mouse events.
       if (overlayWin && !overlayWin.isDestroyed()) {

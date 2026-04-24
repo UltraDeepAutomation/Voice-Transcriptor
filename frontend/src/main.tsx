@@ -991,6 +991,20 @@ function syncKeyActionButton(provider: KeyProvider): void {
 function explainNetworkError(err: unknown, context = ""): string {
   const raw = String((err as Error)?.message || err || "").trim();
   const low = raw.toLowerCase();
+  // Provider-specific branches before the generic fetch-fail catch.
+  // backend/remote_deepgram_live.py raises ``RemoteError("Deepgram
+  // connect failed: <underlying>")`` for any Deepgram WS handshake
+  // failure — which on Cloudflare-backed regions (e.g. Russia without
+  // VPN) surfaces as "did not receive a valid HTTP response". Without
+  // this branch the raw Python message leaks into the status pill;
+  // user doesn't know to try a VPN.
+  if (low.startsWith("deepgram connect failed") ||
+      low.startsWith("deepgram connect timed out") ||
+      low.startsWith("deepgram upstream closed unexpectedly")) {
+    return context
+      ? `${context}: Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to "local" in Settings.`
+      : "Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to \"local\" in Settings.";
+  }
   const isFetchFail =
     low === "failed to fetch" ||
     low.includes("networkerror") ||
@@ -2959,7 +2973,16 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       // to open Settings → API Keys → OpenRouter and paste a key.
       let friendly: string;
       const low = rawMsg.toLowerCase();
-      if (low.includes("openrouter key is not configured") || low.includes("401")) {
+      // Match 401 only as a standalone HTTP status token, NOT a bare
+      // substring — a request id, timestamp, or unrelated payload
+      // could contain "401" as four digits and wrongly tell the user
+      // their API key is missing. The backend emits "HTTP 401" or
+      // "401 Unauthorized" — anchor on those exact token shapes.
+      if (
+        low.includes("openrouter key is not configured") ||
+        /\bhttp\s*401\b/.test(low) ||
+        /\b401\s+(unauthorized|forbidden)\b/.test(low)
+      ) {
         friendly = "Upscale needs an OpenRouter API key.\n\nOpen Settings → API Keys → OpenRouter and paste your key, then try again.";
       } else if (low.includes("failed to fetch") || low.includes("networkerror") || low === "load failed") {
         friendly = "Upscale request failed: the OpenRouter API is unreachable. Check your internet connection or try a VPN.\n\nUsing original transcript.";
@@ -2968,8 +2991,19 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
       } else {
         friendly = `Upscale failed: ${rawMsg}\n\nUsing original transcript.`;
       }
-      $("upscaleOutput").textContent = friendly;
-      $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      // Error path MUST be session-guarded (asymmetric with success).
+      // Success unguarding was justified by the stuck-on-Upscaling...
+      // recovery case. Errors do NOT have that need: the placeholder
+      // was only written when the session matched at START time;
+      // a stale session reaching its catch block later must not
+      // clobber a newer session's successful upscale output. Without
+      // this guard, user records A → stops → starts B → A fails late
+      // (e.g. network flake) → B's good output gets replaced by A's
+      // error. Keep the placeholder-clear asymmetry narrow.
+      if (isCurrentUiSession(sessionToken)) {
+        $("upscaleOutput").textContent = friendly;
+        $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
+      }
       setStatusScoped(sessionToken, "Done");
       return input;
     } finally {
