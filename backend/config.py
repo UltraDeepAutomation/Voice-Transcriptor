@@ -43,9 +43,10 @@ import logging
 import os
 import shutil
 import sys
-import uuid
 from pathlib import Path
 from typing import Any, Dict
+
+from backend.storage import atomic_write_bytes, atomic_write_json, rotate_backup
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +128,13 @@ def _load_or_create_fernet_key() -> bytes:
                 )
     key = Fernet.generate_key()
     try:
-        _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
-        _KEYFILE.write_bytes(key)
+        # Atomic + fsync write via the shared SSOT primitive. Without
+        # atomicity, an interrupted first-launch write could leave a
+        # zero-length keyfile on disk, which the next load would detect
+        # as "corrupt" and regenerate — permanently losing access to
+        # any keys encrypted with the lost original. atomic_write_bytes
+        # guarantees either the old contents or the full new contents.
+        atomic_write_bytes(_KEYFILE, key)
     except OSError as e:
         logger.error(
             "failed to persist encryption keyfile at %s: %s — "
@@ -289,85 +295,15 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    """Crash-safe JSON write.
-
-    Writes to a unique ``.tmp-<uuid>`` file, explicitly ``fsync()``s
-    the temp's contents to storage, ``replace()``s the target in a
-    single syscall, then ``fsync()``s the parent directory on POSIX
-    so the rename itself is durable across power loss. The previous
-    ``tmp.write_text(); tmp.replace()`` pattern was only atomic in the
-    rename-landing sense — after a kernel crash the tmp could land
-    intact but EMPTY because its payload bytes were still in the
-    page cache and never flushed to the platter.
-
-    Raises ``OSError`` on any failure. Cleans up the tmp on failure.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    tmp = path.with_suffix(path.suffix + f".tmp-{uuid.uuid4().hex}")
-    try:
-        # Use `open + fsync` rather than `write_text` so we can force
-        # the contents to storage BEFORE the rename lands. The tmp is
-        # opened with mode="w" (not "x") even though uuid-unique names
-        # make collisions astronomically unlikely — the existing
-        # `_sweep_orphan_tmp_files` housekeeper handles stale tmps
-        # from prior crashes without our help.
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        # `Path.replace` maps to `os.replace` → atomic rename on both
-        # POSIX (same-filesystem `rename(2)`) and Windows
-        # (`MoveFileExW` with MOVEFILE_REPLACE_EXISTING).
-        tmp.replace(path)
-        # On POSIX, fsync the PARENT DIRECTORY so the rename metadata
-        # reaches the platter. Without this, the rename can be lost
-        # in a power-loss scenario even though the target file's data
-        # was fsync'd. Windows has no public dir-fsync API; rely on
-        # NTFS journaling for rename durability there.
-        if os.name != "nt":
-            try:
-                dir_fd = os.open(str(path.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError as e:
-                # Dir fsync failure is non-fatal — the file data is
-                # already on disk; we lose only the "rename is durable"
-                # guarantee. Log so operators can spot flaky storage.
-                logger.warning("config dir fsync skipped at %s: %s", path.parent, e)
-    except OSError:
-        # Half-written tmp lingering around confuses the sweep
-        # housekeeper and wastes inode space — drop it. Swallow any
-        # unlink error and re-raise the original write exception.
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-
-def _rotate_backup(path: Path, backup: Path) -> None:
-    """Copy the current on-disk config to ``.bak`` before overwriting.
-
-    Used as the pre-step of every successful ``save_config``. If the
-    new save turns out to be corrupt (a bug, a disk IO error mid-
-    write, a future-version migration we misimplemented), ``load_config``
-    detects the corruption and transparently falls back to ``.bak``.
-    """
-    if not path.exists():
-        return
-    try:
-        # shutil.copy2 preserves metadata; fine for a readable JSON.
-        # We use copy, not rename, so the backup stays reachable even
-        # if the atomic write below fails partway.
-        shutil.copy2(path, backup)
-    except OSError as e:
-        logger.warning("config backup rotation failed at %s: %s", backup, e)
-        # Non-fatal — we'd rather persist the new config than abort
-        # because of a backup hiccup.
+# Atomic writer primitives live in ``backend.storage`` — shared across
+# every persistence site in the backend (config, upscale presets,
+# archive registry, API token, encryption key, recording .txt/.json).
+# Keeping them module-level private aliases in this file preserves
+# the existing call sites and lets a future migration to a different
+# implementation (say, an async writer or a WAL-style journal) be a
+# one-line change here rather than a grep across the whole module.
+_atomic_write_json = atomic_write_json
+_rotate_backup = rotate_backup
 
 
 def _validate_config_shape(cfg: Any) -> Dict[str, Any]:

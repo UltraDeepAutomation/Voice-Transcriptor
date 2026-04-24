@@ -1,0 +1,148 @@
+"""Shared atomic-write primitives — the SSOT storage layer.
+
+Every persistent file written by the backend goes through one of these
+helpers. The goals are uniform and non-negotiable across call sites:
+
+    1. ATOMICITY — the final file either has the OLD contents or the
+       FULL NEW contents. There is no intermediate state. We write to
+       a unique tmp file in the target's directory and ``os.replace()``
+       in a single syscall.
+
+    2. DURABILITY — contents are ``fsync()``'d to storage BEFORE the
+       rename lands, so a kernel/power crash cannot leave an empty
+       file visible at the target path. On POSIX we also ``fsync()``
+       the parent directory so the rename metadata itself is durable.
+
+    3. CRASH RECOVERY — ``rotate_backup()`` copies the current file to
+       a ``.bak`` sibling BEFORE a mutating write. If the new write is
+       corrupt (bug, truncation, bad migration) the caller's read
+       path can fall back to ``.bak``.
+
+    4. TEMP-FILE HYGIENE — tmp names use ``<target>.tmp-<hex>`` which
+       matches the convention ``_sweep_orphan_tmp_files`` in
+       backend.main expects, so a crash mid-write does not leave
+       permanent clutter.
+
+    5. SINGLE IMPLEMENTATION — NO caller opens a file for write
+       directly. All JSON / text / bytes persistence routes here.
+       This keeps fsync semantics, tmp-naming conventions, and
+       error handling identical across the whole codebase, so a
+       future improvement (say, async writes or a different tmp
+       location under a ramdisk) is a one-file change.
+
+The helpers raise ``OSError`` on any failure. They clean up the tmp
+file before re-raising so no half-written artefact lingers.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any, Union
+
+logger = logging.getLogger(__name__)
+
+# Type alias for ``atomic_write_json``'s payload. We intentionally
+# accept ``Any`` because callers feed ``list`` (e.g. known_archive_dirs)
+# as well as ``dict`` — both serialise fine through ``json.dumps``.
+JSONData = Any
+
+
+def _tmp_path_for(target: Path) -> Path:
+    """Produce a collision-free ``.tmp-<hex>`` sibling of *target*.
+
+    The suffix shape is recognised by ``_sweep_orphan_tmp_files`` in
+    backend/main.py: a crash between the tmp write and the atomic
+    rename leaves a file that the housekeeper deletes on next boot.
+    """
+    return target.with_name(target.name + f".tmp-{uuid.uuid4().hex}")
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    """On POSIX, fsync the parent directory so the rename is durable.
+
+    Windows has no public directory-fsync primitive; NTFS journalling
+    handles rename durability on its own, so we no-op there.
+    """
+    if os.name == "nt":
+        return
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as e:
+        # Dir fsync failure is non-fatal — the file's bytes are
+        # already on disk. We lose only the guarantee that the
+        # rename survives a power loss. Log so flaky storage is
+        # visible in support bundles.
+        logger.warning("parent dir fsync skipped at %s: %s", path.parent, e)
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write *data* to *path* atomically and durably.
+
+    Raises ``OSError`` on disk failures; always cleans up the tmp
+    file before re-raising.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path_for(path)
+    try:
+        # Open explicitly so we can fsync the file descriptor after
+        # writing — ``Path.write_bytes`` does not expose that hook.
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # Atomic rename. Both POSIX (``rename(2)``) and Windows
+        # (``MoveFileExW`` with MOVEFILE_REPLACE_EXISTING) guarantee
+        # the target is either the old file or the new file, never a
+        # torn in-between state.
+        os.replace(tmp, path)
+        _fsync_parent_dir(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """UTF-8 text flavour of ``atomic_write_bytes``.
+
+    Splits via ``text.encode()`` so callers who pass already-computed
+    bytes do not double-encode.
+    """
+    atomic_write_bytes(path, text.encode(encoding))
+
+
+def atomic_write_json(path: Path, data: JSONData, *, indent: int = 2) -> None:
+    """Serialise *data* as UTF-8 JSON and write atomically + durably."""
+    payload = json.dumps(data, ensure_ascii=False, indent=indent)
+    atomic_write_text(path, payload)
+
+
+def rotate_backup(path: Path, backup: Path) -> None:
+    """Copy *path* → *backup* before an overwrite.
+
+    Non-fatal on failure — the caller may still choose to persist the
+    new value rather than abort on a backup hiccup. A warning is
+    logged so flaky storage remains visible to operators.
+
+    No-op if *path* does not exist yet (first-save case).
+    """
+    if not path.exists():
+        return
+    try:
+        # ``shutil.copy2`` preserves timestamps + permissions so the
+        # backup looks identical to the original for diagnostic
+        # purposes. Destination is overwritten if it already exists.
+        shutil.copy2(path, backup)
+    except OSError as e:
+        logger.warning("backup rotation failed for %s → %s: %s", path, backup, e)

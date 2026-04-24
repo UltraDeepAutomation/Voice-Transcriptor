@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.audio import AudioError, ensure_wav_16k, split_channels, write_wav
 from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
+from backend.storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from backend.live import LiveSession
 from backend.jobs import JobStore
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
@@ -421,7 +422,12 @@ def _load_or_create_api_token() -> str:
             return token
     token = secrets.token_urlsafe(32)
     try:
-        API_TOKEN_PATH.write_text(token, encoding="utf-8")
+        # SSOT atomic write: prevents torn state where the token file
+        # exists but is empty/partial after a crash during generation.
+        # A zero-length token file would pass the `API_TOKEN_PATH.exists()`
+        # probe on next boot, read as empty, and the auth guard would
+        # lock the user out until the file is manually deleted.
+        atomic_write_text(API_TOKEN_PATH, token)
     except OSError as e:
         logger.error(
             "api token persist failed at %s: %s — using in-memory token "
@@ -1051,13 +1057,17 @@ async def _save_upload_file(upload: UploadFile, target: Path) -> int:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    tmp_path = path.with_suffix(path.suffix + f".tmp-{uuid.uuid4().hex}")
-    tmp_path.write_text(content, encoding="utf-8")
-    try:
-        os.replace(tmp_path, path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    """Thin wrapper — delegates to the shared SSOT atomic writer.
+
+    Kept as a module-local alias so the many call sites inside
+    backend.main that already use this name don't need a refactor.
+    The shared ``storage.atomic_write_text`` adds ``fsync()`` of the
+    file descriptor AND ``fsync()`` of the parent directory on POSIX,
+    making writes crash-durable in addition to atomic. The prior
+    implementation was atomic in the rename-landing sense only —
+    contents could be lost to page cache on a power loss.
+    """
+    atomic_write_text(path, content)
 
 
 def _normalize_filename(name: str) -> str:
@@ -1788,17 +1798,17 @@ def _upscale_preset_path(preset_id: str) -> Path:
 
 
 def _write_upscale_preset(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write: tmp → replace. A crash mid-write leaves the tmp
-    # file and the original preset intact instead of corrupting the
-    # .json and permanently losing the user's custom preset.
-    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}.json")
-    try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    """Persist an upscale preset via the shared SSOT JSON writer.
+
+    Previously used a local tmp+replace without fsync. The shared
+    writer adds durability (``f.flush() + os.fsync(fd)`` + parent
+    dir fsync on POSIX) so a crash mid-write cannot leave a
+    zero-length preset file that would silently vanish from the UI
+    on next launch. Crash cleanup of orphan tmps is still handled
+    by ``_sweep_orphan_tmp_files`` — the tmp naming convention is
+    shared (``<name>.tmp-<hex>``).
+    """
+    atomic_write_json(path, payload)
 
 
 def _ensure_builtin_upscale_presets() -> None:
