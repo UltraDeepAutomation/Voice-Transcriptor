@@ -42,6 +42,9 @@ let backendBootError = "";
 // with no awareness that its F9 hotkey is unclaimed. Cached here,
 // replayed from `did-finish-load`.
 let lastShortcutStatus = null;
+// Accessibility-poll timer handle — see `app.whenReady` for setup.
+// Stored module-scope so `before-quit` can clear it cleanly.
+let accessibilityPollTimer = null;
 // Ring buffer of the last ~4 KB of backend stderr. When the fallback
 // HTML fires "Backend did not start in time" / "exited with code N
 // after 8 restart attempts", we include the tail of stderr so the user
@@ -5433,23 +5436,58 @@ function killBackendHard(reason) {
   // belt-and-braces backup for crash-exit paths where we don't get to
   // run this function.
   if (process.platform === "win32") {
+    const tryProcKill = () => {
+      // Final fallback — the original TerminateProcess path. Better
+      // than nothing when taskkill fails / times out / the PID is
+      // garbage. ``proc`` may be a stale reference at this point, so
+      // swallow its own failure — we already logged one above.
+      try {
+        if (proc && typeof proc.kill === "function") {
+          proc.kill("SIGKILL");
+          appendMainLog(`[backend-kill] fallback proc.kill(SIGKILL) executed`);
+        } else if (pidForFallback) {
+          process.kill(pidForFallback, "SIGKILL");
+          appendMainLog(`[backend-kill] fallback process.kill(${pidForFallback}, SIGKILL) executed`);
+        }
+      } catch { }
+    };
+    // Guard: the subprocess can have spawned but crashed before we got
+    // here, making `proc.pid` either `undefined` or a stale value that
+    // taskkill will reject with "ERROR: Invalid argument". Without the
+    // guard `String(undefined) === "undefined"` becomes a literal
+    // taskkill arg, the call fails nonzero, and we used to `return`
+    // with no fallback kill.
+    if (!pidForFallback || typeof pidForFallback !== "number") {
+      appendMainLog(`[backend-kill] no valid pid to tree-kill; trying direct proc.kill fallback`);
+      tryProcKill();
+      pidForFallback = null;
+      backendTerminationInProgress = false;
+      return;
+    }
+    let taskkillOk = false;
     try {
       const r = spawnSync("taskkill", ["/pid", String(pidForFallback), "/t", "/f"], {
         windowsHide: true,
         timeout: 5000,
       });
       if (r.status === 0) {
+        taskkillOk = true;
         appendMainLog(`[backend-kill] taskkill tree-killed pid=${pidForFallback}`);
       } else {
         appendMainLog(
-          `[backend-kill] taskkill exit=${r.status} stderr=${(r.stderr || "").toString().trim()}`
+          `[backend-kill] taskkill exit=${r.status} signal=${r.signal || ""} ` +
+          `stderr=${(r.stderr || "").toString().trim().slice(0, 200)}`
         );
       }
     } catch (e) {
-      appendMainLog(`[backend-kill] taskkill failed: ${e?.message || e}`);
-      // Fall through to the POSIX path — better than no kill at all.
-      try { proc.kill(); } catch { }
+      appendMainLog(`[backend-kill] taskkill threw: ${e?.message || e}`);
     }
+    // If taskkill didn't report success (non-zero exit, SIGTERM'd by
+    // our 5 s timeout, or threw), run the direct-kill fallback.
+    // Without this a wedged taskkill (corp AV, elevated shell
+    // blocking) leaves the backend tree orphaned and the next app
+    // launch fails with "port 8321 already in use" for 120 s.
+    if (!taskkillOk) tryProcKill();
     pidForFallback = null;
     backendTerminationInProgress = false;
     return;
@@ -5487,6 +5525,10 @@ app.on("before-quit", () => {
   if (shortcutPollTimer) {
     clearInterval(shortcutPollTimer);
     shortcutPollTimer = null;
+  }
+  if (accessibilityPollTimer) {
+    clearInterval(accessibilityPollTimer);
+    accessibilityPollTimer = null;
   }
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
@@ -5575,7 +5617,13 @@ app.whenReady().then(async () => {
       } catch { }
     };
     checkAccessibility();
-    setInterval(checkAccessibility, 30000);
+    // Capture the handle so we can clear it on before-quit (otherwise
+    // repeated dev-reload leaks intervals, and on production the
+    // refed timer can delay clean shutdown by up to 30 s). `.unref`
+    // also lets the event loop exit naturally if this were the last
+    // pending handle.
+    accessibilityPollTimer = setInterval(checkAccessibility, 30000);
+    try { accessibilityPollTimer.unref?.(); } catch { }
   }
   // Create a 5-bar sound wave tray icon matching the app icon (icon.png).
   // 32×32 @2x retina, template image auto-adapts to light/dark menu bar.

@@ -4238,11 +4238,29 @@ $("retranscribeBtn").addEventListener("click", async () => {
     return;
   }
   // Capture the UI session token at the START of the retranscribe job.
-  // If the user presses F9 mid-retranscribe, activeUiSessionToken
-  // advances, and all our writes after that point must be gated by
+  // If the user presses F9 mid-retranscribe, `activeUiSessionToken`
+  // advances and all our DOM writes after that point must be gated by
   // `isCurrentUiSession(capturedToken)` — otherwise the stale retranscribe
   // clobbers the fresh live session's final output / upscale placeholder.
-  const capturedToken = activeUiSessionToken || "";
+  //
+  // If no live session has ever started, `activeUiSessionToken` is "" —
+  // but `isCurrentUiSession("")` has a legacy short-circuit that returns
+  // TRUE unconditionally (line ~457, treating empty as "no scope, always
+  // current"). That short-circuit makes our gate INERT in the most common
+  // retranscribe path (cold open → import recording → retranscribe → F9).
+  // Generate a dedicated retranscribe token so the gate always evaluates
+  // real equality and the fix actually prevents stale writes.
+  const capturedToken = activeUiSessionToken || createClientSessionId();
+  // Adopt the token as the current UI session for retranscribe's
+  // duration. Without this, `isCurrentUiSession(capturedToken)` would
+  // be false from the start (capturedToken vs the still-empty
+  // `activeUiSessionToken`), and EVERY write during retranscribe would
+  // be silently dropped. Adoption is idempotent — if a prior live
+  // session already set `activeUiSessionToken`, this is a no-op; if
+  // a new live session starts mid-retranscribe, it overwrites
+  // `activeUiSessionToken` and our guard starts blocking stale writes
+  // (which is exactly the data-loss case we care about).
+  if (!activeUiSessionToken) activeUiSessionToken = capturedToken;
   btn.disabled = true;
   btn.classList.add("is-busy");
   try {

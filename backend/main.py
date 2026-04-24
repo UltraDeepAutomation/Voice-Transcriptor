@@ -187,9 +187,12 @@ jobs = JobStore(max_workers=2)
 # via `logger.exception` for operator debugging.
 _ERROR_PATH_REDACT_RE = re.compile(
     r"(?:"
-    # POSIX user/system paths — Macs, Linux, WSL. Capture up to the next
-    # whitespace / quote / colon so we strip the whole filename.
-    r"/(?:Users|home|root|var|tmp|private|opt|Applications|System)/[^\s\"'`]*"
+    # POSIX user/system paths. `(?<![A-Za-z0-9:/])` look-behind prevents
+    # over-redacting URL paths like ``https://example.com/home/stream`` —
+    # we only strip when the slash is preceded by whitespace, quote,
+    # start-of-string, or a non-URL punctuation character, so a real
+    # local path gets caught while a URL path survives the redact.
+    r"(?<![A-Za-z0-9:/])/(?:Users|home|root|var|tmp|private|opt|Applications|System)/[^\s\"'`]*"
     r"|"
     # Windows user/system paths — both `\` and forward-slashed variants.
     r"[A-Za-z]:\\(?:Users|Windows|Temp|ProgramData|Program Files)\\[^\s\"'`]*"
