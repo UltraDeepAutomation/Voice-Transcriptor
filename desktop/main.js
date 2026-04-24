@@ -28,6 +28,87 @@ process.on("unhandledRejection", (reason) => {
   try { console.error("[unhandledRejection]", reason); } catch { }
 });
 
+// Windows: detect OneDrive-managed %APPDATA% and re-home userData to
+// %LOCALAPPDATA%\Transcriptor (which is NEVER synced by OneDrive,
+// regardless of Known-Folder-Move policy). When a corporate Group
+// Policy enables KFM Roaming → OneDrive, our config.json writes get
+// sync-conflicted across devices and ``writeFile(tmp) + rename``
+// fails with EPERM while OneDrive holds the file handle during
+// upload — symptom: users periodically lose their API keys +
+// presets + archive-dir preferences. Also: encrypted API keys wind
+// up syncing to OneDrive cloud (privacy leak).
+//
+// Must run BEFORE any `app.getPath('userData')` call (line 227
+// `mainLogFilePath`), BEFORE `requestSingleInstanceLock` (line 154),
+// and BEFORE we spawn the backend (TRANSCRIPTOR_DATA_DIR env flows
+// through to backend/config.py `_default_data_dir`).
+function _relocateUserDataOffOneDrive() {
+  if (process.platform !== "win32") return;
+  const roaming = process.env.APPDATA;
+  const local = process.env.LOCALAPPDATA;
+  if (!roaming || !local) return;
+  // Resolve OneDrive root candidates. `OneDriveCommercial` is
+  // corporate M365; `OneDriveConsumer` / `OneDrive` are personal.
+  const oneDriveRoots = [
+    process.env.OneDriveCommercial,
+    process.env.OneDriveConsumer,
+    process.env.OneDrive,
+  ].filter((p) => p && typeof p === "string").map((p) => path.resolve(p));
+  if (oneDriveRoots.length === 0) return;
+  const roamingResolved = path.resolve(roaming);
+  const insideOneDrive = oneDriveRoots.some((od) => {
+    const rel = path.relative(od, roamingResolved);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  });
+  if (!insideOneDrive) return;
+  // Target: non-synced Local AppData.
+  const newDir = path.join(local, "Transcriptor");
+  const oldDir = path.join(roaming, "Transcriptor");
+  try { fs.mkdirSync(newDir, { recursive: true }); } catch { /* EEXIST or broken FS — fall through; setPath will still try */ }
+  // One-time migration: if the user had a prior OneDrive'd install,
+  // copy their data from the old location to the new location once.
+  // Marker file prevents re-copying on every launch, which would
+  // silently overwrite their new-location edits with old data.
+  const marker = path.join(newDir, ".migrated-from-onedrive");
+  try {
+    if (!fs.existsSync(marker) && fs.existsSync(oldDir)) {
+      // `cpSync` landed in Node 16.7 / Electron 30 ships Node 20.x.
+      // Copy only the user-facing subset — skip bundled-runtime caches,
+      // .venv, anything else that is safe to regenerate.
+      const copyChild = (name) => {
+        const src = path.join(oldDir, name);
+        const dst = path.join(newDir, name);
+        try {
+          if (fs.existsSync(src) && !fs.existsSync(dst)) {
+            fs.cpSync(src, dst, { recursive: true, errorOnExist: false });
+          }
+        } catch { /* per-child copy failure is non-fatal; user may need to re-enter API keys */ }
+      };
+      for (const child of [
+        "config.json",
+        ".encryption_key",
+        "api_token.txt",
+        "known_archive_dirs.json",
+        "upscale_presets",
+        "recordings",
+      ]) copyChild(child);
+      try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
+    }
+  } catch { /* migration best-effort */ }
+  // Override BOTH Electron's userData AND the backend's DATA_DIR so
+  // they stay in lockstep. The child-spawn code at line ~5085 reads
+  // `TRANSCRIPTOR_DATA_DIR` from process.env — setting it here means
+  // backend/config.py `_default_data_dir` picks up the override even
+  // though it never sees Electron's `app.setPath` call.
+  try { app.setPath("userData", newDir); } catch { /* path must be absolute on Win; already is */ }
+  process.env.TRANSCRIPTOR_DATA_DIR = newDir;
+  // Cache note: main.log path switches to the new dir automatically
+  // on the next appendMainLog call (mainLogFilePath at line 227 is
+  // computed lazily from app.getPath). Old log in OneDrive'd path
+  // stays as an artefact — harmless.
+}
+_relocateUserDataOffOneDrive();
+
 let backend = null;
 let win = null;
 let overlayWin = null;
@@ -3305,6 +3386,62 @@ function snapshotClipboard() {
   }
 }
 
+/**
+ * Smart clipboard restore.
+ *
+ * Waits for the paste to settle, then restores the user's original
+ * clipboard — but ABORTS the restore if the clipboard contents
+ * changed before we got there, which means the user intentionally
+ * copied something new (Cmd+C on a different selection) during the
+ * window. Without this guard the prior fixed-1200 ms setTimeout
+ * could clobber the user's new copy, or could steal a second paste
+ * (Cmd+V → gets transcript again) if the target app handled the
+ * synthesised paste faster than 1200 ms.
+ *
+ * Algorithm:
+ *   1. Wait INITIAL_DELAY_MS (400) so the target process reads the
+ *      clipboard via the synthesised Cmd+V / Ctrl+V.
+ *   2. Poll ``clipboard.readText()`` every POLL_INTERVAL_MS (200)
+ *      up to MAX_WAIT_MS (1500) total.
+ *      - If text still equals what WE wrote → keep waiting.
+ *      - If text differs → user copied something else; ABORT restore
+ *        (don't clobber).
+ *   3. At MAX_WAIT_MS → restore snapshot.
+ *
+ * Note on rich clipboards: ``readText`` returns "" for image-only
+ * clipboards, so Cmd+C on an image during the window → "" !==
+ * writtenText → correctly aborts restore (user's image survives).
+ */
+function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipboardRestore") {
+  const INITIAL_DELAY_MS = 400;
+  const POLL_INTERVAL_MS = 200;
+  const MAX_WAIT_MS = 1500;
+  const expected = String(writtenText == null ? "" : writtenText);
+  const startedAt = Date.now();
+
+  const tryPollOrRestore = () => {
+    const elapsed = Date.now() - startedAt;
+    let current = "";
+    try { current = String(clipboard.readText() || ""); } catch { current = ""; }
+    if (current !== expected) {
+      // User copied something new during the window. Abort the restore
+      // so we don't clobber their new clipboard content. The original
+      // snapshot is forever sacrificed here — acceptable trade-off,
+      // otherwise we silently overwrite user intent.
+      appendMainLog(`[${logCtx}] user copied new content during paste window; skipping restore`);
+      return;
+    }
+    if (elapsed >= MAX_WAIT_MS) {
+      // Paste is settled, clipboard still has our text, no new user
+      // copy arrived — safe to restore the original snapshot.
+      safeExecSync(logCtx, () => restoreClipboard(snap));
+      return;
+    }
+    setTimeout(tryPollOrRestore, POLL_INTERVAL_MS);
+  };
+  setTimeout(tryPollOrRestore, INITIAL_DELAY_MS);
+}
+
 /** Restore a clipboard snapshot produced by snapshotClipboard(). */
 function restoreClipboard(snap) {
   try {
@@ -3548,9 +3685,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
 
         if (check.ok) {
           traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: "vbs_success", verified: false });
-          setTimeout(() => {
-            safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-          }, 1200);
+          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:vbs");
           return { ok: true, reason: "OK:vbs_paste", method: "vbs_paste", verified: false };
         }
         lastReason = (check.stderr || check.stdout || "vbs-failed").trim();
@@ -3586,9 +3721,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], { timeoutMs: 3000 });
         if (fallback.ok && (fallback.stdout || "").includes("OK:")) {
           traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1 });
-          setTimeout(() => {
-            safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-          }, 1200);
+          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:pwsh_fallback");
           return { ok: true, reason: "OK:pwsh_paste_fallback", method: "pwsh_paste_fallback", verified: false };
         }
         lastReason = (fallback.stderr || fallback.stdout || "pwsh-fallback-failed").trim();
@@ -3700,9 +3833,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         if (res.ok) {
           methodOk = true;
           traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: false });
-          setTimeout(() => {
-            safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-          }, 1200);
+          scheduleSmartClipboardRestore(savedClipboard, text, `paste:clipboardRestore:${a.method}`);
           return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: false };
         }
         lastPasteErr = (res.stderr || res.stdout || `${a.method}-failed`).trim();
@@ -3747,9 +3878,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
         logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out });
         traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: false });
         // Restore previous clipboard cleanly since paste was successful
-        setTimeout(() => {
-          safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-        }, 1200);
+        scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste");
         return { ok: true, reason: out, method: "robust_paste", verified: false };
       }
       if (out === "ERR:secure-field") {
@@ -3810,9 +3939,7 @@ async function tryPasteToFocusedField(text, targetAppName = "", targetAppPid = 0
   if (menuRes.ok) {
     const out = String(menuRes.stdout || "").trim();
     if (out.startsWith("OK:")) {
-      setTimeout(() => {
-        safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-      }, 1200);
+      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:menu");
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: false });
       return { ok: true, reason: out, method: "menu-paste", verified: false };
     }
@@ -4397,6 +4524,68 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
+function logPathForLoader() {
+  try { return path.join(app.getPath("userData"), "main.log"); } catch { return ""; }
+}
+
+/**
+ * Progressive boot-loading page.
+ *
+ * Rendered BEFORE /api/health comes back so the user sees a polished
+ * "starting up" screen instead of a blank window (or worse, the
+ * "Backend startup failed" error page as their first impression on a
+ * cold-start that happens to take >2 s). Self-contained data: URL —
+ * no backend dependency, renders instantly. Ticks a live elapsed
+ * counter so the user knows the app hasn't frozen.
+ *
+ * The outer `createWindow` flow swaps this away via `win.loadURL(url)`
+ * the moment /api/health responds OK; on timeout / fatal the `catch`
+ * branch loads the existing error HTML.
+ */
+function _bootLoadingDataUrl(logPath) {
+  const safeLog = escapeHtml(logPath || "");
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>Transcriptor</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0f1115; color: #e5e7eb;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    height: 100%; display: flex; align-items: center; justify-content: center; }
+  .wrap { text-align: center; max-width: 440px; padding: 32px; }
+  .pulse { width: 56px; height: 56px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #7dd3fc 0%, #2563eb 60%, #0c4a6e 100%);
+    margin: 0 auto 20px; animation: p 2s ease-in-out infinite;
+    box-shadow: 0 0 24px 2px rgba(37, 99, 235, 0.35); }
+  @keyframes p { 0%,100%{transform:scale(1);opacity:0.9} 50%{transform:scale(1.08);opacity:1} }
+  h1 { margin: 0 0 6px; font-size: 18px; font-weight: 600; color: #f3f4f6; }
+  .sub { color: #9ca3af; font-size: 13px; line-height: 1.55; margin-bottom: 18px; }
+  .timer { color: #60a5fa; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .slow { color: #fbbf24; font-size: 12px; margin-top: 12px; display: none; }
+  .slow.show { display: block; }
+  .log { margin-top: 24px; color: #6b7280; font-size: 11px; word-break: break-all; }
+  .log code { background: #1f2937; padding: 2px 6px; border-radius: 4px; user-select: all; }
+</style></head><body>
+<div class="wrap">
+  <div class="pulse"></div>
+  <h1>Starting Transcriptor…</h1>
+  <div class="sub">Warming up the transcription engine.<br>This can take a few seconds on first launch.</div>
+  <div class="timer" id="t">0.0 s</div>
+  <div class="slow" id="s">Taking longer than usual — check the log if it stays stuck.</div>
+  <div class="log">Log file:<br><code>${safeLog}</code></div>
+</div>
+<script>
+  var start = performance.now();
+  var t = document.getElementById('t');
+  var s = document.getElementById('s');
+  setInterval(function() {
+    var secs = (performance.now() - start) / 1000;
+    t.textContent = secs.toFixed(1) + ' s';
+    if (secs > 15) s.classList.add('show');
+  }, 100);
+</script>
+</body></html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
 function fileExists(p) {
   // Accept BOTH POSIX absolute paths ("/…") AND Windows drive paths
   // ("C:\…"). The original "/"-prefix gate was a defence against bare
@@ -4568,6 +4757,69 @@ function getAppVenvDir() {
   return path.join(app.getPath("userData"), ".venv");
 }
 
+/**
+ * One-shot cleanup of the legacy 1.0.x app-venv.
+ *
+ * 1.0.x created a Python venv at ``userData/.venv`` (~300–500 MB
+ * after `pip install -r requirements.txt`). 1.1.0 ships a fully
+ * self-contained bundled Python under ``resourcesPath/runtime/``
+ * and never touches the legacy venv — it just sits on the user's
+ * disk forever, wasting space, showing up in backup/sync tooling
+ * for no reason.
+ *
+ * Only deletes if:
+ *   1. We successfully booted with the bundled runtime this session
+ *      (caller guarantees this via call site in resolvePython).
+ *   2. The path really is ``userData/.venv`` — not some other `.venv`
+ *      the user symlinked in via TRANSCRIPTOR_DATA_DIR shenanigans.
+ *   3. We haven't already cleaned it in a prior session
+ *      (idempotency marker).
+ *
+ * Non-fatal on every failure — wasting 500 MB is better than
+ * deleting the wrong directory.
+ */
+function _cleanupOrphanedLegacyVenv() {
+  try {
+    const userData = path.resolve(app.getPath("userData"));
+    const marker = path.join(userData, ".legacy-venv-cleaned");
+    if (fs.existsSync(marker)) return;
+    const venvDir = getAppVenvDir();
+    const target = path.resolve(venvDir);
+    // Safety: path must be EXACTLY `<userData>/.venv` — no subpath,
+    // no symlink chain. Prevents a misconfigured userData from
+    // causing us to delete something unexpected.
+    if (path.dirname(target) !== userData || path.basename(target) !== ".venv") {
+      appendMainLog(`[legacy-venv-cleanup] refusing to delete unexpected path: ${target}`);
+      return;
+    }
+    if (!fs.existsSync(target)) {
+      // No legacy venv to clean. Still write the marker so we skip
+      // the directory-exists probe on every subsequent launch.
+      try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
+      return;
+    }
+    // Additional safety: confirm it LOOKS like a Python venv before
+    // deleting (has pyvenv.cfg or bin/python* / Scripts/python.exe).
+    // A user's arbitrary .venv folder without these markers gets
+    // skipped — better cautious than sorry.
+    const looksLikeVenv = (
+      fs.existsSync(path.join(target, "pyvenv.cfg"))
+      || fs.existsSync(path.join(target, "bin", "python"))
+      || fs.existsSync(path.join(target, "bin", "python3"))
+      || fs.existsSync(path.join(target, "Scripts", "python.exe"))
+    );
+    if (!looksLikeVenv) {
+      appendMainLog(`[legacy-venv-cleanup] ${target} does not look like a Python venv; skipping`);
+      return;
+    }
+    fs.rmSync(target, { recursive: true, force: true });
+    try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
+    appendMainLog(`[legacy-venv-cleanup] removed legacy venv at ${target}`);
+  } catch (e) {
+    appendMainLog(`[legacy-venv-cleanup] non-fatal: ${e?.message || e}`);
+  }
+}
+
 async function findSystemPython(repoRoot) {
   // Find any working Python 3 on the system (for venv creation)
   const sysCandidates = process.platform === "win32" ? [
@@ -4686,6 +4938,7 @@ async function resolvePython(repoRoot) {
     });
     if (check.ok) {
       appendMainLog(`[resolvePython] using bundled runtime: ${bundled}`);
+      _cleanupOrphanedLegacyVenv();
       return bundled;
     }
     appendMainLog(`[resolvePython] bundled runtime failed probe: ${(check.stderr || "").trim()}`);
@@ -5287,7 +5540,31 @@ async function createWindow(options = {}) {
     if (!backend) {
       await startBackend();
     }
-    await waitForHttp(`${BASE_URL}/api/health`, 120_000);
+    // Progressive UI: show a lightweight "Starting up…" page
+    // IMMEDIATELY rather than making the user stare at a blank window
+    // for 5–60 s while the backend cold-starts (bundled Python unpack
+    // + Whisper model warm). The loader is a pure data: URL so it
+    // renders instantly — no backend dependency. Once /api/health
+    // responds OK we swap to the real frontend URL. Previously the
+    // user saw either a blank window or, on failure, the scary
+    // "Backend startup failed" page as their FIRST impression of the
+    // app — a launch-killing UX regression on slow corporate Win
+    // machines where AV scans the bundled python.exe on first run.
+    try {
+      await win.loadURL(_bootLoadingDataUrl(logPathForLoader()));
+      if (showWindow) {
+        win.show();
+        win.focus();
+      }
+    } catch (loaderErr) {
+      appendMainLog(`[boot] loader page failed: ${loaderErr?.message || loaderErr}`);
+      // Non-fatal — if we can't load even the loader, the real URL
+      // load below will also likely fail and hit the error branch.
+    }
+    // 60 s is a reasonable ceiling: cold-start on a fresh install with
+    // bundled runtime is typically <5 s; a 120 s budget just delays
+    // the eventual error feedback without ever helping real users.
+    await waitForHttp(`${BASE_URL}/api/health`, 60_000);
     // Backend is healthy — treat this as a successful recovery signal
     // and clear the restart-attempt counter. Without this reset the
     // counter only decayed on a clean `exit code 0`, which never fires
@@ -5299,7 +5576,10 @@ async function createWindow(options = {}) {
     }
     await refreshWindowForFrontendBuild(true);
     await win.loadURL(url);
-    if (showWindow) {
+    // Window is already shown (above) in the progressive-UI path,
+    // but keep this guard for the `showWindow=false` background
+    // mode where we skipped the early show() entirely.
+    if (showWindow && !win.isVisible()) {
       win.show();
       win.focus();
     }
@@ -5796,6 +6076,27 @@ app.whenReady().then(async () => {
     // and replay it from `did-finish-load` so every window creation
     // sees the current state, including the very first window ever
     // created.
+    // On macOS, check whether the OS is intercepting F1–F12 as media
+    // keys (default on Apple keyboards: "Use F1, F2, etc. keys as
+    // standard function keys" OFF → F9 = Mission Control, F10 =
+    // Notification Center, F11 = Show Desktop). In that mode
+    // `globalShortcut.register("F9")` returns true but the user's
+    // actual F9 press fires the OS function, never reaches us — the
+    // single most common "hotkey does not work" report from Mac users.
+    // We surface the state to the renderer so Settings can badge the
+    // F9 / F10 rows with a "macOS is intercepting this key — hold Fn,
+    // or switch the OS setting, or pick a different hotkey" hint.
+    // No forced dialog on launch — that would annoy users who
+    // deliberately picked a non-F-key accelerator.
+    let macFnState = null;  // null = unknown / non-darwin / probe failed
+    if (process.platform === "darwin") {
+      try {
+        const raw = systemPreferences.getUserDefault("com.apple.keyboard.fnState", "boolean");
+        macFnState = (raw === true);
+      } catch {
+        macFnState = null;
+      }
+    }
     const status = {
       record: {
         desired: shortcuts.record,
@@ -5807,6 +6108,11 @@ app.whenReady().then(async () => {
         active: pasteResult.ok ? shortcuts.paste : "",
         error: pasteResult.ok ? "" : pasteResult.error,
       },
+      // Renderer uses this to decide whether to show the "macOS is
+      // intercepting F9/F10" hint. Only relevant on darwin and only
+      // when the configured accelerator is an F-key.
+      macFnState,
+      platform: process.platform,
     };
     lastShortcutStatus = status;
     if (win && !win.isDestroyed() && win.webContents) {

@@ -170,9 +170,26 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     ).start()
 
     yield
-    # shutdown: nothing to actively release; daemon threads exit with the
-    # process and the rate-limit prune task is torn down via the global
-    # ``asyncio.get_event_loop()`` cancellation FastAPI handles for us.
+    # Shutdown: drain in-flight transcription jobs before the process
+    # exits so Electron's SIGTERM (killBackendHard, 1500 ms hard deadline)
+    # doesn't interrupt mid-write result files. Without this, the worker
+    # thread gets killed between the `open()` and the final `write()`
+    # of `result.json`, leaving a half-written 0-byte file that parses
+    # as corrupt on next launch and surfaces to the user as a
+    # "recording is broken" error.
+    #
+    # Budget is tight: Electron's POSIX killBackendHard escalates
+    # SIGTERM → SIGKILL at 1500 ms (see desktop/main.js), so we have
+    # at most ~1.3 s after uvicorn's signal handler dispatches the
+    # lifespan shutdown. 1.5 s matches that envelope — the common
+    # case (no running job) drains in <50 ms; a wedged ffmpeg worker
+    # won't drain either way and gets killed with the process, same
+    # as before this fix. Rate-limit prune, warm-default, retroactive-
+    # retention etc. are daemon threads — they die with the process.
+    try:
+        await asyncio.to_thread(jobs.shutdown, 1.5)
+    except Exception:
+        logger.exception("jobs pool shutdown failed (non-fatal)")
 
 
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)

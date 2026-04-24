@@ -21,12 +21,24 @@ class RemoteError(RuntimeError):
 
 _SESSION = requests.Session()
 # pool_maxsize=64 comfortably covers FastAPI's default 40-thread executor
-# plus burst; pool_block=True makes high-concurrency uploaders wait for a
-# free slot instead of silently discarding and re-handshaking TLS (the
-# default behaviour emits "Connection pool is full" warnings and adds
-# 100-300 ms per call for the fresh handshake).
-_SESSION.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=True))
-_SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=True))
+# plus burst.
+#
+# pool_block=False (non-blocking overflow): when all 64 slots are in use
+# a new request transparently opens a fresh short-lived connection
+# rather than WAITING for a slot to free. The previous ``block=True``
+# stance looked reasonable ("avoid TLS re-handshake overhead") but had
+# a pathological failure mode: if a remote provider stalls (Deepgram
+# cloud freeze, OpenRouter slow chunk, corporate proxy holding a
+# read), each stalled call pins its pool slot for the full ``timeout``
+# (60 s) while holding one of FastAPI's 40 executor threads. 64 stalled
+# provider calls therefore FREEZE the whole backend threadpool — new
+# requests for /api/health, /api/recordings etc. cannot schedule and
+# users see the UI hang. The 100–300 ms TLS-handshake cost for overflow
+# connections is orders of magnitude cheaper than the minute-long
+# backend stall we trade it for, and in practice urllib3 does not emit
+# warnings for non-blocking overflow.
+_SESSION.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=False))
+_SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=False))
 
 
 # Max seconds we will honour from a Retry-After header before capping.

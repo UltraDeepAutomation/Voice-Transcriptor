@@ -97,3 +97,31 @@ class JobStore:
                 return
             job.status = "error"
             job.error = error
+
+    def shutdown(self, timeout: float = 20.0) -> None:
+        """Gracefully stop the worker pool.
+
+        Cancels queued-but-not-started futures (safe — they never ran,
+        no state to lose) and waits up to ``timeout`` seconds for
+        in-flight worker threads to drain. Called from the FastAPI
+        lifespan shutdown branch so Electron's SIGTERM doesn't kill
+        mid-write transcription threads and leave half-written
+        ``.json`` / ``.txt`` result files on disk (which subsequently
+        parse-fail on next launch and look to the user like corrupt
+        recordings).
+
+        Python's `ThreadPoolExecutor.shutdown(wait=True)` has no
+        timeout parameter, so we run it in a helper thread and
+        ``.join(timeout)`` instead. If in-flight work is truly wedged
+        (ffmpeg stuck, CUDA hang), the helper thread is daemon so the
+        process exits cleanly anyway — but we gave the good path a
+        chance to finish first.
+        """
+        import threading as _th
+        shutdown_thread = _th.Thread(
+            target=lambda: self._pool.shutdown(wait=True, cancel_futures=True),
+            name="job-pool-shutdown",
+            daemon=True,
+        )
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=timeout)

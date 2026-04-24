@@ -2208,9 +2208,49 @@ async function loadMics(forceReload = false): Promise<void> {
   } catch (e) {
     console.error("Error loading microphones:", e);
     const sel = $("micSelect") as HTMLSelectElement;
-    if (forceReload || !sel.options.length || /loading/i.test(sel.value || "")) {
-      sel.innerHTML = '<option value="">Permission denied</option>';
+    // Classify DOMException.name so the user sees actionable copy
+    // instead of a single misleading "Permission denied" catch-all.
+    // NotAllowed → user action (grant permission); NotFound → hardware
+    // problem (plug in a mic, pick another audio device in OS); the
+    // rest → transient / environment issues that need a different
+    // remediation path.
+    const name = (e && typeof e === "object" && "name" in (e as object))
+      ? String((e as { name?: string }).name || "")
+      : "";
+    let label: string;
+    switch (name) {
+      case "NotAllowedError":
+      case "PermissionDeniedError":
+        label = "Permission denied";
+        break;
+      case "NotFoundError":
+      case "DevicesNotFoundError":
+        label = "No microphone detected";
+        break;
+      case "NotReadableError":
+      case "TrackStartError":
+        label = "Microphone in use by another app";
+        break;
+      case "OverconstrainedError":
+      case "ConstraintNotSatisfiedError":
+        label = "Requested microphone unavailable";
+        break;
+      case "SecurityError":
+        label = "Microphone blocked (insecure context)";
+        break;
+      case "AbortError":
+        label = "Microphone request was cancelled";
+        break;
+      default:
+        label = "Microphone unavailable";
     }
+    // Always rewrite — the prior condition guarded behind a dead
+    // `/loading/i.test(sel.value)` regex (`sel.value` is an attribute
+    // value, never the display text, so the check never fired).
+    sel.innerHTML = `<option value="">${label}</option>`;
+    // Tooltip carries the technical name for bug reports without
+    // polluting the select's rendered text.
+    sel.title = name ? `${label} (${name})` : label;
   }
 }
 
@@ -2613,19 +2653,45 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
 function refreshShortcutConflictState(): void {
   const status = (window as unknown as {
     __transcriptorShortcutStatus?: {
-      record?: { active?: string; error?: string };
-      paste?: { active?: string; error?: string };
+      record?: { active?: string; desired?: string; error?: string };
+      paste?: { active?: string; desired?: string; error?: string };
+      macFnState?: boolean | null;
+      platform?: string;
     };
   }).__transcriptorShortcutStatus;
   if (!status) return;
+  // On macOS, detect the "F-keys as media keys" mode. When fnState is
+  // explicitly false AND the user kept an F-key accelerator, the OS
+  // silently eats the press as Mission Control / Exposé — register
+  // succeeds but the handler never fires. Badge the affected shortcut
+  // button with a hint so the user can diagnose.
+  const isMacFnCollision = status.platform === "darwin" && status.macFnState === false;
+  const isFKeyAccel = (accel: string | undefined): boolean => !!accel && /^F([1-9]|1[0-2])$/.test(accel);
   for (const id of ["record", "paste"] as const) {
     const entry = status[id];
     if (!entry) continue;
     const btn = document.getElementById(`shortcut${id[0].toUpperCase()}${id.slice(1)}`) as HTMLButtonElement | null;
     if (!btn) continue;
     const active = !!entry.active;
-    btn.classList.toggle("shortcut-conflict", !active);
-    btn.title = active ? "" : `Not registered: ${entry.error || "unknown reason"}`;
+    const desired = entry.desired || "";
+    // A shortcut is "conflicted" if (a) registration failed OR (b)
+    // registration succeeded but macOS is going to intercept it as a
+    // media key. Case (b) is invisible without this extra check.
+    const macBlocked = isMacFnCollision && isFKeyAccel(desired);
+    const hasConflict = !active || macBlocked;
+    btn.classList.toggle("shortcut-conflict", hasConflict);
+    if (!active) {
+      btn.title = `Not registered: ${entry.error || "unknown reason"}`;
+    } else if (macBlocked) {
+      btn.title = (
+        `macOS is intercepting ${desired} as a media key. ` +
+        `Either enable System Settings → Keyboard → Keyboard Shortcuts → Function Keys → "Use F1, F2 as standard function keys", ` +
+        `or hold Fn while pressing ${desired}, ` +
+        `or pick a non-F-key accelerator here.`
+      );
+    } else {
+      btn.title = "";
+    }
   }
 }
 setInterval(refreshShortcutConflictState, 2000);
@@ -4393,7 +4459,7 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
     // leaks the API token into plaintext logs on every delete.
     const r = await fetch("/api/recordings", { method: "DELETE", headers: authHeaders() });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
+    const data = (await r.json()) as { deleted?: unknown; failed?: unknown };
     setLatestSavedAudio(null);
     if (currentRecordingSummary?.savedName) {
       patchCurrentRecordingSummary({
@@ -4402,8 +4468,20 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
         tone: "warning",
       });
     }
-    showRecordSessionNotice(`Deleted ${data.deleted} recording(s) from the archive.`, "warning", 7000);
-    $("recordingContent").textContent = `Deleted ${data.deleted} recording(s).`;
+    // Coerce to non-negative integer so a backend shape drift (`null`,
+    // missing key, truncated JSON, middleware-injected body) renders
+    // "Deleted 0 recording(s)" instead of "Deleted undefined...". Also
+    // surface partial failures — the backend may skip files it cannot
+    // unlink (permission-denied, file in use on Windows) and previously
+    // the user was told "success" while N files silently survived.
+    const deletedCount = Math.max(0, Number.isFinite(Number(data?.deleted)) ? Number(data.deleted) : 0);
+    const failedCount = Math.max(0, Number.isFinite(Number(data?.failed)) ? Number(data.failed) : 0);
+    const tone = failedCount > 0 ? "error" : "warning";
+    const summary = failedCount > 0
+      ? `Deleted ${deletedCount} recording(s) — ${failedCount} failed (see main.log).`
+      : `Deleted ${deletedCount} recording(s).`;
+    showRecordSessionNotice(summary, tone, 7000);
+    $("recordingContent").textContent = summary;
     $("recordingMeta").textContent = "";
     await loadRecordings(true);
   } catch (e: unknown) {

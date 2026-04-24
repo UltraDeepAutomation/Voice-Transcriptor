@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -20,9 +21,19 @@ logger = logging.getLogger(__name__)
 # the 10+ seconds of the large model load. Double-checked locking: fast
 # path reads the cache dict directly (atomic under the GIL), slow path
 # acquires a per-name lock to prevent duplicate loads of the SAME model.
-_MODEL_LOCK = threading.Lock()  # Guards the name→lock registry.
+#
+# LRU eviction: without a size cap, a user who switches between
+# tiny/base/small/medium/large-v3 (5 models) keeps ~5 GB resident in
+# RSS forever, which OOM-kills on 8 GB hosts. We use an OrderedDict
+# so `move_to_end` on hit promotes the model to most-recently-used
+# in a single atomic op (OrderedDict ops hold the GIL for the call's
+# duration → no torn state for concurrent readers) and evictions on
+# insert pop the LRU entry. Cap defaulted at 2 — most real users
+# stabilise on at most 2 hot models (fast + accurate); one env var
+# override for power users.
+_MODEL_LOCK = threading.Lock()  # Guards name→lock registry + cache mutations.
 _MODEL_NAME_LOCKS: Dict[str, threading.Lock] = {}
-_MODEL_CACHE: Dict[str, WhisperModel] = {}
+_MODEL_CACHE: "OrderedDict[str, WhisperModel]" = OrderedDict()
 _MODEL_WARM_STATE: Dict[str, Dict[str, float]] = {}
 _CPU_COUNT = max(1, os.cpu_count() or 1)
 
@@ -46,6 +57,11 @@ _DEFAULT_NUM_WORKERS = max(
     1,
     min(3, _env_int("TRANSCRIPTOR_WHISPER_NUM_WORKERS", 2 if _CPU_COUNT >= 8 else 1)),
 )
+# Max simultaneously-resident Whisper models. 2 fits typical
+# dual-purpose usage (e.g. small for speed + medium for accuracy)
+# while capping worst-case RSS at ~2 GB (small + medium int8). Bumping
+# past 3 is unsafe on 8 GB hosts.
+_MODEL_CACHE_MAX = max(1, _env_int("TRANSCRIPTOR_WHISPER_CACHE_SIZE", 2))
 
 
 def _is_empty_sequence_transcribe_error(exc: Exception) -> bool:
@@ -70,6 +86,18 @@ def _model(model_name: str) -> WhisperModel:
     # blocking on a concurrent first-time load of model B.
     m = _MODEL_CACHE.get(model_name)
     if m is not None:
+        # Promote to MRU so the oldest idle model gets evicted first
+        # when a new one is loaded. `move_to_end` is a single atomic
+        # C-call under the GIL — safe concurrently with other readers,
+        # no torn state. Two threads both promoting the same key is
+        # idempotent (both land it at the end).
+        try:
+            _MODEL_CACHE.move_to_end(model_name)
+        except KeyError:
+            # Concurrent eviction dropped this model between `get` and
+            # `move_to_end` — the caller still holds a reference, so
+            # their transcription succeeds; the next call reloads.
+            pass
         return m
     # Per-name lock registry. The registry dict itself is guarded by
     # _MODEL_LOCK so two callers can't race to create the per-name lock.
@@ -79,6 +107,10 @@ def _model(model_name: str) -> WhisperModel:
     with per_lock:
         m = _MODEL_CACHE.get(model_name)
         if m is not None:
+            try:
+                _MODEL_CACHE.move_to_end(model_name)
+            except KeyError:
+                pass
             return m
         started = time.perf_counter()
         m = WhisperModel(
@@ -88,7 +120,29 @@ def _model(model_name: str) -> WhisperModel:
             cpu_threads=_DEFAULT_CPU_THREADS,
             num_workers=_DEFAULT_NUM_WORKERS,
         )
-        _MODEL_CACHE[model_name] = m
+        # Insert + LRU eviction under the global lock. Without the lock
+        # two concurrent slow-path loads (for different model names)
+        # could both observe `len < MAX` and both insert, transiently
+        # breaching the cap. Holding `_MODEL_LOCK` briefly here is
+        # harmless — we do NOT hold it during the `WhisperModel(...)`
+        # load above (that's the per-name lock's job).
+        with _MODEL_LOCK:
+            _MODEL_CACHE[model_name] = m
+            while len(_MODEL_CACHE) > _MODEL_CACHE_MAX:
+                # Pop from the FRONT (oldest insertion / least-recently
+                # promoted). Dropping the reference frees the
+                # ctranslate2 model; callers that still hold the
+                # reference finish their transcription, then the GC
+                # reclaims once their ref drops too.
+                evicted_name, _evicted_model = _MODEL_CACHE.popitem(last=False)
+                # Keep warm-state dict in sync — otherwise a user who
+                # loads the evicted model again sees stale warm stats
+                # that don't correspond to the fresh instance.
+                _MODEL_WARM_STATE.pop(evicted_name, None)
+                logger.info(
+                    "whisper model evicted: model=%s (cache_size=%d, cap=%d)",
+                    evicted_name, len(_MODEL_CACHE), _MODEL_CACHE_MAX,
+                )
         logger.info(
             "whisper model loaded: model=%s cpu_threads=%d num_workers=%d load_ms=%d",
             model_name,
