@@ -1303,7 +1303,13 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                     for txt in p.glob("*.txt"):
                         dst = default_dir / txt.name
                         if not dst.exists():
-                            dst.write_bytes(txt.read_bytes())
+                            # SSOT atomic copy: bare `write_bytes`
+                            # leaves a zero-byte dst on crash mid-copy,
+                            # and the subsequent `dst.exists()` check
+                            # blocks any retry — so a single power loss
+                            # during first-run migration permanently
+                            # drops the user's transcript.
+                            atomic_write_bytes(dst, txt.read_bytes())
             except OSError as e:
                 logger.warning("volatile recordings migration failed: %s", e)
             try:
@@ -2093,10 +2099,11 @@ def _open_live_recovery(
         "provider": provider,
     }
     # Metadata first — if this fails there is no file handle to leak.
-    meta_path.write_text(
-        json.dumps(meta_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # SSOT atomic write: bare `write_text` produces a zero-byte file on
+    # crash mid-write, and `_list_live_recoveries` silently skips
+    # unparseable metas → user loses the recovery entry even though
+    # the PCM itself is intact.
+    atomic_write_json(meta_path, meta_payload)
 
     pcm_file = pcm_path.open("wb")
     try:
@@ -2164,10 +2171,9 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 "status": "error" if recovery["had_error"] else "recoverable",
             }
         )
-        recovery["meta_path"].write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        # SSOT atomic write — finalize path. Same rationale as the
+        # recovery-start write above.
+        atomic_write_json(recovery["meta_path"], meta)
     except OSError as e:
         logger.warning("live recovery meta write failed: %s", e)
 
@@ -2594,10 +2600,13 @@ async def create_job(
 
             result_json_path = RESULTS_DIR / f"{job_id}.json"
             result_txt_path = RESULTS_DIR / f"{job_id}.txt"
-            result_json_path.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            result_txt_path.write_text(result.get("text", ""), encoding="utf-8")
+            # SSOT atomic write — the lifespan shutdown hook exists to
+            # prevent half-written result files on SIGTERM, but bare
+            # ``Path.write_text`` is NOT atomic nor fsync'd: a kill
+            # between open() and final flush leaves a zero-byte
+            # result.json that parses as corrupt on next boot.
+            atomic_write_json(result_json_path, result)
+            atomic_write_text(result_txt_path, result.get("text", ""))
             jobs.set_done(
                 job_id,
                 result,
@@ -2784,10 +2793,12 @@ async def create_remote_job(
             jobs.set_progress(job_id, 0.95)
             result_json_path = RESULTS_DIR / f"{job_id}.remote.json"
             result_txt_path = RESULTS_DIR / f"{job_id}.remote.txt"
-            result_json_path.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            result_txt_path.write_text(result.get("text", ""), encoding="utf-8")
+            # SSOT atomic write (same rationale as local job result
+            # above). Previously bare `write_text` left torn files
+            # on SIGTERM — exactly the failure the lifespan drain
+            # was designed to avoid.
+            atomic_write_json(result_json_path, result)
+            atomic_write_text(result_txt_path, result.get("text", ""))
             jobs.set_done(
                 job_id,
                 result,
