@@ -1236,6 +1236,12 @@ def _validate_config_payload(payload: dict) -> None:
 _rec_dir_cache: Optional[Path] = None
 _rec_dir_cache_at = 0.0
 _REC_DIR_CACHE_TTL = 10.0
+# Guard the (cache, timestamp) pair atomically. The list/graph/stats
+# caches at line 1248 already use a shared lock for the same reason —
+# concurrent readers can otherwise see fresh cache + stale timestamp 0.0
+# (defeats the cache) or fresh timestamp + None cache (crash on
+# `.resolve()`). Keep the critical section minimal: one read, one write.
+_rec_dir_cache_lock = threading.Lock()
 
 
 # Single lock guards all three (result, timestamp, key) triples for the
@@ -1266,16 +1272,19 @@ def _invalidate_recordings_cache() -> None:
 
 def _invalidate_recordings_dir_cache() -> None:
     global _rec_dir_cache, _rec_dir_cache_at
-    _rec_dir_cache = None
-    _rec_dir_cache_at = 0.0
+    with _rec_dir_cache_lock:
+        _rec_dir_cache = None
+        _rec_dir_cache_at = 0.0
 
 
 def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
     global _rec_dir_cache, _rec_dir_cache_at
     # monotonic for TTL — internal cache check, immune to clock skew.
     now = time.monotonic()
-    if _rec_dir_cache is not None and (now - _rec_dir_cache_at) < _REC_DIR_CACHE_TTL and cfg is None:
-        return _rec_dir_cache
+    # Atomic (cache, timestamp) read — see lock note above.
+    with _rec_dir_cache_lock:
+        if _rec_dir_cache is not None and (now - _rec_dir_cache_at) < _REC_DIR_CACHE_TTL and cfg is None:
+            return _rec_dir_cache
 
     cfg = cfg or load_config()
     prefs = cfg.get("preferences") or {}
@@ -1318,8 +1327,9 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                 save_config(cfg)
             except OSError as e:
                 logger.warning("volatile config reset failed: %s", e)
-            _rec_dir_cache = default_dir
-            _rec_dir_cache_at = now
+            with _rec_dir_cache_lock:
+                _rec_dir_cache = default_dir
+                _rec_dir_cache_at = now
             return default_dir
 
         # Security: mirror the containment check in
@@ -1335,16 +1345,19 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                 "recordings_dir %s is outside home; falling back to default %s",
                 p, default_dir,
             )
-            _rec_dir_cache = default_dir
-            _rec_dir_cache_at = now
+            with _rec_dir_cache_lock:
+                _rec_dir_cache = default_dir
+                _rec_dir_cache_at = now
             return default_dir
 
         p.mkdir(parents=True, exist_ok=True)
-        _rec_dir_cache = p
-        _rec_dir_cache_at = now
+        with _rec_dir_cache_lock:
+            _rec_dir_cache = p
+            _rec_dir_cache_at = now
         return p
-    _rec_dir_cache = default_dir
-    _rec_dir_cache_at = now
+    with _rec_dir_cache_lock:
+        _rec_dir_cache = default_dir
+        _rec_dir_cache_at = now
     return default_dir
 
 
@@ -2037,7 +2050,12 @@ async def ws_transcribe(websocket: WebSocket):
             logger.error("ws/transcribe fatal error: %s", e, exc_info=True)
             await _ws_send_json(
                 websocket,
-                {"type": "error", "error": str(e), "fatal": True},
+                # Redact: OSError during recovery-ctx open / disk-full
+                # mid-write embeds the live_recovery absolute path
+                # into str(e). _safe_error_text strips POSIX/Windows
+                # paths + token-shaped substrings before the WS frame
+                # forwards anything to the renderer.
+                {"type": "error", "error": _safe_error_text(e), "fatal": True},
             )
         else:
             logger.warning("ws/transcribe transient broken pipe: %s", e)
@@ -2364,7 +2382,10 @@ async def _run_deepgram_live_session(
         logger.warning("ws deepgram connect failed: %s", e)
         await _ws_send_json(
             websocket,
-            {"type": "error", "error": str(e), "fatal": True},
+            # Redact: Deepgram error messages can include API path
+            # fragments / response bodies that may carry the user's
+            # API key prefix or upstream IP.
+            {"type": "error", "error": _safe_error_text(e), "fatal": True},
         )
         await _ws_send_json(
             websocket,
@@ -2553,12 +2574,19 @@ def discard_live_recovery(session_id: str, _auth: None = Depends(_require_api_au
 
 
 @app.post("/api/live/recoveries/{session_id}/promote")
-def promote_live_recovery(
+async def promote_live_recovery(
     session_id: str,
     payload: dict = Body(default_factory=dict),
     _auth: None = Depends(_require_api_auth),
 ):
-    result = _promote_live_recovery(session_id, str((payload or {}).get("archive_dir") or "").strip())
+    # Async + offload: `_promote_live_recovery` reads up to 500 MB of
+    # PCM into a numpy float32 array (~1.5 GB transient heap) and
+    # writes a WAV — multi-second blocking I/O. Sync def pinned an
+    # executor thread for the entire run; concurrent promotions
+    # serialised. Now scheduled on the threadpool with the event
+    # loop free to keep WS frames flowing.
+    archive_dir = str((payload or {}).get("archive_dir") or "").strip()
+    result = await asyncio.to_thread(_promote_live_recovery, session_id, archive_dir)
     return {"ok": True, **result}
 
 
@@ -3117,10 +3145,13 @@ def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_aut
     except OSError as e:
         # save_config logs the underlying reason; surface a clean 500 so
         # the renderer can show a meaningful toast instead of hanging on
-        # an uncaught server exception.
+        # an uncaught server exception. Redact: OSError.__str__ formats
+        # as "[Errno 13] Permission denied: '/Users/<name>/Library/...
+        # /config.json'" — the full path leaks the user's profile name.
+        logger.exception("save_config failed")
         raise HTTPException(
             status_code=500,
-            detail=f"failed to persist config: {e}",
+            detail=f"failed to persist config: {_safe_error_text(e)}",
         )
     _invalidate_recordings_dir_cache()
     _invalidate_recordings_cache()
@@ -3175,7 +3206,7 @@ def _resolve_picker_command() -> tuple[list[str], str]:
 
 
 @app.post("/api/recordings/pick-folder")
-def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
+async def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
     cmd, kind = _resolve_picker_command()
     if kind == "none":
         raise HTTPException(
@@ -3198,9 +3229,15 @@ def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
             + cmd[-1]
         )
     try:
-        result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, timeout=120,
-            encoding="utf-8", errors="replace",
+        # Async + offload: the user-interactive picker dialog can stay
+        # open for tens of seconds. Sync def pinned an executor thread
+        # for the whole modal; concurrent picker invocations + heavy
+        # background work could exhaust the threadpool.
+        result = await asyncio.to_thread(
+            lambda: subprocess.run(
+                cmd, check=True, capture_output=True, text=True, timeout=120,
+                encoding="utf-8", errors="replace",
+            )
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="folder picker timed out")
@@ -3211,9 +3248,18 @@ def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
             raise HTTPException(status_code=400, detail="selection canceled")
         if "User canceled" in stderr:
             raise HTTPException(status_code=400, detail="selection canceled")
-        raise HTTPException(status_code=500, detail=f"folder picker failed: {stderr or 'unknown error'}")
+        # Redact: stderr from PowerShell/zenity/osascript routinely
+        # contains absolute paths (C:\Users\..., /home/...) — strip
+        # via _safe_error_text before echoing to HTTP body.
+        raise HTTPException(
+            status_code=500,
+            detail=f"folder picker failed: {_safe_error_text(stderr or 'unknown error')}",
+        )
     except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=f"folder picker command missing: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"folder picker command missing: {_safe_error_text(e)}",
+        )
 
     selected = (result.stdout or "").strip()
     # PowerShell FolderBrowserDialog encodes cancel as literal "CANCEL".
@@ -3237,7 +3283,7 @@ def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
 
 
 @app.post("/api/recordings/open-folder")
-def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: None = Depends(_require_api_auth)):
+async def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: None = Depends(_require_api_auth)):
     requested = str((payload or {}).get("path") or "").strip()
     if requested:
         d = Path(requested).expanduser()
@@ -3266,16 +3312,21 @@ def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: No
         # os.startfile is the canonical Explorer opener on Windows.
         # It returns immediately and raises OSError on failure.
         try:
-            os.startfile(str(d))  # type: ignore[attr-defined]
+            await asyncio.to_thread(lambda: os.startfile(str(d)))  # type: ignore[attr-defined]
             return {"ok": True, "path": str(d)}
         except OSError as e:
-            raise HTTPException(status_code=500, detail=f"open folder failed: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"open folder failed: {_safe_error_text(e)}",
+            )
     elif sys.platform.startswith("linux"):
         open_cmd = ["xdg-open", str(d)]
     else:
         raise HTTPException(status_code=400, detail=f"open folder not implemented for platform {sys.platform}")
     try:
-        subprocess.run(open_cmd, check=True, capture_output=True, text=True, timeout=15)
+        await asyncio.to_thread(
+            lambda: subprocess.run(open_cmd, check=True, capture_output=True, text=True, timeout=15)
+        )
         return {"ok": True, "path": str(d)}
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="open folder timed out")
@@ -3284,7 +3335,11 @@ def open_recordings_folder(payload: dict = Body(default_factory=dict), _auth: No
         raise HTTPException(status_code=500, detail=f"open folder failed: '{tool}' not found")
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
-        raise HTTPException(status_code=500, detail=f"open folder failed: {stderr or 'unknown error'}")
+        # Redact: xdg-open / explorer stderr can include user paths.
+        raise HTTPException(
+            status_code=500,
+            detail=f"open folder failed: {_safe_error_text(stderr or 'unknown error')}",
+        )
 
 
 _list_cache: Optional[dict] = None
@@ -3404,12 +3459,55 @@ _graph_cache: Optional[dict] = None
 _graph_cache_at = 0.0
 _graph_cache_key: Optional[tuple] = None
 _GRAPH_CACHE_TTL = 30.0
+# Same lazy-init + double-checked pattern as `_list_cache_rebuild_lock`
+# (line ~3326). N concurrent cache misses cost ONE scan instead of N.
+_graph_cache_rebuild_lock: Optional[asyncio.Lock] = None
+
+
+def _build_recordings_graph_payload(d: "Path") -> dict:
+    """Heavy sync scan extracted so the async route can offload it
+    via `asyncio.to_thread`. Glob+stat+read+tokenise on every txt
+    file — this is the workload the previous sync `def` was pinning
+    an executor thread for."""
+    nodes = []
+    for p in d.glob("*.txt"):
+        try:
+            st = p.stat()
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            first = _first_words(raw)
+            display = first if first else p.stem
+            provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
+            text = _extract_stats_text(raw)
+            keywords = _tokenize_words(text)
+            freq: dict[str, int] = {}
+            for w in keywords:
+                freq[w] = freq.get(w, 0) + 1
+            top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            nodes.append(
+                {
+                    "name": p.name,
+                    "display_name": display,
+                    "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    "size_bytes": st.st_size,
+                    "provider": provider,
+                    "keywords": [w for w, _ in top],
+                }
+            )
+        except Exception:
+            continue
+    return {"nodes": nodes}
 
 
 @app.get("/api/recordings/graph")
-def recordings_graph(_auth: None = Depends(_require_api_auth)):
-    """Return recordings with extracted keywords for semantic graph visualization."""
-    global _graph_cache, _graph_cache_at, _graph_cache_key
+async def recordings_graph(_auth: None = Depends(_require_api_auth)):
+    """Return recordings with extracted keywords for semantic graph viz.
+
+    Now ``async`` to prevent the per-file glob+stat+read+regex scan
+    from pinning an executor thread on cold cache. Mirrors the
+    list_recordings pattern (lock + double-checked rebuild + offload
+    via `asyncio.to_thread`).
+    """
+    global _graph_cache, _graph_cache_at, _graph_cache_key, _graph_cache_rebuild_lock
     d = _resolve_recordings_dir()
     now = time.monotonic()
 
@@ -3429,54 +3527,32 @@ def recordings_graph(_auth: None = Depends(_require_api_auth)):
         ):
             return _graph_cache
 
-    nodes = []
-    for p in d.glob("*.txt"):
-        try:
-            st = p.stat()
-            raw = p.read_text(encoding="utf-8", errors="replace")
-            first = _first_words(raw)
-            display = first if first else p.stem
-            provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
-            text = _extract_stats_text(raw)
-            keywords = _tokenize_words(text)
-            # Count frequency and take top 10
-            freq: dict[str, int] = {}
-            for w in keywords:
-                freq[w] = freq.get(w, 0) + 1
-            top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
-            nodes.append(
-                {
-                    "name": p.name,
-                    "display_name": display,
-                    "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                    "size_bytes": st.st_size,
-                    "provider": provider,
-                    "keywords": [w for w, _ in top],
-                }
-            )
-        except Exception:
-            continue
+    if _graph_cache_rebuild_lock is None:
+        _graph_cache_rebuild_lock = asyncio.Lock()
 
-    result = {"nodes": nodes}
-    with _recordings_caches_lock:
-        _graph_cache = result
-        _graph_cache_at = now
-        _graph_cache_key = cache_key
-    return result
+    async with _graph_cache_rebuild_lock:
+        # Double-checked.
+        now = time.monotonic()
+        with _recordings_caches_lock:
+            if (
+                _graph_cache is not None
+                and _graph_cache_key == cache_key
+                and (now - _graph_cache_at) < _GRAPH_CACHE_TTL
+            ):
+                return _graph_cache
+        result = await asyncio.to_thread(_build_recordings_graph_payload, d)
+        with _recordings_caches_lock:
+            _graph_cache = result
+            _graph_cache_at = time.monotonic()
+            _graph_cache_key = cache_key
+        return result
 
 
-@app.delete("/api/recordings")
-def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
-    # Scan ALL known archive dirs — not just the default one — so that
-    # recordings saved to custom directories are fully removed. Without
-    # this, only the TXT files in the default dir were deleted while
-    # audio files and TXT files in custom dirs were left on disk.
-    # Invalidate the list/graph/stats caches BEFORE the delete loop AND
-    # after — a concurrent GET /api/recordings landing mid-delete would
-    # otherwise repopulate the cache with stale entries that survive
-    # until the next invalidation. Double-invalidate is cheap and
-    # closes the race window entirely.
-    _invalidate_recordings_cache()
+def _delete_all_recordings_sync() -> dict:
+    """Bulk-delete sweep across known archive dirs. Sync helper so
+    the async route can offload via `asyncio.to_thread` — bare
+    `def` previously pinned an executor thread for seconds when
+    purging thousands of files."""
     deleted = 0
     failed = 0
     for d in _get_known_archive_dirs():
@@ -3489,18 +3565,32 @@ def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
                 deleted += 1
             except Exception:
                 failed += 1
-    _invalidate_recordings_cache()
     return {"deleted": deleted, "failed": failed}
 
 
-@app.get("/api/recordings/{recording_name}")
-def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth)):
-    p = _recording_path_or_404(recording_name)
+@app.delete("/api/recordings")
+async def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
+    # Scan ALL known archive dirs — not just the default one — so that
+    # recordings saved to custom directories are fully removed. Without
+    # this, only the TXT files in the default dir were deleted while
+    # audio files and TXT files in custom dirs were left on disk.
+    # Invalidate the list/graph/stats caches BEFORE the delete loop AND
+    # after — a concurrent GET /api/recordings landing mid-delete would
+    # otherwise repopulate the cache with stale entries that survive
+    # until the next invalidation. Double-invalidate is cheap and
+    # closes the race window entirely.
+    _invalidate_recordings_cache()
+    result = await asyncio.to_thread(_delete_all_recordings_sync)
+    _invalidate_recordings_cache()
+    return result
+
+
+def _read_recording_payload(p: "Path") -> dict:
+    """Sync helper that does the per-recording stat + read + parse.
+    Offloaded by the async route so a multi-MB transcript read does
+    not pin an executor thread."""
     st = p.stat()
     raw = p.read_text(encoding="utf-8", errors="replace")
-    # ``display_text`` strips the file header (Title/Saved at/Language/
-    # Provider/Model) and returns only the transcript body. The raw
-    # ``content`` is still returned for backwards compat / export.
     display = _extract_transcript_text(raw)
     return {
         "name": p.name,
@@ -3510,6 +3600,15 @@ def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth))
         "display_text": display or raw,
         **_recording_audio_payload(p.name),
     }
+
+
+@app.get("/api/recordings/{recording_name}")
+async def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth)):
+    # ``display_text`` strips the file header (Title/Saved at/Language/
+    # Provider/Model) and returns only the transcript body. The raw
+    # ``content`` is still returned for backwards compat / export.
+    p = _recording_path_or_404(recording_name)
+    return await asyncio.to_thread(_read_recording_payload, p)
 
 
 @app.get("/api/recordings/{recording_name}/audio")
@@ -3531,31 +3630,14 @@ _stats_cache: Optional[dict] = None
 _stats_cache_at = 0.0
 _stats_cache_key: Optional[tuple] = None
 _STATS_CACHE_TTL = 30.0
+_stats_cache_rebuild_lock: Optional[asyncio.Lock] = None
 
 
-@app.get("/api/recordings/stats/summary")
-def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
-    global _stats_cache, _stats_cache_at, _stats_cache_key
-    d = _resolve_recordings_dir()
-    now = time.monotonic()
-
-    # Build a lightweight cache key: dir mtime + file count
-    try:
-        dir_mtime = d.stat().st_mtime
-        file_count = sum(1 for _ in d.glob("*.txt"))
-    except Exception:
-        dir_mtime = 0.0
-        file_count = -1
-    cache_key = (str(d), dir_mtime, file_count)
-
-    with _recordings_caches_lock:
-        if (
-            _stats_cache is not None
-            and _stats_cache_key == cache_key
-            and (now - _stats_cache_at) < _STATS_CACHE_TTL
-        ):
-            return _stats_cache
-
+def _build_recordings_stats_payload(d: "Path") -> dict:
+    """Heavy sync stats scan extracted for `asyncio.to_thread` offload.
+    Reads + tokenises every transcript in the archive — O(N) on file
+    count and O(M) on transcript size; pinning an executor thread for
+    seconds is the previous regression."""
     files = sorted(d.glob("*.txt"))
     total_recordings = len(files)
     total_words = 0
@@ -3590,8 +3672,7 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
     min_duration_sec = min(durations_sec) if durations_sec else 0
     avg_words_per_recording = round(total_words / total_recordings, 1) if total_recordings else 0.0
     avg_chars_per_recording = round(total_chars / total_recordings, 1) if total_recordings else 0.0
-
-    result = {
+    return {
         "total_recordings": total_recordings,
         "total_words": total_words,
         "total_chars": total_chars,
@@ -3604,11 +3685,55 @@ def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         "providers": [{"name": k, "count": v} for k, v in sorted(providers.items(), key=lambda kv: kv[1], reverse=True)],
         "languages": [{"name": k, "count": v} for k, v in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)],
     }
+
+
+@app.get("/api/recordings/stats/summary")
+async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
+    """Return aggregate transcript statistics; cached for 30 s.
+
+    Async + offload pattern matches list_recordings + recordings_graph.
+    On cold cache the scan is offloaded to a worker thread; concurrent
+    misses serialise on a per-cache asyncio.Lock so the heaviest
+    workload (full archive read + tokenise) runs ONCE per invalidation.
+    """
+    global _stats_cache, _stats_cache_at, _stats_cache_key, _stats_cache_rebuild_lock
+    d = _resolve_recordings_dir()
+    now = time.monotonic()
+
+    try:
+        dir_mtime = d.stat().st_mtime
+        file_count = sum(1 for _ in d.glob("*.txt"))
+    except Exception:
+        dir_mtime = 0.0
+        file_count = -1
+    cache_key = (str(d), dir_mtime, file_count)
+
     with _recordings_caches_lock:
-        _stats_cache = result
-        _stats_cache_at = now
-        _stats_cache_key = cache_key
-    return result
+        if (
+            _stats_cache is not None
+            and _stats_cache_key == cache_key
+            and (now - _stats_cache_at) < _STATS_CACHE_TTL
+        ):
+            return _stats_cache
+
+    if _stats_cache_rebuild_lock is None:
+        _stats_cache_rebuild_lock = asyncio.Lock()
+
+    async with _stats_cache_rebuild_lock:
+        now = time.monotonic()
+        with _recordings_caches_lock:
+            if (
+                _stats_cache is not None
+                and _stats_cache_key == cache_key
+                and (now - _stats_cache_at) < _STATS_CACHE_TTL
+            ):
+                return _stats_cache
+        result = await asyncio.to_thread(_build_recordings_stats_payload, d)
+        with _recordings_caches_lock:
+            _stats_cache = result
+            _stats_cache_at = time.monotonic()
+            _stats_cache_key = cache_key
+        return result
 
 
 @app.post("/api/recordings/save")
@@ -3629,6 +3754,13 @@ def save_recording(
         source_text = "[No speech captured]"
 
     target_dir = _resolve_recordings_target_dir(archive_dir, create=not require_existing)
+    # SSOT consistency with save_recording_with_audio (line 3799): every
+    # save into a custom archive dir must register that dir so
+    # `_retroactive_audio_retention` and `_get_known_archive_dirs`
+    # know about it. Previously only the audio-bearing save called
+    # `_register_archive_dir`; a text-only save into a brand-new
+    # custom folder left the dir invisible to retention sweeps.
+    _register_archive_dir(target_dir)
     if existing_name:
         if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")

@@ -37,8 +37,8 @@ _SESSION = requests.Session()
 # connections is orders of magnitude cheaper than the minute-long
 # backend stall we trade it for, and in practice urllib3 does not emit
 # warnings for non-blocking overflow.
-_SESSION.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=False))
-_SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=64, max_retries=0, pool_block=False))
+_SESSION.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=64, max_retries=0, pool_block=False))
+_SESSION.mount("http://", HTTPAdapter(pool_connections=8, pool_maxsize=64, max_retries=0, pool_block=False))
 
 
 # Max seconds we will honour from a Retry-After header before capping.
