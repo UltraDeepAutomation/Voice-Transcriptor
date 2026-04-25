@@ -123,6 +123,12 @@ let backendBootError = "";
 // with no awareness that its F9 hotkey is unclaimed. Cached here,
 // replayed from `did-finish-load`.
 let lastShortcutStatus = null;
+// Cached macOS Accessibility-trust state. Updated by the
+// `checkAccessibility` poll inside app.whenReady; replayed to every
+// renderer load via did-finish-load so a closed-and-reopened window
+// (tray click after `win.close` on darwin) doesn't have to wait the
+// full 30 s poll cycle to learn the current trust state.
+let lastAccessibilityTrusted = null;
 // Accessibility-poll timer handle — see `app.whenReady` for setup.
 // Stored module-scope so `before-quit` can clear it cleanly.
 let accessibilityPollTimer = null;
@@ -2034,13 +2040,31 @@ function ensureOverlayWindow() {
     if (raw === "__overlay_mouse_leave__") {
       // Mouse left the pill — pass clicks through to desktop.
       if (overlayWin && !overlayWin.isDestroyed()) {
-        overlayWin.setIgnoreMouseEvents(true, { forward: true });
+        // `forward: true` is macOS-only per Electron docs. The
+        // initial setup at lines ~1938 platform-gates correctly;
+        // this re-invocation on every mouse-leave was previously
+        // unconditional, throwing on some Windows builds and
+        // leaving the overlay stuck in an inconsistent ignore
+        // state. Mirror the platform gate here.
+        if (process.platform === "darwin") {
+          overlayWin.setIgnoreMouseEvents(true, { forward: true });
+        } else {
+          overlayWin.setIgnoreMouseEvents(true);
+        }
       }
       return;
     }
   });
   overlayWin.on("closed", () => {
     overlayWin = null;
+    // CRITICAL: reset overlayLoaded too. ensureOverlayWindow checks
+    // `if (!overlayLoaded)` to decide whether to call loadURL on the
+    // freshly-recreated window. Without this reset, a destroyed +
+    // recreated overlay (display change, dev hot-reload, electron
+    // session crash) was a fresh BrowserWindow with NO HTML loaded,
+    // yet overlayLoaded=true short-circuited every loadURL path —
+    // permanent blank capsule until the entire process restarts.
+    overlayLoaded = false;
   });
   return overlayWin;
 }
@@ -3852,7 +3876,16 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
 
       // Fast path: VBS SendKeys — no compilation, no .NET assembly
       // loading, executes in <100 ms on all Windows versions.
-      const vbsPath = path.join(app.getPath("temp"), `transcriptor_paste_${Date.now()}.vbs`);
+      // Use a per-invocation UUID rather than Date.now() — two paste
+      // operations in the same millisecond (chained autosend, dual
+      // hotkey press) collided on the same temp filename, and the
+      // first's `unlinkSync` could delete the second's script
+      // mid-execution. crypto.randomUUID is in Node 14.17+ so it's
+      // safe in our Electron 30 build.
+      const vbsPath = path.join(
+        app.getPath("temp"),
+        `transcriptor_paste_${require("crypto").randomUUID()}.vbs`,
+      );
       try {
         const vbsLines = [
           'Set WshShell = CreateObject("WScript.Shell")',
@@ -3894,7 +3927,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
           Buffer.from(vbsSource, "utf16le"),
         ]);
         fs.writeFileSync(vbsPath, vbsBuf);
-        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], { timeoutMs: 2500 });
+        // 5000 ms (was 2500): on Windows 11 with Defender real-time
+        // scanning, cscript launch can spend 1–3 s in AV scan before
+        // the script body executes. The previous 2.5 s budget made
+        // VBS paste fail on these machines and fall through to the
+        // slower PowerShell path with no functional benefit.
+        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], { timeoutMs: 5000 });
 
         // Clean up temp file
         try { fs.unlinkSync(vbsPath); } catch { }
@@ -5283,13 +5321,19 @@ async function ensureBackendRuntime(python, repoRoot) {
 }
 
 async function startBackend() {
-  if (backend) return;
+  // ORDER MATTERS: check inflight FIRST. Otherwise a concurrent
+  // caller arriving during the spawn-then-instant-crash window can
+  // see `backend` momentarily set, take the early-return, and
+  // proceed to loadURL against a backend that's about to die.
+  // Returning the inflight promise keeps every concurrent caller
+  // synchronised on the same outcome.
   if (backendStartInFlight) return backendStartInFlight;
+  if (backend) return;
 
-  // Absorb any queued crash-restart: the caller is asking for a
-  // backend NOW, so the deferred restart is redundant. Clearing the
-  // timer here also prevents it from firing mid-start and causing
-  // startBackend() to re-enter itself.
+  // Absorb any queued crash-restart BEFORE we set inflight, so a
+  // concurrent caller that arrives while the timer is firing can't
+  // race us into double-spawn. The timer clear must happen on the
+  // SAME synchronous branch as the inflight check above.
   if (backendRestartTimer) {
     clearTimeout(backendRestartTimer);
     backendRestartTimer = null;
@@ -5549,20 +5593,34 @@ async function createWindow(options = {}) {
   // transcript containing an <a href="https://evil..."> that's clicked
   // must NOT navigate the renderer to an attacker-controlled origin —
   // hand it off to the OS default browser via shell.openExternal.
+  //
+  // Use proper URL origin parsing rather than string prefix-match.
+  // Prefix-match is vulnerable to suffix injection: BASE_URL =
+  // "http://127.0.0.1:8321" prefix-matches "http://127.0.0.1:8321evil.com"
+  // because the dot/slash boundary is not enforced. URL.parse strips
+  // ambiguity — same protocol + host + port = same origin. We also
+  // match the backend's host:port exactly instead of any-port loopback.
+  const _isBackendOrigin = (rawUrl) => {
+    if (typeof rawUrl !== "string") return false;
+    let parsed;
+    try { parsed = new URL(rawUrl); } catch { return false; }
+    let backend;
+    try { backend = new URL(BASE_URL); } catch { return false; }
+    return parsed.protocol === backend.protocol
+        && parsed.hostname === backend.hostname
+        && parsed.port === backend.port;
+  };
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (typeof url === "string" && (url.startsWith(BASE_URL) || url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:"))) {
-      return { action: "allow" };
-    }
+    if (_isBackendOrigin(url)) return { action: "allow" };
     if (typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"))) {
       try { shell.openExternal(url); } catch { }
     }
     return { action: "deny" };
   });
   win.webContents.on("will-navigate", (e, url) => {
-    if (typeof url !== "string") { e.preventDefault(); return; }
-    if (url.startsWith(BASE_URL) || url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:")) return;
+    if (_isBackendOrigin(url)) return;
     e.preventDefault();
-    if (url.startsWith("http://") || url.startsWith("https://")) {
+    if (typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"))) {
       try { shell.openExternal(url); } catch { }
     }
   });
@@ -5672,6 +5730,35 @@ async function createWindow(options = {}) {
         );
       } catch (e) {
         appendMainLog(`[did-finish-load] shortcut replay failed: ${e?.message || e}`);
+      }
+    }
+    // Replay cached accessibility-trust state. A window closed
+    // (tray) and reopened would otherwise wait up to 30 s (the
+    // poll interval) before the renderer learns whether
+    // accessibility is granted, leaving the F9-collision badge
+    // and other dependent UI in a stale state.
+    if (lastAccessibilityTrusted !== null && win && !win.isDestroyed() && win.webContents) {
+      try {
+        await win.webContents.executeJavaScript(
+          `window.__transcriptorAccessibilityStatus = ${JSON.stringify({ trusted: lastAccessibilityTrusted })};`,
+          true,
+        );
+      } catch (e) {
+        appendMainLog(`[did-finish-load] accessibility replay failed: ${e?.message || e}`);
+      }
+    }
+    // Replay backendBootError if set — a window that was closed-
+    // and-reopened after a failed boot attempt would otherwise
+    // render its boot overlay in a "no error" state, hiding the
+    // diagnostic the user needs.
+    if (backendBootError && win && !win.isDestroyed() && win.webContents) {
+      try {
+        await win.webContents.executeJavaScript(
+          `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+          true,
+        );
+      } catch (e) {
+        appendMainLog(`[did-finish-load] backendBootError replay failed: ${e?.message || e}`);
       }
     }
   });
@@ -6051,12 +6138,11 @@ app.whenReady().then(async () => {
   // event to listen for, so we poll at 30 s intervals and surface the
   // state to the renderer. Non-Darwin platforms no-op.
   if (process.platform === "darwin") {
-    let lastTrusted = null;
     const checkAccessibility = () => {
       try {
         const trusted = !!systemPreferences.isTrustedAccessibilityClient(false);
-        if (trusted !== lastTrusted) {
-          lastTrusted = trusted;
+        if (trusted !== lastAccessibilityTrusted) {
+          lastAccessibilityTrusted = trusted;
           appendMainLog(`[accessibility] trusted=${trusted}`);
           if (win && !win.isDestroyed() && win.webContents) {
             win.webContents
@@ -6323,7 +6409,11 @@ app.whenReady().then(async () => {
         registerGlobalShortcuts();
       }
     } catch { }
+  // Match accessibilityPollTimer: `.unref` so this refed timer
+  // doesn't block clean event-loop shutdown by up to 2 s. Cleared
+  // explicitly in `before-quit` (line ~5491) for the same reason.
   }, 2000);
+  try { shortcutPollTimer.unref?.(); } catch { }
 
   await requestMacPastePermissionsOnce();
   await startBackend();

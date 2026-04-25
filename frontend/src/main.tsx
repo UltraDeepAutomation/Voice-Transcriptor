@@ -472,6 +472,40 @@ function renderLatestSavedAudio(): void {
   const audioEl = $("currentRecordingAudio") as HTMLAudioElement;
   const metaEl = $("currentRecordingAudioMeta");
 
+  // Compute the new playback URL FIRST. If the desired URL equals the
+  // currently-playing one, do nothing — previously we unconditionally
+  // `pause() + removeAttribute("src") + load()` on every refresh,
+  // which reset playback to position 0 even when called from a
+  // routine `loadRecordings(true)` triggered by an unrelated save.
+  // Real-world symptom: user starts playing back audio via the
+  // native <audio controls>, a concurrent save refresh fires this
+  // function, and playback jumps to the start mid-listen.
+  const desiredBackendUrl = latestSavedAudioState
+    ? latestRecordingAudioUrl(
+        latestSavedAudioState.savedName || "",
+        latestSavedAudioState.archiveDir || ""
+      )
+    : "";
+  // If the audio source isn't changing AND we already have a src
+  // attribute, skip the disruptive reset. We only need to ensure
+  // the row is shown and meta is up to date.
+  if (
+    latestSavedAudioState
+    && !latestSavedAudioState.file
+    && desiredBackendUrl
+    && audioEl.getAttribute("src") === desiredBackendUrl
+  ) {
+    row.hidden = false;
+    metaEl.textContent = latestSavedAudioState.sizeBytes
+      ? fmtBytes(latestSavedAudioState.sizeBytes)
+      : latestSavedAudioState.title;
+    const retranscribeBtn = document.getElementById("retranscribeBtn");
+    if (retranscribeBtn) {
+      retranscribeBtn.hidden = !latestSavedAudioState.savedName;
+    }
+    return;
+  }
+
   audioEl.pause();
   revokeCurrentRecordingAudioUrl();
 
@@ -483,13 +517,9 @@ function renderLatestSavedAudio(): void {
     return;
   }
 
-  const backendUrl = latestRecordingAudioUrl(
-    latestSavedAudioState.savedName || "",
-    latestSavedAudioState.archiveDir || ""
-  );
   const playbackUrl = latestSavedAudioState.file
     ? URL.createObjectURL(latestSavedAudioState.file)
-    : backendUrl;
+    : desiredBackendUrl;
   if (!playbackUrl) {
     row.hidden = true;
     audioEl.removeAttribute("src");
@@ -3049,9 +3079,23 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
     }
     const t0 = performance.now();
     const upscaleModel = getUpscaleModelValue();
+    // Backend rejects upscale requests with text > 120 000 chars
+    // (`/api/upscale` HTTP 400). Cap client-side and surface a
+    // friendly notice so the user understands WHY the upscale was
+    // skipped instead of seeing an opaque server error. We trim
+    // from the start so the trailing summary (often the most
+    // useful part for AI rewrite) is preserved.
+    const MAX_UPSCALE_INPUT_CHARS = 120_000;
+    let payloadText = input;
+    if (payloadText.length > MAX_UPSCALE_INPUT_CHARS) {
+      const overflow = payloadText.length - MAX_UPSCALE_INPUT_CHARS;
+      payloadText = payloadText.slice(overflow);
+      console.warn(`Upscale: trimmed ${overflow} leading chars to fit ${MAX_UPSCALE_INPUT_CHARS} cap`);
+      setStatusScoped(sessionToken, `Upscaling (trimmed first ${overflow.toLocaleString()} chars)`, "warning");
+    }
     try {
       const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", {
-        text: input,
+        text: payloadText,
         preset_id: upscalePresetId(),
         model: upscaleModel || undefined,
       });
@@ -3417,9 +3461,21 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
   queueUiPreferencesSave();
 });
 ($("autoStopSilenceSeconds") as HTMLInputElement).addEventListener("change", () => {
+  // Reflect the clamped value back into the DOM. `getAutoStopSilenceConfig`
+  // already clamps via `clampNumber(..., 1, 120)`, but the input element
+  // itself kept the raw user-typed value. Result was a UI/state mismatch:
+  // user typed `999` and saw `999` while the persisted config held `120`.
+  // Now the displayed value matches the saved value at all times.
+  const inp = $("autoStopSilenceSeconds") as HTMLInputElement;
+  const cfg = getAutoStopSilenceConfig();
+  if (String(cfg.seconds) !== inp.value) inp.value = String(cfg.seconds);
   queueUiPreferencesSave();
 });
 ($("autoStopSilenceDb") as HTMLInputElement).addEventListener("change", () => {
+  // Same UI/state-mismatch fix as above for the silence threshold.
+  const inp = $("autoStopSilenceDb") as HTMLInputElement;
+  const cfg = getAutoStopSilenceConfig();
+  if (String(cfg.thresholdDb) !== inp.value) inp.value = String(cfg.thresholdDb);
   queueUiPreferencesSave();
 });
 ($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => {
@@ -3559,6 +3615,18 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 ($("upscalePresetDeleteBtn") as HTMLButtonElement).addEventListener("click", () => {
   const cur = selectedUpscalePreset();
   if (!cur || cur.builtin) return;
+  // Confirm before destructive action. Custom upscale presets can
+  // hold dozens of lines of carefully-tuned prompt instructions —
+  // a single accidental click previously dropped them with no undo.
+  // The delete-all-recordings flow has a modal for the same reason;
+  // mirror that severity floor here. ``window.confirm`` is the
+  // simplest blocking primitive that respects keyboard navigation
+  // and matches the platform's native dialog style.
+  const presetLabel = String(cur.name || cur.id || "this preset").trim();
+  const confirmed = window.confirm(
+    `Delete the upscale preset “${presetLabel}”?\n\nThis cannot be undone.`,
+  );
+  if (!confirmed) return;
   void fetch(`/api/upscale/presets/${encodeURIComponent(cur.id)}`, {
     method: "DELETE",
     headers: authHeaders(),
