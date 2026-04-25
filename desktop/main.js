@@ -5834,6 +5834,18 @@ async function createWindow(options = {}) {
       appendMainLog(`[backend-recovery] healthy after ${backendRestartAttempts} attempt(s); resetting counter`);
       backendRestartAttempts = 0;
     }
+    // CLEAR `backendBootError` once /api/health responds OK. Pass-24c
+    // added a `did-finish-load` replay of this string so a closed-
+    // and-reopened window can re-deliver the diagnostic — but if the
+    // user successfully RECOVERED from the error (transient port
+    // collision, fixed permissions, etc.), the stale message would
+    // re-render on every subsequent window load, looking like the
+    // app failed when it actually succeeded. Clearing on health-OK
+    // closes that regression window.
+    if (backendBootError) {
+      appendMainLog(`[backend-recovery] clearing prior backendBootError (was: ${backendBootError.slice(0, 80)}...)`);
+      backendBootError = "";
+    }
     await refreshWindowForFrontendBuild(true);
     await win.loadURL(url);
     // Window is already shown (above) in the progressive-UI path,
