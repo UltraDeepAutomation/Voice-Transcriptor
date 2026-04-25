@@ -3606,6 +3606,44 @@ function snapshotClipboard() {
   }
 }
 
+// Reference-counted snapshot of the user's REAL clipboard, captured
+// at the FIRST paste of any chained-paste sequence. Without this,
+// rapid F9-stop → F9-stop within the 1500 ms restore window has
+// paste-2's `snapshotClipboard` capture paste-1's transcript as the
+// "original" — paste-2's eventual restore then writes paste-1's
+// transcript back onto the clipboard, permanently pinning it
+// (the user's real clipboard is gone forever).
+//
+// acquireClipboardSnapshot:
+//   - First paste: snapshots the clipboard (user's real content)
+//     and stores it module-wide.
+//   - Subsequent pastes during the restore window: return the SAME
+//     snapshot. Increment depth.
+//
+// releaseClipboardSnapshot:
+//   - Decrement depth. When the LAST outstanding paste finishes
+//     (depth=0), clear the cached snapshot so the next paste-cycle
+//     starts fresh.
+//
+// Both atomic under V8's single-threaded event loop — no extra lock
+// needed, the increment/decrement pair runs synchronously between
+// awaits.
+let _clipboardSnapshotDepth = 0;
+let _clipboardSnapshotCache = null;
+function acquireClipboardSnapshot() {
+  _clipboardSnapshotDepth += 1;
+  if (_clipboardSnapshotCache === null) {
+    _clipboardSnapshotCache = snapshotClipboard();
+  }
+  return _clipboardSnapshotCache;
+}
+function releaseClipboardSnapshot() {
+  _clipboardSnapshotDepth = Math.max(0, _clipboardSnapshotDepth - 1);
+  if (_clipboardSnapshotDepth === 0) {
+    _clipboardSnapshotCache = null;
+  }
+}
+
 /**
  * Smart clipboard restore.
  *
@@ -3649,12 +3687,14 @@ function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipbo
       // snapshot is forever sacrificed here — acceptable trade-off,
       // otherwise we silently overwrite user intent.
       appendMainLog(`[${logCtx}] user copied new content during paste window; skipping restore`);
+      releaseClipboardSnapshot();
       return;
     }
     if (elapsed >= MAX_WAIT_MS) {
       // Paste is settled, clipboard still has our text, no new user
       // copy arrived — safe to restore the original snapshot.
       safeExecSync(logCtx, () => restoreClipboard(snap));
+      releaseClipboardSnapshot();
       return;
     }
     setTimeout(tryPollOrRestore, POLL_INTERVAL_MS);
@@ -3752,7 +3792,14 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
     frontBeforePid: frontBefore.pid || 0,
     textLen: String(text).length,
   });
-  const savedClipboard = snapshotClipboard();
+  // Acquire the depth-counted shared snapshot. First paste captures
+  // the user's REAL clipboard; subsequent pastes during the
+  // 1500 ms restore window reuse the same snapshot so a chained
+  // paste can never accidentally capture our own transcript as
+  // the "original" content. Every code path below MUST eventually
+  // call releaseClipboardSnapshot() so the cache clears when the
+  // last outstanding paste resolves.
+  const savedClipboard = acquireClipboardSnapshot();
   try {
     clipboard.writeText(String(text));
   } catch {
@@ -3761,6 +3808,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
     traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
     // Restore original clipboard.
     safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
+    releaseClipboardSnapshot();
     return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
   }
   traceStep(trace, "clipboard_write_ok", {});
@@ -4143,6 +4191,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
       if (out === "ERR:secure-field") {
         traceEnd(trace, "failed", { reason: "secure-field" });
         safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
+        releaseClipboardSnapshot();
         return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
       }
       if (out === "ERR:no-accessibility") {
@@ -4227,6 +4276,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   });
   // Restore original clipboard whether paste succeeded or all methods failed.
   try { restoreClipboard(savedClipboard); } catch { }
+  releaseClipboardSnapshot();
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
