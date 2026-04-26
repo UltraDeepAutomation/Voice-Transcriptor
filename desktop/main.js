@@ -5681,6 +5681,76 @@ async function createWindow(options = {}) {
     }
     return { action: "deny" };
   });
+  // Renderer → main IPC over the document-title channel. The renderer
+  // (sandbox: true, contextIsolation: true, no preload) cannot use
+  // ipcRenderer; the canonical workaround used elsewhere in this file
+  // is to set ``document.title = "__app_<verb>__<payload>"`` and have
+  // the main process intercept the page-title-updated event. We
+  // restrict accepted verbs to a closed list and decode the payload
+  // back to a known recordings dir + filename, so a malicious
+  // transcript cannot smuggle arbitrary paths into shell.showItemInFolder.
+  win.webContents.on("page-title-updated", (event, title) => {
+    const raw = String(title || "");
+    if (!raw.startsWith("__app_")) return;
+    event.preventDefault();
+    if (raw.startsWith("__app_reveal_recording__")) {
+      let payload;
+      try {
+        payload = JSON.parse(decodeURIComponent(raw.slice("__app_reveal_recording__".length)));
+      } catch (e) {
+        appendMainLog(`[reveal-recording] bad payload: ${e?.message || e}`);
+        return;
+      }
+      const safeName = String(payload?.name || "").replace(/[\\/]+/g, "");
+      const archiveDirRaw = String(payload?.archiveDir || "").trim();
+      if (!safeName) return;
+      // Resolve the audio path under the SAME archive dir we wrote to.
+      // archiveDir comes back from saveRecordingText which already
+      // sanitises it via _resolve_recordings_target_dir on the backend
+      // side, but defence-in-depth: only accept absolute paths under
+      // the userData root or under TRANSCRIPTOR_DATA_DIR / recordings.
+      const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+      const recordingsRoot = path.resolve(dataDir, "recordings");
+      const archiveDir = archiveDirRaw && path.isAbsolute(archiveDirRaw)
+        ? path.resolve(archiveDirRaw)
+        : recordingsRoot;
+      // Walk up to make sure the resolved path is still under the
+      // user's home — block any symlink-shenanigans that would point
+      // at /etc/shadow or similar.
+      const home = app.getPath("home");
+      if (!archiveDir.startsWith(home)) {
+        appendMainLog(`[reveal-recording] archive_dir outside home: ${archiveDir}`);
+        return;
+      }
+      // The recording is named ``YYYY-MM-DD_HH-MM-SS__title.txt``;
+      // the matching audio is ``...__title.<ext>``. We don't know the
+      // ext at the renderer (saveRecordingText only returns .txt
+      // name), so glob the dir for any same-stem file. shell.show
+      // ItemInFolder reveals + selects whichever matches first; if no
+      // audio yet, fall back to revealing the .txt itself so the
+      // user still lands on the right spot.
+      const stem = safeName.replace(/\.txt$/i, "");
+      let target = path.join(archiveDir, safeName);
+      try {
+        const entries = fs.readdirSync(archiveDir);
+        const audioMatch = entries.find((f) =>
+          f.startsWith(stem + ".") && !f.endsWith(".txt"),
+        );
+        if (audioMatch) target = path.join(archiveDir, audioMatch);
+      } catch {
+        // dir may not exist if archive was just deleted; fall through
+        // to the .txt path which will silently no-op in shell.show
+        // ItemInFolder.
+      }
+      try {
+        shell.showItemInFolder(target);
+      } catch (e) {
+        appendMainLog(`[reveal-recording] shell.showItemInFolder failed: ${e?.message || e}`);
+      }
+      return;
+    }
+  });
+
   win.webContents.on("will-navigate", (e, url) => {
     if (_isBackendOrigin(url)) return;
     e.preventDefault();

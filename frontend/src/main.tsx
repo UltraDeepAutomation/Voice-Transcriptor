@@ -275,6 +275,14 @@ declare global {
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
+    /**
+     * Open the OS file manager (Finder / Explorer / Files) at the
+     * audio file matching the given recording. Implemented by setting
+     * ``document.title`` to a known prefix; the Electron main process
+     * intercepts via ``page-title-updated`` and calls
+     * ``shell.showItemInFolder``. No-op in plain-browser dev preview.
+     */
+    __transcriptorRevealRecording?: (name: string, archiveDir: string) => void;
   }
 }
 
@@ -7951,14 +7959,32 @@ if (_bootRetry) {
 interface UploadQueueItem {
   id: string;
   file: File;
+  // ``stage`` is a finer-grained signal than ``status`` — multiple
+  // stages share the same outer ``status`` of "transcribing" but
+  // surface different labels in the queue UI:
+  //   queued   → Queued
+  //   uploading → Uploading … (file body in flight to backend)
+  //   processing → Processing … (backend is decoding video / running
+  //                Deepgram REST / OpenRouter audio model)
+  //   none      → status's own label (done/error/cancelled)
   status: "queued" | "transcribing" | "done" | "error" | "cancelled";
+  stage?: "queued" | "uploading" | "processing" | "done";
   text?: string;
   error?: string;
   startedAt?: number;
   endedAt?: number;
   provider?: Provider;
+  model?: string;
+  language?: string;
+  savedName?: string;
+  savedArchiveDir?: string;
   abortController?: AbortController;
 }
+
+// The currently-selected queue item id — drives which transcript is
+// shown in the right-hand Result pane. Defaults to the most-recently
+// completed item; user click overrides.
+let uploadSelectedId: string | null = null;
 
 const uploadQueue: UploadQueueItem[] = [];
 let uploadProcessorRunning = false;
@@ -8167,6 +8193,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // state — don't transition it back to transcribing.
   if (item.status === "cancelled") return;
   item.status = "transcribing";
+  item.stage = "uploading";
   item.startedAt = performance.now();
   // Per-item AbortController. Threaded through every fetch so
   // the user's Stop button can yank the in-flight request even
@@ -8174,6 +8201,22 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // `cancelUploadItem` can find and call abort().
   item.abortController = new AbortController();
   renderUploadQueue();
+  // Heuristic stage transition: ``fetch`` doesn't expose a clean
+  // "request body fully sent" event in the browser, so we mark the
+  // crossover from "uploading" to "processing" after a small delay
+  // proportional to the file size — at typical broadband speeds,
+  // 1 MB ≈ 100ms, so a 50 MB video is ~5 s of uploading. Capped at
+  // 8 s so a slow link doesn't pin "uploading" forever, and the
+  // backend's actual response time then takes over the "processing"
+  // perception. The crossover is replaced by the real transition
+  // when the response arrives below.
+  const _stageCrossoverDelay = Math.min(8000, Math.max(800, item.file.size / 10000));
+  const _stageTimer = window.setTimeout(() => {
+    if (item.status === "transcribing" && item.stage === "uploading") {
+      item.stage = "processing";
+      renderUploadQueue();
+    }
+  }, _stageCrossoverDelay);
   const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
   const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   const diarize = !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked;
@@ -8212,6 +8255,9 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     }
     item.text = text;
     item.status = "done";
+    item.stage = "done";
+    item.model = modelLabel;
+    item.language = language;
     item.endedAt = performance.now();
     // Persist to the History tab's archive. We pass the original
     // file so the audio is saved alongside the transcript and is
@@ -8219,7 +8265,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     // single archive reload at the end of each successful save.
     if (text) {
       try {
-        await saveRecordingText({
+        const saveOut = await saveRecordingText({
           title: (item.file.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
           sourceText: text,
           transcriptText: text,
@@ -8229,11 +8275,24 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
           audioFile: item.file,
           refreshList: true,
         });
+        if (saveOut && typeof saveOut === "object") {
+          item.savedName = String((saveOut as { name?: string }).name || "");
+          item.savedArchiveDir = String(
+            (saveOut as { archive_dir?: string }).archive_dir || "",
+          );
+        }
       } catch (saveErr) {
         // Persist failure is non-fatal — the transcript is still
         // shown to the user; only the History entry is missing.
         console.warn("Upload: saveRecordingText failed", saveErr);
       }
+    }
+    // Auto-select the just-completed item in the result pane unless
+    // the user has already clicked another item — gives a clear
+    // visual confirmation of "this is your transcript" without
+    // them having to hunt for it.
+    if (uploadSelectedId === null) {
+      uploadSelectedId = item.id;
     }
   } catch (e) {
     // Distinguish user-cancelled from genuine error so the queue UI
@@ -8243,12 +8302,15 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     const isAbort = e instanceof DOMException && e.name === "AbortError";
     if (isAbort) {
       item.status = "cancelled";
+      item.stage = undefined;
     } else {
       item.status = "error";
+      item.stage = undefined;
       item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
     }
     item.endedAt = performance.now();
   } finally {
+    clearTimeout(_stageTimer);
     item.abortController = undefined;
     renderUploadQueue();
   }
@@ -8259,6 +8321,15 @@ function uploadStatusLabel(item: UploadQueueItem): string {
     case "queued":
       return "Queued";
     case "transcribing":
+      // Granular stage labels — user explicitly asked for "видеть, на
+      // какой процент он транскрибирован" + "видео превращается в
+      // аудио, потом аудио". We don't have a true byte-progress
+      // signal from the backend (no SSE stream), so we surface the
+      // CLIENT-side phase labels: uploading-the-body vs waiting-for-
+      // the-backend-to-decode-and-transcribe. Better than a flat
+      // "Transcribing…" that idles for 30s on a 50 MB video.
+      if (item.stage === "uploading") return "Uploading…";
+      if (item.stage === "processing") return "Processing…";
       return "Transcribing…";
     case "done": {
       const ms = item.endedAt && item.startedAt ? item.endedAt - item.startedAt : 0;
@@ -8343,6 +8414,15 @@ function renderUploadQueue(): void {
   for (const item of uploadQueue) {
     const li = document.createElement("li");
     li.className = `upload-queue-item upload-queue-item--${item.status}`;
+    if (item.id === uploadSelectedId) li.classList.add("is-selected");
+    // Click anywhere on the item swaps the result-pane to it. The
+    // per-item Stop / × button stops propagation so they don't double-
+    // trigger the selection.
+    li.addEventListener("click", () => {
+      uploadSelectedId = item.id;
+      renderUploadQueue();
+      renderUploadResultPane();
+    });
 
     const header = document.createElement("div");
     header.className = "upload-queue-item-header";
@@ -8445,6 +8525,123 @@ function renderUploadQueue(): void {
     }
     list.appendChild(li);
   }
+  renderUploadResultPane();
+}
+
+// ── Upload result pane (right column) ──────────────────────────────
+//
+// Renders the currently-selected queue item's transcript + metadata
+// + a "Reveal in Finder" button that asks the Electron main process
+// to open the saved audio file in the OS file manager. Falls back
+// gracefully on platforms without ``shell.showItemInFolder`` IPC.
+function renderUploadResultPane(): void {
+  const textEl = document.getElementById("uploadResultText");
+  const metaEl = document.getElementById("uploadResultMeta");
+  const titleEl = document.getElementById("uploadResultTitle");
+  const copyBtn = document.getElementById("uploadResultCopyBtn") as HTMLButtonElement | null;
+  const revealBtn = document.getElementById("uploadResultRevealBtn") as HTMLButtonElement | null;
+  if (!textEl || !metaEl) return;
+  // Resolve which item to show: explicit user selection wins; else
+  // the most-recently-completed item; else nothing.
+  let item: UploadQueueItem | undefined;
+  if (uploadSelectedId) {
+    item = uploadQueue.find((it) => it.id === uploadSelectedId);
+  }
+  if (!item) {
+    // Most recent done — sorted by endedAt desc.
+    const dones = uploadQueue.filter((it) => it.status === "done" && it.text);
+    dones.sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+    item = dones[0];
+  }
+  if (!item) {
+    textEl.textContent = "";
+    metaEl.hidden = true;
+    if (titleEl) titleEl.textContent = "Result";
+    if (copyBtn) copyBtn.hidden = true;
+    if (revealBtn) revealBtn.hidden = true;
+    return;
+  }
+  if (titleEl) {
+    titleEl.textContent = `Result · ${item.file.name}`.length > 60
+      ? "Result"
+      : `Result · ${item.file.name}`;
+  }
+  if (item.status === "done" && item.text) {
+    textEl.textContent = item.text;
+    metaEl.hidden = false;
+    metaEl.innerHTML = "";
+    const append = (k: string, v: string) => {
+      if (!v) return;
+      const span = document.createElement("span");
+      span.innerHTML = `<span class="upload-result-meta-key">${k}</span>${v.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c] || c)}`;
+      metaEl.appendChild(span);
+    };
+    append("provider", item.provider || "");
+    append("model", item.model || "");
+    append("language", item.language || "");
+    const dur = item.endedAt && item.startedAt ? `${((item.endedAt - item.startedAt) / 1000).toFixed(1)}s` : "";
+    append("duration", dur);
+    append("size", formatUploadFileSize(item.file.size));
+    append("words", String((item.text.match(/\S+/g) || []).length));
+    if (copyBtn) {
+      copyBtn.hidden = false;
+      copyBtn.onclick = () => {
+        try {
+          navigator.clipboard?.writeText(item!.text || "");
+          copyBtn.title = "Copied";
+          setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
+        } catch { /* fall through */ }
+      };
+    }
+    if (revealBtn) {
+      // Show only when the audio actually persisted (savedName set
+      // by saveRecordingText). The Electron main process exposes
+      // ``window.__transcriptorRevealRecording`` that calls
+      // ``shell.showItemInFolder`` — when the renderer runs in a
+      // plain browser (vite dev), the helper is undefined and we
+      // hide the button instead of triggering a no-op.
+      const hasReveal = typeof (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording === "function";
+      revealBtn.hidden = !item.savedName || !hasReveal;
+      revealBtn.onclick = () => {
+        const fn = (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording;
+        if (fn) fn(item!.savedName || "", item!.savedArchiveDir || "");
+      };
+    }
+  } else if (item.status === "error" && item.error) {
+    textEl.textContent = item.error;
+    metaEl.hidden = true;
+    if (copyBtn) copyBtn.hidden = true;
+    if (revealBtn) revealBtn.hidden = true;
+  } else {
+    // queued / transcribing / cancelled — show stage label as the
+    // body so the right pane mirrors the queue's per-item state.
+    textEl.textContent = uploadStatusLabel(item);
+    metaEl.hidden = true;
+    if (copyBtn) copyBtn.hidden = true;
+    if (revealBtn) revealBtn.hidden = true;
+  }
 }
 
 setupUploadView();
+
+// Renderer-side helper to ask the Electron main process to open the
+// OS file manager at the audio file. We can't use ipcRenderer directly
+// (sandbox + contextIsolation + no preload), so we encode the request
+// into a sentinel ``document.title`` and let main.js's
+// ``page-title-updated`` handler decode + dispatch. The handler
+// validates name + archiveDir against the user's home dir before
+// invoking ``shell.showItemInFolder``. Title is restored a tick later
+// so the app's normal title text isn't permanently replaced.
+window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
+  const safe = String(name || "").replace(/[\\/]/g, "");
+  if (!safe) return;
+  const payload = encodeURIComponent(
+    JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
+  );
+  const prevTitle = document.title;
+  document.title = "__app_reveal_recording__" + payload;
+  // Restore the normal title after a microtask. main.js consumes the
+  // event synchronously, so the sentinel only needs to live for one
+  // event-loop tick.
+  setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+};

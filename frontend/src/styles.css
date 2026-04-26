@@ -919,6 +919,21 @@ textarea:focus-visible,
   border-bottom: 1px solid var(--line);
 }
 
+/*
+ * When ``.pane-head-row-top`` is the ONLY row inside ``.pane-header``
+ * (Upload tab — single-row pane-header without the bottom toolbar
+ * row that Live/Transcribe/Upscale all carry), its bottom border
+ * stacks on top of ``.pane-header``'s own border-bottom and renders
+ * as a double horizontal line right beneath the title. Suppress the
+ * inner border in that case so only the outer pane-header divider
+ * remains. ``:last-child`` is the right selector — when the bottom
+ * row exists it becomes :last-child instead, leaving the divider
+ * between top and bottom rows intact.
+ */
+.pane-head-row-top:last-child {
+  border-bottom: 0;
+}
+
 .pane-head-row-bottom {
   min-height: calc(var(--h-control-compact) + 8px);
   align-items: center;
@@ -3090,6 +3105,85 @@ canvas,
 #uploadQueuePane .upload-queue-list,
 #uploadQueuePane .upload-empty-state {
   margin: 12px;
+}
+
+/*
+ * Upload tab uses a 3-pane split (Drop / Queue / Result). The default
+ * .split column ratios (0.8/1.0/1.2) are tuned for Live tab's
+ * Live-Preview / Transcribe / Upscale columns where Upscale needs
+ * extra room for its toolbar; on Upload, the user wants the result
+ * pane (where the transcribed text shows) to be the largest, with
+ * drop and queue narrower and roughly equal. 0.85/0.85/1.3 hits that.
+ */
+.view[data-view="upload"] .split {
+  grid-template-columns: 0.85fr 0.85fr 1.3fr;
+}
+
+#uploadResultPane {
+  display: flex;
+  flex-direction: column;
+}
+
+#uploadResultPane .upload-result-text {
+  flex: 1 1 auto;
+  margin: 12px;
+  padding: 14px 16px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-1);
+  background: var(--surface-2);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 0;
+}
+
+#uploadResultPane .upload-result-text:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-2);
+  font-style: italic;
+}
+
+.upload-result-meta {
+  margin: 0 12px 12px;
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--surface-3, rgba(255,255,255,0.03));
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.upload-result-meta-key {
+  color: var(--text-3, #6b7280);
+  margin-right: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.upload-result-reveal {
+  font-size: 11px;
+  padding: 4px 10px;
+  margin-left: 6px;
+}
+
+/* Selected queue item highlight — clicking an item shows it in the
+   result pane and marks it as selected with a subtle ring. */
+.upload-queue-item.is-selected {
+  border-color: var(--text-2);
+  background: var(--surface-3, rgba(255,255,255,0.04));
+  cursor: pointer;
+}
+.upload-queue-item {
+  cursor: pointer;
 }
 
 .upload-droplarge {

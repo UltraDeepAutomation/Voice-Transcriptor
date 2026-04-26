@@ -214,6 +214,30 @@
               </div>
             </div>
           </div>
+          <!--
+            Result pane — shows the latest completed transcript so the
+            user can read / copy / open in Finder the saved file
+            without leaving the Upload tab. Selecting any item in the
+            queue swaps the content here.
+          -->
+          <div class="pane" id="uploadResultPane">
+            <div class="pane-header">
+              <div class="pane-head-row pane-head-row-top">
+                <span class="pane-title" id="uploadResultTitle">Result</span>
+                <div class="pane-actions">
+                  <button class="icon-btn" id="uploadResultCopyBtn" type="button"
+                    aria-label="Copy transcript" title="Copy transcript" hidden>
+                    <span class="copy-ico" aria-hidden="true"></span>
+                  </button>
+                  <button class="btn btn-ghost upload-result-reveal" id="uploadResultRevealBtn"
+                    type="button" hidden>Reveal in Finder</button>
+                </div>
+              </div>
+            </div>
+            <pre class="out upload-result-text" id="uploadResultText"
+              data-placeholder="Select a completed item to view its transcript here."></pre>
+            <div class="upload-result-meta" id="uploadResultMeta" hidden></div>
+          </div>
         </div>
       </section>
 
