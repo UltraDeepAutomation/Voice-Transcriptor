@@ -108,8 +108,9 @@
   <div class="shell">
     <nav class="sidebar">
       <div class="sb-nav">
-        <button class="sb-item active" data-view="record">Record</button>
-        <button class="sb-item" data-view="recordings">Recordings</button>
+        <button class="sb-item active" data-view="upload">Upload</button>
+        <button class="sb-item" data-view="record">Live</button>
+        <button class="sb-item" data-view="recordings">History</button>
         <button class="sb-item" data-view="settings">Settings</button>
         <button class="sb-item" data-view="graph">Graph</button>
       </div>
@@ -121,7 +122,7 @@
           <div class="window-heading">
             <span class="window-title">Transcriptor</span>
             <div class="window-view-stack">
-              <span class="window-view" id="windowViewLabel">Record</span>
+              <span class="window-view" id="windowViewLabel">Upload</span>
             </div>
           </div>
           <span class="net-pill" id="netPill" title="Internet connection status">
@@ -131,7 +132,61 @@
         </div>
       </div>
 
-      <section class="view" data-view="record">
+      <section class="view" data-view="upload">
+        <div class="topbar">
+          <div class="topbar-row">
+            <label class="top-item">
+              <span class="lbl">Provider</span>
+              <select id="uploadProvider">
+                <option value="deepgram">Deepgram Nova-3</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="local">Local (Whisper)</option>
+              </select>
+            </label>
+            <label class="top-item top-item-lang">
+              <span class="lbl">Lang</span>
+              <select id="uploadLanguage">
+                <option value="auto">Auto</option>
+                <option value="ru">RU</option>
+                <option value="en">EN</option>
+              </select>
+            </label>
+            <label class="top-item top-item-toggle">
+              <span class="lbl">Diarize</span>
+              <input type="checkbox" id="uploadDiarize" />
+            </label>
+          </div>
+        </div>
+        <div class="upload-shell">
+          <div class="upload-shell-left">
+            <div class="upload-droplarge" id="uploadLargeDrop" tabindex="0" role="button"
+              aria-label="Drop audio or video files here, or click to browse">
+              <input id="uploadLargeFileInput" type="file" accept="audio/*,video/*" multiple hidden />
+              <div class="upload-droplarge-icon" aria-hidden="true">↑</div>
+              <div class="upload-droplarge-title">Drop audio or video files here</div>
+              <div class="upload-droplarge-sub">
+                or click to browse · WAV, MP3, M4A, FLAC, OGG, AAC, MP4, WEBM, MOV, MKV
+              </div>
+              <div class="upload-droplarge-hint" id="uploadProviderHint"></div>
+            </div>
+          </div>
+          <div class="upload-shell-right">
+            <div class="upload-queue-header">
+              <span class="upload-queue-title" id="uploadQueueTitle">Queue</span>
+              <button class="btn btn-ghost upload-queue-clear" id="uploadQueueClearBtn" type="button" hidden>
+                Clear done
+              </button>
+            </div>
+            <ul class="upload-queue-list" id="uploadQueueList" aria-live="polite"></ul>
+            <div class="upload-empty-state" id="uploadEmptyState">
+              Drop files on the left and they'll appear here as they transcribe.<br>
+              Each completed file is saved to <b>History</b> automatically.
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="record" hidden>
         <div class="topbar">
           <select id="mode" hidden>
             <option value="live" selected>Live</option>

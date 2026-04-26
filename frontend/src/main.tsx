@@ -3,7 +3,7 @@ import "./styles.css";
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type KeyProvider = "openrouter" | "deepgram";
-type ViewName = "record" | "recordings" | "settings" | "graph";
+type ViewName = "upload" | "record" | "recordings" | "settings" | "graph";
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
 
 interface NetworkStatusResponse {
@@ -2137,7 +2137,11 @@ function switchView(view: ViewName): void {
     }
   });
   $("windowViewLabel").textContent =
-    view === "settings" ? "Settings" : view === "recordings" ? "Recordings" : view === "graph" ? "Graph" : "Record";
+    view === "upload" ? "Upload"
+      : view === "settings" ? "Settings"
+      : view === "recordings" ? "History"
+      : view === "graph" ? "Graph"
+      : "Live";
   if (view === "recordings") {
     // Only reload from the server if we have no cached items yet. If
     // the list was already loaded (e.g. from initRecordingsBootstrap
@@ -7825,3 +7829,376 @@ if (_bootRetry) {
     window.location.reload();
   });
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// ██  Upload Tab — drag-and-drop + queued batch transcription      ██
+// ══════════════════════════════════════════════════════════════════════
+//
+// SSOT for the upload pipeline. Reuses the existing transcription
+// primitives (`localJobSync`, `remoteJobSync`, `saveRecordingText`)
+// instead of forking a parallel implementation, so any backend-side
+// behaviour change (provider, language, retention) flows through to
+// the upload tab automatically.
+//
+// Flow per file:
+//   1. enqueueUploadFile(file) — validate size + push to queue +
+//      kick the single-flight processor.
+//   2. processUploadItem(item) — provider-aware transcribe call.
+//      Auto-falls back to local when the chosen remote provider has
+//      no key (rather than silently failing per-item).
+//   3. saveRecordingText({audioFile: item.file, …}) — persist into
+//      the same archive the History tab reads, so the recording
+//      shows up in History without an extra round-trip.
+//   4. renderUploadQueue() — re-render the right pane.
+//
+// One processor at a time (uploadProcessorRunning latch) — keeps
+// CPU + bandwidth predictable, avoids thrashing the threadpool.
+
+interface UploadQueueItem {
+  id: string;
+  file: File;
+  status: "queued" | "transcribing" | "done" | "error";
+  text?: string;
+  error?: string;
+  startedAt?: number;
+  endedAt?: number;
+  provider?: Provider;
+}
+
+const uploadQueue: UploadQueueItem[] = [];
+let uploadProcessorRunning = false;
+// 1 GB hard cap on per-file size matches the backend's MAX_UPLOAD_BYTES
+// (500 MB) × 2 — leaves headroom for video containers (MP4 / MKV)
+// where the audio track itself fits comfortably under the backend cap
+// after demux. Caught client-side so the user sees the rejection
+// instantly rather than after a multi-GB upload to a 413.
+const UPLOAD_FILE_SIZE_CAP = 1024 * 1024 * 1024;
+// Accept-set mirrors the backend's allowed extensions plus video
+// containers (the backend's ffmpeg path demuxes audio out of any of
+// these). Drag-drop browsers don't enforce ``accept`` so we
+// double-check at the JS level.
+const UPLOAD_ALLOWED_EXTS = new Set([
+  // audio
+  "wav", "mp3", "m4a", "flac", "ogg", "aac", "opus", "wma",
+  // video / mixed
+  "mp4", "webm", "mov", "mkv", "avi", "m4v", "mpg", "mpeg", "3gp",
+]);
+
+function setupUploadView(): void {
+  const dropZone = document.getElementById("uploadLargeDrop");
+  const fileInput = document.getElementById("uploadLargeFileInput") as HTMLInputElement | null;
+  const provider = document.getElementById("uploadProvider") as HTMLSelectElement | null;
+  const language = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
+  if (!dropZone || !fileInput || !provider || !language) return;
+  // Click anywhere on the drop zone (except interactive children) opens
+  // the native file picker.
+  dropZone.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    if (target.closest("button") || target.closest("a") || target.closest("input")) return;
+    fileInput.click();
+  });
+  // Keyboard activation: drop zone has tabindex=0 + role=button.
+  dropZone.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
+  fileInput.addEventListener("change", () => {
+    const files = Array.from(fileInput.files || []);
+    // Allow the user to pick the SAME file twice — clearing the
+    // input value re-triggers `change` on the next pick. Without
+    // this, dragging the same file twice silently no-ops.
+    fileInput.value = "";
+    files.forEach(enqueueUploadFile);
+  });
+  // Drag visual states. We want the highlight on EITHER `dragenter`
+  // (first time the dragged item enters us) OR `dragover` (continuous
+  // while inside) — they fire enough to keep the class set. We also
+  // need `preventDefault()` on `dragover` for the browser to allow
+  // the eventual `drop`.
+  ["dragenter", "dragover"].forEach((ev) => {
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.add("drag");
+    });
+  });
+  ["dragleave", "drop"].forEach((ev) => {
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.remove("drag");
+    });
+  });
+  dropZone.addEventListener("drop", (e: DragEvent) => {
+    const dt = e.dataTransfer;
+    if (!dt) return;
+    Array.from(dt.files).forEach(enqueueUploadFile);
+  });
+  // Block the entire window from navigating away if a file is
+  // dropped OUTSIDE the drop zone — without this, dropping a file
+  // anywhere else opens it in the renderer (replacing the app).
+  // Scoped to the upload view via `closest('.view[data-view="upload"]')`
+  // so dropping on Record/Settings/etc. retains default browser
+  // behaviour (none, since those views don't accept drops anyway).
+  ["dragover", "drop"].forEach((ev) => {
+    window.addEventListener(ev, (e) => {
+      const view = (document.querySelector('.view[data-view="upload"]') as HTMLElement | null);
+      if (!view || view.hidden) return;
+      // Inside the drop zone the per-element listeners already handle it.
+      if ((e.target as HTMLElement)?.closest("#uploadLargeDrop")) return;
+      e.preventDefault();
+    });
+  });
+  const clearBtn = document.getElementById("uploadQueueClearBtn") as HTMLButtonElement | null;
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      // Drop only finished items so an in-flight transcription is
+      // never aborted by an accidental Clear click.
+      for (let i = uploadQueue.length - 1; i >= 0; i--) {
+        const st = uploadQueue[i].status;
+        if (st === "done" || st === "error") uploadQueue.splice(i, 1);
+      }
+      renderUploadQueue();
+    });
+  }
+  provider.addEventListener("change", () => updateUploadProviderHint());
+  // Initial provider default: prefer Deepgram if the user has a key,
+  // else fall back to local Whisper (offline-capable). Honors per-tab
+  // independence — the Record tab's selection is unaffected.
+  const initialProvider: Provider = isProviderKeyConfigured("deepgram") ? "deepgram" : "local";
+  provider.value = initialProvider;
+  // Mirror language preference from the global #language so users who
+  // already pinned RU/EN don't have to re-pick it on every tab.
+  try {
+    const globalLang = (document.getElementById("language") as HTMLSelectElement | null)?.value;
+    if (globalLang && ["auto", "ru", "en"].includes(globalLang)) language.value = globalLang;
+  } catch { }
+  updateUploadProviderHint();
+  renderUploadQueue();
+}
+
+function updateUploadProviderHint(): void {
+  const provider = (document.getElementById("uploadProvider") as HTMLSelectElement | null)?.value || "deepgram";
+  const hintEl = document.getElementById("uploadProviderHint");
+  if (!hintEl) return;
+  if (provider === "deepgram") {
+    hintEl.textContent = isProviderKeyConfigured("deepgram")
+      ? "Cloud transcription via Deepgram Nova-3 — fastest, multi-language."
+      : "Add a Deepgram key in Settings, or switch to Local for offline transcription.";
+  } else if (provider === "openrouter") {
+    hintEl.textContent = isProviderKeyConfigured("openrouter")
+      ? "Audio transcription via OpenRouter."
+      : "Add an OpenRouter key in Settings, or switch to Local for offline transcription.";
+  } else {
+    hintEl.textContent = "Offline transcription via Whisper. Slower than cloud, no API key required.";
+  }
+}
+
+function enqueueUploadFile(file: File): void {
+  // Size gate — backend has its own 413, but rejecting client-side
+  // saves the upload time + spares the server.
+  if (file.size > UPLOAD_FILE_SIZE_CAP) {
+    uploadQueue.push({
+      id: createClientSessionId(),
+      file,
+      status: "error",
+      error: `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(UPLOAD_FILE_SIZE_CAP / (1024 * 1024))} MB cap).`,
+    });
+    renderUploadQueue();
+    return;
+  }
+  // Format gate — drag-drop browsers ignore the `accept` attribute.
+  // We accept anything the backend's ffmpeg can demux, which is
+  // basically all common audio + video containers.
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  if (ext && !UPLOAD_ALLOWED_EXTS.has(ext)) {
+    uploadQueue.push({
+      id: createClientSessionId(),
+      file,
+      status: "error",
+      error: `Unsupported file type ".${ext}". Drop an audio or video file.`,
+    });
+    renderUploadQueue();
+    return;
+  }
+  uploadQueue.push({ id: createClientSessionId(), file, status: "queued" });
+  renderUploadQueue();
+  void runUploadProcessor();
+}
+
+async function runUploadProcessor(): Promise<void> {
+  if (uploadProcessorRunning) return;
+  uploadProcessorRunning = true;
+  try {
+    while (true) {
+      const next = uploadQueue.find((it) => it.status === "queued");
+      if (!next) break;
+      await processUploadItem(next);
+    }
+  } finally {
+    uploadProcessorRunning = false;
+  }
+}
+
+async function processUploadItem(item: UploadQueueItem): Promise<void> {
+  item.status = "transcribing";
+  item.startedAt = performance.now();
+  renderUploadQueue();
+  const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
+  const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
+  const diarize = !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked;
+  const selectedProvider = (providerSel?.value || "deepgram") as Provider;
+  // Honor offline mode the same way the Record tab does — fall back
+  // to local when the chosen remote provider isn't available right now.
+  const provider = resolveEffectiveProvider(selectedProvider);
+  const language = (languageSel?.value || "auto").trim();
+  item.provider = provider;
+  try {
+    if (provider !== "local" && !isProviderKeyConfigured(provider)) {
+      throw new Error(providerKeyErrorMessage(provider));
+    }
+    let text = "";
+    let modelLabel = "";
+    if (provider === "local") {
+      modelLabel = "small";
+      const out = await localJobSync(item.file, {
+        language: resolveFastLocalLanguage(language),
+        model: modelLabel,
+        splitStereo: true,
+        wordTimestamps: false,
+      });
+      text = String(out.text || "").trim();
+    } else {
+      modelLabel = getRemoteModelValue(provider) || "";
+      const out = await remoteJobSync(item.file, {
+        provider,
+        language,
+        diarize,
+        openrouterModel: modelLabel,
+      });
+      text = String(out.text || "").trim();
+    }
+    item.text = text;
+    item.status = "done";
+    item.endedAt = performance.now();
+    // Persist to the History tab's archive. We pass the original
+    // file so the audio is saved alongside the transcript and is
+    // playable from the History row. `refreshList: true` triggers a
+    // single archive reload at the end of each successful save.
+    if (text) {
+      try {
+        await saveRecordingText({
+          title: (item.file.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
+          sourceText: text,
+          transcriptText: text,
+          provider,
+          model: modelLabel,
+          language,
+          audioFile: item.file,
+          refreshList: true,
+        });
+      } catch (saveErr) {
+        // Persist failure is non-fatal — the transcript is still
+        // shown to the user; only the History entry is missing.
+        console.warn("Upload: saveRecordingText failed", saveErr);
+      }
+    }
+  } catch (e) {
+    item.status = "error";
+    item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
+    item.endedAt = performance.now();
+  } finally {
+    renderUploadQueue();
+  }
+}
+
+function uploadStatusLabel(item: UploadQueueItem): string {
+  switch (item.status) {
+    case "queued":
+      return "Queued";
+    case "transcribing":
+      return "Transcribing…";
+    case "done": {
+      const ms = item.endedAt && item.startedAt ? item.endedAt - item.startedAt : 0;
+      return `Done · ${(ms / 1000).toFixed(1)}s`;
+    }
+    case "error":
+      return "Failed";
+  }
+}
+
+function renderUploadQueue(): void {
+  const list = document.getElementById("uploadQueueList") as HTMLUListElement | null;
+  const empty = document.getElementById("uploadEmptyState");
+  const clearBtn = document.getElementById("uploadQueueClearBtn") as HTMLButtonElement | null;
+  const titleEl = document.getElementById("uploadQueueTitle");
+  if (!list || !empty || !clearBtn) return;
+  if (uploadQueue.length === 0) {
+    list.innerHTML = "";
+    empty.hidden = false;
+    clearBtn.hidden = true;
+    if (titleEl) titleEl.textContent = "Queue";
+    return;
+  }
+  empty.hidden = true;
+  const finished = uploadQueue.filter((it) => it.status === "done" || it.status === "error").length;
+  clearBtn.hidden = finished === 0;
+  if (titleEl) {
+    const total = uploadQueue.length;
+    titleEl.textContent = `Queue · ${finished}/${total} done`;
+  }
+  // Clear + rebuild. Queue length is bounded by user clicks (rarely
+  // > 50); full re-render is fine and avoids stale-DOM state issues
+  // (per-item refs, status class drift across status transitions).
+  list.innerHTML = "";
+  for (const item of uploadQueue) {
+    const li = document.createElement("li");
+    li.className = `upload-queue-item upload-queue-item--${item.status}`;
+    const header = document.createElement("div");
+    header.className = "upload-queue-item-header";
+    const name = document.createElement("span");
+    name.className = "upload-queue-item-name";
+    name.textContent = item.file.name;
+    name.title = item.file.name;
+    header.appendChild(name);
+    const status = document.createElement("span");
+    status.className = "upload-queue-item-status";
+    status.textContent = uploadStatusLabel(item);
+    header.appendChild(status);
+    li.appendChild(header);
+    if (item.status === "done" && item.text) {
+      const body = document.createElement("div");
+      body.className = "upload-queue-item-body";
+      body.textContent = item.text;
+      li.appendChild(body);
+      const actions = document.createElement("div");
+      actions.className = "upload-queue-item-actions";
+      const copyBtn = document.createElement("button");
+      copyBtn.className = "btn btn-ghost upload-queue-item-action";
+      copyBtn.type = "button";
+      copyBtn.textContent = "Copy";
+      copyBtn.addEventListener("click", () => {
+        try {
+          navigator.clipboard?.writeText(item.text || "");
+          copyBtn.textContent = "Copied";
+          setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+        } catch {
+          copyBtn.textContent = "Copy failed";
+          setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+        }
+      });
+      actions.appendChild(copyBtn);
+      li.appendChild(actions);
+    } else if (item.status === "error" && item.error) {
+      const err = document.createElement("div");
+      err.className = "upload-queue-item-error";
+      err.textContent = item.error;
+      li.appendChild(err);
+    }
+    list.appendChild(li);
+  }
+}
+
+setupUploadView();
