@@ -114,6 +114,19 @@ let win = null;
 let overlayWin = null;
 let overlayWaveMonitor = null;
 let overlayLoaded = false;
+// In-flight loadURL Promise. Three call sites (ensureOverlayVisible,
+// showRecordingOverlay, the startup preload) all guard their loadURL
+// with `if (!overlayLoaded)` and set `overlayLoaded = true` after the
+// await resolves. Concurrent callers (e.g. user presses Alt+Left then
+// Alt+Shift+V before the first overlay finishes loading) all see
+// `overlayLoaded = false`, all call `ow.loadURL`, and Electron aborts
+// every prior loadURL when a new one starts on the same webContents —
+// so the FIRST caller's await rejects with ERR_ABORTED, its catch
+// hides the overlay, and the user sees a flash-and-vanish with no
+// recording started. The shared promise gates all three sites onto
+// the SAME loadURL call: subsequent callers await the same Promise
+// instead of issuing a competing load.
+let _overlayLoadPromise = null;
 let tray = null;
 let backendBootError = "";
 // Cache the last shortcut-registration status so we can replay it to
@@ -2145,6 +2158,48 @@ function getOverlayWindowWidth() {
     : OVERLAY_TOKENS.window.collapsedWidth;
 }
 
+/**
+ * Idempotent overlay HTML loader. All three call-sites that previously
+ * inlined `if (!overlayLoaded) { await ow.loadURL(...); overlayLoaded = true; }`
+ * now route through here so concurrent callers share ONE loadURL —
+ * second callers await the first's promise instead of issuing a
+ * competing load that aborts the first.
+ *
+ * Edge cases:
+ *   - already loaded → no-op, immediate resolve.
+ *   - loadURL in flight → second caller awaits the same promise;
+ *     both observe `overlayLoaded = true` after it resolves.
+ *   - loadURL rejects (window destroyed mid-load, OOM, etc.) → the
+ *     `.catch` clears overlayLoaded and the in-flight pointer so the
+ *     next caller can retry with a fresh load. We rethrow so the
+ *     caller's existing try/catch around `ensureOverlayVisible` /
+ *     `showRecordingOverlay` still surfaces the failure to its
+ *     trace + status path.
+ *   - overlay window closed (line ~2090 listener resets overlayLoaded
+ *     to false) DURING a successful in-flight load → the loadURL
+ *     promise rejects when the webContents tears down, the `.catch`
+ *     fires and clears state, the next caller starts fresh.
+ */
+async function ensureOverlayLoaded() {
+  if (overlayLoaded) return;
+  if (!_overlayLoadPromise) {
+    const ow = ensureOverlayWindow();
+    _overlayLoadPromise = ow
+      .loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`)
+      .then(() => {
+        overlayLoaded = true;
+      })
+      .catch((err) => {
+        overlayLoaded = false;
+        throw err;
+      })
+      .finally(() => {
+        _overlayLoadPromise = null;
+      });
+  }
+  await _overlayLoadPromise;
+}
+
 function applyOverlayWindowSize() {
   if (!overlayWin || overlayWin.isDestroyed()) return;
   safeExecSync("applyOverlayWindowSize", () => {
@@ -2184,10 +2239,11 @@ async function showRecordingOverlay() {
   setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
-  if (!overlayLoaded) {
-    await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
-    overlayLoaded = true;
-  }
+  // Routed through ensureOverlayLoaded so a parallel call from
+  // ensureOverlayVisible (rapid Alt+Left → Alt+Shift+V hotkey
+  // sequence) shares the same in-flight loadURL instead of issuing
+  // a competing load that aborts the first one.
+  await ensureOverlayLoaded();
   const upscaleCtx = await getRendererUpscalePresetContext();
   overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
   overlayQuickUpscalePreset = upscaleCtx.selected;
@@ -2325,10 +2381,8 @@ async function ensureOverlayVisible(options = {}) {
   const { resetTimer = false, startTimer = false, status = null } = options;
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
-  if (!overlayLoaded) {
-    await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
-    overlayLoaded = true;
-  }
+  // Idempotent / race-safe load: see ensureOverlayLoaded note above.
+  await ensureOverlayLoaded();
   await safeExec("ensureOverlayVisible:initializeQuickSettings", async () => {
     const upscaleCtx = await getRendererUpscalePresetContext();
     overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
@@ -6627,10 +6681,10 @@ app.whenReady().then(async () => {
 
   // Preload overlay once to avoid first-use delay after hotkey.
   try {
-    const ow = ensureOverlayWindow();
-    if (!overlayLoaded) {
-      await ow.loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`);
-      overlayLoaded = true;
-    }
+    ensureOverlayWindow();
+    // Routed through ensureOverlayLoaded so this preload shares its
+    // loadURL with any concurrent shortcut-driven ensureOverlayVisible
+    // call (rare during startup, but a race-free path costs nothing).
+    await ensureOverlayLoaded();
   } catch { }
 });
