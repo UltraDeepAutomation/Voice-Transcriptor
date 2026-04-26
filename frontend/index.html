@@ -142,7 +142,7 @@
       <section class="view" data-view="upload">
         <div class="topbar">
           <div class="topbar-row">
-            <label class="top-item">
+            <label class="top-item top-item-mic">
               <span class="lbl">Provider</span>
               <select id="uploadProvider">
                 <option value="deepgram">Deepgram Nova-3</option>
@@ -158,36 +158,60 @@
                 <option value="en">EN</option>
               </select>
             </label>
-            <label class="top-item top-item-toggle">
+            <label class="top-item top-item-toggle upload-diarize-item">
               <span class="lbl">Diarize</span>
-              <input type="checkbox" id="uploadDiarize" />
+              <label class="toggle-inline toggle-blue">
+                <input type="checkbox" id="uploadDiarize" />
+              </label>
             </label>
           </div>
         </div>
-        <div class="upload-shell">
-          <div class="upload-shell-left">
+
+        <div class="split">
+          <div class="pane" id="uploadDropPane">
+            <div class="pane-header">
+              <div class="pane-head-row pane-head-row-top">
+                <span class="pane-title">Drop files</span>
+                <div class="pane-actions">
+                  <button class="icon-btn" id="uploadBrowseBtn" type="button"
+                    aria-label="Choose files" title="Choose files">
+                    <span class="copy-ico" aria-hidden="true"></span>
+                  </button>
+                </div>
+              </div>
+            </div>
             <div class="upload-droplarge" id="uploadLargeDrop" tabindex="0" role="button"
               aria-label="Drop audio or video files here, or click to browse">
               <input id="uploadLargeFileInput" type="file" accept="audio/*,video/*" multiple hidden />
               <div class="upload-droplarge-icon" aria-hidden="true">↑</div>
-              <div class="upload-droplarge-title">Drop audio or video files here</div>
+              <div class="upload-droplarge-title">Drop audio or video files</div>
               <div class="upload-droplarge-sub">
-                or click to browse · WAV, MP3, M4A, FLAC, OGG, AAC, MP4, WEBM, MOV, MKV
+                or click to browse
+              </div>
+              <div class="upload-droplarge-formats">
+                WAV · MP3 · M4A · FLAC · OGG · AAC · MP4 · WEBM · MOV · MKV
               </div>
               <div class="upload-droplarge-hint" id="uploadProviderHint"></div>
             </div>
           </div>
-          <div class="upload-shell-right">
-            <div class="upload-queue-header">
-              <span class="upload-queue-title" id="uploadQueueTitle">Queue</span>
-              <button class="btn btn-ghost upload-queue-clear" id="uploadQueueClearBtn" type="button" hidden>
-                Clear done
-              </button>
+          <div class="split-gap"></div>
+          <div class="pane" id="uploadQueuePane">
+            <div class="pane-header">
+              <div class="pane-head-row pane-head-row-top">
+                <span class="pane-title" id="uploadQueueTitle">Queue</span>
+                <div class="pane-actions">
+                  <button class="btn btn-ghost upload-queue-clear" id="uploadQueueClearBtn"
+                    type="button" hidden>Clear done</button>
+                </div>
+              </div>
             </div>
             <ul class="upload-queue-list" id="uploadQueueList" aria-live="polite"></ul>
             <div class="upload-empty-state" id="uploadEmptyState">
-              Drop files on the left and they'll appear here as they transcribe.<br>
-              Each completed file is saved to <b>History</b> automatically.
+              <div class="upload-empty-state-title">No files yet</div>
+              <div class="upload-empty-state-sub">
+                Drop audio or video on the left.<br>
+                Each completed file is saved to <b>History</b> automatically.
+              </div>
             </div>
           </div>
         </div>

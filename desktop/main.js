@@ -6313,10 +6313,31 @@ app.whenReady().then(async () => {
       if (fs.existsSync(cfgPath)) {
         const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
         const ui = raw?.preferences?.ui || {};
-        return {
-          record: String(ui.shortcut_record || defaults.record).trim() || defaults.record,
-          paste: String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste,
-        };
+        let record = String(ui.shortcut_record || defaults.record).trim() || defaults.record;
+        let paste = String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste;
+        // Mirror the renderer's loadCfg one-time migration:
+        // a Mac user's config still carries pass-15's stale F9/F10
+        // cross-platform default. F9 = Mission Control on macOS, so
+        // registering it here means the OS hijacks every press and
+        // the user reports "shortcut doesn't work". The renderer
+        // ALSO migrates and queues a pending re-register on its 2 s
+        // poll, but the main process registers FIRST at startup —
+        // for those 2+ seconds (and any earlier F9 press), the
+        // shortcut is a black hole. Mirror the migration here so
+        // the FIRST register call uses the correct platform default.
+        if (process.platform === "darwin" && record === "F9" && paste === "F10") {
+          record = defaults.record;
+          paste = defaults.paste;
+          appendMainLog("[shortcuts] migrated stale F9/F10 → Alt+Left/Alt+Shift+V on Mac");
+        }
+        // Migration 2: legacy `Alt+Shift+7` was unpressable on
+        // US/UK layouts (Shift+7 = `&`). Always rewrite to the
+        // platform default's paste accelerator.
+        if (paste === "Alt+Shift+7") {
+          paste = defaults.paste;
+          appendMainLog(`[shortcuts] migrated stale Alt+Shift+7 → ${paste}`);
+        }
+        return { record, paste };
       }
     } catch (e) {
       appendMainLog(`[shortcuts] config read error: ${e?.message || e}`);

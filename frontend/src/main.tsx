@@ -8019,6 +8019,13 @@ function setupUploadView(): void {
       renderUploadQueue();
     });
   }
+  // Browse button in pane header — alternative to clicking the
+  // drop zone, useful when the queue is full and the drop zone
+  // has scrolled below the fold.
+  const browseBtn = document.getElementById("uploadBrowseBtn");
+  if (browseBtn) {
+    browseBtn.addEventListener("click", () => fileInput.click());
+  }
   provider.addEventListener("change", () => updateUploadProviderHint());
   // Initial provider default: prefer Deepgram if the user has a key,
   // else fall back to local Whisper (offline-capable). Honors per-tab

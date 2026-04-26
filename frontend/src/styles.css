@@ -3057,28 +3057,30 @@ canvas,
   min-width: 120px;
 }
 
-/* ───────────── Upload tab ───────────── */
+/* ───────────── Upload tab ─────────────
+ * Layout matches the Live tab's `.split` + `.pane` aesthetic:
+ * a left "Drop files" pane + right "Queue" pane, each with the
+ * same pane-header bar, dark surface, subtle borders. The drop
+ * zone itself is the only dashed element — everything around it
+ * is solid pane chrome, consistent with the rest of the app.
+ */
 
-.upload-shell {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
-  gap: 16px;
-  padding: 16px;
-  flex: 1 1 auto;
-  min-height: 0;
+.upload-diarize-item .toggle-inline {
+  display: inline-flex;
+  align-items: center;
 }
 
-@media (max-width: 900px) {
-  .upload-shell {
-    grid-template-columns: 1fr;
-  }
-}
-
-.upload-shell-left,
-.upload-shell-right {
+#uploadDropPane,
+#uploadQueuePane {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+#uploadDropPane .upload-droplarge,
+#uploadQueuePane .upload-queue-list,
+#uploadQueuePane .upload-empty-state {
+  margin: 12px;
 }
 
 .upload-droplarge {
@@ -3088,87 +3090,83 @@ canvas,
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 32px 24px;
-  border: 2px dashed var(--surface-3, #3a3a3a);
-  border-radius: 14px;
-  background: var(--surface-1, #1a1a1a);
+  padding: 36px 24px;
+  border: 1.5px dashed var(--surface-3, #3a3a3a);
+  border-radius: 12px;
+  background: var(--surface-2, #15181c);
   color: var(--text-2, #a0a0a0);
   cursor: pointer;
-  transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
+  transition: border-color 140ms ease, background-color 140ms ease, transform 140ms ease;
   outline: none;
-  min-height: 320px;
+  min-height: 0;
 }
 
 .upload-droplarge:hover,
 .upload-droplarge:focus-visible {
   border-color: var(--primary, #6c90c6);
-  background: var(--surface-2, #232323);
+  background: var(--surface-1, #1a1f25);
   color: var(--text-1, #e5e7eb);
 }
 
 .upload-droplarge.drag {
   border-color: var(--primary, #6c90c6);
-  background: var(--surface-2, #2a3140);
+  border-style: solid;
+  background: linear-gradient(180deg, rgba(108, 144, 198, 0.10) 0%, rgba(108, 144, 198, 0.04) 100%);
   color: var(--text-1, #e5e7eb);
-  transform: scale(1.01);
+  transform: scale(1.005);
 }
 
 .upload-droplarge-icon {
-  font-size: 56px;
+  font-size: 48px;
   line-height: 1;
-  margin-bottom: 14px;
+  margin-bottom: 16px;
   color: var(--primary, #6c90c6);
-  opacity: 0.85;
+  opacity: 0.8;
   font-weight: 700;
 }
 
 .upload-droplarge-title {
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text-1, #f3f4f6);
-  margin-bottom: 6px;
+  margin-bottom: 4px;
+  letter-spacing: 0.01em;
 }
 
 .upload-droplarge-sub {
   font-size: 13px;
   color: var(--text-2, #9ca3af);
+  margin-bottom: 16px;
+  line-height: 1.4;
+}
+
+.upload-droplarge-formats {
+  font-size: 11px;
+  color: var(--text-2, #6b7280);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
   margin-bottom: 14px;
-  max-width: 480px;
-  line-height: 1.5;
 }
 
 .upload-droplarge-hint {
-  margin-top: 8px;
+  margin-top: 12px;
+  padding: 8px 14px;
   font-size: 12px;
-  color: var(--text-2, #6b7280);
-  max-width: 480px;
-  line-height: 1.4;
-  font-style: italic;
-}
-
-.upload-queue-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--surface-3, #2a2a2a);
-  margin-bottom: 10px;
-}
-
-.upload-queue-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-1, #e5e7eb);
+  color: var(--text-2, #9ca3af);
+  background: rgba(108, 144, 198, 0.06);
+  border: 1px solid rgba(108, 144, 198, 0.18);
+  border-radius: 6px;
+  max-width: 420px;
+  line-height: 1.45;
 }
 
 .upload-queue-clear {
-  font-size: 12px;
+  font-size: 11px;
   padding: 4px 10px;
 }
 
 .upload-queue-list {
   list-style: none;
-  margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -3337,12 +3335,26 @@ canvas,
 }
 
 .upload-empty-state {
-  font-size: 13px;
-  color: var(--text-2, #6b7280);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  padding: 24px 16px;
   text-align: center;
-  padding: 32px 16px;
-  line-height: 1.6;
-  border: 1px dashed var(--surface-3, #2a2a2a);
-  border-radius: 8px;
+  line-height: 1.55;
+}
+
+.upload-empty-state-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1, #e5e7eb);
+  letter-spacing: 0.01em;
+}
+
+.upload-empty-state-sub {
+  font-size: 12px;
+  color: var(--text-2, #6b7280);
 }
 
