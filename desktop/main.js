@@ -6444,8 +6444,41 @@ app.whenReady().then(async () => {
     }
   }
 
-  function registerGlobalShortcuts() {
-    const shortcuts = readShortcutsFromConfig();
+  function registerGlobalShortcuts(override = null) {
+    // SSOT for the accelerators we actually bind:
+    //   - At startup → readShortcutsFromConfig() (disk-backed, pre-renderer).
+    //   - After a Settings-UI capture → renderer pushes pending values
+    //     via `__transcriptorPendingShortcuts`. Pass them in here as
+    //     `override` so the registration uses the IN-MEMORY values the
+    //     user just typed, NOT the disk config.
+    //
+    // Why the override exists (root cause of "не ставятся новые при
+    // нажатии клавиш"): the renderer queues a debounced (600 ms) save
+    // to /api/config which the backend writes to disk asynchronously,
+    // while ALSO setting the pending window flag immediately. The main
+    // process polls every 2 s. If the poll fires before the disk write
+    // completes (debounce + apiPost RTT + fs flush often >2 s under
+    // any load), readShortcutsFromConfig returns the OLD shortcut and
+    // we re-register the very accelerator the user just changed away
+    // from. The pending flag is consumed but its payload is discarded.
+    // Result: the displayed shortcut updates in the UI but the actual
+    // global hotkey remains the previous binding. Routing the pending
+    // payload through `override` removes the disk-write dependency
+    // entirely — registration uses exactly what the user pressed.
+    //
+    // Defensive fallback: if `override` is partial (only `record` or
+    // only `paste`) we fill the missing half from disk so we never
+    // unregister an accelerator without re-registering its replacement.
+    let shortcuts;
+    if (override && (override.record || override.paste)) {
+      const fromDisk = (override.record && override.paste) ? null : readShortcutsFromConfig();
+      shortcuts = {
+        record: String(override.record || (fromDisk && fromDisk.record) || "").trim(),
+        paste: String(override.paste || (fromDisk && fromDisk.paste) || "").trim(),
+      };
+    } else {
+      shortcuts = readShortcutsFromConfig();
+    }
     // Unregister old shortcuts (keep devtools)
     if (registeredRecordHotkey) {
       try { globalShortcut.unregister(registeredRecordHotkey); } catch { }
@@ -6574,7 +6607,11 @@ app.whenReady().then(async () => {
       );
       if (pending && (pending.record || pending.paste)) {
         appendMainLog(`[shortcuts] live reload: record=${pending.record} paste=${pending.paste}`);
-        registerGlobalShortcuts();
+        // Pass the in-memory payload directly. registerGlobalShortcuts
+        // will NOT re-read disk for these values, eliminating the
+        // pending-vs-disk-write race that silently rebound users to
+        // the OLD accelerator after Settings → Shortcuts capture.
+        registerGlobalShortcuts({ record: pending.record, paste: pending.paste });
       }
     } catch { }
   // Match accessibilityPollTimer: `.unref` so this refed timer
