@@ -3204,6 +3204,14 @@ canvas,
   justify-content: space-between;
 }
 
+.upload-queue-item-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .upload-queue-item-name {
   font-size: 13px;
   font-weight: 500;
@@ -3211,8 +3219,19 @@ canvas,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  flex: 1 1 auto;
-  min-width: 0;
+}
+
+.upload-queue-item-size {
+  font-size: 11px;
+  color: var(--text-2, #6b7280);
+  font-variant-numeric: tabular-nums;
+}
+
+.upload-queue-item-tail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .upload-queue-item-status {
@@ -3223,6 +3242,62 @@ canvas,
   background: var(--surface-3, #2a2a2a);
   color: var(--text-2, #9ca3af);
   white-space: nowrap;
+}
+
+.upload-queue-item-remove {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--text-2, #6b7280);
+  font-size: 18px;
+  line-height: 1;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms ease, color 120ms ease;
+}
+.upload-queue-item-remove:hover,
+.upload-queue-item-remove:focus-visible {
+  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
+  color: var(--danger-text, #ff8080);
+  outline: none;
+}
+
+.upload-queue-item-progress {
+  margin-top: 8px;
+  height: 3px;
+  background: var(--surface-3, #2a2a2a);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.upload-queue-item-progress-bar {
+  width: 30%;
+  height: 100%;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    var(--primary, #6c90c6) 50%,
+    transparent 100%);
+  animation: upload-progress-shift 1.4s linear infinite;
+}
+
+@keyframes upload-progress-shift {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(450%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upload-queue-item-progress-bar {
+    animation: none;
+    width: 100%;
+    background: var(--primary, #6c90c6);
+    opacity: 0.5;
+  }
 }
 
 .upload-queue-item--transcribing .upload-queue-item-status { background: var(--primary-bg, #1e2a3a); color: var(--primary, #79b6ff); }

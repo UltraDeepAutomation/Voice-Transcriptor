@@ -93,7 +93,14 @@
     a ``data-state="error"`` attribute so CSS can swap colors + show
     the retry button without requiring class mutation from JS.
   -->
-  <div class="boot-overlay" id="bootOverlay" aria-live="polite" data-state="loading">
+  <!-- Pass-28: hidden by default. Electron's main process now waits
+       for /api/health to respond OK BEFORE loading the renderer URL,
+       so by the time the user sees this DOM the backend is already
+       up. The overlay still exists as a render target for
+       `__setBackendBootError` (used only if the backend later dies
+       and a fresh window load can't reach /api/health) — JS toggles
+       `[hidden]` off when there's something to show. -->
+  <div class="boot-overlay" id="bootOverlay" aria-live="polite" data-state="loading" hidden>
     <div class="boot-overlay-card">
       <div class="boot-overlay-spinner" aria-hidden="true"></div>
       <div class="boot-overlay-title">Transcriptor</div>

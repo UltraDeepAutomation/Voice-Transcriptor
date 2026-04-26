@@ -2570,7 +2570,24 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
 // input-language switcher, also impossible to press on US keyboards
 // because Shift+digit produces punctuation). Users can still rebind
 // via Settings → Shortcuts.
-const DEFAULT_SHORTCUTS = { record: "F9", paste: "F10" };
+// Platform-specific defaults — kept in lockstep with desktop/main.js
+// `readShortcutsFromConfig`. F-keys conflict with macOS media-key
+// mode (F9=Mission Control, F10=Notification Center), so Mac gets
+// Option-based combos. Win/Linux F-keys are clean and avoid Alt+Left
+// = browser-back / Alt+Shift+letter = Windows input-language switch.
+const _platformDefaultShortcuts: Record<string, { record: string; paste: string }> = {
+  // navigator.platform is the only reliable in-renderer probe; we
+  // can't import process.platform here.
+  darwin: { record: "Alt+Left", paste: "Alt+Shift+V" },
+  default: { record: "F9", paste: "F10" },
+};
+const _isMacRenderer = (() => {
+  try {
+    return /Mac|iPhone|iPad/.test(navigator.platform || "")
+        || /Mac OS X/.test(navigator.userAgent || "");
+  } catch { return false; }
+})();
+const DEFAULT_SHORTCUTS = _isMacRenderer ? _platformDefaultShortcuts.darwin : _platformDefaultShortcuts.default;
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 
@@ -2602,10 +2619,30 @@ function acceleratorToDisplay(acc: string): string {
 
 /** Convert KeyboardEvent → Electron accelerator string */
 function keyEventToAccelerator(e: KeyboardEvent): string | null {
-  // Must have at least one modifier
-  if (!e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) return null;
-  // Ignore standalone modifier keys
+  // Ignore standalone modifier keys (still being held down).
   if (["Alt", "Control", "Meta", "Shift"].includes(e.key)) return null;
+  // Standalone (no-modifier) keys are allowed when the key is a
+  // function-row key (F1–F12), an arrow / nav key, or another
+  // dedicated control key. These are safe to bind alone because
+  // they don't conflict with normal text input. Letter / digit /
+  // punctuation standalone bindings would steal user typing in
+  // the renderer, so those still REQUIRE at least one modifier.
+  // Without this gate the Settings → Shortcuts capture refused
+  // every press of F9/F10/Arrow/etc. and silently never bound.
+  const hasModifier = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
+  const code = String(e.code || "").trim();
+  const key = String(e.key || "").trim();
+  const isFunctionKey = /^F\d{1,2}$/.test(key) || /^F\d{1,2}$/.test(code);
+  const isStandaloneAllowed = (
+    isFunctionKey
+    || key === "ArrowLeft" || key === "ArrowRight" || key === "ArrowUp" || key === "ArrowDown"
+    || code === "ArrowLeft" || code === "ArrowRight" || code === "ArrowUp" || code === "ArrowDown"
+    || key === "Home" || key === "End" || key === "PageUp" || key === "PageDown"
+    || key === "Insert" || key === "Delete"
+    || code === "Home" || code === "End" || code === "PageUp" || code === "PageDown"
+    || code === "Insert" || code === "Delete"
+  );
+  if (!hasModifier && !isStandaloneAllowed) return null;
 
   const parts: string[] = [];
   // Separate Control (Ctrl) from Command (Meta/Cmd) unless BOTH are
@@ -2625,8 +2662,8 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   // macOS / Windows / Linux. For punctuation we still accept the
   // actual emitted ASCII symbol first because Electron accelerators
   // are defined in terms of symbols, not DOM code names.
-  const code = String(e.code || "").trim();
-  const key = String(e.key || "").trim();
+  // (`code` and `key` already declared above for the standalone-allowed
+  // gate; reuse those values here.)
   let mapped: string | null = null;
   if (/^Key[A-Z]$/.test(code)) mapped = code.slice(3);
   else if (/^Digit[0-9]$/.test(code)) mapped = code.slice(5);
@@ -3336,26 +3373,22 @@ async function loadCfg(): Promise<void> {
     }
     await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
-    // Load keyboard shortcuts, migrating deprecated 1.0-alpha defaults.
-    // Alt+Left silently hijacked the browser "Back" navigation; Alt+Shift+7
-    // is literally unpressable on US/UK layouts (Shift+7 produces '&'
-    // not '7') and collides with the Windows Alt+Shift input-language
-    // switcher. Users upgrading from a build where those were defaults
-    // must be migrated to the new F9/F10 defaults, otherwise their
-    // persisted config values ride forward and the shortcut feature
-    // remains broken for them forever.
-    const LEGACY_DEPRECATED_SHORTCUTS = new Set(["Alt+Left", "Alt+Shift+7"]);
+    // Load keyboard shortcuts. Defaults are platform-specific
+    // (DEFAULT_SHORTCUTS at module scope) — Mac=Option+Left/Shift+V,
+    // Win/Linux=F9/F10. We previously hard-migrated `Alt+Left` and
+    // `Alt+Shift+7` to F9/F10 unconditionally, which clobbered the
+    // valid Mac default. The migration is removed now: any
+    // user-saved value is honored as-is, and ONLY the legacy
+    // `Alt+Shift+7` (literally unpressable — Shift+7=`&` on US/UK)
+    // is rewritten because it never worked anywhere.
     const rawRecord = String(ui.shortcut_record || "").trim();
     const rawPaste = String(ui.shortcut_paste || "").trim();
-    const recordIsLegacy = rawRecord && LEGACY_DEPRECATED_SHORTCUTS.has(rawRecord);
-    const pasteIsLegacy = rawPaste && LEGACY_DEPRECATED_SHORTCUTS.has(rawPaste);
-    if (rawRecord && !recordIsLegacy) currentShortcuts.record = rawRecord;
-    if (rawPaste && !pasteIsLegacy) currentShortcuts.paste = rawPaste;
+    if (rawRecord) currentShortcuts.record = rawRecord;
+    // Only reject the truly broken legacy paste shortcut.
+    if (rawPaste && rawPaste !== "Alt+Shift+7") currentShortcuts.paste = rawPaste;
     updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
     updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
-    if (recordIsLegacy || pasteIsLegacy) {
-      // Persist the migration so Electron's shortcut poll picks up the
-      // new defaults and the user doesn't re-migrate every launch.
+    if (rawPaste === "Alt+Shift+7") {
       (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
         record: currentShortcuts.record,
         paste: currentShortcuts.paste,
@@ -8129,6 +8162,28 @@ function uploadStatusLabel(item: UploadQueueItem): string {
   }
 }
 
+function formatUploadFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function removeUploadItem(id: string): void {
+  const idx = uploadQueue.findIndex((it) => it.id === id);
+  if (idx === -1) return;
+  const item = uploadQueue[idx];
+  // Don't yank an item out from under the active processor — it
+  // would orphan the in-flight network request and the result
+  // would arrive but have nowhere to land. The user can still
+  // drop it via Clear after it finishes (it lands in History
+  // anyway via auto-save).
+  if (item.status === "transcribing") return;
+  uploadQueue.splice(idx, 1);
+  renderUploadQueue();
+}
+
 function renderUploadQueue(): void {
   const list = document.getElementById("uploadQueueList") as HTMLUListElement | null;
   const empty = document.getElementById("uploadEmptyState");
@@ -8156,18 +8211,64 @@ function renderUploadQueue(): void {
   for (const item of uploadQueue) {
     const li = document.createElement("li");
     li.className = `upload-queue-item upload-queue-item--${item.status}`;
+
     const header = document.createElement("div");
     header.className = "upload-queue-item-header";
+
+    const meta = document.createElement("div");
+    meta.className = "upload-queue-item-meta";
     const name = document.createElement("span");
     name.className = "upload-queue-item-name";
     name.textContent = item.file.name;
     name.title = item.file.name;
-    header.appendChild(name);
+    meta.appendChild(name);
+    const sizeStr = formatUploadFileSize(item.file.size);
+    if (sizeStr) {
+      const size = document.createElement("span");
+      size.className = "upload-queue-item-size";
+      size.textContent = sizeStr;
+      meta.appendChild(size);
+    }
+    header.appendChild(meta);
+
+    const tail = document.createElement("div");
+    tail.className = "upload-queue-item-tail";
     const status = document.createElement("span");
     status.className = "upload-queue-item-status";
     status.textContent = uploadStatusLabel(item);
-    header.appendChild(status);
+    tail.appendChild(status);
+    // Per-item delete (X). Kept off `transcribing` items because we
+    // can't reliably abort an in-flight remoteJobSync without a per-
+    // request abort controller threaded through the pipeline.
+    if (item.status !== "transcribing") {
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "upload-queue-item-remove";
+      removeBtn.setAttribute("aria-label", "Remove from queue");
+      removeBtn.title = "Remove from queue";
+      removeBtn.textContent = "×";
+      removeBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        removeUploadItem(item.id);
+      });
+      tail.appendChild(removeBtn);
+    }
+    header.appendChild(tail);
     li.appendChild(header);
+
+    if (item.status === "transcribing") {
+      // Indeterminate progress bar while the transcription is in
+      // flight. The backend doesn't stream per-file progress for
+      // the upload path, so a determinate bar would lie; an
+      // animated bar communicates "working" without false precision.
+      const progress = document.createElement("div");
+      progress.className = "upload-queue-item-progress";
+      const bar = document.createElement("div");
+      bar.className = "upload-queue-item-progress-bar";
+      progress.appendChild(bar);
+      li.appendChild(progress);
+    }
+
     if (item.status === "done" && item.text) {
       const body = document.createElement("div");
       body.className = "upload-queue-item-body";

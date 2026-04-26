@@ -5850,30 +5850,17 @@ async function createWindow(options = {}) {
     if (!backend) {
       await startBackend();
     }
-    // Progressive UI: show a lightweight "Starting up…" page
-    // IMMEDIATELY rather than making the user stare at a blank window
-    // for 5–60 s while the backend cold-starts (bundled Python unpack
-    // + Whisper model warm). The loader is a pure data: URL so it
-    // renders instantly — no backend dependency. Once /api/health
-    // responds OK we swap to the real frontend URL. Previously the
-    // user saw either a blank window or, on failure, the scary
-    // "Backend startup failed" page as their FIRST impression of the
-    // app — a launch-killing UX regression on slow corporate Win
-    // machines where AV scans the bundled python.exe on first run.
-    try {
-      await win.loadURL(_bootLoadingDataUrl(logPathForLoader()));
-      if (showWindow) {
-        win.show();
-        win.focus();
-      }
-    } catch (loaderErr) {
-      appendMainLog(`[boot] loader page failed: ${loaderErr?.message || loaderErr}`);
-      // Non-fatal — if we can't load even the loader, the real URL
-      // load below will also likely fail and hit the error branch.
-    }
-    // 60 s is a reasonable ceiling: cold-start on a fresh install with
-    // bundled runtime is typically <5 s; a 120 s budget just delays
-    // the eventual error feedback without ever helping real users.
+    // Per-user-decision (pass 28): NO BOOT LOADER. The window stays
+    // hidden during the cold-start window; once /api/health responds
+    // OK we load the real URL and reveal the window. This avoids
+    // the "Starting Transcriptor…" pulse screen the user finds
+    // distracting, while ALSO avoiding the alternative regression
+    // (blank window for 5–60 s) — by staying hidden we show
+    // nothing at all until the app is genuinely ready.
+    //
+    // 60 s ceiling: cold-start on a fresh install with bundled
+    // runtime is typically <5 s; the budget just bounds the wait
+    // before the catch branch surfaces a real error to the user.
     await waitForHttp(`${BASE_URL}/api/health`, 60_000);
     // Backend is healthy — treat this as a successful recovery signal
     // and clear the restart-attempt counter. Without this reset the
@@ -5898,9 +5885,10 @@ async function createWindow(options = {}) {
     }
     await refreshWindowForFrontendBuild(true);
     await win.loadURL(url);
-    // Window is already shown (above) in the progressive-UI path,
-    // but keep this guard for the `showWindow=false` background
-    // mode where we skipped the early show() entirely.
+    // Reveal NOW that the real frontend is loaded and the backend is
+    // healthy. Skipping the loader page (pass 28) means this is the
+    // very first time the user sees a window — no transition flash,
+    // no "starting up" UI, just the ready app.
     if (showWindow && !win.isVisible()) {
       win.show();
       win.focus();
@@ -6303,9 +6291,22 @@ app.whenReady().then(async () => {
   let registeredPasteHotkey = "";
 
   function readShortcutsFromConfig() {
-    // Must match DEFAULT_SHORTCUTS in frontend/src/main.tsx. F9/F10 are
-    // cross-platform-safe: no built-in app binding on Win/Mac/Linux.
-    const defaults = { record: "F9", paste: "F10" };
+    // Must match DEFAULT_SHORTCUTS in frontend/src/main.tsx.
+    //
+    // Platform-specific defaults — F-keys on Mac fight the OS:
+    // F9 = Mission Control / F10 = Notification Center under the
+    // default "media keys" mode, so users had to either hold Fn or
+    // toggle the OS setting before our hotkey did anything. On
+    // Win/Linux F-keys are clean — no built-in app binding.
+    //
+    // Mac: Option+Left for record (Option = "Alt" in Electron's
+    //      accelerator vocabulary; both left and right Option work),
+    //      Option+Shift+V for paste-last (avoids the Shift+7=`&`
+    //      quirk on US/UK layouts that broke Alt+Shift+7).
+    // Win/Linux: F9 / F10 (clean function keys).
+    const defaults = process.platform === "darwin"
+      ? { record: "Alt+Left", paste: "Alt+Shift+V" }
+      : { record: "F9", paste: "F10" };
     try {
       const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
       const cfgPath = path.join(dataDir, "config.json");
