@@ -44,6 +44,14 @@ interface AppConfig {
       remote_model_deepgram?: string;
       shortcut_record?: string;
       shortcut_paste?: string;
+      // Upload tab persistent state — provider/language/diarize were
+      // previously DOM-only and reset to defaults on every app launch.
+      // Mirrored into the same ``preferences.ui`` namespace as the
+      // Live tab keys (``provider``, ``language``) — separate keys so
+      // the two tabs don't fight over the same value.
+      upload_provider?: string;
+      upload_language?: string;
+      upload_diarize?: boolean;
     };
   };
 }
@@ -2559,6 +2567,12 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0],
     shortcut_record: currentShortcuts.record,
     shortcut_paste: currentShortcuts.paste,
+    // Upload tab — mirrors current DOM values. Optional-chained because
+    // setupUploadView may not have run yet on a page that loaded
+    // without the Upload section (defensive against future view splits).
+    upload_provider: ((document.getElementById("uploadProvider") as HTMLSelectElement | null)?.value || "deepgram").trim(),
+    upload_language: ((document.getElementById("uploadLanguage") as HTMLSelectElement | null)?.value || "auto").trim(),
+    upload_diarize: !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked,
   };
 }
 
@@ -3373,6 +3387,30 @@ async function loadCfg(): Promise<void> {
     }
     await loadUpscalePresets(pendingUpscalePresetId);
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
+
+    // Upload tab — restore persisted provider/language/diarize. Each
+    // input is guarded so a config carried over from a build without
+    // the Upload tab (or with a different option set) gracefully falls
+    // through to the HTML default instead of crashing on missing DOM.
+    const uploadProviderEl = document.getElementById("uploadProvider") as HTMLSelectElement | null;
+    if (uploadProviderEl && ui.upload_provider) {
+      const wanted = String(ui.upload_provider).trim();
+      if (Array.from(uploadProviderEl.options).some((o) => o.value === wanted)) {
+        uploadProviderEl.value = wanted;
+      }
+    }
+    const uploadLanguageEl = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
+    if (uploadLanguageEl && ui.upload_language) {
+      const wanted = String(ui.upload_language).trim();
+      if (Array.from(uploadLanguageEl.options).some((o) => o.value === wanted)) {
+        uploadLanguageEl.value = wanted;
+      }
+    }
+    const uploadDiarizeEl = document.getElementById("uploadDiarize") as HTMLInputElement | null;
+    if (uploadDiarizeEl && typeof ui.upload_diarize === "boolean") {
+      uploadDiarizeEl.checked = ui.upload_diarize;
+    }
+
     // Load keyboard shortcuts. Defaults are platform-specific
     // (DEFAULT_SHORTCUTS at module scope) — Mac=Option+Left/Shift+V,
     // Win/Linux=F9/F10.
@@ -7946,7 +7984,22 @@ function setupUploadView(): void {
   const fileInput = document.getElementById("uploadLargeFileInput") as HTMLInputElement | null;
   const provider = document.getElementById("uploadProvider") as HTMLSelectElement | null;
   const language = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
+  const diarize = document.getElementById("uploadDiarize") as HTMLInputElement | null;
   if (!dropZone || !fileInput || !provider || !language) return;
+  // Persist Upload-tab state across launches. Without this every
+  // app start reset the provider to the HTML default ("Deepgram")
+  // even when the user routinely worked with Local Whisper or
+  // OpenRouter — silent UX regression. The autosave debouncer +
+  // queueUiPreferencesSave write to /api/config in the same
+  // ``preferences.ui`` payload as Live-tab settings.
+  provider.addEventListener("change", () => {
+    queueUiPreferencesSave();
+    updateUploadProviderHint();
+  });
+  language.addEventListener("change", () => queueUiPreferencesSave());
+  if (diarize) {
+    diarize.addEventListener("change", () => queueUiPreferencesSave());
+  }
   // Click anywhere on the drop zone (except interactive children) opens
   // the native file picker.
   dropZone.addEventListener("click", (e) => {

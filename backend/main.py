@@ -39,6 +39,7 @@ from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_
 from backend.storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from backend.live import LiveSession
 from backend.jobs import JobStore
+from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
 from backend.remote_deepgram_live import (
@@ -287,14 +288,17 @@ LIVE_RECOVERY_RETENTION_SEC = _env_int("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 ALLOWED_REMOTE_PROVIDERS = {"openrouter", "deepgram"}
 ALLOWED_AUDIO_EXTS = {
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".flac",
-    ".ogg",
-    ".aac",
-    ".mp4",
-    ".webm",
+    # Audio containers — natively understood by Deepgram REST and the
+    # OpenRouter audio-input pipeline.
+    ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".opus",
+    ".aac", ".webm", ".wma",
+    # Video containers — accepted because the Upload UI's accept attr
+    # is ``audio/*,video/*`` and users routinely drop screen recordings.
+    # Deepgram natively understands mp4/m4v; other containers fall
+    # through to the ffmpeg path in audio.ensure_wav_16k for remote
+    # transcription. Without these the validator returned HTTP 400
+    # before the audio extraction code even saw the file.
+    ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".mpg", ".mpeg", ".3gp",
 }
 LIVE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -2837,7 +2841,13 @@ async def create_remote_job(
             )
         except ValueError as e:
             jobs.set_error(job_id, f"bad_request: {_safe_error_text(e)}")
-        except (OpenRouterError, DeepgramRemoteError) as e:
+        except RemoteError as e:
+            # Catches BOTH provider-specific subclasses (OpenRouterError,
+            # DeepgramRemoteError raised inside their respective modules)
+            # AND the bare base RemoteError raised by http_retry.request_
+            # with_retry on network-layer failures (DNS, TCP reset, TLS,
+            # HTTP timeout). Listing only subclasses here would miss
+            # network errors and surface them as opaque HTTP 500s.
             jobs.set_error(job_id, _safe_error_text(e))
         except Exception as e:
             logger.exception("remote transcription job failed (job_id=%s)", job_id)
@@ -2909,7 +2919,10 @@ async def remote_transcribe_sync(
         return {"ok": True, "result": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e))
-    except (OpenRouterError, DeepgramRemoteError) as e:
+    except RemoteError as e:
+        # See create_remote_job's matching handler for the hierarchy
+        # rationale — base RemoteError covers http_retry network errors
+        # that the typed subclasses miss.
         raise HTTPException(status_code=502, detail=_safe_error_text(e))
     except Exception as e:
         logger.exception("remote_transcribe_sync failed")
