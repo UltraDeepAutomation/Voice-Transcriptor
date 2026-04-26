@@ -3375,20 +3375,43 @@ async function loadCfg(): Promise<void> {
     syncQuickSettingsVisibility(ui.quick_settings_open === true);
     // Load keyboard shortcuts. Defaults are platform-specific
     // (DEFAULT_SHORTCUTS at module scope) — Mac=Option+Left/Shift+V,
-    // Win/Linux=F9/F10. We previously hard-migrated `Alt+Left` and
-    // `Alt+Shift+7` to F9/F10 unconditionally, which clobbered the
-    // valid Mac default. The migration is removed now: any
-    // user-saved value is honored as-is, and ONLY the legacy
-    // `Alt+Shift+7` (literally unpressable — Shift+7=`&` on US/UK)
-    // is rewritten because it never worked anywhere.
-    const rawRecord = String(ui.shortcut_record || "").trim();
-    const rawPaste = String(ui.shortcut_paste || "").trim();
+    // Win/Linux=F9/F10.
+    //
+    // One-time migration paths for users carrying forward stale
+    // values from earlier builds:
+    //   1. `Alt+Shift+7` (any platform) → platform default's paste.
+    //      Literally unpressable on US/UK layouts (Shift+7=`&`)
+    //      and collides with Win Alt+Shift = input-language switch.
+    //   2. `F9` / `F10` ON MACOS → Mac default Alt+Left / Alt+Shift+V.
+    //      Pass-15 set F9/F10 as the cross-platform default; on Mac
+    //      F9 is Mission Control and F10 is Notification Center, so
+    //      a Mac user saved an effectively non-functional shortcut
+    //      via the default. We rewrite ONLY the exact F9/F10 pair —
+    //      a Mac user who DELIBERATELY chose F11 / Cmd+Shift+T / etc.
+    //      is left untouched.
+    let rawRecord = String(ui.shortcut_record || "").trim();
+    let rawPaste = String(ui.shortcut_paste || "").trim();
+    let didMigrate = false;
+    // Migration 1: broken paste shortcut.
+    if (rawPaste === "Alt+Shift+7") {
+      rawPaste = DEFAULT_SHORTCUTS.paste;
+      didMigrate = true;
+    }
+    // Migration 2: Mac users with the stale F9/F10 cross-platform
+    // pair. Both must match exactly; partial matches mean the user
+    // customised one half and we leave both alone.
+    if (_isMacRenderer && rawRecord === "F9" && rawPaste === "F10") {
+      rawRecord = DEFAULT_SHORTCUTS.record;  // Alt+Left
+      rawPaste = DEFAULT_SHORTCUTS.paste;    // Alt+Shift+V
+      didMigrate = true;
+    }
     if (rawRecord) currentShortcuts.record = rawRecord;
-    // Only reject the truly broken legacy paste shortcut.
-    if (rawPaste && rawPaste !== "Alt+Shift+7") currentShortcuts.paste = rawPaste;
+    if (rawPaste) currentShortcuts.paste = rawPaste;
     updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
     updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
-    if (rawPaste === "Alt+Shift+7") {
+    if (didMigrate) {
+      // Persist + signal Electron to re-register globalShortcut
+      // with the new accelerators on the next 2 s poll tick.
       (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
         record: currentShortcuts.record,
         paste: currentShortcuts.paste,
