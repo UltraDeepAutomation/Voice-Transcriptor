@@ -1320,6 +1320,15 @@ textarea:focus-visible,
   box-shadow: 0 0 0 1px rgba(92, 156, 245, 0.22);
 }
 
+/* Pure grey-tone toggle — used in the Upload tab where the user
+   asked for "оттенки серого как везде". Driven entirely by design
+   tokens so theme tweaks flow through without re-editing this rule. */
+.toggle-inline.toggle-neutral input:checked {
+  background: var(--surface-3, #3a3a3a);
+  border-color: var(--text-2, #6b7280);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
 .toggle-inline.toggle-purple input:checked {
   background: #5a2f87;
   border-color: #9c6ccc;

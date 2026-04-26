@@ -1684,13 +1684,21 @@ function createOverlayHtml() {
         // focus to fire its click handler.
         const secsBounds = { min: 1, max: 120 };
         const emitSecs = (v) => {
-          // Must NOT use ``|| 2`` fallback on the rounded value —
+          // Must NOT use a "|| 2" fallback on the rounded value —
           // that turns a legitimate Math.round(0) into 2 AFTER the
           // clamp's floor is supposed to take over. Scenario: user
           // at value 1 clicks minus → readSecs=1 → 1-1=0 → Math.round(0)=0
           // → 0||2 → 2. Sign-inverted: the minus button INCREMENTS
           // the value at the min boundary. Handle NaN explicitly
           // instead, so the clamp does its own floor.
+          //
+          // CRITICAL: this comment lives INSIDE the createOverlayHtml
+          // template literal (backtick-delimited). The previous form
+          // used double backticks (``|| 2``) for emphasis, but those
+          // backticks PARSED AS TEMPLATE LITERAL DELIMITERS and broke
+          // the entire createOverlayHtml — every shortcut call that
+          // tried to render the overlay threw "...is not a function".
+          // Always use plain quotes inside this template body.
           const raw = Number(v);
           const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
           const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
