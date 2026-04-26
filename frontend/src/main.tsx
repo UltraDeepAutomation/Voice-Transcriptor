@@ -1774,7 +1774,23 @@ async function remoteJob(
 
 async function remoteJobSync(
   file: File,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
+  opts: {
+    provider: Provider;
+    language: string;
+    diarize: boolean;
+    openrouterModel?: string;
+    signal?: AbortSignal;
+    /**
+     * Optional upload-progress callback. Receives a 0..1 fraction
+     * during the request-body upload phase. Browsers' ``fetch``
+     * doesn't expose a request-body progress event, so when this
+     * callback is provided we route through XMLHttpRequest instead
+     * (which surfaces ``upload.onprogress``). Without a callback,
+     * we still use ``fetch`` for the lower memory footprint on
+     * the response side.
+     */
+    onUploadProgress?: (fraction: number) => void;
+  }
 ): Promise<{ text: string; provider: string; model?: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
@@ -1783,6 +1799,68 @@ async function remoteJobSync(
   fd.set("diarize", String(!!opts.diarize));
   if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
+  }
+  // XHR branch — used when caller wants an upload-progress %. Browsers'
+  // ``fetch`` does not surface request-body progress events (the spec
+  // is still a draft); XHR's ``upload.onprogress`` is the only
+  // cross-browser path. We mirror fetch's contract: AbortSignal
+  // support + the same response shape + the same parseError-style
+  // error messages.
+  if (opts.onUploadProgress) {
+    return await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/remote/transcribe-sync", true);
+      const authHdrs = authHeaders();
+      for (const [k, v] of Object.entries(authHdrs)) {
+        xhr.setRequestHeader(k, String(v));
+      }
+      xhr.responseType = "text";
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && e.total > 0) {
+          const f = Math.max(0, Math.min(1, e.loaded / e.total));
+          opts.onUploadProgress!(f);
+        }
+      };
+      xhr.upload.onload = () => opts.onUploadProgress!(1);
+      xhr.onerror = () => reject(new Error("network error"));
+      xhr.ontimeout = () => reject(new Error("request timed out"));
+      xhr.onload = () => {
+        if (xhr.status >= 400) {
+          let msg = `HTTP ${xhr.status}`;
+          try {
+            const parsed = JSON.parse(xhr.responseText || "{}") as { detail?: string };
+            if (parsed.detail) msg = String(parsed.detail);
+          } catch { /* fall through */ }
+          reject(new Error(msg));
+          return;
+        }
+        try {
+          const js = JSON.parse(xhr.responseText || "{}") as { result?: { text?: string; provider?: string; model?: string } };
+          resolve({
+            text: String(js?.result?.text || "").trim(),
+            provider: String(js?.result?.provider || opts.provider || ""),
+            model: String(js?.result?.model || "").trim() || undefined,
+          });
+        } catch (e) {
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      };
+      // AbortSignal → xhr.abort. Mirror DOMException name="AbortError"
+      // so callers' ``e instanceof DOMException && e.name === "AbortError"``
+      // checks work the same way for both fetch and XHR paths.
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          xhr.abort();
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        opts.signal.addEventListener("abort", () => {
+          xhr.abort();
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      }
+      xhr.send(fd);
+    });
   }
   const r = await fetch("/api/remote/transcribe-sync", {
     method: "POST",
@@ -4279,6 +4357,19 @@ async function openRecording(name: string): Promise<void> {
       player.load();
       audioRow.hidden = true;
     }
+    // Reveal-in-Finder button — surfaced when running inside Electron
+    // (``__transcriptorRevealRecording`` injected by main.tsx and
+    // dispatched by main.js via the page-title-updated channel).
+    // Hidden in plain-browser dev preview where the helper is undefined.
+    const revealBtn = document.getElementById("recordingRevealBtn") as HTMLButtonElement | null;
+    if (revealBtn) {
+      const hasReveal = typeof window.__transcriptorRevealRecording === "function";
+      revealBtn.hidden = !hasReveal;
+      revealBtn.onclick = () => {
+        const fn = window.__transcriptorRevealRecording;
+        if (fn) fn(name, currentArchiveDirSnapshot());
+      };
+    }
     updateRecordingCopyState();
   } catch (e) {
     if (requestSeq !== recordingOpenRequestSeq || selectedRecordingName !== name) return;
@@ -4293,6 +4384,8 @@ async function openRecording(name: string): Promise<void> {
     player.removeAttribute("src");
     player.load();
     $("recordingAudioRow").hidden = true;
+    const revealBtn = document.getElementById("recordingRevealBtn") as HTMLButtonElement | null;
+    if (revealBtn) revealBtn.hidden = true;
     updateRecordingCopyState();
   }
 }
@@ -7969,6 +8062,12 @@ interface UploadQueueItem {
   //   none      → status's own label (done/error/cancelled)
   status: "queued" | "transcribing" | "done" | "error" | "cancelled";
   stage?: "queued" | "uploading" | "processing" | "done";
+  /**
+   * 0..1 fraction of the upload-body byte progress, populated only
+   * during the ``uploading`` stage. ``undefined`` once the request
+   * body has been fully sent and the backend is processing.
+   */
+  uploadProgress?: number;
   text?: string;
   error?: string;
   startedAt?: number;
@@ -8250,6 +8349,22 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         diarize,
         openrouterModel: modelLabel,
         signal: item.abortController.signal,
+        // Real upload-byte progress via XHR. The crossover-timer
+        // above is still wired up as a safety net (in case the
+        // browser's XHR doesn't fire ``upload.onload`` for some
+        // reason), but the user now sees a real %% during the
+        // body upload phase.
+        onUploadProgress: (f) => {
+          if (item.status !== "transcribing") return;
+          item.uploadProgress = f;
+          if (f >= 0.999) {
+            // Body fully sent → switch to processing without waiting
+            // for the size-proportional crossover timer.
+            item.stage = "processing";
+            item.uploadProgress = undefined;
+          }
+          renderUploadQueue();
+        },
       });
       text = String(out.text || "").trim();
     }
@@ -8321,14 +8436,22 @@ function uploadStatusLabel(item: UploadQueueItem): string {
     case "queued":
       return "Queued";
     case "transcribing":
-      // Granular stage labels — user explicitly asked for "видеть, на
-      // какой процент он транскрибирован" + "видео превращается в
-      // аудио, потом аудио". We don't have a true byte-progress
-      // signal from the backend (no SSE stream), so we surface the
-      // CLIENT-side phase labels: uploading-the-body vs waiting-for-
-      // the-backend-to-decode-and-transcribe. Better than a flat
-      // "Transcribing…" that idles for 30s on a 50 MB video.
-      if (item.stage === "uploading") return "Uploading…";
+      // Three labelled phases inside the outer "transcribing" status:
+      //   uploading  → real % from XHR.upload.onprogress (user asked
+      //                "на какой процент он транскрибирован"; this is
+      //                the only phase where a true % exists — once
+      //                bytes are at the backend, no SSE stream surfaces
+      //                ffmpeg / Deepgram progress).
+      //   processing → backend is decoding video / running provider
+      //                ("Processing…" — better than a stuck percentage).
+      //   none       → fallback when neither stage was set (transient
+      //                window between latch and first progress event).
+      if (item.stage === "uploading") {
+        const pct = typeof item.uploadProgress === "number"
+          ? Math.round(item.uploadProgress * 100)
+          : null;
+        return pct !== null ? `Uploading · ${pct}%` : "Uploading…";
+      }
       if (item.stage === "processing") return "Processing…";
       return "Transcribing…";
     case "done": {
@@ -8482,14 +8605,20 @@ function renderUploadQueue(): void {
     li.appendChild(header);
 
     if (item.status === "transcribing") {
-      // Indeterminate progress bar while the transcription is in
-      // flight. The backend doesn't stream per-file progress for
-      // the upload path, so a determinate bar would lie; an
-      // animated bar communicates "working" without false precision.
+      // Determinate bar during ``uploading`` (real % from XHR);
+      // indeterminate animated bar during ``processing`` (no
+      // backend progress stream, so a determinate bar would lie).
       const progress = document.createElement("div");
       progress.className = "upload-queue-item-progress";
       const bar = document.createElement("div");
-      bar.className = "upload-queue-item-progress-bar";
+      const hasPct = item.stage === "uploading"
+        && typeof item.uploadProgress === "number";
+      if (hasPct) {
+        bar.className = "upload-queue-item-progress-bar is-determinate";
+        bar.style.width = `${Math.max(2, Math.round((item.uploadProgress || 0) * 100))}%`;
+      } else {
+        bar.className = "upload-queue-item-progress-bar";
+      }
       progress.appendChild(bar);
       li.appendChild(progress);
     }
