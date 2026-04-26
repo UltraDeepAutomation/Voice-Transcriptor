@@ -7913,12 +7913,13 @@ if (_bootRetry) {
 interface UploadQueueItem {
   id: string;
   file: File;
-  status: "queued" | "transcribing" | "done" | "error";
+  status: "queued" | "transcribing" | "done" | "error" | "cancelled";
   text?: string;
   error?: string;
   startedAt?: number;
   endedAt?: number;
   provider?: Provider;
+  abortController?: AbortController;
 }
 
 const uploadQueue: UploadQueueItem[] = [];
@@ -8014,7 +8015,9 @@ function setupUploadView(): void {
       // never aborted by an accidental Clear click.
       for (let i = uploadQueue.length - 1; i >= 0; i--) {
         const st = uploadQueue[i].status;
-        if (st === "done" || st === "error") uploadQueue.splice(i, 1);
+        if (st === "done" || st === "error" || st === "cancelled") {
+          uploadQueue.splice(i, 1);
+        }
       }
       renderUploadQueue();
     });
@@ -8106,8 +8109,17 @@ async function runUploadProcessor(): Promise<void> {
 }
 
 async function processUploadItem(item: UploadQueueItem): Promise<void> {
+  // Cancellation guard: if the user hit Cancel before this item
+  // reached the head of the queue, it's already in cancelled
+  // state — don't transition it back to transcribing.
+  if (item.status === "cancelled") return;
   item.status = "transcribing";
   item.startedAt = performance.now();
+  // Per-item AbortController. Threaded through every fetch so
+  // the user's Stop button can yank the in-flight request even
+  // if the network is mid-stream. We attach it to the item so
+  // `cancelUploadItem` can find and call abort().
+  item.abortController = new AbortController();
   renderUploadQueue();
   const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
   const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
@@ -8131,6 +8143,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         model: modelLabel,
         splitStereo: true,
         wordTimestamps: false,
+        signal: item.abortController.signal,
       });
       text = String(out.text || "").trim();
     } else {
@@ -8140,6 +8153,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         language,
         diarize,
         openrouterModel: modelLabel,
+        signal: item.abortController.signal,
       });
       text = String(out.text || "").trim();
     }
@@ -8169,10 +8183,20 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       }
     }
   } catch (e) {
-    item.status = "error";
-    item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
+    // Distinguish user-cancelled from genuine error so the queue UI
+    // shows "Cancelled" instead of "Failed" — and so the user
+    // doesn't have to read a "AbortError: ..." message that's
+    // basically meaningless to them.
+    const isAbort = e instanceof DOMException && e.name === "AbortError";
+    if (isAbort) {
+      item.status = "cancelled";
+    } else {
+      item.status = "error";
+      item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
+    }
     item.endedAt = performance.now();
   } finally {
+    item.abortController = undefined;
     renderUploadQueue();
   }
 }
@@ -8189,6 +8213,8 @@ function uploadStatusLabel(item: UploadQueueItem): string {
     }
     case "error":
       return "Failed";
+    case "cancelled":
+      return "Cancelled";
   }
 }
 
@@ -8204,14 +8230,35 @@ function removeUploadItem(id: string): void {
   const idx = uploadQueue.findIndex((it) => it.id === id);
   if (idx === -1) return;
   const item = uploadQueue[idx];
-  // Don't yank an item out from under the active processor — it
-  // would orphan the in-flight network request and the result
-  // would arrive but have nowhere to land. The user can still
-  // drop it via Clear after it finishes (it lands in History
-  // anyway via auto-save).
+  // Don't yank an item out from under the active processor —
+  // user must Cancel first, then remove. (Cancel is a separate
+  // button on `transcribing` items via `cancelUploadItem`.)
   if (item.status === "transcribing") return;
   uploadQueue.splice(idx, 1);
   renderUploadQueue();
+}
+
+function cancelUploadItem(id: string): void {
+  const item = uploadQueue.find((it) => it.id === id);
+  if (!item) return;
+  if (item.status === "queued") {
+    // Not started yet — just drop it.
+    item.status = "cancelled";
+    item.endedAt = performance.now();
+    renderUploadQueue();
+    return;
+  }
+  if (item.status === "transcribing") {
+    // Abort the in-flight fetch. The processor's catch will
+    // see DOMException name === "AbortError" and mark it
+    // cancelled (NOT error) so the queue UI distinguishes
+    // user-cancelled from transcription failures.
+    try { item.abortController?.abort(); } catch { /* idempotent */ }
+    // Status flip happens inside processUploadItem's finally;
+    // no need to set it here. Re-render just to disable the
+    // Stop button immediately for visual feedback.
+    renderUploadQueue();
+  }
 }
 
 function renderUploadQueue(): void {
@@ -8228,7 +8275,9 @@ function renderUploadQueue(): void {
     return;
   }
   empty.hidden = true;
-  const finished = uploadQueue.filter((it) => it.status === "done" || it.status === "error").length;
+  const finished = uploadQueue.filter(
+    (it) => it.status === "done" || it.status === "error" || it.status === "cancelled",
+  ).length;
   clearBtn.hidden = finished === 0;
   if (titleEl) {
     const total = uploadQueue.length;
@@ -8267,10 +8316,23 @@ function renderUploadQueue(): void {
     status.className = "upload-queue-item-status";
     status.textContent = uploadStatusLabel(item);
     tail.appendChild(status);
-    // Per-item delete (X). Kept off `transcribing` items because we
-    // can't reliably abort an in-flight remoteJobSync without a per-
-    // request abort controller threaded through the pipeline.
-    if (item.status !== "transcribing") {
+    // Per-item action button. While transcribing → Stop (aborts
+    // in-flight fetch via the item's AbortController). Otherwise →
+    // Remove (drops the item from the queue, no abort needed
+    // since it's already settled).
+    if (item.status === "transcribing") {
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "upload-queue-item-stop";
+      stopBtn.setAttribute("aria-label", "Stop transcription");
+      stopBtn.title = "Stop transcription";
+      stopBtn.textContent = "Stop";
+      stopBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        cancelUploadItem(item.id);
+      });
+      tail.appendChild(stopBtn);
+    } else {
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "upload-queue-item-remove";
