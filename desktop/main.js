@@ -1692,13 +1692,15 @@ function createOverlayHtml() {
           // the value at the min boundary. Handle NaN explicitly
           // instead, so the clamp does its own floor.
           //
-          // CRITICAL: this comment lives INSIDE the createOverlayHtml
-          // template literal (backtick-delimited). The previous form
-          // used double backticks (``|| 2``) for emphasis, but those
-          // backticks PARSED AS TEMPLATE LITERAL DELIMITERS and broke
-          // the entire createOverlayHtml — every shortcut call that
-          // tried to render the overlay threw "...is not a function".
-          // Always use plain quotes inside this template body.
+          // CRITICAL: this comment is INSIDE createOverlayHtml's
+          // outer template literal. NEVER write a backtick or a
+          // dollar-curly placeholder marker (the two-character
+          // sequence "dollar then open-brace") inside this template
+          // body — even in a comment. A stray backtick closes the
+          // template and dumps the rest as JS; a stray placeholder
+          // opener tries to evaluate the JS that follows it as an
+          // interpolation expression. Both have crashed shortcuts in
+          // production. Use plain quotes 'X' or "X" only.
           const raw = Number(v);
           const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
           const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
@@ -1713,10 +1715,14 @@ function createOverlayHtml() {
           const on = !!enabled;
           if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
           // Mirror emitSecs: NaN → default, let the clamp's floor
-          // provide the minimum. The previous `|| 2` trick coerced
+          // provide the minimum. The previous "|| 2" trick coerced
           // a legitimate 0 (if ever passed) to 2 BEFORE the clamp
           // could floor it to 1 — same anti-pattern the sibling
           // emitSecs fn was fixed for. Keep both consistent.
+          // (No backticks in this comment — see emitSecs's CRITICAL
+          // note above: any backtick inside this template body would
+          // close the outer template literal and crash overlay
+          // rendering with "...is not a function".)
           const raw = Number(seconds);
           const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
           const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));

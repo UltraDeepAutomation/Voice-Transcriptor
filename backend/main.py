@@ -2738,6 +2738,58 @@ def _run_remote_transcribe_once(
 
     if audio_bytes is None and upload_path is not None:
         audio_bytes = upload_path.read_bytes()
+
+    # ── Video → audio extraction (and any non-PCM container → 16k mono WAV) ─
+    #
+    # Deepgram REST and OpenRouter audio-input endpoints both accept a
+    # narrow set of audio containers. When the user drops a video file
+    # (MOV, MKV, AVI, MPG, 3GP, etc.) — the Upload UI's
+    # ``accept="audio/*,video/*"`` invites them — sending the raw
+    # container body to either provider results in a generic 400/500
+    # with no useful client-side message. The user's ask was literally
+    # "видео сначала в аудио превращай и аудио уже отправляй".
+    #
+    # Strategy: always-extract on these video extensions, plus the
+    # rarer audio containers Deepgram doesn't reliably accept (wma).
+    # mp4 / m4v are kept native for Deepgram (it sniffs the moov
+    # atom for the AAC track) but ALSO routed through ffmpeg for
+    # OpenRouter because Gemini's audio path expects a true audio
+    # codec, not an MP4 container with a video track interleaved.
+    #
+    # ensure_wav_16k(path, path, channels=1) is the canonical converter
+    # already used by the upload + recording paths; it handles ffmpeg
+    # not-installed by raising AudioError, which our caller maps to
+    # HTTP 502 cleanly via the RemoteError catch (AudioError isn't a
+    # RemoteError, but at this layer it's a network-equivalent failure).
+    _orig_ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else ""
+    _VIDEO_OR_NON_REMOTE_EXTS = {
+        "mov", "mkv", "avi", "m4v", "mpg", "mpeg", "3gp", "wma",
+    }
+    _needs_extraction = (
+        _orig_ext in _VIDEO_OR_NON_REMOTE_EXTS
+        or (prov == "openrouter" and _orig_ext in {"mp4", "webm"})
+    )
+    if _needs_extraction and audio_bytes is not None:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="transcribe_extract_") as _td:
+            _src = Path(_td) / f"src.{_orig_ext or 'bin'}"
+            _src.write_bytes(audio_bytes)
+            _dst = Path(_td) / "out.wav"
+            try:
+                ensure_wav_16k(str(_src), str(_dst), channels=1)
+                audio_bytes = _dst.read_bytes()
+                # Update orig_name so the downstream Content-Type and
+                # MIME guess match the actual bytes — otherwise Deepgram
+                # gets ``audio/x-matroska`` for what is now WAV PCM and
+                # rejects with 400.
+                orig_name = (orig_name.rsplit(".", 1)[0] if "." in orig_name else orig_name) + ".wav"
+            except AudioError as e:
+                # Surface as RemoteError so the existing catch in the
+                # endpoint maps it to HTTP 502 with a useful detail
+                # message ("ffmpeg failed: ..." or "ffmpeg conversion
+                # timed out") rather than a generic 500.
+                raise RemoteError(f"audio extraction failed: {e}") from e
+
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("openrouter") or {}
@@ -2886,8 +2938,17 @@ async def remote_transcribe_sync(
     # concatenation (O(N²) — reallocates the full prefix on every chunk).
     # For a 500 MB file that difference is ~125 GB of transient heap vs
     # ~500 MB, which the OOM killer resolves before the ceiling guard fires.
+    # Streaming chunk read. ``UploadFile`` exposes ``await file.read(N)``
+    # — NOT ``async for chunk in file`` (Starlette removed __aiter__ in
+    # 0.36; the previous form raised TypeError on every Upload-tab POST,
+    # surfacing as HTTP 500 with a 1400-char-truncated traceback in
+    # main.log that hid the real cause for hours).
     _upload_buf = bytearray()
-    async for chunk in file:
+    _CHUNK_SIZE = 1024 * 1024  # 1 MiB
+    while True:
+        chunk = await file.read(_CHUNK_SIZE)
+        if not chunk:
+            break
         _upload_buf.extend(chunk)
         if len(_upload_buf) > MAX_UPLOAD_BYTES:
             raise HTTPException(
