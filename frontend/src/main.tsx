@@ -4627,7 +4627,32 @@ $("retranscribeBtn").addEventListener("click", async () => {
   if (!activeUiSessionToken) activeUiSessionToken = capturedToken;
   btn.disabled = true;
   btn.classList.add("is-busy");
+  // Visible-progress writer. The user reported the re-transcribe job
+  // is invisible — the button's ``is-busy`` class is far from the eye
+  // and finalOutput shows the OLD transcript (or whatever was there
+  // before) until success or failure. Mirroring every state transition
+  // into finalOutput is the simplest way to make the running job
+  // unambiguous, AND it doubles as the "what stage are we in" hint
+  // when the eventual error message is shown (the last status the
+  // user saw is now the most recent provider that was tried).
+  //
+  // Every write through this helper goes through the same
+  // ``isCurrentUiSession`` gate that ``$("finalOutput").textContent``
+  // assignments below already use, so a fresh live session that
+  // started DURING re-transcribe never gets stomped by a stale status.
+  const setRetranscribeStatus = (text: string): void => {
+    if (isCurrentUiSession(capturedToken)) {
+      $("finalOutput").textContent = text;
+    }
+  };
+  // Track which providers were actually attempted so the final error
+  // message tells the user precisely what was tried — "switch to local
+  // in Settings" was misleading when the code had already fallen
+  // through to local under the hood and local ALSO failed. The hint
+  // surface is rebuilt below from this list, not hardcoded.
+  const triedProviders: string[] = [];
   try {
+    setRetranscribeStatus("Preparing audio…");
     // Prefer the in-memory blob captured during this session — it is the
     // canonical PCM we just assembled and avoids a round-trip to the
     // backend that could race with the recordings archive write. Fall
@@ -4648,22 +4673,27 @@ $("retranscribeBtn").addEventListener("click", async () => {
     const lang = (($("language") as HTMLSelectElement).value || "auto").trim();
     let text = "";
     let usedProvider: Provider = "local";
+    let lastProviderError: unknown = null;
 
     // 1. Try Deepgram REST — higher accuracy than local Whisper for most
     //    languages. Only attempted when the user has a key configured.
     if (isProviderKeyConfigured("deepgram")) {
+      const dgModel = getRemoteModelValue("deepgram") || "nova-3";
+      triedProviders.push(`Deepgram ${dgModel}`);
+      setRetranscribeStatus(`Re-transcribing via Deepgram (${dgModel})…`);
       try {
         const result = await remoteJobSync(audioFile, {
           provider: "deepgram",
           language: lang,
           diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-          openrouterModel: getRemoteModelValue("deepgram"),
+          openrouterModel: dgModel,
         });
         text = String(result.text || "").trim();
         usedProvider = "deepgram";
       } catch (deepgramErr) {
         // Network timeout, rate-limit, bad key — log and fall through to
         // local Whisper so the user still gets a usable transcript.
+        lastProviderError = deepgramErr;
         console.warn("Re-transcribe: Deepgram REST failed, trying local Whisper:", deepgramErr);
       }
     }
@@ -4671,6 +4701,14 @@ $("retranscribeBtn").addEventListener("click", async () => {
     // 2. Local Whisper fallback — always available, no API key required.
     if (!text) {
       const model = ($("model") as HTMLSelectElement).value || "small";
+      triedProviders.push(`local Whisper ${model}`);
+      // Two-line message captures both the fallback context AND the
+      // current step: the user sees Deepgram-failed reason without
+      // losing the "we are still working" signal.
+      const fallbackHint = lastProviderError
+        ? `Deepgram failed — trying local Whisper (${model})…`
+        : `Re-transcribing via local Whisper (${model})…`;
+      setRetranscribeStatus(fallbackHint);
       const localResult = await transcribeCanonicalAudioLocally(audioFile, lang, model);
       text = localResult.text.trim();
       usedProvider = "local";
@@ -4727,12 +4765,29 @@ $("retranscribeBtn").addEventListener("click", async () => {
       }
     } else {
       if (isCurrentUiSession(capturedToken)) {
-        $("finalOutput").textContent = "Re-transcribe returned empty result.";
+        const tried = triedProviders.length ? ` (tried: ${triedProviders.join(", ")})` : "";
+        $("finalOutput").textContent = `Re-transcribe returned empty result${tried}.`;
       }
     }
   } catch (e) {
     if (isCurrentUiSession(capturedToken)) {
-      $("finalOutput").textContent = explainNetworkError(e, "Re-transcribe failed");
+      // Build a precise error message that names what was tried.
+      // The default ``explainNetworkError`` hint suggested "switch
+      // Provider to local in Settings" — misleading here because the
+      // code ALREADY fell through to local under the hood (and local
+      // is what just failed). Append the tried-providers tail so the
+      // user understands the local fallback ran and also failed; the
+      // suggestion to "switch to local" is suppressed when local is
+      // in the tried list.
+      let msg = explainNetworkError(e, "Re-transcribe failed");
+      if (triedProviders.some((p) => p.startsWith("local"))) {
+        // Strip the "switch Provider to local" tail — local already
+        // failed, so the suggestion is actively unhelpful.
+        msg = msg.replace(/, or switch Provider to "local" in Settings\.?$/i, ".");
+        msg = msg.replace(/ or switch Provider to "local" in Settings\.?$/i, ".");
+      }
+      const triedSuffix = triedProviders.length ? ` Tried: ${triedProviders.join(", ")}.` : "";
+      $("finalOutput").textContent = `${msg}${triedSuffix}`;
     }
   } finally {
     btn.disabled = false;
