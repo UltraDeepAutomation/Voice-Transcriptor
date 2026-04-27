@@ -2876,6 +2876,15 @@ function startShortcutRecording(btn: HTMLButtonElement): void {
   if (keysSpan) keysSpan.textContent = "Press keys...";
   // Add global keydown listener
   document.addEventListener("keydown", handleShortcutKeydown, true);
+  // Outside-click cancel: without this, clicking ANYWHERE other than
+  // a shortcut row left capture mode active. The keydown listener
+  // stayed attached to ``document`` and any subsequent keypress
+  // (typing in another field, pressing arrow keys to scroll, etc.)
+  // silently rebound the user's shortcut. The visible ``.recording``
+  // class on the button was the only cue that capture was still
+  // active, and a user who navigated to another tab couldn't even
+  // see it. Capture phase so we beat per-element click handlers.
+  document.addEventListener("mousedown", handleShortcutOutsideMousedown, true);
 }
 
 function stopShortcutRecording(restoreDisplay: boolean): void {
@@ -2888,7 +2897,29 @@ function stopShortcutRecording(restoreDisplay: boolean): void {
     if (keysSpan) keysSpan.textContent = acceleratorToDisplay(acc);
   }
   document.removeEventListener("keydown", handleShortcutKeydown, true);
+  document.removeEventListener("mousedown", handleShortcutOutsideMousedown, true);
   activeShortcutBtn = null;
+}
+
+/**
+ * Outside-click cancel for the shortcut-recording mode. Fires before
+ * any element-level click handler (capture phase) so we can revert
+ * display + detach the keydown listener BEFORE a click on the OTHER
+ * shortcut row's button triggers its own ``startShortcutRecording``
+ * (which itself calls ``stopShortcutRecording(false)`` for a clean
+ * hand-off, but there's no harm in our cancelling first).
+ *
+ * Containment check uses ``Node.contains`` so clicks on the keys-span
+ * inside the active button (e.g. the user double-clicks the visible
+ * accelerator text) are treated as clicks ON the button — recording
+ * stays active so the user can press fresh keys.
+ */
+function handleShortcutOutsideMousedown(e: MouseEvent): void {
+  if (!activeShortcutBtn) return;
+  const target = e.target as Node | null;
+  if (!target) return;
+  if (activeShortcutBtn.contains(target)) return;
+  stopShortcutRecording(true);
 }
 
 function handleShortcutKeydown(e: KeyboardEvent): void {
