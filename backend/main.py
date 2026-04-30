@@ -964,7 +964,16 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    # Backend-owned limits surface here so the frontend doesn't carry a
+    # second copy that can drift from the server-side enforcement.
+    # SSOT: MAX_UPLOAD_BYTES is the only definition; frontend reads
+    # this field on every refreshNetworkState tick and refreshes its
+    # cached cap. If the field is absent (older / dev backend) the
+    # frontend keeps its hardcoded fallback.
+    return {
+        "ok": True,
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+    }
 
 
 @app.post("/api/transcribe/warmup")

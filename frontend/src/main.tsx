@@ -318,7 +318,14 @@ const fmtBytes = (bytes: number): string => {
 };
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
-const MAX_FILE_BYTES = 500 * 1024 * 1024;
+// SSOT: backend defines MAX_UPLOAD_BYTES in backend/main.py and surfaces
+// it in /api/health under "max_upload_bytes". The constant below is the
+// fallback that applies BEFORE the first /api/health response lands (cold
+// boot, /api/health timeout in dev, mock backend without the field). It
+// is never the source of truth — refreshNetworkState() rewrites this
+// value from every successful health probe so the cap can never drift
+// from what the backend will actually accept on POST.
+let MAX_FILE_BYTES = 500 * 1024 * 1024;
 const AUDIO_TOKENS = {
   liveSampleRateHz: 16_000,
 } as const;
@@ -2262,6 +2269,23 @@ async function refreshNetworkState(): Promise<void> {
   try {
     const health = await fetch("/api/health");
     if (!health.ok) throw new Error(`health ${health.status}`);
+    // SSOT for the upload cap: backend's /api/health surfaces
+    // ``max_upload_bytes`` (= MAX_UPLOAD_BYTES in backend/main.py).
+    // We refresh our cached cap from every successful health probe
+    // so the frontend never silently allows more bytes than the
+    // backend will accept (would 413 mid-upload after the user
+    // already waited for it). Defensive Number/Finite check tolerates
+    // an old backend without the field — falls back to current value.
+    try {
+      const healthJson = (await health.clone().json()) as { max_upload_bytes?: unknown };
+      const candidate = Number(healthJson?.max_upload_bytes);
+      if (Number.isFinite(candidate) && candidate > 0) {
+        MAX_FILE_BYTES = Math.trunc(candidate);
+      }
+    } catch (e) {
+      // Non-JSON or shape mismatch — keep prior MAX_FILE_BYTES.
+      console.debug("health body parse skipped", e);
+    }
     // First successful /api/health means the Python backend is up and
     // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
     // so later refreshes don't re-trigger work after the first success.
