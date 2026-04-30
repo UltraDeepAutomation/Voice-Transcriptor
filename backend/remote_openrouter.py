@@ -101,8 +101,18 @@ def openrouter_transcribe(
     text = ""
     try:
         text = js["choices"][0]["message"]["content"]
-    except Exception:
-        text = str(js)
+    except (KeyError, IndexError, TypeError) as shape_err:
+        # OpenRouter changed the response shape (or echoed an empty
+        # error envelope). Returning ``str(js)`` made the entire raw
+        # API response — potentially echoing the user's prompt and
+        # the audio's base64 payload — visible to the caller as if
+        # it were the transcribed text. Far better to surface the
+        # shape mismatch as a RemoteError so the route handler maps
+        # it to a 502 with a sane message and the renderer falls
+        # back to local Whisper.
+        raise RemoteError(
+            f"OpenRouter response shape unexpected: {type(shape_err).__name__}"
+        ) from shape_err
 
     logger.info("openrouter_transcribe: success, %d chars", len(text))
     return {"text": text, "raw": js}

@@ -1292,12 +1292,22 @@ def _invalidate_recordings_dir_cache() -> None:
 
 def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
     global _rec_dir_cache, _rec_dir_cache_at
+    # SSOT cache invariant: the global cache reflects the implicit
+    # ``load_config()`` path ONLY. When the caller supplies an explicit
+    # ``cfg`` we compute the result for THAT config but never write it
+    # into the cache — otherwise a one-off call with a fabricated cfg
+    # would poison subsequent implicit-load callers with a value
+    # disconnected from what's on disk. Tracked with a local flag
+    # rather than splitting the function so the security/migration
+    # logic stays in one spot.
+    cache_writes_enabled = cfg is None
     # monotonic for TTL — internal cache check, immune to clock skew.
     now = time.monotonic()
     # Atomic (cache, timestamp) read — see lock note above.
-    with _rec_dir_cache_lock:
-        if _rec_dir_cache is not None and (now - _rec_dir_cache_at) < _REC_DIR_CACHE_TTL and cfg is None:
-            return _rec_dir_cache
+    if cache_writes_enabled:
+        with _rec_dir_cache_lock:
+            if _rec_dir_cache is not None and (now - _rec_dir_cache_at) < _REC_DIR_CACHE_TTL:
+                return _rec_dir_cache
 
     cfg = cfg or load_config()
     prefs = cfg.get("preferences") or {}
@@ -1340,9 +1350,10 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                 save_config(cfg)
             except OSError as e:
                 logger.warning("volatile config reset failed: %s", e)
-            with _rec_dir_cache_lock:
-                _rec_dir_cache = default_dir
-                _rec_dir_cache_at = now
+            if cache_writes_enabled:
+                with _rec_dir_cache_lock:
+                    _rec_dir_cache = default_dir
+                    _rec_dir_cache_at = now
             return default_dir
 
         # Security: mirror the containment check in
@@ -1358,19 +1369,22 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                 "recordings_dir %s is outside home; falling back to default %s",
                 p, default_dir,
             )
-            with _rec_dir_cache_lock:
-                _rec_dir_cache = default_dir
-                _rec_dir_cache_at = now
+            if cache_writes_enabled:
+                with _rec_dir_cache_lock:
+                    _rec_dir_cache = default_dir
+                    _rec_dir_cache_at = now
             return default_dir
 
         p.mkdir(parents=True, exist_ok=True)
-        with _rec_dir_cache_lock:
-            _rec_dir_cache = p
-            _rec_dir_cache_at = now
+        if cache_writes_enabled:
+            with _rec_dir_cache_lock:
+                _rec_dir_cache = p
+                _rec_dir_cache_at = now
         return p
-    with _rec_dir_cache_lock:
-        _rec_dir_cache = default_dir
-        _rec_dir_cache_at = now
+    if cache_writes_enabled:
+        with _rec_dir_cache_lock:
+            _rec_dir_cache = default_dir
+            _rec_dir_cache_at = now
     return default_dir
 
 
@@ -1447,28 +1461,38 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
     return resolved
 
 
+# SSOT: audio extensions a saved recording can carry alongside its
+# .txt transcript. Both ``_recording_audio_path`` (retrieval lookup
+# for the History tab's audio player and Re-transcribe path) AND
+# ``_prune_old_recording_audio`` (retention sweeper) iterate this
+# tuple. Two divergent definitions previously meant a saved file
+# with one of the missing extensions would be playable but never
+# pruned, OR be pruned but never findable for playback. Including
+# ``.opus``/``.oga``/``.wma`` so users who manually drop those into
+# the recordings directory (or future codecs we add to ALLOWED_AUDIO
+# _EXTS) round-trip correctly. ``.mp4``/``.webm`` stay in for the
+# Live tab MediaRecorder path which can produce either container.
+_RECORDING_AUDIO_EXTS: tuple[str, ...] = (
+    ".wav", ".m4a", ".mp3", ".flac", ".ogg", ".oga",
+    ".opus", ".aac", ".mp4", ".webm", ".wma",
+)
+
+
 def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optional[Path]:
     stem = Path(os.path.basename(name or "")).stem
     if not stem:
         return None
     root_dir = target_dir or _resolve_recordings_dir()
-    for ext in (".wav", ".m4a", ".mp3", ".flac", ".ogg", ".aac", ".mp4", ".webm"):
+    for ext in _RECORDING_AUDIO_EXTS:
         candidate = root_dir / f"{stem}{ext}"
         if candidate.exists() and candidate.is_file():
             return candidate
     return None
 
 
-_AUDIO_EXTS_FOR_RETENTION: tuple[str, ...] = (
-    ".wav",
-    ".m4a",
-    ".mp3",
-    ".flac",
-    ".ogg",
-    ".aac",
-    ".mp4",
-    ".webm",
-)
+# Backward-compat alias for any caller that imports this name. New
+# code should use ``_RECORDING_AUDIO_EXTS`` directly.
+_AUDIO_EXTS_FOR_RETENTION: tuple[str, ...] = _RECORDING_AUDIO_EXTS
 
 
 def _prune_old_recording_audio(
@@ -2174,18 +2198,40 @@ def _record_recovery_chunk(recovery: dict, data: bytes) -> None:
                 recovery["bytes"], MAX_LIVE_RECOVERY_BYTES,
             )
         return
-    recovery["chunks"] += 1
-    recovery["bytes"] += len(data)
+    # Counter increment MUST follow a successful write — otherwise an
+    # OSError on the very chunk that wins (full disk, EBADF, EIO) still
+    # bumps ``bytes`` and ``chunks``. Subsequent comparisons against
+    # MAX_LIVE_RECOVERY_BYTES then trip earlier than reality, the meta
+    # JSON written on finalize overstates how much PCM actually landed,
+    # and downstream duration math (``bytes / 32000.0``) reports a
+    # longer recording than truly recoverable.
     try:
         recovery["pcm_file"].write(data)
     except OSError as e:
         logger.warning("live recovery write failed: %s", e)
+        return
+    recovery["chunks"] += 1
+    recovery["bytes"] += len(data)
 
 
 def _finalize_live_recovery(recovery: dict) -> None:
     try:
-        recovery["pcm_file"].flush()
-        recovery["pcm_file"].close()
+        # Flush Python buffers and fsync the kernel buffer to disk
+        # BEFORE closing — close alone does not call fsync, so a power
+        # cut between close and the next syscall can leave the recovery
+        # spool with the last batch of writes only in the kernel page
+        # cache. This file's whole purpose is crash recovery, so the
+        # one place we MUST be durable is at finalize.
+        f = recovery["pcm_file"]
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError as fsync_err:
+            # Non-POSIX filesystems can refuse fsync; the data is at
+            # least flushed out of Python and into the OS, which is
+            # all we can promise on those platforms.
+            logger.debug("live recovery fsync skipped: %s", fsync_err)
+        f.close()
     except OSError as e:
         logger.warning("live recovery close failed: %s", e)
     try:
@@ -2535,7 +2581,14 @@ async def _run_deepgram_live_session(
                 "stats": drained.get("stats"),
             }
         except Exception as e:
-            finalize_error = str(e)
+            # ``str(e)`` can carry the upstream provider's raw error body
+            # (Deepgram disconnect with "WebSocket: HTTP 401 Unauthorized
+            # — token=tok_AbC...") which leaks the API token prefix or
+            # absolute paths in the renderer payload. Route through
+            # ``_safe_error_text`` which strips paths + token-shaped
+            # substrings, matching every other error envelope on this
+            # endpoint.
+            finalize_error = _safe_error_text(e)
             recovery["had_error"] = True
             logger.error("deepgram finalize failed: %s", e, exc_info=True)
             final_payload = {
@@ -2548,7 +2601,7 @@ async def _run_deepgram_live_session(
             }
 
         if upstream_fatal and session.last_error:
-            final_payload["error"] = session.last_error
+            final_payload["error"] = _safe_error_text(session.last_error)
 
         if not fw.done():
             try:
@@ -3471,7 +3524,14 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                     **_recording_audio_payload(p.name),
                 }
             )
-        except Exception:
+        except Exception as e:
+            # Silent skip used to be a black box: a corrupt recording
+            # disappeared from the list with no log, no UI signal, no
+            # way for the user to know why a file they can see in
+            # Finder is missing from History. ``debug``-level so a
+            # routine truncated-during-save won't spam ops, but the
+            # name and exception class are still in the support log.
+            logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
             continue
     items.sort(key=lambda x: x["modified_at"], reverse=True)
     return {"items": items, "directory": str(d)}
