@@ -261,7 +261,11 @@ def transcribe_audio(
         )
     except Exception as e:
         if _is_empty_sequence_transcribe_error(e):
-            duration = float(audio_16k_mono.shape[0]) / 16000.0 if audio_16k_mono is not None else 0.0
+            # ``audio_16k_mono is not None`` was a leftover defensive
+            # ternary — line 245 above already raises ValueError on
+            # None, so by the time control reaches this except branch
+            # ``audio_16k_mono`` is guaranteed to be a real ndarray.
+            duration = float(audio_16k_mono.shape[0]) / 16000.0
             return _empty_transcribe_result(duration)
         raise
 

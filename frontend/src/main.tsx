@@ -2220,7 +2220,12 @@ function syncMode(): void {
   $("waveCanvas").hidden = false;
   $("uploadPanel").hidden = true;
   $("btnStart").style.display = "inline-flex";
-  setSelectedFile(null);
+  // Removed: setSelectedFile(null). The Live tab no longer surfaces a
+  // file picker — the Upload tab fully owns batch transcription. The
+  // call here was a vestige of the pre-Upload-tab era; resetting
+  // ``selectedFile`` on every loadCfg / view change clobbered any
+  // value still in flight from the now-removed Live-tab file flow,
+  // and on every config refresh wrote to ``#fileName`` for nothing.
 }
 
 function setNetworkState(online: boolean, latencyMs: number | null = null): void {
@@ -2910,7 +2915,23 @@ function refreshShortcutConflictState(): void {
     }
   }
 }
-setInterval(refreshShortcutConflictState, 2000);
+// 2s polling for the conflict-state badge on Settings → Shortcuts.
+// Capture the handle so a future code path (e.g. shutdown hook,
+// pre-quit IPC) can clear it. Gate the body on document visibility
+// so the poll doesn't waste CPU when the renderer window is hidden
+// (e.g. user dragged the recording overlay to focus while the
+// Settings tab is invisible behind it).
+const _shortcutConflictPollHandle = window.setInterval(() => {
+  if (document.visibilityState === "hidden") return;
+  refreshShortcutConflictState();
+}, 2000);
+// Symmetric cleanup: a ``pagehide`` event fires before any teardown
+// (Electron renderer reload, dev hot-reload, real navigation away),
+// so clearing here prevents a stale handle from leaking across hot
+// reloads in development.
+window.addEventListener("pagehide", () => {
+  try { window.clearInterval(_shortcutConflictPollHandle); } catch { /* idempotent */ }
+}, { once: true });
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
   // Cancel any existing recording
@@ -7983,9 +8004,22 @@ populateBuiltinUpscalePresetOptions();
 // the helper and never block app startup.
 void cleanupOrphanPcmSpool();
 void refreshNetworkState();
-window.setInterval(() => void refreshNetworkState(), UI_TOKENS.network.refreshIntervalMs);
+// Network-state poll. Capture the handle so a teardown path can
+// clear it. Skip the body when the renderer window is hidden — the
+// /api/network probe + /api/health round-trip is wasted work when
+// the user can't see the indicator anyway, and on Electron with the
+// main window hidden the renderer keeps running.
+const _networkPollHandle = window.setInterval(() => {
+  if (document.visibilityState === "hidden") return;
+  void refreshNetworkState();
+}, UI_TOKENS.network.refreshIntervalMs);
 window.addEventListener("online", () => void refreshNetworkState());
 window.addEventListener("offline", () => void refreshNetworkState());
+// Symmetric cleanup so dev hot-reloads / explicit teardown paths
+// don't leave stale handles behind.
+window.addEventListener("pagehide", () => {
+  try { window.clearInterval(_networkPollHandle); } catch { /* idempotent */ }
+}, { once: true });
 // Race bootstrap against a 15-second wall-clock timeout so a stalled
 // network mount or slow FS does not hang the boot overlay forever — the
 // promise must settle for any caller that `await recordingsBootstrapPromise`

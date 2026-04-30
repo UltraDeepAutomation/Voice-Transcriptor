@@ -641,10 +641,23 @@ def save_config(cfg: Dict[str, Any]) -> None:
 
 
 def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep copy of *cfg* with every provider key redacted.
+
+    Iterates ``providers.keys()`` rather than a hardcoded
+    ``("openrouter", "deepgram")`` tuple so any future provider added
+    to DEFAULT_CONFIG / config.json is automatically redacted on every
+    log + diagnostic dump. The previous tuple meant a hypothetical
+    ``elevenlabs`` / ``assemblyai`` provider's key would leak through
+    every redact site (logs, support bundles, error envelopes) until
+    someone remembered to add the new name to this list.
+    """
     cfg = json.loads(json.dumps(cfg))
-    providers = cfg.get("providers") or {}
-    for name in ("openrouter", "deepgram"):
-        if isinstance(providers.get(name), dict) and "key" in providers[name]:
-            k = providers[name].get("key") or ""
-            providers[name]["key"] = "" if not k else (k[:3] + "..." + k[-2:])
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return cfg
+    for name, prov in list(providers.items()):
+        if not isinstance(prov, dict) or "key" not in prov:
+            continue
+        k = prov.get("key") or ""
+        prov["key"] = "" if not k else (k[:3] + "..." + k[-2:])
     return cfg
