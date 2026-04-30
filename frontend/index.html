@@ -350,9 +350,21 @@
                       <option value="openrouter">OpenRouter</option>
                       <option value="">None</option>
                     </select>
+                    <!-- Options below are placeholders: ``populateRemote
+                         ModelOptions`` (frontend/src/main.tsx) overwrites
+                         this select's children from the canonical
+                         OPENROUTER_AUDIO_MODELS / DEEPGRAM_AUDIO_MODELS
+                         arrays before the user can interact. The first
+                         ``<option>`` was previously
+                         ``google/gemini-3.1-flash-lite-preview`` which is
+                         NOT a valid OpenRouter slug — surfaced by the
+                         renderer for ~milliseconds during cold boot until
+                         the SSOT-driven repopulate ran. Replaced with the
+                         canonical SSOT default so the cold-boot flash
+                         never shows a stale model id. -->
                     <select id="remoteModelSelect" title="Remote model" hidden>
-                      <option value="google/gemini-3.1-flash-lite-preview">google/gemini-3.1-flash-lite-preview</option>
                       <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
+                      <option value="google/gemini-2.0-flash-lite">google/gemini-2.0-flash-lite</option>
                       <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
                       <option value="nova-3">nova-3</option>
                     </select>
@@ -627,7 +639,12 @@
                     aria-label="Save Deepgram key" title="Save key"></button>
                 </span>
               </label>
-              <input id="orModel" type="hidden" value="google/gemini-3.1-flash-lite-preview" />
+              <!-- Hidden input bridges legacy callers; the live value is
+                   set by ``loadCfg`` from the SSOT OPENROUTER_AUDIO_MODELS
+                   array. Default below mirrors that SSOT's first entry
+                   (``google/gemini-2.5-flash``) so the brief cold-boot
+                   window before loadCfg runs reads a real model slug. -->
+              <input id="orModel" type="hidden" value="google/gemini-2.5-flash" />
             </div>
           </div>
           <div class="card card-defaults">
