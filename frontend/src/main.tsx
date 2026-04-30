@@ -1822,6 +1822,15 @@ async function remoteJobSync(
         xhr.setRequestHeader(k, String(v));
       }
       xhr.responseType = "text";
+      // Hard upload-and-response ceiling. Without this, a TCP black hole
+      // (ISP route flap, VPN drop, sleeping wifi NIC) leaves the XHR in
+      // limbo forever — ``onerror``/``ontimeout`` only fire when the
+      // browser sees an explicit failure event. The user sees a spinner
+      // that never resolves and the only way out is the optional Stop
+      // button. 5 minutes is generous for a single Upload-tab item; the
+      // backend's own /api/transcribe-sync runs at most a few minutes
+      // per file at typical model speeds.
+      xhr.timeout = 5 * 60_000;
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && e.total > 0) {
           const f = Math.max(0, Math.min(1, e.loaded / e.total));
@@ -1861,10 +1870,15 @@ async function remoteJobSync(
           reject(new DOMException("Aborted", "AbortError"));
           return;
         }
+        // ``{ once: true }`` so a controller that fires abort more
+        // than once (e.g. user clicks Stop while another teardown is
+        // already in flight) doesn't call reject twice — the second
+        // call is a Promise no-op but still allocates the DOMException
+        // and walks the listener queue.
         opts.signal.addEventListener("abort", () => {
           xhr.abort();
           reject(new DOMException("Aborted", "AbortError"));
-        });
+        }, { once: true });
       }
       xhr.send(fd);
     });
@@ -2297,7 +2311,14 @@ async function refreshNetworkState(): Promise<void> {
       return;
     }
     const s = (await netResp.json()) as NetworkStatusResponse;
-    setNetworkState(true, s.latency_ms ?? null);
+    // Honor the backend's ``online`` field instead of forcing true.
+    // The old hardcoded ``true`` ignored the backend's connectivity
+    // probe entirely — even when /api/network reported the network
+    // unreachable, ``resolveEffectiveProvider`` kept routing to remote
+    // providers, which then timed out with a confusing "remote
+    // provider unreachable" error instead of falling back to local
+    // Whisper as the offline indicator was supposed to enforce.
+    setNetworkState(s.online !== false, s.latency_ms ?? null);
   } catch {
     setNetworkState(false, null);
   }
@@ -8197,12 +8218,23 @@ let uploadSelectedId: string | null = null;
 
 const uploadQueue: UploadQueueItem[] = [];
 let uploadProcessorRunning = false;
-// 1 GB hard cap on per-file size matches the backend's MAX_UPLOAD_BYTES
-// (500 MB) × 2 — leaves headroom for video containers (MP4 / MKV)
-// where the audio track itself fits comfortably under the backend cap
-// after demux. Caught client-side so the user sees the rejection
-// instantly rather than after a multi-GB upload to a 413.
-const UPLOAD_FILE_SIZE_CAP = 1024 * 1024 * 1024;
+// Per-file ceiling for the Upload tab. Derived from MAX_FILE_BYTES
+// (which mirrors the backend's MAX_UPLOAD_BYTES via /api/health) plus
+// a 2× headroom for video containers (MP4 / MKV) — the backend's
+// ffmpeg path demuxes audio out, so the audio bytes typically fit
+// well under MAX_FILE_BYTES even when the source video file is
+// multiple times larger. Caught client-side so the user sees the
+// rejection instantly rather than after a multi-GB upload to a 413.
+//
+// SSOT note: the constant below is the multiplier — never the byte
+// number itself. The byte number lives in MAX_FILE_BYTES which is
+// re-read from /api/health on every refreshNetworkState tick. A
+// function (not a const) is used so the cap follows the latest cap
+// after a backend cap bump, without requiring a renderer reload.
+const UPLOAD_VIDEO_HEADROOM_MULT = 2;
+function uploadFileSizeCap(): number {
+  return MAX_FILE_BYTES * UPLOAD_VIDEO_HEADROOM_MULT;
+}
 // Accept-set mirrors the backend's allowed extensions plus video
 // containers (the backend's ffmpeg path demuxes audio out of any of
 // these). Drag-drop browsers don't enforce ``accept`` so we
@@ -8317,7 +8349,11 @@ function setupUploadView(): void {
   if (browseBtn) {
     browseBtn.addEventListener("click", () => fileInput.click());
   }
-  provider.addEventListener("change", () => updateUploadProviderHint());
+  // (Earlier ``provider.addEventListener("change", ...)`` block already
+  // wires both queueUiPreferencesSave AND updateUploadProviderHint at
+  // line ~8237. A duplicate listener here was attaching ANOTHER hint
+  // refresh on every change, which leaked one stale-DOM-read closure
+  // into the listener list per renderer reload. Removed.)
   // Initial provider default: prefer Deepgram if the user has a key,
   // else fall back to local Whisper (offline-capable). Honors per-tab
   // independence — the Record tab's selection is unaffected.
@@ -8353,12 +8389,13 @@ function updateUploadProviderHint(): void {
 function enqueueUploadFile(file: File): void {
   // Size gate — backend has its own 413, but rejecting client-side
   // saves the upload time + spares the server.
-  if (file.size > UPLOAD_FILE_SIZE_CAP) {
+  const cap = uploadFileSizeCap();
+  if (file.size > cap) {
     uploadQueue.push({
       id: createClientSessionId(),
       file,
       status: "error",
-      error: `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(UPLOAD_FILE_SIZE_CAP / (1024 * 1024))} MB cap).`,
+      error: `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`,
     });
     renderUploadQueue();
     return;
@@ -8502,8 +8539,16 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         });
         if (saveOut && typeof saveOut === "object") {
           item.savedName = String((saveOut as { name?: string }).name || "");
+          // ``saveRecordingText`` returns ``SavedRecordingRef`` whose
+          // shape is ``{ name, archiveDir }`` (camelCase — see
+          // SavedRecordingRef interface). The previous read used
+          // ``archive_dir`` (snake_case) which is always undefined →
+          // savedArchiveDir was always "" and the Upload-pane Reveal-
+          // in-Finder button silently sent an empty archiveDir IPC
+          // payload. The main process logged "archive_dir empty" and
+          // the user saw nothing happen.
           item.savedArchiveDir = String(
-            (saveOut as { archive_dir?: string }).archive_dir || "",
+            (saveOut as { archiveDir?: string }).archiveDir || "",
           );
         }
       } catch (saveErr) {
@@ -8745,14 +8790,29 @@ function renderUploadQueue(): void {
       copyBtn.type = "button";
       copyBtn.textContent = "Copy";
       copyBtn.addEventListener("click", () => {
-        try {
-          navigator.clipboard?.writeText(item.text || "");
-          copyBtn.textContent = "Copied";
-          setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
-        } catch {
+        // navigator.clipboard.writeText returns a Promise — async
+        // rejections (Safari without user gesture, focus issues,
+        // permissions denied) are NOT caught by a sync try/catch.
+        // The old code optimistically said "Copied" even when the
+        // write rejected, leaving the user with an empty clipboard
+        // and a confident success label. .then/.catch routes both
+        // outcomes correctly; the optional chaining handles the
+        // (rare) browser without the clipboard API at all.
+        const writePromise = navigator.clipboard?.writeText(item.text || "");
+        if (!writePromise) {
           copyBtn.textContent = "Copy failed";
           setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+          return;
         }
+        writePromise
+          .then(() => {
+            copyBtn.textContent = "Copied";
+            setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+          })
+          .catch(() => {
+            copyBtn.textContent = "Copy failed";
+            setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+          });
       });
       actions.appendChild(copyBtn);
       li.appendChild(actions);
@@ -8825,11 +8885,26 @@ function renderUploadResultPane(): void {
     if (copyBtn) {
       copyBtn.hidden = false;
       copyBtn.onclick = () => {
-        try {
-          navigator.clipboard?.writeText(item!.text || "");
-          copyBtn.title = "Copied";
+        // Clipboard write is async — sync try/catch never sees the
+        // rejection. Mirror the queue-item Copy button's robust
+        // .then/.catch path so a denied clipboard (Safari w/o user
+        // gesture, focus loss) flips the title to "Copy failed"
+        // rather than misleadingly showing "Copied" on a no-op.
+        const writePromise = navigator.clipboard?.writeText(item!.text || "");
+        if (!writePromise) {
+          copyBtn.title = "Copy failed";
           setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
-        } catch { /* fall through */ }
+          return;
+        }
+        writePromise
+          .then(() => {
+            copyBtn.title = "Copied";
+            setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
+          })
+          .catch(() => {
+            copyBtn.title = "Copy failed";
+            setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
+          });
       };
     }
     if (revealBtn) {
