@@ -2134,8 +2134,19 @@ function positionOverlayWindow() {
 // In all three cases we re-measure and re-pin the overlay to the
 // bottom-center of the display it currently (or most recently) lived
 // on. Cheap and idempotent — no-op when overlayWin is null.
+// Module-scope reference so before-quit + idempotency guard can both
+// reach it. Without this, every call to registerDisplayTopologyListeners
+// (e.g. dev hot-reload, accidental double-call from a future window-
+// recreate path) accumulates one more listener per topology event,
+// and they're all retained for the app's lifetime since screen has
+// no implicit lifecycle hook.
+let _displayReposition = null;
 function registerDisplayTopologyListeners() {
-  const reposition = () => {
+  // Idempotent: if we already wired listeners in a previous call,
+  // skip — installing the same handler twice would double-fire on
+  // every topology event.
+  if (_displayReposition) return;
+  _displayReposition = () => {
     if (!overlayWin || overlayWin.isDestroyed()) return;
     try {
       positionOverlayWindow();
@@ -2144,12 +2155,25 @@ function registerDisplayTopologyListeners() {
     }
   };
   try {
-    screen.on("display-metrics-changed", reposition);
-    screen.on("display-added", reposition);
-    screen.on("display-removed", reposition);
+    screen.on("display-metrics-changed", _displayReposition);
+    screen.on("display-added", _displayReposition);
+    screen.on("display-removed", _displayReposition);
   } catch (e) {
     appendMainLog(`[display-topology] listener install failed: ${e?.message || e}`);
+    _displayReposition = null;
   }
+}
+
+function unregisterDisplayTopologyListeners() {
+  if (!_displayReposition) return;
+  try {
+    screen.removeListener("display-metrics-changed", _displayReposition);
+    screen.removeListener("display-added", _displayReposition);
+    screen.removeListener("display-removed", _displayReposition);
+  } catch (e) {
+    appendMainLog(`[display-topology] listener removal failed: ${e?.message || e}`);
+  }
+  _displayReposition = null;
 }
 
 function getOverlayWindowWidth() {
@@ -5590,10 +5614,18 @@ async function startBackend() {
     backendStderrTail = (backendStderrTail + msg).slice(-BACKEND_STDERR_TAIL_MAX);
   });
 
-  backend.on("exit", (code) => {
-    appendMainLog(`[backend-exit] code=${code}`);
+  backend.on("exit", (code, signal) => {
+    appendMainLog(`[backend-exit] code=${code} signal=${signal || ""}`);
     backend = null;
-    if (!isQuitting && Number(code || 0) !== 0) {
+    // Restart on either:
+    //   (a) non-zero exit (Python crash, sys.exit(1), broken venv, ...)
+    //   (b) signal exit (segfault, oom-kill, manual SIGKILL outside our
+    //       quit path) — code is null in that case so the old check
+    //       ``Number(code || 0) !== 0`` was 0 !== 0 → false → silently
+    //       skipped restart. A backend killed by SIGSEGV would not
+    //       come back without a manual app relaunch.
+    const abnormalExit = Number(code || 0) !== 0 || (signal != null && signal !== "");
+    if (!isQuitting && abnormalExit) {
       if (backendRestartTimer) {
         clearTimeout(backendRestartTimer);
         backendRestartTimer = null;
@@ -5771,8 +5803,18 @@ async function createWindow(options = {}) {
       // Walk up to make sure the resolved path is still under the
       // user's home — block any symlink-shenanigans that would point
       // at /etc/shadow or similar.
-      const home = app.getPath("home");
-      if (!archiveDir.startsWith(home)) {
+      //
+      // Plain ``startsWith(home)`` has the classic prefix-bypass bug:
+      // when home = "/Users/foo", any sibling like "/Users/foobar/x"
+      // also matches because "/Users/foobar" starts with "/Users/foo".
+      // A compromised renderer could pass an archive_dir like
+      // "<home>~unrelated/whatever" and reveal arbitrary files via
+      // shell.showItemInFolder. Anchor the check on a path-separator
+      // boundary (or exact equality) so only descendants of home pass.
+      const home = path.resolve(app.getPath("home"));
+      const isInsideHome =
+        archiveDir === home || archiveDir.startsWith(home + path.sep);
+      if (!isInsideHome) {
         appendMainLog(`[reveal-recording] archive_dir outside home: ${archiveDir}`);
         return;
       }
@@ -6249,6 +6291,17 @@ function killBackendHard(reason) {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  // Clear the auto-restart timer FIRST, before any other cleanup.
+  // killBackendHard at the bottom of this handler also clears it, but
+  // by then we've already spent ~tens of milliseconds tearing down
+  // shortcuts, timers, the overlay, and the tray. If the timer fires
+  // during that window it spawns a NEW backend that the now-cleared
+  // ``backend`` reference can't kill — a guaranteed orphan. Yanking
+  // the timer first closes that race window.
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
+  }
   globalShortcut.unregisterAll();
   if (shortcutPollTimer) {
     clearInterval(shortcutPollTimer);
@@ -6270,6 +6323,11 @@ app.on("before-quit", () => {
     clearTimeout(overlayTranscribingStatusTimer);
     overlayTranscribingStatusTimer = null;
   }
+  // Symmetric removal of the screen topology listeners installed by
+  // registerDisplayTopologyListeners. Without this, the listeners and
+  // their closure ref to overlayWin retain memory across unusual quit
+  // paths (e.g. dev hot-reload that reinstates app.whenReady).
+  unregisterDisplayTopologyListeners();
   hideRecordingOverlay();
   if (overlayWin && !overlayWin.isDestroyed()) {
     try {
@@ -6412,6 +6470,17 @@ app.whenReady().then(async () => {
   tray.on("right-click", () => {
     tray?.popUpContextMenu(trayMenu);
   });
+  // Linux GTK status icons don't emit ``right-click`` on most desktop
+  // environments — only macOS and Windows do. Without setContextMenu,
+  // Linux users have no way to reach Quit / Open from the tray icon.
+  // Calling setContextMenu installs a native context menu hook that
+  // works on every platform; macOS and Windows still benefit from the
+  // explicit right-click handler above for double-coverage.
+  try {
+    tray.setContextMenu(trayMenu);
+  } catch (e) {
+    appendMainLog(`[tray] setContextMenu failed: ${e?.message || e}`);
+  }
   if (!app.isPackaged) {
     const devKey = process.platform === "darwin" ? "Command+Shift+D" : "Control+Shift+D";
     const ok = globalShortcut.register(devKey, () => {
@@ -6687,4 +6756,34 @@ app.whenReady().then(async () => {
     // call (rare during startup, but a race-free path costs nothing).
     await ensureOverlayLoaded();
   } catch { }
+}).catch((err) => {
+  // The whenReady chain has many awaits — startBackend, permission
+  // probes, accessibility checks, overlay preload — and any one of
+  // them rejecting becomes an unhandled promise rejection that the
+  // top-level ``unhandledRejection`` handler logs but cannot recover
+  // from. The app then sits in an inconsistent state (no shortcuts,
+  // no tray, no backend) with the user staring at a hidden window.
+  // Catching here gives us one place to surface the failure both to
+  // the log AND to the renderer / boot overlay so the user can
+  // either retry or quit instead of force-killing.
+  const msg = err && err.message ? err.message : String(err);
+  try { appendMainLog(`[whenReady-fatal] ${msg}`); } catch { }
+  backendBootError = `App startup failed: ${msg}`;
+  setBackendBootStatus("");
+  // Surface to whichever surface is alive: an existing window's
+  // boot-overlay first (renderer is up but backend died), tray
+  // notification second, dialog last (final fallback when the
+  // window never made it).
+  if (win && !win.isDestroyed() && win.webContents) {
+    try {
+      win.webContents.executeJavaScript(
+        `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+        true,
+      ).catch(() => { });
+    } catch { }
+  } else {
+    try {
+      dialog.showErrorBox("Transcriptor — startup failed", msg);
+    } catch { }
+  }
 });
