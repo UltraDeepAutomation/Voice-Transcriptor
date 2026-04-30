@@ -325,6 +325,18 @@ UPSCALE_MAX_CUSTOM_PRESETS = 3
 # up *all* archives on the next startup, not just the current default.
 _ARCHIVE_DIR_REGISTRY_PATH = DATA_DIR / "known_archive_dirs.json"
 UPSCALE_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Windows reserved device names — case-insensitive, regardless of
+# extension. Creating ``con.json`` / ``prn.json`` etc. on a Windows
+# filesystem opens the corresponding character device instead of a
+# regular file; the open(...) call returns a handle that hangs
+# read/write/stat in unpredictable ways. The regex above accepts
+# every one of these tokens, so we add an explicit reject list that
+# fires before the path leaves this helper.
+_WINDOWS_RESERVED_BASENAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+})
 
 BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
     "clean": {
@@ -1414,7 +1426,13 @@ def _atomic_temp_path(final_path: Path) -> Path:
 
 def _recording_path_or_404(name: str, target_dir: Optional[Path] = None) -> Path:
     safe = os.path.basename(name or "")
-    if not safe.endswith(".txt") or safe in {"", ".", ".."}:
+    # Case-insensitive ``.txt`` check — on macOS HFS+/APFS and Windows
+    # NTFS the filesystem itself is case-insensitive, so a recording
+    # written as ``foo.txt`` is the same file as ``foo.TXT``. The old
+    # ``safe.endswith(".txt")`` rejected the .TXT spelling at the
+    # validator before we even touched the disk, returning 400 for a
+    # file the OS would have happily found.
+    if not safe.lower().endswith(".txt") or safe in {"", ".", ".."}:
         raise HTTPException(status_code=400, detail="invalid recording name")
     p = (target_dir or _resolve_recordings_dir()) / safe
     if not p.exists() or not p.is_file():
@@ -1850,6 +1868,15 @@ def _upscale_preset_path(preset_id: str) -> Path:
     raw = (preset_id or "").strip()
     if not UPSCALE_PRESET_ID_RE.fullmatch(raw):
         raise HTTPException(status_code=400, detail="invalid preset id")
+    # Block Windows reserved device names BEFORE we try to open the
+    # path. Without this check ``raw="con"`` produces ``con.json``
+    # which opens the character console device on every Windows
+    # filesystem, hanging subsequent atomic_write_json calls. The
+    # check is cross-platform — refusing these names on POSIX too
+    # keeps the regex's accepted-character set the only contract
+    # callers need to know.
+    if raw.lower() in _WINDOWS_RESERVED_BASENAMES:
+        raise HTTPException(status_code=400, detail="invalid preset id (reserved name)")
     return UPSCALE_PRESETS_DIR / f"{raw}.json"
 
 

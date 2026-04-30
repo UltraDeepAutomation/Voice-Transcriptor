@@ -5028,6 +5028,19 @@ function runCommand(cmd, args, options = {}) {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    // Three independent code paths (timeout, child error, child close)
+    // can all reach ``resolve``; the first wins, the rest are no-ops.
+    // Without this guard, an error fired BETWEEN the timeout's
+    // SIGKILL and the kernel reaping the process triggered TWO
+    // resolves on the same Promise — the second is a Promise no-op
+    // but the work allocated by the second (e.g. extra stderr
+    // concatenation) is wasted and the trace path fires twice.
+    let settled = false;
+    const settleOnce = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
     const child = spawn(cmd, effectiveArgs, {
       cwd: options.cwd,
       env: options.env || process.env,
@@ -5043,7 +5056,7 @@ function runCommand(cmd, args, options = {}) {
       try {
         child.kill("SIGKILL");
       } catch { }
-      resolve({ ok: false, code: -1, stdout, stderr: `${stderr}\nTimed out` });
+      settleOnce({ ok: false, code: -1, stdout, stderr: `${stderr}\nTimed out` });
     }, timeoutMs);
 
     child.stdout.on("data", (d) => {
@@ -5056,12 +5069,12 @@ function runCommand(cmd, args, options = {}) {
 
     child.on("error", (err) => {
       clearTimeout(timer);
-      resolve({ ok: false, code: -1, stdout, stderr: `${stderr}\n${err.message}` });
+      settleOnce({ ok: false, code: -1, stdout, stderr: `${stderr}\n${err.message}` });
     });
 
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ ok: code === 0, code: code ?? -1, stdout, stderr });
+      settleOnce({ ok: code === 0, code: code ?? -1, stdout, stderr });
     });
   });
 }
@@ -5684,6 +5697,16 @@ function waitForHttp(url, timeoutMs) {
         } else {
           setTimeout(tick, 250);
         }
+      });
+      // Per-request timeout so a hanging connection (backend mid-boot,
+      // accept queue full, kernel pause) doesn't sit on a half-open
+      // socket for the full outer ``timeoutMs``. Without this, a 60 s
+      // outer timeout with 250 ms retry interval can pile up ~240
+      // dangling sockets against the loopback backend before the outer
+      // reject fires. ``req.destroy()`` cancels the in-flight TCP
+      // connection cleanly so the next tick reuses fresh sockets.
+      req.setTimeout(2000, () => {
+        try { req.destroy(); } catch { }
       });
       req.on("error", () => setTimeout(tick, 250));
     };
