@@ -186,6 +186,12 @@ let postStopQueue = [];
 let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
 let backendRestartTimer = null;
+// Render-process-gone recovery timer. Schedules a loadURL to recreate
+// the renderer 500 ms after a crash. Tracked at module scope so
+// before-quit can clear it — if the user quits during the recovery
+// window the loadURL would otherwise fire against a teardown-in-progress
+// webContents and produce shutdown-log noise.
+let renderRecoveryTimer = null;
 let backendRestartAttempts = 0;
 // Set at app.whenReady, cleared on before-quit so shutdown doesn't
 // produce unhandledRejection noise from executeJavaScript against a
@@ -5879,18 +5885,37 @@ async function createWindow(options = {}) {
   });
 
   const mediaPermissions = new Set(["media", "microphone", "audioCapture", "videoCapture"]);
+  // Origin gate: only the backend's own origin is allowed to request
+  // media permissions. Without this check, a navigation race or a
+  // shared-session future (Electron 30+ shares the default session
+  // across BrowserWindow instances) could let any other origin
+  // inherit our microphone grant. Tightened to ``_isBackendOrigin``
+  // so the renderer must be on http://127.0.0.1:<our-port> to be
+  // allowed.
   win.webContents.session.setPermissionRequestHandler((wc, permission, cb) => {
     const perm = String(permission || "");
     const url = wc?.getURL?.() || "";
-    const allow = mediaPermissions.has(perm);
-    appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${url}`);
+    const knownPerm = mediaPermissions.has(perm);
+    const fromBackend = _isBackendOrigin(url);
+    const allow = knownPerm && fromBackend;
+    if (knownPerm && !fromBackend) {
+      appendMainLog(`[perm-request] DENY non-backend origin: perm=${perm} url=${url}`);
+    } else {
+      appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${url}`);
+    }
     cb(allow);
   });
   win.webContents.session.setPermissionCheckHandler((wc, permission) => {
     const perm = String(permission || "");
     const url = wc?.getURL?.() || "";
-    const allow = mediaPermissions.has(perm);
-    appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${url}`);
+    const knownPerm = mediaPermissions.has(perm);
+    const fromBackend = _isBackendOrigin(url);
+    const allow = knownPerm && fromBackend;
+    if (knownPerm && !fromBackend) {
+      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} url=${url}`);
+    } else {
+      appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${url}`);
+    }
     return allow;
   });
   win.webContents.on("render-process-gone", (_event, details) => {
@@ -5923,8 +5948,15 @@ async function createWindow(options = {}) {
     }
     // The renderer is dead; ``reload()`` on a crashed webContents
     // throws. Schedule a fresh load so the user sees a working UI
-    // on the next Spotlight/Dock click.
-    setTimeout(() => {
+    // on the next Spotlight/Dock click. Track the handle so the
+    // app-quit path can clear it — if the user quits within the
+    // 500 ms window after a crash, the timer would otherwise fire
+    // against a webContents that's already going through teardown
+    // and produce an unhandled rejection in the shutdown log.
+    if (renderRecoveryTimer) clearTimeout(renderRecoveryTimer);
+    renderRecoveryTimer = setTimeout(() => {
+      renderRecoveryTimer = null;
+      if (isQuitting) return;
       if (!win || win.isDestroyed() || !win.webContents) return;
       const baseUrl = `${BASE_URL}/`;
       win.loadURL(baseUrl).catch((e) => {
@@ -6324,6 +6356,14 @@ app.on("before-quit", () => {
   if (backendRestartTimer) {
     clearTimeout(backendRestartTimer);
     backendRestartTimer = null;
+  }
+  // Same reasoning for the render-process-gone recovery timer:
+  // if the user quits during the 500 ms window after a renderer
+  // crash, the scheduled loadURL must NOT fire against a webContents
+  // that's already going through teardown.
+  if (renderRecoveryTimer) {
+    clearTimeout(renderRecoveryTimer);
+    renderRecoveryTimer = null;
   }
   globalShortcut.unregisterAll();
   if (shortcutPollTimer) {
