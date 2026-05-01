@@ -161,6 +161,11 @@ let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
 let overlayQuickSettingsOpen = false;
+// Win/Linux click-through fix: poll cursor against pill bounds and
+// toggle ignoreMouseEvents from the main process. See the comment
+// inside ensureOverlayWindow for the full rationale.
+let overlayMouseTrackTimer = null;
+let overlayMouseInPill = false;
 let overlayQuickProvider = "local";
 let overlayQuickModel = "small";
 let overlayQuickUpscalePreset = "builtin_clean";
@@ -1982,10 +1987,73 @@ function ensureOverlayWindow() {
   // The overlay HTML reports mouse enter/leave on the pill so we toggle this.
   // The `{ forward: true }` option is macOS-only per Electron docs; passing it
   // on Windows/Linux is silently ignored in some versions and throws in others.
+  //
+  // CROSS-PLATFORM ASYMMETRY (user report on Windows: "клик идёт сквозь
+  // settings button" / "клик сквозь капсулу"):
+  //
+  //   On macOS, `{ forward: true }` lets MOUSE-MOVE events still reach
+  //   the renderer for hit-testing while clicks pass through. That's
+  //   how the pill's own ``mouseenter``/``mouseleave`` listeners
+  //   detect when the cursor crosses the pill boundary and emit the
+  //   `__overlay_mouse_enter__` / `_leave_` console events that flip
+  //   ignoreMouseEvents off for the pill region.
+  //
+  //   On Windows + Linux, `forward` does NOT exist. With plain
+  //   ``setIgnoreMouseEvents(true)`` the renderer NEVER sees ANY
+  //   mouse events — including the move that should fire mouseenter
+  //   on the pill. So the renderer never sends the "enter" signal,
+  //   we never flip ignoreMouseEvents to false, and clicks pass
+  //   straight through the pill — including on the settings button.
+  //
+  //   FIX: poll the cursor against the pill's screen-space bounds in
+  //   a 50 ms interval and toggle ignoreMouseEvents directly from the
+  //   main process. The pill is centered horizontally in the overlay
+  //   window and pinned to its bottom; we recompute its bounds on
+  //   every tick because the overlay window can move (display change,
+  //   Quick-Settings expand) and the pill height is fixed by
+  //   OVERLAY_TOKENS.window.pillHeight.
   if (process.platform === "darwin") {
     overlayWin.setIgnoreMouseEvents(true, { forward: true });
   } else {
     overlayWin.setIgnoreMouseEvents(true);
+    if (overlayMouseTrackTimer) clearInterval(overlayMouseTrackTimer);
+    overlayMouseTrackTimer = setInterval(() => {
+      if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
+      try {
+        const cursor = screen.getCursorScreenPoint();
+        const wb = overlayWin.getBounds();
+        // Pill height = OVERLAY_TOKENS.window.height (the visible
+        // capsule height, pinned to the bottom of the BrowserWindow).
+        // When Quick-Settings is OPEN the visible content extends
+        // upward to fill the entire BrowserWindow, so the click-zone
+        // expands to the full window rectangle. When closed, only
+        // the bottom pill is visible — clicks above it should pass
+        // through to apps behind so users can interact with them.
+        const visibleH = overlayQuickSettingsOpen
+          ? wb.height
+          : (OVERLAY_TOKENS.window.height || 47);
+        const inPill =
+          cursor.x >= wb.x &&
+          cursor.x <= wb.x + wb.width &&
+          cursor.y >= (wb.y + wb.height - visibleH) &&
+          cursor.y <= wb.y + wb.height;
+        // Only flip when state actually changes — repeated identical
+        // calls are cheap but the rerender on the renderer side from
+        // an event change is wasteful.
+        if (inPill !== overlayMouseInPill) {
+          overlayMouseInPill = inPill;
+          overlayWin.setIgnoreMouseEvents(!inPill);
+        }
+      } catch (e) {
+        // Window destroyed mid-tick; clear and let next ensureOverlay
+        // Window setup re-arm.
+        if (overlayMouseTrackTimer) {
+          clearInterval(overlayMouseTrackTimer);
+          overlayMouseTrackTimer = null;
+        }
+      }
+    }, 50);
+    try { overlayMouseTrackTimer.unref?.(); } catch { /* ignore */ }
   }
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   // "screen-saver" level puts the pill above legitimate fullscreen
@@ -2106,6 +2174,14 @@ function ensureOverlayWindow() {
     // yet overlayLoaded=true short-circuited every loadURL path —
     // permanent blank capsule until the entire process restarts.
     overlayLoaded = false;
+    // Stop the Win/Linux mouse-tracking polling so it doesn't tick
+    // against a destroyed overlayWin reference. The next ensureOverlay
+    // Window call re-arms it for the recreated window.
+    if (overlayMouseTrackTimer) {
+      clearInterval(overlayMouseTrackTimer);
+      overlayMouseTrackTimer = null;
+    }
+    overlayMouseInPill = false;
   });
   return overlayWin;
 }
@@ -6408,6 +6484,10 @@ app.on("before-quit", () => {
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
+  }
+  if (overlayMouseTrackTimer) {
+    clearInterval(overlayMouseTrackTimer);
+    overlayMouseTrackTimer = null;
   }
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
