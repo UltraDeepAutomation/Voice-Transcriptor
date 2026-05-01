@@ -81,12 +81,18 @@ def openrouter_transcribe(
     }
 
     logger.info("openrouter_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
-    # Split (connect, read) timeouts. The old single-int ``60`` applied to
-    # BOTH phases — on a broken DNS path the app wasted 60s per attempt
-    # (3 × 60 = 3 min) before declaring failure. 10s connect is plenty
-    # for any cold-cache lookup; the 60s read covers Gemini's audio
-    # latency including worst-case queueing.
-    r = request_with_retry("POST", url, headers=headers, json=payload, timeout=(10, 60))
+    # Adaptive timeout matching remote_deepgram.py — the OpenRouter audio
+    # path base64-encodes the audio bytes inline in the JSON body, so the
+    # uploaded payload is ~1.33× the raw audio size. ``requests`` applies
+    # the read-timeout to the whole socket including the write/upload
+    # phase, so a large audio body on a slow link trips the timeout
+    # mid-upload. Same formula as the Deepgram path: 180 s floor + 8 s
+    # per encoded MB (rounded up to account for base64 inflation).
+    encoded_mb = max(1.0, (len(audio_bytes) * 1.34) / (1024 * 1024))
+    read_timeout = max(180, int(encoded_mb * 8))
+    r = request_with_retry(
+        "POST", url, headers=headers, json=payload, timeout=(10, read_timeout),
+    )
 
     if r.status_code >= 400:
         error_text = r.text[:400]

@@ -121,22 +121,40 @@ def deepgram_transcribe(
     }
 
     logger.info("deepgram_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
-    # ``timeout=(connect, read)`` tuple. ``10`` for connect: matches the
-    # live-WS handshake budget (``remote_deepgram_live.connect`` uses 15s
-    # with retry; REST has its own 3-attempt retry and shorter per-attempt
-    # budgets keep total latency bounded). The prior 5s connect budget
-    # fired false-positive timeouts on cold-DNS and mobile-tethered
-    # uplinks — exactly the scenario the live-WS fix targeted. ``60``
-    # for read: Deepgram REST returns quickly (<5s) for normal audio;
-    # the 60s ceiling is only for pathologically long files or
-    # upstream congestion.
+    # Adaptive timeout for large-file uploads.
+    #
+    # User report (1 May 2026): a 26.6 MB m4a from a slow / cross-region
+    # link (RU → us-east Deepgram) failed with
+    #   network error after 3 attempts: ('Connection aborted.',
+    #   TimeoutError('The write operation timed out'))
+    # Root cause: ``requests`` applies the read-timeout to the SOCKET as
+    # a whole, including the upload (write) phase. With the body still
+    # being uploaded after 60 s the socket trips its idle timeout and
+    # raises during ``data=`` send. Retrying the same 26 MB POST 3 times
+    # just bled bandwidth — the bottleneck is upload speed, not transient
+    # provider hiccups.
+    #
+    # Formula: ``read = max(180, body_mb * 8)`` seconds.
+    #   * 180 s floor covers small files even on a tarpit-slow link.
+    #   * 8 s/MB ceiling covers ~1 Mbit/s sustained upload (typical
+    #     mobile-tethered minimum) plus headroom for Deepgram's own
+    #     processing time after the body is fully received.
+    # Connect stays at 10 s — DNS + TLS handshake is independent of body size.
+    body_mb = max(1.0, len(audio_bytes) / (1024 * 1024))
+    read_timeout = max(180, int(body_mb * 8))
+    # Retries scaled inversely to body size: small files keep the 3-attempt
+    # transient-recovery behaviour, large uploads attempt twice. Three full
+    # retries of a 50 MB body waste 150 MB on a network that's already
+    # struggling — the second attempt is the diagnostic value, beyond that
+    # is bandwidth waste.
+    upload_retries = 3 if body_mb < 5 else 2
     r = request_with_retry(
         "POST", url,
         headers=headers,
         params=params,
         data=audio_bytes,
-        timeout=(10, 60),
-        retries=3,
+        timeout=(10, read_timeout),
+        retries=upload_retries,
     )
 
     if r.status_code >= 400:

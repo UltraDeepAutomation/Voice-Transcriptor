@@ -129,7 +129,45 @@ def request_with_retry(
                 break
             time.sleep(backoff_base if attempt == 0 else backoff_base * (attempt + 1))
     if last_err is not None:
-        raise RemoteError(f"network error after {retries} attempts: {last_err}")
+        # Translate common low-level error patterns into actionable
+        # messages. The raw form the user previously saw —
+        #   "network error after 3 attempts: ('Connection aborted.',
+        #    TimeoutError('The write operation timed out'))"
+        # — is unhelpful: it doesn't explain what to DO. Map the most
+        # common patterns to a one-liner that names the likely cause
+        # (slow upload, DNS unreachable, TLS issue) so the user can
+        # decide between retry, smaller file, VPN, or local Whisper.
+        err_text = str(last_err)
+        err_lower = err_text.lower()
+        hint = ""
+        if (
+            "write operation timed out" in err_lower
+            or "writetimeout" in err_lower
+            or ("connection aborted" in err_lower and "timed out" in err_lower)
+        ):
+            hint = (
+                " — upload timed out. Audio file likely too large for the current "
+                "upload speed; try a smaller file, a faster connection, or switch "
+                'Provider to "local" in Settings.'
+            )
+        elif "name resolution" in err_lower or "nodename nor servname" in err_lower or "name or service not known" in err_lower:
+            hint = (
+                " — DNS could not resolve the provider's hostname. Check internet "
+                "connection or DNS settings."
+            )
+        elif "ssl" in err_lower or "certificate" in err_lower or "tls" in err_lower:
+            hint = (
+                " — TLS handshake failed. Check system clock, corporate proxy, "
+                "or antivirus that intercepts HTTPS."
+            )
+        elif "connection refused" in err_lower:
+            hint = " — provider refused the connection (maintenance / region block)."
+        elif "read timed out" in err_lower:
+            hint = (
+                " — provider took too long to respond. Retry, or switch Provider "
+                'to "local" in Settings if the link is consistently slow.'
+            )
+        raise RemoteError(f"network error after {retries} attempts: {err_text}{hint}")
     # All attempts returned a transient HTTP status — return the last
     # response so the caller surfaces the exact upstream error.
     assert last_resp is not None
