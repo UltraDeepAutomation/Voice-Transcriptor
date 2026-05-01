@@ -1967,7 +1967,15 @@ function ensureOverlayWindow() {
     backgroundColor: "#00000000",
     webPreferences: {
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      // Same Windows background-throttling fix as the main window.
+      // The overlay shows the recording timer + waveform — both
+      // depend on rAF / setInterval that Chromium clamps to 1 Hz
+      // on a backgrounded renderer. Without this flag the timer
+      // visibly stalls when the user switches focus during a
+      // recording session, even though the underlying mic capture
+      // is in the main window's renderer.
+      backgroundThrottling: false,
     }
   });
   // Allow clicks to pass through transparent regions around the capsule pill.
@@ -5765,6 +5773,29 @@ async function createWindow(options = {}) {
       // Sandbox: renderer has no Node.js access even in worst case
       // (a preload script exploit would not break out of sandbox).
       sandbox: true,
+      // ROOT CAUSE for Windows-only "transcription is slow / doesn't
+      // appear when the app window is not focused":
+      //
+      // Chromium aggressively throttles background renderers to save
+      // CPU on Windows. When this BrowserWindow loses focus (user
+      // alt-tabs to a browser to paste into a Meet chat / Slack /
+      // editor — the EXACT workflow this app is built for):
+      //   * setInterval / setTimeout clamp to 1 Hz
+      //   * AudioContext + AudioWorklet get demoted CPU priority,
+      //     so the PCM-capture worklet skips frames and the mic
+      //     stream goes patchy
+      //   * WebSocket frames sit on the Chromium event loop
+      //     without being processed for hundreds of ms
+      //   * MediaRecorder ondataavailable callbacks stall
+      //
+      // Result on Windows: "I started recording, switched to my
+      // browser to paste, came back — no transcription appeared
+      // and the bar at the bottom shows 'no speech detected'".
+      // On macOS Chromium throttles less aggressively so the same
+      // workflow worked fine. This single flag disables the
+      // throttle for our renderer so background recording behaves
+      // identically across platforms.
+      backgroundThrottling: false,
     }
   });
 

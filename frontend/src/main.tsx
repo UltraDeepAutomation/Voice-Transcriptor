@@ -6502,10 +6502,20 @@ async function stopLive(enhance: boolean): Promise<void> {
         const errMsg = e instanceof Error ? e.message : String(e || "");
         console.warn(`Audio persistence attempt failed (archiveDir="${tryArchiveDir}", fileSize=${savedAudioFile?.size || 0}, fileName=${savedAudioFile?.name || "?"})`, e);
         if (tryArchiveDir === "" || saveDirs.length === 1) {
-          // Both attempts failed — truly broken.
+          // Both attempts failed — truly broken. Surface the ACTUAL
+          // backend error message instead of a generic "check folder
+          // permissions" hint that masks the real cause. The previous
+          // text said the same thing for a Windows path-too-long, an
+          // antivirus block, a 413 oversize, a 5xx backend crash, or a
+          // genuine permission denial — all five looked identical to
+          // the user. Now we name the underlying error verbatim and
+          // append the permission hint as a fallback when the message
+          // is empty (rare; only fires on `String(e)` of a bare object).
+          const detail = errMsg.trim()
+            || "unknown error — check the Recordings folder permissions";
           patchCurrentRecordingSummary({
             title: provisionalTitle,
-            status: "Audio capture finished, but save failed. Check Recordings folder permissions.",
+            status: `Audio capture finished, but save failed: ${detail}`,
             tone: "error",
           }, sessionUiToken);
         }
