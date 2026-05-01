@@ -764,7 +764,19 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   ) {
     return fallback;
   }
-  return cleaned.length > 160 ? fallback : cleaned;
+  // Length cap raised from 160 → 800 chars. The 160 cap was a defensive
+  // filter against raw stack traces leaking into the UI, but it ALSO
+  // truncated legitimate actionable error messages from
+  // ``request_with_retry`` that include both the underlying network
+  // error AND a one-liner hint ("upload timed out — file too large
+  // for current upload speed; try smaller file or switch to local").
+  // Such hints run ~200-280 chars and were silently dropped to the
+  // fallback "Transcription failed." — the screenshot the user showed
+  // had exactly this symptom: bare fallback with no detail. 800 chars
+  // is plenty for any actionable backend message; raw stack traces
+  // are filtered by the regex tests above (which trigger the fallback
+  // before we ever reach the length comparison).
+  return cleaned.length > 800 ? fallback : cleaned;
 }
 
 function normalizeTranscriptWhitespace(text: string): string {

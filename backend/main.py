@@ -34,7 +34,13 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.audio import AudioError, ensure_wav_16k, split_channels, write_wav
+from backend.audio import (
+    AudioError,
+    compact_audio_for_remote,
+    ensure_wav_16k,
+    split_channels,
+    write_wav,
+)
 from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
 from backend.storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from backend.live import LiveSession
@@ -2828,56 +2834,58 @@ def _run_remote_transcribe_once(
     if audio_bytes is None and upload_path is not None:
         audio_bytes = upload_path.read_bytes()
 
-    # ── Video → audio extraction (and any non-PCM container → 16k mono WAV) ─
+    # ── ALWAYS pre-compress to 16 kHz mono Opus/WebM for remote ───────────
     #
-    # Deepgram REST and OpenRouter audio-input endpoints both accept a
-    # narrow set of audio containers. When the user drops a video file
-    # (MOV, MKV, AVI, MPG, 3GP, etc.) — the Upload UI's
-    # ``accept="audio/*,video/*"`` invites them — sending the raw
-    # container body to either provider results in a generic 400/500
-    # with no useful client-side message. The user's ask was literally
-    # "видео сначала в аудио превращай и аудио уже отправляй".
+    # User feedback (1 May 2026) after a 26.6 MB m4a uploaded to Deepgram
+    # tripped a "write operation timed out" error from cross-region (RU →
+    # us-east) link congestion: "все форматы должны превращаться в аудио
+    # и отправляться". The right answer is to ALWAYS pre-encode to a
+    # compact uniform format before the upload regardless of source
+    # container — m4a, mp3, wav, mp4 video, mkv, all of them.
     #
-    # Strategy: always-extract on these video extensions, plus the
-    # rarer audio containers Deepgram doesn't reliably accept (wma).
-    # mp4 / m4v are kept native for Deepgram (it sniffs the moov
-    # atom for the AAC track) but ALSO routed through ffmpeg for
-    # OpenRouter because Gemini's audio path expects a true audio
-    # codec, not an MP4 container with a video track interleaved.
+    # Why ALWAYS:
+    #   * Source size collapses 5-10× for typical inputs (e.g. 128 kbps
+    #     stereo m4a → 24 kbps mono Opus). The 26.6 MB / 28-min clip
+    #     above becomes ~5 MB. 5× shorter upload = far less likely to
+    #     trip provider socket-write timeouts on slow / congested links,
+    #     and bandwidth-cost-per-transcription drops proportionally.
+    #   * Container quirks (mp4 with multiple audio tracks, m4a with
+    #     unusual moov-atom placement, mkv with VP9 video that confuses
+    #     Deepgram's container sniffer) are all eliminated — Deepgram
+    #     and OpenRouter both reliably decode webm/opus.
+    #   * ffmpeg overhead is ~1-3 s for tiny files, ~10-30 s for hour-
+    #     long files — always smaller than the upload time savings on
+    #     anything but a LAN-fast link, and on a LAN-fast link the
+    #     overhead is invisible.
     #
-    # ensure_wav_16k(path, path, channels=1) is the canonical converter
-    # already used by the upload + recording paths; it handles ffmpeg
-    # not-installed by raising AudioError, which our caller maps to
-    # HTTP 502 cleanly via the RemoteError catch (AudioError isn't a
-    # RemoteError, but at this layer it's a network-equivalent failure).
-    _orig_ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else ""
-    _VIDEO_OR_NON_REMOTE_EXTS = {
-        "mov", "mkv", "avi", "m4v", "mpg", "mpeg", "3gp", "wma",
-    }
-    _needs_extraction = (
-        _orig_ext in _VIDEO_OR_NON_REMOTE_EXTS
-        or (prov == "openrouter" and _orig_ext in {"mp4", "webm"})
-    )
-    if _needs_extraction and audio_bytes is not None:
+    # The pre-existing "video extraction" branch is now redundant —
+    # ``compact_audio_for_remote`` does the right thing for video too
+    # (ffmpeg's ``-i`` accepts every container including video; the
+    # output is always opus/webm regardless).
+    if audio_bytes is not None:
         import tempfile
-        with tempfile.TemporaryDirectory(prefix="transcribe_extract_") as _td:
+        with tempfile.TemporaryDirectory(prefix="transcribe_compact_") as _td:
+            _orig_ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else ""
             _src = Path(_td) / f"src.{_orig_ext or 'bin'}"
             _src.write_bytes(audio_bytes)
-            _dst = Path(_td) / "out.wav"
+            _dst = Path(_td) / "out.webm"
             try:
-                ensure_wav_16k(str(_src), str(_dst), channels=1)
+                compact_audio_for_remote(str(_src), str(_dst))
                 audio_bytes = _dst.read_bytes()
-                # Update orig_name so the downstream Content-Type and
-                # MIME guess match the actual bytes — otherwise Deepgram
-                # gets ``audio/x-matroska`` for what is now WAV PCM and
-                # rejects with 400.
-                orig_name = (orig_name.rsplit(".", 1)[0] if "." in orig_name else orig_name) + ".wav"
+                # Update orig_name so the downstream Content-Type
+                # mapping in remote_deepgram / remote_openrouter sees
+                # ``.webm`` and labels the body ``audio/webm``. Without
+                # this Deepgram receives ``audio/x-m4a`` for what is
+                # actually opus/webm bytes and rejects with HTTP 400.
+                _stem = orig_name.rsplit(".", 1)[0] if "." in orig_name else orig_name
+                orig_name = f"{_stem}.webm"
             except AudioError as e:
-                # Surface as RemoteError so the existing catch in the
-                # endpoint maps it to HTTP 502 with a useful detail
-                # message ("ffmpeg failed: ..." or "ffmpeg conversion
-                # timed out") rather than a generic 500.
-                raise RemoteError(f"audio extraction failed: {e}") from e
+                # Surface as RemoteError so the existing endpoint catch
+                # maps it to HTTP 502 with the ffmpeg detail. AudioError
+                # explicitly explains "ffmpeg not installed" or "ffmpeg
+                # failed: <reason>" — both more useful than a silent
+                # post-upload provider 4xx.
+                raise RemoteError(f"audio compression failed: {e}") from e
 
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""

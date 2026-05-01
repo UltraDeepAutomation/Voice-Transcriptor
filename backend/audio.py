@@ -68,6 +68,114 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _run_ffmpeg(cmd: list[str], timeout_sec: int) -> None:
+    """Run ffmpeg with bounded stderr + hard timeout.
+
+    Shared between every ffmpeg invocation in this module so the
+    bounded-memory stderr handling, kill-on-timeout, and AudioError
+    surface stay uniform.
+
+    Raises AudioError on non-zero return or timeout.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    collected: list[str] = []
+    reader = threading.Thread(
+        target=lambda: collected.extend(
+            _bounded_stderr_reader(proc.stderr, _FFMPEG_STDERR_CAP_BYTES)
+        ),
+        name="ffmpeg-stderr-reader",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        try:
+            proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise AudioError(f"ffmpeg conversion timed out after {timeout_sec}s")
+        reader.join(timeout=5)
+    finally:
+        try:
+            if proc.stderr is not None and not proc.stderr.closed:
+                proc.stderr.close()
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        msg = "".join(collected).strip() or f"ffmpeg exited with code {proc.returncode}"
+        logger.warning("ffmpeg failed (rc=%d): %s", proc.returncode, msg)
+        raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
+
+
+def compact_audio_for_remote(path_in: str, path_out: str) -> str:
+    """Compress arbitrary audio/video to a Deepgram-friendly compact form.
+
+    Output: 16 kHz mono Opus in WebM container at ~24 kbit/s. This
+    cuts a typical 128 kbit/s stereo m4a / mp3 down by 5-10× — for
+    a 26.6 MB / ~28 min file, the encoded WebM is ~5 MB. Smaller
+    upload = far less likely to trip a write-timeout on slow or
+    cross-region links (RU → us-east Deepgram is the documented
+    failure mode), and Deepgram natively understands webm/opus so
+    container-sniffing edge cases for m4a / mp4 / mkv go away too.
+
+    Why ALWAYS convert (vs. "convert only when >5 MB"):
+      * Tiny files (<2 MB): ffmpeg overhead is ~1-3 s; upload savings
+        are smaller but the codec normalization still buys reliability
+        on Deepgram's container parser.
+      * Container quirks (mp4 with multiple audio tracks, m4a with
+        unusual moov-atom placement): provider-side decode failures
+        are far rarer with a clean Opus/WebM stream.
+      * Cost / latency / failure profile is BOUNDED — the worst case
+        is a tiny CPU spike, no risk of bandwidth blow-up.
+
+    Output extension is enforced as ``.webm``; callers should pass
+    a path ending in ``.webm`` so MIME sniffing on the receiving
+    side aligns. ``ensure_wav_16k`` is unchanged — local Whisper
+    still receives PCM WAV (Whisper expects raw waveform input,
+    not a compressed container).
+
+    Raises AudioError if ffmpeg isn't installed or the conversion fails.
+    """
+    if not _has_ffmpeg():
+        raise AudioError(
+            "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg` "
+            "or `winget install Gyan.FFmpeg`) — required for remote-provider "
+            "audio compression."
+        )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", path_in,
+        # Resample to 16 kHz mono — Whisper / Deepgram both target this
+        # rate; anything higher is wasted bandwidth.
+        "-ar", "16000",
+        "-ac", "1",
+        # Opus encoder. ``-b:a 24k`` is the sweet spot for speech: still
+        # intelligible at 24 kbit/s, indistinguishable from 64 kbit/s
+        # WAV PCM at the Whisper / Deepgram model's input granularity.
+        "-c:a", "libopus",
+        "-b:a", "24k",
+        # ``-application voip`` tunes the Opus encoder for speech
+        # rather than music — better intelligibility at low bitrates.
+        "-application", "voip",
+        # Force WebM container output regardless of ``path_out`` ext.
+        "-f", "webm",
+        path_out,
+    ]
+    _run_ffmpeg(cmd, timeout_sec=600)
+    return path_out
+
+
 def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     """Ensure 16k WAV PCM output using ffmpeg when needed.
 
