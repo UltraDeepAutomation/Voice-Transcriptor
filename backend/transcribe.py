@@ -231,6 +231,34 @@ def _build_result(
     }
 
 
+# SSOT for the faster-whisper transcribe kwargs we apply to every
+# inference call (live + upload-sync + file). Centralized so a future
+# tuning change is a one-place edit and so the live path can't drift
+# from the upload-sync path.
+#
+# ``condition_on_previous_text=False`` is the critical bit. faster-
+# whisper defaults it to ``True``: each segment is decoded with the
+# PREVIOUS segment's text as context. The trade-off:
+#
+#   * True  →  slightly more coherent transitions between adjacent
+#              sentences (~1-2 % BLEU bump on benchmark corpora).
+#   * False →  every segment is decoded independently, immune to a
+#              well-documented "hallucination loop" failure mode where
+#              one weird/empty segment poisons every subsequent one
+#              and the tail of long audio comes back as empty
+#              transcripts.
+#
+# User report: "не полностью транскрибирует на локальной модели"
+# (uploaded audio came back with only the first portion transcribed).
+# That symptom is a textbook hallucination-loop manifestation; the
+# affected fraction grows with audio duration. We accept the tiny
+# coherence loss in exchange for reliable transcription of arbitrary
+# user-supplied audio.
+_WHISPER_TRANSCRIBE_DEFAULTS = {
+    "condition_on_previous_text": False,
+}
+
+
 def transcribe_audio(
     audio_16k_mono: np.ndarray,
     model_name: str,
@@ -258,6 +286,7 @@ def transcribe_audio(
             word_timestamps=word_timestamps,
             beam_size=beam_size,
             best_of=best_of,
+            **_WHISPER_TRANSCRIBE_DEFAULTS,
         )
     except Exception as e:
         if _is_empty_sequence_transcribe_error(e):
@@ -295,6 +324,7 @@ def transcribe_file(
             word_timestamps=word_timestamps,
             beam_size=beam_size,
             best_of=best_of,
+            **_WHISPER_TRANSCRIBE_DEFAULTS,
         )
     except Exception as e:
         if _is_empty_sequence_transcribe_error(e):

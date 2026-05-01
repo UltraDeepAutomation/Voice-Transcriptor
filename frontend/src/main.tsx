@@ -512,9 +512,18 @@ function renderLatestSavedAudio(): void {
   // If the audio source isn't changing AND we already have a src
   // attribute, skip the disruptive reset. We only need to ensure
   // the row is shown and meta is up to date.
+  //
+  // Updated for the backend-URL-prefer fix: with savedName set we
+  // play from the backend URL even when ``file`` is also present.
+  // The skip-rerender guard now applies whenever the CURRENTLY-
+  // ATTACHED src matches the desired backend URL — regardless of
+  // whether ``file`` exists. Without this update, the second
+  // setCurrentRecordingAudio call (post-save, with savedName) was
+  // forced through a full re-render, revoking + re-creating an
+  // unused ObjectURL on every save tick.
   if (
     latestSavedAudioState
-    && !latestSavedAudioState.file
+    && latestSavedAudioState.savedName
     && desiredBackendUrl
     && audioEl.getAttribute("src") === desiredBackendUrl
   ) {
@@ -540,9 +549,35 @@ function renderLatestSavedAudio(): void {
     return;
   }
 
-  const playbackUrl = latestSavedAudioState.file
-    ? URL.createObjectURL(latestSavedAudioState.file)
-    : desiredBackendUrl;
+  // Source preference order:
+  //   1. Backend URL when savedName is known — DURABLE: the backend
+  //      wrote the file to disk via atomic_write_bytes, the audio
+  //      element can re-fetch any time, survives OPFS sink destroy,
+  //      survives renderer reloads.
+  //   2. In-memory blob URL when the file is fresh from MediaRecorder /
+  //      PcmSink and not yet uploaded to backend (the recording-just-
+  //      stopped window before save completes — typically <500 ms).
+  //
+  // ROOT CAUSE for "audio doesn't play on Windows" (user report):
+  //   OpfsPcmSink.finalize() returns a ``File`` whose Blob references
+  //   the OPFS-backed spool lazily — ``new Blob([header, spool])``.
+  //   When deferredSinkDestroy.destroy() removes the OPFS file (right
+  //   after the upload completes), the lazy blob composite is
+  //   effectively a dangling pointer. Chromium on macOS happens to
+  //   cache blob bytes more aggressively in this scenario, so the
+  //   <audio> element kept playing. Chromium on Windows reads blob
+  //   bytes lazily on play, hits the deleted OPFS handle, and the
+  //   media element fires a silent error code=4 (src-not-supported).
+  //
+  //   Switching to the backend URL once savedName is set bypasses
+  //   the OPFS lifecycle entirely — same URL, same bytes, durable.
+  //   The blob URL stays as the first-render fallback for the brief
+  //   pre-save window.
+  const playbackUrl = (latestSavedAudioState.savedName && desiredBackendUrl)
+    ? desiredBackendUrl
+    : latestSavedAudioState.file
+      ? URL.createObjectURL(latestSavedAudioState.file)
+      : "";
   if (!playbackUrl) {
     row.hidden = true;
     audioEl.removeAttribute("src");
@@ -550,7 +585,10 @@ function renderLatestSavedAudio(): void {
     metaEl.textContent = "";
     return;
   }
-  currentRecordingAudioObjectUrl = latestSavedAudioState.file ? playbackUrl : "";
+  // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
+  // free it later. Backend URLs are not ObjectURLs — nothing to revoke.
+  const isObjectUrl = playbackUrl.startsWith("blob:");
+  currentRecordingAudioObjectUrl = isObjectUrl ? playbackUrl : "";
   audioEl.src = playbackUrl;
   audioEl.load();
   row.hidden = false;
@@ -612,16 +650,20 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     const fileName = latestSavedAudioState.downloadName
       || latestSavedAudioState.savedName
       || "recording.wav";
+    // Mirror the playback source-preference order from
+    // renderLatestSavedAudio: prefer the backend URL once savedName
+    // is set (durable, OPFS-independent), fall back to the in-memory
+    // File blob only during the brief pre-save window.
     let url = "";
     let revokeAfter = false;
-    if (file) {
-      url = URL.createObjectURL(file);
-      revokeAfter = true;
-    } else if (latestSavedAudioState.savedName) {
+    if (latestSavedAudioState.savedName) {
       url = latestRecordingAudioUrl(
         latestSavedAudioState.savedName,
         latestSavedAudioState.archiveDir || "",
       );
+    } else if (file) {
+      url = URL.createObjectURL(file);
+      revokeAfter = true;
     }
     if (!url) return;
     const a = document.createElement("a");
