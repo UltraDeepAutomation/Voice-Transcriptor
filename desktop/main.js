@@ -4552,6 +4552,31 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
   return { ok: false, reason };
 }
 
+// Tracks recordingIds that have already been enqueued or processed
+// in this app session. enqueuePostStopTask dedupes against this set
+// so a single recording can never produce two paste events.
+//
+// User report (1 May 2026, Telegram screenshot showed duplicated text):
+//   "Сергей, привет... Просто расскажу,"           ← interim-final paste
+//   "Сергей, привет... Просто расскажу кратко..."  ← later final paste
+// The two halves both started with the exact same opening sentence —
+// classic two-paste-of-same-recording symptom. Two entry points feed
+// enqueuePostStopTask:
+//   * toggleRecordingFromShortcut() — fired by Alt+Left hotkey
+//   * stopRecordingFromOverlay()    — fired by clicking the overlay
+//                                     stop pill, wrapped in
+//                                     guardedStopFromOverlay
+// They use SEPARATE in-flight flags (shortcutToggleInFlight vs
+// overlayStopInFlight). A press-and-click sequence within ~50 ms can
+// invoke both before either flag has been observed, producing TWO
+// enqueuePostStopTask calls for the SAME recordingId — two
+// transcript polls, two clipboard writes, two AppleScript Cmd+V's.
+// Dedup at the enqueue gate is the simplest enterprise-correct fix:
+// recordingId is monotonic (++liveRecordingSeq in startLive), unique
+// per recording, and already on the task. We track up to 4096
+// recordingIds (~weeks of normal usage) and roll the oldest out.
+const _enqueuedRecordingIds = new Set();
+const _ENQUEUED_RECORDING_IDS_CAP = 4096;
 function enqueuePostStopTask(options = {}) {
   const task = {
     autoTranscribe: !!options.autoTranscribe,
@@ -4561,6 +4586,26 @@ function enqueuePostStopTask(options = {}) {
     target: normalizeCapturedPasteTarget(options.target),
   };
   if (!task.autoTranscribe) return;
+  // Dedup by recordingId. recordingId === 0 is the legacy fallback
+  // (renderer didn't supply one, very old build); skip dedup for
+  // those so the legacy path still works at least once. Modern
+  // renderers always send a positive monotonic id.
+  if (task.recordingId > 0) {
+    if (_enqueuedRecordingIds.has(task.recordingId)) {
+      appendMainLog(
+        `[post-stop-queue] dedup-skipped rec=${task.recordingId} ` +
+        `(already enqueued; preventing double-paste)`
+      );
+      return;
+    }
+    _enqueuedRecordingIds.add(task.recordingId);
+    // Roll the oldest entry out when the cap is reached.
+    if (_enqueuedRecordingIds.size > _ENQUEUED_RECORDING_IDS_CAP) {
+      const iter = _enqueuedRecordingIds.values();
+      const oldest = iter.next().value;
+      if (oldest !== undefined) _enqueuedRecordingIds.delete(oldest);
+    }
+  }
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
   appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
