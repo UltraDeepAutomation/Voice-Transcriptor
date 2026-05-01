@@ -421,18 +421,26 @@
             <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
 
             <div class="pane-footer current-audio-row" id="currentRecordingAudioRow" hidden>
-              <audio id="currentRecordingAudio" controls></audio>
+              <audio id="currentRecordingAudio" controls preload="auto"></audio>
               <button class="icon-btn" id="retranscribeBtn" type="button"
                 aria-label="Re-transcribe saved audio via REST API"
                 title="Re-transcribe">
                 <span class="reload-ico" aria-hidden="true"></span>
               </button>
+              <!-- Explicit Download button. The native <audio controls>
+                   three-dot menu's "Download" entry doesn't reliably
+                   appear in Electron on Windows for blob: URLs (Chromium
+                   hides it for many MIME / source combinations). User
+                   reported "нет кнопки скачать". This explicit button
+                   triggers a download via an off-DOM <a download> with
+                   the file's real name + MIME so it works on every
+                   platform regardless of player chrome behaviour. -->
+              <button class="icon-btn" id="currentRecordingDownloadBtn" type="button"
+                aria-label="Download recording audio"
+                title="Download audio">
+                <span class="download-ico" aria-hidden="true"></span>
+              </button>
               <span class="current-audio-meta" id="currentRecordingAudioMeta"></span>
-              <!-- ``Open`` and ``Download`` icon buttons removed: the
-                   native ``<audio controls>`` chrome already ships
-                   a three-dot menu with "Download" and the browser
-                   can open the object URL in a new tab. Having two
-                   redundant ways to do the same thing was clutter. -->
             </div>
 
             <div class="pane-footer resource-row" id="downloadRow" hidden>

@@ -595,6 +595,69 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
   });
 }
 
+// Wire the explicit Download button (added in index.html because the
+// native <audio controls> three-dot "Download" entry doesn't reliably
+// appear in Electron on Windows for blob: URLs).
+//
+// We re-derive the URL on click rather than caching it so the button
+// always points at the freshest source — when the user re-transcribes
+// the same audio, the in-memory File is replaced and the cached URL
+// would otherwise download the previous take.
+(() => {
+  const btn = document.getElementById("currentRecordingDownloadBtn") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    if (!latestSavedAudioState) return;
+    const file = latestSavedAudioState.file;
+    const fileName = latestSavedAudioState.downloadName
+      || latestSavedAudioState.savedName
+      || "recording.wav";
+    let url = "";
+    let revokeAfter = false;
+    if (file) {
+      url = URL.createObjectURL(file);
+      revokeAfter = true;
+    } else if (latestSavedAudioState.savedName) {
+      url = latestRecordingAudioUrl(
+        latestSavedAudioState.savedName,
+        latestSavedAudioState.archiveDir || "",
+      );
+    }
+    if (!url) return;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    if (revokeAfter) {
+      // Defer revoke so the browser's download stream finishes reading
+      // the blob first. 30 s is generous for a multi-MB recording.
+      window.setTimeout(() => {
+        try { URL.revokeObjectURL(url); } catch { /* idempotent */ }
+      }, 30_000);
+    }
+  });
+})();
+
+// Audio element error handler — Windows users reported playback fails
+// on the just-recorded clip. Without this hook the failure was silent;
+// now any media-element error is logged so we can diagnose codec /
+// MIME / blob-revocation issues from the support bundle.
+(() => {
+  const audioEl = document.getElementById("currentRecordingAudio") as HTMLAudioElement | null;
+  if (!audioEl) return;
+  audioEl.addEventListener("error", () => {
+    const err = audioEl.error;
+    const code = err ? err.code : -1;
+    const msg = err ? (err.message || "") : "";
+    const src = audioEl.currentSrc || audioEl.src || "";
+    const fileType = latestSavedAudioState?.file?.type || "";
+    console.warn(`[currentRecordingAudio] media error code=${code} msg=${msg} mime=${fileType} src=${src.slice(0, 120)}`);
+  });
+})();
+
 function providerLabel(provider: string): string {
   const value = String(provider || "").trim().toLowerCase();
   if (!value || value === "unknown") return "Unknown";

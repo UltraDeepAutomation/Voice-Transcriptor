@@ -2189,6 +2189,20 @@ textarea:focus-visible,
   animation: reload-spin 0.9s linear infinite;
 }
 
+/* Download icon — explicit chrome for the recording-audio Download
+   button that replaces the unreliable native <audio controls>
+   three-dot "Download" entry on Windows. Same sizing as .reload-ico
+   so the two adjacent icon-btn's line up visually. */
+.download-ico {
+  width: 14px;
+  height: 14px;
+  display: inline-block;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 14px 14px;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12 4v12m0 0l-4-4m4 4l4-4' stroke='%23D2D2D2' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M4 19h16' stroke='%23D2D2D2' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
 @keyframes reload-spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
