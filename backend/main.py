@@ -2880,12 +2880,34 @@ def _run_remote_transcribe_once(
                 _stem = orig_name.rsplit(".", 1)[0] if "." in orig_name else orig_name
                 orig_name = f"{_stem}.webm"
             except AudioError as e:
-                # Surface as RemoteError so the existing endpoint catch
-                # maps it to HTTP 502 with the ffmpeg detail. AudioError
-                # explicitly explains "ffmpeg not installed" or "ffmpeg
-                # failed: <reason>" — both more useful than a silent
-                # post-upload provider 4xx.
-                raise RemoteError(f"audio compression failed: {e}") from e
+                _err_text = str(e).lower()
+                # GRACEFUL DEGRADATION when ffmpeg is missing: a fresh
+                # Windows install (or a corp environment that blocks
+                # winget) may not have ffmpeg yet. Rather than failing
+                # the entire remote-transcribe with HTTP 502, fall back
+                # to sending the raw bytes — Deepgram accepts most
+                # common containers (m4a, mp3, wav, mp4) directly via
+                # mime sniffing. The user pays the slow-upload tax we
+                # tried to avoid (uncompressed body) but DOES get a
+                # transcript, which is the user-visible product
+                # contract. ffmpeg-required failure paths (genuinely
+                # corrupted input, codec mismatch) are still raised as
+                # RemoteError so the user sees an actionable message.
+                if "ffmpeg is not installed" in _err_text:
+                    logger.warning(
+                        "ffmpeg missing — sending raw audio body "
+                        "(%d bytes, ext=%s) without compression. Install "
+                        "ffmpeg to halve upload time on slow links.",
+                        len(audio_bytes), _orig_ext,
+                    )
+                    # Leave audio_bytes + orig_name unchanged. Fall
+                    # through to the provider call with the original
+                    # bytes and original mime mapping.
+                else:
+                    # Genuine conversion failure (corrupt input, codec
+                    # mismatch, ffmpeg crash). Surface so the endpoint
+                    # catch maps to HTTP 502 with an actionable detail.
+                    raise RemoteError(f"audio compression failed: {e}") from e
 
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""

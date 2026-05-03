@@ -4691,8 +4691,37 @@ async function runPostStopQueue() {
   }
 }
 
+// Second-line dedup: tracks recordingIds that have ACTUALLY been pasted.
+// Even if ``_enqueuedRecordingIds`` somehow lets a duplicate through
+// (future bug, edge race, recordingId==0 legacy path), this gate
+// blocks the second paste before it reaches the AppleScript / VBS /
+// xdotool key-injection. Belt-and-braces over the enqueue dedup.
+const _pastedRecordingIds = new Set();
+const _PASTED_RECORDING_IDS_CAP = 4096;
+function _markRecordingPasted(recordingId) {
+  if (!recordingId || recordingId <= 0) return;
+  _pastedRecordingIds.add(recordingId);
+  if (_pastedRecordingIds.size > _PASTED_RECORDING_IDS_CAP) {
+    const oldest = _pastedRecordingIds.values().next().value;
+    if (oldest !== undefined) _pastedRecordingIds.delete(oldest);
+  }
+}
+
 async function processPostStopTask(task) {
   const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
+  // SECOND-LINE DEDUP — even if the same recordingId reaches this
+  // function through some path that bypassed _enqueuedRecordingIds
+  // (defensive against future regressions, the legacy recordingId==0
+  // exemption path, or any race that pushes directly into postStop
+  // Queue), refuse to paste a recording that already produced one.
+  if (task.recordingId > 0 && _pastedRecordingIds.has(task.recordingId)) {
+    appendMainLog(
+      `[post-stop-paste] dedup-skipped rec=${task.recordingId} ` +
+      `(already pasted; second-line guard fired)`,
+    );
+    traceEnd(trace, "skipped", { reason: "already-pasted" });
+    return;
+  }
   // Old value was 120000 (2 minutes!) which caused the overlay to
   // hang indefinitely showing "Transcribing..." when the renderer was
   // slow or unresponsive. 15 seconds is more than enough for any
@@ -4887,6 +4916,11 @@ async function processPostStopTask(task) {
       `[paste-auto] ${pasteTargetSummary(effectiveTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
     if (pasted.ok) {
+      // Mark this recordingId as pasted BEFORE returning so any
+      // second-arrival task for the same id (defensive against races
+      // that bypass the enqueue dedup) is rejected by the second-line
+      // guard at the top of processPostStopTask.
+      _markRecordingPasted(task.recordingId);
       // Show success immediately once the paste actually happened.
       await setOverlayStatus("Pasted");
     }

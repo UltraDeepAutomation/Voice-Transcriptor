@@ -807,10 +807,21 @@ function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): Transcript
 function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
   if (!segments.length) return [];
   const epsilon = UI_TOKENS.finalize.segmentEpsilonSec;
-  const ordered = [...segments].sort((a, b) => a.start - b.start || a.end - b.end);
+  // Sort by start asc, then end DESC. The longer / later-ending segment
+  // for the same start time lands FIRST in the merged list, so the
+  // shorter overlapping interim that follows is dropped by the
+  // is-prefix-of-prev test below. Without the descending end-tie-break
+  // the shorter interim arrived first and the longer final was kept,
+  // leaving both in the transcript and producing visible duplication
+  // — exactly the user-reported "Просто расскажу," + "Просто расскажу
+  // кратко. И ты тоже" pattern within a single recording.
+  const ordered = [...segments].sort(
+    (a, b) => (a.start - b.start) || (b.end - a.end),
+  );
   const merged: TranscriptSegment[] = [];
   for (const segment of ordered) {
     const prev = merged[merged.length - 1];
+    // 1. Exact duplicate: drop.
     if (
       prev &&
       Math.abs(prev.start - segment.start) <= epsilon &&
@@ -818,6 +829,37 @@ function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegme
       prev.text === segment.text
     ) {
       continue;
+    }
+    // 2. Prefix-overlap dedup: when a later interim emission shares
+    //    the same start as a kept segment AND its text is a strict
+    //    prefix of the kept segment's text (within whitespace
+    //    normalisation), drop the shorter interim. Deepgram
+    //    streaming emits this pattern: an interim "Сергей привет"
+    //    is followed by the final "Сергей привет, как дела" — both
+    //    arrive with identical start times. The previous merge
+    //    only dropped EXACT duplicates so both ended up in the
+    //    transcript, the user saw their utterance twice in the
+    //    paste, and the auto-paste delivered both halves back-to-
+    //    back. Comparing on whitespace-normalised lowercase guards
+    //    against trailing-comma / spacing differences between the
+    //    two emissions ("hello world," vs "hello world , ").
+    if (
+      prev &&
+      Math.abs(prev.start - segment.start) <= epsilon
+    ) {
+      const prevNorm = prev.text.replace(/\s+/g, " ").trim().toLowerCase();
+      const curNorm = segment.text.replace(/\s+/g, " ").trim().toLowerCase();
+      if (prevNorm.startsWith(curNorm)) {
+        // Current segment's text is wholly contained in prev (which
+        // ended later thanks to the descending end-tie-break) → drop.
+        continue;
+      }
+      if (curNorm.startsWith(prevNorm)) {
+        // Reverse case — shouldn't happen with the desc-end sort
+        // but defensive: replace prev with the longer segment.
+        merged[merged.length - 1] = segment;
+        continue;
+      }
     }
     merged.push(segment);
   }
