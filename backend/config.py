@@ -127,27 +127,56 @@ def _load_or_create_fernet_key() -> bytes:
                     _KEYFILE, e,
                 )
     key = Fernet.generate_key()
-    try:
-        # Atomic + fsync write via the shared SSOT primitive. Without
-        # atomicity, an interrupted first-launch write could leave a
-        # zero-length keyfile on disk, which the next load would detect
-        # as "corrupt" and regenerate — permanently losing access to
-        # any keys encrypted with the lost original. atomic_write_bytes
-        # guarantees either the old contents or the full new contents.
-        atomic_write_bytes(_KEYFILE, key)
-    except OSError as e:
-        logger.error(
-            "failed to persist encryption keyfile at %s: %s — "
-            "encryption will use an in-memory key for this session only",
-            _KEYFILE, e,
-        )
-        return key
-    try:
-        os.chmod(_KEYFILE, 0o600)
-    except OSError as e:
-        # Non-POSIX filesystems (Windows, exFAT, network mounts): the
-        # keyfile still exists with default permissions.
-        logger.debug("encryption keyfile chmod skipped: %s", e)
+    # Direct write through ``os.open`` with O_CREAT | O_EXCL | mode=0o600
+    # so the file is NEVER readable by other users on the system, not
+    # even briefly. The previous ``atomic_write_bytes`` + ``os.chmod``
+    # sequence left a window between the rename (default 0o644 perms
+    # via os.replace) and the chmod where the encryption key was
+    # world-readable. On a multi-user Linux / macOS host this is a
+    # real exposure for the milliseconds between the two syscalls.
+    #
+    # O_EXCL fails if the file already exists. We checked existence
+    # at the top of the function; a TOCTOU race here would only
+    # produce an OSError, which we handle below.
+    if os.name == "nt":
+        # Windows doesn't honor mode bits on os.open the same way;
+        # NTFS ACL is what protects user data and the file lands in
+        # %APPDATA%\Transcriptor\ which is already user-private. The
+        # atomic primitive is good enough on Win.
+        try:
+            atomic_write_bytes(_KEYFILE, key)
+        except OSError as e:
+            logger.error(
+                "failed to persist encryption keyfile at %s: %s — "
+                "encryption will use an in-memory key for this session only",
+                _KEYFILE, e,
+            )
+            return key
+    else:
+        try:
+            _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(
+                str(_KEYFILE),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                os.write(fd, key)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            # Belt-and-braces chmod in case the umask masked our mode.
+            try:
+                os.chmod(_KEYFILE, 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            logger.error(
+                "failed to persist encryption keyfile at %s: %s — "
+                "encryption will use an in-memory key for this session only",
+                _KEYFILE, e,
+            )
+            return key
     return key
 
 

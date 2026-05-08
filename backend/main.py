@@ -1618,7 +1618,16 @@ def _register_archive_dir(path: Path) -> None:
             return  # Already known — no write needed
         existing.append(abs_str)
         try:
-            _atomic_write_text(_ARCHIVE_DIR_REGISTRY_PATH, json.dumps(sorted(existing)))
+            # SSOT: every other JSON persistence site in the backend
+            # uses atomic_write_json directly (config.json, recovery
+            # meta, upscale presets, job result.json). The previous
+            # ``_atomic_write_text(path, json.dumps(...))`` here was
+            # functionally equivalent but inconsistent: missed the
+            # ``ensure_ascii=False`` + ``indent=2`` shape produced by
+            # atomic_write_json, so a Cyrillic recordings_dir landed
+            # as ``\\u041a\\u043e...`` escapes in the registry while
+            # every other JSON file held it as readable UTF-8.
+            atomic_write_json(_ARCHIVE_DIR_REGISTRY_PATH, sorted(existing))
         except Exception as exc:
             logger.warning("register_archive_dir: write failed for %s: %s", abs_str, exc)
 
