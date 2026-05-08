@@ -1488,18 +1488,22 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
 # SSOT: audio extensions a saved recording can carry alongside its
 # .txt transcript. Both ``_recording_audio_path`` (retrieval lookup
 # for the History tab's audio player and Re-transcribe path) AND
-# ``_prune_old_recording_audio`` (retention sweeper) iterate this
-# tuple. Two divergent definitions previously meant a saved file
-# with one of the missing extensions would be playable but never
-# pruned, OR be pruned but never findable for playback. Including
-# ``.opus``/``.oga``/``.wma`` so users who manually drop those into
-# the recordings directory (or future codecs we add to ALLOWED_AUDIO
-# _EXTS) round-trip correctly. ``.mp4``/``.webm`` stay in for the
-# Live tab MediaRecorder path which can produce either container.
-_RECORDING_AUDIO_EXTS: tuple[str, ...] = (
-    ".wav", ".m4a", ".mp3", ".flac", ".ogg", ".oga",
-    ".opus", ".aac", ".mp4", ".webm", ".wma",
-)
+# ``_prune_old_recording_audio`` (retention sweeper) AND
+# ``delete_all_recordings`` walk this tuple.
+#
+# Derived directly from ``ALLOWED_AUDIO_EXTS`` so video containers
+# (mp4, m4v, mov, mkv, avi, mpg, mpeg, 3gp) that are accepted at the
+# upload validator gate ALSO round-trip through retrieval / retention
+# / delete. The previous static tuple omitted every video extension —
+# a user uploading a .mov file via save-with-audio would be unable to
+# play it back in History, the audio file would never be pruned by
+# the retention sweep, AND ``delete_all_recordings`` would orphan it
+# on disk forever (deleting only the .txt transcript). SSOT drift
+# between ALLOWED_AUDIO_EXTS (validator scope) and
+# _RECORDING_AUDIO_EXTS (lifecycle scope) was a silent data-leak bug.
+#
+# Sorting is purely for deterministic iteration order in tests.
+_RECORDING_AUDIO_EXTS: tuple[str, ...] = tuple(sorted(ALLOWED_AUDIO_EXTS))
 
 
 def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optional[Path]:
@@ -2248,25 +2252,39 @@ def _record_recovery_chunk(recovery: dict, data: bytes) -> None:
 
 
 def _finalize_live_recovery(recovery: dict) -> None:
+    # Flush + fsync inside try/finally so ``close()`` is GUARANTEED to
+    # run on every error path. Previous form had ``f.flush()`` outside
+    # the inner try, so an OSError from flush (disk full, EIO mid-
+    # write) jumped to the outer except WITHOUT closing the file —
+    # leaking one PCM file descriptor per failed session. On a
+    # consistently-failing disk the per-process FD limit is reached in
+    # minutes and the entire backend stops accepting WS connections.
+    f = recovery["pcm_file"]
     try:
-        # Flush Python buffers and fsync the kernel buffer to disk
-        # BEFORE closing — close alone does not call fsync, so a power
-        # cut between close and the next syscall can leave the recovery
-        # spool with the last batch of writes only in the kernel page
-        # cache. This file's whole purpose is crash recovery, so the
-        # one place we MUST be durable is at finalize.
-        f = recovery["pcm_file"]
-        f.flush()
         try:
-            os.fsync(f.fileno())
-        except OSError as fsync_err:
-            # Non-POSIX filesystems can refuse fsync; the data is at
-            # least flushed out of Python and into the OS, which is
-            # all we can promise on those platforms.
-            logger.debug("live recovery fsync skipped: %s", fsync_err)
-        f.close()
-    except OSError as e:
-        logger.warning("live recovery close failed: %s", e)
+            # Flush Python buffers and fsync the kernel buffer to disk
+            # BEFORE closing — close alone does not call fsync, so a
+            # power cut between close and the next syscall can leave
+            # the recovery spool with the last batch of writes only
+            # in the kernel page cache. This file's whole purpose is
+            # crash recovery, so the one place we MUST be durable is
+            # at finalize.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError as fsync_err:
+                # Non-POSIX filesystems can refuse fsync; the data is
+                # already flushed out of Python into the OS, which is
+                # all we can promise on those platforms.
+                logger.debug("live recovery fsync skipped: %s", fsync_err)
+        except OSError as flush_err:
+            logger.warning("live recovery flush/fsync failed: %s", flush_err)
+    finally:
+        # Close ALWAYS runs — even on flush() failure. FD never leaks.
+        try:
+            f.close()
+        except OSError as close_err:
+            logger.warning("live recovery close failed: %s", close_err)
     try:
         if recovery["bytes"] < 32000:  # ~1s at 16kHz mono pcm16
             recovery["pcm_path"].unlink(missing_ok=True)
@@ -4040,7 +4058,13 @@ async def save_recording_with_audio(
     audio_backup: Optional[Path] = None
     if out_audio.exists():
         try:
-            audio_backup = out_audio.with_name(f"{out_audio.name}.backup-{uuid.uuid4().hex}")
+            # Use the canonical ``.tmp-<hex>`` convention so a crash
+            # between the rename and the rollback's cleanup is handled
+            # automatically by ``_sweep_orphan_tmp_files`` on next boot.
+            # The previous ``.backup-<hex>`` form was NOT matched by
+            # ``_TMP_ORPHAN_RE`` — every crashed save_with_audio left a
+            # permanent backup of the prior audio on disk forever.
+            audio_backup = out_audio.with_name(f"{out_audio.name}.tmp-{uuid.uuid4().hex}")
             os.replace(out_audio, audio_backup)
         except OSError:
             audio_backup = None  # Couldn't backup — rollback will only be safe for new-recording path

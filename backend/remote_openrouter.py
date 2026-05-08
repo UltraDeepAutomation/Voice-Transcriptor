@@ -90,8 +90,16 @@ def openrouter_transcribe(
     # per encoded MB (rounded up to account for base64 inflation).
     encoded_mb = max(1.0, (len(audio_bytes) * 1.34) / (1024 * 1024))
     read_timeout = max(180, int(encoded_mb * 8))
+    # Scale retries inversely to body size — same logic the Deepgram
+    # path applies. Three full retries of a 50 MB encoded body waste
+    # 150 MB of bandwidth on a network that's already struggling; the
+    # 2nd attempt is the diagnostic value, beyond that is bandwidth
+    # waste. Small files keep the 3-attempt transient-recovery path.
+    upload_retries = 3 if encoded_mb < 5 else 2
     r = request_with_retry(
-        "POST", url, headers=headers, json=payload, timeout=(10, read_timeout),
+        "POST", url, headers=headers, json=payload,
+        timeout=(10, read_timeout),
+        retries=upload_retries,
     )
 
     if r.status_code >= 400:

@@ -1047,7 +1047,11 @@ function renderCurrentRecordingSummary(
     // Also clear the DOM pill — previously only internal state was reset,
     // leaving the previous session's status text (e.g. "Done", "Upscaling")
     // visible in the header after recording ended.
-    setStatus("", "neutral");
+    // ``"idle"`` (not the formerly-passed ``"neutral"``) is the
+    // ``StatusKind`` enum value matching the visual neutral grey dot.
+    // ``"neutral"`` was a TS2345 error caught by tsc but tolerated
+    // because Vite skips type-checks. Now the type contract holds.
+    setStatus("", "idle");
     return;
   }
   const status = String(summary.status || "").trim();
@@ -3649,7 +3653,10 @@ function queueUiPreferencesSave(): void {
       preferences: {
         recordings_dir: nextRecordingsDir,
         remote_provider: remoteProvider,
-        openrouter: { model: openrouterModel || "google/gemini-2.5-flash" },
+        // SSOT: derive default from OPENROUTER_AUDIO_MODELS so a future
+        // version bump (e.g. gemini-2.6-flash) flows through; the prior
+        // hardcoded literal would silently keep stuck on 2.5-flash.
+        openrouter: { model: openrouterModel || OPENROUTER_AUDIO_MODELS[0] },
         ui: collectUiPreferences(),
       },
     };
@@ -3697,7 +3704,9 @@ async function loadCfg(): Promise<void> {
     keyInput("deepgram").placeholder = "DEEPGRAM_API_KEY";
     syncKeyActionButton("openrouter");
     syncKeyActionButton("deepgram");
-    const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || "google/gemini-2.5-flash";
+    // SSOT default mirrors OPENROUTER_AUDIO_MODELS[0]. Same SSOT
+    // rationale as the autosave path above.
+    const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || OPENROUTER_AUDIO_MODELS[0];
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     configuredRecordingsDir = (cfg.preferences || {}).recordings_dir || "";
     ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;

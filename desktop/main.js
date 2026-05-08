@@ -4388,6 +4388,26 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   } // end macOS block
 
   // Secondary fallback: trigger Edit -> Paste menu item in target process.
+  // macOS-only — uses AppleScript ``System Events`` which doesn't exist
+  // on Win/Linux. Without this guard, the post-Win/Linux fallthrough
+  // ran the osascript spawn anyway, hit ENOENT (no osascript binary),
+  // overwrote ``lastReason`` with the bogus spawn-error string, and
+  // surfaced a useless "spawn osascript ENOENT" status to the user
+  // instead of the real Win/Linux paste-failure cause. Skip directly
+  // to the consolidated failure path which restores the clipboard +
+  // releases the snapshot symmetrically with the success branches.
+  if (process.platform !== "darwin") {
+    try { restoreClipboard(savedClipboard); } catch { }
+    releaseClipboardSnapshot();
+    traceEnd(trace, "failed", { reason: lastReason || "paste-no-attempt", method: "exhausted" });
+    logPasteTrace("failed", { reason: compactLogText(lastReason || "paste-no-attempt") });
+    return {
+      ok: false,
+      reason: lastReason || "paste-no-attempt",
+      method: "exhausted",
+      verified: false,
+    };
+  }
   const menuPasteScript = `
     set targetApp to "${escapedApp}"
     set targetPid to ${Math.trunc(pid)}
@@ -6125,6 +6145,30 @@ async function createWindow(options = {}) {
       appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
       pendingTranscriptionCount = 0;
     }
+    // Drain any queued post-stop tasks — their renderer state is
+    // dead, polling them would just spin processPostStopTask for
+    // 15 s per task hitting executeJavaScript failures, then time
+    // out. Faster + cleaner to drop them now.
+    if (postStopQueue.length > 0) {
+      const dropped = postStopQueue.length;
+      postStopQueue = [];
+      appendMainLog(`[render-process-gone] dropped postStopQueue=${dropped}`);
+    }
+    // Clear dedup Sets — the post-crash renderer's ``liveRecordingSeq``
+    // resets to 0 on reload, so the new recordings will reuse ids 1, 2,
+    // 3, ... that the pre-crash session already added to these Sets.
+    // Without this clear, the next recording's recordingId=1 silently
+    // collides with the dead-session entry and the dedup gate falsely
+    // skips the post-stop paste task — user records, stops, and sees
+    // NO paste happen until ids climb past the highest pre-crash id.
+    if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
+      appendMainLog(
+        `[render-process-gone] clearing dedup sets ` +
+        `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
+      );
+      _enqueuedRecordingIds.clear();
+      _pastedRecordingIds.clear();
+    }
     // Tear down the overlay: it may be in "Transcribing" state
     // pointing at a transcript that will never arrive.
     try {
@@ -6266,11 +6310,20 @@ async function createWindow(options = {}) {
     win = null;
   });
 
-  const url = `${BASE_URL}/`;
+  // ``url`` is captured AFTER startBackend so it reflects whatever
+  // port pickBackendPort actually bound. Previously captured at this
+  // point (before the conditional startBackend call), the URL would
+  // freeze at the OLD ``BASE_URL`` and a port shift inside
+  // pickBackendPort (preferred 8321 occupied → fallback 8322) made
+  // win.loadURL hit ERR_CONNECTION_REFUSED on the stale port. The
+  // healthcheck below already used template re-evaluation against
+  // fresh BASE_URL, so the inconsistency was easy to miss until a
+  // backend-restart-after-crash path triggered the port shift.
   try {
     if (!backend) {
       await startBackend();
     }
+    const url = `${BASE_URL}/`;
     // Per-user-decision (pass 28): NO BOOT LOADER. The window stays
     // hidden during the cold-start window; once /api/health responds
     // OK we load the real URL and reveal the window. This avoids

@@ -381,7 +381,21 @@ class DeepgramLiveSession:
         if not chunk:
             return
         try:
-            await self._ws.send(chunk)
+            # Hard 5-second send timeout. Without it, a half-open TCP
+            # socket (kernel-level hung sendq, network partition with
+            # no RST yet) wedges this await for the full system socket
+            # timeout (60-300 s on Linux). While hung, the WS receiver
+            # in main.py cannot read more frames from the renderer,
+            # finalize cannot fire, and the user sees a frozen UI.
+            # The websockets library's close_timeout is for the close
+            # handshake only, not mid-stream sends — we bound it here.
+            await asyncio.wait_for(self._ws.send(chunk), timeout=5.0)
+        except asyncio.TimeoutError:
+            fatal = self.stats.segments_final == 0
+            self._report_error(
+                "Deepgram send hung (>5s) — connection wedged", fatal=fatal,
+            )
+            return
         except ConnectionClosed as e:
             fatal = self.stats.segments_final == 0
             self._report_error(
@@ -392,13 +406,14 @@ class DeepgramLiveSession:
                     "deepgram-live: send after close, degrading gracefully (%d committed segs)",
                     self.stats.segments_final,
                 )
+            return
         except WebSocketException as e:
             fatal = self.stats.segments_final == 0
             self._report_error(f"Deepgram send failed: {e}", fatal=fatal)
-        else:
-            self.stats.bytes_sent += len(chunk)
-            self.stats.chunks_sent += 1
-            self.stats.last_send_at = time.monotonic()
+            return
+        self.stats.bytes_sent += len(chunk)
+        self.stats.chunks_sent += 1
+        self.stats.last_send_at = time.monotonic()
 
     async def events(self) -> AsyncIterator[dict]:
         """Yield normalized events until the session terminates.
@@ -426,8 +441,17 @@ class DeepgramLiveSession:
         if self._ws is not None and not self._finalize_sent:
             self._finalize_sent = True
             try:
-                await self._ws.send(json.dumps({"type": "CloseStream"}))
+                # Same 5-second bound as send_pcm — a wedged TCP socket
+                # mustn't hang finalize indefinitely. The CloseStream
+                # frame is tiny so the timeout only fires when the
+                # underlying socket is genuinely stuck.
+                await asyncio.wait_for(
+                    self._ws.send(json.dumps({"type": "CloseStream"})),
+                    timeout=5.0,
+                )
                 logger.debug("deepgram-live: CloseStream sent")
+            except asyncio.TimeoutError:
+                logger.warning("deepgram-live: CloseStream send timed out (>5s)")
             except ConnectionClosed:
                 logger.debug("deepgram-live: CloseStream skipped (already closed)")
             except WebSocketException as e:
