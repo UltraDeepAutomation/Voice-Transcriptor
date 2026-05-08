@@ -372,7 +372,26 @@ const ALLOWED_AUDIO_MIME = new Set([
   "audio/webm",
   "audio/aac",
 ]);
-const ALLOWED_AUDIO_EXT = new Set(["wav", "mp3", "m4a", "flac", "ogg", "aac", "mp4", "webm"]);
+// SSOT for the file extensions BOTH the Live-tab file-picker
+// validator and the Upload-tab drag-drop validator accept. Mirrors
+// backend/main.py:ALLOWED_AUDIO_EXTS: every extension the backend's
+// ffmpeg path can demux (audio + video + Opus/Ogg-Audio variants).
+//
+// Previously the file held TWO divergent sets: ``ALLOWED_AUDIO_EXT``
+// (8 audio-only entries) used for setSelectedFile, and
+// ``UPLOAD_ALLOWED_EXTS`` (17 audio+video entries) used for
+// enqueueUploadFile. The Upload set itself was missing ``oga`` that
+// the backend WOULD accept — silent rejection at the client for a
+// file the server would have transcribed. Consolidated here so a
+// future ext addition (.flv, .ts, .wmv, ...) is a one-line change.
+const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
+  // Audio containers — natively understood by Deepgram REST and the
+  // OpenRouter audio-input pipeline. Mirrors backend/main.py:296.
+  "wav", "mp3", "m4a", "flac", "ogg", "oga", "opus", "aac", "webm", "wma",
+  // Video containers — backend extracts audio via ffmpeg before
+  // forwarding to remote providers. Mirrors backend/main.py:307.
+  "mp4", "m4v", "mov", "mkv", "avi", "mpg", "mpeg", "3gp",
+]);
 const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
 const OPENROUTER_AUDIO_MODELS = [
   "google/gemini-2.5-flash",
@@ -7291,10 +7310,15 @@ function setSelectedFile(file: File | null): void {
   if (file) {
     const ext = (file.name.split(".").pop() || "").toLowerCase();
     const mimeOk = !file.type || ALLOWED_AUDIO_MIME.has(file.type);
-    const extOk = !!ext && ALLOWED_AUDIO_EXT.has(ext);
+    // Use the SSOT extension set that mirrors backend's
+    // ALLOWED_AUDIO_EXTS. Previously rejected legitimate .opus / .oga
+    // / .wma files the backend would have accepted, plus ALL video
+    // containers — even though the backend's ffmpeg path can demux
+    // audio out of any of them.
+    const extOk = !!ext && ACCEPTED_AUDIO_VIDEO_EXTS.has(ext);
     if (!mimeOk && !extOk) {
       reportFileSelectionError(
-        "Unsupported audio format. Allowed: WAV, MP3, M4A, FLAC, OGG, AAC, MP4, WEBM."
+        "Unsupported file type. Drop an audio or video file.",
       );
       return;
     }
@@ -8465,12 +8489,12 @@ function uploadFileSizeCap(): number {
 // containers (the backend's ffmpeg path demuxes audio out of any of
 // these). Drag-drop browsers don't enforce ``accept`` so we
 // double-check at the JS level.
-const UPLOAD_ALLOWED_EXTS = new Set([
-  // audio
-  "wav", "mp3", "m4a", "flac", "ogg", "aac", "opus", "wma",
-  // video / mixed
-  "mp4", "webm", "mov", "mkv", "avi", "m4v", "mpg", "mpeg", "3gp",
-]);
+// Alias to the SSOT set defined near the top of the file. Kept
+// under its old name so existing call sites (enqueueUploadFile)
+// don't need editing; the underlying set is the single canonical
+// list mirroring backend ALLOWED_AUDIO_EXTS — adding a new ext is
+// now a one-line change in ACCEPTED_AUDIO_VIDEO_EXTS.
+const UPLOAD_ALLOWED_EXTS = ACCEPTED_AUDIO_VIDEO_EXTS;
 
 function setupUploadView(): void {
   const dropZone = document.getElementById("uploadLargeDrop");
