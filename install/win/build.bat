@@ -72,7 +72,7 @@ echo   ========================================
 echo     Build complete!
 echo   ========================================
 echo.
-echo   Installer: dist\Transcriptor Setup 1.1.7.exe
+echo   Installer: dist\Transcriptor Setup 1.1.8.exe
 echo.
 echo   Double-click the .exe to install:
 echo     - Installs to %%LOCALAPPDATA%%\Programs\Transcriptor

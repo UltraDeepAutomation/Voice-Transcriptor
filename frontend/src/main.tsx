@@ -807,23 +807,43 @@ function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): Transcript
 function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
   if (!segments.length) return [];
   const epsilon = UI_TOKENS.finalize.segmentEpsilonSec;
-  // Sort by start asc, then end DESC. The longer / later-ending segment
-  // for the same start time lands FIRST in the merged list, so the
-  // shorter overlapping interim that follows is dropped by the
-  // is-prefix-of-prev test below. Without the descending end-tie-break
-  // the shorter interim arrived first and the longer final was kept,
-  // leaving both in the transcript and producing visible duplication
-  // — exactly the user-reported "Просто расскажу," + "Просто расскажу
-  // кратко. И ты тоже" pattern within a single recording.
+  // Speaker-aware equality. Both undefined ↔ both undefined (mono
+  // stream); a numbered speaker on one side and undefined on the
+  // other counts as DIFFERENT (don't conflate diarized into mono).
+  // Two distinct speaker indices are ALWAYS different — even when
+  // the text and timing happen to match, they're genuinely two
+  // utterances and must both be kept. Without this gate, a
+  // call-recording with cross-talk where speaker 0 and speaker 1
+  // utter "yeah" within the same epsilon window had ONE of them
+  // silently dropped from the transcript and the auto-paste was
+  // missing a turn. Subtle data-loss bug visible only with
+  // diarize=on.
+  const sameSpeaker = (a: TranscriptSegment, b: TranscriptSegment): boolean =>
+    a.speaker === b.speaker;
+  // Sort by start asc, then end DESC, then speaker asc. The
+  // longer / later-ending segment for the same (start, speaker)
+  // lands FIRST in the merged list, so the shorter overlapping
+  // interim that follows is dropped by the is-prefix-of-prev test
+  // below. Without the descending end-tie-break the shorter
+  // interim arrived first and the longer final was kept,
+  // leaving both in the transcript and producing visible
+  // duplication — exactly the user-reported "Просто расскажу," +
+  // "Просто расскажу кратко. И ты тоже" pattern within a single
+  // recording. The speaker tertiary keeps diarized output
+  // deterministic when two speakers share a start tick.
   const ordered = [...segments].sort(
-    (a, b) => (a.start - b.start) || (b.end - a.end),
+    (a, b) =>
+      (a.start - b.start) ||
+      (b.end - a.end) ||
+      ((a.speaker ?? -1) - (b.speaker ?? -1)),
   );
   const merged: TranscriptSegment[] = [];
   for (const segment of ordered) {
     const prev = merged[merged.length - 1];
-    // 1. Exact duplicate: drop.
+    // 1. Exact duplicate (same speaker, same timing, same text): drop.
     if (
       prev &&
+      sameSpeaker(prev, segment) &&
       Math.abs(prev.start - segment.start) <= epsilon &&
       Math.abs(prev.end - segment.end) <= epsilon &&
       prev.text === segment.text
@@ -831,20 +851,23 @@ function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegme
       continue;
     }
     // 2. Prefix-overlap dedup: when a later interim emission shares
-    //    the same start as a kept segment AND its text is a strict
-    //    prefix of the kept segment's text (within whitespace
-    //    normalisation), drop the shorter interim. Deepgram
-    //    streaming emits this pattern: an interim "Сергей привет"
-    //    is followed by the final "Сергей привет, как дела" — both
-    //    arrive with identical start times. The previous merge
-    //    only dropped EXACT duplicates so both ended up in the
-    //    transcript, the user saw their utterance twice in the
-    //    paste, and the auto-paste delivered both halves back-to-
-    //    back. Comparing on whitespace-normalised lowercase guards
-    //    against trailing-comma / spacing differences between the
-    //    two emissions ("hello world," vs "hello world , ").
+    //    the same start AND speaker as a kept segment AND its text
+    //    is a strict prefix of the kept segment's text (within
+    //    whitespace normalisation), drop the shorter interim.
+    //    Deepgram streaming emits this pattern: an interim
+    //    "Сергей привет" is followed by the final "Сергей привет,
+    //    как дела" — both arrive with identical start times. The
+    //    previous merge only dropped EXACT duplicates so both ended
+    //    up in the transcript, the user saw their utterance twice
+    //    in the paste, and the auto-paste delivered both halves
+    //    back-to-back. Comparing on whitespace-normalised lowercase
+    //    guards against trailing-comma / spacing differences
+    //    between the two emissions ("hello world," vs "hello world
+    //    , "). Speaker-aware: cross-talk between two speakers at
+    //    the same start is preserved.
     if (
       prev &&
+      sameSpeaker(prev, segment) &&
       Math.abs(prev.start - segment.start) <= epsilon
     ) {
       const prevNorm = prev.text.replace(/\s+/g, " ").trim().toLowerCase();
