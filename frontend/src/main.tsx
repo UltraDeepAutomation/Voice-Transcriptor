@@ -7343,46 +7343,143 @@ async function stopLive(enhance: boolean): Promise<void> {
         if (instantTranscript) {
           transcriptRaw = instantTranscript;
 
+          // ── Tail-gap detection (Stop-pressed-mid-utterance fix) ───
+          //
+          // Each committed segment has a Deepgram-provided ``end``
+          // timestamp (seconds since stream start). If the last
+          // committed segment ends well before the recording's total
+          // duration, there is audio AT THE TAIL that wasn't yet
+          // finalized when ``getCanonicalLiveSourceText()`` was
+          // called. This is exactly what the user reports as
+          // "сразу нажимаю на" — they spoke the last word, hit Stop
+          // immediately, and the last word's audio either:
+          //   1. hadn't been processed by Deepgram yet (in flight),
+          //   2. had been processed but only emitted as INTERIM, with
+          //      the ``is_final`` for it still in upstream queue, or
+          //   3. arrived at Deepgram AFTER CloseStream and Deepgram
+          //      emits the trailing ``is_final`` post-CloseStream
+          //      (which the envelope captures, but the fast path
+          //      previously fired-and-forgot).
+          //
+          // Threshold: 0.6 s. Less than Deepgram's 0.7 s endpointing
+          // window — anything under is normal latency for the last
+          // word, anything over is a real tail-cut.
+          //
+          // Recovery escalation:
+          //   1. Wait for ``liveFinalPromise`` (already in flight,
+          //      4000 ms ceiling). Its envelope contains the post-
+          //      CloseStream ``is_final`` segments. If those extend
+          //      beyond ``instantTranscript`` (more words / later
+          //      end-time), use them.
+          //   2. If the envelope ALSO doesn't fill the gap, escalate
+          //      to ``recoverFromEmptyTranscript`` which runs a full
+          //      pass over the on-disk audio (Deepgram REST → local
+          //      Whisper). The on-disk audio is captured locally via
+          //      PCM sink and is ALWAYS complete — it predates any
+          //      WebSocket dropout.
+          const wordCountOf = (s: string): number =>
+            s.split(/\s+/).filter(Boolean).length;
+          const lastSegEnd = liveTranscriptSegments.length > 0
+            ? liveTranscriptSegments[liveTranscriptSegments.length - 1].end
+            : 0;
+          const tailGapSec = recordedSec - lastSegEnd;
+          // Skip the check on very short recordings (< 1 s) where the
+          // gap arithmetic isn't meaningful. Skip when the user had
+          // streaming-error already (handled by the dedicated branch).
+          const tailLikelyMissing =
+            recordedSec > 1.0 && tailGapSec > 0.6 && !liveStreamErrorAtStop;
+          if (tailLikelyMissing) {
+            patchCurrentRecordingSummary({
+              title: provisionalTitle,
+              status: `Recovering tail (${Math.round(tailGapSec * 1000)}ms after last finalized segment)…`,
+              tone: "info",
+            }, sessionUiToken);
+            // Step 1 — wait for the in-flight envelope.
+            const envelope = liveFinalPromise ? await liveFinalPromise : null;
+            const envelopeText = (envelope?.text || "").trim();
+            const envelopeJoined = envelope
+              ? joinTranscriptSegments(envelope.segments)
+              : "";
+            // Pick whichever envelope flavour is longer (text vs
+            // segment-join) — they can disagree when Deepgram
+            // returns a hybrid alternatives payload.
+            const envelopeBest =
+              envelopeText.length >= envelopeJoined.length
+                ? envelopeText
+                : envelopeJoined;
+            if (
+              envelopeBest
+              && wordCountOf(envelopeBest) > wordCountOf(instantTranscript)
+            ) {
+              transcriptRaw = envelopeBest;
+            } else {
+              // Step 2 — envelope didn't help. Escalate to a fresh
+              // pass on the on-disk audio. ``recoverFromEmptyTranscript``
+              // is named for the empty case but the helper is
+              // semantically "produce the best transcript we can
+              // from the saved audio" and is the right escalation
+              // here too. Backend re-fetch ensures we don't read a
+              // dangling OPFS blob.
+              const recovered = await recoverFromEmptyTranscript(
+                `Live tail truncated (${Math.round(tailGapSec * 1000)}ms gap).`,
+              );
+              if (
+                recovered
+                && wordCountOf(recovered) > wordCountOf(instantTranscript)
+              ) {
+                transcriptRaw = recovered;
+                patchCurrentRecordingSummary({
+                  title: provisionalTitle,
+                  status: "Recovered tail via on-disk re-transcription.",
+                  tone: "success",
+                }, sessionUiToken);
+              }
+            }
+          }
+
           // ── Auto REST re-transcribe on suspiciously short streaming result ──
           //
-          // If the streaming transcript is much shorter than expected for
-          // the recording duration, the Deepgram WebSocket likely dropped
-          // packets due to a bad connection. The canonical audio file is
-          // ALWAYS complete (captured locally via PCM sink), so we can
-          // re-transcribe it via Deepgram's REST batch API to recover the
-          // full text. This is the "50 sec recording but only 10 words"
-          // scenario the user reported.
+          // Catches the catastrophic case (>70% of expected words
+          // missing — usually a streaming dropout, not just a tail
+          // cut). Still relies on the on-disk audio being present
+          // and a Deepgram key being configured. The tail-gap
+          // recovery above is the more precise fix; this stays as a
+          // safety net for the broader "streaming captured almost
+          // nothing" scenario.
           //
           // Heuristic: expect ~2.5 words per second of speech. If the
-          // streaming result has less than 30% of the expected word count,
-          // trigger an automatic REST re-transcribe.
-          const wordCount = transcriptRaw.split(/\s+/).filter(Boolean).length;
+          // streaming result has less than 30% of the expected word
+          // count, trigger an automatic REST re-transcribe.
+          const wordCount = wordCountOf(transcriptRaw);
           const expectedWords = recordedSec * 2.5;
           const isSuspiciouslyShort = recordedSec > 5 && wordCount < expectedWords * 0.3;
-          if (isSuspiciouslyShort && transcribeInputFile && isProviderKeyConfigured("deepgram")) {
+          if (isSuspiciouslyShort && isProviderKeyConfigured("deepgram")) {
             patchCurrentRecordingSummary({
               title: provisionalTitle,
               status: `Streaming captured only ${wordCount} words for ${Math.round(recordedSec)}s. Re-transcribing via REST...`,
               tone: "warning",
             }, sessionUiToken);
-            try {
-              const restResult = await remoteJobSync(transcribeInputFile, {
-                provider: "deepgram",
-                language: languageValue,
-                diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-                openrouterModel: getRemoteModelValue("deepgram"),
-              });
-              const restText = String(restResult.text || "").trim();
-              if (restText && restText.split(/\s+/).length > wordCount) {
-                transcriptRaw = restText;
-                patchCurrentRecordingSummary({
-                  title: provisionalTitle,
-                  status: "REST re-transcribe recovered full text.",
-                  tone: "success",
-                }, sessionUiToken);
+            const restRecoveryFile = await fetchRecoveryAudioFile();
+            if (restRecoveryFile) {
+              try {
+                const restResult = await remoteJobSync(restRecoveryFile, {
+                  provider: "deepgram",
+                  language: languageValue,
+                  diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+                  openrouterModel: getRemoteModelValue("deepgram"),
+                });
+                const restText = String(restResult.text || "").trim();
+                if (restText && wordCountOf(restText) > wordCount) {
+                  transcriptRaw = restText;
+                  patchCurrentRecordingSummary({
+                    title: provisionalTitle,
+                    status: "REST re-transcribe recovered full text.",
+                    tone: "success",
+                  }, sessionUiToken);
+                }
+              } catch (restErr) {
+                console.warn("Auto REST re-transcribe failed, keeping streaming result", restErr);
               }
-            } catch (restErr) {
-              console.warn("Auto REST re-transcribe failed, keeping streaming result", restErr);
             }
           }
         } else {
