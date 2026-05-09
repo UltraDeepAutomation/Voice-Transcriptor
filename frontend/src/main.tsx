@@ -1451,26 +1451,36 @@ function explainNetworkError(err: unknown, context = ""): string {
 }
 
 async function parseError(r: Response): Promise<string> {
-  let details = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
+  // 1.1.25 fix: previously called ``await r.json()`` then on failure
+  // ``await r.text()``. ``Response`` body is a one-shot stream — once
+  // ``json()`` consumes it (even on a malformed-JSON failure path),
+  // ``text()`` always rejects with "body stream already read". Every
+  // non-JSON error response was reduced to the bare ``HTTP <status>``
+  // line, dropping the actual server error message. Fix: read once
+  // as text, then attempt JSON parsing on the buffered string.
+  const status = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
+  let raw = "";
   try {
-    const j: unknown = await r.json();
+    raw = await r.text();
+  } catch (textError) {
+    console.debug("parseError: response body unavailable", textError);
+    return status;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return status;
+  try {
+    const j: unknown = JSON.parse(trimmed);
     if (typeof j === "object" && j && "detail" in j) {
       const detail = (j as { detail?: unknown }).detail;
-      const raw = typeof detail === "string" ? detail : JSON.stringify(j);
-      details = `${details}: ${raw}`;
-    } else {
-      details = `${details}: ${JSON.stringify(j)}`;
+      const detailRaw = typeof detail === "string" ? detail : JSON.stringify(j);
+      return `${status}: ${detailRaw}`;
     }
+    return `${status}: ${JSON.stringify(j)}`;
   } catch {
-    // Body wasn't JSON; fall through to text parsing.
-    try {
-      const txt = await r.text();
-      if (txt && txt.trim()) details = `${details}: ${txt.trim()}`;
-    } catch (textError) {
-      console.debug("parseError: response body unavailable", textError);
-    }
+    // Body wasn't JSON — surface the raw text payload (e.g., a plain
+    // HTTP 500 traceback or proxy error page).
+    return `${status}: ${trimmed}`;
   }
-  return details || `HTTP ${r.status}`;
 }
 
 async function apiGet<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -1824,9 +1834,37 @@ class OpfsPcmSink implements PcmSink {
     _activePcmSpoolNames.delete(this.fileHandle.name);
 
     if (this.lastWriteError) {
-      // The spool file may be truncated or corrupt. Return an empty
-      // File so the caller can fall back to the WebM container.
-      return new File([new Blob([], { type: "audio/wav" })], name, { type: "audio/wav" });
+      // 1.1.25 fix: previously returned an empty WAV here even though
+      // ``flushPending``'s catch branch (line ~1789) deliberately
+      // re-enqueues failed chunks into ``pendingChunks`` so finalize
+      // can salvage them from RAM. Returning empty discarded the bytes
+      // and forced the lower-fidelity WebM fallback for what was
+      // typically a transient disk hiccup. Now we splice the in-memory
+      // chunks together with whatever DID land on the OPFS spool: the
+      // spool prefix + the unwritten tail = a complete WAV.
+      try {
+        const spoolFile = await this.fileHandle.getFile();
+        const spoolBytes = spoolFile.size;
+        const tailChunks = this.pendingChunks;
+        const tailBytes = tailChunks.reduce((a, c) => a + c.byteLength, 0);
+        const totalDataBytes = spoolBytes + tailBytes;
+        if (totalDataBytes === 0) {
+          return new File([new Blob([], { type: "audio/wav" })], name, { type: "audio/wav" });
+        }
+        const tailMerged = new Uint8Array(tailBytes);
+        let off = 0;
+        for (const c of tailChunks) {
+          tailMerged.set(new Uint8Array(c.buffer, c.byteOffset, c.byteLength), off);
+          off += c.byteLength;
+        }
+        const header = buildWavHeader(sampleRate, totalDataBytes);
+        const blob = new Blob([header, spoolFile, tailMerged], { type: "audio/wav" });
+        return new File([blob], name, { type: "audio/wav" });
+      } catch (salvageErr) {
+        // Spool file was already lost too — last-resort empty WAV.
+        console.warn("OpfsPcmSink.finalize: salvage failed after lastWriteError", salvageErr);
+        return new File([new Blob([], { type: "audio/wav" })], name, { type: "audio/wav" });
+      }
     }
 
     const spool = await this.fileHandle.getFile();
@@ -8023,7 +8061,13 @@ function setSelectedFile(file: File | null): void {
   }
   if (file) {
     const ext = (file.name.split(".").pop() || "").toLowerCase();
-    const mimeOk = !file.type || ALLOWED_AUDIO_MIME.has(file.type);
+    // 1.1.25 fix: previous gate was ``!file.type || ALLOWED_AUDIO_MIME.has(file.type)``
+    // which treated MISSING MIME as "passes" — combined with also-missing
+    // extension on a file with no dot, both checks were lenient and let
+    // unidentifiable binaries through to the backend. The MIME path now
+    // requires an actual MIME match; the extension path independently
+    // accepts files where the MIME is empty but the extension is known.
+    const mimeOk = !!file.type && ALLOWED_AUDIO_MIME.has(file.type);
     // Use the SSOT extension set that mirrors backend's
     // ALLOWED_AUDIO_EXTS. Previously rejected legitimate .opus / .oga
     // / .wma files the backend would have accepted, plus ALL video
