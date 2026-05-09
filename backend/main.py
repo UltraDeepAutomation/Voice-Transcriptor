@@ -909,7 +909,6 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
             title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             stem = _recording_stem(title)
             target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
-            _register_archive_dir(target_dir)
             audio_out = target_dir / f"{stem}.wav"
             text_out = target_dir / f"{stem}.txt"
             tmp_audio = _atomic_temp_path(audio_out)
@@ -925,6 +924,13 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
                     model=model,
                     language=language,
                 )
+                # 1.1.25 fix: register the archive AFTER writes succeed.
+                # Previously called before write_wav; if the write
+                # failed, the archive dir was already registered for
+                # nothing, polluting ``_known_archive_dirs.json`` with
+                # paths that contain no user data and slowing every
+                # subsequent retention sweep.
+                _register_archive_dir(target_dir)
             except Exception:
                 # Roll back: if the text write failed after the audio was
                 # already placed at its final path, delete the orphaned
@@ -2017,8 +2023,20 @@ def _tokenize_words(text: str) -> list[str]:
 
 
 def _extract_meta_field(content: str, field: str) -> str:
+    # 1.1.25 fix: previous form ran the regex MULTILINE over the whole
+    # file. If a transcript contained a line starting with "Provider:"
+    # / "Language:" (entirely possible in spoken text), the user content
+    # was returned as the recording's metadata — corrupting the stats
+    # endpoint's provider histogram, the graph endpoint, and the filter
+    # UI. Header lines live BEFORE the first blank line in the on-disk
+    # format produced by ``_render_recording_content``; restrict the
+    # regex search to that prefix so transcript content cannot match a
+    # fake header.
+    text = content or ""
+    header_end = text.find("\n\n")
+    header = text[:header_end] if header_end >= 0 else text
     pattern = rf"^{re.escape(field)}:\s*(.+)$"
-    m = re.search(pattern, content or "", flags=re.IGNORECASE | re.MULTILINE)
+    m = re.search(pattern, header, flags=re.IGNORECASE | re.MULTILINE)
     return (m.group(1).strip() if m else "")
 
 
@@ -2454,21 +2472,49 @@ def _finalize_live_recovery(recovery: dict) -> None:
         logger.warning("live recovery meta write failed: %s", e)
 
 
+# 1.1.25: hard timeout for the per-message WS send.
+# A misbehaving / paused client (background tab, slow renderer) would
+# otherwise let Starlette's send buffer back up and the await would
+# suspend indefinitely. The Deepgram forwarder calls _ws_send_json on
+# every event; one stalled send wedges the entire forwarder loop and
+# prevents stop.set() from being honoured. 5 s is generous for a
+# loopback websocket — anything beyond is a stalled client we should
+# treat as a broken pipe and let recovery proceed.
+_WS_SEND_TIMEOUT_SEC = 5.0
+
+
 async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
     """Send a JSON payload on a WebSocket, swallowing harmless shutdown races.
 
     Returns ``True`` on success. Logs transient broken-pipe errors and
     returns ``False`` without raising so the caller can continue its
-    cleanup.
+    cleanup. A send that exceeds ``_WS_SEND_TIMEOUT_SEC`` is treated as
+    a broken pipe — the sender returns False and the caller's normal
+    "client gone" cleanup path runs.
     """
     try:
-        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        await asyncio.wait_for(
+            websocket.send_text(json.dumps(payload, ensure_ascii=False)),
+            timeout=_WS_SEND_TIMEOUT_SEC,
+        )
         return True
+    except asyncio.TimeoutError:
+        # Same return-False semantics as broken-pipe — caller's loop
+        # treats this as "client gone" and shuts the session down,
+        # rather than wedging on a paused renderer indefinitely.
+        logger.warning(
+            "ws send timed out after %.1fs (treating as broken pipe)",
+            _WS_SEND_TIMEOUT_SEC,
+        )
+        return False
     except Exception as e:
         if _is_broken_pipe_error(e):
             logger.debug("ws send skipped (pipe closed): %s", e)
         else:
-            logger.warning("ws send failed: %s", e)
+            # 1.1.25: include traceback for non-pipe failures so a
+            # JSON-encoding error (e.g. numpy.float32 leak into a
+            # segment dict) doesn't hide its call site.
+            logger.warning("ws send failed: %s", e, exc_info=True)
         return False
 
 
