@@ -193,8 +193,19 @@ def deepgram_transcribe(
             alternatives = channel.get("alternatives", [])
             if alternatives:
                 text = alternatives[0].get("transcript", "")
-    except (KeyError, IndexError):
-        pass
+    except (KeyError, IndexError) as e:
+        # 1.1.25: previously ``pass``-swallowed without context. A
+        # Deepgram schema change (rename/restructure of channels/
+        # alternatives) silently produced empty transcripts on
+        # every call — the user saw "success, 0 chars" and assumed
+        # the audio was bad. Now log enough context to identify
+        # the breakage.
+        logger.warning(
+            "deepgram_transcribe: response shape mismatch (%s). "
+            "Result keys at root: %r — falling back to empty text.",
+            e,
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+        )
 
     logger.info("deepgram_transcribe: success, %d chars", len(text))
     return {

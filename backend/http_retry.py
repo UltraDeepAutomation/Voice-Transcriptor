@@ -5,6 +5,7 @@ Centralised retry logic with exponential backoff — used by both
 """
 
 import datetime as _dt
+import random
 import time
 from email.utils import parsedate_to_datetime
 from typing import Optional
@@ -12,6 +13,22 @@ from typing import Optional
 import requests
 from requests import RequestException
 from requests.adapters import HTTPAdapter
+
+
+def _exponential_backoff(attempt: int, base: float) -> float:
+    """Return the wait-time for retry attempt N with jitter.
+
+    1.1.25: previous logic was ``base if attempt == 0 else base *
+    (attempt + 1)`` which produced LINEAR backoff (base, 2·base,
+    3·base, ...) despite the docstring promising exponential. Linear
+    retries under sustained throttling continue hammering the
+    provider; exponential gives the upstream time to recover.
+
+    Adds 10% jitter so concurrent clients don't synchronise their
+    retry waves into a thundering herd.
+    """
+    delay = base * (2 ** attempt)
+    return delay + random.uniform(0, delay * 0.1)
 
 
 class RemoteError(RuntimeError):
@@ -111,7 +128,7 @@ def request_with_retry(
             resp = _SESSION.request(method, url, timeout=timeout, **kwargs)
             if resp.status_code in _TRANSIENT_HTTP_STATUS and attempt < retries - 1:
                 last_resp = resp
-                delay = backoff_base if attempt == 0 else backoff_base * (attempt + 1)
+                delay = _exponential_backoff(attempt, backoff_base)
                 # Honour Retry-After per RFC 7231. Providers
                 # (OpenRouter, Deepgram) emit this on 429/503 to signal
                 # the correct wait time; ignoring it hammers the
@@ -127,7 +144,7 @@ def request_with_retry(
             last_err = e
             if attempt == retries - 1:
                 break
-            time.sleep(backoff_base if attempt == 0 else backoff_base * (attempt + 1))
+            time.sleep(_exponential_backoff(attempt, backoff_base))
     if last_err is not None:
         # Translate common low-level error patterns into actionable
         # messages. The raw form the user previously saw —

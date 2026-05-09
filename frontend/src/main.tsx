@@ -7600,8 +7600,12 @@ async function stopLive(enhance: boolean): Promise<void> {
           //      Whisper). The on-disk audio is captured locally via
           //      PCM sink and is ALWAYS complete — it predates any
           //      WebSocket dropout.
-          const wordCountOf = (s: string): number =>
-            s.split(/\s+/).filter(Boolean).length;
+          // 1.1.25: SSOT — use ``countWords`` (the module-level
+          // helper at line ~862) instead of an inline lambda. Keeps
+          // word-counting semantics consistent across the codebase
+          // (Unicode handling, whitespace normalisation), and avoids
+          // the maintenance hazard of two divergent definitions.
+          const wordCountOf = countWords;
           // 1.1.25 fix: previously read ``liveTranscriptSegments[last].end``
           // — but ``mergeTranscriptSegments`` sorts by ``start asc, end desc,
           // speaker asc``. With diarized recordings or out-of-order
@@ -8085,7 +8089,14 @@ function reportFileSelectionError(message: string): void {
     domText: message,
     kind: "error",
   });
-  patchCurrentRecordingSummary({ status: message, tone: "error" });
+  // 1.1.25 fix: previously called ``patchCurrentRecordingSummary``
+  // with NO sessionToken — that wrote unconditionally and could
+  // clobber the status pill of an active live recording when the
+  // user dropped a bad file in the (non-active) Live tab file
+  // picker mid-recording. File-selection state and live-recording
+  // state are unrelated and must not share the status surface.
+  // Use the non-disruptive notice instead.
+  showRecordSessionNotice(message, "error", 6000);
 }
 
 function setSelectedFile(file: File | null): void {
