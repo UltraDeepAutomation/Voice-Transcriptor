@@ -1858,26 +1858,18 @@ function createOverlayHtml() {
         };
         const render = () => {
           ctx.clearRect(0, 0, waveW, waveH);
-          // 1.1.23: silent-floor for the overlay waveform.
-          //
-          // Previous code did ``Math.max(2, …)`` which clamped every
-          // bar — including bars sampled while the mic was open but
-          // the user hadn't started speaking yet — to at least 2 px
-          // height. With ~120 bars across the canvas that produced
-          // a constant 2 px-tall bright-red horizontal line during
-          // the first 1-2 seconds of every recording (user report:
-          // "красная маленькая полосочка первые несколько секунд").
-          // Worse, the same minimum applied at the leading edge
-          // every time the user paused mid-sentence — visually
-          // implying audio level when there was none.
-          //
-          // The fix: drop the 2 px floor entirely. A bar's height
-          // is now just ``v * (waveH - 2)``. At ambient-noise
-          // levels (v ≈ 0.001-0.02 → h ≈ 0.04-0.8 px) the bar is
-          // sub-pixel and renders invisible. When the user actually
-          // speaks (v > ~0.1 → h > 4 px) the bar becomes clearly
-          // visible. The "wave grows when I talk" feedback is
-          // preserved; the spurious red sliver on silence is gone.
+          // 1.1.24 silent-floor for the overlay waveform.
+          // Drop the previous 2 px height floor that produced a
+          // bright-red sliver across the canvas during silence.
+          // New formula h = v * (waveH - 2) renders sub-pixel
+          // bars invisible at ambient-noise level and visible
+          // only on real speech. Tail of the comment is
+          // intentionally short here because the entire
+          // createOverlayHtml body is itself a JS template
+          // literal: a stray backtick or dollar-brace in this
+          // comment block (see 1.1.23 regression that broke
+          // global hotkeys) closes the outer literal and breaks
+          // every interpolation downstream.
           for (let i = 0; i < bars.length; i++) {
             const v = bars[bars.length - 1 - i];
             const x = waveW - (i + 1) * (bw + gap);
