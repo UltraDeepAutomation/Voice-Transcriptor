@@ -457,6 +457,38 @@ class DeepgramLiveSession:
         )
         if self._ws is not None and not self._finalize_sent:
             self._finalize_sent = True
+            # ── 1.1.19: send Finalize BEFORE CloseStream ─────────────
+            #
+            # Deepgram's streaming protocol supports two control msgs:
+            #   • Finalize:    flushes buffered audio and emits a
+            #                  final ``is_final=true`` Result message
+            #                  WITHOUT closing the connection. Designed
+            #                  exactly for "user pressed Stop, give me
+            #                  the trailing transcript now".
+            #   • CloseStream: graceful shutdown — server processes
+            #                  remaining audio and closes.
+            #
+            # In the 1.1.18 user logs, the post-CloseStream is_final
+            # was empty for EVERY long recording (env.wordCount=0)
+            # despite Deepgram clearly receiving the audio (it had
+            # emitted is_final segments mid-stream). Some Deepgram
+            # regions appear to skip the trailing-buffer flush on
+            # CloseStream alone and only emit it on an explicit
+            # Finalize. Sending Finalize first guarantees that flush;
+            # CloseStream then closes cleanly with the buffer already
+            # emptied.
+            try:
+                await asyncio.wait_for(
+                    self._ws.send(json.dumps({"type": "Finalize"})),
+                    timeout=5.0,
+                )
+                logger.info("deepgram-live: Finalize sent (forces trailing is_final flush)")
+            except asyncio.TimeoutError:
+                logger.warning("deepgram-live: Finalize send timed out (>5s)")
+            except ConnectionClosed:
+                logger.info("deepgram-live: Finalize skipped (already closed)")
+            except WebSocketException as e:
+                logger.warning("deepgram-live: Finalize send failed: %s", e)
             try:
                 # Same 5-second bound as send_pcm — a wedged TCP socket
                 # mustn't hang finalize indefinitely. The CloseStream
@@ -503,11 +535,19 @@ class DeepgramLiveSession:
             duration_sec = float(
                 max(s.get("end", 0.0) for s in self._finalized_segments)
             )
+        # 1.1.19: explicit DELTA logging — segments_final at ENTER vs
+        # EXIT shows whether the Finalize+CloseStream sequence
+        # actually produced trailing is_final segments. If
+        # segments_final didn't increase between ENTER and EXIT, we
+        # know the post-CloseStream flush is ineffective for this
+        # session (likely region/network) and recovery is the only
+        # path to the trailing words.
         logger.info(
-            "deepgram-live: finalized in %.0f ms text_len=%d segments=%d bytes_sent=%d",
+            "deepgram-live: finalize EXIT %.0f ms text_len=%d segments_final=%d (delta from ENTER) duration_sec=%.2f bytes_sent=%d",
             self.stats.finalize_ms,
             len(final_text),
             self.stats.segments_final,
+            duration_sec,
             self.stats.bytes_sent,
         )
         return {

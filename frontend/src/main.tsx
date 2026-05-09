@@ -7389,9 +7389,19 @@ async function stopLive(enhance: boolean): Promise<void> {
     // block the UI on it.
     const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
       const tStart = performance.now();
-      const innerPromise = recoverFromEmptyTranscriptInner(reason);
+      // ``timeoutHandle`` is captured so the inner-resolves-first path
+      // can clearTimeout and avoid the misleading "HARD TIMEOUT" log
+      // that would otherwise fire 20 s after the function already
+      // returned (cosmetic noise the user noticed in main.log).
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      const innerPromise = recoverFromEmptyTranscriptInner(reason).finally(() => {
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+        }
+      });
       const timeoutPromise = new Promise<string>((resolve) => {
-        setTimeout(() => {
+        timeoutHandle = setTimeout(() => {
           console.log(`[trace recover] HARD TIMEOUT after ${RECOVERY_HARD_TIMEOUT_MS}ms — abandoning recovery`);
           resolve("");
         }, RECOVERY_HARD_TIMEOUT_MS);
@@ -7550,34 +7560,54 @@ async function stopLive(enhance: boolean): Promise<void> {
             const recoveryPromise = recoverFromEmptyTranscript(
               `Live tail truncated (${Math.round(tailGapSec * 1000)}ms gap${skipEnvelope ? ", Deepgram WS silent" : ""}).`,
             );
-            const [envelope, recoveryText] = await Promise.all([envelopePromise, recoveryPromise]);
-            const raceMs = performance.now() - tRace;
-
-            const envelopeText = (envelope?.text || "").trim();
-            const envelopeJoined = envelope
-              ? joinTranscriptSegments(envelope.segments)
-              : "";
-            const envelopeBest =
-              envelopeText.length >= envelopeJoined.length
-                ? envelopeText
-                : envelopeJoined;
-            console.log(`[trace tail-gap] race waitMs=${raceMs.toFixed(0)} skippedEnvelope=${skipEnvelope} env.wordCount=${wordCountOf(envelopeBest)} env.lastSegEnd=${envelope && envelope.segments.length > 0 ? envelope.segments[envelope.segments.length - 1].end.toFixed(2) : "n/a"} recovery.wordCount=${wordCountOf(recoveryText)} instant.wordCount=${wordCountOf(instantTranscript)} envTail="${envelopeBest.slice(-60).replace(/\n/g, "\\n")}" recTail="${recoveryText.slice(-60).replace(/\n/g, "\\n")}"`);
-
-            // Pick the longest of [instant, envelope, recovery].
-            // Word-count comparison is the heuristic; equal counts
-            // keep ``instant`` (preserves any custom merge dedup
-            // already applied on the streaming snapshot).
-            type Candidate = { label: "instant" | "envelope" | "recovery"; text: string; count: number };
-            const candidates: Candidate[] = [
-              { label: "instant", text: instantTranscript, count: wordCountOf(instantTranscript) },
-              { label: "envelope", text: envelopeBest, count: wordCountOf(envelopeBest) },
-              { label: "recovery", text: recoveryText, count: wordCountOf(recoveryText) },
-            ];
-            const best = candidates.reduce((a, b) => (b.count > a.count ? b : a));
-            if (best.label !== "instant" && best.text) {
-              transcriptRaw = best.text;
-              console.log(`[trace tail-gap] decision=USE_${best.label.toUpperCase()} (+${best.count - wordCountOf(instantTranscript)} words)`);
-              if (best.label === "recovery") {
+            // ── 1.1.19: smart race instead of Promise.all ─────────────
+            //
+            // Promise.all blocked until BOTH promises resolved. The
+            // user's logs revealed that on long recordings the
+            // post-CloseStream envelope often resolves with empty text
+            // at the 4 s ceiling (Deepgram regional issue) while
+            // recovery resolves at 2-3 s with a strict improvement.
+            // Promise.all then waited an additional 1-2 s for the
+            // envelope timeout — pure waste because we already had a
+            // better answer.
+            //
+            // New strategy:
+            //   1. Race envelope vs recovery.
+            //   2. If the FIRST resolved promise produces a strict
+            //      word-count improvement over ``instantTranscript``,
+            //      use it immediately — DO NOT wait for the second.
+            //   3. If the first didn't help, await the OTHER (it might
+            //      yet produce an improvement).
+            //   4. If neither beat instant, keep instant.
+            //
+            // Saves ~1.5 s per long recording in the typical case.
+            type Cand = { label: "envelope" | "recovery"; text: string; words: number };
+            const wcInstant = wordCountOf(instantTranscript);
+            const envelopeCand: Promise<Cand> = envelopePromise.then((env) => {
+              const t = (env?.text || "").trim();
+              const j = env ? joinTranscriptSegments(env.segments) : "";
+              const text = t.length >= j.length ? t : j;
+              return { label: "envelope" as const, text, words: wordCountOf(text) };
+            });
+            const recoveryCand: Promise<Cand> = recoveryPromise.then((text) => ({
+              label: "recovery" as const, text, words: wordCountOf(text),
+            }));
+            const first = await Promise.race([envelopeCand, recoveryCand]);
+            const firstMs = performance.now() - tRace;
+            console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} tail="${first.text.slice(-60).replace(/\n/g, "\\n")}"`);
+            let chose: Cand | null = first.words > wcInstant && first.text ? first : null;
+            if (!chose) {
+              // First didn't improve — wait for the OTHER.
+              const other = first.label === "envelope" ? await recoveryCand : await envelopeCand;
+              const otherMs = performance.now() - tRace;
+              console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} tail="${other.text.slice(-60).replace(/\n/g, "\\n")}"`);
+              if (other.words > wcInstant && other.text) chose = other;
+            }
+            const totalRaceMs = performance.now() - tRace;
+            if (chose) {
+              transcriptRaw = chose.text;
+              console.log(`[trace tail-gap] decision=USE_${chose.label.toUpperCase()} (+${chose.words - wcInstant} words) totalMs=${totalRaceMs.toFixed(0)}`);
+              if (chose.label === "recovery") {
                 patchCurrentRecordingSummary({
                   title: provisionalTitle,
                   status: "Recovered full transcript from saved audio.",
@@ -7585,7 +7615,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                 }, sessionUiToken);
               }
             } else {
-              console.log(`[trace tail-gap] decision=KEEP_INSTANT (race did not produce a longer transcript)`);
+              console.log(`[trace tail-gap] decision=KEEP_INSTANT (no improvement) totalMs=${totalRaceMs.toFixed(0)}`);
             }
           }
 
@@ -7702,9 +7732,39 @@ async function stopLive(enhance: boolean): Promise<void> {
       // mismatch, or server-side silent reject), no error event
       // fired, and the user had to manually press Re-transcribe.
       if (!transcriptRaw) {
-        transcriptRaw = await recoverFromEmptyTranscript(
-          "Live stream returned no text.",
-        );
+        // ── 1.1.19: skip recovery on a truly silent recording ──
+        //
+        // If Deepgram's WebSocket emitted NOTHING during the entire
+        // recording — no committed segments, no interim, no
+        // ``lastInterimSnapshot`` — there is essentially nothing to
+        // recover. Running the full chain (Deepgram REST + local
+        // Whisper) on the silent audio file just confirms there is
+        // no speech, costing ~7 seconds for an empty result. Detect
+        // the "definitely silent" case and emit empty without the
+        // recovery dance.
+        //
+        // The streaming-vs-real-silent distinction matters: a
+        // streaming dropout WOULD have committed/interim residue
+        // from the pre-dropout speech, so this guard correctly
+        // recovers in that case (residue is non-empty → falls through
+        // to the recovery branch below).
+        const noStreamingActivity =
+          liveTranscriptSegments.length === 0
+          && !liveInterimText.trim()
+          && !lastInterimSnapshot.trim()
+          && !liveDraftText.trim();
+        if (noStreamingActivity) {
+          console.log(`[trace stopLive] silent recording — skipping recovery (no streaming activity at all)`);
+          patchCurrentRecordingSummary({
+            title: provisionalTitle,
+            status: "Recording completed, no speech detected.",
+            tone: "info",
+          }, sessionUiToken);
+        } else {
+          transcriptRaw = await recoverFromEmptyTranscript(
+            "Live stream returned no text.",
+          );
+        }
       }
     } else {
       // OpenRouter (or any future non-streaming remote): the REST promise
