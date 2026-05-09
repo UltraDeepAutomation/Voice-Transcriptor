@@ -21,6 +21,14 @@ where node >nul 2>&1 || (echo ERROR: Node.js not found. Install from https://nod
 where npm >nul 2>&1 || (echo ERROR: npm not found. Install Node.js from https://nodejs.org && pause && exit /b 1)
 for /f "tokens=*" %%v in ('node --version') do echo   Node.js %%v
 
+REM Read version from desktop/package.json — single source of truth.
+REM Previously this script hardcoded the version in the trailing echo
+REM block, so a release that bumped package.json without also editing
+REM this script would print stale instructions. Driving from package
+REM .json eliminates the drift.
+for /f "tokens=*" %%v in ('node -p "require('%ROOT_DIR%/desktop/package.json').version"') do set APP_VERSION=%%v
+echo   Building Transcriptor !APP_VERSION!
+
 REM ── Clean ──────────────────────────────────────────────────────────────
 echo [2/6] Cleaning stale builds...
 if exist "%ROOT_DIR%\desktop\dist\win-unpacked" rmdir /s /q "%ROOT_DIR%\desktop\dist\win-unpacked" 2>nul
@@ -72,7 +80,7 @@ echo   ========================================
 echo     Build complete!
 echo   ========================================
 echo.
-echo   Installer: dist\Transcriptor Setup 1.1.13.exe
+echo   Installer: dist\Transcriptor Setup !APP_VERSION!.exe
 echo.
 echo   Double-click the .exe to install:
 echo     - Installs to %%LOCALAPPDATA%%\Programs\Transcriptor

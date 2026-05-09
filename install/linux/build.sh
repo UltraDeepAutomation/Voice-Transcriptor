@@ -21,6 +21,14 @@ command -v node &>/dev/null || { echo "ERROR: Node.js not found. Install from ht
 command -v npm &>/dev/null || { echo "ERROR: npm not found. Install Node.js"; exit 1; }
 echo "  Node.js $(node --version), npm $(npm --version)"
 
+# Read version from desktop/package.json — single source of truth.
+# Previously this script hardcoded the version in the trailing echo
+# block, so a release that bumped package.json without also editing
+# this script would print stale instructions. Driving from package
+# .json eliminates the drift.
+APP_VERSION=$(node -p "require('$ROOT_DIR/desktop/package.json').version")
+echo "  Building Transcriptor $APP_VERSION"
+
 # -- 2. Clean --
 echo "[2/6] Cleaning stale builds..."
 rm -rf "$ROOT_DIR/desktop/dist/linux-unpacked" "$ROOT_DIR/desktop/dist"/*.AppImage 2>/dev/null || true
@@ -62,11 +70,11 @@ echo "  ========================================"
 echo "    Build complete!"
 echo "  ========================================"
 echo ""
-echo "  AppImage: dist/Transcriptor-1.1.13.AppImage"
+echo "  AppImage: dist/Transcriptor-${APP_VERSION}.AppImage"
 echo ""
 echo "  To run:"
-echo "    chmod +x dist/Transcriptor-1.1.13.AppImage"
-echo "    ./dist/Transcriptor-1.1.13.AppImage"
+echo "    chmod +x dist/Transcriptor-${APP_VERSION}.AppImage"
+echo "    ./dist/Transcriptor-${APP_VERSION}.AppImage"
 echo ""
 echo "  Or double-click in your file manager."
 echo ""

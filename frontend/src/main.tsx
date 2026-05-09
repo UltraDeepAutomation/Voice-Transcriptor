@@ -515,6 +515,127 @@ function latestRecordingAudioUrl(savedName = "", archiveDir = ""): string {
   return `/api/recordings/${encodeURIComponent(safeName)}/audio?${params.toString()}`;
 }
 
+// MIME → canonical extension mapping. Used when the backend's
+// ``Content-Disposition`` header is absent or unparseable and we have
+// to synthesize a filename from the saved-name stem. The backend's
+// ``ALLOWED_AUDIO_MIME`` set is the SSOT for which MIME types we may
+// receive; this map is its inverse for the (rare) header-missing path.
+const MIME_TO_AUDIO_EXT: Record<string, string> = {
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/wave": "wav",
+  "audio/mpeg": "mp3",
+  "audio/mp4": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/flac": "flac",
+  "audio/x-flac": "flac",
+  "audio/ogg": "ogg",
+  "audio/webm": "webm",
+  "audio/aac": "aac",
+  "audio/opus": "opus",
+};
+
+// RFC 6266 Content-Disposition filename parser.
+// Handles:
+//   - filename="audio.webm"
+//   - filename=audio.webm
+//   - filename*=UTF-8''audio.webm  (RFC 5987 percent-encoded)
+// Returns "" when the header is absent, malformed, or contains a path
+// separator (defensive against backend bugs that could let a server
+// dictate where the upload will be persisted client-side).
+function parseContentDispositionFilename(header: string): string {
+  if (!header) return "";
+  // RFC 5987 / 6266 ext-value (UTF-8'') takes precedence over the plain form.
+  const extMatch = /filename\*\s*=\s*([^']*)'[^']*'([^;]+)/i.exec(header);
+  if (extMatch) {
+    try {
+      const decoded = decodeURIComponent(extMatch[2].trim());
+      if (decoded && !/[\\/]/.test(decoded)) return decoded;
+    } catch {
+      // Fall through to plain parser.
+    }
+  }
+  const plainMatch = /filename\s*=\s*("([^"]+)"|([^;]+))/i.exec(header);
+  if (plainMatch) {
+    const raw = (plainMatch[2] ?? plainMatch[3] ?? "").trim();
+    if (raw && !/[\\/]/.test(raw)) return raw;
+  }
+  return "";
+}
+
+// Fetch the saved audio file from the backend with HONEST extension
+// and MIME — both derived from the backend's response headers, which
+// are the single source of truth for the on-disk file's actual
+// container.
+//
+// ROOT CAUSE this replaces (Re-transcribe failure on packaged builds):
+//   The previous Re-transcribe path did:
+//     audioFile = new File([blob], savedName.replace(/\.txt$/, ".wav"),
+//                            { type: "audio/wav" });
+//   But the on-disk audio is usually ``.webm`` (live recordings) —
+//   ``selectCanonicalCapturedAudio`` writes ``live-<ts>.webm`` for
+//   the streaming path. Forcing ``.wav`` + ``audio/wav`` on a WebM
+//   payload breaks BOTH provider paths:
+//     - Deepgram REST: routes via Content-Type → mismatch → HTTP 400
+//       "invalid audio data".
+//     - Local Whisper: backend's ``ensure_wav_16k`` fast-path tries
+//       ``soundfile.info`` on the ``.wav``-named bytes; fails; falls
+//       through to ffmpeg, which sniffs WebM correctly when ffmpeg
+//       is bundled but raises a generic exception (NOT AudioError)
+//       when ffmpeg degrades silently — uncaught by the AudioError
+//       handler at main.py:2823 → HTTP 500.
+//   Both fail simultaneously on a valid 1.3 MB recording — exactly
+//   the user-reported symptom.
+//
+// ROOT CAUSE this also replaces (OPFS-dangling blob on Re-transcribe):
+//   The same handler also had a "prefer in-memory ``audioState.file``
+//   over backend GET" branch that broke after pcmSink.destroy() ran:
+//   the lazy ``Blob([header, opfsSpool])`` composite reads as zero
+//   bytes once OPFS reaps the spool. Same class as the e2a39c8
+//   playback bug; the playback path was already migrated to backend-
+//   served URL but Re-transcribe was missed.
+//
+// Strategy: ALWAYS go through the backend HTTP endpoint. The disk
+// file is the canonical source. Round-trip cost is loopback (<10ms
+// for typical 1-2 MB recordings) — negligible compared to the
+// transcription job that follows.
+async function fetchSavedAudioFromBackend(
+  savedName: string,
+  archiveDir: string,
+): Promise<File> {
+  const audioUrl = latestRecordingAudioUrl(savedName, archiveDir);
+  if (!audioUrl) throw new Error("Saved recording name is missing.");
+  const audioResp = await fetch(audioUrl, { headers: authHeaders() });
+  if (!audioResp.ok) {
+    throw new Error(`Audio fetch failed: HTTP ${audioResp.status} ${audioResp.statusText}`.trim());
+  }
+  const audioBlob = await audioResp.blob();
+  if (audioBlob.size === 0) {
+    // Defensive: a 200 OK with an empty body would otherwise look
+    // healthy at the upload boundary and only fail downstream inside
+    // ffmpeg/libsndfile with a vague "invalid data" error. Surface
+    // the truncation here so the user-facing message is precise.
+    throw new Error("Audio fetch returned an empty file.");
+  }
+  // Backend's Content-Type header IS the SSOT — never override it
+  // with a local guess. A missing/blank header is the only case we
+  // synthesize a fallback for.
+  const headerType = (audioResp.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  const mimeType = headerType || audioBlob.type || "application/octet-stream";
+  // Filename: prefer backend's Content-Disposition (the on-disk file
+  // name verbatim), then fall back to the savedName stem with the
+  // canonical extension for the MIME type, then the savedName stem
+  // with .bin (very last resort — should never trigger in practice).
+  const dispositionFilename = parseContentDispositionFilename(
+    audioResp.headers.get("content-disposition") || "",
+  );
+  const filename = dispositionFilename
+    || (savedName.endsWith(".txt")
+      ? savedName.replace(/\.txt$/, "." + (MIME_TO_AUDIO_EXT[mimeType] || "bin"))
+      : savedName);
+  return new File([audioBlob], filename, { type: mimeType });
+}
+
 function renderLatestSavedAudio(): void {
   const row = $("currentRecordingAudioRow");
   const audioEl = $("currentRecordingAudio") as HTMLAudioElement;
@@ -4933,29 +5054,49 @@ $("retranscribeBtn").addEventListener("click", async () => {
   // through to local under the hood and local ALSO failed. The hint
   // surface is rebuilt below from this list, not hardcoded.
   const triedProviders: string[] = [];
+  // Lifted out of the inner ``try`` so the outer ``catch`` can include
+  // the FIRST upstream error (typically the Deepgram failure) in the
+  // user-visible error message. Previously the Deepgram error was
+  // captured only inside the inner try, so by the time we reached the
+  // outer catch the variable was out of scope and only the LAST
+  // (local Whisper) error was displayed.
+  let lastProviderError: unknown = null;
   try {
     setRetranscribeStatus("Preparing audio…");
-    // Prefer the in-memory blob captured during this session — it is the
-    // canonical PCM we just assembled and avoids a round-trip to the
-    // backend that could race with the recordings archive write. Fall
-    // back to fetching the saved file if the blob is absent (viewing a
-    // recording saved in a previous session, or after a page reload).
-    let audioFile: File;
-    if (audioState.file) {
-      audioFile = audioState.file instanceof File
-        ? audioState.file
-        : new File([audioState.file], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
-    } else {
-      const audioUrl = latestRecordingAudioUrl(audioState.savedName, audioState.archiveDir || "");
-      const audioResp = await fetch(audioUrl, { headers: authHeaders() });
-      if (!audioResp.ok) throw new Error(`Audio fetch failed: HTTP ${audioResp.status}`);
-      const audioBlob = await audioResp.blob();
-      audioFile = new File([audioBlob], audioState.savedName.replace(/\.txt$/, ".wav"), { type: "audio/wav" });
-    }
+    // ALWAYS fetch from the backend — never trust the in-memory blob.
+    //
+    // The previous "prefer in-memory ``audioState.file`` over backend
+    // GET" optimization saved one loopback round-trip but had two
+    // catastrophic failure modes that hit the user simultaneously:
+    //
+    //  1. ``audioState.file`` is the lazy OPFS-backed ``Blob([header,
+    //     spool])`` from ``OpfsPcmSink.finalize()``. After
+    //     ``deferredSinkDestroy.destroy()`` runs (right after the
+    //     initial save completes, in stopLive's tail), the spool is
+    //     gone and the Blob reads as zero bytes. The same lifecycle
+    //     bug already broke playback on Windows and was fixed in
+    //     ``renderLatestSavedAudio`` (line 601-605) by routing through
+    //     the backend URL — Re-transcribe was missed.
+    //  2. The construction also FORCED ``.wav`` extension and
+    //     ``audio/wav`` MIME on a payload that is usually WebM-Opus
+    //     for live recordings (see selectCanonicalCapturedAudio at
+    //     line 1841: ``live-<ts>.webm``). That lie breaks Deepgram
+    //     REST (Content-Type-driven container detection) and breaks
+    //     local Whisper (ensure_wav_16k's ``.wav``-fast-path probes
+    //     soundfile.info → fails → falls through to ffmpeg which
+    //     sometimes succeeds via content-sniffing, sometimes raises
+    //     a generic non-AudioError exception that the backend's
+    //     ``except AudioError`` handler at main.py:2823 lets escape
+    //     as HTTP 500). User-visible: BOTH providers fail on the
+    //     same valid 1.3 MB / 41-second recording.
+    //
+    // ``fetchSavedAudioFromBackend`` derives BOTH the filename and
+    // the MIME from the backend's response headers — the on-disk
+    // file is the canonical source.
+    const audioFile = await fetchSavedAudioFromBackend(audioState.savedName, audioState.archiveDir || "");
     const lang = (($("language") as HTMLSelectElement).value || "auto").trim();
     let text = "";
     let usedProvider: Provider = "local";
-    let lastProviderError: unknown = null;
 
     // 1. Try Deepgram REST — higher accuracy than local Whisper for most
     //    languages. Only attempted when the user has a key configured.
@@ -5069,7 +5210,25 @@ $("retranscribeBtn").addEventListener("click", async () => {
         msg = msg.replace(/ or switch Provider to "local" in Settings\.?$/i, ".");
       }
       const triedSuffix = triedProviders.length ? ` Tried: ${triedProviders.join(", ")}.` : "";
-      $("finalOutput").textContent = `${msg}${triedSuffix}`;
+      // Surface the FIRST upstream error (typically the Deepgram
+      // failure) when both providers were attempted. Previously the
+      // Deepgram error was logged only via console.warn — invisible
+      // to a packaged-build user — and the toast showed only the
+      // local Whisper failure. With both errors visible, the user can
+      // distinguish "Deepgram returned 401 → expected, local picked
+      // it up but failed for unrelated reason" from "both failed for
+      // the SAME reason (e.g., upload bytes corrupt)".
+      let firstProviderTail = "";
+      if (lastProviderError && triedProviders.length > 1) {
+        const firstMsg = lastProviderError instanceof Error
+          ? lastProviderError.message
+          : String(lastProviderError || "");
+        const firstShort = firstMsg.split("\n")[0].slice(0, 200).trim();
+        if (firstShort) {
+          firstProviderTail = ` First: ${firstShort}.`;
+        }
+      }
+      $("finalOutput").textContent = `${msg}${triedSuffix}${firstProviderTail}`;
     }
   } finally {
     btn.disabled = false;
@@ -5322,7 +5481,23 @@ interface LiveFinalSlot {
   waiters: Array<(envelope: LiveFinalEnvelope | null) => void>;
 }
 const liveFinalSlots = new Map<string, LiveFinalSlot>();
-let liveStreamError = "";
+// Session-scoped live-stream error map. Was previously a single
+// global ``let liveStreamError = ""``; that allowed an OLD session's
+// error event (fired through a buffered ws.onmessage tick) to bleed
+// into a fresh session's ``liveStreamErrorAtStop`` snapshot at
+// stopLive time, causing the new session's fast-path to short-
+// circuit on a phantom error from the previous recording. Keying
+// on ``sessionUiToken`` makes each session's error scope-pure.
+const liveStreamErrors = new Map<string, string>();
+function getLiveStreamError(token: string): string {
+  if (!token) return "";
+  return liveStreamErrors.get(token) || "";
+}
+function setLiveStreamError(token: string, err: string): void {
+  if (!token) return;
+  if (err) liveStreamErrors.set(token, err);
+  else liveStreamErrors.delete(token);
+}
 
 function ensureLiveFinalSlot(token: string): LiveFinalSlot {
   let slot = liveFinalSlots.get(token);
@@ -5370,7 +5545,12 @@ function clearLiveStreamState(): void {
     }
     liveFinalSlots.delete(token);
   }
-  liveStreamError = "";
+  // Session-scoped error map: drop entries for stale sessions only.
+  // The active session's error (if any) is preserved so that a tail-
+  // running stopLive can still see it.
+  for (const token of [...liveStreamErrors.keys()]) {
+    if (token !== activeToken) liveStreamErrors.delete(token);
+  }
   liveInterimText = "";
 }
 
@@ -6051,7 +6231,7 @@ async function startLive(): Promise<void> {
     if (!msg) return;
     switch (msg.type) {
       case "error": {
-        liveStreamError = msg.error;
+        setLiveStreamError(sessionUiToken, msg.error);
         console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
         // Only surface truly fatal errors to the user. Non-fatal
         // stream drops (when we already have committed segments) are
@@ -6350,6 +6530,28 @@ async function stopLive(enhance: boolean): Promise<void> {
   const sessionUiToken = liveSessionId;
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
+  // ── transcription-latency timer ───────────────────────────────────
+  //
+  // Captured at the TOP of stopLive — i.e. the moment after the user
+  // pressed Stop / hotkey-toggle. This is the user-perceived
+  // "transcription latency" surface in the Settings → Recordings
+  // metric pane. Previously this timestamp was set far below (around
+  // line 7122, inside the post-pipeline branch) AFTER the full stop
+  // sequence had already run: stream.getTracks().stop, worklet drain,
+  // MediaRecorder flush, OPFS finalize, ws.send(finalize),
+  // waitForLiveFinalEnvelope Promise creation. On the FAST PATH where
+  // streaming had already produced a full transcript, the only awaits
+  // between that timestamp and the latency computation were
+  // saveRecordingText (loopback, ms) — yielding metrics like
+  // "TRANSCRIBE 3 ms" that meant "we did basically nothing here"
+  // instead of the ~real round-trip (which is hundreds of ms to
+  // multiple seconds depending on path).
+  //
+  // Moving the start to the top of stopLive fixes the metric for ALL
+  // exit paths — fast (instant transcript), slow (envelope wait),
+  // recovery (Deepgram REST fallback), local (Whisper full-audio
+  // pass), and every short-circuit return below.
+  const transcribeStartedAt = performance.now();
   let title = "Recording " + new Date().toLocaleString();
   const _smartTitle = (text: string): string => {
     const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
@@ -6481,7 +6683,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   // covering the tail of the utterance AFTER CloseStream) still make
   // it into the transcript. The old code snapshotted BEFORE the wait
   // and lost those trailing segments — that was the tail-cut bug.
-  const liveStreamErrorAtStop = liveStreamError;
+  const liveStreamErrorAtStop = getLiveStreamError(sessionUiToken);
 
   let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
   if (ws) {
@@ -6960,7 +7162,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
     return;
   }
-  const transcribeStartedAt = performance.now();
+  // (transcribeStartedAt is captured at the top of stopLive — line ~6510)
   if (isCurrentUiSession(sessionUiToken)) {
     $("progressRow").hidden = false;
   }
@@ -6975,11 +7177,111 @@ async function stopLive(enhance: boolean): Promise<void> {
   // Allow next hotkey/session to start while this recording is transcribing.
   setBusy(false, sessionUiToken);
   try {
+    // ── Recovery-audio resolver ────────────────────────────────────
+    //
+    // Single source of truth for the audio bytes used by EVERY post-
+    // stop recovery path (final-local-pass, REST recovery, empty-
+    // result fallback, suspiciously-short re-transcribe).
+    //
+    // PREFERS the backend re-fetch over the in-memory ``transcribe
+    // InputFile``. The in-memory file is the lazy ``Blob([header,
+    // OPFS-spool])`` from ``OpfsPcmSink.finalize()``; once
+    // ``deferredSinkDestroy.destroy()`` runs (which already happened
+    // earlier in this function, around line 6754), the spool is gone
+    // and the lazy blob reads as zero bytes — uploads succeed with a
+    // 200 status but the backend gets an empty payload, ffmpeg
+    // raises "invalid data", and BOTH provider paths fail
+    // simultaneously. This is the same OPFS-dangling lifecycle bug
+    // that broke playback on Windows (commit e2a39c8) and that the
+    // 1.1.13 empty-fallback inadvertently re-introduced for the
+    // upload path.
+    //
+    // The backend re-fetch hits ``/api/recordings/<name>/audio`` —
+    // a loopback FileResponse over the durable on-disk file. It
+    // returns honest ``Content-Type`` + ``Content-Disposition``
+    // headers so we never lie about the container.
+    //
+    // Falls through to the in-memory file ONLY when the recording
+    // was never persisted (extremely rare — stopLive's two-attempt
+    // save with default-dir fallback covers nearly every failure).
+    const fetchRecoveryAudioFile = async (): Promise<File | null> => {
+      if (persistedRecordingName) {
+        try {
+          return await fetchSavedAudioFromBackend(
+            persistedRecordingName,
+            persistedRecordingArchiveDir,
+          );
+        } catch (e) {
+          console.warn("Recovery audio backend fetch failed; trying in-memory file", e);
+        }
+      }
+      return transcribeInputFile;
+    };
     const runLocalFinalPass = async (): Promise<LocalTranscriptionResult> => {
-      if (!transcribeInputFile) {
+      const audioFile = await fetchRecoveryAudioFile();
+      if (!audioFile) {
         throw new Error("Canonical audio file is unavailable for final local transcription.");
       }
-      return transcribeCanonicalAudioLocally(transcribeInputFile, languageValue, liveSnapshot.finalLocalModel);
+      return transcribeCanonicalAudioLocally(audioFile, languageValue, liveSnapshot.finalLocalModel);
+    };
+    // Unified empty-transcript recovery: tries Deepgram REST
+    // (when a key is configured) THEN local Whisper, in that order,
+    // against the durably-stored audio. Returns "" when nothing
+    // recovered. All progress UI writes are session-gated so a
+    // fresh recording started during recovery doesn't get clobbered.
+    //
+    // Replaces three previously-divergent fallback paths that each
+    // did a different subset of the chain:
+    //   - liveStreamErrorAtStop fast path: cached only, NO REST
+    //     recovery (worst-case: lower-quality cache wins over the
+    //     full Deepgram REST result).
+    //   - envelope-error branch: REST → local. The reference impl.
+    //   - 1.1.13 bottom safety net: local only, NO REST (worse than
+    //     manual Re-transcribe which the user clearly preferred).
+    // Centralizing them ensures every path tries the highest-
+    // quality available transcription before giving up.
+    const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
+      const audioFile = await fetchRecoveryAudioFile();
+      if (!audioFile) return "";
+      if (isProviderKeyConfigured("deepgram")) {
+        if (isCurrentUiSession(sessionUiToken)) {
+          patchCurrentRecordingSummary({
+            title: provisionalTitle,
+            status: `${reason} Recovering via Deepgram REST.`,
+            tone: "warning",
+          }, sessionUiToken);
+        }
+        try {
+          const result = await remoteJobSync(audioFile, {
+            provider: "deepgram",
+            language: languageValue,
+            diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+            openrouterModel: getRemoteModelValue("deepgram"),
+          });
+          const text = String(result.text || "").trim();
+          if (text) return text;
+        } catch (e) {
+          console.warn(`Deepgram REST recovery failed (${reason}); trying local Whisper`, e);
+        }
+      }
+      if (isCurrentUiSession(sessionUiToken)) {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: `${reason} Recovering via local Whisper.`,
+          tone: "warning",
+        }, sessionUiToken);
+      }
+      try {
+        const local = await transcribeCanonicalAudioLocally(
+          audioFile,
+          languageValue,
+          liveSnapshot.finalLocalModel,
+        );
+        return String(local.text || "").trim();
+      } catch (e) {
+        console.error(`Local Whisper recovery failed (${reason})`, e);
+        return "";
+      }
     };
     let transcriptRaw = "";
     let transcriptForPaste = "";
@@ -7006,10 +7308,20 @@ async function stopLive(enhance: boolean): Promise<void> {
       setStatusScoped(sessionUiToken, "Finalizing");
 
       // Fast path: the live stream already errored before stop. Skip
-      // the finalize wait entirely and go straight to what we have.
+      // the finalize wait entirely and use whatever committed
+      // segments we have. If those are empty AND the canonical audio
+      // file is on disk, recover via Deepgram REST → local Whisper —
+      // the streaming WS error doesn't taint the saved audio, so we
+      // shouldn't drop the recording silently when a higher-quality
+      // recovery is available.
       if (liveStreamErrorAtStop) {
         transcriptRaw =
           liveCommittedDisplayCache || joinTranscriptSegments(liveTranscriptSegments);
+        if (!transcriptRaw) {
+          transcriptRaw = await recoverFromEmptyTranscript(
+            `Live stream errored mid-recording (${liveStreamErrorAtStop}).`,
+          );
+        }
       } else {
         // ── Instant transcript from committed + interim ───────────
         //
@@ -7083,7 +7395,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             tone: "info",
           }, sessionUiToken);
           const envelope = liveFinalPromise ? await liveFinalPromise : null;
-          const envelopeError = envelope?.error || liveStreamError || "";
+          const envelopeError = envelope?.error || getLiveStreamError(sessionUiToken) || "";
           if (envelope && envelope.text && !envelopeError) {
             transcriptRaw = envelope.text.trim();
           } else if (envelope && envelope.segments.length && !envelopeError) {
@@ -7127,32 +7439,31 @@ async function stopLive(enhance: boolean): Promise<void> {
 
       // ── Final safety net: empty Deepgram-live result ──────────────
       //
-      // If we get here with NO transcript, every Deepgram path failed:
-      // streaming was empty, envelope was empty (no text, no segments,
-      // no error), REST fallback wasn't triggered (no error path), and
-      // ``getCanonicalLiveSourceText()`` returned nothing. Don't drop
-      // the recording silently — the audio file is on disk and Whisper
-      // can still transcribe it. This mirrors the OpenRouter branch
-      // below, which always falls back to ``runLocalFinalPass()`` on
-      // empty/failed remote.
+      // If we get here with NO transcript, every Deepgram-streaming
+      // path failed silently: streaming was empty, envelope was
+      // empty (no text, no segments, no error), the REST recovery
+      // arm in the envelope-error branch wasn't reached because no
+      // error fired, and ``getCanonicalLiveSourceText()`` returned
+      // nothing. Don't drop the recording silently — the audio file
+      // is on disk and the unified recovery helper can still try
+      // Deepgram REST → local Whisper against it.
       //
-      // Symptom this fixes: the screenshot showing "TRANSCRIBE 3 ms"
-      // with 0 captured words on a 41 s recording — the live WS
-      // returned empty after a few ms (auth issue, network drop, or
-      // server-side rejection), no error event fired, and the user
-      // had to manually press Re-transcribe.
-      if (!transcriptRaw && transcribeInputFile) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "Live stream returned no text. Falling back to local transcription from the saved audio.",
-          tone: "warning",
-        }, sessionUiToken);
-        try {
-          const fallbackOut = await runLocalFinalPass();
-          transcriptRaw = String(fallbackOut.text || "").trim();
-        } catch (localErr) {
-          console.error("Live empty-result local fallback failed", localErr);
-        }
+      // Previously this safety net called only ``runLocalFinalPass``
+      // (added in 1.1.13) — but that's strictly worse than what the
+      // user does manually with Re-transcribe (REST → local). The
+      // unified ``recoverFromEmptyTranscript`` mirrors the manual
+      // path exactly and uses the durable backend-fetched audio
+      // (avoiding the OPFS-dangling-blob class of bug).
+      //
+      // Symptom this addresses: the screenshot showing "TRANSCRIBE
+      // 3 ms" with 0 captured words on a 41 s recording — the live
+      // WS returned empty (auth issue, network drop, sample-rate
+      // mismatch, or server-side silent reject), no error event
+      // fired, and the user had to manually press Re-transcribe.
+      if (!transcriptRaw) {
+        transcriptRaw = await recoverFromEmptyTranscript(
+          "Live stream returned no text.",
+        );
       }
     } else {
       // OpenRouter (or any future non-streaming remote): the REST promise

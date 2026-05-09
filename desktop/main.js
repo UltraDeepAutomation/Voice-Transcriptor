@@ -6231,6 +6231,35 @@ async function createWindow(options = {}) {
   win.webContents.on("did-finish-load", async () => {
     loadedFrontendBuildSignature = (await getFrontendBuildSignature()) || "";
     appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
+    // Clear paste-dedup Sets on every renderer (re)load.
+    //
+    // ``liveRecordingSeq`` (the renderer-side monotonic counter that
+    // produces ``recordingId`` values) resets to 0 in every new
+    // renderer instance — initial window load AND after a user-
+    // initiated ``location.reload()`` (e.g. via the backend-recovery
+    // reload at ``recoverFromBackendBoot`` or via DevTools). Without
+    // this clear, the new renderer reuses ids 1, 2, 3... that the
+    // previous renderer already recorded in the dedup Sets, and
+    // ``handleRecordingPostStop`` falsely identifies the next
+    // recording's stop signal as a duplicate — silently dropping the
+    // paste task. The user records, stops, and nothing pastes.
+    //
+    // The same clear was previously applied only in the
+    // ``render-process-gone`` handler (renderer crash path); a
+    // user-initiated reload (no crash) was missed. The class of bug
+    // is identical, so unifying the clear under ``did-finish-load``
+    // covers BOTH paths with a single source of truth.
+    //
+    // On the very first load the Sets are empty and the clear is a
+    // no-op — safe to run unconditionally.
+    if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
+      appendMainLog(
+        `[did-finish-load] clearing dedup sets ` +
+        `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
+      );
+      _enqueuedRecordingIds.clear();
+      _pastedRecordingIds.clear();
+    }
     // Replay the cached shortcut status. If the initial
     // registerGlobalShortcuts() call happened before this window
     // existed (the usual case — shortcuts register during app.whenReady
