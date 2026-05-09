@@ -65,25 +65,46 @@ for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
 
 logger = logging.getLogger(__name__)
 
-# 1.1.20: ensure ``backend.*`` loggers emit INFO records.
+# 1.1.21: route ``backend.*`` INFO records to a dedicated stderr
+# handler so they reach the Electron main.log.
 #
-# Python's root logger defaults to WARNING. Module-level
-# ``logger = logging.getLogger(__name__)`` calls inherit that
-# threshold unless overridden, which silently swallowed every
-# ``logger.info(...)`` line we added in 1.1.19 for the
-# Finalize/CloseStream / is_final / finalize ENTER+EXIT
-# diagnostics. Without those records reaching main.log, we cannot
-# tell whether the new ``Finalize`` send is actually firing on
-# stop or whether Deepgram is genuinely silent on this user's
-# region.
+# Background. Module-level ``logger = logging.getLogger(__name__)``
+# inherits the ROOT logger's effective threshold. By default that's
+# WARNING, so every ``logger.info(...)`` line we added in 1.1.19
+# (Finalize sent, finalize ENTER/EXIT, is_final per-segment, etc.)
+# was silently filtered. Setting the package logger's level alone
+# (1.1.20) wasn't enough either — uvicorn configures the root
+# handler set at startup, and Python's logging delegates effective
+# level enforcement at the HANDLER not just the logger. The active
+# handler chain (root → uvicorn's stderr stream) was rejecting INFO
+# even though ``backend.*`` was set to INFO.
 #
-# Setting the package-level "backend" logger to INFO once at
-# module import time fixes every submodule (backend.remote_
-# deepgram_live, backend.transcribe, backend.audio, …) without
-# touching uvicorn's own logger hierarchy. Uvicorn's
-# --log-level=info flag in desktop/main.js handles its own
-# loggers; this line handles ours.
-logging.getLogger("backend").setLevel(logging.INFO)
+# Fix: attach our OWN ``StreamHandler(sys.stderr)`` directly to the
+# ``backend`` logger at INFO level, and disable propagation so
+# records don't double-emit through root. This bypasses uvicorn's
+# config entirely — every ``backend.*`` INFO+ record goes straight
+# to stderr → ``backend.stderr.on("data")`` in desktop/main.js →
+# ``[backend-stderr] …`` in main.log. The diagnostic ladder we
+# need (Finalize sent / is_final emissions / finalize EXIT delta)
+# is now visible by construction.
+_backend_logger = logging.getLogger("backend")
+_backend_logger.setLevel(logging.INFO)
+if not any(
+    isinstance(h, logging.StreamHandler) and getattr(h, "_transcriptor_backend", False)
+    for h in _backend_logger.handlers
+):
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setLevel(logging.INFO)
+    _h.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    # Sentinel attribute lets the dedup check above survive
+    # multiple imports (uvicorn's --reload, test fixtures, etc.)
+    # without stacking handlers per import.
+    _h._transcriptor_backend = True  # type: ignore[attr-defined]
+    _backend_logger.addHandler(_h)
+# Stop propagation: with our own handler in place, propagating to
+# root would also send the record through uvicorn's stderr handler
+# and produce duplicate ``[backend-stderr]`` lines for every log.
+_backend_logger.propagate = False
 
 
 # ── Parent-death watchdog ───────────────────────────────────────────────────
