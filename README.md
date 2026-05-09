@@ -2,8 +2,13 @@
 
 **Голосовой транскриптор с живой записью, AI-улучшением текста и auto-paste для macOS, Windows и Linux.**
 
-> Нажмите **F9** из любого приложения — Transcriptor запишет речь, транскрибирует её и автоматически вставит текст в активное поле ввода.
-> **F10** вставит последний транскрипт повторно. Обе клавиши настраиваются в Settings.
+> Нажмите глобальный hotkey из любого приложения — Transcriptor запишет речь, транскрибирует её и автоматически вставит текст в активное поле ввода.
+>
+> **Дефолтные комбинации:**
+> - **macOS:** `Option+Left` старт/стоп записи, `Option+Shift+V` вставить последний транскрипт.
+> - **Windows / Linux:** `F9` старт/стоп записи, `Alt+Shift+V` вставить последний транскрипт.
+>
+> Обе клавиши настраиваются в Settings.
 
 ---
 
@@ -12,7 +17,7 @@
 - 🎤 **Live-транскрипция** — запись с микрофона в реальном времени с промежуточными результатами
 - 🤖 **AI Upscale** — улучшение текста через OpenRouter (Gemini, GPT-4o, Claude) с пресетами: Clean, Business, AI & Code
 - 📋 **Auto-paste** — автоматическая вставка результата в активное приложение с платформенными шорткатами (`Cmd+V` / `Ctrl+V`, затем `Cmd+Enter` / `Ctrl+Enter`, если включён auto-send)
-- ⌨️ **Глобальная горячая клавиша** — F9 старт/стоп записи, F10 вставить последний транскрипт. Переназначаются в Settings
+- ⌨️ **Глобальная горячая клавиша** — старт/стоп записи + повтор-paste. Дефолты: `Option+Left` / `Option+Shift+V` (macOS), `F9` / `Alt+Shift+V` (Windows / Linux). Переназначаются в Settings
 - 🔇 **Auto-stop по тишине** — автоматическая остановка записи при паузе в речи (настраивается прямо в overlay-капсуле во время записи: +/- кнопки с click-and-hold)
 - 🌐 **3 провайдера** — локальный Whisper (offline, работает без интернета), OpenRouter, Deepgram Nova-3
 - 💊 **Overlay** — компактный pill-виджет поверх всех окон с таймером, VU-метром и быстрыми настройками
@@ -26,24 +31,28 @@
 
 **1.1.0+ идёт с Python 3.12 + ffmpeg внутри инсталлятора для Windows и macOS.** Никаких предварительных установок (winget / brew / pip / setup-скриптов) больше не нужно — двойной клик, и всё работает.
 
+> Имена файлов в инструкциях ниже используют `<version>` как плейсхолдер.
+> Подставь актуальную версию из release-страницы (текущая релизная — `1.1.25`).
+> SSOT для версии: `desktop/package.json` → используется vite-инжектом `__APP_VERSION__`,
+> electron-builder, и build-скриптами `install/{linux,win}/build.*`.
+
 ### Windows x64 (~201 MB)
-1. Скачать `Transcriptor Setup 1.1.1.exe`
+1. Скачать `Transcriptor Setup <version>.exe`
 2. Двойной клик → SmartScreen **"Подробнее"** → **"Выполнить в любом случае"**
 3. Через ~30 секунд приложение запущено. Разрешить микрофон при запросе Windows
 
 ### macOS Apple Silicon M1-M4 (~220 MB)
-1. Скачать `Transcriptor-1.1.1-mac-arm64.dmg`
+1. Скачать `Transcriptor-<version>-arm64.dmg`
 2. Открыть DMG, перетащить Transcriptor.app в Applications
 3. **macOS Sonoma 14+ / Sequoia 15+:** System Settings → Privacy & Security → прокрутить вниз → **"Open Anyway"** рядом с предупреждением Transcriptor → потом двойной клик → **"Open"**
-4. Разрешить 3 permissions: Microphone, Accessibility, Input Monitoring
+4. Разрешить 3 permissions: **Microphone**, **Accessibility**, **Automation** (для AppleScript-paste). Это всё, что приложение запрашивает у системы — Input Monitoring не используется.
 
-### macOS Intel (~257 MB)
-То же, но `Transcriptor-1.1.1-mac-intel.dmg`.
+> 💡 **Только Apple Silicon.** Начиная с релиза 1.1.24 build rules production-сборки — `arm64-only` (M1/M2/M3/M4). Для Intel-Mac можно собрать локально через `npm --prefix desktop run dist:dir -- --x64`, но в публичном relэase такой DMG больше не выкладывается.
 
 ### Linux x64 (~101 MB, AppImage)
 ```bash
-chmod +x Transcriptor-1.1.1.AppImage
-./Transcriptor-1.1.1.AppImage
+chmod +x Transcriptor-<version>.AppImage
+./Transcriptor-<version>.AppImage
 ```
 
 На Linux AppImage **всё ещё нужны системные зависимости** (Python 3.10+ и ffmpeg), потому что bundling Python на Linux упирается в PyPI timeout. Установить заранее:
@@ -129,8 +138,9 @@ Release build: см. `desktop/scripts/prepare-runtime.sh` + `npm run dist` / `np
 Для запуска из исходников без сборки `.app`:
 
 ```bash
-chmod +x run.command
-./run.command
+# macOS
+chmod +x install/mac/run.command
+./install/mac/run.command
 ```
 
 Или вручную:
@@ -151,7 +161,7 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8321
 cd desktop && npm install && npm start
 ```
 
-> 💡 `run.command` делает всё это автоматически в одну команду.
+> 💡 `install/mac/run.command` делает всё это автоматически в одну команду.
 
 ---
 
@@ -160,11 +170,23 @@ cd desktop && npm install && npm start
 Если вы изменили код и хотите обновить установленное приложение:
 
 ```bash
-chmod +x BUILD.sh
-./BUILD.sh
+# macOS — корневой dispatcher
+chmod +x BUILD.command
+./BUILD.command
+
+# или напрямую: install/mac/BUILD.sh
 ```
 
 Скрипт соберёт фронтенд, упакует Electron-приложение и установит его в `~/Applications`.
+
+```bash
+# Windows
+install\win\build.bat
+
+# Linux
+chmod +x install/linux/build.sh
+./install/linux/build.sh
+```
 
 ---
 
@@ -216,7 +238,7 @@ cp .env.example .env
 xattr -cr ~/Applications/Transcriptor.app
 
 # Или переустановить
-./setup.command
+./install/mac/setup.command
 ```
 
 ### Бэкенд не стартует (порт занят)
@@ -231,7 +253,7 @@ lsof -ti tcp:8321 | xargs kill -9
 ```bash
 # Пересоздать venv
 rm -rf "$HOME/Library/Application Support/Transcriptor/.venv"
-./setup.command
+./install/mac/setup.command
 ```
 
 ### Whisper скачивает модель при каждом запуске

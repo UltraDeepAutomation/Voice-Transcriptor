@@ -26,7 +26,14 @@ REM Previously this script hardcoded the version in the trailing echo
 REM block, so a release that bumped package.json without also editing
 REM this script would print stale instructions. Driving from package
 REM .json eliminates the drift.
-for /f "tokens=*" %%v in ('node -p "require('%ROOT_DIR%/desktop/package.json').version"') do set APP_VERSION=%%v
+REM 1.1.25 fix: previous form ``node -p "require('%ROOT_DIR%/...')"``
+REM passed ``%ROOT_DIR%`` directly into a JS string literal. JS treats
+REM backslashes as escape sequences (\b, \f, \n, \r, \t, \v, \0, \U…),
+REM so user paths like ``C:\Users\...\Voice Transcriptor`` were
+REM mangled and ``require()`` failed with "Cannot find module
+REM C:Users...". Pass the path via env var so JS sees it as a literal.
+set "PKG_PATH=%ROOT_DIR%\desktop\package.json"
+for /f "tokens=*" %%v in ('node -p "require(process.env.PKG_PATH).version"') do set APP_VERSION=%%v
 echo   Building Transcriptor !APP_VERSION!
 
 REM ── Clean ──────────────────────────────────────────────────────────────
