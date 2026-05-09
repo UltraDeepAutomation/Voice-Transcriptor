@@ -6124,6 +6124,21 @@ async function createWindow(options = {}) {
     }
     return allow;
   });
+  // Mirror renderer-side trace logs to main.log so we can debug
+  // tail-cut and other live-pipeline issues from a packaged build
+  // without the user opening DevTools. Only lines that start with
+  // ``[trace]`` are mirrored — keeps the log focused. The renderer
+  // emits these via plain ``console.log("[trace] ...")``; no IPC
+  // bridge or preload script needed.
+  //
+  // Args: (event, level, message, line, sourceId)
+  //   level: 0=verbose, 1=info, 2=warning, 3=error
+  win.webContents.on("console-message", (_event, level, message) => {
+    const text = String(message || "");
+    if (!text.startsWith("[trace")) return;
+    const levelTag = level === 3 ? "ERROR" : level === 2 ? "WARN" : "INFO";
+    appendMainLog(`[renderer ${levelTag}] ${text}`);
+  });
   win.webContents.on("render-process-gone", (_event, details) => {
     const reason = String(details?.reason || "unknown");
     const exitCode = details?.exitCode ?? "";

@@ -603,14 +603,17 @@ async function fetchSavedAudioFromBackend(
   savedName: string,
   archiveDir: string,
 ): Promise<File> {
+  const tFetch = performance.now();
   const audioUrl = latestRecordingAudioUrl(savedName, archiveDir);
   if (!audioUrl) throw new Error("Saved recording name is missing.");
   const audioResp = await fetch(audioUrl, { headers: authHeaders() });
   if (!audioResp.ok) {
+    console.log(`[trace fetchAudio] FAIL savedName="${savedName}" archiveDir="${archiveDir}" status=${audioResp.status} statusText="${audioResp.statusText}" durMs=${(performance.now() - tFetch).toFixed(0)}`);
     throw new Error(`Audio fetch failed: HTTP ${audioResp.status} ${audioResp.statusText}`.trim());
   }
   const audioBlob = await audioResp.blob();
   if (audioBlob.size === 0) {
+    console.log(`[trace fetchAudio] FAIL empty body savedName="${savedName}" archiveDir="${archiveDir}" durMs=${(performance.now() - tFetch).toFixed(0)}`);
     // Defensive: a 200 OK with an empty body would otherwise look
     // healthy at the upload boundary and only fail downstream inside
     // ffmpeg/libsndfile with a vague "invalid data" error. Surface
@@ -633,6 +636,7 @@ async function fetchSavedAudioFromBackend(
     || (savedName.endsWith(".txt")
       ? savedName.replace(/\.txt$/, "." + (MIME_TO_AUDIO_EXT[mimeType] || "bin"))
       : savedName);
+  console.log(`[trace fetchAudio] OK savedName="${savedName}" filename="${filename}" mime="${mimeType}" sizeBytes=${audioBlob.size} durMs=${(performance.now() - tFetch).toFixed(0)}`);
   return new File([audioBlob], filename, { type: mimeType });
 }
 
@@ -6210,6 +6214,7 @@ async function startLive(): Promise<void> {
     if (!slot) return;
     if (slot.envelope) return;
     if (slot.waiters.length === 0) return;
+    console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot.envelope} waiters=${slot.waiters.length}`);
     if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
     console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
     resolveLiveFinal(sessionUiToken, {
@@ -6260,6 +6265,8 @@ async function startLive(): Promise<void> {
         return;
       }
       case "segments": {
+        const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
+        console.log(`[trace ws-segments] count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} lastText="${lastNew.text.slice(-50)}"` : "(empty)"}`);
         appendLiveTranscriptSegments(msg.segments);
         if (liveDraftText) {
           persistLiveDraft(true);
@@ -6271,6 +6278,8 @@ async function startLive(): Promise<void> {
         return;
       }
       case "final": {
+        const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
+        console.log(`[trace ws-final] textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} lastText="${lastSeg.text.slice(-50)}"` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
         const envelope: LiveFinalEnvelope = {
           text: normalizeTranscriptWhitespace(msg.text),
           segments: msg.segments,
@@ -6652,6 +6661,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   // being flushed, and those trailing frames could arrive at Deepgram
   // AFTER CloseStream and get dropped. Reordering stream.stop() to
   // step 1 fixes this at the root.
+  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${liveTranscriptSegments.length} liveDraftLen=${liveDraftText.length} liveInterimLen=${liveInterimText.length} lastInterimSnapshotLen=${lastInterimSnapshot.length}`);
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   } catch (e) {
@@ -6659,12 +6669,17 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
   mark("stream.getTracks.stop");
 
+  const t0Drain = performance.now();
   await flushWorkletPort();
   mark("flushWorkletPort");
+  const flushDur = performance.now() - t0Drain;
   await waitForWorkletDrain();
   mark("waitForWorkletDrain");
+  const drainDur = performance.now() - t0Drain - flushDur;
   await stopMediaRecorderAndFlush();
   mark("stopMediaRecorderAndFlush");
+  const recorderDur = performance.now() - t0Drain - flushDur - drainDur;
+  console.log(`[trace stopLive] drained flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms recorder=${recorderDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${liveTranscriptSegments.length}`);
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
@@ -6709,10 +6724,15 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: "finalize" }));
+        console.log(`[trace stopLive] finalize sent to ws (state=OPEN, pendingFrames=${wsPendingFrames.length})`);
       } catch (e) {
-        console.warn("live ws finalize send failed", e);
+        console.warn(`[trace stopLive] finalize send threw: ${e instanceof Error ? e.message : String(e)}`);
       }
+    } else {
+      console.log(`[trace stopLive] finalize NOT sent — ws.readyState=${ws.readyState} (0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED)`);
     }
+  } else {
+    console.log(`[trace stopLive] no ws — finalize skipped`);
   }
 
   // Drain the PCM sink. For OPFS-backed sinks this is ~O(disk IO
@@ -7241,8 +7261,13 @@ async function stopLive(enhance: boolean): Promise<void> {
     // Centralizing them ensures every path tries the highest-
     // quality available transcription before giving up.
     const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
+      console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
       const audioFile = await fetchRecoveryAudioFile();
-      if (!audioFile) return "";
+      if (!audioFile) {
+        console.log(`[trace recover] no audio file available — abort`);
+        return "";
+      }
+      console.log(`[trace recover] audio resolved name="${audioFile.name}" mime="${audioFile.type}" sizeBytes=${audioFile.size}`);
       if (isProviderKeyConfigured("deepgram")) {
         if (isCurrentUiSession(sessionUiToken)) {
           patchCurrentRecordingSummary({
@@ -7251,6 +7276,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             tone: "warning",
           }, sessionUiToken);
         }
+        const tDg = performance.now();
         try {
           const result = await remoteJobSync(audioFile, {
             provider: "deepgram",
@@ -7259,10 +7285,13 @@ async function stopLive(enhance: boolean): Promise<void> {
             openrouterModel: getRemoteModelValue("deepgram"),
           });
           const text = String(result.text || "").trim();
+          console.log(`[trace recover] deepgram REST OK durMs=${(performance.now() - tDg).toFixed(0)} textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
           if (text) return text;
         } catch (e) {
-          console.warn(`Deepgram REST recovery failed (${reason}); trying local Whisper`, e);
+          console.log(`[trace recover] deepgram REST FAIL durMs=${(performance.now() - tDg).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
         }
+      } else {
+        console.log(`[trace recover] deepgram skipped — no API key configured`);
       }
       if (isCurrentUiSession(sessionUiToken)) {
         patchCurrentRecordingSummary({
@@ -7271,15 +7300,18 @@ async function stopLive(enhance: boolean): Promise<void> {
           tone: "warning",
         }, sessionUiToken);
       }
+      const tLocal = performance.now();
       try {
         const local = await transcribeCanonicalAudioLocally(
           audioFile,
           languageValue,
           liveSnapshot.finalLocalModel,
         );
-        return String(local.text || "").trim();
+        const text = String(local.text || "").trim();
+        console.log(`[trace recover] local whisper OK durMs=${(performance.now() - tLocal).toFixed(0)} model="${liveSnapshot.finalLocalModel}" textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
+        return text;
       } catch (e) {
-        console.error(`Local Whisper recovery failed (${reason})`, e);
+        console.log(`[trace recover] local whisper FAIL durMs=${(performance.now() - tLocal).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
         return "";
       }
     };
@@ -7340,6 +7372,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         // committed + interim path is the SSOT and matches exactly
         // what the Live Preview pane showed the user during recording.
         const instantTranscript = getCanonicalLiveSourceText();
+        console.log(`[trace stopLive] fast-path enter committedLen=${liveDraftText.length} interimLen=${liveInterimText.length} lastInterimSnapshotLen=${lastInterimSnapshot.length} instantTranscriptLen=${instantTranscript.length} instantWordCount=${instantTranscript.split(/\s+/).filter(Boolean).length} instantTail="${instantTranscript.slice(-60).replace(/\n/g, "\\n")}"`);
         if (instantTranscript) {
           transcriptRaw = instantTranscript;
 
@@ -7388,6 +7421,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           // streaming-error already (handled by the dedicated branch).
           const tailLikelyMissing =
             recordedSec > 1.0 && tailGapSec > 0.6 && !liveStreamErrorAtStop;
+          console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSegEnd=${lastSegEnd.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
           if (tailLikelyMissing) {
             patchCurrentRecordingSummary({
               title: provisionalTitle,
@@ -7395,7 +7429,9 @@ async function stopLive(enhance: boolean): Promise<void> {
               tone: "info",
             }, sessionUiToken);
             // Step 1 — wait for the in-flight envelope.
+            const tEnvWait = performance.now();
             const envelope = liveFinalPromise ? await liveFinalPromise : null;
+            const envWaitMs = performance.now() - tEnvWait;
             const envelopeText = (envelope?.text || "").trim();
             const envelopeJoined = envelope
               ? joinTranscriptSegments(envelope.segments)
@@ -7407,12 +7443,18 @@ async function stopLive(enhance: boolean): Promise<void> {
               envelopeText.length >= envelopeJoined.length
                 ? envelopeText
                 : envelopeJoined;
+            const envelopeLastSegEnd = envelope && envelope.segments.length > 0
+              ? envelope.segments[envelope.segments.length - 1].end
+              : 0;
+            console.log(`[trace tail-gap] envelope waitMs=${envWaitMs.toFixed(0)} envelope=${envelope ? "received" : "null/timeout"} envelopeError="${envelope?.error || ""}" textLen=${envelopeText.length} segCount=${envelope?.segments.length || 0} envelopeLastSegEnd=${envelopeLastSegEnd.toFixed(2)} envelopeBestLen=${envelopeBest.length} envelopeWordCount=${wordCountOf(envelopeBest)} instantWordCount=${wordCountOf(instantTranscript)} envelopeTail="${envelopeBest.slice(-60).replace(/\n/g, "\\n")}"`);
             if (
               envelopeBest
               && wordCountOf(envelopeBest) > wordCountOf(instantTranscript)
             ) {
               transcriptRaw = envelopeBest;
+              console.log(`[trace tail-gap] decision=USE_ENVELOPE (+${wordCountOf(envelopeBest) - wordCountOf(instantTranscript)} words)`);
             } else {
+              console.log(`[trace tail-gap] envelope did NOT extend transcript — escalating to recoverFromEmptyTranscript`);
               // Step 2 — envelope didn't help. Escalate to a fresh
               // pass on the on-disk audio. ``recoverFromEmptyTranscript``
               // is named for the empty case but the helper is
@@ -7420,19 +7462,25 @@ async function stopLive(enhance: boolean): Promise<void> {
               // from the saved audio" and is the right escalation
               // here too. Backend re-fetch ensures we don't read a
               // dangling OPFS blob.
+              const tRec = performance.now();
               const recovered = await recoverFromEmptyTranscript(
                 `Live tail truncated (${Math.round(tailGapSec * 1000)}ms gap).`,
               );
+              const recDur = performance.now() - tRec;
+              console.log(`[trace tail-gap] recovery returned len=${recovered.length} wordCount=${wordCountOf(recovered)} durMs=${recDur.toFixed(0)} tail="${recovered.slice(-60).replace(/\n/g, "\\n")}"`);
               if (
                 recovered
                 && wordCountOf(recovered) > wordCountOf(instantTranscript)
               ) {
                 transcriptRaw = recovered;
+                console.log(`[trace tail-gap] decision=USE_RECOVERY (+${wordCountOf(recovered) - wordCountOf(instantTranscript)} words)`);
                 patchCurrentRecordingSummary({
                   title: provisionalTitle,
                   status: "Recovered tail via on-disk re-transcription.",
                   tone: "success",
                 }, sessionUiToken);
+              } else {
+                console.log(`[trace tail-gap] decision=KEEP_INSTANT (no recovery improved on streaming)`);
               }
             }
           }
@@ -7607,6 +7655,8 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
     }
 
+    console.log(`[trace stopLive] FINAL transcriptRaw len=${transcriptRaw.length} wordCount=${transcriptRaw.split(/\s+/).filter(Boolean).length} tail="${transcriptRaw.slice(-80).replace(/\n/g, "\\n")}"`);
+
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
@@ -7727,7 +7777,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         return `${label}: ${(t - prev).toFixed(0)}ms`;
       })
       .join(" → ");
-    console.info(`[stopLive] total=${totalMs.toFixed(0)}ms | ${labels}`);
+    console.log(`[trace stopLive] total=${totalMs.toFixed(0)}ms | ${labels}`);
     (window as unknown as { __transcriptorStopTimings?: unknown }).__transcriptorStopTimings = {
       totalMs,
       phases: stopTimings,
