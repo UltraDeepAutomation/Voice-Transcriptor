@@ -2250,11 +2250,22 @@ async function remoteJobSync(
         // call is a Promise no-op but still allocates the DOMException
         // and walks the listener queue.
         opts.signal.addEventListener("abort", () => {
-          xhr.abort();
+          // ``xhr.abort()`` is idempotent but can throw on some
+          // platforms when the request was never started; swallow
+          // so the AbortError reject still happens.
+          try { xhr.abort(); } catch { /* idempotent */ }
           reject(new DOMException("Aborted", "AbortError"));
         }, { once: true });
       }
-      xhr.send(fd);
+      // 1.1.25: ``xhr.send`` itself can throw synchronously (e.g.,
+      // CSP-blocked URL, disconnected page lifecycle, malformed
+      // body). Without this catch, the surrounding ``new Promise(...)``
+      // executor exception is uncaught — Node-style unhandled rejection.
+      try {
+        xhr.send(fd);
+      } catch (e) {
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
     });
   }
   const r = await fetch("/api/remote/transcribe-sync", {
@@ -2715,9 +2726,14 @@ function hideBootOverlayOnce(): void {
   overlay.dataset.state = "success";
   const statusEl = document.getElementById("bootOverlayStatus");
   if (statusEl) statusEl.textContent = "Ready";
-  // Fade out, then fully hide after CSS transition finishes so pointer
-  // events stop intercepting clicks into the app behind it.
-  overlay.hidden = true;
+  // 1.1.25 fix: previously set ``overlay.hidden = true`` immediately,
+  // which removes the element from layout INSTANTLY — no CSS
+  // transition can run on a hidden element. The comment claimed
+  // "fade out then fully hide" but the code did a hard cut. Now the
+  // dataset.state="success" change drives the CSS opacity transition
+  // (~300 ms in styles.css), and we wait for it to finish before
+  // marking ``hidden`` so pointer-events stop intercepting clicks.
+  window.setTimeout(() => { overlay.hidden = true; }, 320);
 }
 
 document.querySelectorAll(".sb-item").forEach((e) => {
@@ -7001,7 +7017,19 @@ async function stopLive(enhance: boolean): Promise<void> {
         persistedRecordingName = persisted.name;
         persistedRecordingArchiveDir = persisted.archiveDir;
         setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
-        await discardLiveRecovery(liveSessionId);
+        // 1.1.25: best-effort recovery discard. The save above ALREADY
+        // succeeded; a 5xx from /api/live-recovery/discard does not
+        // invalidate the persisted recording. Previous code let that
+        // exception escape into the outer ``catch (e)`` at the bottom
+        // of the for-loop, which then reported the recording as a save
+        // failure and left the live-recovery snapshot for the next
+        // boot to "recover" — producing a duplicate of a recording
+        // that was already saved correctly.
+        try {
+          await discardLiveRecovery(liveSessionId);
+        } catch (e) {
+          console.warn("discardLiveRecovery failed (non-fatal); recovery will be re-promoted on next start", e);
+        }
         const fallbackNote = tryArchiveDir !== sessionArchiveDir && sessionArchiveDir
           ? " (saved to default folder — configured archive was unavailable)"
           : "";
@@ -7574,9 +7602,17 @@ async function stopLive(enhance: boolean): Promise<void> {
           //      WebSocket dropout.
           const wordCountOf = (s: string): number =>
             s.split(/\s+/).filter(Boolean).length;
-          const lastSegEnd = liveTranscriptSegments.length > 0
-            ? liveTranscriptSegments[liveTranscriptSegments.length - 1].end
-            : 0;
+          // 1.1.25 fix: previously read ``liveTranscriptSegments[last].end``
+          // — but ``mergeTranscriptSegments`` sorts by ``start asc, end desc,
+          // speaker asc``. With diarized recordings or out-of-order
+          // arrivals, the array tail does NOT necessarily have the maximum
+          // ``end``. Tail-gap math must use Math.max(end) so the recovery
+          // decision matches "where did finalized audio actually stop?",
+          // not "what was the last array entry?".
+          const lastSegEnd = liveTranscriptSegments.reduce(
+            (max, seg) => (seg.end > max ? seg.end : max),
+            0,
+          );
           const tailGapSec = recordedSec - lastSegEnd;
           // Skip the check on very short recordings (< 1 s) where the
           // gap arithmetic isn't meaningful. Skip when the user had
