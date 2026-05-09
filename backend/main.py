@@ -65,6 +65,26 @@ for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
 
 logger = logging.getLogger(__name__)
 
+# 1.1.20: ensure ``backend.*`` loggers emit INFO records.
+#
+# Python's root logger defaults to WARNING. Module-level
+# ``logger = logging.getLogger(__name__)`` calls inherit that
+# threshold unless overridden, which silently swallowed every
+# ``logger.info(...)`` line we added in 1.1.19 for the
+# Finalize/CloseStream / is_final / finalize ENTER+EXIT
+# diagnostics. Without those records reaching main.log, we cannot
+# tell whether the new ``Finalize`` send is actually firing on
+# stop or whether Deepgram is genuinely silent on this user's
+# region.
+#
+# Setting the package-level "backend" logger to INFO once at
+# module import time fixes every submodule (backend.remote_
+# deepgram_live, backend.transcribe, backend.audio, …) without
+# touching uvicorn's own logger hierarchy. Uvicorn's
+# --log-level=info flag in desktop/main.js handles its own
+# loggers; this line handles ours.
+logging.getLogger("backend").setLevel(logging.INFO)
+
 
 # ── Parent-death watchdog ───────────────────────────────────────────────────
 #
