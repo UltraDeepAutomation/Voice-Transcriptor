@@ -3,17 +3,25 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
-// Read the SSOT version from package.json at build time. The Settings
-// tab's version badge previously hardcoded "1.1.1" in index.html and
-// drifted forever after every release bump (we shipped through 1.1.11
-// before noticing). Now ``__APP_VERSION__`` is injected as a string
-// literal at compile time, the renderer rewrites the badge from this
-// constant on boot, and the only place to bump the displayed version
-// is frontend/package.json (which release notes already require to
-// match desktop/package.json).
+// 1.1.25: read the version from desktop/package.json — the SINGLE
+// source of truth for the shipped artifact's version. electron-builder
+// uses ``desktop/package.json`` for the DMG title, NSIS installer
+// filename, and CFBundleShortVersionString; install/{linux,win}/
+// build.* scripts ALSO read ``desktop/package.json`` for their
+// echo banners. Previously ``vite.config.ts`` read frontend/
+// package.json, so the maintainer had to bump TWO files in lock-
+// step every release — the exact drift the SSOT comment in 1.1.13
+// claimed to prevent.
+//
+// Reading the desktop manifest from inside the frontend's vite
+// build is OK at build time: the file is always present in the
+// repo at the parent's sibling, and is part of the release
+// pipeline. ``frontend/package.json``'s ``version`` field is now
+// ignored (vestigial, but kept for npm tooling that occasionally
+// reads it).
 const PKG_VERSION: string = (() => {
   const here = dirname(fileURLToPath(import.meta.url));
-  const pkgPath = resolve(here, "package.json");
+  const pkgPath = resolve(here, "../desktop/package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
   return String(pkg.version || "0.0.0");
 })();

@@ -1595,6 +1595,20 @@ _AUDIO_EXT_TO_MIME: dict[str, str] = {
     ".3gp": "video/3gpp",
 }
 
+# 1.1.25 SSOT invariant: every accepted extension MUST have an
+# explicit MIME mapping. Falling back to ``mimetypes.guess_type``
+# for an unmapped extension produces wrong MIMEs for our actual
+# formats (the whole reason ``_AUDIO_EXT_TO_MIME`` exists). An
+# import-time assert prevents drift from compiling at all: adding
+# a new ext to ``ALLOWED_AUDIO_EXTS`` without adding the matching
+# MIME entry now fails on backend startup instead of silently
+# falling through to ``application/octet-stream``.
+_missing_mime_exts = ALLOWED_AUDIO_EXTS - _AUDIO_EXT_TO_MIME.keys()
+assert not _missing_mime_exts, (
+    f"ALLOWED_AUDIO_EXTS / _AUDIO_EXT_TO_MIME drift: missing MIME "
+    f"mapping for {sorted(_missing_mime_exts)}"
+)
+
 
 def _audio_content_type(filename: str) -> str:
     """Return the canonical Content-Type for an audio/video filename.
