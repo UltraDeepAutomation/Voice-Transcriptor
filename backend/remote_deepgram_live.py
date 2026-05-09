@@ -82,15 +82,28 @@ class DeepgramLiveConfig:
     smart_format: bool = True
     # Endpointing is the silence threshold (in ms) Deepgram uses to
     # decide a chunk is "complete enough" to seal as is_final=true.
-    # The old value (300 ms) was tuned for very short commands and
-    # produced grammatically-broken fragments for conversational
-    # speech — the user's "по чанкам не всегда грамотно отрабатывает"
-    # report. 700 ms matches Deepgram's own recommendation for
-    # dictation / long-form and lets Nova-3 build a full clause
-    # before finalizing, so segments land as proper sentences with
-    # punctuation instead of fragments like "I think that" → "we
-    # should do" → "this thing".
-    endpointing_ms: int = 700
+    #
+    # 1.1.18 — reverted 700 → 300 ms.
+    #
+    # The 700 ms bump (from the "грамматически-неточные фрагменты"
+    # report) made segments grammatically richer, but the user's
+    # 1.1.17 main.log showed Nova-3 multilingual on a Russian uplink
+    # returning interim text continuously and NEVER emitting
+    # ``is_final`` during a 14-second recording (``segments_final=0``
+    # at stop time). The post-CloseStream finalize also failed to
+    # arrive in time (envelope timed out at 4 s). Result: every Stop
+    # fell through to the on-disk REST recovery path — a 3+ second
+    # tax on every recording that the streaming path was supposed to
+    # avoid.
+    #
+    # 300 ms matches typical conversational pause length (250–500 ms),
+    # so utterance breaks reliably seal ``is_final`` segments DURING
+    # streaming. The "broken fragments" concern is unrelated to this
+    # window — ``smart_format=True`` (enabled above) is what handles
+    # sentence assembly + punctuation regardless of how often
+    # individual segments are sealed. The 700 ms bump was solving the
+    # wrong axis.
+    endpointing_ms: int = 300
     # Utterance end is the silence threshold that triggers
     # ``speech_final=true`` (end-of-utterance signal used downstream
     # to decide when to emit a period). 1200 ms was too aggressive
@@ -438,6 +451,10 @@ class DeepgramLiveSession:
         Returns a dict with ``text``, ``segments`` and ``durationSec``.
         """
         started = time.perf_counter()
+        logger.info(
+            "deepgram-live: finalize ENTER segments_final=%d segments_interim=%d bytes_sent=%d",
+            self.stats.segments_final, self.stats.segments_interim, self.stats.bytes_sent,
+        )
         if self._ws is not None and not self._finalize_sent:
             self._finalize_sent = True
             try:
@@ -449,11 +466,11 @@ class DeepgramLiveSession:
                     self._ws.send(json.dumps({"type": "CloseStream"})),
                     timeout=5.0,
                 )
-                logger.debug("deepgram-live: CloseStream sent")
+                logger.info("deepgram-live: CloseStream sent")
             except asyncio.TimeoutError:
                 logger.warning("deepgram-live: CloseStream send timed out (>5s)")
             except ConnectionClosed:
-                logger.debug("deepgram-live: CloseStream skipped (already closed)")
+                logger.info("deepgram-live: CloseStream skipped (already closed)")
             except WebSocketException as e:
                 logger.warning("deepgram-live: CloseStream send failed: %s", e)
 
@@ -857,6 +874,10 @@ class DeepgramLiveSession:
             self._finalized_segments.append(segment)
             self._latest_interim = None
             self.stats.segments_final += 1
+            logger.info(
+                "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s textLen=%d text=%r",
+                start, end, speech_final, len(text), text[:80],
+            )
             out_segment: dict[str, object] = {
                 "start": segment["start"],
                 "end": segment["end"],
@@ -873,6 +894,13 @@ class DeepgramLiveSession:
 
         self._latest_interim = segment
         self.stats.segments_interim += 1
+        if self.stats.segments_interim % 5 == 1:
+            # Sample 1-in-5 interim emissions to keep log volume bounded
+            # while still proving Deepgram is producing output.
+            logger.info(
+                "deepgram-live: interim #%d start=%.2f end=%.2f textLen=%d",
+                self.stats.segments_interim, start, end, len(text),
+            )
         interim_segment: dict[str, object] = {
             "start": segment["start"],
             "end": segment["end"],

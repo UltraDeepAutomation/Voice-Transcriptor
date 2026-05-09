@@ -3199,6 +3199,87 @@ async def remote_transcribe_sync(
         raise HTTPException(status_code=500, detail=f"Remote transcription failed: {_safe_error_text(e)}")
 
 
+@app.post("/api/recordings/{recording_name}/transcribe-on-disk")
+async def transcribe_recording_on_disk(
+    recording_name: str,
+    payload: dict = Body(default_factory=dict),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Transcribe an already-saved recording WITHOUT a re-upload.
+
+    Recovery path optimization. The frontend's previous "tail-gap"
+    fallback chain went:
+        frontend GET /api/recordings/<name>/audio        # loopback fetch
+        frontend POST /api/remote/transcribe-sync (FormData)  # loopback upload
+        backend reads UploadFile into memory             # extra copy
+        backend ffmpeg-recompresses                      # extra encode
+        backend → Deepgram REST                          # actual work
+    On a 1 MB recording + 100 ms loopback latency the redundant
+    GET+POST round-trip costs ~500 ms-1 s. This endpoint short-
+    circuits both: the audio bytes are already on disk, the backend
+    reads them directly, no upload boundary involved.
+
+    Body shape (all optional, defaulted):
+        provider:        "deepgram" | "openrouter" (default: deepgram)
+        language:        ISO-639-1 / "auto" (default: auto)
+        diarize:         bool (default: false)
+        num_speakers:    str (deepgram only)
+        openrouter_model: str
+        archive_dir:     str — same as the GET endpoint
+
+    Returns same shape as ``/api/remote/transcribe-sync``.
+    """
+    provider_norm = str(payload.get("provider") or "").strip()
+    if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
+        raise HTTPException(status_code=400, detail="unsupported provider")
+    archive_dir = str(payload.get("archive_dir") or "").strip()
+    target_dir = (
+        _resolve_recordings_target_dir(archive_dir, create=False)
+        if archive_dir
+        else None
+    )
+    p = _recording_path_or_404(recording_name, target_dir=target_dir)
+    audio_path = _recording_audio_path(p.name, target_dir=target_dir)
+    if audio_path is None:
+        raise HTTPException(status_code=404, detail="recording audio not found")
+    try:
+        audio_bytes = audio_path.read_bytes()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"failed to read audio: {_safe_error_text(e)}")
+    if len(audio_bytes) == 0:
+        raise HTTPException(status_code=500, detail="audio file is empty")
+    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"audio too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+        )
+    lang_opt = _normalize_language(str(payload.get("language") or "auto"))
+    cfg = load_config()
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: _run_remote_transcribe_once(
+                provider_norm=provider_norm,
+                audio_bytes=audio_bytes,
+                orig_name=audio_path.name,
+                language=lang_opt,
+                diarize=bool(payload.get("diarize") or False),
+                num_speakers=str(payload.get("num_speakers") or ""),
+                openrouter_model=str(payload.get("openrouter_model") or ""),
+                cfg=cfg,
+            ),
+        )
+        return {"ok": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e))
+    except RemoteError as e:
+        raise HTTPException(status_code=502, detail=_safe_error_text(e))
+    except Exception as e:
+        logger.exception("transcribe_recording_on_disk failed")
+        raise HTTPException(status_code=500, detail=f"On-disk transcription failed: {_safe_error_text(e)}")
+
+
 @app.post("/api/upscale")
 async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
     text = str(payload.get("text") or "").strip()

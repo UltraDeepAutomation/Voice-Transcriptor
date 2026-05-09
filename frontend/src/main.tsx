@@ -7266,14 +7266,42 @@ async function stopLive(enhance: boolean): Promise<void> {
     //     manual Re-transcribe which the user clearly preferred).
     // Centralizing them ensures every path tries the highest-
     // quality available transcription before giving up.
-    const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
-      console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
-      const audioFile = await fetchRecoveryAudioFile();
-      if (!audioFile) {
-        console.log(`[trace recover] no audio file available — abort`);
-        return "";
+    // Deepgram REST against an already-saved recording — skips the
+    // ``GET /api/recordings/<name>/audio`` + ``POST /api/remote/
+    // transcribe-sync`` round-trip by hitting the in-place
+    // ``transcribe-on-disk`` endpoint added in 1.1.18. Saves
+    // 500 ms-1 s of loopback overhead on every recovery call when
+    // the recording was successfully persisted (the common case).
+    const deepgramRestOnDisk = async (): Promise<string | null> => {
+      if (!persistedRecordingName) return null;
+      const params = new URLSearchParams({ token: apiToken() });
+      const url = `/api/recordings/${encodeURIComponent(persistedRecordingName)}/transcribe-on-disk?${params.toString()}`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: "deepgram",
+          language: languageValue,
+          diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+          openrouter_model: getRemoteModelValue("deepgram"),
+          archive_dir: persistedRecordingArchiveDir || "",
+        }),
+      });
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => "");
+        throw new Error(`HTTP ${resp.status}${detail ? ": " + detail.slice(0, 200) : ""}`);
       }
-      console.log(`[trace recover] audio resolved name="${audioFile.name}" mime="${audioFile.type}" sizeBytes=${audioFile.size}`);
+      const data = await resp.json();
+      return String(data?.result?.text || "").trim();
+    };
+    // Hard time-bound on recovery so a stalled provider doesn't
+    // block the entire stopLive flow indefinitely. 20 s is generous
+    // for the typical chain (on-disk REST 1-2 s + local Whisper
+    // fallback 5-15 s on a 30 s recording) and still bounds the
+    // user-visible "stop button is hung" experience.
+    const RECOVERY_HARD_TIMEOUT_MS = 20000;
+    const recoverFromEmptyTranscriptInner = async (reason: string): Promise<string> => {
+      console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
       if (isProviderKeyConfigured("deepgram")) {
         if (isCurrentUiSession(sessionUiToken)) {
           patchCurrentRecordingSummary({
@@ -7283,21 +7311,52 @@ async function stopLive(enhance: boolean): Promise<void> {
           }, sessionUiToken);
         }
         const tDg = performance.now();
+        // FAST PATH: backend transcribes the on-disk file directly
+        // (no upload). Falls through to upload-based path only when
+        // the recording wasn't persisted (extremely rare — stopLive's
+        // two-attempt save handles every common failure).
         try {
-          const result = await remoteJobSync(audioFile, {
-            provider: "deepgram",
-            language: languageValue,
-            diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-            openrouterModel: getRemoteModelValue("deepgram"),
-          });
-          const text = String(result.text || "").trim();
-          console.log(`[trace recover] deepgram REST OK durMs=${(performance.now() - tDg).toFixed(0)} textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
-          if (text) return text;
+          const onDisk = await deepgramRestOnDisk();
+          if (onDisk !== null) {
+            console.log(`[trace recover] deepgram REST on-disk durMs=${(performance.now() - tDg).toFixed(0)} textLen=${onDisk.length} wordCount=${onDisk.split(/\s+/).filter(Boolean).length}`);
+            if (onDisk) return onDisk;
+          } else {
+            console.log(`[trace recover] no persistedRecordingName — falling back to upload-based REST`);
+          }
         } catch (e) {
-          console.log(`[trace recover] deepgram REST FAIL durMs=${(performance.now() - tDg).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
+          console.log(`[trace recover] deepgram REST on-disk FAIL durMs=${(performance.now() - tDg).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}" — falling back to upload-based REST`);
+        }
+        // SLOW PATH (kept as fallback when on-disk endpoint is
+        // unavailable, e.g., older backend, or when the recording
+        // wasn't persisted): fetch audio + upload via FormData.
+        const audioFile = await fetchRecoveryAudioFile();
+        if (audioFile) {
+          const tDg2 = performance.now();
+          try {
+            const result = await remoteJobSync(audioFile, {
+              provider: "deepgram",
+              language: languageValue,
+              diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+              openrouterModel: getRemoteModelValue("deepgram"),
+            });
+            const text = String(result.text || "").trim();
+            console.log(`[trace recover] deepgram REST upload durMs=${(performance.now() - tDg2).toFixed(0)} textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
+            if (text) return text;
+          } catch (e) {
+            console.log(`[trace recover] deepgram REST upload FAIL durMs=${(performance.now() - tDg2).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
+          }
         }
       } else {
         console.log(`[trace recover] deepgram skipped — no API key configured`);
+      }
+      // Local Whisper — last resort. Always uses the in-memory /
+      // backend-fetched file path (no in-place equivalent because
+      // local pass already runs server-side and there's no upload
+      // boundary worth saving).
+      const audioFile = await fetchRecoveryAudioFile();
+      if (!audioFile) {
+        console.log(`[trace recover] no audio file for local whisper — abort`);
+        return "";
       }
       if (isCurrentUiSession(sessionUiToken)) {
         patchCurrentRecordingSummary({
@@ -7320,6 +7379,26 @@ async function stopLive(enhance: boolean): Promise<void> {
         console.log(`[trace recover] local whisper FAIL durMs=${(performance.now() - tLocal).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
         return "";
       }
+    };
+    // Public helper: wraps the inner chain in a hard timeout so a
+    // stalled provider can't hang the stopLive flow forever. The
+    // inner chain races against a sentinel that resolves with "" at
+    // the deadline. The inner work keeps running in the background
+    // (its promises don't get cancelled — the caller just stops
+    // waiting), so a delayed result still gets logged; we just don't
+    // block the UI on it.
+    const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
+      const tStart = performance.now();
+      const innerPromise = recoverFromEmptyTranscriptInner(reason);
+      const timeoutPromise = new Promise<string>((resolve) => {
+        setTimeout(() => {
+          console.log(`[trace recover] HARD TIMEOUT after ${RECOVERY_HARD_TIMEOUT_MS}ms — abandoning recovery`);
+          resolve("");
+        }, RECOVERY_HARD_TIMEOUT_MS);
+      });
+      const result = await Promise.race([innerPromise, timeoutPromise]);
+      console.log(`[trace recover] outer durMs=${(performance.now() - tStart).toFixed(0)} resultLen=${result.length}`);
+      return result;
     };
     let transcriptRaw = "";
     let transcriptForPaste = "";
