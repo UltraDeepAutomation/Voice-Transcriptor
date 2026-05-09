@@ -1858,11 +1858,32 @@ function createOverlayHtml() {
         };
         const render = () => {
           ctx.clearRect(0, 0, waveW, waveH);
+          // 1.1.23: silent-floor for the overlay waveform.
+          //
+          // Previous code did ``Math.max(2, …)`` which clamped every
+          // bar — including bars sampled while the mic was open but
+          // the user hadn't started speaking yet — to at least 2 px
+          // height. With ~120 bars across the canvas that produced
+          // a constant 2 px-tall bright-red horizontal line during
+          // the first 1-2 seconds of every recording (user report:
+          // "красная маленькая полосочка первые несколько секунд").
+          // Worse, the same minimum applied at the leading edge
+          // every time the user paused mid-sentence — visually
+          // implying audio level when there was none.
+          //
+          // The fix: drop the 2 px floor entirely. A bar's height
+          // is now just ``v * (waveH - 2)``. At ambient-noise
+          // levels (v ≈ 0.001-0.02 → h ≈ 0.04-0.8 px) the bar is
+          // sub-pixel and renders invisible. When the user actually
+          // speaks (v > ~0.1 → h > 4 px) the bar becomes clearly
+          // visible. The "wave grows when I talk" feedback is
+          // preserved; the spurious red sliver on silence is gone.
           for (let i = 0; i < bars.length; i++) {
             const v = bars[bars.length - 1 - i];
             const x = waveW - (i + 1) * (bw + gap);
             if (x < 0) break;
-            const h = Math.max(2, Math.min(waveH - 2, v * (waveH - 2)));
+            const h = Math.min(waveH - 2, v * (waveH - 2));
+            if (h <= 0) continue;
             const y = (waveH - h) / 2;
             if (waveMode === 'recording') {
               ctx.fillStyle = 'rgba(255,77,77,.88)';
