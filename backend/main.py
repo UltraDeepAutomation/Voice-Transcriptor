@@ -1143,15 +1143,36 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _normalize_filename(name: str) -> str:
-    base = os.path.basename(name or "audio")
+    # 1.1.25: strip BOTH POSIX and NT path separators regardless of host
+    # OS, so a Windows-style filename submitted to a POSIX backend can't
+    # keep its backslashes through ``os.path.basename`` (POSIX
+    # ``basename`` does NOT split on backslash). Defence-in-depth.
+    raw = (name or "audio.wav").replace("\\", "/")
+    base = os.path.basename(raw)
     # Keep alnum, dot, dash, underscore only to avoid strange filenames.
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
-    return cleaned or "audio.wav"
+    if not cleaned:
+        return "audio.wav"
+    # 1.1.25: previous form returned ``cleaned`` even when it lacked an
+    # extension entirely (e.g. input "audio." → cleaned "audio" → no
+    # extension), letting downstream content-type / retention paths
+    # treat it as an unknown format. Always ensure a fallback ``.wav``
+    # extension when the user-supplied name didn't produce one.
+    if "." not in cleaned:
+        return f"{cleaned}.wav"
+    return cleaned
 
 
 def _validate_audio_filename(name: str) -> None:
+    # 1.1.25: previous form was ``if ext and ext not in ALLOWED_...``
+    # which silently passed when the filename had NO extension. A POST
+    # with ``filename="evil"`` (no ext) bypassed the audio-format
+    # whitelist entirely and was saved as ``{job_id}.evil``, then
+    # routed to ffmpeg / soundfile which threw a confusing "invalid
+    # data" error deep in the pipeline instead of a clean 400 at the
+    # validator boundary. Now: empty extension is itself rejected.
     ext = Path(name).suffix.lower()
-    if ext and ext not in ALLOWED_AUDIO_EXTS:
+    if not ext or ext not in ALLOWED_AUDIO_EXTS:
         raise HTTPException(status_code=400, detail="unsupported audio file extension")
 
 
@@ -3825,7 +3846,17 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                     "size_bytes": st.st_size,
                     "provider": provider,
                     "language": language,
-                    **_recording_audio_payload(p.name),
+                    # 1.1.25 fix: thread the listed directory through to
+                    # ``_recording_audio_payload``. Previously called
+                    # without target_dir, which silently fell back to
+                    # ``_resolve_recordings_dir()``. Currently the
+                    # caller passes the resolved default dir, so values
+                    # match — but a future caller listing a non-default
+                    # archive would silently report has_audio=false on
+                    # every entry. Mirrors the pattern in
+                    # ``get_recording_audio`` and
+                    # ``transcribe_recording_on_disk``.
+                    **_recording_audio_payload(p.name, target_dir=d),
                 }
             )
         except Exception as e:
@@ -4032,7 +4063,7 @@ async def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
     return result
 
 
-def _read_recording_payload(p: "Path") -> dict:
+def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> dict:
     """Sync helper that does the per-recording stat + read + parse.
     Offloaded by the async route so a multi-MB transcript read does
     not pin an executor thread."""
@@ -4045,7 +4076,12 @@ def _read_recording_payload(p: "Path") -> dict:
         "size_bytes": st.st_size,
         "content": raw,
         "display_text": display or raw,
-        **_recording_audio_payload(p.name),
+        # 1.1.25 fix: thread the resolved directory through so a
+        # call against a non-default archive correctly looks up the
+        # audio within that archive instead of falling back to
+        # ``_resolve_recordings_dir()`` and reporting has_audio=false
+        # for every entry in custom archives.
+        **_recording_audio_payload(p.name, target_dir=(target_dir or p.parent)),
     }
 
 

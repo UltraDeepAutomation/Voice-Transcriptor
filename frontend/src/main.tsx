@@ -404,7 +404,15 @@ const OPENROUTER_AUDIO_MODELS = [
   "google/gemini-2.0-flash-lite",
   "openai/gpt-4o-audio-preview",
 ];
+// 1.1.25 SSOT: every cold-start fallback to the OpenRouter default
+// model previously inlined ``DEFAULT_OPENROUTER_AUDIO_MODEL`` at 7+
+// sites (cfg load, autosave, getter, re-render, etc.). Adding a
+// new default required hunting all sites; missing one produced
+// drift between the cold-boot model and what the user actually
+// saw selected. Single named constant eliminates the hazard.
+const DEFAULT_OPENROUTER_AUDIO_MODEL = OPENROUTER_AUDIO_MODELS[0];
 const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
+const DEFAULT_DEEPGRAM_AUDIO_MODEL = DEEPGRAM_AUDIO_MODELS[0];
 
 /**
  * Text-generation models suitable for upscaling a raw transcript into
@@ -469,7 +477,7 @@ let recordSessionNoticeTimer: number | null = null;
 let busyScopeToken = "";
 let liveStartAbortReason = "";
 const remoteModelByProvider: Record<RemoteProvider, string> = {
-  openrouter: OPENROUTER_AUDIO_MODELS[0],
+  openrouter: DEFAULT_OPENROUTER_AUDIO_MODEL,
   deepgram: DEEPGRAM_AUDIO_MODELS[0],
 };
 const MASKED_KEY_VALUE = "••••••••••••••••••••••••••••••••••••••••";
@@ -2075,7 +2083,7 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
 function getRemoteModelValue(provider: Provider): string {
   if (provider === "openrouter") {
     const v = (remoteModelByProvider.openrouter || "").trim();
-    return v || OPENROUTER_AUDIO_MODELS[0];
+    return v || DEFAULT_OPENROUTER_AUDIO_MODEL;
   }
   if (provider === "deepgram") {
     const v = (remoteModelByProvider.deepgram || "").trim();
@@ -2121,7 +2129,7 @@ function syncRemoteModelOptions(): void {
     remoteModelByProvider.deepgram = sel.value;
     return;
   }
-  const preferred = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[0];
+  const preferred = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
   const models = new Set<string>(OPENROUTER_AUDIO_MODELS);
   if (preferred) models.add(preferred);
   sel.hidden = false;
@@ -3089,7 +3097,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_stop_silence_enabled: silence.enabled,
     auto_stop_silence_seconds: silence.seconds,
     auto_stop_silence_db: silence.thresholdDb,
-    remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[0],
+    remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL,
     remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0],
     shortcut_record: currentShortcuts.record,
     shortcut_paste: currentShortcuts.paste,
@@ -3830,7 +3838,7 @@ function queueUiPreferencesSave(): void {
     uiPrefSaveTimer = null;
     const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
     const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
-    const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || OPENROUTER_AUDIO_MODELS[0];
+    const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
     const shouldRefreshRecordingsArchive = nextRecordingsDir !== configuredRecordingsDir;
     ($("orModel") as HTMLInputElement).value = openrouterModel;
@@ -3841,7 +3849,7 @@ function queueUiPreferencesSave(): void {
         // SSOT: derive default from OPENROUTER_AUDIO_MODELS so a future
         // version bump (e.g. gemini-2.6-flash) flows through; the prior
         // hardcoded literal would silently keep stuck on 2.5-flash.
-        openrouter: { model: openrouterModel || OPENROUTER_AUDIO_MODELS[0] },
+        openrouter: { model: openrouterModel || DEFAULT_OPENROUTER_AUDIO_MODEL },
         ui: collectUiPreferences(),
       },
     };
@@ -3889,14 +3897,14 @@ async function loadCfg(): Promise<void> {
     keyInput("deepgram").placeholder = "DEEPGRAM_API_KEY";
     syncKeyActionButton("openrouter");
     syncKeyActionButton("deepgram");
-    // SSOT default mirrors OPENROUTER_AUDIO_MODELS[0]. Same SSOT
+    // SSOT default mirrors DEFAULT_OPENROUTER_AUDIO_MODEL. Same SSOT
     // rationale as the autosave path above.
-    const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || OPENROUTER_AUDIO_MODELS[0];
+    const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || DEFAULT_OPENROUTER_AUDIO_MODEL;
     ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     configuredRecordingsDir = (cfg.preferences || {}).recordings_dir || "";
     ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;
     const ui = (cfg.preferences || {}).ui || {};
-    remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || OPENROUTER_AUDIO_MODELS[0];
+    remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEEPGRAM_AUDIO_MODELS[0] || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
     const languageSel = $("language") as HTMLSelectElement;
     const providerSel = $("providerSelect") as HTMLSelectElement;
@@ -4317,7 +4325,7 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
     });
 });
 ($("orModel") as HTMLInputElement).addEventListener("change", () => {
-  remoteModelByProvider.openrouter = (($("orModel") as HTMLInputElement).value || "").trim() || OPENROUTER_AUDIO_MODELS[0];
+  remoteModelByProvider.openrouter = (($("orModel") as HTMLInputElement).value || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
   syncRemoteModelOptions();
   queueUiPreferencesSave();
 });
@@ -5085,7 +5093,14 @@ $("retranscribeBtn").addEventListener("click", async () => {
   // a new live session starts mid-retranscribe, it overwrites
   // `activeUiSessionToken` and our guard starts blocking stale writes
   // (which is exactly the data-loss case we care about).
-  if (!activeUiSessionToken) activeUiSessionToken = capturedToken;
+  //
+  // 1.1.25 fix: track whether WE adopted the token. The cleanup at
+  // function end releases ours-only — never a token a real live
+  // session put in place — so a phantom token doesn't survive after
+  // re-transcribe and cause future deferred writes to incorrectly
+  // pass `isCurrentUiSession` when no real session is active.
+  const adoptedToken = !activeUiSessionToken;
+  if (adoptedToken) activeUiSessionToken = capturedToken;
   btn.disabled = true;
   btn.classList.add("is-busy");
   // Visible-progress writer. The user reported the re-transcribe job
@@ -5291,6 +5306,16 @@ $("retranscribeBtn").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.classList.remove("is-busy");
+    // 1.1.25 fix: release the token only if WE adopted it AND no
+    // real live session has taken over. This is the symmetric
+    // counterpart of the adoption above; without it, the phantom
+    // capturedToken kept ``activeUiSessionToken`` non-empty after
+    // re-transcribe, and any deferred async write keyed on the
+    // captured token would pass ``isCurrentUiSession(capturedToken)``
+    // forever — silent data corruption hazard.
+    if (adoptedToken && activeUiSessionToken === capturedToken) {
+      activeUiSessionToken = "";
+    }
   }
 });
 
