@@ -362,12 +362,16 @@
                          the SSOT-driven repopulate ran. Replaced with the
                          canonical SSOT default so the cold-boot flash
                          never shows a stale model id. -->
-                    <select id="remoteModelSelect" title="Remote model" hidden>
-                      <option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option>
-                      <option value="google/gemini-2.0-flash-lite">google/gemini-2.0-flash-lite</option>
-                      <option value="openai/gpt-4o-audio-preview">openai/gpt-4o-audio-preview</option>
-                      <option value="nova-3">nova-3</option>
-                    </select>
+                    <!-- 1.1.25: empty placeholder. populateRemoteModelOptions
+                         (see frontend/src/main.tsx) rebuilds this select from
+                         OPENROUTER_AUDIO_MODELS / DEEPGRAM_AUDIO_MODELS at
+                         boot — the only SSOT for the remote-model list.
+                         Previously this placeholder hardcoded a stale list
+                         that mixed nova-3 (Deepgram) under what should have
+                         been an OpenRouter-only fallback, producing a
+                         millisecond cold-boot flash with the wrong content
+                         and a fourth maintenance surface to keep in sync. -->
+                    <select id="remoteModelSelect" title="Remote model" hidden></select>
                   </div>
                   <div class="pane-control-group pane-control-group-secondary">
                     <div class="transcribe-settings-wrap">

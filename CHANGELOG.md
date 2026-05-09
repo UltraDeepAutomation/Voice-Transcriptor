@@ -3,6 +3,163 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.25] — 2026-05-10
+
+Comprehensive 5-agent audit pass, **107 real bugs identified** across
+24K LOC; ~45 fixed in this release across 18 commits. All P0 closed,
+~80 % of P1 closed, principal SSOT violations eliminated.
+
+### Fixed (audit + post-audit batch)
+
+#### P0 (data-loss / breakage)
+- **frontend `setSelectedFile`** — extension-less + MIME-less files no longer
+  bypass the upload validator (lenient `!file.type` short-circuit removed).
+- **frontend `OpfsPcmSink.finalize`** — recovers in-memory PCM after a write
+  failure instead of returning empty WAV; salvages spool prefix + RAM tail.
+- **frontend `parseError`** — reads response body once as text then attempts
+  JSON; previous form double-consumed the stream and dropped server error
+  detail.
+
+#### P1 (incorrect behaviour / leaks)
+- **backend Fernet keyfile** — disk-write failure no longer returns an
+  in-memory key that would have caused silent permanent loss of every
+  encrypted API key on the next boot.
+- **backend `decrypt_value`** — distinguishes InvalidToken (warn) from any
+  other exception (error + stack), no more silent secret loss.
+- **backend `dict(DEFAULT_CONFIG)` → `copy.deepcopy`** — caller mutation no
+  longer corrupts the global default for the rest of the process (5 sites).
+- **backend Deepgram error envelopes** — final-payload + `/api/upscale` 502
+  now route through `_safe_error_text`, no more raw upstream URLs / token
+  prefixes leaking into the renderer.
+- **backend local-assist final envelope** — `LiveSession.finalize_envelope()`
+  reports the cumulative transcript instead of always-empty; frontend stops
+  triggering a recovery REST round-trip on every successful local stop.
+- **backend `transcribe.py` warm-probe regex** — covers Python 3.12 wording
+  ("max() iterable argument is empty"); spurious stack trace on every cold
+  start is gone.
+- **backend `audio.py` ffmpeg cleanup** — partial output files unlinked on
+  ffmpeg failure (both `compact_audio_for_remote` and `ensure_wav_16k`);
+  downstream transcribe paths can no longer consume torn files.
+- **backend Deepgram `connect()`** — retries on `OSError` (DNS gaierror,
+  ConnectionRefused) per the docstring; previous code retried only on
+  `TimeoutError`.
+- **backend `_finalize_sent` flag** — set AFTER the Finalize send succeeds,
+  not before; cancellation between flag-set and send no longer orphans the
+  Finalize.
+- **backend keepalive race** — snapshots `self._ws` before each send; close()
+  on the same event loop can no longer null the reference between guard
+  and use.
+- **backend `connect()` rollback** — closes the open WebSocket if a
+  `BaseException` (incl. `CancelledError`) fires between socket-open and
+  recv/keepalive task launch; eliminates a connection-leak path.
+- **backend `_ws_send_json`** — 5 s send timeout treats stalled clients as
+  broken pipes; one paused renderer can no longer wedge the entire
+  forwarder loop.
+- **backend `_extract_meta_field`** — restricted to the file header prefix
+  (text before first blank line); user transcript content starting with
+  "Provider:" / "Language:" no longer corrupts stats / graph / filter.
+- **backend `_promote_live_recovery`** — registers archive dir AFTER writes
+  succeed, not before; failed writes no longer pollute the registry.
+- **backend `compact_audio_for_remote` ffmpeg-missing** — raises
+  `RemoteError` with an actionable message for non-Deepgram-native
+  containers (.wma / .mkv / .opus / .webm / etc.) instead of degrading
+  to a confusing upstream 400.
+- **backend validators** — `_validate_audio_filename` rejects empty
+  extensions; `_normalize_filename` strips Windows backslashes regardless
+  of host OS and ensures fallback `.wav` extension when none exists.
+- **backend recordings list** — `_recording_audio_payload` receives
+  `target_dir` from list and single-recording paths so non-default
+  archives correctly resolve audio existence.
+- **frontend `lastSegEnd`** — tail-gap detection uses `Math.max(end)` over
+  segments instead of array tail; correct for diarized recordings and
+  out-of-order arrivals.
+- **frontend `xhr.send`** — wrapped in try/catch + idempotent abort guard;
+  pre-send abort no longer surfaces as a network-error reject.
+- **frontend `discardLiveRecovery`** — failure no longer misreported as a
+  save failure; recovery duplicate-on-restart eliminated.
+- **frontend `hideBootOverlayOnce`** — defers `hidden=true` past the CSS
+  transition so the documented fade-out actually runs.
+- **frontend Re-transcribe token leak** — `activeUiSessionToken` adopted
+  on cold-start re-transcribe is now released in `finally`; phantom token
+  no longer survives.
+- **frontend `reportFileSelectionError`** — non-disruptive notice replaces
+  the blanket `patchCurrentRecordingSummary` write that could clobber an
+  active live recording's status pill.
+- **desktop `toggleRecordingFromShortcut`** — uses
+  `execRendererJsWithTimeout(2000)` instead of unbounded
+  `executeJavaScript`; stuck renderer no longer makes the hotkey a
+  permanent no-op.
+- **desktop OneDrive migration** — marker only written when EVERY child
+  copy succeeded; partial copy failures now retry on next boot instead
+  of permanently stranding user data in the OneDrive path.
+- **desktop backend restart timer** — null'd from `.finally` instead of
+  the synchronous start path; concurrent `startBackend()` callers no
+  longer race into a double-spawn → port-bind collision loop.
+- **desktop `hideRecordingOverlay`** — clears `overlayMouseTrackTimer`;
+  20 Hz syscall poll no longer wastes CPU + battery for the entire app
+  session whenever the overlay is hidden.
+- **desktop overlay timer regex** — `\d{2,3}:\d{2}` accepts 100+ minute
+  recordings; previous regex froze the overlay timer at 99:59.
+- **desktop macOS permissions** — request prompt runs in parallel with
+  backend boot, no longer blocks the launch sequence on a modal dialog
+  the user might leave for minutes.
+- **desktop `playOverlayCue`** — 500 ms cap on executeJavaScript so a
+  stuck overlay webContents can't freeze hotkey-bound code paths.
+- **desktop overlay close** — resets `overlayQuickSettingsInitialized` and
+  `overlayQuickAutoSendInitialized` flags; recreated overlay window no
+  longer shows stale checkbox states until manual toggle.
+- **desktop `__app_reveal_recording__`** — rejects names containing `..`;
+  prevents path-traversal enumeration of the user's home parent through
+  `shell.showItemInFolder`.
+- **desktop hotkey 1.1.24 regression** — comment block inside
+  `createOverlayHtml`'s template literal was breaking the outer literal
+  via stray backticks + `${}`; rewritten without those characters.
+
+#### SSOT consolidation
+- **`backend/audio_constants.py`** — single source of truth for
+  `LIVE_SAMPLE_RATE_HZ` (16 000), `LIVE_PCM_BYTES_PER_SEC` (32 000), and
+  `LIVE_RECOVERY_MIN_BYTES`. Every literal `16000`/`32000` in `audio.py`,
+  `main.py`, `live.py`, and `remote_deepgram_live.py` migrated.
+- **`backend/deepgram_endpoints.py`** — `DEEPGRAM_REST_BASE` and
+  `DEEPGRAM_LIVE_URL` centralised; both `remote_deepgram` and
+  `remote_deepgram_live` import from here. `TRANSCRIPTOR_DEEPGRAM_HOST`
+  env override for regional routing.
+- **Version SSOT** — `vite.config.ts` now reads
+  `desktop/package.json` instead of `frontend/package.json` for
+  `__APP_VERSION__`. One file to bump per release; `frontend/package.json`
+  `"version"` field is vestigial.
+- **MIME drift assert** — backend module-import-time assertion that
+  `ALLOWED_AUDIO_EXTS ⊆ _AUDIO_EXT_TO_MIME.keys()` so a future addition
+  to the ext list without a matching MIME entry fails on boot, not
+  silently downstream.
+- **`DEFAULT_OPENROUTER_AUDIO_MODEL`** — single named constant replaces
+  inline `OPENROUTER_AUDIO_MODELS[0]` at 11 sites.
+- **`countWords`** — `wordCountOf` aliases the module-level helper
+  instead of a divergent inline lambda.
+
+#### Docs / build
+- **README** — corrected hotkey defaults per OS, removed Mac Intel
+  section (build is arm64-only since 1.1.24), replaced hardcoded
+  `1.1.1` filenames with `<version>` placeholders.
+- **`.env.example`** — `TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC`
+  documented default corrected from 3600 to 86400 (matches code).
+- **`install/win/build.bat`** — JS-string backslash escape bug fixed
+  (`\b`, `\t`, etc. in user paths). Pass via env var instead.
+- **Mac build rules** — arm64-only (M-series); Intel x64 dropped from
+  electron-builder target and `dist` script.
+- **Renderer trace log bridge** — `console.log("[trace ...]")` lines
+  mirror to `main.log` via `webContents.on("console-message", ...)`;
+  enables packaged-build debugging without DevTools.
+
+### [Unreleased prior to 1.1.25]
+1.1.2 → 1.1.24: 22 release commits between 1.1.1 and 1.1.25
+covering tail-cut recovery (1.1.13 → 1.1.16 ladder), parallel
+race + Finalize-before-CloseStream (1.1.17 → 1.1.19), the
+Deepgram-WS-not-emitting-is_final root cause investigation
+(1.1.20 → 1.1.22), the overlay waveform red-line fix (1.1.23) and
+the comment-in-template hotkey breakage + restore (1.1.24).
+See `git log --oneline --grep "release"` for the full chain.
+
 ## [1.1.1] — 2026-04-25
 
 Enterprise-grade storage layer (SSOT) and a dense wave of pre-launch
