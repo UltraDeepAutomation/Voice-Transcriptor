@@ -66,7 +66,19 @@ _MODEL_CACHE_MAX = max(1, _env_int("TRANSCRIPTOR_WHISPER_CACHE_SIZE", 2))
 
 def _is_empty_sequence_transcribe_error(exc: Exception) -> bool:
     msg = str(exc or "").lower()
-    return "empty sequence" in msg and "max()" in msg
+    # 1.1.25: cover BOTH Python wordings of the same error.
+    # • Python <=3.11 / faster-whisper raises:
+    #     "max() arg is an empty sequence"
+    # • Python 3.12+ raises:
+    #     "max() iterable argument is empty"
+    # Previously matched only the 3.11 form, so on Python 3.12 (the
+    # bundled runtime), the warm probe (which intentionally feeds
+    # a silent buffer) re-raised this signature instead of returning
+    # an empty result, producing a spurious stack trace in main.log
+    # on every cold start.
+    if "max()" not in msg:
+        return False
+    return ("empty sequence" in msg) or ("iterable argument is empty" in msg)
 
 
 def _empty_transcribe_result(duration: float = 0.0) -> Dict[str, Any]:

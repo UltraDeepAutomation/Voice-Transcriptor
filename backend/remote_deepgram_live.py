@@ -302,6 +302,24 @@ class DeepgramLiveSession:
                     "deepgram-live: connected on retry after total_ms=%.0f",
                     (time.perf_counter() - started) * 1000.0,
                 )
+            except OSError as os_err:
+                # 1.1.25: docstring above promised retry on "DNS miss
+                # on attempt 1 -> attempt 2 hits a warm cache" but the
+                # original code only retried on TimeoutError. A real
+                # DNS miss raises OSError (gaierror), and TCP-RST
+                # during connect raises ConnectionRefusedError (also
+                # OSError). Both are transient on the post-sleep wake
+                # / mobile-network-flap paths. Retry once with the
+                # budget the docstring already documents.
+                logger.warning(
+                    "deepgram-live: connect %s on attempt 1 (%s) — retrying once with budget=%.1fs",
+                    type(os_err).__name__, os_err, retry_budget,
+                )
+                self._ws = await _attempt(retry_budget)
+                logger.info(
+                    "deepgram-live: connected on retry after total_ms=%.0f",
+                    (time.perf_counter() - started) * 1000.0,
+                )
         except InvalidStatus as e:
             status = getattr(e.response, "status_code", None)
             body_text = ""
@@ -456,7 +474,15 @@ class DeepgramLiveSession:
             self.stats.segments_final, self.stats.segments_interim, self.stats.bytes_sent,
         )
         if self._ws is not None and not self._finalize_sent:
-            self._finalize_sent = True
+            # 1.1.25: idempotency flag is set AFTER the Finalize send
+            # succeeds, NOT before. Previously a CancelledError fired
+            # between the flag-set and the actual ``ws.send`` would
+            # leave ``_finalize_sent=True`` even though Deepgram never
+            # got the Finalize signal — a follow-up finalize() call
+            # then early-returned and the trailing is_final was never
+            # flushed. Moving the flag below the send-success makes
+            # the flag a faithful witness of "Finalize was actually
+            # delivered to Deepgram".
             # ── 1.1.19: send Finalize BEFORE CloseStream ─────────────
             #
             # Deepgram's streaming protocol supports two control msgs:
@@ -482,10 +508,15 @@ class DeepgramLiveSession:
                     self._ws.send(json.dumps({"type": "Finalize"})),
                     timeout=5.0,
                 )
+                self._finalize_sent = True
                 logger.info("deepgram-live: Finalize sent (forces trailing is_final flush)")
             except asyncio.TimeoutError:
                 logger.warning("deepgram-live: Finalize send timed out (>5s)")
             except ConnectionClosed:
+                # Connection was already closed — treat as "Finalize
+                # need not happen", flag accordingly so a second call
+                # doesn't try again.
+                self._finalize_sent = True
                 logger.info("deepgram-live: Finalize skipped (already closed)")
             except WebSocketException as e:
                 logger.warning("deepgram-live: Finalize send failed: %s", e)
@@ -817,14 +848,22 @@ class DeepgramLiveSession:
         try:
             while not self._closed and self._ws is not None:
                 await asyncio.sleep(self._keepalive_interval_sec)
-                if self._closed or self._ws is None:
+                # 1.1.25: snapshot ``self._ws`` BEFORE the send. close()
+                # on the same event loop can null ``self._ws`` after we
+                # passed the guard but before ``self._ws.send(...)``
+                # re-reads the attribute, raising AttributeError on
+                # ``None.send``. Snapshotting under the no-await window
+                # of the guard makes the send a real WebSocket reference
+                # whose own send-error semantics we already handle.
+                ws = self._ws
+                if self._closed or ws is None:
                     return
                 last = self.stats.last_send_at or 0.0
                 idle_for = time.monotonic() - last if last else float("inf")
                 if idle_for < self._keepalive_idle_threshold_sec:
                     continue
                 try:
-                    await self._ws.send(json.dumps({"type": "KeepAlive"}))
+                    await ws.send(json.dumps({"type": "KeepAlive"}))
                     self.stats.keepalives_sent += 1
                     logger.debug(
                         "deepgram-live: sent KeepAlive after %.1fs idle",
@@ -834,6 +873,10 @@ class DeepgramLiveSession:
                     return
                 except WebSocketException as e:
                     logger.debug("deepgram-live: KeepAlive send failed: %s", e)
+                    return
+                except AttributeError:
+                    # Race lost: close() ran between our snapshot and the
+                    # send call (rare but observed under heavy load).
                     return
         except asyncio.CancelledError:
             raise

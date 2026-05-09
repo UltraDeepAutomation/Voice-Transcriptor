@@ -172,7 +172,21 @@ def compact_audio_for_remote(path_in: str, path_out: str) -> str:
         "-f", "webm",
         path_out,
     ]
-    _run_ffmpeg(cmd, timeout_sec=600)
+    # 1.1.25: clean up partial output on ffmpeg failure. ffmpeg's
+    # ``-y`` flag truncates the output up front, so a non-zero exit
+    # leaves a 0-byte (or partially-written) file at ``path_out``.
+    # A subsequent transcribe call that doesn't size-check would
+    # then read the fragment and produce garbage. Belt-and-braces
+    # cleanup keeps the contract "either path_out is a complete
+    # encoded file or it doesn't exist".
+    try:
+        _run_ffmpeg(cmd, timeout_sec=600)
+    except AudioError:
+        try:
+            os.unlink(path_out)
+        except OSError:
+            pass
+        raise
     return path_out
 
 
@@ -282,6 +296,15 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             # debugging; surface only a compact prefix in the
             # exception that callers may echo back over HTTP.
             logger.warning("ffmpeg failed (rc=%d): %s", proc.returncode, msg)
+            # 1.1.25: clean up partial output. ffmpeg's ``-y`` flag
+            # truncates the output up front, so a non-zero exit
+            # leaves a 0-byte (or torn) WAV at ``path_out`` that
+            # downstream transcribe calls would otherwise consume
+            # as if it were a real recording.
+            try:
+                os.unlink(path_out)
+            except OSError:
+                pass
             raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
         return path_out
 
