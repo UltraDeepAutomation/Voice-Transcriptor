@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
 # centralised host as the REST module so a regional override sets
 # both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL  # noqa: E402,F401
 
 
@@ -78,7 +79,10 @@ class DeepgramLiveConfig:
 
     model: str = "nova-3"
     language: str = "auto"
-    sample_rate: int = 16000
+    # Constrained to ``LIVE_SAMPLE_RATE_HZ`` — the WS announces this
+    # rate to Deepgram and the frontend downsampler targets it; any
+    # override here MUST come with a matching frontend change.
+    sample_rate: int = LIVE_SAMPLE_RATE_HZ
     channels: int = 1
     interim_results: bool = True
     punctuate: bool = True

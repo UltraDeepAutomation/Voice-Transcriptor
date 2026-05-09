@@ -6,13 +6,18 @@ from typing import Optional
 
 import numpy as np
 
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
 from backend.transcribe import transcribe_audio
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class LiveConfig:
-    sample_rate: int = 16000
+    # Constrained to ``LIVE_SAMPLE_RATE_HZ`` — the canonical live PCM
+    # rate that the Deepgram WS announces, the WAV writer outputs,
+    # and Whisper expects natively. Overriding here also requires
+    # coordinated updates in those three sites.
+    sample_rate: int = LIVE_SAMPLE_RATE_HZ
     window_sec: float = 8.0
     overlap_sec: float = 1.0
     min_step_sec: float = 1.0

@@ -15,6 +15,13 @@ from typing import Optional, Tuple
 import numpy as np
 import soundfile as sf
 
+# 1.1.25: SSOT for the canonical live-streaming sample rate.
+# Replaces in-file literals at the validation, write_wav default,
+# split_channels resample, and conversion paths so the Deepgram
+# announces / Whisper input contract / WAV writer rate stay in
+# lock-step from a single source.
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,9 +163,9 @@ def compact_audio_for_remote(path_in: str, path_out: str) -> str:
         "-hide_banner",
         "-loglevel", "error",
         "-i", path_in,
-        # Resample to 16 kHz mono — Whisper / Deepgram both target this
-        # rate; anything higher is wasted bandwidth.
-        "-ar", "16000",
+        # Resample to LIVE_SAMPLE_RATE_HZ mono — Whisper / Deepgram both
+        # target this rate; anything higher is wasted bandwidth.
+        "-ar", str(LIVE_SAMPLE_RATE_HZ),
         "-ac", "1",
         # Opus encoder. ``-b:a 24k`` is the sweet spot for speech: still
         # intelligible at 24 kbit/s, indistinguishable from 64 kbit/s
@@ -202,7 +209,7 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     if ext == ".wav":
         try:
             info = sf.info(path_in)
-            if info.samplerate == 16000 and info.channels == channels and info.subtype == "PCM_16":
+            if info.samplerate == LIVE_SAMPLE_RATE_HZ and info.channels == channels and info.subtype == "PCM_16":
                 # Already perfect — copy atomically via tmp+rename so a
                 # disk-full mid-copy leaves the destination untouched
                 # (the fallback path below already does this; symmetry
@@ -239,7 +246,7 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             "-i",
             path_in,
             "-ar",
-            "16000",
+            str(LIVE_SAMPLE_RATE_HZ),
             "-ac",
             str(int(channels)),
             "-c:a",
@@ -314,9 +321,10 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
         )
 
     data, sr = sf.read(path_in, always_2d=True)
-    if sr != 16000:
+    if sr != LIVE_SAMPLE_RATE_HZ:
         raise AudioError(
-            "ffmpeg is not installed. Please upload a 16kHz WAV (or install ffmpeg for auto-convert)."
+            f"ffmpeg is not installed. Please upload a {LIVE_SAMPLE_RATE_HZ} Hz WAV "
+            "(or install ffmpeg for auto-convert)."
         )
     if data.shape[1] != channels:
         raise AudioError(
@@ -349,7 +357,7 @@ def load_wav(path_wav: str) -> Tuple[np.ndarray, int]:
     return data, int(sr)
 
 
-def write_wav(path_wav: str, data: np.ndarray, sr: int = 16000) -> None:
+def write_wav(path_wav: str, data: np.ndarray, sr: int = LIVE_SAMPLE_RATE_HZ) -> None:
     sf.write(path_wav, data, sr, subtype="PCM_16")
 
 
@@ -359,8 +367,8 @@ def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
     Returns (ch1_path, ch2_path). If mono, returns (mono_path, None) with mono_path=None (caller can use original).
     """
     data, sr = load_wav(path_wav_16k)
-    if sr != 16000:
-        raise AudioError("Expected 16k WAV input")
+    if sr != LIVE_SAMPLE_RATE_HZ:
+        raise AudioError(f"Expected {LIVE_SAMPLE_RATE_HZ} Hz WAV input")
     ch = data.shape[1]
     if ch == 1:
         return None, None
@@ -370,6 +378,6 @@ def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
     base, _ = os.path.splitext(path_wav_16k)
     ch1 = base + ".ch1.wav"
     ch2 = base + ".ch2.wav"
-    write_wav(ch1, data[:, 0:1], 16000)
-    write_wav(ch2, data[:, 1:2], 16000)
+    write_wav(ch1, data[:, 0:1], LIVE_SAMPLE_RATE_HZ)
+    write_wav(ch2, data[:, 1:2], LIVE_SAMPLE_RATE_HZ)
     return ch1, ch2

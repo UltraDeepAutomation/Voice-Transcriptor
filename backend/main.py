@@ -34,6 +34,11 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.audio_constants import (
+    LIVE_PCM_BYTES_PER_SEC,
+    LIVE_RECOVERY_MIN_BYTES,
+    LIVE_SAMPLE_RATE_HZ,
+)
 from backend.audio import (
     AudioError,
     compact_audio_for_remote,
@@ -749,18 +754,18 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
             if not LIVE_SESSION_ID_RE.fullmatch(session_id):
                 continue
             bytes_count = int(raw.get("bytes") or pcm_path.stat().st_size or 0)
-            if bytes_count < 32000:
+            if bytes_count < LIVE_RECOVERY_MIN_BYTES:
                 continue
             records.append(
                 {
                     "session_id": session_id,
                     "started_at": str(raw.get("started_at") or ""),
                     "finished_at": str(raw.get("finished_at") or ""),
-                    "sample_rate": int(raw.get("sample_rate") or 16000),
+                    "sample_rate": int(raw.get("sample_rate") or LIVE_SAMPLE_RATE_HZ),
                     "bytes": bytes_count,
                     "model": str(raw.get("model") or "small"),
                     "language": str(raw.get("language") or "auto"),
-                    "duration_sec": round(bytes_count / 32000.0, 2),
+                    "duration_sec": round(bytes_count / float(LIVE_PCM_BYTES_PER_SEC), 2),
                 }
             )
         except Exception as _list_err:
@@ -879,7 +884,7 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
             # np.frombuffer + astype(float32) materialises 3× the raw PCM
             # size in RAM simultaneously.
             pcm_size = pcm_path.stat().st_size
-            if pcm_size < 32000:
+            if pcm_size < LIVE_RECOVERY_MIN_BYTES:
                 raise HTTPException(status_code=400, detail="live recovery too short")
             if pcm_size > MAX_RECOVERY_PROMOTE_BYTES:
                 # Do NOT interpolate `pcm_path` into the response body —
@@ -913,7 +918,7 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
             text_out = target_dir / f"{stem}.txt"
             tmp_audio = _atomic_temp_path(audio_out)
             try:
-                write_wav(str(tmp_audio), pcm, 16000)
+                write_wav(str(tmp_audio), pcm, LIVE_SAMPLE_RATE_HZ)
                 os.replace(tmp_audio, audio_out)
                 _write_recording_text_file(
                     out=text_out,
@@ -2346,7 +2351,7 @@ def _open_live_recovery(
         "session_id": session_id,
         "started_at": started_at.isoformat(),
         "finished_at": "",
-        "sample_rate": 16000,
+        "sample_rate": LIVE_SAMPLE_RATE_HZ,
         "format": "pcm16le_mono",
         "bytes": 0,
         "chunks": 0,
@@ -2452,7 +2457,7 @@ def _finalize_live_recovery(recovery: dict) -> None:
         except OSError as close_err:
             logger.warning("live recovery close failed: %s", close_err)
     try:
-        if recovery["bytes"] < 32000:  # ~1s at 16kHz mono pcm16
+        if recovery["bytes"] < LIVE_RECOVERY_MIN_BYTES:  # ~1s at LIVE_SAMPLE_RATE_HZ mono pcm16
             recovery["pcm_path"].unlink(missing_ok=True)
             recovery["meta_path"].unlink(missing_ok=True)
             return
@@ -2682,7 +2687,7 @@ async def _run_deepgram_live_session(
     dg_cfg = DeepgramLiveConfig(
         model=model or "nova-3",
         language=language or "auto",
-        sample_rate=16000,
+        sample_rate=LIVE_SAMPLE_RATE_HZ,
         interim_results=True,
         diarize=bool(diarize),
     )
