@@ -6526,6 +6526,14 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (stopTransitionInFlight) return;
   if (!isRecording) return;
   stopTransitionInFlight = true;
+  // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
+  // ``finally`` block can close the WS AFTER the entire transcribe
+  // phase finishes (envelope wait, recovery race, save). The
+  // teardown chain in the inner try-block assigns this variable
+  // instead of calling ws.close() inline, which would race the
+  // backend's post-CloseStream is_final emission and truncate the
+  // tail.
+  let _wsToCloseAtEnd: WebSocket | null = null;
   // Wrap the entire body in try/finally so the in-flight guard is ALWAYS
   // cleared, even if a pre-main-try await (flushWorkletPort / waitForWorklet
   // Drain / stopMediaRecorderAndFlush / pcmSink.finalize / selectCanonical
@@ -6854,19 +6862,40 @@ async function stopLive(enhance: boolean): Promise<void> {
   scriptSinkGain = null;
   src = null;
   analyser = null;
-  tearDown("ws.close", () => {
-    if (ws) {
-      // Null the handlers BEFORE close(): late onclose/onerror fires
-      // from the socket keep closures over sessionUiToken alive until the
-      // socket is GC'd. Nulling them releases those closures immediately
-      // and prevents stale handlers from touching post-teardown state.
-      ws.onopen = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onmessage = null;
-      ws.close();
-    }
-  });
+  // ── 1.1.22: defer ws.close until envelope arrived ──
+  //
+  // The previous version closed the WebSocket and nulled its
+  // handlers HERE in the teardown chain — i.e. only ~10 ms after
+  // ``ws.send({type: "finalize"})`` was issued just above. That
+  // race truncates the entire post-stop tail:
+  //
+  //   1. Frontend: send finalize → close WS in 10 ms.
+  //   2. Backend's ``ws-dg-rx`` task receives finalize, drains
+  //      250 ms, then calls ``session.finalize()`` which sends
+  //      ``Finalize`` and ``CloseStream`` to Deepgram.
+  //   3. Deepgram processes the trailing audio, emits the post-
+  ///     CloseStream is_final at ~T+800 ms (timestamp 11:43:11.888
+  //      in the user's main.log).
+  //   4. Backend's forwarder task tries to send that segment to
+  //      the frontend WS — but the WS was closed at step 1, the
+  //      send fails silently. Same fate for the final envelope.
+  //
+  // Net result: the trailing is_final ``"восемь, девять, десять"``
+  // existed at the backend (proven by the 1.1.21 log line
+  // ``finalize EXIT … segments_final=9 (delta from ENTER)``) but
+  // never reached the frontend. ``getCanonicalLiveSourceText``
+  // committed text stopped at ``"семь"`` and recovery had to do
+  // the work — costing ~3 s and sometimes producing a worse
+  // result.
+  //
+  // Fix: just hold the reference. The WS stays open through the
+  // transcribe-phase await chain (envelope wait, recovery race),
+  // ``ws.onmessage`` continues to deliver post-CloseStream
+  // segments and the final envelope, and the WS is closed once
+  // at the very end of stopLive (outer finally). Nulling the
+  // socket-level handlers happens at that same final close so
+  // we still prevent leaked closures.
+  _wsToCloseAtEnd = ws;
   ws = null;
   wsPendingFrames = [];
   mediaRecorder = null;
@@ -7954,6 +7983,22 @@ async function stopLive(enhance: boolean): Promise<void> {
       currentRecordingId = 0;
       window.__transcriptorCurrentRecordingId = 0;
     }
+    // ── 1.1.22: close the live WS here, AFTER the entire transcribe
+    // phase finished. See comment at the deferred-close site for the
+    // rationale (avoids truncating the post-CloseStream tail). Null
+    // the socket-level handlers right before close() so any in-flight
+    // event that lands during the close handshake doesn't reach into
+    // freshly-cleaned state. ``_wsToCloseAtEnd`` survives the
+    // try-block scope because it was declared on the function body.
+    try {
+      if (_wsToCloseAtEnd) {
+        _wsToCloseAtEnd.onopen = null;
+        _wsToCloseAtEnd.onclose = null;
+        _wsToCloseAtEnd.onerror = null;
+        _wsToCloseAtEnd.onmessage = null;
+        try { _wsToCloseAtEnd.close(); } catch { /* already closed */ }
+      }
+    } catch { /* defensive */ }
   }
 }
 
