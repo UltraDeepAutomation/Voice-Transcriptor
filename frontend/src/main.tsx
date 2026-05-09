@@ -6485,14 +6485,24 @@ async function stopLive(enhance: boolean): Promise<void> {
 
   let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
   if (ws) {
-    // 2000 ms budget for the full round-trip after CloseStream.
+    // 4000 ms budget for the full round-trip after CloseStream.
     // Covers the 700 ms endpointing threshold + Deepgram's server-
     // side finalize (~500–1500 ms) + network RTT + backend forward.
-    // The FAST PATH in the Deepgram branch below short-circuits this
-    // ceiling entirely when committed segments already cover the
-    // recording tail — so this value is only a safety floor for
-    // pathologically slow finalizes, not the normal stop latency.
-    const finalizeWaitMs = 2000;
+    //
+    // Bumped 2000 → 4000 ms (1.1.13) after user reports of TAIL
+    // TRUNCATION on slow / cross-region networks (RU → us-east
+    // Deepgram). With 2000 ms, a 500 ms-pause-at-end + 700 ms
+    // endpointing + 1500 ms server-finalize + 600 ms RTT = 3300 ms
+    // round-trip that BARELY beat the timeout — the very last
+    // utterance landed AFTER the deadline and was dropped. The
+    // visible symptom: the user's last words missing from the
+    // committed transcript and from the auto-paste output.
+    //
+    // The FAST PATH in the Deepgram branch below still short-
+    // circuits this ceiling when committed segments already cover
+    // the recording tail, so the new ceiling only matters on the
+    // genuinely-slow path it was always there for.
+    const finalizeWaitMs = 4000;
     liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, finalizeWaitMs);
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -7113,6 +7123,36 @@ async function stopLive(enhance: boolean): Promise<void> {
       if (!transcriptRaw) {
         const committed = getCanonicalLiveSourceText();
         if (committed) transcriptRaw = committed;
+      }
+
+      // ── Final safety net: empty Deepgram-live result ──────────────
+      //
+      // If we get here with NO transcript, every Deepgram path failed:
+      // streaming was empty, envelope was empty (no text, no segments,
+      // no error), REST fallback wasn't triggered (no error path), and
+      // ``getCanonicalLiveSourceText()`` returned nothing. Don't drop
+      // the recording silently — the audio file is on disk and Whisper
+      // can still transcribe it. This mirrors the OpenRouter branch
+      // below, which always falls back to ``runLocalFinalPass()`` on
+      // empty/failed remote.
+      //
+      // Symptom this fixes: the screenshot showing "TRANSCRIBE 3 ms"
+      // with 0 captured words on a 41 s recording — the live WS
+      // returned empty after a few ms (auth issue, network drop, or
+      // server-side rejection), no error event fired, and the user
+      // had to manually press Re-transcribe.
+      if (!transcriptRaw && transcribeInputFile) {
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "Live stream returned no text. Falling back to local transcription from the saved audio.",
+          tone: "warning",
+        }, sessionUiToken);
+        try {
+          const fallbackOut = await runLocalFinalPass();
+          transcriptRaw = String(fallbackOut.text || "").trim();
+        } catch (localErr) {
+          console.error("Live empty-result local fallback failed", localErr);
+        }
       }
     } else {
       // OpenRouter (or any future non-streaming remote): the REST promise
