@@ -256,6 +256,12 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
 type UiStatusTone = "neutral" | "info" | "success" | "warning" | "error";
 type RecordingFinalSignalKind = "" | "transcript" | "status" | "error";
 
+// Compile-time injected by vite.config.ts from frontend/package.json's
+// ``version`` field. SSOT for the version label rendered in the
+// Settings tab — previously hardcoded ``1.1.1`` in index.html and
+// drifted across every release.
+declare const __APP_VERSION__: string;
+
 declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
@@ -8203,6 +8209,20 @@ async function initRecordingsBootstrap(): Promise<void> {
   new ResizeObserver(() => {
     if (!ct.closest("[hidden]")) gRender();
   }).observe(ct);
+})();
+
+// Stamp the version badge on boot. The HTML at #appVersionNumber
+// holds a build-time placeholder that vite/index.html templating
+// can't reach without a separate build step; updating it from JS
+// lets us keep frontend/package.json as the single SSOT for the
+// version string. The vite.config.ts ``define`` block injects
+// ``__APP_VERSION__`` at compile time so this read is a string
+// literal in the bundle, not a runtime fetch.
+(() => {
+  const badge = document.getElementById("appVersionNumber");
+  if (badge && typeof __APP_VERSION__ === "string" && __APP_VERSION__) {
+    badge.textContent = __APP_VERSION__;
+  }
 })();
 
 void loadCfg()

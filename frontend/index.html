@@ -619,7 +619,15 @@
             <div class="screen-header-copy">
               <h2>Settings</h2>
               <div class="screen-header-version" id="appVersionBadge" aria-live="polite">
-                Transcriptor v<span id="appVersionNumber">1.1.1</span>
+                <!-- ``#appVersionNumber`` text is set by main.tsx on boot
+                     from the compile-time-injected ``__APP_VERSION__``
+                     constant (vite.config.ts ``define`` block reads
+                     frontend/package.json's version field). The "—"
+                     placeholder is what renders during the brief
+                     pre-script window; users never see it because the
+                     script runs synchronously after parse. SSOT for
+                     this label is now frontend/package.json. -->
+                Transcriptor v<span id="appVersionNumber">—</span>
               </div>
             </div>
           </div>
