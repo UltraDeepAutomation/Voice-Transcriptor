@@ -38,6 +38,7 @@ SSOT (Single Source of Truth) guarantees provided by this module:
         are transparently re-encrypted on first load.
 """
 
+import copy
 import json
 import logging
 import os
@@ -146,12 +147,18 @@ def _load_or_create_fernet_key() -> bytes:
         try:
             atomic_write_bytes(_KEYFILE, key)
         except OSError as e:
+            # See POSIX branch comment below for rationale: returning
+            # an in-memory key causes silent permanent data loss on
+            # the next boot (different key generated, all encrypted
+            # values become garbage). Refusing to use any key keeps
+            # existing on-disk encrypted values readable.
             logger.error(
                 "failed to persist encryption keyfile at %s: %s — "
-                "encryption will use an in-memory key for this session only",
+                "REFUSING to use a session-only key (existing encrypted "
+                "values stay decryptable on next successful boot)",
                 _KEYFILE, e,
             )
-            return key
+            return b""
     else:
         try:
             _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
@@ -171,12 +178,30 @@ def _load_or_create_fernet_key() -> bytes:
             except OSError:
                 pass
         except OSError as e:
+            # 1.1.25 fix: previously returned the in-memory ``key`` here.
+            # That looked safe ("encryption keeps working this session")
+            # but caused catastrophic SILENT data loss at the next boot:
+            # the keyfile was never persisted, so the next boot's
+            # ``_load_or_create_fernet_key()`` generated a DIFFERENT key
+            # → every value the user encrypted in this session became
+            # undecryptable garbage → ``decrypt_value`` swallowed
+            # InvalidToken and returned "" → user saw all their API
+            # keys empty with NO warning.
+            #
+            # New behaviour: refuse to use any Fernet key this session.
+            # Existing on-disk encrypted values stay readable on the
+            # next boot ONCE the keyfile path becomes writable. A
+            # session that runs without a keyfile cannot encrypt new
+            # values, but that's strictly better than encrypting them
+            # with a doomed in-memory key.
             logger.error(
                 "failed to persist encryption keyfile at %s: %s — "
-                "encryption will use an in-memory key for this session only",
+                "REFUSING to use a session-only key; existing encrypted "
+                "values stay decryptable on next boot once the keyfile "
+                "directory is writable.",
                 _KEYFILE, e,
             )
-            return key
+            return b""
     return key
 
 
@@ -212,8 +237,21 @@ def decrypt_value(stored: str) -> str:
     token = stored[len(_ENC_PREFIX):]
     try:
         return _FERNET.decrypt(token.encode("ascii")).decode("utf-8")
-    except (InvalidToken, Exception):
-        return ""  # corrupted — treat as empty
+    except InvalidToken:
+        # 1.1.25: distinguish "wrong key / corrupted token" from
+        # transient decryption errors. The first is expected after
+        # keyfile rotation; the second is a real fault that must be
+        # logged loudly so a user-visible "API key disappeared"
+        # symptom can be traced back to its cause.
+        logger.warning("decrypt_value: token corrupted or wrong key — treating as empty")
+        return ""
+    except Exception as e:
+        logger.error(
+            "decrypt_value: unexpected decryption error: %s — "
+            "treating as empty (potential silent secret loss)",
+            e, exc_info=True,
+        )
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +392,7 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
     """
     if not isinstance(cfg, dict):
         logger.warning("config is not a JSON object (got %s) — using defaults", type(cfg).__name__)
-        return dict(DEFAULT_CONFIG)
+        return copy.deepcopy(DEFAULT_CONFIG)
     out: Dict[str, Any] = dict(cfg)  # preserve unknown keys
     # providers block
     providers = out.get("providers")
@@ -551,7 +589,7 @@ def load_config() -> Dict[str, Any]:
                         "backup config at %s is also unusable (%s); using defaults",
                         _CONFIG_BACKUP_PATH, e2,
                     )
-                    return dict(DEFAULT_CONFIG)
+                    return copy.deepcopy(DEFAULT_CONFIG)
             else:
                 logger.error(
                     "no backup available at %s — using defaults. The user's "
@@ -559,9 +597,9 @@ def load_config() -> Dict[str, Any]:
                     "file is left on disk for manual recovery.",
                     _CONFIG_BACKUP_PATH,
                 )
-                return dict(DEFAULT_CONFIG)
+                return copy.deepcopy(DEFAULT_CONFIG)
     else:
-        return dict(DEFAULT_CONFIG)
+        return copy.deepcopy(DEFAULT_CONFIG)
 
     # 2. Migrate schema (v1 → v2 → …). Never crashes boot — a
     # migration bug reverts to the pre-bump config and logs.
@@ -628,7 +666,7 @@ def load_config() -> Dict[str, Any]:
         logger.error(
             "config key decryption failed: %s — falling back to defaults", e,
         )
-        return dict(DEFAULT_CONFIG)
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(cfg: Dict[str, Any]) -> None:

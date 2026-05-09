@@ -2560,13 +2560,20 @@ async def _run_local_live_session(
         except Exception as e:
             if not _is_broken_pipe_error(e):
                 logger.debug("ws local tail emit failed: %s", e)
+        # 1.1.25: final envelope now reports the cumulative transcript
+        # accumulated across the session. Previously this always sent
+        # text="" / segments=[] / durationSec=0.0 — causing the frontend
+        # to mis-classify a successful local-assist session as empty
+        # and trigger an unnecessary recovery REST round-trip on every
+        # local-provider stop.
+        final_state = session.finalize_envelope()
         await _ws_send_json(
             websocket,
             {
                 "type": "final",
-                "text": "",
-                "segments": [],
-                "durationSec": 0.0,
+                "text": final_state["text"],
+                "segments": final_state["segments"],
+                "durationSec": final_state["duration_sec"],
                 "source": "local-assist",
             },
         )
@@ -2618,7 +2625,13 @@ async def _run_deepgram_live_session(
                 "segments": [],
                 "durationSec": 0.0,
                 "source": "deepgram-live",
-                "error": str(e),
+                # 1.1.25: route through ``_safe_error_text`` so this
+                # final envelope matches the redaction policy applied
+                # to the ``error`` event a few lines above. Previously
+                # this path leaked raw Deepgram error bodies (which
+                # can include the upstream URL + token prefix) into
+                # the renderer payload.
+                "error": _safe_error_text(e),
             },
         )
         recovery["had_error"] = True
@@ -3381,9 +3394,17 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
                     continue
                 raise
         if out is None:
-            raise last_err or RuntimeError("upscale failed")
+            if last_err is not None:
+                raise last_err
+            # 1.1.25: previously raised a bare RuntimeError that
+            # escaped the OpenRouterError handler below and surfaced
+            # as a generic FastAPI 500 with no actionable message.
+            raise HTTPException(status_code=502, detail="upscale failed: no candidate model succeeded")
     except OpenRouterError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        # 1.1.25: route through ``_safe_error_text`` so the 502 body
+        # never leaks raw upstream URL fragments / response bodies
+        # into the renderer.
+        raise HTTPException(status_code=502, detail=_safe_error_text(e))
     return {
         "ok": True,
         "preset_id": preset.get("id"),

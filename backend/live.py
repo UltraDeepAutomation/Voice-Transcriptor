@@ -47,6 +47,14 @@ class LiveSession:
         self._last_emitted_end = 0.0
         self._consecutive_errors = 0
         self._last_error_signature: Optional[str] = None
+        # 1.1.25: accumulator of every emitted segment so the
+        # ``finalize_envelope`` method below can return the full
+        # transcript at session end. Without this, the WS handler's
+        # "final" envelope was always empty even when the local
+        # pipeline produced N segments — frontend then mis-classified
+        # the session as "no text" and triggered an unnecessary
+        # recovery REST round-trip.
+        self._emitted_segments: list[dict] = []
 
     def _get_last_samples(self, n: int) -> np.ndarray:
         if n <= 0 or self._ring_samples <= 0:
@@ -224,4 +232,30 @@ class LiveSession:
             logger.debug("no new segments to emit")
             return None
         logger.info("emitting %d new segments", len(new_segments))
+        # 1.1.25: keep an internal cumulative copy so
+        # ``finalize_envelope`` can return the full transcript at end.
+        self._emitted_segments.extend(new_segments)
         return {"type": "segments", "segments": new_segments}
+
+    def finalize_envelope(self) -> dict:
+        """Return the canonical end-of-session payload for this LiveSession.
+
+        Joins every previously-emitted segment into a single transcript
+        and reports the duration as the latest segment's end-time. Used
+        by ``_run_local_live_session`` to fill the ``"final"`` WebSocket
+        message — the frontend treats an empty final envelope as a
+        signal to fall back to recovery.
+        """
+        segments = list(self._emitted_segments)
+        text = " ".join(
+            (s.get("text") or "").strip() for s in segments if s.get("text")
+        ).strip()
+        duration_sec = max(
+            (float(s.get("end") or 0.0) for s in segments),
+            default=0.0,
+        )
+        return {
+            "text": text,
+            "segments": segments,
+            "duration_sec": round(duration_sec, 3),
+        }
