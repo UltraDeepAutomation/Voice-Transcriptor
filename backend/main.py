@@ -3124,6 +3124,28 @@ def _run_remote_transcribe_once(
                 # corrupted input, codec mismatch) are still raised as
                 # RemoteError so the user sees an actionable message.
                 if "ffmpeg is not installed" in _err_text:
+                    # 1.1.25 fix: previous comment claimed "Deepgram
+                    # accepts most common containers" but the
+                    # ALLOWED_AUDIO_EXTS list includes containers
+                    # Deepgram REST does NOT accept without an ffmpeg
+                    # demux (.wma, .mkv, .avi, .mov, .m4v, .mpg,
+                    # .mpeg, .3gp, .opus, .ogg, .oga, .webm, .flac).
+                    # Sending those raw produced an opaque Deepgram
+                    # 400 ("invalid audio data") that the user
+                    # couldn't act on. Now: if the original extension
+                    # is in the Deepgram-native subset (wav/mp3/m4a/
+                    # mp4/aac), graceful-degrade as before; otherwise
+                    # raise a clear "install ffmpeg" RemoteError so
+                    # the user sees an actionable message instead of
+                    # a confusing upstream 400.
+                    _DEEPGRAM_NATIVE_EXTS = {"wav", "mp3", "m4a", "mp4", "aac"}
+                    if _orig_ext not in _DEEPGRAM_NATIVE_EXTS:
+                        raise RemoteError(
+                            "ffmpeg is required to upload "
+                            f".{_orig_ext or 'unknown'} files; install ffmpeg "
+                            "(brew install ffmpeg / winget install Gyan.FFmpeg) "
+                            "and retry, or upload as wav/mp3/m4a/mp4/aac."
+                        ) from e
                     logger.warning(
                         "ffmpeg missing — sending raw audio body "
                         "(%d bytes, ext=%s) without compression. Install "

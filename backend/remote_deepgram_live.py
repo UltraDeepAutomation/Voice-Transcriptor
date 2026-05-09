@@ -394,12 +394,30 @@ class DeepgramLiveSession:
             raise DeepgramLiveError(msg) from e
 
         self.stats.connect_ms = (time.perf_counter() - started) * 1000.0
-        self._recv_task = asyncio.create_task(
-            self._recv_loop(), name="deepgram-live-recv"
-        )
-        self._keepalive_task = asyncio.create_task(
-            self._keepalive_loop(), name="deepgram-live-keepalive"
-        )
+        # 1.1.25: socket-open + task-launch is wrapped so a
+        # CancelledError fired between the two doesn't leak the open
+        # WebSocket. The window is small (synchronous create_task
+        # calls) but real — under heavy event-loop pressure or
+        # cooperative cancellation from the caller, an open socket
+        # with no recv task to drain it accumulates server-side and
+        # burns the user's quota.
+        try:
+            self._recv_task = asyncio.create_task(
+                self._recv_loop(), name="deepgram-live-recv"
+            )
+            self._keepalive_task = asyncio.create_task(
+                self._keepalive_loop(), name="deepgram-live-keepalive"
+            )
+        except BaseException:
+            # Cancellation or OOM between socket-open and task-launch:
+            # close the orphan socket so the connection doesn't leak.
+            try:
+                if self._ws is not None:
+                    await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            raise
         logger.info(
             "deepgram-live: connected in %.0f ms", self.stats.connect_ms
         )
