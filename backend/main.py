@@ -1506,6 +1506,69 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
 _RECORDING_AUDIO_EXTS: tuple[str, ...] = tuple(sorted(ALLOWED_AUDIO_EXTS))
 
 
+# ── Explicit extension → Content-Type map ──────────────────────────────
+#
+# Python's stdlib ``mimetypes.guess_type`` returns *wrong* MIMEs for
+# extensions we actually use:
+#   .webm  → "video/webm"           (we use it as an audio container)
+#   .opus  → "audio/ogg"            (loses opus distinction)
+#   .m4a   → "audio/mp4a-latm"      (legacy; modern is audio/mp4)
+#   .wma   → "audio/x-ms-wma"       (Windows-Media legacy form)
+#
+# When we serve a recording over HTTP and the frontend or Deepgram REST
+# routes by Content-Type header, those wrong MIMEs cause:
+#   • Frontend Re-transcribe receiving ``video/webm`` for an Opus file
+#     and synthesizing a ``.bin`` filename.
+#   • Deepgram REST receiving ``video/webm`` and deciding it's video,
+#     either rejecting it or attempting unnecessary demux.
+# Both are silent failures — the upload "succeeds" but the transcript
+# comes back empty, exactly the user-reported "Re-transcribe failed
+# both providers" symptom.
+#
+# This map is the single source of truth for HOW we describe each
+# extension on the wire. It overrides ``mimetypes.guess_type`` for
+# every entry; falls through to guess_type only for extensions we
+# don't list (which would be unusual — they should be in
+# ``ALLOWED_AUDIO_EXTS``).
+_AUDIO_EXT_TO_MIME: dict[str, str] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/opus",
+    ".aac": "audio/aac",
+    ".webm": "audio/webm",
+    ".wma": "audio/x-ms-wma",
+    # Video containers we accept and demux server-side — frontend
+    # treats them as opaque payloads, so we stamp them as the
+    # canonical video MIME so downstream tools dispatch correctly.
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".mpg": "video/mpeg",
+    ".mpeg": "video/mpeg",
+    ".3gp": "video/3gpp",
+}
+
+
+def _audio_content_type(filename: str) -> str:
+    """Return the canonical Content-Type for an audio/video filename.
+
+    Always prefer the explicit ``_AUDIO_EXT_TO_MIME`` map over Python's
+    ``mimetypes.guess_type`` (which returns ``video/webm`` for an Opus
+    audio container, ``audio/ogg`` for ``.opus``, ``audio/mp4a-latm``
+    for ``.m4a``, etc. — all of which break wire-level routing).
+    """
+    ext = Path(filename or "").suffix.lower()
+    if ext in _AUDIO_EXT_TO_MIME:
+        return _AUDIO_EXT_TO_MIME[ext]
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
 def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optional[Path]:
     stem = Path(os.path.basename(name or "")).stem
     if not stem:
@@ -1756,7 +1819,7 @@ def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> di
             "audio_size_bytes": 0,
             "audio_mime": "",
         }
-    mime = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    mime = _audio_content_type(audio_path.name)
     try:
         size_bytes = audio_path.stat().st_size
     except Exception:
@@ -3849,7 +3912,7 @@ def get_recording_audio(
     audio_path = _recording_audio_path(p.name, target_dir=target_dir)
     if audio_path is None:
         raise HTTPException(status_code=404, detail="recording audio not found")
-    media_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    media_type = _audio_content_type(audio_path.name)
     return FileResponse(str(audio_path), media_type=media_type, filename=audio_path.name)
 
 

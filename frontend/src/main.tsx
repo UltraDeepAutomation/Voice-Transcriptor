@@ -6995,6 +6995,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       title: provisionalTitle,
       status: startupAbortReason,
       tone: "error",
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
     return;
   }
@@ -7036,6 +7037,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       title: provisionalTitle,
       status: "Silence detected. Audio remains available for review.",
       tone: "success",
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
     return;
   }
@@ -7085,6 +7087,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         ? "Audio saved. Final transcription was skipped for this session."
         : "Audio saved, but the canonical transcription input is unavailable for this session.",
       tone: skippedBySetting ? "success" : "warning",
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
     return;
   }
@@ -7129,6 +7132,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       title: provisionalTitle,
       status: "Audio saved. No transcription provider is selected.",
       tone: "warning",
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
     return;
   }
@@ -7155,6 +7159,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       title: provisionalTitle,
       status: `${msg} Audio is still saved locally.`,
       tone: "error",
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
     try {
       await saveRecordingText({
@@ -7174,6 +7179,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           title: provisionalTitle,
           status: `${msg} The original archive changed before the session metadata could be finalized.`,
           tone: "warning",
+          transcribeLatencyMs: performance.now() - transcribeStartedAt,
         }, sessionUiToken);
       }
     }
@@ -7423,65 +7429,84 @@ async function stopLive(enhance: boolean): Promise<void> {
             recordedSec > 1.0 && tailGapSec > 0.6 && !liveStreamErrorAtStop;
           console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSegEnd=${lastSegEnd.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
           if (tailLikelyMissing) {
+            // ── Parallel race: envelope + REST recovery ─────────────
+            //
+            // Previous (1.1.15-1.1.16) implementation was SEQUENTIAL:
+            //   1. await envelope (up to 4 s ceiling)
+            //   2. if envelope didn't help, await recovery (~3 s)
+            // → worst case 7+ s of post-Stop latency.
+            //
+            // The user's real-world test showed segmentCount=0 after
+            // 14 s of audio (Deepgram WS was streaming interim but
+            // never finalizing into is_final). The envelope was
+            // GUARANTEED empty in that case — we waited 3.7 s for a
+            // result we knew wouldn't come, then started recovery
+            // serially. Total: 7.6 s of dead-time after Stop.
+            //
+            // New strategy:
+            //   • Skip envelope wait entirely when segmentCount=0 —
+            //     no is_final ever arrived during streaming, the
+            //     post-CloseStream envelope WILL also be empty.
+            //   • Otherwise launch envelope + recovery IN PARALLEL,
+            //     await both via Promise.all, then pick whichever
+            //     candidate (instant / envelope / recovery) has the
+            //     most words. Cost is max(env, recovery) instead of
+            //     env + recovery.
+            //
+            // Net for the user's case: 7.6 s → ~3 s.
+            const skipEnvelope = liveTranscriptSegments.length === 0;
             patchCurrentRecordingSummary({
               title: provisionalTitle,
-              status: `Recovering tail (${Math.round(tailGapSec * 1000)}ms after last finalized segment)…`,
+              status: skipEnvelope
+                ? "Live stream had no finalized segments — recovering full transcript from saved audio…"
+                : `Recovering tail (${Math.round(tailGapSec * 1000)}ms gap)…`,
               tone: "info",
             }, sessionUiToken);
-            // Step 1 — wait for the in-flight envelope.
-            const tEnvWait = performance.now();
-            const envelope = liveFinalPromise ? await liveFinalPromise : null;
-            const envWaitMs = performance.now() - tEnvWait;
+            console.log(`[trace tail-gap] strategy=${skipEnvelope ? "RECOVERY-ONLY (segmentCount=0, envelope guaranteed empty)" : "PARALLEL (envelope + recovery)"}`);
+
+            const tRace = performance.now();
+            const envelopePromise: Promise<LiveFinalEnvelope | null> = skipEnvelope
+              ? Promise.resolve(null)
+              : (liveFinalPromise || Promise.resolve(null));
+            const recoveryPromise = recoverFromEmptyTranscript(
+              `Live tail truncated (${Math.round(tailGapSec * 1000)}ms gap${skipEnvelope ? ", Deepgram WS silent" : ""}).`,
+            );
+            const [envelope, recoveryText] = await Promise.all([envelopePromise, recoveryPromise]);
+            const raceMs = performance.now() - tRace;
+
             const envelopeText = (envelope?.text || "").trim();
             const envelopeJoined = envelope
               ? joinTranscriptSegments(envelope.segments)
               : "";
-            // Pick whichever envelope flavour is longer (text vs
-            // segment-join) — they can disagree when Deepgram
-            // returns a hybrid alternatives payload.
             const envelopeBest =
               envelopeText.length >= envelopeJoined.length
                 ? envelopeText
                 : envelopeJoined;
-            const envelopeLastSegEnd = envelope && envelope.segments.length > 0
-              ? envelope.segments[envelope.segments.length - 1].end
-              : 0;
-            console.log(`[trace tail-gap] envelope waitMs=${envWaitMs.toFixed(0)} envelope=${envelope ? "received" : "null/timeout"} envelopeError="${envelope?.error || ""}" textLen=${envelopeText.length} segCount=${envelope?.segments.length || 0} envelopeLastSegEnd=${envelopeLastSegEnd.toFixed(2)} envelopeBestLen=${envelopeBest.length} envelopeWordCount=${wordCountOf(envelopeBest)} instantWordCount=${wordCountOf(instantTranscript)} envelopeTail="${envelopeBest.slice(-60).replace(/\n/g, "\\n")}"`);
-            if (
-              envelopeBest
-              && wordCountOf(envelopeBest) > wordCountOf(instantTranscript)
-            ) {
-              transcriptRaw = envelopeBest;
-              console.log(`[trace tail-gap] decision=USE_ENVELOPE (+${wordCountOf(envelopeBest) - wordCountOf(instantTranscript)} words)`);
-            } else {
-              console.log(`[trace tail-gap] envelope did NOT extend transcript — escalating to recoverFromEmptyTranscript`);
-              // Step 2 — envelope didn't help. Escalate to a fresh
-              // pass on the on-disk audio. ``recoverFromEmptyTranscript``
-              // is named for the empty case but the helper is
-              // semantically "produce the best transcript we can
-              // from the saved audio" and is the right escalation
-              // here too. Backend re-fetch ensures we don't read a
-              // dangling OPFS blob.
-              const tRec = performance.now();
-              const recovered = await recoverFromEmptyTranscript(
-                `Live tail truncated (${Math.round(tailGapSec * 1000)}ms gap).`,
-              );
-              const recDur = performance.now() - tRec;
-              console.log(`[trace tail-gap] recovery returned len=${recovered.length} wordCount=${wordCountOf(recovered)} durMs=${recDur.toFixed(0)} tail="${recovered.slice(-60).replace(/\n/g, "\\n")}"`);
-              if (
-                recovered
-                && wordCountOf(recovered) > wordCountOf(instantTranscript)
-              ) {
-                transcriptRaw = recovered;
-                console.log(`[trace tail-gap] decision=USE_RECOVERY (+${wordCountOf(recovered) - wordCountOf(instantTranscript)} words)`);
+            console.log(`[trace tail-gap] race waitMs=${raceMs.toFixed(0)} skippedEnvelope=${skipEnvelope} env.wordCount=${wordCountOf(envelopeBest)} env.lastSegEnd=${envelope && envelope.segments.length > 0 ? envelope.segments[envelope.segments.length - 1].end.toFixed(2) : "n/a"} recovery.wordCount=${wordCountOf(recoveryText)} instant.wordCount=${wordCountOf(instantTranscript)} envTail="${envelopeBest.slice(-60).replace(/\n/g, "\\n")}" recTail="${recoveryText.slice(-60).replace(/\n/g, "\\n")}"`);
+
+            // Pick the longest of [instant, envelope, recovery].
+            // Word-count comparison is the heuristic; equal counts
+            // keep ``instant`` (preserves any custom merge dedup
+            // already applied on the streaming snapshot).
+            type Candidate = { label: "instant" | "envelope" | "recovery"; text: string; count: number };
+            const candidates: Candidate[] = [
+              { label: "instant", text: instantTranscript, count: wordCountOf(instantTranscript) },
+              { label: "envelope", text: envelopeBest, count: wordCountOf(envelopeBest) },
+              { label: "recovery", text: recoveryText, count: wordCountOf(recoveryText) },
+            ];
+            const best = candidates.reduce((a, b) => (b.count > a.count ? b : a));
+            if (best.label !== "instant" && best.text) {
+              transcriptRaw = best.text;
+              console.log(`[trace tail-gap] decision=USE_${best.label.toUpperCase()} (+${best.count - wordCountOf(instantTranscript)} words)`);
+              if (best.label === "recovery") {
                 patchCurrentRecordingSummary({
                   title: provisionalTitle,
-                  status: "Recovered tail via on-disk re-transcription.",
+                  status: "Recovered full transcript from saved audio.",
                   tone: "success",
                 }, sessionUiToken);
-              } else {
-                console.log(`[trace tail-gap] decision=KEEP_INSTANT (no recovery improved on streaming)`);
               }
+            } else {
+              console.log(`[trace tail-gap] decision=KEEP_INSTANT (race did not produce a longer transcript)`);
             }
           }
 
@@ -7546,33 +7571,25 @@ async function stopLive(enhance: boolean): Promise<void> {
           } else if (envelope && envelope.segments.length && !envelopeError) {
             transcriptRaw = joinTranscriptSegments(envelope.segments);
           } else if (envelopeError) {
-          // Nothing committed, nothing final, only an error — try
-          // Deepgram REST on the saved audio as a last resort.
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: `Live stream issue (${envelopeError}). Falling back to Deepgram REST.`,
-            tone: "warning",
-          }, sessionUiToken);
-          if (transcribeInputFile && isProviderKeyConfigured("deepgram")) {
-            try {
-              const fallback = await remoteJobSync(transcribeInputFile, {
-                provider: "deepgram",
-                language: languageValue,
-                diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-                openrouterModel: getRemoteModelValue("deepgram"),
-              });
-              transcriptRaw = String(fallback.text || "").trim();
-            } catch (e) {
-              console.warn("Deepgram REST fallback failed; using local full-audio pass", e);
-              try {
-                const fallbackOut = await runLocalFinalPass();
-                transcriptRaw = String(fallbackOut.text || "").trim();
-              } catch (localError) {
-                console.error("Local fallback also failed", localError);
-              }
-            }
+            // Migrated to ``recoverFromEmptyTranscript`` in 1.1.17:
+            // the previous bespoke chain at this branch read
+            // ``transcribeInputFile`` directly, which is the OPFS-
+            // dangling lazy ``Blob([header, spool])`` after
+            // ``deferredSinkDestroy.destroy()`` runs upstream.
+            // ``recoverFromEmptyTranscript`` resolves audio through
+            // ``fetchRecoveryAudioFile`` (durable backend re-fetch
+            // first, in-memory only as last resort) and runs the
+            // exact same Deepgram-REST → local-Whisper chain — same
+            // behaviour, no dangling-blob class of bug.
+            patchCurrentRecordingSummary({
+              title: provisionalTitle,
+              status: `Live stream issue (${envelopeError}). Recovering from saved audio…`,
+              tone: "warning",
+            }, sessionUiToken);
+            transcriptRaw = await recoverFromEmptyTranscript(
+              `Live stream errored (${envelopeError}).`,
+            );
           }
-        }
         } // close ``else`` (no instantTranscript — envelope fallback)
       }
 

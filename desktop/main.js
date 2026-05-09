@@ -6246,28 +6246,43 @@ async function createWindow(options = {}) {
   win.webContents.on("did-finish-load", async () => {
     loadedFrontendBuildSignature = (await getFrontendBuildSignature()) || "";
     appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
-    // Clear paste-dedup Sets on every renderer (re)load.
+    // Clear paste-dedup Sets on every renderer (re)load — but ONLY
+    // when no in-flight recording or queued post-stop work exists.
     //
     // ``liveRecordingSeq`` (the renderer-side monotonic counter that
     // produces ``recordingId`` values) resets to 0 in every new
     // renderer instance — initial window load AND after a user-
-    // initiated ``location.reload()`` (e.g. via the backend-recovery
-    // reload at ``recoverFromBackendBoot`` or via DevTools). Without
-    // this clear, the new renderer reuses ids 1, 2, 3... that the
-    // previous renderer already recorded in the dedup Sets, and
-    // ``handleRecordingPostStop`` falsely identifies the next
-    // recording's stop signal as a duplicate — silently dropping the
-    // paste task. The user records, stops, and nothing pastes.
+    // initiated ``location.reload()`` (recoverFromBackendBoot,
+    // DevTools refresh, F5). Without a clear at that boundary, ids
+    // 1, 2, 3 from the new renderer collide with stale Set entries
+    // from the previous renderer — ``handleRecordingPostStop`` then
+    // falsely flags the next recording as a duplicate and silently
+    // drops the paste task.
     //
-    // The same clear was previously applied only in the
-    // ``render-process-gone`` handler (renderer crash path); a
-    // user-initiated reload (no crash) was missed. The class of bug
-    // is identical, so unifying the clear under ``did-finish-load``
-    // covers BOTH paths with a single source of truth.
+    // BUT: a careless unconditional clear is itself a regression
+    // surface. ``did-finish-load`` also fires when DevTools refreshes
+    // mid-recording (Cmd-R / F5 while a recording is active). At that
+    // moment ``pendingTranscriptionCount > 0`` (the in-flight stop is
+    // queued) and ``postStopQueue`` is non-empty — clearing the Sets
+    // there drops the active recording's id, then the post-stop
+    // signal arrives and bypasses dedup, allowing the SAME content
+    // to be pasted twice (once by the queued task, once by the
+    // post-reload retry). That is the exact paste-duplication
+    // regression the 1b05c52 / 1.1.10 hardening fixed.
     //
-    // On the very first load the Sets are empty and the clear is a
-    // no-op — safe to run unconditionally.
-    if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
+    // Idle-gate: clear only when both signals say "no work in
+    // flight". On a normal cold load both are zero / empty — clear
+    // runs as before. On a mid-recording reload the clear is
+    // skipped, the in-flight id stays in the Set, and the queued
+    // task's eventual paste is correctly deduped.
+    const idle = pendingTranscriptionCount === 0 && postStopQueue.length === 0;
+    if (!idle) {
+      appendMainLog(
+        `[did-finish-load] dedup clear SKIPPED ` +
+        `(pending=${pendingTranscriptionCount} queue=${postStopQueue.length}) — ` +
+        `mid-recording reload protected from paste-dup regression`,
+      );
+    } else if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
       appendMainLog(
         `[did-finish-load] clearing dedup sets ` +
         `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
