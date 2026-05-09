@@ -40,7 +40,11 @@ class DeepgramRemoteError(RemoteError):
 # without touching the base class in http_retry.
 RemoteError = DeepgramRemoteError  # type: ignore[misc]
 
-DEEPGRAM_API_BASE = "https://api.deepgram.com/v1"
+# 1.1.25 SSOT: imported from ``backend.deepgram_endpoints`` so REST
+# and live modules share one source of truth for the Deepgram host.
+# Re-exported as ``DEEPGRAM_API_BASE`` for backward compat with any
+# external caller that imports the old name.
+from backend.deepgram_endpoints import DEEPGRAM_REST_BASE as DEEPGRAM_API_BASE  # noqa: E402,F401
 
 
 def deepgram_transcribe(

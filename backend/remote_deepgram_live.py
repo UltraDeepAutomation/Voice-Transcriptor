@@ -58,7 +58,10 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 logger = logging.getLogger(__name__)
 
 
-DEEPGRAM_LIVE_URL = "wss://api.deepgram.com/v1/listen"
+# 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
+# centralised host as the REST module so a regional override sets
+# both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
+from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL  # noqa: E402,F401
 
 
 @dataclass
