@@ -2202,6 +2202,14 @@ function ensureOverlayWindow() {
     // yet overlayLoaded=true short-circuited every loadURL path —
     // permanent blank capsule until the entire process restarts.
     overlayLoaded = false;
+    // 1.1.25: same lifecycle hazard for the quick-settings init
+    // flags. Without reset, a destroyed + recreated overlay window
+    // skipped the one-time renderer-state sync and showed stale
+    // checkbox states until the user manually toggled something.
+    // Initialization flags must track the lifecycle of what they
+    // initialize.
+    overlayQuickSettingsInitialized = false;
+    overlayQuickAutoSendInitialized = false;
     // Stop the Win/Linux mouse-tracking polling so it doesn't tick
     // against a destroyed overlayWin reference. The next ensureOverlay
     // Window call re-arms it for the recreated window.
@@ -2676,11 +2684,21 @@ async function showPostStopYellowThenTranscribing(delayMs = 500) {
 async function playOverlayCue(kind = "start") {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
   const cue = kind === "stop" ? "stop" : "start";
+  // 1.1.25: hard 500 ms cap on the executeJavaScript call. Audio
+  // cue is best-effort; never block hotkey responsiveness on it.
+  // Without the cap, a stuck overlay webContents (rare but real:
+  // data: URL never resolved, GPU-process restart in flight) would
+  // freeze ``toggleRecordingFromShortcut`` / ``stopRecordingFromOverlay``
+  // / ``showRecordingOverlay`` — all three call playOverlayCue
+  // synchronously under their respective inflight guards.
   try {
-    await overlayWin.webContents.executeJavaScript(
-      `window.playCue && window.playCue(${JSON.stringify(cue)});`,
-      true
-    );
+    await Promise.race([
+      overlayWin.webContents.executeJavaScript(
+        `window.playCue && window.playCue(${JSON.stringify(cue)});`,
+        true,
+      ),
+      new Promise((res) => setTimeout(res, 500)),
+    ]);
     appendMainLog(`[overlay-cue] kind=${cue}`);
   } catch (e) {
     appendMainLog(`[overlay-cue-error] kind=${cue} err=${compactLogText(e?.message || e)}`);
@@ -6099,9 +6117,17 @@ async function createWindow(options = {}) {
         appendMainLog(`[reveal-recording] bad payload: ${e?.message || e}`);
         return;
       }
-      const safeName = String(payload?.name || "").replace(/[\\/]+/g, "");
+      // 1.1.25: path-traversal defense. Previous form stripped only
+      // path separators, leaving ``..`` intact. Combined with
+      // shell.showItemInFolder, a renderer compromise could enumerate
+      // the user's home parent (e.g. /Users) by repeatedly revealing
+      // dotted names. Reject any name containing ``..`` OR a path
+      // separator outright — recording filenames produced by the
+      // backend never need either character.
+      const rawName = String(payload?.name || "");
+      if (!rawName || rawName.includes("..") || /[\\/]/.test(rawName)) return;
+      const safeName = rawName;
       const archiveDirRaw = String(payload?.archiveDir || "").trim();
-      if (!safeName) return;
       // Resolve the audio path under the SAME archive dir we wrote to.
       // archiveDir comes back from saveRecordingText which already
       // sanitises it via _resolve_recordings_target_dir on the backend
