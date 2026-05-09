@@ -75,6 +75,7 @@ function _relocateUserDataOffOneDrive() {
       // `cpSync` landed in Node 16.7 / Electron 30 ships Node 20.x.
       // Copy only the user-facing subset — skip bundled-runtime caches,
       // .venv, anything else that is safe to regenerate.
+      let allCopied = true;
       const copyChild = (name) => {
         const src = path.join(oldDir, name);
         const dst = path.join(newDir, name);
@@ -82,7 +83,16 @@ function _relocateUserDataOffOneDrive() {
           if (fs.existsSync(src) && !fs.existsSync(dst)) {
             fs.cpSync(src, dst, { recursive: true, errorOnExist: false });
           }
-        } catch { /* per-child copy failure is non-fatal; user may need to re-enter API keys */ }
+        } catch (e) {
+          // 1.1.25 fix: previously silently swallowed per-child errors
+          // AND wrote the migration marker unconditionally. If a single
+          // child copy failed (disk full, AV blocking, antivirus quarantine
+          // mid-rename), the marker pinned the migration as "done" forever
+          // and the user's recordings stayed stranded in the OneDrive path
+          // — silent data loss. Now we track success and write the marker
+          // only when EVERY child landed.
+          allCopied = false;
+        }
       };
       for (const child of [
         "config.json",
@@ -92,7 +102,12 @@ function _relocateUserDataOffOneDrive() {
         "upscale_presets",
         "recordings",
       ]) copyChild(child);
-      try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
+      if (allCopied) {
+        try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
+      }
+      // If !allCopied, intentionally do NOT write the marker — next boot
+      // will retry the failed child(ren). The user only sees a "did all
+      // copies succeed" delta on retry, never silent loss.
     }
   } catch { /* migration best-effort */ }
   // Override BOTH Electron's userData AND the backend's DATA_DIR so
@@ -1810,7 +1825,7 @@ function createOverlayHtml() {
         attachHoldRepeat(quickAutoStopPlus, +1);
         window.setTimer = (t) => {
           const str = String(t || '').trim();
-          if (/^\\d{2}:\\d{2}$/.test(str)) {
+          if (/^\\d{2,3}:\\d{2}$/.test(str)) {
             el.textContent = str;
           }
         };
@@ -2547,7 +2562,11 @@ async function ensureOverlayVisible(options = {}) {
 async function setOverlayTimer(text) {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
   const value = String(text || "").trim();
-  if (!/^\d{2}:\d{2}$/.test(value)) return;
+  // 1.1.25: accept 2-OR-3-digit minutes so recordings >99:59 don't
+  // freeze the overlay timer. Same regex pattern used inside
+  // ``createOverlayHtml``'s ``window.setTimer`` (see line ~1828)
+  // is updated symmetrically.
+  if (!/^\d{2,3}:\d{2}$/.test(value)) return;
   await safeExec("setOverlayTimer", () =>
     overlayWin.webContents.executeJavaScript(`window.setTimer && window.setTimer(${JSON.stringify(value)});`, true)
   );
@@ -2599,6 +2618,19 @@ function hideRecordingOverlay() {
   if (overlayWaveMonitor) {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
+  }
+  // 1.1.25 fix: hideRecordingOverlay was missing the
+  // overlayMouseTrackTimer clear, so the 50 ms cursor-poll syscall
+  // kept firing 20 Hz forever after the overlay was dismissed —
+  // wasted CPU + battery drain for the entire app session. The timer
+  // is re-armed by ensureOverlayWindow on the next show, so behaviour
+  // on the visible-overlay path is unchanged.
+  if (typeof overlayMouseTrackTimer !== "undefined" && overlayMouseTrackTimer) {
+    clearInterval(overlayMouseTrackTimer);
+    overlayMouseTrackTimer = null;
+    if (typeof overlayMouseInPill !== "undefined") {
+      overlayMouseInPill = false;
+    }
   }
   // Safety net: when the overlay is fully dismissed and no worker is
   // actively draining the post-stop queue, both the counter and the
@@ -2727,7 +2759,16 @@ async function toggleRecordingFromShortcut() {
       return;
     }
 
-    const result = await win.webContents.executeJavaScript(
+    // 1.1.25 fix: previously called ``executeJavaScript`` directly with
+    // no timeout, while this function holds ``shortcutToggleInFlight =
+    // true``. A stuck renderer (long synchronous work, blocked event
+    // loop, frozen DOM) made the hotkey a permanent no-op until process
+    // restart — the exact failure mode the dedicated
+    // ``execRendererJsWithTimeout`` helper exists to prevent. 2 s
+    // budget mirrors the helper's default; if the renderer can't
+    // respond in 2 s the recording probably wasn't going to work
+    // anyway, and the hotkey resets cleanly via the inflight finally.
+    const result = await execRendererJsWithTimeout(
       `
       (() => {
         const isRec = !!(window.__transcriptorIsRecording);
@@ -2739,8 +2780,18 @@ async function toggleRecordingFromShortcut() {
         return { ok: true, recording: !isRec, auto, autoSendEnter, timerText, recordingId };
       })();
       `,
-      true
+      null,
+      2000,
     );
+    if (result === null) {
+      // Renderer didn't respond inside the budget — log, release the
+      // inflight guard via the outer finally, and let the user retry.
+      appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
+      shortcutToggleInFlight = false;
+      scheduleOverlayHide(1300);
+      traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
+      return;
+    }
 
     if (!result?.ok) {
       traceStep(trace, "renderer_toggle_failed", { result: result || null });
@@ -5861,10 +5912,23 @@ async function startBackend() {
       const delay = Math.min(800 * attempt, 5000);
       appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
       backendRestartTimer = setTimeout(() => {
-        backendRestartTimer = null;
+        // 1.1.25 fix: previously nulled ``backendRestartTimer`` BEFORE
+        // calling startBackend(). A concurrent caller (window-create,
+        // tray click) entering startBackend between the null and the
+        // inflight assignment passed the ``if (backendRestartTimer)
+        // clearTimeout(...)`` guard on a now-null timer, then proceeded
+        // independently — both spawned ``python -m uvicorn`` and the
+        // loser hit "Address already in use", triggering yet another
+        // restart cycle and leaking PIDs.
+        //
+        // New ordering: keep backendRestartTimer set until startBackend
+        // takes the inflight lock; null it from .finally so a concurrent
+        // clearTimeout above is a no-op only AFTER the inflight promise
+        // is in place.
         startBackend()
           .then(() => appendMainLog("[backend-restart] attempted"))
-          .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`));
+          .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`))
+          .finally(() => { backendRestartTimer = null; });
       }, delay);
     } else if (Number(code || 0) === 0) {
       backendRestartAttempts = 0;
@@ -7121,10 +7185,20 @@ app.whenReady().then(async () => {
   }, 2000);
   try { shortcutPollTimer.unref?.(); } catch { }
 
-  await requestMacPastePermissionsOnce();
+  // 1.1.25 fix: previously awaited the permission prompts before
+  // starting the backend. The permission dialog is modal and can
+  // sit there for minutes if the user is AFK — backend never
+  // booted, renderer's preload waited, user thought the app was
+  // broken. Kick the prompt off in PARALLEL with backend boot
+  // (they are orthogonal — perms gate paste at runtime, not boot).
+  const macPermPromise = requestMacPastePermissionsOnce();
   await startBackend();
   await ensureWindowVisible();
   await requestMacMicrophonePermissionOnce();
+  // Drain the permission prompt promise — by now boot is complete,
+  // the user has the window in front of them, and any modal dialog
+  // is contextual rather than blocking the launch.
+  try { await macPermPromise; } catch { /* best-effort permission */ }
 
   // Preload overlay once to avoid first-use delay after hotkey.
   try {
