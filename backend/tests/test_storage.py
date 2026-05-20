@@ -15,7 +15,7 @@ routes through this module. Correctness is shipping-critical:
 
 These tests exercise every invariant in isolation. Run with:
 
-    python -m pytest backend/tests/test_storage.py -v
+    python -m unittest backend.tests.test_storage -v
 
 No backend.main import — storage.py stands alone, so we avoid the
 parent-death watchdog that otherwise kills subprocess test runners.

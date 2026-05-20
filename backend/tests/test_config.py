@@ -16,7 +16,8 @@ backend.config resolves DATA_DIR / CONFIG_PATH at module import time
 from the env var, we re-import fresh in each test via ``importlib``
 to get clean state.
 
-Run with:   python -m pytest backend/tests/test_config.py -v
+Run with:
+    python -m unittest backend.tests.test_config -v
 """
 
 import importlib

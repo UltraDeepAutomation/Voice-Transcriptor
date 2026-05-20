@@ -156,6 +156,20 @@ interface LocalTranscriptionResult {
   durationSec: number;
 }
 
+interface RemoteTranscriptionResult {
+  text: string;
+  provider: string;
+  model?: string;
+}
+
+interface BackendJobState<T> {
+  job_id: string;
+  status: "queued" | "running" | "done" | "error";
+  progress: number;
+  error?: string | null;
+  result?: T | null;
+}
+
 interface LiveSessionSnapshot {
   provider: Provider;
   effectiveProvider: Provider;
@@ -2146,7 +2160,7 @@ function syncRemoteModelOptions(): void {
 
 async function remoteJob(
   file: File,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string }
+  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
 ): Promise<{ job_id: string }> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
@@ -2156,9 +2170,86 @@ async function remoteJob(
   if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
   }
-  const r = await fetch("/api/remote/jobs", { method: "POST", body: fd, headers: authHeaders() });
+  const r = await fetch("/api/remote/jobs", {
+    method: "POST",
+    body: fd,
+    headers: authHeaders(),
+    signal: opts.signal,
+  });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as { job_id: string };
+}
+
+async function waitForBackendJob<T>(
+  jobId: string,
+  opts: {
+    signal?: AbortSignal;
+    onProgress?: (job: BackendJobState<T>) => void;
+  } = {},
+): Promise<T> {
+  const startedAt = performance.now();
+  while (true) {
+    if (opts.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      headers: authHeaders(),
+      signal: opts.signal,
+    });
+    if (!r.ok) throw new Error(await parseError(r));
+    const job = (await r.json()) as BackendJobState<T>;
+    opts.onProgress?.(job);
+    if (job.status === "done") {
+      if (!job.result) throw new Error("Job finished without a result.");
+      return job.result;
+    }
+    if (job.status === "error") {
+      throw new Error(String(job.error || "Transcription failed."));
+    }
+    const pollMs = performance.now() - startedAt > 30_000 ? 3_000 : 900;
+    await new Promise<void>((resolve, reject) => {
+      const signal = opts.signal;
+      let timer = 0;
+      const cleanup = () => {
+        window.clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(new DOMException("Aborted", "AbortError"));
+      };
+      timer = window.setTimeout(() => {
+        cleanup();
+        resolve();
+      }, pollMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+}
+
+async function remoteJobQueued(
+  file: File,
+  opts: {
+    provider: Provider;
+    language: string;
+    diarize: boolean;
+    openrouterModel?: string;
+    signal?: AbortSignal;
+    onProcessingProgress?: (fraction: number) => void;
+  },
+): Promise<RemoteTranscriptionResult> {
+  const created = await remoteJob(file, opts);
+  const result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, {
+    signal: opts.signal,
+    onProgress: (job) => {
+      opts.onProcessingProgress?.(Math.max(0, Math.min(1, Number(job.progress || 0))));
+    },
+  });
+  return {
+    text: String(result?.text || "").trim(),
+    provider: String(result?.provider || opts.provider || ""),
+    model: String(result?.model || "").trim() || undefined,
+  };
 }
 
 async function remoteJobSync(
@@ -2169,16 +2260,6 @@ async function remoteJobSync(
     diarize: boolean;
     openrouterModel?: string;
     signal?: AbortSignal;
-    /**
-     * Optional upload-progress callback. Receives a 0..1 fraction
-     * during the request-body upload phase. Browsers' ``fetch``
-     * doesn't expose a request-body progress event, so when this
-     * callback is provided we route through XMLHttpRequest instead
-     * (which surfaces ``upload.onprogress``). Without a callback,
-     * we still use ``fetch`` for the lower memory footprint on
-     * the response side.
-     */
-    onUploadProgress?: (fraction: number) => void;
   }
 ): Promise<{ text: string; provider: string; model?: string }> {
   const fd = new FormData();
@@ -2188,93 +2269,6 @@ async function remoteJobSync(
   fd.set("diarize", String(!!opts.diarize));
   if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
-  }
-  // XHR branch — used when caller wants an upload-progress %. Browsers'
-  // ``fetch`` does not surface request-body progress events (the spec
-  // is still a draft); XHR's ``upload.onprogress`` is the only
-  // cross-browser path. We mirror fetch's contract: AbortSignal
-  // support + the same response shape + the same parseError-style
-  // error messages.
-  if (opts.onUploadProgress) {
-    return await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/remote/transcribe-sync", true);
-      const authHdrs = authHeaders();
-      for (const [k, v] of Object.entries(authHdrs)) {
-        xhr.setRequestHeader(k, String(v));
-      }
-      xhr.responseType = "text";
-      // Hard upload-and-response ceiling. Without this, a TCP black hole
-      // (ISP route flap, VPN drop, sleeping wifi NIC) leaves the XHR in
-      // limbo forever — ``onerror``/``ontimeout`` only fire when the
-      // browser sees an explicit failure event. The user sees a spinner
-      // that never resolves and the only way out is the optional Stop
-      // button. 5 minutes is generous for a single Upload-tab item; the
-      // backend's own /api/transcribe-sync runs at most a few minutes
-      // per file at typical model speeds.
-      xhr.timeout = 5 * 60_000;
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable && e.total > 0) {
-          const f = Math.max(0, Math.min(1, e.loaded / e.total));
-          opts.onUploadProgress!(f);
-        }
-      };
-      xhr.upload.onload = () => opts.onUploadProgress!(1);
-      xhr.onerror = () => reject(new Error("network error"));
-      xhr.ontimeout = () => reject(new Error("request timed out"));
-      xhr.onload = () => {
-        if (xhr.status >= 400) {
-          let msg = `HTTP ${xhr.status}`;
-          try {
-            const parsed = JSON.parse(xhr.responseText || "{}") as { detail?: string };
-            if (parsed.detail) msg = String(parsed.detail);
-          } catch { /* fall through */ }
-          reject(new Error(msg));
-          return;
-        }
-        try {
-          const js = JSON.parse(xhr.responseText || "{}") as { result?: { text?: string; provider?: string; model?: string } };
-          resolve({
-            text: String(js?.result?.text || "").trim(),
-            provider: String(js?.result?.provider || opts.provider || ""),
-            model: String(js?.result?.model || "").trim() || undefined,
-          });
-        } catch (e) {
-          reject(e instanceof Error ? e : new Error(String(e)));
-        }
-      };
-      // AbortSignal → xhr.abort. Mirror DOMException name="AbortError"
-      // so callers' ``e instanceof DOMException && e.name === "AbortError"``
-      // checks work the same way for both fetch and XHR paths.
-      if (opts.signal) {
-        if (opts.signal.aborted) {
-          xhr.abort();
-          reject(new DOMException("Aborted", "AbortError"));
-          return;
-        }
-        // ``{ once: true }`` so a controller that fires abort more
-        // than once (e.g. user clicks Stop while another teardown is
-        // already in flight) doesn't call reject twice — the second
-        // call is a Promise no-op but still allocates the DOMException
-        // and walks the listener queue.
-        opts.signal.addEventListener("abort", () => {
-          // ``xhr.abort()`` is idempotent but can throw on some
-          // platforms when the request was never started; swallow
-          // so the AbortError reject still happens.
-          try { xhr.abort(); } catch { /* idempotent */ }
-          reject(new DOMException("Aborted", "AbortError"));
-        }, { once: true });
-      }
-      // 1.1.25: ``xhr.send`` itself can throw synchronously (e.g.,
-      // CSP-blocked URL, disconnected page lifecycle, malformed
-      // body). Without this catch, the surrounding ``new Promise(...)``
-      // executor exception is uncaught — Node-style unhandled rejection.
-      try {
-        xhr.send(fd);
-      } catch (e) {
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-    });
   }
   const r = await fetch("/api/remote/transcribe-sync", {
     method: "POST",
@@ -9255,7 +9249,7 @@ if (_bootRetry) {
 // ══════════════════════════════════════════════════════════════════════
 //
 // SSOT for the upload pipeline. Reuses the existing transcription
-// primitives (`localJobSync`, `remoteJobSync`, `saveRecordingText`)
+// primitives (`localJobSync`, `remoteJobQueued`, `saveRecordingText`)
 // instead of forking a parallel implementation, so any backend-side
 // behaviour change (provider, language, retention) flows through to
 // the upload tab automatically.
@@ -9584,26 +9578,20 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       text = String(out.text || "").trim();
     } else {
       modelLabel = getRemoteModelValue(provider) || "";
-      const out = await remoteJobSync(item.file, {
+      const out = await remoteJobQueued(item.file, {
         provider,
         language,
         diarize,
         openrouterModel: modelLabel,
         signal: item.abortController.signal,
-        // Real upload-byte progress via XHR. The crossover-timer
-        // above is still wired up as a safety net (in case the
-        // browser's XHR doesn't fire ``upload.onload`` for some
-        // reason), but the user now sees a real %% during the
-        // body upload phase.
-        onUploadProgress: (f) => {
+        // Upload-tab remote jobs must not hold one browser XHR open
+        // for upload + ffmpeg + provider processing. Large videos can
+        // legitimately run past the old 5-minute XHR ceiling; the
+        // backend job owns the long work and this renderer only polls.
+        onProcessingProgress: () => {
           if (item.status !== "transcribing") return;
-          item.uploadProgress = f;
-          if (f >= 0.999) {
-            // Body fully sent → switch to processing without waiting
-            // for the size-proportional crossover timer.
-            item.stage = "processing";
-            item.uploadProgress = undefined;
-          }
+          item.stage = "processing";
+          item.uploadProgress = undefined;
           renderUploadQueue();
         },
       });

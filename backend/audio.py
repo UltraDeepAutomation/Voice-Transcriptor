@@ -122,6 +122,40 @@ def _run_ffmpeg(cmd: list[str], timeout_sec: int) -> None:
         raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
 
 
+def _compact_audio_for_remote_cmd(path_in: str, path_out: str) -> list[str]:
+    return [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-i", path_in,
+        # Remote uploads may be full video files. Select exactly one audio
+        # stream and disable every non-audio stream so ffmpeg never spends
+        # minutes transcoding video into the WebM output.
+        "-map", "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-map_metadata", "-1",
+        # Resample to LIVE_SAMPLE_RATE_HZ mono — Whisper / Deepgram both
+        # target this rate; anything higher is wasted bandwidth.
+        "-ar", str(LIVE_SAMPLE_RATE_HZ),
+        "-ac", "1",
+        # Opus encoder. ``-b:a 24k`` is the sweet spot for speech: still
+        # intelligible at 24 kbit/s, indistinguishable from 64 kbit/s
+        # WAV PCM at the Whisper / Deepgram model's input granularity.
+        "-c:a", "libopus",
+        "-b:a", "24k",
+        # ``-application voip`` tunes the Opus encoder for speech
+        # rather than music — better intelligibility at low bitrates.
+        "-application", "voip",
+        # Force WebM container output regardless of ``path_out`` ext.
+        "-f", "webm",
+        path_out,
+    ]
+
+
 def compact_audio_for_remote(path_in: str, path_out: str) -> str:
     """Compress arbitrary audio/video to a Deepgram-friendly compact form.
 
@@ -157,28 +191,7 @@ def compact_audio_for_remote(path_in: str, path_out: str) -> str:
             "or `winget install Gyan.FFmpeg`) — required for remote-provider "
             "audio compression."
         )
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", path_in,
-        # Resample to LIVE_SAMPLE_RATE_HZ mono — Whisper / Deepgram both
-        # target this rate; anything higher is wasted bandwidth.
-        "-ar", str(LIVE_SAMPLE_RATE_HZ),
-        "-ac", "1",
-        # Opus encoder. ``-b:a 24k`` is the sweet spot for speech: still
-        # intelligible at 24 kbit/s, indistinguishable from 64 kbit/s
-        # WAV PCM at the Whisper / Deepgram model's input granularity.
-        "-c:a", "libopus",
-        "-b:a", "24k",
-        # ``-application voip`` tunes the Opus encoder for speech
-        # rather than music — better intelligibility at low bitrates.
-        "-application", "voip",
-        # Force WebM container output regardless of ``path_out`` ext.
-        "-f", "webm",
-        path_out,
-    ]
+    cmd = _compact_audio_for_remote_cmd(path_in, path_out)
     # 1.1.25: clean up partial output on ffmpeg failure. ffmpeg's
     # ``-y`` flag truncates the output up front, so a non-zero exit
     # leaves a 0-byte (or partially-written) file at ``path_out``.
