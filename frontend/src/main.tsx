@@ -9282,9 +9282,9 @@ interface UploadQueueItem {
   status: "queued" | "transcribing" | "done" | "error" | "cancelled";
   stage?: "queued" | "uploading" | "processing" | "done";
   /**
-   * 0..1 fraction of the upload-body byte progress, populated only
-   * during the ``uploading`` stage. ``undefined`` once the request
-   * body has been fully sent and the backend is processing.
+   * 0..1 fraction of known upload progress. Browser fetch does not
+   * expose request-body progress, so this remains undefined for the
+   * job-based Upload flow and the UI uses stage labels instead.
    */
   uploadProgress?: number;
   text?: string;
@@ -9306,22 +9306,13 @@ let uploadSelectedId: string | null = null;
 
 const uploadQueue: UploadQueueItem[] = [];
 let uploadProcessorRunning = false;
-// Per-file ceiling for the Upload tab. Derived from MAX_FILE_BYTES
-// (which mirrors the backend's MAX_UPLOAD_BYTES via /api/health) plus
-// a 2× headroom for video containers (MP4 / MKV) — the backend's
-// ffmpeg path demuxes audio out, so the audio bytes typically fit
-// well under MAX_FILE_BYTES even when the source video file is
-// multiple times larger. Caught client-side so the user sees the
-// rejection instantly rather than after a multi-GB upload to a 413.
-//
-// SSOT note: the constant below is the multiplier — never the byte
-// number itself. The byte number lives in MAX_FILE_BYTES which is
-// re-read from /api/health on every refreshNetworkState tick. A
-// function (not a const) is used so the cap follows the latest cap
-// after a backend cap bump, without requiring a renderer reload.
-const UPLOAD_VIDEO_HEADROOM_MULT = 2;
+// Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
+// which mirrors backend MAX_UPLOAD_BYTES via /api/health. Even though
+// the backend later demuxes audio out of video containers, it still has
+// to receive and spool the original request body first; accepting a
+// larger client-side cap would only defer failure to a backend 413.
 function uploadFileSizeCap(): number {
-  return MAX_FILE_BYTES * UPLOAD_VIDEO_HEADROOM_MULT;
+  return MAX_FILE_BYTES;
 }
 // Accept-set mirrors the backend's allowed extensions plus video
 // containers (the backend's ffmpeg path demuxes audio out of any of
@@ -9674,11 +9665,10 @@ function uploadStatusLabel(item: UploadQueueItem): string {
       return "Queued";
     case "transcribing":
       // Three labelled phases inside the outer "transcribing" status:
-      //   uploading  → real % from XHR.upload.onprogress (user asked
-      //                "на какой процент он транскрибирован"; this is
-      //                the only phase where a true % exists — once
-      //                bytes are at the backend, no SSE stream surfaces
-      //                ffmpeg / Deepgram progress).
+      //   uploading  → request body is being handed to the backend.
+      //                fetch does not expose browser upload progress,
+      //                so this is a stage label unless a future transport
+      //                supplies a determinate fraction.
       //   processing → backend is decoding video / running provider
       //                ("Processing…" — better than a stuck percentage).
       //   none       → fallback when neither stage was set (transient
@@ -9842,9 +9832,9 @@ function renderUploadQueue(): void {
     li.appendChild(header);
 
     if (item.status === "transcribing") {
-      // Determinate bar during ``uploading`` (real % from XHR);
-      // indeterminate animated bar during ``processing`` (no
-      // backend progress stream, so a determinate bar would lie).
+      // Determinate bar only when a transport supplied a real fraction;
+      // otherwise use the indeterminate animation for both upload and
+      // processing so the UI does not invent progress.
       const progress = document.createElement("div");
       progress.className = "upload-queue-item-progress";
       const bar = document.createElement("div");
