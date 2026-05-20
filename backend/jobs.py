@@ -8,12 +8,17 @@ from typing import Any, Dict, Optional
 @dataclass
 class Job:
     id: str
-    status: str = "queued"  # queued | running | done | error
+    status: str = "queued"  # queued | running | done | error | cancelled
     progress: float = 0.0
     error: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     result_files: Dict[str, str] = field(default_factory=dict)  # kind -> path
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+
+class JobCancelledError(RuntimeError):
+    """Raised by worker checkpoints when a user cancelled the job."""
 
 
 class JobStore:
@@ -34,7 +39,7 @@ class JobStore:
         # if the pool is exhausted the store silently stays over the soft cap
         # rather than destroying in-flight work.
         evictable = sorted(
-            [j for j in self._jobs.values() if j.status in ("done", "error")],
+            [j for j in self._jobs.values() if j.status in ("done", "error", "cancelled")],
             key=lambda j: j.created_at,
         )
         drop = len(self._jobs) - self._max_jobs
@@ -68,6 +73,8 @@ class JobStore:
             job = self._jobs.get(job_id)
             if job is None:
                 return
+            if job.status != "queued":
+                return
             job.status = "running"
             job.progress = 0.01
 
@@ -75,6 +82,8 @@ class JobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                return
+            if job.status not in ("queued", "running"):
                 return
             job.progress = max(0.0, min(1.0, float(progress)))
 
@@ -84,6 +93,8 @@ class JobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                return
+            if job.status in ("cancelled", "done", "error"):
                 return
             job.status = "done"
             job.progress = 1.0
@@ -95,8 +106,36 @@ class JobStore:
             job = self._jobs.get(job_id)
             if job is None:
                 return
+            if job.status in ("cancelled", "done", "error"):
+                return
             job.status = "error"
             job.error = error
+
+    def cancel(self, job_id: str) -> Optional[Job]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            if job.status in ("done", "error", "cancelled"):
+                return job
+            job.status = "cancelled"
+            job.error = None
+            job.cancel_event.set()
+            return job
+
+    def is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return bool(job and job.status == "cancelled")
+
+    def cancel_event(self, job_id: str) -> Optional[threading.Event]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job.cancel_event if job else None
+
+    def raise_if_cancelled(self, job_id: str) -> None:
+        if self.is_cancelled(job_id):
+            raise JobCancelledError("job cancelled")
 
     def shutdown(self, timeout: float = 20.0) -> None:
         """Gracefully stop the worker pool.

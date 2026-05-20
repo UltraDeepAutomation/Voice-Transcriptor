@@ -164,7 +164,7 @@ interface RemoteTranscriptionResult {
 
 interface BackendJobState<T> {
   job_id: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   progress: number;
   error?: string | null;
   result?: T | null;
@@ -2180,6 +2180,37 @@ async function remoteJob(
   return (await r.json()) as { job_id: string };
 }
 
+async function localJob(
+  file: File,
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+): Promise<{ job_id: string }> {
+  const fd = new FormData();
+  fd.append("file", file, file.name || "audio.wav");
+  fd.set("language", opts.language || "auto");
+  fd.set("model", opts.model || "small");
+  fd.set("split_stereo", String(!!opts.splitStereo));
+  fd.set("word_timestamps", String(!!opts.wordTimestamps));
+  const r = await fetch("/api/jobs", {
+    method: "POST",
+    body: fd,
+    headers: authHeaders(),
+    signal: opts.signal,
+  });
+  if (!r.ok) throw new Error(await parseError(r));
+  return (await r.json()) as { job_id: string };
+}
+
+async function cancelBackendJob(jobId: string): Promise<void> {
+  try {
+    await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+  } catch (e) {
+    console.debug("backend job cancel failed", e);
+  }
+}
+
 async function waitForBackendJob<T>(
   jobId: string,
   opts: {
@@ -2205,6 +2236,9 @@ async function waitForBackendJob<T>(
     }
     if (job.status === "error") {
       throw new Error(String(job.error || "Transcription failed."));
+    }
+    if (job.status === "cancelled") {
+      throw new DOMException("Aborted", "AbortError");
     }
     const pollMs = performance.now() - startedAt > 30_000 ? 3_000 : 900;
     await new Promise<void>((resolve, reject) => {
@@ -2239,17 +2273,60 @@ async function remoteJobQueued(
   },
 ): Promise<RemoteTranscriptionResult> {
   const created = await remoteJob(file, opts);
-  const result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, {
-    signal: opts.signal,
-    onProgress: (job) => {
-      opts.onProcessingProgress?.(Math.max(0, Math.min(1, Number(job.progress || 0))));
-    },
-  });
+  const onAbort = () => { void cancelBackendJob(created.job_id); };
+  if (opts.signal?.aborted) {
+    await cancelBackendJob(created.job_id);
+    throw new DOMException("Aborted", "AbortError");
+  }
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  let result: RemoteTranscriptionResult;
+  try {
+    result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, {
+      signal: opts.signal,
+      onProgress: (job) => {
+        opts.onProcessingProgress?.(Math.max(0, Math.min(1, Number(job.progress || 0))));
+      },
+    });
+  } finally {
+    opts.signal?.removeEventListener("abort", onAbort);
+  }
   return {
     text: String(result?.text || "").trim(),
     provider: String(result?.provider || opts.provider || ""),
     model: String(result?.model || "").trim() || undefined,
   };
+}
+
+function normalizeLocalTranscriptionResult(raw: { text?: string; duration?: number; segments?: Array<{ start?: number; end?: number; text?: string }> } | null | undefined): LocalTranscriptionResult {
+  const rawSegments = Array.isArray(raw?.segments) ? raw?.segments || [] : [];
+  const segments = rawSegments
+    .map((segment) => normalizeTranscriptSegment(segment))
+    .filter((segment): segment is TranscriptSegment => !!segment);
+  return {
+    text: normalizeTranscriptWhitespace(String(raw?.text || "")),
+    segments,
+    durationSec: Math.max(0, Number(raw?.duration || 0)),
+  };
+}
+
+async function localJobQueued(
+  file: File,
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+): Promise<LocalTranscriptionResult> {
+  const created = await localJob(file, opts);
+  const onAbort = () => { void cancelBackendJob(created.job_id); };
+  if (opts.signal?.aborted) {
+    await cancelBackendJob(created.job_id);
+    throw new DOMException("Aborted", "AbortError");
+  }
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  let result: { text?: string; duration?: number; segments?: Array<{ start?: number; end?: number; text?: string }> };
+  try {
+    result = await waitForBackendJob(created.job_id, { signal: opts.signal });
+  } finally {
+    opts.signal?.removeEventListener("abort", onAbort);
+  }
+  return normalizeLocalTranscriptionResult(result);
 }
 
 async function remoteJobSync(
@@ -2382,15 +2459,7 @@ async function localJobSync(
       segments?: Array<{ start?: number; end?: number; text?: string }>;
     };
   };
-  const rawSegments = Array.isArray(js?.result?.segments) ? js.result?.segments || [] : [];
-  const segments = rawSegments
-    .map((segment) => normalizeTranscriptSegment(segment))
-    .filter((segment): segment is TranscriptSegment => !!segment);
-  return {
-    text: normalizeTranscriptWhitespace(String(js?.result?.text || "")),
-    segments,
-    durationSec: Math.max(0, Number(js?.result?.duration || 0)),
-  };
+  return normalizeLocalTranscriptionResult(js?.result);
 }
 
 async function transcribeCanonicalAudioLocally(file: File, language: string, model: string): Promise<LocalTranscriptionResult> {
@@ -9249,7 +9318,7 @@ if (_bootRetry) {
 // ══════════════════════════════════════════════════════════════════════
 //
 // SSOT for the upload pipeline. Reuses the existing transcription
-// primitives (`localJobSync`, `remoteJobQueued`, `saveRecordingText`)
+// primitives (`localJobQueued`, `remoteJobQueued`, `saveRecordingText`)
 // instead of forking a parallel implementation, so any backend-side
 // behaviour change (provider, language, retention) flows through to
 // the upload tab automatically.
@@ -9559,7 +9628,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     let modelLabel = "";
     if (provider === "local") {
       modelLabel = "small";
-      const out = await localJobSync(item.file, {
+      const out = await localJobQueued(item.file, {
         language: resolveFastLocalLanguage(language),
         model: modelLabel,
         splitStereo: true,

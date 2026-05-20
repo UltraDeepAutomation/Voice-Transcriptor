@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from typing import Optional, Tuple
 
@@ -75,7 +76,11 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def _run_ffmpeg(cmd: list[str], timeout_sec: int) -> None:
+def _run_ffmpeg(
+    cmd: list[str],
+    timeout_sec: int,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
     """Run ffmpeg with bounded stderr + hard timeout.
 
     Shared between every ffmpeg invocation in this module so the
@@ -101,7 +106,23 @@ def _run_ffmpeg(cmd: list[str], timeout_sec: int) -> None:
     reader.start()
     try:
         try:
-            proc.wait(timeout=timeout_sec)
+            deadline = time.monotonic() + timeout_sec
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    raise AudioError("ffmpeg conversion cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout_sec)
+                try:
+                    proc.wait(timeout=min(0.25, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         except subprocess.TimeoutExpired:
             proc.kill()
             try:
@@ -156,7 +177,11 @@ def _compact_audio_for_remote_cmd(path_in: str, path_out: str) -> list[str]:
     ]
 
 
-def compact_audio_for_remote(path_in: str, path_out: str) -> str:
+def compact_audio_for_remote(
+    path_in: str,
+    path_out: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
     """Compress arbitrary audio/video to a Deepgram-friendly compact form.
 
     Output: 16 kHz mono Opus in WebM container at ~24 kbit/s. This
@@ -200,7 +225,7 @@ def compact_audio_for_remote(path_in: str, path_out: str) -> str:
     # cleanup keeps the contract "either path_out is a complete
     # encoded file or it doesn't exist".
     try:
-        _run_ffmpeg(cmd, timeout_sec=600)
+        _run_ffmpeg(cmd, timeout_sec=600, cancel_event=cancel_event)
     except AudioError:
         try:
             os.unlink(path_out)

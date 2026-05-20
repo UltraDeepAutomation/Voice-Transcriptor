@@ -49,7 +49,7 @@ from backend.audio import (
 from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
 from backend.storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from backend.live import LiveSession
-from backend.jobs import JobStore
+from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
@@ -2944,6 +2944,7 @@ async def create_job(
 
     def run():
         try:
+            jobs.raise_if_cancelled(job_id)
             jobs.set_running(job_id)
             result = _run_local_transcribe_once(
                 run_id=job_id,
@@ -2952,8 +2953,12 @@ async def create_job(
                 language=lang_opt,
                 split_stereo=split_stereo,
                 word_timestamps=word_timestamps,
-                progress_cb=lambda value: jobs.set_progress(job_id, value),
+                progress_cb=lambda value: (
+                    jobs.raise_if_cancelled(job_id),
+                    jobs.set_progress(job_id, value),
+                ),
             )
+            jobs.raise_if_cancelled(job_id)
 
             result_json_path = RESULTS_DIR / f"{job_id}.json"
             result_txt_path = RESULTS_DIR / f"{job_id}.txt"
@@ -2972,6 +2977,8 @@ async def create_job(
                     "txt": str(result_txt_path),
                 },
             )
+        except JobCancelledError:
+            jobs.cancel(job_id)
         except AudioError as e:
             jobs.set_error(job_id, _safe_error_text(e))
         except Exception as e:
@@ -3048,7 +3055,13 @@ def _run_remote_transcribe_once(
     num_speakers: str,
     openrouter_model: str,
     cfg: Optional[dict] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
+    def _raise_if_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError("job cancelled")
+
+    _raise_if_cancelled()
     if cfg is None:
         cfg = load_config()
     # Defensive `or {}` — `cfg.get("preferences", {})` returns None when
@@ -3061,8 +3074,10 @@ def _run_remote_transcribe_once(
         or "openrouter"
     ).strip()
 
+    _raise_if_cancelled()
     if audio_bytes is None and upload_path is not None:
         audio_bytes = upload_path.read_bytes()
+    _raise_if_cancelled()
 
     # ── ALWAYS pre-compress to 16 kHz mono Opus/WebM for remote ───────────
     #
@@ -3100,7 +3115,13 @@ def _run_remote_transcribe_once(
             _src.write_bytes(audio_bytes)
             _dst = Path(_td) / "out.webm"
             try:
-                compact_audio_for_remote(str(_src), str(_dst))
+                _raise_if_cancelled()
+                compact_audio_for_remote(
+                    str(_src),
+                    str(_dst),
+                    cancel_event=cancel_event,
+                )
+                _raise_if_cancelled()
                 audio_bytes = _dst.read_bytes()
                 # Update orig_name so the downstream Content-Type
                 # mapping in remote_deepgram / remote_openrouter sees
@@ -3161,6 +3182,7 @@ def _run_remote_transcribe_once(
                     # catch maps to HTTP 502 with an actionable detail.
                     raise RemoteError(f"audio compression failed: {e}") from e
 
+    _raise_if_cancelled()
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("openrouter") or {}
@@ -3173,6 +3195,7 @@ def _run_remote_transcribe_once(
             audio_bytes=audio_bytes,
             filename=orig_name,
         )
+        _raise_if_cancelled()
         return {
             "provider": "openrouter",
             "model": model,
@@ -3191,6 +3214,7 @@ def _run_remote_transcribe_once(
             language=language,
             diarize=bool(diarize),
         )
+        _raise_if_cancelled()
         return {
             "provider": "deepgram",
             "model": model,
@@ -3222,6 +3246,7 @@ async def create_remote_job(
 
     job_id = str(uuid.uuid4())
     jobs.create(job_id)
+    cancel_event = jobs.cancel_event(job_id)
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
@@ -3231,9 +3256,15 @@ async def create_remote_job(
     lang_opt = _normalize_language(language)
 
     def run():
+        def _check_cancelled() -> None:
+            if jobs.is_cancelled(job_id):
+                raise JobCancelledError("job cancelled")
+
         try:
+            _check_cancelled()
             jobs.set_running(job_id)
             jobs.set_progress(job_id, 0.05)
+            _check_cancelled()
             jobs.set_progress(job_id, 0.15)
             result = _run_remote_transcribe_once(
                 provider_norm=provider_norm,
@@ -3243,8 +3274,10 @@ async def create_remote_job(
                 diarize=diarize,
                 num_speakers=num_speakers,
                 openrouter_model=openrouter_model,
+                cancel_event=cancel_event,
             )
 
+            _check_cancelled()
             jobs.set_progress(job_id, 0.95)
             result_json_path = RESULTS_DIR / f"{job_id}.remote.json"
             result_txt_path = RESULTS_DIR / f"{job_id}.remote.txt"
@@ -3262,6 +3295,9 @@ async def create_remote_job(
                     "txt": str(result_txt_path),
                 },
             )
+        except JobCancelledError:
+            cancel_event.set()
+            jobs.cancel(job_id)
         except ValueError as e:
             jobs.set_error(job_id, f"bad_request: {_safe_error_text(e)}")
         except RemoteError as e:
@@ -3645,6 +3681,19 @@ def get_job(job_id: str, _auth: None = Depends(_require_api_auth)):
         "error": job.error,
         "result": job.result if job.status == "done" else None,
         "result_files": job.result_files if job.status == "done" else None,
+    }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, _auth: None = Depends(_require_api_auth)):
+    job = jobs.cancel(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "progress": job.progress,
+        "error": job.error,
     }
 
 
