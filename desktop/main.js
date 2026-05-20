@@ -5821,6 +5821,7 @@ async function startBackend() {
   // and `frontend`) which invites silent import shadowing on any
   // refactor.
   const args = [
+    "-B",
     "-m", "uvicorn",
     "backend.main:app",
     "--app-dir", repoRoot,
