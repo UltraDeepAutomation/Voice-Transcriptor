@@ -6925,6 +6925,17 @@ async function stopLive(enhance: boolean): Promise<void> {
   const effectiveProvider = liveSnapshot.effectiveProvider;
   const modelValue = liveSnapshot.model;
   const sourceLiveText = getSessionCanonicalLiveSourceText(sessionUiToken);
+  // The stop entry snapshot is intentionally not the SSOT: final/interim
+  // events can still arrive while the socket drains and the audio is saved.
+  let latestSourceLiveText = sourceLiveText;
+  const latestSourceForSave = (): string => {
+    const refreshed = getSessionCanonicalLiveSourceText(sessionUiToken);
+    if (refreshed) {
+      latestSourceLiveText = refreshed;
+    }
+    return latestSourceLiveText;
+  };
+  const latestSourceTitle = (): string => _smartTitle(latestSourceForSave());
   const captureSilenceSnapshot = (liveText: string): {
     hardSilence: boolean;
     likelySilenceWithoutPreview: boolean;
@@ -7298,7 +7309,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         const persisted = await saveRecordingText({
           archiveDir: tryArchiveDir,
           title: provisionalTitle,
-          sourceText: sourceLiveText,
+          sourceText: latestSourceForSave(),
           transcriptText: "",
           provider: providerValue || "local",
           model: modelValue,
@@ -7388,7 +7399,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     return;
   }
 
-  const drainedSourceLiveText = getSessionCanonicalLiveSourceText(sessionUiToken) || sourceLiveText;
+  const drainedSourceLiveText = latestSourceForSave();
   const drainedSilence = captureSilenceSnapshot(drainedSourceLiveText);
   if (drainedSilence.silentCapture) {
     publishRecordingFinalSignal({
@@ -7404,8 +7415,8 @@ async function stopLive(enhance: boolean): Promise<void> {
         name: persistedRecordingName,
         archiveDir: persistedRecordingArchiveDir,
         requireExisting: !!persistedRecordingName,
-        title: _smartTitle(sourceLiveText),
-        sourceText: sourceLiveText,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
         transcriptText: "[ Silence ]",
         provider: providerValue,
         model: modelValue,
@@ -7451,8 +7462,8 @@ async function stopLive(enhance: boolean): Promise<void> {
         name: persistedRecordingName,
         archiveDir: persistedRecordingArchiveDir,
         requireExisting: !!persistedRecordingName,
-        title: _smartTitle(sourceLiveText),
-        sourceText: sourceLiveText,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
         transcriptText: "",
         provider: providerValue,
         model: modelValue,
@@ -7498,8 +7509,8 @@ async function stopLive(enhance: boolean): Promise<void> {
         name: persistedRecordingName,
         archiveDir: persistedRecordingArchiveDir,
         requireExisting: !!persistedRecordingName,
-        title: _smartTitle(sourceLiveText),
-        sourceText: sourceLiveText,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
         transcriptText: "",
         provider: "local",
         model: modelValue,
@@ -7556,8 +7567,8 @@ async function stopLive(enhance: boolean): Promise<void> {
         name: persistedRecordingName,
         archiveDir: persistedRecordingArchiveDir,
         requireExisting: !!persistedRecordingName,
-        title: _smartTitle(sourceLiveText),
-        sourceText: sourceLiveText,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
         transcriptText: "",
         provider,
         model: modelValue,
@@ -7836,7 +7847,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         transcriptRaw =
           errorBuffer?.committedDisplayText ||
           errorBuffer?.committedText ||
-          (errorBuffer ? joinTranscriptSegments(errorBuffer.segments) : sourceLiveText);
+          (errorBuffer ? joinTranscriptSegments(errorBuffer.segments) : latestSourceForSave());
         if (!transcriptRaw) {
           transcriptRaw = await recoverFromEmptyTranscript(
             `Live stream errored mid-recording (${liveStreamErrorAtStop}).`,
@@ -8203,7 +8214,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
       const previewDraft =
         (getLiveTranscriptBuffer(sessionUiToken)?.committedDisplayText || "").trim()
-        || sourceLiveText;
+        || latestSourceForSave();
       if (previewDraft) {
         setStatusScoped(sessionUiToken, "Transcribing");
         patchCurrentRecordingSummary({
@@ -8227,7 +8238,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           transcriptRaw = String(fallbackOut.text || "").trim();
         }
       }
-      if (!transcriptRaw && (previewDraft || sourceLiveText)) {
+      if (!transcriptRaw && (previewDraft || latestSourceForSave())) {
         patchCurrentRecordingSummary({
           title: provisionalTitle,
           status: "Remote final transcript was empty. Falling back to local transcription from the saved audio.",
@@ -8276,7 +8287,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         archiveDir: persistedRecordingArchiveDir,
         requireExisting: !!persistedRecordingName,
         title,
-        sourceText: sourceLiveText,
+        sourceText: latestSourceForSave(),
         transcriptText: transcriptRaw,
         provider,
         model: modelValue,
@@ -8324,8 +8335,8 @@ async function stopLive(enhance: boolean): Promise<void> {
         name: persistedRecordingName,
         archiveDir: persistedRecordingArchiveDir,
         requireExisting: !!persistedRecordingName,
-        title: _smartTitle(sourceLiveText),
-        sourceText: sourceLiveText,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
         transcriptText: "",
         provider,
         model: modelValue,
