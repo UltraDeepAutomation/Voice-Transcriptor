@@ -9520,6 +9520,7 @@ const uploadQueue: UploadQueueItem[] = [];
 let uploadActiveProcessors = 0;
 let uploadProcessorPumpScheduled = false;
 let uploadHideFinished = false;
+let uploadRevealReconcileInFlight: Promise<void> | null = null;
 const UPLOAD_EMPTY_TRANSCRIPT_TEXT = "[No speech captured]";
 // Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
 // which mirrors backend MAX_UPLOAD_BYTES via /api/health. Even though
@@ -9551,6 +9552,31 @@ function uploadItemSize(item: UploadQueueItem): number {
 
 function uploadItemResultText(item: UploadQueueItem): string {
   return String(item.text || "").trim() || UPLOAD_EMPTY_TRANSCRIPT_TEXT;
+}
+
+function normalizeUploadTranscriptIdentity(text: string): string {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function uploadDisplayPreviewFromText(text: string, maxWords = 8): string {
+  const cleaned = String(text || "").replace(/\[.*?\]/g, "").trim();
+  if (!cleaned) return "";
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (!words.length) return "";
+  let preview = words.slice(0, maxWords).join(" ");
+  if (words.length > maxWords) preview += "...";
+  if (preview.length > 80) preview = preview.slice(0, 77) + "...";
+  return preview;
+}
+
+function extractRecordingTranscriptForUploadMatch(content: string, displayText = ""): string {
+  const raw = String(content || "").trim();
+  const display = String(displayText || "").trim();
+  const trans = raw.match(/(?:^|\n)Transcription:\s*([\s\S]*)$/i);
+  if (trans && trans[1].trim()) return trans[1].trim();
+  const orig = raw.match(/(?:^|\n)Original:\s*([\s\S]*?)(?:\n\s*Transcription:|$)/i);
+  if (orig && orig[1].trim()) return orig[1].trim();
+  return display || raw;
 }
 
 type UploadRevealTarget = { name: string; archiveDir: string };
@@ -9602,6 +9628,76 @@ function createUploadRevealButton(item: UploadQueueItem): HTMLButtonElement | nu
     revealUploadItem(item);
   });
   return btn;
+}
+
+async function reconcileUploadQueueRevealTargetsFromArchive(): Promise<void> {
+  if (uploadRevealReconcileInFlight) return uploadRevealReconcileInFlight;
+  const legacyItems = uploadQueue.filter((item) =>
+    item.status === "done" &&
+    !uploadRevealTarget(item) &&
+    !!normalizeUploadTranscriptIdentity(item.text || "")
+  );
+  if (!legacyItems.length) return;
+
+  uploadRevealReconcileInFlight = (async () => {
+    try {
+      await ensureRecordingsArchiveReady();
+      const archiveDir = currentArchiveDirSnapshot();
+      if (!archiveDir || !recordingItems.length) return;
+
+      const previews = new Set(
+        legacyItems
+          .map((item) => uploadDisplayPreviewFromText(item.text || ""))
+          .filter(Boolean),
+      );
+      if (!previews.size) return;
+
+      const candidateNames = Array.from(new Set(
+        recordingItems
+          .filter((recording) => previews.has(String(recording.display_name || "")))
+          .map((recording) => recording.name),
+      ));
+      if (!candidateNames.length) return;
+
+      const matchesByText = new Map<string, string[]>();
+      for (const name of candidateNames) {
+        try {
+          const payload = await apiGet<{ content?: string; display_text?: string }>(
+            "/api/recordings/" + encodeURIComponent(name),
+          );
+          const identity = normalizeUploadTranscriptIdentity(
+            extractRecordingTranscriptForUploadMatch(
+              String(payload.content || ""),
+              String(payload.display_text || ""),
+            ),
+          );
+          if (!identity) continue;
+          const matches = matchesByText.get(identity) || [];
+          matches.push(name);
+          matchesByText.set(identity, matches);
+        } catch (e) {
+          console.warn("Upload queue reveal target reconcile skipped recording", name, e);
+        }
+      }
+
+      let changed = false;
+      for (const item of legacyItems) {
+        const identity = normalizeUploadTranscriptIdentity(item.text || "");
+        const matches = matchesByText.get(identity) || [];
+        if (matches.length !== 1) continue;
+        item.savedName = matches[0];
+        item.savedArchiveDir = archiveDir;
+        changed = true;
+      }
+      if (changed) {
+        saveUploadQueueSnapshot();
+        renderUploadQueue();
+      }
+    } finally {
+      uploadRevealReconcileInFlight = null;
+    }
+  })();
+  return uploadRevealReconcileInFlight;
 }
 
 function isUploadTerminalStatus(status: UploadQueueStatus): boolean {
@@ -9832,6 +9928,7 @@ function setupUploadView(): void {
   } catch { }
   updateUploadProviderHint();
   renderUploadQueue();
+  void reconcileUploadQueueRevealTargetsFromArchive();
 }
 
 function updateUploadProviderHint(): void {
