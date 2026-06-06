@@ -3319,7 +3319,7 @@ canvas,
 
 .upload-queue-item-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
   justify-content: space-between;
 }
@@ -3329,6 +3329,7 @@ canvas,
   height: 8px;
   border-radius: 999px;
   flex: 0 0 auto;
+  margin-top: 5px;
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
 }
 
@@ -3507,12 +3508,17 @@ canvas,
 .upload-queue-item-actions {
   margin-top: 8px;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
 .upload-queue-item-action {
   font-size: 11px;
   padding: 4px 10px;
+}
+
+.upload-queue-item-reveal {
+  white-space: nowrap;
 }
 
 .upload-empty-state {

@@ -238,14 +238,6 @@ let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
-// Legacy fallback for reveal requests that come from older persisted
-// queue snapshots without an exact backend-provided audio_name. New
-// renderer builds pass audioName explicitly; this list is only a
-// bounded same-stem lookup, never the primary source of truth.
-const RECORDING_AUDIO_EXTS = Object.freeze([
-  ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".opus", ".aac",
-  ".webm", ".wma", ".mp4", ".m4v", ".mov", ".mkv",
-]);
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
     collapsedWidth: 320,
@@ -6146,13 +6138,12 @@ async function createWindow(options = {}) {
       const rawName = String(payload?.name || "");
       if (!rawName || rawName.includes("..") || /[\\/]/.test(rawName)) return;
       const safeName = rawName;
-      const rawAudioName = String(payload?.audioName || "");
-      const hasSafeAudioName =
-        !!rawAudioName &&
-        !rawAudioName.includes("..") &&
-        !/[\\/]/.test(rawAudioName);
+      if (!safeName.toLowerCase().endsWith(".txt")) {
+        appendMainLog(`[reveal-recording] rejected non-transcript name: ${safeName}`);
+        return;
+      }
       const archiveDirRaw = String(payload?.archiveDir || "").trim();
-      // Resolve the audio path under the SAME archive dir we wrote to.
+      // Resolve the transcript path under the SAME archive dir we wrote to.
       // archiveDir comes back from saveRecordingText which already
       // sanitises it via _resolve_recordings_target_dir on the backend
       // side, but defence-in-depth: only accept absolute paths under
@@ -6180,32 +6171,12 @@ async function createWindow(options = {}) {
         appendMainLog(`[reveal-recording] archive_dir outside home: ${archiveDir}`);
         return;
       }
-      // The recording is named ``YYYY-MM-DD_HH-MM-SS__title.txt``;
-      // modern renderers also pass the exact backend-provided
-      // ``audioName``. Use that first. Only older queue snapshots lack
-      // it, so they get a bounded same-stem extension lookup instead
-      // of the previous unordered `entries.find(stem + ".")` which
-      // could reveal a stale temp/backup sibling.
-      const stem = safeName.replace(/\.txt$/i, "");
-      let target = path.join(archiveDir, safeName);
-      if (hasSafeAudioName) {
-        const parsedAudio = path.parse(rawAudioName);
-        const sameStem = parsedAudio.name === stem;
-        const notText = parsedAudio.ext.toLowerCase() !== ".txt";
-        const exactAudioPath = path.join(archiveDir, rawAudioName);
-        if (sameStem && notText && fs.existsSync(exactAudioPath)) {
-          target = exactAudioPath;
-        }
-      }
-      if (target === path.join(archiveDir, safeName)) {
-        for (const ext of RECORDING_AUDIO_EXTS) {
-          const candidate = path.join(archiveDir, `${stem}${ext}`);
-          if (fs.existsSync(candidate)) {
-            target = candidate;
-            break;
-          }
-        }
-      }
+      // Reveal means "show the transcript file". Never substitute the
+      // adjacent audio/video recording: the History and Upload panes
+      // already have dedicated playback, and selecting the media file
+      // made the user think the transcription had been saved under the
+      // wrong name.
+      const target = path.join(archiveDir, safeName);
       try {
         shell.showItemInFolder(target);
       } catch (e) {

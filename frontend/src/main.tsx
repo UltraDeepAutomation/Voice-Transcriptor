@@ -140,7 +140,6 @@ interface LatestSavedAudioState {
 interface SavedRecordingRef {
   name: string;
   archiveDir: string;
-  audioName?: string;
 }
 
 interface TranscriptSegment {
@@ -298,12 +297,12 @@ declare global {
     __setBackendBootError?: (msg: string) => void;
     /**
      * Open the OS file manager (Finder / Explorer / Files) at the
-     * audio file matching the given recording. Implemented by setting
+     * transcript file matching the given recording. Implemented by setting
      * ``document.title`` to a known prefix; the Electron main process
      * intercepts via ``page-title-updated`` and calls
      * ``shell.showItemInFolder``. No-op in plain-browser dev preview.
      */
-    __transcriptorRevealRecording?: (name: string, archiveDir: string, audioName?: string) => void;
+    __transcriptorRevealRecording?: (name: string, archiveDir: string) => void;
   }
 }
 
@@ -4910,7 +4909,7 @@ async function openRecording(name: string): Promise<void> {
       revealBtn.hidden = !hasReveal;
       revealBtn.onclick = () => {
         const fn = window.__transcriptorRevealRecording;
-        if (fn) fn(name, currentArchiveDirSnapshot(), String(r.audio_name || ""));
+        if (fn) fn(name, currentArchiveDirSnapshot());
       };
     }
     updateRecordingCopyState();
@@ -4965,7 +4964,6 @@ async function saveRecordingText(opts: {
   }
   let savedName = existingName;
   let savedArchiveDir = archiveDir;
-  let savedAudioName = "";
   if (audioFile) {
     const fd = new FormData();
     fd.append("file", audioFile, audioFile.name || "recording.wav");
@@ -4981,10 +4979,9 @@ async function saveRecordingText(opts: {
     if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
     const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
     if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { name?: string; archive_dir?: string; audio_name?: string };
+    const js = (await r.json()) as { name?: string; archive_dir?: string };
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    savedAudioName = String(js.audio_name || "").trim();
   } else {
     const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
       name: existingName,
@@ -5007,7 +5004,6 @@ async function saveRecordingText(opts: {
   return {
     name: savedName,
     archiveDir: savedArchiveDir,
-    ...(savedAudioName ? { audioName: savedAudioName } : {}),
   };
 }
 
@@ -9470,7 +9466,6 @@ interface UploadQueueSnapshotItem {
   language?: string;
   savedName?: string;
   savedArchiveDir?: string;
-  savedAudioName?: string;
 }
 
 interface UploadQueueStoragePayload {
@@ -9510,7 +9505,6 @@ interface UploadQueueItem {
   language?: string;
   savedName?: string;
   savedArchiveDir?: string;
-  savedAudioName?: string;
   abortController?: AbortController;
 }
 
@@ -9579,7 +9573,6 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
     language: item.language || "",
     savedName: item.savedName || "",
     savedArchiveDir: item.savedArchiveDir || "",
-    savedAudioName: item.savedAudioName || "",
   };
 }
 
@@ -9636,7 +9629,6 @@ function restoreUploadQueueSnapshot(): void {
         language: String(src.language || ""),
         savedName: String(src.savedName || ""),
         savedArchiveDir: String(src.savedArchiveDir || ""),
-        savedAudioName: String(src.savedAudioName || ""),
       });
     }
     saveUploadQueueSnapshot();
@@ -9984,9 +9976,6 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
           item.savedArchiveDir = String(
             (saveOut as { archiveDir?: string }).archiveDir || "",
           );
-          item.savedAudioName = String(
-            (saveOut as { audioName?: string }).audioName || "",
-          );
         }
       } catch (saveErr) {
         // Persist failure is non-fatal — the transcript is still
@@ -10253,6 +10242,10 @@ function renderUploadQueue(): void {
       li.appendChild(body);
       const actions = document.createElement("div");
       actions.className = "upload-queue-item-actions";
+      const revealFn = (window as unknown as {
+        __transcriptorRevealRecording?: (n: string, d: string) => void;
+      }).__transcriptorRevealRecording;
+      const canReveal = !!item.savedName && typeof revealFn === "function";
       const copyBtn = document.createElement("button");
       copyBtn.className = "btn btn-ghost upload-queue-item-action";
       copyBtn.type = "button";
@@ -10266,6 +10259,17 @@ function renderUploadQueue(): void {
         })();
       });
       actions.appendChild(copyBtn);
+      if (canReveal) {
+        const revealItemBtn = document.createElement("button");
+        revealItemBtn.className = "btn btn-ghost upload-queue-item-action upload-queue-item-reveal";
+        revealItemBtn.type = "button";
+        revealItemBtn.textContent = "Reveal in Finder";
+        revealItemBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          revealFn(item.savedName || "", item.savedArchiveDir || "");
+        });
+        actions.appendChild(revealItemBtn);
+      }
       li.appendChild(actions);
     } else if (item.status === "error" && item.error) {
       const err = document.createElement("div");
@@ -10282,7 +10286,7 @@ function renderUploadQueue(): void {
 //
 // Renders the currently-selected queue item's transcript + metadata
 // + a "Reveal in Finder" button that asks the Electron main process
-// to open the saved audio file in the OS file manager. Falls back
+// to open the saved transcript file in the OS file manager. Falls back
 // gracefully on platforms without ``shell.showItemInFolder`` IPC.
 function renderUploadResultPane(): void {
   const textEl = document.getElementById("uploadResultText");
@@ -10357,8 +10361,8 @@ function renderUploadResultPane(): void {
       };
     }
     if (revealBtn) {
-      // Show only when the audio actually persisted (savedName set
-      // by saveRecordingText). The Electron main process exposes
+      // Show only when the transcript persisted (savedName set by
+      // saveRecordingText). The Electron main process exposes
       // ``window.__transcriptorRevealRecording`` that calls
       // ``shell.showItemInFolder`` — when the renderer runs in a
       // plain browser (vite dev), the helper is undefined and we
@@ -10366,8 +10370,8 @@ function renderUploadResultPane(): void {
       const hasReveal = typeof (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording === "function";
       revealBtn.hidden = !item.savedName || !hasReveal;
       revealBtn.onclick = () => {
-        const fn = (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string, a?: string) => void }).__transcriptorRevealRecording;
-        if (fn) fn(item!.savedName || "", item!.savedArchiveDir || "", item!.savedAudioName || "");
+        const fn = (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording;
+        if (fn) fn(item!.savedName || "", item!.savedArchiveDir || "");
       };
     }
   } else if (item.status === "error" && item.error) {
@@ -10388,18 +10392,18 @@ function renderUploadResultPane(): void {
 setupUploadView();
 
 // Renderer-side helper to ask the Electron main process to open the
-// OS file manager at the audio file. We can't use ipcRenderer directly
+// OS file manager at the transcript file. We can't use ipcRenderer directly
 // (sandbox + contextIsolation + no preload), so we encode the request
 // into a sentinel ``document.title`` and let main.js's
 // ``page-title-updated`` handler decode + dispatch. The handler
 // validates name + archiveDir against the user's home dir before
 // invoking ``shell.showItemInFolder``. Title is restored a tick later
 // so the app's normal title text isn't permanently replaced.
-window.__transcriptorRevealRecording = (name: string, archiveDir: string, audioName = "") => {
+window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
   const safe = String(name || "").replace(/[\\/]/g, "");
-  if (!safe) return;
+  if (!safe || !safe.toLowerCase().endsWith(".txt")) return;
   const payload = encodeURIComponent(
-    JSON.stringify({ name: safe, archiveDir: String(archiveDir || ""), audioName: String(audioName || "") }),
+    JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
   );
   const prevTitle = document.title;
   document.title = "__app_reveal_recording__" + payload;
