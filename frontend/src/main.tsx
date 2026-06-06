@@ -8015,9 +8015,14 @@ async function stopLive(enhance: boolean): Promise<void> {
             //   2. If the FIRST resolved promise produces a strict
             //      word-count improvement over ``instantTranscript``,
             //      use it immediately — DO NOT wait for the second.
-            //   3. If the first didn't help, await the OTHER (it might
-            //      yet produce an improvement).
-            //   4. If neither beat instant, keep instant.
+            //   3. If the first candidate is already within 90% of
+            //      instant, keep instant immediately. Waiting for REST
+            //      after an equal envelope is pure latency and caused
+            //      the overlay paste task to time out.
+            //   4. Only if the first candidate is clearly worse/empty,
+            //      await the OTHER (it might yet recover a real stream
+            //      dropout).
+            //   5. If neither beat instant, keep instant.
             //
             // Saves ~1.5 s per long recording in the typical case.
             type Cand = { label: "envelope" | "recovery"; text: string; words: number };
@@ -8037,7 +8042,13 @@ async function stopLive(enhance: boolean): Promise<void> {
             let chose: Cand | null = improvedText !== baseTranscriptForRace
               ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
               : null;
-            if (!chose) {
+            const firstConfirmsInstant =
+              wcInstant > 0 &&
+              first.words >= Math.max(1, Math.floor(wcInstant * 0.9));
+            if (!chose && firstConfirmsInstant) {
+              console.log(`[trace tail-gap] decision=KEEP_INSTANT_EARLY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
+            }
+            if (!chose && !firstConfirmsInstant) {
               // First didn't improve — wait for the OTHER.
               const other = first.label === "envelope" ? await recoveryCand : await envelopeCand;
               const otherMs = performance.now() - tRace;
@@ -8058,7 +8069,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                   tone: "success",
                 }, sessionUiToken);
               }
-            } else {
+            } else if (!firstConfirmsInstant) {
               console.log(`[trace tail-gap] decision=KEEP_INSTANT (no improvement) totalMs=${totalRaceMs.toFixed(0)}`);
             }
           }

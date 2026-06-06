@@ -4824,14 +4824,11 @@ async function processPostStopTask(task) {
     traceEnd(trace, "skipped", { reason: "already-pasted" });
     return;
   }
-  // Old value was 120000 (2 minutes!) which caused the overlay to
-  // hang indefinitely showing "Transcribing..." when the renderer was
-  // slow or unresponsive. 15 seconds is more than enough for any
-  // realistic Deepgram/local transcription + upscale pass. If the
-  // transcript hasn't arrived by then, we give up and hide the overlay
-  // — the transcript will still appear in the main window when it
-  // eventually resolves, the paste just won't happen automatically.
-  const deadline = Date.now() + 15000;
+  // Bound overlay wait to the renderer's live-recovery SLA. Fast paths
+  // exit immediately on paste-ready; this ceiling only protects the
+  // rare "stream dropped, REST/local recovery is still running" case.
+  const POST_STOP_TRANSCRIPT_TIMEOUT_MS = 24000;
+  const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
