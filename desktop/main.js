@@ -5849,6 +5849,12 @@ async function startBackend() {
   const envPath = ffmpegDir
     ? `${ffmpegDir}${path.delimiter}${process.env.PATH || ""}`
     : (process.env.PATH || "");
+  const pythonCacheDir = path.join(app.getPath("userData"), "python-cache");
+  try {
+    fs.mkdirSync(pythonCacheDir, { recursive: true });
+  } catch (e) {
+    appendMainLog(`[backend-start] python cache dir unavailable: ${e?.message || e}`);
+  }
   // Child env. `--app-dir repoRoot` (above, in args) already inserts
   // repoRoot into sys.path for uvicorn's module resolution, so
   // exporting PYTHONPATH=repoRoot would double-inject the same dir
@@ -5868,9 +5874,13 @@ async function startBackend() {
     // added") and amfi on every subsequent backend spawn re-checks
     // the envelope — eventually breaking launch after enough
     // imports accumulated. Setting this env var makes Python run
-    // entirely from source; the ~5-10ms first-import overhead is
-    // negligible vs. the invariant of a stable on-disk signature.
+    // entirely from source; PYTHONPYCACHEPREFIX is an additional
+    // hard guard for any Python subprocess/import path that ignores
+    // -B or PYTHONDONTWRITEBYTECODE. Any bytecode cache that still
+    // gets written lands in userData/python-cache, never in the
+    // signed Resources envelope.
     PYTHONDONTWRITEBYTECODE: "1",
+    PYTHONPYCACHEPREFIX: pythonCacheDir,
     TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
   };
   backend = spawn(python, args, {
