@@ -2593,7 +2593,7 @@ function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
 }
 
 function getCanonicalLiveSourceText(): string {
-  // Include BOTH committed segments AND the best available interim so
+  // Include committed segments plus every useful interim candidate so
   // the tail of the utterance is never lost.
   //
   // Why ``lastInterimSnapshot``: when Deepgram sends an ``is_final``
@@ -2605,14 +2605,15 @@ function getCanonicalLiveSourceText(): string {
   // the time stopLive reads this function, the tail word is gone.
   //
   // ``lastInterimSnapshot`` preserves the interim text from just
-  // before the last clear. We pick whichever is LONGEST among:
+  // before the last clear. We merge BOTH:
   //   1. Current ``liveInterimText`` (if Deepgram sent a fresh interim
   //      after the last is_final)
   //   2. ``lastInterimSnapshot`` (the interim just before the last
   //      is_final wiped it)
   //
-  // Deduplication: if the chosen interim is already a SUBSTRING of
-  // ``committed``, skip it to avoid "foo bar bar" artifacts.
+  // Deduplication: if an interim is already represented in committed
+  // text, skip it; if it overlaps at the boundary, append only the new
+  // tail words.
   return composeCanonicalLiveSourceText(
     liveDraftText,
     liveInterimText,
@@ -5682,44 +5683,64 @@ function composeCanonicalLiveSourceText(
   const committed = normalizeTranscriptWhitespace(committedRaw);
   const currentInterim = normalizeTranscriptWhitespace(currentInterimRaw);
   const snapshotInterim = normalizeTranscriptWhitespace(snapshotInterimRaw);
-  const interim =
-    currentInterim.length >= snapshotInterim.length
-      ? currentInterim
-      : snapshotInterim;
-  if (!interim) return committed;
-  if (!committed) return interim;
-  if (committed.endsWith(interim)) return committed;
+
+  const pickRicher = (a: string, b: string): string => {
+    const left = normalizeTranscriptWhitespace(a);
+    const right = normalizeTranscriptWhitespace(b);
+    if (!left) return right;
+    if (!right) return left;
+    const leftWords = countWords(left);
+    const rightWords = countWords(right);
+    if (rightWords > leftWords) return right;
+    if (rightWords === leftWords && right.length > left.length) return right;
+    return left;
+  };
+
   const normalizeWords = (s: string): string[] =>
     s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
-  const interimWords = normalizeWords(interim);
-  if (interimWords.length === 0) return committed;
   const normalizeComparable = (s: string): string =>
     s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
-  const committedComparable = normalizeComparable(committed);
-  const interimComparable = normalizeComparable(interim);
-  if (interimComparable && committedComparable.includes(interimComparable)) {
-    return committed;
-  }
-  const lastCommittedWords = committed.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
-  const lastCommittedNorm = normalizeWords(lastCommittedWords).join(" ");
-  const interimNorm = interimWords.join(" ");
-  if (lastCommittedNorm.endsWith(interimNorm)) return committed;
 
-  // Interim hypotheses can overlap committed text with a shifted
-  // boundary, e.g. committed="... сказал больше" and interim="больше
-  // завершил". Merge the longest normalized suffix/prefix overlap so
-  // the fast stop path keeps the tail without duplicating the overlap.
-  const committedNormWords = normalizeWords(committed);
-  const interimRawWords = interim.split(/\s+/).filter(Boolean);
-  const maxOverlap = Math.min(committedNormWords.length, interimWords.length);
-  for (let n = maxOverlap; n > 0; n--) {
-    const committedSuffix = committedNormWords.slice(-n).join(" ");
-    const interimPrefix = interimWords.slice(0, n).join(" ");
-    if (committedSuffix !== interimPrefix) continue;
-    const remainder = interimRawWords.slice(n).join(" ").trim();
-    return remainder ? `${committed} ${remainder}` : committed;
-  }
-  return `${committed} ${interim}`;
+  const mergeInterim = (baseRaw: string, interimRaw: string): string => {
+    const base = normalizeTranscriptWhitespace(baseRaw);
+    const interim = normalizeTranscriptWhitespace(interimRaw);
+    if (!interim) return base;
+    if (!base) return interim;
+    if (base.endsWith(interim)) return base;
+    const interimWords = normalizeWords(interim);
+    if (interimWords.length === 0) return base;
+    const baseComparable = normalizeComparable(base);
+    const interimComparable = normalizeComparable(interim);
+    if (interimComparable && baseComparable.includes(interimComparable)) {
+      return base;
+    }
+    const lastBaseWords = base.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
+    const lastBaseNorm = normalizeWords(lastBaseWords).join(" ");
+    const interimNorm = interimWords.join(" ");
+    if (lastBaseNorm.endsWith(interimNorm)) return base;
+
+    // Interim hypotheses can overlap committed text with a shifted
+    // boundary, e.g. committed="... сказал больше" and interim="больше
+    // завершил". Merge the longest normalized suffix/prefix overlap so
+    // the fast stop path keeps the tail without duplicating the overlap.
+    const baseNormWords = normalizeWords(base);
+    const interimRawWords = interim.split(/\s+/).filter(Boolean);
+    const maxOverlap = Math.min(baseNormWords.length, interimWords.length);
+    for (let n = maxOverlap; n > 0; n--) {
+      const baseSuffix = baseNormWords.slice(-n).join(" ");
+      const interimPrefix = interimWords.slice(0, n).join(" ");
+      if (baseSuffix !== interimPrefix) continue;
+      const remainder = interimRawWords.slice(n).join(" ").trim();
+      return remainder ? `${base} ${remainder}` : base;
+    }
+    return `${base} ${interim}`;
+  };
+
+  const withSnapshot = mergeInterim(committed, snapshotInterim);
+  const withCurrent = mergeInterim(committed, currentInterim);
+  const snapshotThenCurrent = mergeInterim(withSnapshot, currentInterim);
+  return [committed, withSnapshot, withCurrent, snapshotThenCurrent]
+    .reduce((best, candidate) => pickRicher(best, candidate), "");
 }
 
 function canonicalTextFromBuffer(buffer: LiveTranscriptBuffer): string {
@@ -7933,9 +7954,9 @@ async function stopLive(enhance: boolean): Promise<void> {
             // serially. Total: 7.6 s of dead-time after Stop.
             //
             // New strategy:
-            //   • Skip envelope wait entirely when segmentCount=0 —
-            //     no is_final ever arrived during streaming, the
-            //     post-CloseStream envelope WILL also be empty.
+            //   • Skip envelope wait only when neither finalized nor
+            //     interim timestamps exist. If the stream has interim
+            //     coverage, CloseStream can still promote it to final.
             //   • Otherwise launch envelope + recovery IN PARALLEL,
             //     await both via Promise.all, then pick whichever
             //     candidate (instant / envelope / recovery) has the
@@ -7951,7 +7972,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                 : `Recovering tail (${Math.round(tailGapSec * 1000)}ms gap)…`,
               tone: "info",
             }, sessionUiToken);
-            console.log(`[trace tail-gap] strategy=${skipEnvelope ? "RECOVERY-ONLY (segmentCount=0, envelope guaranteed empty)" : "PARALLEL (envelope + recovery)"}`);
+            console.log(`[trace tail-gap] strategy=${skipEnvelope ? "RECOVERY-ONLY (no timestamped live coverage)" : "PARALLEL (envelope + recovery)"}`);
 
             const tRace = performance.now();
             const envelopePromise: Promise<LiveFinalEnvelope | null> = skipEnvelope
