@@ -10,6 +10,7 @@ import threading
 import time
 import subprocess
 import mimetypes
+import tempfile
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -41,7 +42,7 @@ from backend.audio_constants import (
 )
 from backend.audio import (
     AudioError,
-    compact_audio_for_remote,
+    compact_audio_chunks_for_remote,
     ensure_wav_16k,
     split_channels,
     write_wav,
@@ -337,6 +338,14 @@ def _env_int(name: str, default: int) -> int:
 
 RESULT_RETENTION_SEC = _env_int("TRANSCRIPTOR_RESULT_RETENTION_SEC", 86400)
 LIVE_RECOVERY_RETENTION_SEC = _env_int("TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC", 86400)
+REMOTE_TRANSCRIBE_CHUNK_SEC = max(
+    60,
+    min(3600, _env_int("TRANSCRIPTOR_REMOTE_TRANSCRIBE_CHUNK_SEC", 15 * 60)),
+)
+REMOTE_RAW_FALLBACK_MAX_BYTES = max(
+    1 * 1024 * 1024,
+    _env_int("TRANSCRIPTOR_REMOTE_RAW_FALLBACK_MAX_BYTES", 8 * 1024 * 1024),
+)
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 ALLOWED_REMOTE_PROVIDERS = {"openrouter", "deepgram"}
 ALLOWED_AUDIO_EXTS = {
@@ -912,8 +921,8 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
             language = str(meta.get("language") or "auto").strip() or "auto"
             pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
             title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            stem = _recording_stem(title)
             target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
+            stem = _unique_recording_stem(target_dir, title)
             audio_out = target_dir / f"{stem}.wav"
             text_out = target_dir / f"{stem}.txt"
             tmp_audio = _atomic_temp_path(audio_out)
@@ -1484,17 +1493,27 @@ def _sanitize_name(value: str) -> str:
     return cleaned[:80].strip(" ._-") or "recording"
 
 
-def _recording_filename(title: str) -> str:
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return f"{ts}__{_sanitize_name(title)}.txt"
-
-
 def _recording_stem(name_or_title: str) -> str:
     raw = os.path.basename(name_or_title or "").strip()
     if raw.endswith(".txt"):
         return Path(raw).stem
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     return f"{ts}__{_sanitize_name(raw or 'recording')}"
+
+
+def _recording_stem_available(target_dir: Path, stem: str) -> bool:
+    return not (target_dir / f"{stem}.txt").exists() and not any(target_dir.glob(f"{stem}.*"))
+
+
+def _unique_recording_stem(target_dir: Path, title: str) -> str:
+    base = _recording_stem(title)
+    if _recording_stem_available(target_dir, base):
+        return base
+    for _ in range(128):
+        candidate = f"{base}-{uuid.uuid4().hex[:8]}"
+        if _recording_stem_available(target_dir, candidate):
+            return candidate
+    raise HTTPException(status_code=500, detail="could not allocate unique recording name")
 
 
 def _atomic_temp_path(final_path: Path) -> Path:
@@ -2234,17 +2253,23 @@ async def ws_transcribe(websocket: WebSocket):
     started_at = datetime.now()
     recovery_ctx: Optional[dict] = None
     try:
-        # Open inside the try so that any filesystem error (ENOSPC,
-        # EACCES, stale network mount) is caught by the finally below
-        # and the accepted WebSocket is still closed cleanly.
-        recovery_ctx = _open_live_recovery(
-            session_id=session_id,
-            started_at=started_at,
-            provider=provider,
-            model=model or ("nova-3" if provider == "deepgram" else "small"),
-            language=lang_opt or "auto",
-            archive_dir=archive_dir,
-        )
+        try:
+            recovery_ctx = _open_live_recovery(
+                session_id=session_id,
+                started_at=started_at,
+                provider=provider,
+                model=model or ("nova-3" if provider == "deepgram" else "small"),
+                language=lang_opt or "auto",
+                archive_dir=archive_dir,
+            )
+        except Exception as e:
+            recovery_ctx = None
+            logger.warning(
+                "live recovery disabled for session_id=%s: %s",
+                session_id,
+                e,
+                exc_info=True,
+            )
         if provider == "deepgram":
             dg_cfg = load_config()
             dg_key = (((dg_cfg.get("providers") or {}).get("deepgram") or {}).get("key") or "").strip()
@@ -2268,8 +2293,7 @@ async def ws_transcribe(websocket: WebSocket):
                         "error": "Deepgram API key is not configured",
                     },
                 )
-                if recovery_ctx is not None:
-                    recovery_ctx["had_error"] = True
+                _mark_recovery_error(recovery_ctx)
                 return
             await _run_deepgram_live_session(
                 websocket=websocket,
@@ -2290,8 +2314,7 @@ async def ws_transcribe(websocket: WebSocket):
         pass
     except Exception as e:
         if not _is_broken_pipe_error(e):
-            if recovery_ctx is not None:
-                recovery_ctx["had_error"] = True
+            _mark_recovery_error(recovery_ctx)
             logger.error("ws/transcribe fatal error: %s", e, exc_info=True)
             await _ws_send_json(
                 websocket,
@@ -2391,7 +2414,14 @@ def _open_live_recovery(
         raise
 
 
-def _record_recovery_chunk(recovery: dict, data: bytes) -> None:
+def _mark_recovery_error(recovery: Optional[dict]) -> None:
+    if recovery is not None:
+        recovery["had_error"] = True
+
+
+def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
+    if recovery is None:
+        return
     # Hard cap on the per-session recovery spool. Without this a user
     # who leaves a tab streaming overnight (or a runaway reconnect loop)
     # can fill a small SSD. We stop writing silently once the ceiling is
@@ -2558,7 +2588,7 @@ async def _run_local_live_session(
     websocket: WebSocket,
     model: str,
     language: Optional[str],
-    recovery: dict,
+    recovery: Optional[dict],
 ) -> None:
     """Drive the local faster-whisper assist pipeline for a live session."""
     if model not in ALLOWED_LOCAL_MODELS:
@@ -2587,7 +2617,7 @@ async def _run_local_live_session(
             if _is_broken_pipe_error(e):
                 logger.warning("ws local receiver broken pipe: %s", e)
             else:
-                recovery["had_error"] = True
+                _mark_recovery_error(recovery)
                 logger.error("ws local receiver error: %s", e, exc_info=True)
             stop.set()
 
@@ -2609,7 +2639,7 @@ async def _run_local_live_session(
                         and out.get("type") == "error"
                         and out.get("fatal")
                     ):
-                        recovery["had_error"] = True
+                        _mark_recovery_error(recovery)
                         stop.set()
                         return
                 try:
@@ -2620,7 +2650,7 @@ async def _run_local_live_session(
             if _is_broken_pipe_error(e):
                 logger.warning("ws local transcriber broken pipe: %s", e)
             else:
-                recovery["had_error"] = True
+                _mark_recovery_error(recovery)
                 logger.error("ws local transcriber error: %s", e, exc_info=True)
             stop.set()
 
@@ -2672,7 +2702,7 @@ async def _run_deepgram_live_session(
     model: str,
     language: str,
     diarize: bool,
-    recovery: dict,
+    recovery: Optional[dict],
 ) -> None:
     """Drive the Deepgram live streaming proxy for one recording.
 
@@ -2720,7 +2750,7 @@ async def _run_deepgram_live_session(
                 "error": _safe_error_text(e),
             },
         )
-        recovery["had_error"] = True
+        _mark_recovery_error(recovery)
         return
 
     stop = asyncio.Event()
@@ -2795,7 +2825,7 @@ async def _run_deepgram_live_session(
             if _is_broken_pipe_error(e):
                 logger.warning("ws deepgram receiver broken pipe: %s", e)
             else:
-                recovery["had_error"] = True
+                _mark_recovery_error(recovery)
                 logger.error("ws deepgram receiver error: %s", e, exc_info=True)
             stop.set()
 
@@ -2807,14 +2837,14 @@ async def _run_deepgram_live_session(
                     stop.set()
                     return
                 if event.get("type") == "error":
-                    recovery["had_error"] = True
+                    _mark_recovery_error(recovery)
                     if event.get("fatal"):
                         upstream_fatal = True
                         stop.set()
                         return
         except Exception as e:
             if not _is_broken_pipe_error(e):
-                recovery["had_error"] = True
+                _mark_recovery_error(recovery)
                 logger.error("ws deepgram forwarder error: %s", e, exc_info=True)
             stop.set()
 
@@ -2852,7 +2882,7 @@ async def _run_deepgram_live_session(
             # substrings, matching every other error envelope on this
             # endpoint.
             finalize_error = _safe_error_text(e)
-            recovery["had_error"] = True
+            _mark_recovery_error(recovery)
             logger.error("deepgram finalize failed: %s", e, exc_info=True)
             final_payload = {
                 "type": "final",
@@ -3056,10 +3086,21 @@ def _run_remote_transcribe_once(
     openrouter_model: str,
     cfg: Optional[dict] = None,
     cancel_event: Optional[threading.Event] = None,
+    progress_cb: Optional[Callable[[float], None]] = None,
 ) -> dict[str, Any]:
     def _raise_if_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise JobCancelledError("job cancelled")
+
+    def _set_progress(value: float) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(value)
+        except JobCancelledError:
+            raise
+        except Exception as e:
+            logger.debug("remote progress callback raised: %s", e)
 
     _raise_if_cancelled()
     if cfg is None:
@@ -3075,158 +3116,177 @@ def _run_remote_transcribe_once(
     ).strip()
 
     _raise_if_cancelled()
-    if audio_bytes is None and upload_path is not None:
-        audio_bytes = upload_path.read_bytes()
-    _raise_if_cancelled()
-
-    # ── ALWAYS pre-compress to 16 kHz mono Opus/WebM for remote ───────────
-    #
-    # User feedback (1 May 2026) after a 26.6 MB m4a uploaded to Deepgram
-    # tripped a "write operation timed out" error from cross-region (RU →
-    # us-east) link congestion: "все форматы должны превращаться в аудио
-    # и отправляться". The right answer is to ALWAYS pre-encode to a
-    # compact uniform format before the upload regardless of source
-    # container — m4a, mp3, wav, mp4 video, mkv, all of them.
-    #
-    # Why ALWAYS:
-    #   * Source size collapses 5-10× for typical inputs (e.g. 128 kbps
-    #     stereo m4a → 24 kbps mono Opus). The 26.6 MB / 28-min clip
-    #     above becomes ~5 MB. 5× shorter upload = far less likely to
-    #     trip provider socket-write timeouts on slow / congested links,
-    #     and bandwidth-cost-per-transcription drops proportionally.
-    #   * Container quirks (mp4 with multiple audio tracks, m4a with
-    #     unusual moov-atom placement, mkv with VP9 video that confuses
-    #     Deepgram's container sniffer) are all eliminated — Deepgram
-    #     and OpenRouter both reliably decode webm/opus.
-    #   * ffmpeg overhead is ~1-3 s for tiny files, ~10-30 s for hour-
-    #     long files — always smaller than the upload time savings on
-    #     anything but a LAN-fast link, and on a LAN-fast link the
-    #     overhead is invisible.
-    #
-    # The pre-existing "video extraction" branch is now redundant —
-    # ``compact_audio_for_remote`` does the right thing for video too
-    # (ffmpeg's ``-i`` accepts every container including video; the
-    # output is always opus/webm regardless).
-    if audio_bytes is not None:
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="transcribe_compact_") as _td:
-            _orig_ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else ""
-            _src = Path(_td) / f"src.{_orig_ext or 'bin'}"
-            _src.write_bytes(audio_bytes)
-            _dst = Path(_td) / "out.webm"
-            try:
-                _raise_if_cancelled()
-                compact_audio_for_remote(
-                    str(_src),
-                    str(_dst),
-                    cancel_event=cancel_event,
-                )
-                _raise_if_cancelled()
-                audio_bytes = _dst.read_bytes()
-                # Update orig_name so the downstream Content-Type
-                # mapping in remote_deepgram / remote_openrouter sees
-                # ``.webm`` and labels the body ``audio/webm``. Without
-                # this Deepgram receives ``audio/x-m4a`` for what is
-                # actually opus/webm bytes and rejects with HTTP 400.
-                _stem = orig_name.rsplit(".", 1)[0] if "." in orig_name else orig_name
-                orig_name = f"{_stem}.webm"
-            except AudioError as e:
-                _err_text = str(e).lower()
-                # GRACEFUL DEGRADATION when ffmpeg is missing: a fresh
-                # Windows install (or a corp environment that blocks
-                # winget) may not have ffmpeg yet. Rather than failing
-                # the entire remote-transcribe with HTTP 502, fall back
-                # to sending the raw bytes — Deepgram accepts most
-                # common containers (m4a, mp3, wav, mp4) directly via
-                # mime sniffing. The user pays the slow-upload tax we
-                # tried to avoid (uncompressed body) but DOES get a
-                # transcript, which is the user-visible product
-                # contract. ffmpeg-required failure paths (genuinely
-                # corrupted input, codec mismatch) are still raised as
-                # RemoteError so the user sees an actionable message.
-                if "ffmpeg is not installed" in _err_text:
-                    # 1.1.25 fix: previous comment claimed "Deepgram
-                    # accepts most common containers" but the
-                    # ALLOWED_AUDIO_EXTS list includes containers
-                    # Deepgram REST does NOT accept without an ffmpeg
-                    # demux (.wma, .mkv, .avi, .mov, .m4v, .mpg,
-                    # .mpeg, .3gp, .opus, .ogg, .oga, .webm, .flac).
-                    # Sending those raw produced an opaque Deepgram
-                    # 400 ("invalid audio data") that the user
-                    # couldn't act on. Now: if the original extension
-                    # is in the Deepgram-native subset (wav/mp3/m4a/
-                    # mp4/aac), graceful-degrade as before; otherwise
-                    # raise a clear "install ffmpeg" RemoteError so
-                    # the user sees an actionable message instead of
-                    # a confusing upstream 400.
-                    _DEEPGRAM_NATIVE_EXTS = {"wav", "mp3", "m4a", "mp4", "aac"}
-                    if _orig_ext not in _DEEPGRAM_NATIVE_EXTS:
-                        raise RemoteError(
-                            "ffmpeg is required to upload "
-                            f".{_orig_ext or 'unknown'} files; install ffmpeg "
-                            "(brew install ffmpeg / winget install Gyan.FFmpeg) "
-                            "and retry, or upload as wav/mp3/m4a/mp4/aac."
-                        ) from e
-                    logger.warning(
-                        "ffmpeg missing — sending raw audio body "
-                        "(%d bytes, ext=%s) without compression. Install "
-                        "ffmpeg to halve upload time on slow links.",
-                        len(audio_bytes), _orig_ext,
-                    )
-                    # Leave audio_bytes + orig_name unchanged. Fall
-                    # through to the provider call with the original
-                    # bytes and original mime mapping.
-                else:
-                    # Genuine conversion failure (corrupt input, codec
-                    # mismatch, ffmpeg crash). Surface so the endpoint
-                    # catch maps to HTTP 502 with an actionable detail.
-                    raise RemoteError(f"audio compression failed: {e}") from e
-
-    _raise_if_cancelled()
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("openrouter") or {}
         model = (
             openrouter_model or pref.get("model") or "google/gemini-2.5-flash"
         ).strip()
-        out = openrouter_transcribe(
-            api_key=or_key,
-            model=model,
-            audio_bytes=audio_bytes,
-            filename=orig_name,
-        )
-        _raise_if_cancelled()
-        return {
-            "provider": "openrouter",
-            "model": model,
-            "text": (out.get("text") or "").strip(),
-            "raw": out.get("raw"),
-        }
 
-    if prov == "deepgram":
+        def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
+            out = openrouter_transcribe(
+                api_key=or_key,
+                model=model,
+                audio_bytes=payload,
+                filename=filename,
+            )
+            return {
+                "provider": "openrouter",
+                "model": model,
+                "text": (out.get("text") or "").strip(),
+                "raw": out.get("raw"),
+            }
+
+    elif prov == "deepgram":
         dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
         model = (openrouter_model or "nova-3").strip()
-        out = deepgram_transcribe(
-            api_key=dg_key,
-            audio_bytes=audio_bytes,
-            filename=orig_name,
-            model=model,
-            language=language,
-            diarize=bool(diarize),
-        )
-        _raise_if_cancelled()
-        return {
-            "provider": "deepgram",
-            "model": model,
-            "text": (out.get("text") or "").strip(),
-            "raw": out.get("raw"),
-        }
 
-    # Bad input → ValueError (translates to HTTP 400 at the endpoints).
-    # Bare Exception would have been caught by the generic "Remote
-    # transcription failed" branch and surfaced as 500, misleading
-    # the client into retrying an unrecoverable validation error.
-    raise ValueError(f"Unknown provider: {prov!r}")
+        def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
+            out = deepgram_transcribe(
+                api_key=dg_key,
+                audio_bytes=payload,
+                filename=filename,
+                model=model,
+                language=language,
+                diarize=bool(diarize),
+            )
+            return {
+                "provider": "deepgram",
+                "model": model,
+                "text": (out.get("text") or "").strip(),
+                "raw": out.get("raw"),
+            }
+
+    else:
+        # Bad input → ValueError (translates to HTTP 400 at the endpoints).
+        # Bare Exception would have been caught by the generic "Remote
+        # transcription failed" branch and surfaced as 500, misleading
+        # the client into retrying an unrecoverable validation error.
+        raise ValueError(f"Unknown provider: {prov!r}")
+
+    if audio_bytes is None and upload_path is None:
+        raise ValueError("audio input is required")
+
+    _raise_if_cancelled()
+    with tempfile.TemporaryDirectory(prefix="transcribe_remote_") as _td:
+        work_dir = Path(_td)
+        orig_ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else ""
+        source_path = upload_path
+        source_size = 0
+        if source_path is not None:
+            try:
+                source_size = source_path.stat().st_size
+            except OSError:
+                source_size = 0
+        else:
+            source_size = len(audio_bytes or b"")
+            source_path = work_dir / f"src.{orig_ext or 'bin'}"
+            source_path.write_bytes(audio_bytes or b"")
+
+        chunks_dir = work_dir / "chunks"
+        stem = orig_name.rsplit(".", 1)[0] if "." in orig_name else orig_name
+        try:
+            _set_progress(0.18)
+            chunk_paths = compact_audio_chunks_for_remote(
+                str(source_path),
+                str(chunks_dir),
+                chunk_sec=REMOTE_TRANSCRIBE_CHUNK_SEC,
+                cancel_event=cancel_event,
+            )
+            _raise_if_cancelled()
+            _set_progress(0.30)
+        except AudioError as e:
+            err_text = str(e).lower()
+            native_exts = {"wav", "mp3", "m4a", "mp4", "aac"}
+            if "ffmpeg is not installed" not in err_text:
+                raise RemoteError(f"audio compression failed: {e}") from e
+            if orig_ext not in native_exts or source_size > REMOTE_RAW_FALLBACK_MAX_BYTES:
+                raise RemoteError(
+                    "ffmpeg is required for reliable remote transcription of "
+                    f".{orig_ext or 'unknown'} files over "
+                    f"{REMOTE_RAW_FALLBACK_MAX_BYTES // (1024 * 1024)} MB; "
+                    "install ffmpeg and retry, or switch Provider to local."
+                ) from e
+            logger.warning(
+                "ffmpeg missing — sending small raw audio body "
+                "(%d bytes, ext=%s) without compression",
+                source_size,
+                orig_ext,
+            )
+            payload = audio_bytes if audio_bytes is not None else source_path.read_bytes()
+            result = _provider_call(payload or b"", orig_name)
+            _raise_if_cancelled()
+            _set_progress(0.92)
+            return result
+
+        total_chunk_bytes = 0
+        chunk_sizes: list[int] = []
+        for p in chunk_paths:
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                size = 0
+            total_chunk_bytes += size
+            chunk_sizes.append(size)
+        logger.info(
+            "remote_transcribe: provider=%s model=%s source_bytes=%d chunks=%d "
+            "chunk_sec=%d compact_bytes=%d max_chunk_bytes=%d",
+            prov,
+            model,
+            source_size,
+            len(chunk_paths),
+            REMOTE_TRANSCRIBE_CHUNK_SEC,
+            total_chunk_bytes,
+            max(chunk_sizes or [0]),
+        )
+
+        if len(chunk_paths) == 1:
+            payload = Path(chunk_paths[0]).read_bytes()
+            result = _provider_call(payload, f"{stem}.webm")
+            _raise_if_cancelled()
+            _set_progress(0.92)
+            return result
+
+        text_parts: list[str] = []
+        raw_chunks: list[dict[str, Any]] = []
+        for idx, chunk_path in enumerate(chunk_paths):
+            _raise_if_cancelled()
+            payload = Path(chunk_path).read_bytes()
+            chunk_name = f"{stem}.part{idx + 1:04d}.webm"
+            logger.info(
+                "remote_transcribe: chunk %d/%d provider=%s bytes=%d",
+                idx + 1,
+                len(chunk_paths),
+                prov,
+                len(payload),
+            )
+            result = _provider_call(payload, chunk_name)
+            _raise_if_cancelled()
+            text = (result.get("text") or "").strip()
+            if text:
+                text_parts.append(text)
+            raw_chunks.append(
+                {
+                    "index": idx,
+                    "filename": chunk_name,
+                    "bytes": len(payload),
+                    "raw": result.get("raw"),
+                }
+            )
+            _set_progress(0.30 + ((idx + 1) / max(1, len(chunk_paths))) * 0.62)
+
+        return {
+            "provider": prov,
+            "model": model,
+            "text": "\n\n".join(text_parts).strip(),
+            "raw": {
+                "chunked": True,
+                "chunk_seconds": REMOTE_TRANSCRIBE_CHUNK_SEC,
+                "source_bytes": source_size,
+                "compact_bytes": total_chunk_bytes,
+                "chunks": raw_chunks,
+            },
+        }
 
 
 @app.post("/api/remote/jobs")
@@ -3275,6 +3335,10 @@ async def create_remote_job(
                 num_speakers=num_speakers,
                 openrouter_model=openrouter_model,
                 cancel_event=cancel_event,
+                progress_cb=lambda value: (
+                    jobs.raise_if_cancelled(job_id),
+                    jobs.set_progress(job_id, value),
+                ),
             )
 
             _check_cancelled()
@@ -3307,6 +3371,12 @@ async def create_remote_job(
             # with_retry on network-layer failures (DNS, TCP reset, TLS,
             # HTTP timeout). Listing only subclasses here would miss
             # network errors and surface them as opaque HTTP 500s.
+            logger.warning(
+                "remote transcription provider error (job_id=%s provider=%s): %s",
+                job_id,
+                provider_norm or "config-default",
+                e,
+            )
             jobs.set_error(job_id, _safe_error_text(e))
         except Exception as e:
             logger.exception("remote transcription job failed (job_id=%s)", job_id)
@@ -3337,33 +3407,10 @@ async def remote_transcribe_sync(
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
-    # Read audio bytes into memory for speed, but enforce the same
-    # MAX_UPLOAD_BYTES ceiling that _save_upload_file uses — without
-    # this a 2 GB file would be fully loaded into the Python heap,
-    # causing an OOM that kills the backend and all ongoing sessions.
-    # Use a bytearray (O(N) amortised append) instead of immutable bytes
-    # concatenation (O(N²) — reallocates the full prefix on every chunk).
-    # For a 500 MB file that difference is ~125 GB of transient heap vs
-    # ~500 MB, which the OOM killer resolves before the ceiling guard fires.
-    # Streaming chunk read. ``UploadFile`` exposes ``await file.read(N)``
-    # — NOT ``async for chunk in file`` (Starlette removed __aiter__ in
-    # 0.36; the previous form raised TypeError on every Upload-tab POST,
-    # surfacing as HTTP 500 with a 1400-char-truncated traceback in
-    # main.log that hid the real cause for hours).
-    _upload_buf = bytearray()
-    _CHUNK_SIZE = 1024 * 1024  # 1 MiB
-    while True:
-        chunk = await file.read(_CHUNK_SIZE)
-        if not chunk:
-            break
-        _upload_buf.extend(chunk)
-        if len(_upload_buf) > MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
-            )
-    audio_bytes = bytes(_upload_buf)
-    del _upload_buf
+    request_id = str(uuid.uuid4())
+    upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
+    await _save_upload_file(file, upload_path)
+
     lang_opt = _normalize_language(language)
     cfg = load_config()
     loop = asyncio.get_running_loop()
@@ -3375,7 +3422,7 @@ async def remote_transcribe_sync(
             None,
             lambda: _run_remote_transcribe_once(
                 provider_norm=provider_norm,
-                audio_bytes=audio_bytes,
+                upload_path=upload_path,
                 orig_name=orig_name,
                 language=lang_opt,
                 diarize=diarize,
@@ -3395,6 +3442,11 @@ async def remote_transcribe_sync(
     except Exception as e:
         logger.exception("remote_transcribe_sync failed")
         raise HTTPException(status_code=500, detail=f"Remote transcription failed: {_safe_error_text(e)}")
+    finally:
+        try:
+            os.remove(upload_path)
+        except OSError as e:
+            logger.debug("remote sync upload cleanup skipped for %s: %s", upload_path, e)
 
 
 @app.post("/api/recordings/{recording_name}/transcribe-on-disk")
@@ -3441,12 +3493,12 @@ async def transcribe_recording_on_disk(
     if audio_path is None:
         raise HTTPException(status_code=404, detail="recording audio not found")
     try:
-        audio_bytes = audio_path.read_bytes()
+        audio_size = audio_path.stat().st_size
     except OSError as e:
-        raise HTTPException(status_code=500, detail=f"failed to read audio: {_safe_error_text(e)}")
-    if len(audio_bytes) == 0:
+        raise HTTPException(status_code=500, detail=f"failed to stat audio: {_safe_error_text(e)}")
+    if audio_size == 0:
         raise HTTPException(status_code=500, detail="audio file is empty")
-    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+    if audio_size > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
             detail=f"audio too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
@@ -3459,7 +3511,7 @@ async def transcribe_recording_on_disk(
             None,
             lambda: _run_remote_transcribe_once(
                 provider_norm=provider_norm,
-                audio_bytes=audio_bytes,
+                upload_path=audio_path,
                 orig_name=audio_path.name,
                 language=lang_opt,
                 diarize=bool(payload.get("diarize") or False),
@@ -4375,7 +4427,8 @@ def save_recording(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        out = target_dir / _recording_filename(title)
+        stem = _unique_recording_stem(target_dir, title)
+        out = target_dir / f"{stem}.txt"
     _write_recording_text_file(
         out=out,
         title=title,
@@ -4431,7 +4484,7 @@ async def save_recording_with_audio(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem = _recording_stem(safe_title)
+        stem = _unique_recording_stem(target_dir, safe_title)
 
     out_text = target_dir / f"{stem}.txt"
     out_audio = target_dir / f"{stem}{ext}"

@@ -1,0 +1,126 @@
+import importlib
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+def _fresh_main_module(data_dir: str):
+    os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
+    os.environ["TRANSCRIPTOR_DATA_DIR"] = data_dir
+    for name in ("backend.main", "backend.config"):
+        sys.modules.pop(name, None)
+    return importlib.import_module("backend.main")
+
+
+class RemoteChunkingTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.main = _fresh_main_module(self._tmp.name)
+
+    def tearDown(self):
+        try:
+            self.main.jobs.shutdown(timeout=0.1)
+        except Exception:
+            pass
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
+        self._tmp.cleanup()
+
+    def test_remote_transcribe_sends_chunks_and_merges_in_order(self):
+        source = Path(self._tmp.name) / "source.mp4"
+        source.write_bytes(b"source-video-bytes")
+        calls = []
+
+        def fake_compact(path_in, output_dir, *, chunk_sec, cancel_event=None):
+            self.assertEqual(path_in, str(source))
+            self.assertEqual(chunk_sec, self.main.REMOTE_TRANSCRIBE_CHUNK_SEC)
+            out_dir = Path(output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            paths = []
+            for idx, payload in enumerate((b"one", b"two", b"three")):
+                p = out_dir / f"chunk_{idx:05d}.webm"
+                p.write_bytes(payload)
+                paths.append(str(p))
+            return paths
+
+        def fake_deepgram_transcribe(**kwargs):
+            calls.append(
+                {
+                    "filename": kwargs["filename"],
+                    "bytes": kwargs["audio_bytes"],
+                    "language": kwargs["language"],
+                    "diarize": kwargs["diarize"],
+                }
+            )
+            return {
+                "text": f"text:{kwargs['filename']}",
+                "raw": {"filename": kwargs["filename"]},
+            }
+
+        progress = []
+        with mock.patch.object(
+            self.main,
+            "compact_audio_chunks_for_remote",
+            side_effect=fake_compact,
+        ), mock.patch.object(
+            self.main,
+            "deepgram_transcribe",
+            side_effect=fake_deepgram_transcribe,
+        ):
+            result = self.main._run_remote_transcribe_once(
+                provider_norm="deepgram",
+                upload_path=source,
+                orig_name="long.mp4",
+                language="ru",
+                diarize=True,
+                num_speakers="",
+                openrouter_model="nova-3",
+                cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
+                progress_cb=progress.append,
+            )
+
+        self.assertEqual(
+            [c["filename"] for c in calls],
+            ["long.part0001.webm", "long.part0002.webm", "long.part0003.webm"],
+        )
+        self.assertEqual([c["bytes"] for c in calls], [b"one", b"two", b"three"])
+        self.assertTrue(all(c["language"] == "ru" for c in calls))
+        self.assertTrue(all(c["diarize"] for c in calls))
+        self.assertEqual(result["provider"], "deepgram")
+        self.assertEqual(result["model"], "nova-3")
+        self.assertEqual(
+            result["text"],
+            "text:long.part0001.webm\n\n"
+            "text:long.part0002.webm\n\n"
+            "text:long.part0003.webm",
+        )
+        self.assertTrue(result["raw"]["chunked"])
+        self.assertEqual(len(result["raw"]["chunks"]), 3)
+        self.assertGreaterEqual(progress[0], 0.18)
+        self.assertGreaterEqual(progress[-1], 0.9)
+
+    def test_live_recovery_helpers_are_optional(self):
+        self.main._record_recovery_chunk(None, b"pcm")
+        self.main._mark_recovery_error(None)
+
+    def test_unique_recording_stem_skips_existing_stem(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        first = self.main._unique_recording_stem(target, "same title")
+        (target / f"{first}.txt").write_text("existing", encoding="utf-8")
+
+        with mock.patch.object(self.main, "_recording_stem", return_value=first):
+            second = self.main._unique_recording_stem(target, "same title")
+
+        self.assertNotEqual(second, first)
+        self.assertTrue(second.startswith(first + "-"))
+        self.assertFalse((target / f"{second}.txt").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

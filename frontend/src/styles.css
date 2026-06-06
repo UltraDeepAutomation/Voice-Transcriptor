@@ -3277,7 +3277,8 @@ canvas,
   line-height: 1.45;
 }
 
-.upload-queue-clear {
+.upload-queue-clear,
+.upload-queue-hide {
   font-size: 11px;
   padding: 4px 10px;
 }
@@ -3322,6 +3323,19 @@ canvas,
   gap: 10px;
   justify-content: space-between;
 }
+
+.upload-queue-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
+}
+
+.upload-queue-status-dot--queued { background: #f4c542; }
+.upload-queue-status-dot--transcribing { background: #5aa9ff; }
+.upload-queue-status-dot--done { background: #62c77b; }
+.upload-queue-status-dot--error { background: #ff6767; }
 
 .upload-queue-item-meta {
   display: flex;
@@ -3524,4 +3538,3 @@ canvas,
   font-size: 12px;
   color: var(--text-2, #6b7280);
 }
-

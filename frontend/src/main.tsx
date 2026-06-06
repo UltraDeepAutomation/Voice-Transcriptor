@@ -413,6 +413,9 @@ const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
   "mp4", "m4v", "mov", "mkv", "avi", "mpg", "mpeg", "3gp",
 ]);
 const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
+const UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
+const UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200;
+const UPLOAD_QUEUE_MAX_PARALLEL = 2;
 const OPENROUTER_AUDIO_MODELS = [
   "google/gemini-2.5-flash",
   "google/gemini-2.0-flash-lite",
@@ -789,7 +792,8 @@ function setLatestSavedAudio(state: LatestSavedAudioState | null): void {
   renderLatestSavedAudio();
 }
 
-function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir = "", _sessionToken = ""): void {
+function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir = "", sessionToken = ""): void {
+  if (sessionToken && !isCurrentUiSession(sessionToken)) return;
   if (!file) {
     setLatestSavedAudio(null);
     return;
@@ -4569,64 +4573,53 @@ function flashButtonFeedback(btn: HTMLButtonElement, copiedLabel: string, defaul
   }, 900);
 }
 
+async function writeTextToClipboard(text: string): Promise<boolean> {
+  const value = String(text || "");
+  if (!value) return false;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch (e) {
+    console.debug("navigator.clipboard.writeText failed; trying fallback", e);
+  }
+
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "true");
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  ta.style.top = "0";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  try {
+    ta.focus();
+    ta.select();
+    return document.execCommand("copy") === true;
+  } catch (e) {
+    console.warn("execCommand copy fallback failed", e);
+    return false;
+  } finally {
+    ta.remove();
+  }
+}
+
 async function copyRecordingText(): Promise<void> {
   const text = ($("recordingContent").textContent || "").trim();
   if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    // Fallback path for browsers that block ``navigator.clipboard`` (Safari
-    // private mode, http: origins on old Chromium, denied user permission).
-    // ``execCommand("copy")`` can itself throw in those same environments
-    // — wrap in try/finally so the detached <textarea> is guaranteed to be
-    // removed from the DOM even if the copy itself fails. Otherwise a
-    // repeated copy attempt accumulates invisible <textarea> ghosts that
-    // leak memory and can interfere with focus management.
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    try {
-      ta.focus();
-      ta.select();
-      document.execCommand("copy");
-    } catch (e) {
-      console.warn("execCommand copy fallback failed", e);
-    } finally {
-      ta.remove();
-    }
-  }
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
-  flashButtonFeedback(btn, "Copied", "Copy recording text");
+  const ok = await writeTextToClipboard(text);
+  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", "Copy recording text");
 }
 
 async function copyTextContent(text: string, btnId = ""): Promise<void> {
   const value = String(text || "").trim();
   if (!value) return;
-  try {
-    await navigator.clipboard.writeText(value);
-  } catch {
-    // See copyRecordingText for the rationale behind the try/finally
-    // wrapper — guarantees the fallback <textarea> is always removed.
-    const ta = document.createElement("textarea");
-    ta.value = value;
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    try {
-      ta.focus();
-      ta.select();
-      document.execCommand("copy");
-    } catch (e) {
-      console.warn("execCommand copy fallback failed", e);
-    } finally {
-      ta.remove();
-    }
-  }
+  const ok = await writeTextToClipboard(value);
   if (btnId) {
     const btn = $(btnId) as HTMLButtonElement;
-    flashButtonFeedback(btn, "Copied", btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text");
+    flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text");
   }
 }
 
@@ -5603,6 +5596,7 @@ let liveTranscriptSegments: TranscriptSegment[] = [];
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 let stopTransitionInFlight = false;
+let stopTransitionOwnerToken = "";
 // Synchronous guard set at the top of startLive BEFORE any await.  This
 // prevents a second startLive call from racing through the same
 // `if (isBusy)` check while the first call is still awaiting the
@@ -6667,7 +6661,9 @@ async function waitForWorkletDrain(
 async function stopLive(enhance: boolean): Promise<void> {
   if (stopTransitionInFlight) return;
   if (!isRecording) return;
+  const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
+  stopTransitionOwnerToken = stopTransitionToken;
   // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
   // ``finally`` block can close the WS AFTER the entire transcribe
   // phase finishes (envelope wait, recovery race, save). The
@@ -6676,6 +6672,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   // backend's post-CloseStream is_final emission and truncate the
   // tail.
   let _wsToCloseAtEnd: WebSocket | null = null;
+  let stopTransitionReleased = false;
+  let stoppedRecordingId = 0;
   // Wrap the entire body in try/finally so the in-flight guard is ALWAYS
   // cleared, even if a pre-main-try await (flushWorkletPort / waitForWorklet
   // Drain / stopMediaRecorderAndFlush / pcmSink.finalize / selectCanonical
@@ -6685,8 +6683,20 @@ async function stopLive(enhance: boolean): Promise<void> {
   // = true forever, permanently blocking all future stopLive calls.
   try {
   const recordingId = currentRecordingId;
+  stoppedRecordingId = recordingId;
   const liveSessionId = activeLiveSessionId;
   const sessionUiToken = liveSessionId;
+  const releaseStopTransitionForNextRecording = (): void => {
+    if (stopTransitionReleased) return;
+    stopTransitionReleased = true;
+    if (stopTransitionOwnerToken === stopTransitionToken) {
+      stopTransitionInFlight = false;
+      stopTransitionOwnerToken = "";
+    }
+    setBusy(false, sessionUiToken);
+    const stopBtn = document.getElementById("btnStop") as HTMLButtonElement | null;
+    if (stopBtn) stopBtn.disabled = true;
+  };
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
   // ── transcription-latency timer ───────────────────────────────────
@@ -7073,6 +7083,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (savedAudioFile) {
     setCurrentRecordingAudio(savedAudioFile, "", sessionArchiveDir, sessionUiToken);
   }
+  releaseStopTransitionForNextRecording();
 
   let persistedRecordingName = "";
   let persistedRecordingArchiveDir = "";
@@ -8135,17 +8146,18 @@ async function stopLive(enhance: boolean): Promise<void> {
     };
   }
   } finally {
-    // Cleared at the very END of stopLive so a new startLive → stopLive
-    // cannot race with in-flight save/transcribe/upscale work and corrupt
-    // module-level state. The outer try/finally guarantees the flag is
-    // cleared on EVERY exit path — including uncaught throws from the
-    // pre-main-try awaits — so a single crash never permanently bricks
-    // the stop state machine.
-    stopTransitionInFlight = false;
+    // Usually cleared earlier once capture globals have been detached,
+    // so the next recording can start while this session saves/transcribes.
+    // Keep this final assignment as the crash-proof fallback for exceptions
+    // before that release point.
+    if (stopTransitionOwnerToken === stopTransitionToken) {
+      stopTransitionInFlight = false;
+      stopTransitionOwnerToken = "";
+    }
     // Guarantee id is 0 even if an uncaught throw happened before the
     // in-body reset above — a stale id would confuse the overlay's
     // post-stop task guard on the next recording start.
-    if (currentRecordingId !== 0) {
+    if (stoppedRecordingId > 0 && currentRecordingId === stoppedRecordingId) {
       currentRecordingId = 0;
       window.__transcriptorCurrentRecordingId = 0;
     }
@@ -9324,22 +9336,50 @@ if (_bootRetry) {
 // the upload tab automatically.
 //
 // Flow per file:
-//   1. enqueueUploadFile(file) — validate size + push to queue +
-//      kick the single-flight processor.
+//   1. enqueueUploadFile(file) — validate size + insert at the top +
+//      kick the bounded parallel processor.
 //   2. processUploadItem(item) — provider-aware transcribe call.
 //      Auto-falls back to local when the chosen remote provider has
 //      no key (rather than silently failing per-item).
-//   3. saveRecordingText({audioFile: item.file, …}) — persist into
+//   3. saveRecordingText({audioFile: sourceFile, …}) — persist into
 //      the same archive the History tab reads, so the recording
 //      shows up in History without an extra round-trip.
 //   4. renderUploadQueue() — re-render the right pane.
 //
-// One processor at a time (uploadProcessorRunning latch) — keeps
-// CPU + bandwidth predictable, avoids thrashing the threadpool.
+// Bounded processor pool — upload/transcribe work should not serialize
+// behind one long video, but it also must not saturate every backend
+// worker while the user is recording.
+
+type UploadQueueStatus = "queued" | "transcribing" | "done" | "error" | "cancelled";
+
+interface UploadQueueSnapshotItem {
+  id: string;
+  displayName: string;
+  sizeBytes: number;
+  status: UploadQueueStatus;
+  text?: string;
+  error?: string;
+  startedAt?: number;
+  endedAt?: number;
+  completedAt?: number;
+  provider?: Provider;
+  model?: string;
+  language?: string;
+  savedName?: string;
+  savedArchiveDir?: string;
+}
+
+interface UploadQueueStoragePayload {
+  version: 1;
+  hideFinished: boolean;
+  items: UploadQueueSnapshotItem[];
+}
 
 interface UploadQueueItem {
   id: string;
-  file: File;
+  file?: File;
+  displayName: string;
+  sizeBytes: number;
   // ``stage`` is a finer-grained signal than ``status`` — multiple
   // stages share the same outer ``status`` of "transcribing" but
   // surface different labels in the queue UI:
@@ -9348,7 +9388,7 @@ interface UploadQueueItem {
   //   processing → Processing … (backend is decoding video / running
   //                Deepgram REST / OpenRouter audio model)
   //   none      → status's own label (done/error/cancelled)
-  status: "queued" | "transcribing" | "done" | "error" | "cancelled";
+  status: UploadQueueStatus;
   stage?: "queued" | "uploading" | "processing" | "done";
   /**
    * 0..1 fraction of known upload progress. Browser fetch does not
@@ -9360,6 +9400,7 @@ interface UploadQueueItem {
   error?: string;
   startedAt?: number;
   endedAt?: number;
+  completedAt?: number;
   provider?: Provider;
   model?: string;
   language?: string;
@@ -9374,7 +9415,9 @@ interface UploadQueueItem {
 let uploadSelectedId: string | null = null;
 
 const uploadQueue: UploadQueueItem[] = [];
-let uploadProcessorRunning = false;
+let uploadActiveProcessors = 0;
+let uploadProcessorPumpScheduled = false;
+let uploadHideFinished = false;
 // Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
 // which mirrors backend MAX_UPLOAD_BYTES via /api/health. Even though
 // the backend later demuxes audio out of video containers, it still has
@@ -9394,6 +9437,108 @@ function uploadFileSizeCap(): number {
 // now a one-line change in ACCEPTED_AUDIO_VIDEO_EXTS.
 const UPLOAD_ALLOWED_EXTS = ACCEPTED_AUDIO_VIDEO_EXTS;
 
+function uploadItemName(item: UploadQueueItem): string {
+  return String(item.displayName || item.file?.name || "Uploaded file");
+}
+
+function uploadItemSize(item: UploadQueueItem): number {
+  const size = Number(item.sizeBytes || item.file?.size || 0);
+  return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+function isUploadTerminalStatus(status: UploadQueueStatus): boolean {
+  return status === "done" || status === "error" || status === "cancelled";
+}
+
+function isUploadPastItem(item: UploadQueueItem): boolean {
+  return isUploadTerminalStatus(item.status);
+}
+
+function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem {
+  return {
+    id: item.id,
+    displayName: uploadItemName(item),
+    sizeBytes: uploadItemSize(item),
+    status: item.status,
+    text: item.text || "",
+    error: item.error || "",
+    startedAt: item.startedAt,
+    endedAt: item.endedAt,
+    completedAt: item.completedAt,
+    provider: item.provider || "",
+    model: item.model || "",
+    language: item.language || "",
+    savedName: item.savedName || "",
+    savedArchiveDir: item.savedArchiveDir || "",
+  };
+}
+
+function saveUploadQueueSnapshot(): void {
+  try {
+    const payload: UploadQueueStoragePayload = {
+      version: 1,
+      hideFinished: uploadHideFinished,
+      items: uploadQueue
+        .slice(0, UPLOAD_QUEUE_MAX_PERSISTED_ITEMS)
+        .map(uploadQueueSnapshotItem),
+    };
+    localStorage.setItem(UPLOAD_QUEUE_STORAGE_KEY, JSON.stringify(payload));
+  } catch (e) {
+    console.warn("Upload queue snapshot save failed", e);
+  }
+}
+
+function restoreUploadQueueSnapshot(): void {
+  let raw = "";
+  try {
+    raw = localStorage.getItem(UPLOAD_QUEUE_STORAGE_KEY) || "";
+  } catch (e) {
+    console.warn("Upload queue snapshot read failed", e);
+    return;
+  }
+  if (!raw) return;
+  try {
+    const payload = JSON.parse(raw) as Partial<UploadQueueStoragePayload>;
+    uploadHideFinished = payload.hideFinished === true;
+    const restored = Array.isArray(payload.items) ? payload.items : [];
+    uploadQueue.splice(0, uploadQueue.length);
+    for (const src of restored.slice(0, UPLOAD_QUEUE_MAX_PERSISTED_ITEMS)) {
+      const displayName = String(src.displayName || "").trim();
+      if (!displayName) continue;
+      const status = String(src.status || "error") as UploadQueueStatus;
+      const interrupted = status === "queued" || status === "transcribing";
+      uploadQueue.push({
+        id: String(src.id || createClientSessionId()),
+        displayName,
+        sizeBytes: Number(src.sizeBytes || 0),
+        status: interrupted ? "error" : (isUploadTerminalStatus(status) ? status : "error"),
+        text: String(src.text || ""),
+        error: interrupted
+          ? "Interrupted by app restart before this file finished."
+          : String(src.error || ""),
+        startedAt: typeof src.startedAt === "number" ? src.startedAt : undefined,
+        endedAt: typeof src.endedAt === "number" ? src.endedAt : undefined,
+        completedAt: typeof src.completedAt === "number"
+          ? src.completedAt
+          : (interrupted ? Date.now() : undefined),
+        provider: (src.provider || "") as Provider,
+        model: String(src.model || ""),
+        language: String(src.language || ""),
+        savedName: String(src.savedName || ""),
+        savedArchiveDir: String(src.savedArchiveDir || ""),
+      });
+    }
+    saveUploadQueueSnapshot();
+  } catch (e) {
+    console.warn("Upload queue snapshot parse failed", e);
+  }
+}
+
+function addUploadQueueItem(item: UploadQueueItem): void {
+  uploadQueue.unshift(item);
+  saveUploadQueueSnapshot();
+}
+
 function setupUploadView(): void {
   const dropZone = document.getElementById("uploadLargeDrop");
   const fileInput = document.getElementById("uploadLargeFileInput") as HTMLInputElement | null;
@@ -9401,6 +9546,7 @@ function setupUploadView(): void {
   const language = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   const diarize = document.getElementById("uploadDiarize") as HTMLInputElement | null;
   if (!dropZone || !fileInput || !provider || !language) return;
+  restoreUploadQueueSnapshot();
   // Persist Upload-tab state across launches. Without this every
   // app start reset the provider to the HTML default ("Deepgram")
   // even when the user routinely worked with Local Whisper or
@@ -9487,6 +9633,15 @@ function setupUploadView(): void {
           uploadQueue.splice(i, 1);
         }
       }
+      saveUploadQueueSnapshot();
+      renderUploadQueue();
+    });
+  }
+  const hideBtn = document.getElementById("uploadQueueHideBtn") as HTMLButtonElement | null;
+  if (hideBtn) {
+    hideBtn.addEventListener("click", () => {
+      uploadHideFinished = !uploadHideFinished;
+      saveUploadQueueSnapshot();
       renderUploadQueue();
     });
   }
@@ -9539,9 +9694,11 @@ function enqueueUploadFile(file: File): void {
   // saves the upload time + spares the server.
   const cap = uploadFileSizeCap();
   if (file.size > cap) {
-    uploadQueue.push({
+    addUploadQueueItem({
       id: createClientSessionId(),
       file,
+      displayName: file.name,
+      sizeBytes: file.size,
       status: "error",
       error: `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`,
     });
@@ -9553,32 +9710,44 @@ function enqueueUploadFile(file: File): void {
   // basically all common audio + video containers.
   const ext = (file.name.split(".").pop() || "").toLowerCase();
   if (ext && !UPLOAD_ALLOWED_EXTS.has(ext)) {
-    uploadQueue.push({
+    addUploadQueueItem({
       id: createClientSessionId(),
       file,
+      displayName: file.name,
+      sizeBytes: file.size,
       status: "error",
       error: `Unsupported file type ".${ext}". Drop an audio or video file.`,
     });
     renderUploadQueue();
     return;
   }
-  uploadQueue.push({ id: createClientSessionId(), file, status: "queued" });
+  addUploadQueueItem({
+    id: createClientSessionId(),
+    file,
+    displayName: file.name,
+    sizeBytes: file.size,
+    status: "queued",
+  });
   renderUploadQueue();
   void runUploadProcessor();
 }
 
-async function runUploadProcessor(): Promise<void> {
-  if (uploadProcessorRunning) return;
-  uploadProcessorRunning = true;
-  try {
-    while (true) {
+function runUploadProcessor(): void {
+  if (uploadProcessorPumpScheduled) return;
+  uploadProcessorPumpScheduled = true;
+  queueMicrotask(() => {
+    uploadProcessorPumpScheduled = false;
+    while (uploadActiveProcessors < UPLOAD_QUEUE_MAX_PARALLEL) {
       const next = uploadQueue.find((it) => it.status === "queued");
       if (!next) break;
-      await processUploadItem(next);
+      uploadActiveProcessors += 1;
+      void processUploadItem(next).finally(() => {
+        uploadActiveProcessors = Math.max(0, uploadActiveProcessors - 1);
+        saveUploadQueueSnapshot();
+        runUploadProcessor();
+      });
     }
-  } finally {
-    uploadProcessorRunning = false;
-  }
+  });
 }
 
 async function processUploadItem(item: UploadQueueItem): Promise<void> {
@@ -9586,6 +9755,16 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // reached the head of the queue, it's already in cancelled
   // state — don't transition it back to transcribing.
   if (item.status === "cancelled") return;
+  if (!item.file) {
+    item.status = "error";
+    item.error = "Source file is no longer available. Re-add the file to transcribe it again.";
+    item.endedAt = performance.now();
+    item.completedAt = Date.now();
+    saveUploadQueueSnapshot();
+    renderUploadQueue();
+    return;
+  }
+  const sourceFile = item.file;
   item.status = "transcribing";
   item.stage = "uploading";
   item.startedAt = performance.now();
@@ -9594,6 +9773,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // if the network is mid-stream. We attach it to the item so
   // `cancelUploadItem` can find and call abort().
   item.abortController = new AbortController();
+  saveUploadQueueSnapshot();
   renderUploadQueue();
   // Heuristic stage transition: ``fetch`` doesn't expose a clean
   // "request body fully sent" event in the browser, so we mark the
@@ -9604,7 +9784,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // backend's actual response time then takes over the "processing"
   // perception. The crossover is replaced by the real transition
   // when the response arrives below.
-  const _stageCrossoverDelay = Math.min(8000, Math.max(800, item.file.size / 10000));
+  const _stageCrossoverDelay = Math.min(8000, Math.max(800, sourceFile.size / 10000));
   const _stageTimer = window.setTimeout(() => {
     if (item.status === "transcribing" && item.stage === "uploading") {
       item.stage = "processing";
@@ -9628,7 +9808,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     let modelLabel = "";
     if (provider === "local") {
       modelLabel = "small";
-      const out = await localJobQueued(item.file, {
+      const out = await localJobQueued(sourceFile, {
         language: resolveFastLocalLanguage(language),
         model: modelLabel,
         splitStereo: true,
@@ -9638,7 +9818,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       text = String(out.text || "").trim();
     } else {
       modelLabel = getRemoteModelValue(provider) || "";
-      const out = await remoteJobQueued(item.file, {
+      const out = await remoteJobQueued(sourceFile, {
         provider,
         language,
         diarize,
@@ -9663,6 +9843,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     item.model = modelLabel;
     item.language = language;
     item.endedAt = performance.now();
+    item.completedAt = Date.now();
     // Persist to the History tab's archive. We pass the original
     // file so the audio is saved alongside the transcript and is
     // playable from the History row. `refreshList: true` triggers a
@@ -9670,13 +9851,13 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     if (text) {
       try {
         const saveOut = await saveRecordingText({
-          title: (item.file.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
+          title: (sourceFile.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
           sourceText: text,
           transcriptText: text,
           provider,
           model: modelLabel,
           language,
-          audioFile: item.file,
+          audioFile: sourceFile,
           refreshList: true,
         });
         if (saveOut && typeof saveOut === "object") {
@@ -9721,6 +9902,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
     }
     item.endedAt = performance.now();
+    item.completedAt = Date.now();
   } finally {
     clearTimeout(_stageTimer);
     item.abortController = undefined;
@@ -9778,6 +9960,7 @@ function removeUploadItem(id: string): void {
   // button on `transcribing` items via `cancelUploadItem`.)
   if (item.status === "transcribing") return;
   uploadQueue.splice(idx, 1);
+  saveUploadQueueSnapshot();
   renderUploadQueue();
 }
 
@@ -9788,6 +9971,8 @@ function cancelUploadItem(id: string): void {
     // Not started yet — just drop it.
     item.status = "cancelled";
     item.endedAt = performance.now();
+    item.completedAt = Date.now();
+    saveUploadQueueSnapshot();
     renderUploadQueue();
     return;
   }
@@ -9808,29 +9993,51 @@ function renderUploadQueue(): void {
   const list = document.getElementById("uploadQueueList") as HTMLUListElement | null;
   const empty = document.getElementById("uploadEmptyState");
   const clearBtn = document.getElementById("uploadQueueClearBtn") as HTMLButtonElement | null;
+  const hideBtn = document.getElementById("uploadQueueHideBtn") as HTMLButtonElement | null;
   const titleEl = document.getElementById("uploadQueueTitle");
   if (!list || !empty || !clearBtn) return;
+  const visibleItems = uploadHideFinished
+    ? uploadQueue.filter((it) => !isUploadPastItem(it))
+    : uploadQueue;
   if (uploadQueue.length === 0) {
     list.innerHTML = "";
     empty.hidden = false;
+    const emptyTitle = empty.querySelector(".upload-empty-state-title");
+    const emptySub = empty.querySelector(".upload-empty-state-sub");
+    if (emptyTitle) emptyTitle.textContent = "No files yet";
+    if (emptySub) {
+      emptySub.innerHTML = "Drop audio or video on the left.<br>Each completed file is saved to <b>History</b> automatically.";
+    }
     clearBtn.hidden = true;
+    if (hideBtn) hideBtn.hidden = true;
     if (titleEl) titleEl.textContent = "Queue";
     return;
   }
-  empty.hidden = true;
   const finished = uploadQueue.filter(
     (it) => it.status === "done" || it.status === "error" || it.status === "cancelled",
   ).length;
   clearBtn.hidden = finished === 0;
+  if (hideBtn) {
+    hideBtn.hidden = finished === 0;
+    hideBtn.textContent = uploadHideFinished ? "Show past" : "Hide past";
+    hideBtn.setAttribute("aria-pressed", uploadHideFinished ? "true" : "false");
+  }
   if (titleEl) {
     const total = uploadQueue.length;
     titleEl.textContent = `Queue · ${finished}/${total} done`;
+  }
+  empty.hidden = visibleItems.length > 0;
+  if (visibleItems.length === 0) {
+    const emptyTitle = empty.querySelector(".upload-empty-state-title");
+    const emptySub = empty.querySelector(".upload-empty-state-sub");
+    if (emptyTitle) emptyTitle.textContent = "Past queues hidden";
+    if (emptySub) emptySub.textContent = "Use Show past to reveal completed queue items.";
   }
   // Clear + rebuild. Queue length is bounded by user clicks (rarely
   // > 50); full re-render is fine and avoids stale-DOM state issues
   // (per-item refs, status class drift across status transitions).
   list.innerHTML = "";
-  for (const item of uploadQueue) {
+  for (const item of visibleItems) {
     const li = document.createElement("li");
     li.className = `upload-queue-item upload-queue-item--${item.status}`;
     if (item.id === uploadSelectedId) li.classList.add("is-selected");
@@ -9846,14 +10053,20 @@ function renderUploadQueue(): void {
     const header = document.createElement("div");
     header.className = "upload-queue-item-header";
 
+    const dot = document.createElement("span");
+    const dotKind = item.status === "cancelled" ? "error" : item.status;
+    dot.className = `upload-queue-status-dot upload-queue-status-dot--${dotKind}`;
+    dot.setAttribute("aria-hidden", "true");
+    header.appendChild(dot);
+
     const meta = document.createElement("div");
     meta.className = "upload-queue-item-meta";
     const name = document.createElement("span");
     name.className = "upload-queue-item-name";
-    name.textContent = item.file.name;
-    name.title = item.file.name;
+    name.textContent = uploadItemName(item);
+    name.title = uploadItemName(item);
     meta.appendChild(name);
-    const sizeStr = formatUploadFileSize(item.file.size);
+    const sizeStr = formatUploadFileSize(uploadItemSize(item));
     if (sizeStr) {
       const size = document.createElement("span");
       size.className = "upload-queue-item-size";
@@ -9930,30 +10143,13 @@ function renderUploadQueue(): void {
       copyBtn.className = "btn btn-ghost upload-queue-item-action";
       copyBtn.type = "button";
       copyBtn.textContent = "Copy";
-      copyBtn.addEventListener("click", () => {
-        // navigator.clipboard.writeText returns a Promise — async
-        // rejections (Safari without user gesture, focus issues,
-        // permissions denied) are NOT caught by a sync try/catch.
-        // The old code optimistically said "Copied" even when the
-        // write rejected, leaving the user with an empty clipboard
-        // and a confident success label. .then/.catch routes both
-        // outcomes correctly; the optional chaining handles the
-        // (rare) browser without the clipboard API at all.
-        const writePromise = navigator.clipboard?.writeText(item.text || "");
-        if (!writePromise) {
-          copyBtn.textContent = "Copy failed";
+      copyBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        void (async () => {
+          const ok = await writeTextToClipboard(item.text || "");
+          copyBtn.textContent = ok ? "Copied" : "Copy failed";
           setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
-          return;
-        }
-        writePromise
-          .then(() => {
-            copyBtn.textContent = "Copied";
-            setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
-          })
-          .catch(() => {
-            copyBtn.textContent = "Copy failed";
-            setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
-          });
+        })();
       });
       actions.appendChild(copyBtn);
       li.appendChild(actions);
@@ -9988,9 +10184,10 @@ function renderUploadResultPane(): void {
     item = uploadQueue.find((it) => it.id === uploadSelectedId);
   }
   if (!item) {
-    // Most recent done — sorted by endedAt desc.
+    // Most recent done — sorted by wall-clock completion first so
+    // restored queue snapshots and fresh completions share one order.
     const dones = uploadQueue.filter((it) => it.status === "done" && it.text);
-    dones.sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+    dones.sort((a, b) => (b.completedAt || b.endedAt || 0) - (a.completedAt || a.endedAt || 0));
     item = dones[0];
   }
   if (!item) {
@@ -10002,9 +10199,10 @@ function renderUploadResultPane(): void {
     return;
   }
   if (titleEl) {
-    titleEl.textContent = `Result · ${item.file.name}`.length > 60
+    const itemName = uploadItemName(item);
+    titleEl.textContent = `Result · ${itemName}`.length > 60
       ? "Result"
-      : `Result · ${item.file.name}`;
+      : `Result · ${itemName}`;
   }
   if (item.status === "done" && item.text) {
     textEl.textContent = item.text;
@@ -10021,31 +10219,20 @@ function renderUploadResultPane(): void {
     append("language", item.language || "");
     const dur = item.endedAt && item.startedAt ? `${((item.endedAt - item.startedAt) / 1000).toFixed(1)}s` : "";
     append("duration", dur);
-    append("size", formatUploadFileSize(item.file.size));
+    append("size", formatUploadFileSize(uploadItemSize(item)));
     append("words", String((item.text.match(/\S+/g) || []).length));
     if (copyBtn) {
       copyBtn.hidden = false;
       copyBtn.onclick = () => {
-        // Clipboard write is async — sync try/catch never sees the
-        // rejection. Mirror the queue-item Copy button's robust
-        // .then/.catch path so a denied clipboard (Safari w/o user
-        // gesture, focus loss) flips the title to "Copy failed"
-        // rather than misleadingly showing "Copied" on a no-op.
-        const writePromise = navigator.clipboard?.writeText(item!.text || "");
-        if (!writePromise) {
-          copyBtn.title = "Copy failed";
-          setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
-          return;
-        }
-        writePromise
-          .then(() => {
-            copyBtn.title = "Copied";
-            setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
-          })
-          .catch(() => {
-            copyBtn.title = "Copy failed";
-            setTimeout(() => { copyBtn.title = "Copy transcript"; }, 1200);
-          });
+        void (async () => {
+          const ok = await writeTextToClipboard(item!.text || "");
+          copyBtn.title = ok ? "Copied" : "Copy failed";
+          copyBtn.setAttribute("aria-label", ok ? "Copied" : "Copy failed");
+          setTimeout(() => {
+            copyBtn.title = "Copy transcript";
+            copyBtn.setAttribute("aria-label", "Copy transcript");
+          }, 1200);
+        })();
       };
     }
     if (revealBtn) {

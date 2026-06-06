@@ -5,6 +5,7 @@ for WAV files that are already in the expected format (16kHz PCM_16 mono).
 """
 
 import logging
+import glob
 import os
 import shutil
 import subprocess
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 # few hundred bytes for diagnostics. Without this cap, a crash-loop
 # upload could OOM the backend.
 _FFMPEG_STDERR_CAP_BYTES = 64 * 1024
+_REMOTE_COMPACT_TIMEOUT_SEC = 1800
 
 
 class AudioError(RuntimeError):
@@ -177,6 +179,37 @@ def _compact_audio_for_remote_cmd(path_in: str, path_out: str) -> list[str]:
     ]
 
 
+def _compact_audio_chunks_for_remote_cmd(
+    path_in: str,
+    segment_pattern: str,
+    chunk_sec: int,
+) -> list[str]:
+    sec = max(1, int(chunk_sec or 1))
+    return [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-i", path_in,
+        "-map", "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-map_metadata", "-1",
+        "-ar", str(LIVE_SAMPLE_RATE_HZ),
+        "-ac", "1",
+        "-c:a", "libopus",
+        "-b:a", "24k",
+        "-application", "voip",
+        "-f", "segment",
+        "-segment_time", str(sec),
+        "-reset_timestamps", "1",
+        "-segment_format", "webm",
+        segment_pattern,
+    ]
+
+
 def compact_audio_for_remote(
     path_in: str,
     path_out: str,
@@ -225,7 +258,11 @@ def compact_audio_for_remote(
     # cleanup keeps the contract "either path_out is a complete
     # encoded file or it doesn't exist".
     try:
-        _run_ffmpeg(cmd, timeout_sec=600, cancel_event=cancel_event)
+        _run_ffmpeg(
+            cmd,
+            timeout_sec=_REMOTE_COMPACT_TIMEOUT_SEC,
+            cancel_event=cancel_event,
+        )
     except AudioError:
         try:
             os.unlink(path_out)
@@ -233,6 +270,52 @@ def compact_audio_for_remote(
             pass
         raise
     return path_out
+
+
+def compact_audio_chunks_for_remote(
+    path_in: str,
+    output_dir: str,
+    *,
+    chunk_sec: int,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[str]:
+    """Compress arbitrary audio/video into bounded remote-upload chunks.
+
+    Each output chunk is a standalone 16 kHz mono Opus/WebM file. The
+    remote transcription layer sends those chunks sequentially and
+    merges text afterward, so long videos never depend on one large
+    socket write succeeding. This is the long-form counterpart to
+    :func:`compact_audio_for_remote` and intentionally uses the same
+    codec/rate/container settings.
+    """
+    if not _has_ffmpeg():
+        raise AudioError(
+            "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg` "
+            "or `winget install Gyan.FFmpeg`) — required for remote-provider "
+            "audio compression."
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    pattern = os.path.join(output_dir, "chunk_%05d.webm")
+    cmd = _compact_audio_chunks_for_remote_cmd(path_in, pattern, chunk_sec)
+    try:
+        _run_ffmpeg(
+            cmd,
+            timeout_sec=_REMOTE_COMPACT_TIMEOUT_SEC,
+            cancel_event=cancel_event,
+        )
+    except AudioError:
+        for p in glob.glob(os.path.join(output_dir, "chunk_*.webm")):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        raise
+
+    chunks = sorted(glob.glob(os.path.join(output_dir, "chunk_*.webm")))
+    chunks = [p for p in chunks if os.path.getsize(p) > 0]
+    if not chunks:
+        raise AudioError("ffmpeg produced no audio chunks")
+    return chunks
 
 
 def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
