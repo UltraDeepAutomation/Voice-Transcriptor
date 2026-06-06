@@ -5860,6 +5860,25 @@ function richerTranscript(currentText: string, candidateText: string): string {
   return current;
 }
 
+function candidateConfirmsTranscriptCoverage(currentText: string, candidateText: string): boolean {
+  const current = normalizeTranscriptWhitespace(currentText);
+  const candidate = normalizeTranscriptWhitespace(candidateText);
+  if (!current || !candidate) return false;
+  const currentWords = countWords(current);
+  const candidateWords = countWords(candidate);
+  if (currentWords <= 0 || candidateWords <= 0) return false;
+  if (candidateWords >= currentWords) return true;
+  if (candidateWords < Math.max(1, Math.floor(currentWords * 0.9))) return false;
+
+  const normalizeWords = (s: string): string[] =>
+    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
+  const currentSet = new Set(normalizeWords(current));
+  const candidateNormWords = normalizeWords(candidate);
+  if (!candidateNormWords.length) return false;
+  const overlap = candidateNormWords.filter((word) => currentSet.has(word)).length;
+  return overlap / candidateNormWords.length >= 0.85;
+}
+
 function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
   if (!buffer) return false;
   return (
@@ -8042,14 +8061,14 @@ async function stopLive(enhance: boolean): Promise<void> {
             let chose: Cand | null = improvedText !== baseTranscriptForRace
               ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
               : null;
-            const recoveryConfirmsInstant =
-              first.label === "recovery" &&
-              wcInstant > 0 &&
-              first.words >= Math.max(1, Math.floor(wcInstant * 0.9));
-            if (!chose && recoveryConfirmsInstant) {
-              console.log(`[trace tail-gap] decision=KEEP_INSTANT_AFTER_RECOVERY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
+            const firstConfirmsInstant = candidateConfirmsTranscriptCoverage(
+              baseTranscriptForRace,
+              first.text,
+            );
+            if (!chose && firstConfirmsInstant) {
+              console.log(`[trace tail-gap] decision=KEEP_INSTANT_EARLY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
             }
-            if (!chose && !recoveryConfirmsInstant) {
+            if (!chose && !firstConfirmsInstant) {
               // First didn't improve — wait for the OTHER.
               const other = first.label === "envelope" ? await recoveryCand : await envelopeCand;
               const otherMs = performance.now() - tRace;
@@ -8070,7 +8089,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                   tone: "success",
                 }, sessionUiToken);
               }
-            } else if (!recoveryConfirmsInstant) {
+            } else if (!firstConfirmsInstant) {
               console.log(`[trace tail-gap] decision=KEEP_INSTANT (no improvement) totalMs=${totalRaceMs.toFixed(0)}`);
             }
           }
