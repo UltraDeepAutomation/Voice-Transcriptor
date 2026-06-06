@@ -9553,6 +9553,57 @@ function uploadItemResultText(item: UploadQueueItem): string {
   return String(item.text || "").trim() || UPLOAD_EMPTY_TRANSCRIPT_TEXT;
 }
 
+type UploadRevealTarget = { name: string; archiveDir: string };
+
+function normalizeTranscriptRecordingName(name: string): string {
+  const safe = String(name || "").trim().replace(/[\\/]/g, "");
+  if (!safe || safe.includes("..") || !safe.toLowerCase().endsWith(".txt")) return "";
+  return safe;
+}
+
+function installRevealRecordingBridge(): void {
+  window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
+    const safe = normalizeTranscriptRecordingName(name);
+    if (!safe) return;
+    const payload = encodeURIComponent(
+      JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
+    );
+    const prevTitle = document.title;
+    document.title = "__app_reveal_recording__" + payload;
+    // main.js consumes the sentinel synchronously via page-title-updated.
+    setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+  };
+}
+
+function uploadRevealTarget(item: UploadQueueItem | null | undefined): UploadRevealTarget | null {
+  const name = normalizeTranscriptRecordingName(String(item?.savedName || ""));
+  if (!name) return null;
+  return {
+    name,
+    archiveDir: String(item?.savedArchiveDir || currentArchiveDirSnapshot() || "").trim(),
+  };
+}
+
+function revealUploadItem(item: UploadQueueItem | null | undefined): boolean {
+  const target = uploadRevealTarget(item);
+  if (!target || typeof window.__transcriptorRevealRecording !== "function") return false;
+  window.__transcriptorRevealRecording(target.name, target.archiveDir);
+  return true;
+}
+
+function createUploadRevealButton(item: UploadQueueItem): HTMLButtonElement | null {
+  if (!uploadRevealTarget(item)) return null;
+  const btn = document.createElement("button");
+  btn.className = "btn btn-ghost upload-queue-item-action upload-queue-item-reveal";
+  btn.type = "button";
+  btn.textContent = "Reveal in Finder";
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    revealUploadItem(item);
+  });
+  return btn;
+}
+
 function isUploadTerminalStatus(status: UploadQueueStatus): boolean {
   return status === "done" || status === "error" || status === "cancelled";
 }
@@ -10248,10 +10299,6 @@ function renderUploadQueue(): void {
       li.appendChild(body);
       const actions = document.createElement("div");
       actions.className = "upload-queue-item-actions";
-      const revealFn = (window as unknown as {
-        __transcriptorRevealRecording?: (n: string, d: string) => void;
-      }).__transcriptorRevealRecording;
-      const canReveal = !!item.savedName && typeof revealFn === "function";
       const copyBtn = document.createElement("button");
       copyBtn.className = "btn btn-ghost upload-queue-item-action";
       copyBtn.type = "button";
@@ -10265,17 +10312,8 @@ function renderUploadQueue(): void {
         })();
       });
       actions.appendChild(copyBtn);
-      if (canReveal) {
-        const revealItemBtn = document.createElement("button");
-        revealItemBtn.className = "btn btn-ghost upload-queue-item-action upload-queue-item-reveal";
-        revealItemBtn.type = "button";
-        revealItemBtn.textContent = "Reveal in Finder";
-        revealItemBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          revealFn(item.savedName || "", item.savedArchiveDir || "");
-        });
-        actions.appendChild(revealItemBtn);
-      }
+      const revealItemBtn = createUploadRevealButton(item);
+      if (revealItemBtn) actions.appendChild(revealItemBtn);
       li.appendChild(actions);
     } else if (item.status === "error" && item.error) {
       const err = document.createElement("div");
@@ -10362,17 +10400,10 @@ function renderUploadResultPane(): void {
       };
     }
     if (revealBtn) {
-      // Show only when the transcript persisted (savedName set by
-      // saveRecordingText). The Electron main process exposes
-      // ``window.__transcriptorRevealRecording`` that calls
-      // ``shell.showItemInFolder`` — when the renderer runs in a
-      // plain browser (vite dev), the helper is undefined and we
-      // hide the button instead of triggering a no-op.
-      const hasReveal = typeof (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording === "function";
-      revealBtn.hidden = !item.savedName || !hasReveal;
+      const target = uploadRevealTarget(item);
+      revealBtn.hidden = !target;
       revealBtn.onclick = () => {
-        const fn = (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording;
-        if (fn) fn(item!.savedName || "", item!.savedArchiveDir || "");
+        revealUploadItem(item);
       };
     }
   } else if (item.status === "error" && item.error) {
@@ -10390,26 +10421,7 @@ function renderUploadResultPane(): void {
   }
 }
 
+// Renderer-side bridge must be installed before setupUploadView(), because
+// setupUploadView() immediately restores and renders persisted queue items.
+installRevealRecordingBridge();
 setupUploadView();
-
-// Renderer-side helper to ask the Electron main process to open the
-// OS file manager at the transcript file. We can't use ipcRenderer directly
-// (sandbox + contextIsolation + no preload), so we encode the request
-// into a sentinel ``document.title`` and let main.js's
-// ``page-title-updated`` handler decode + dispatch. The handler
-// validates name + archiveDir against the user's home dir before
-// invoking ``shell.showItemInFolder``. Title is restored a tick later
-// so the app's normal title text isn't permanently replaced.
-window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
-  const safe = String(name || "").replace(/[\\/]/g, "");
-  if (!safe || !safe.toLowerCase().endsWith(".txt")) return;
-  const payload = encodeURIComponent(
-    JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
-  );
-  const prevTitle = document.title;
-  document.title = "__app_reveal_recording__" + payload;
-  // Restore the normal title after a microtask. main.js consumes the
-  // event synchronously, so the sentinel only needs to live for one
-  // event-loop tick.
-  setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
-};
