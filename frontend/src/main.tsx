@@ -140,6 +140,7 @@ interface LatestSavedAudioState {
 interface SavedRecordingRef {
   name: string;
   archiveDir: string;
+  audioName?: string;
 }
 
 interface TranscriptSegment {
@@ -302,7 +303,7 @@ declare global {
      * intercepts via ``page-title-updated`` and calls
      * ``shell.showItemInFolder``. No-op in plain-browser dev preview.
      */
-    __transcriptorRevealRecording?: (name: string, archiveDir: string) => void;
+    __transcriptorRevealRecording?: (name: string, archiveDir: string, audioName?: string) => void;
   }
 }
 
@@ -4909,7 +4910,7 @@ async function openRecording(name: string): Promise<void> {
       revealBtn.hidden = !hasReveal;
       revealBtn.onclick = () => {
         const fn = window.__transcriptorRevealRecording;
-        if (fn) fn(name, currentArchiveDirSnapshot());
+        if (fn) fn(name, currentArchiveDirSnapshot(), String(r.audio_name || ""));
       };
     }
     updateRecordingCopyState();
@@ -4964,6 +4965,7 @@ async function saveRecordingText(opts: {
   }
   let savedName = existingName;
   let savedArchiveDir = archiveDir;
+  let savedAudioName = "";
   if (audioFile) {
     const fd = new FormData();
     fd.append("file", audioFile, audioFile.name || "recording.wav");
@@ -4979,9 +4981,10 @@ async function saveRecordingText(opts: {
     if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
     const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
     if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { name?: string; archive_dir?: string };
+    const js = (await r.json()) as { name?: string; archive_dir?: string; audio_name?: string };
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+    savedAudioName = String(js.audio_name || "").trim();
   } else {
     const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
       name: existingName,
@@ -5001,7 +5004,11 @@ async function saveRecordingText(opts: {
   if (opts.refreshList !== false) {
     loadRecordings(true).catch(() => { });
   }
-  return { name: savedName, archiveDir: savedArchiveDir };
+  return {
+    name: savedName,
+    archiveDir: savedArchiveDir,
+    ...(savedAudioName ? { audioName: savedAudioName } : {}),
+  };
 }
 
 $("recordingsRefreshBtn").addEventListener("click", () =>
@@ -9463,6 +9470,7 @@ interface UploadQueueSnapshotItem {
   language?: string;
   savedName?: string;
   savedArchiveDir?: string;
+  savedAudioName?: string;
 }
 
 interface UploadQueueStoragePayload {
@@ -9502,6 +9510,7 @@ interface UploadQueueItem {
   language?: string;
   savedName?: string;
   savedArchiveDir?: string;
+  savedAudioName?: string;
   abortController?: AbortController;
 }
 
@@ -9550,6 +9559,10 @@ function isUploadPastItem(item: UploadQueueItem): boolean {
   return isUploadTerminalStatus(item.status);
 }
 
+function isUploadVisibleUnderCurrentFilter(item: UploadQueueItem): boolean {
+  return !uploadHideFinished || !isUploadPastItem(item);
+}
+
 function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem {
   return {
     id: item.id,
@@ -9566,6 +9579,7 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
     language: item.language || "",
     savedName: item.savedName || "",
     savedArchiveDir: item.savedArchiveDir || "",
+    savedAudioName: item.savedAudioName || "",
   };
 }
 
@@ -9622,6 +9636,7 @@ function restoreUploadQueueSnapshot(): void {
         language: String(src.language || ""),
         savedName: String(src.savedName || ""),
         savedArchiveDir: String(src.savedArchiveDir || ""),
+        savedAudioName: String(src.savedAudioName || ""),
       });
     }
     saveUploadQueueSnapshot();
@@ -9969,6 +9984,9 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
           item.savedArchiveDir = String(
             (saveOut as { archiveDir?: string }).archiveDir || "",
           );
+          item.savedAudioName = String(
+            (saveOut as { audioName?: string }).audioName || "",
+          );
         }
       } catch (saveErr) {
         // Persist failure is non-fatal — the transcript is still
@@ -10278,11 +10296,18 @@ function renderUploadResultPane(): void {
   let item: UploadQueueItem | undefined;
   if (uploadSelectedId) {
     item = uploadQueue.find((it) => it.id === uploadSelectedId);
+    if (item && !isUploadVisibleUnderCurrentFilter(item)) {
+      item = undefined;
+    }
   }
   if (!item) {
     // Most recent done — sorted by wall-clock completion first so
     // restored queue snapshots and fresh completions share one order.
-    const dones = uploadQueue.filter((it) => it.status === "done" && it.text);
+    const dones = uploadQueue.filter((it) =>
+      it.status === "done" &&
+      it.text &&
+      isUploadVisibleUnderCurrentFilter(it)
+    );
     dones.sort((a, b) => (b.completedAt || b.endedAt || 0) - (a.completedAt || a.endedAt || 0));
     item = dones[0];
   }
@@ -10341,8 +10366,8 @@ function renderUploadResultPane(): void {
       const hasReveal = typeof (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording === "function";
       revealBtn.hidden = !item.savedName || !hasReveal;
       revealBtn.onclick = () => {
-        const fn = (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string) => void }).__transcriptorRevealRecording;
-        if (fn) fn(item!.savedName || "", item!.savedArchiveDir || "");
+        const fn = (window as unknown as { __transcriptorRevealRecording?: (n: string, d: string, a?: string) => void }).__transcriptorRevealRecording;
+        if (fn) fn(item!.savedName || "", item!.savedArchiveDir || "", item!.savedAudioName || "");
       };
     }
   } else if (item.status === "error" && item.error) {
@@ -10370,11 +10395,11 @@ setupUploadView();
 // validates name + archiveDir against the user's home dir before
 // invoking ``shell.showItemInFolder``. Title is restored a tick later
 // so the app's normal title text isn't permanently replaced.
-window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
+window.__transcriptorRevealRecording = (name: string, archiveDir: string, audioName = "") => {
   const safe = String(name || "").replace(/[\\/]/g, "");
   if (!safe) return;
   const payload = encodeURIComponent(
-    JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
+    JSON.stringify({ name: safe, archiveDir: String(archiveDir || ""), audioName: String(audioName || "") }),
   );
   const prevTitle = document.title;
   document.title = "__app_reveal_recording__" + payload;

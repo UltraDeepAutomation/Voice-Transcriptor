@@ -238,6 +238,14 @@ let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
+// Legacy fallback for reveal requests that come from older persisted
+// queue snapshots without an exact backend-provided audio_name. New
+// renderer builds pass audioName explicitly; this list is only a
+// bounded same-stem lookup, never the primary source of truth.
+const RECORDING_AUDIO_EXTS = Object.freeze([
+  ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".opus", ".aac",
+  ".webm", ".wma", ".mp4", ".m4v", ".mov", ".mkv",
+]);
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
     collapsedWidth: 320,
@@ -6138,6 +6146,11 @@ async function createWindow(options = {}) {
       const rawName = String(payload?.name || "");
       if (!rawName || rawName.includes("..") || /[\\/]/.test(rawName)) return;
       const safeName = rawName;
+      const rawAudioName = String(payload?.audioName || "");
+      const hasSafeAudioName =
+        !!rawAudioName &&
+        !rawAudioName.includes("..") &&
+        !/[\\/]/.test(rawAudioName);
       const archiveDirRaw = String(payload?.archiveDir || "").trim();
       // Resolve the audio path under the SAME archive dir we wrote to.
       // archiveDir comes back from saveRecordingText which already
@@ -6168,24 +6181,30 @@ async function createWindow(options = {}) {
         return;
       }
       // The recording is named ``YYYY-MM-DD_HH-MM-SS__title.txt``;
-      // the matching audio is ``...__title.<ext>``. We don't know the
-      // ext at the renderer (saveRecordingText only returns .txt
-      // name), so glob the dir for any same-stem file. shell.show
-      // ItemInFolder reveals + selects whichever matches first; if no
-      // audio yet, fall back to revealing the .txt itself so the
-      // user still lands on the right spot.
+      // modern renderers also pass the exact backend-provided
+      // ``audioName``. Use that first. Only older queue snapshots lack
+      // it, so they get a bounded same-stem extension lookup instead
+      // of the previous unordered `entries.find(stem + ".")` which
+      // could reveal a stale temp/backup sibling.
       const stem = safeName.replace(/\.txt$/i, "");
       let target = path.join(archiveDir, safeName);
-      try {
-        const entries = fs.readdirSync(archiveDir);
-        const audioMatch = entries.find((f) =>
-          f.startsWith(stem + ".") && !f.endsWith(".txt"),
-        );
-        if (audioMatch) target = path.join(archiveDir, audioMatch);
-      } catch {
-        // dir may not exist if archive was just deleted; fall through
-        // to the .txt path which will silently no-op in shell.show
-        // ItemInFolder.
+      if (hasSafeAudioName) {
+        const parsedAudio = path.parse(rawAudioName);
+        const sameStem = parsedAudio.name === stem;
+        const notText = parsedAudio.ext.toLowerCase() !== ".txt";
+        const exactAudioPath = path.join(archiveDir, rawAudioName);
+        if (sameStem && notText && fs.existsSync(exactAudioPath)) {
+          target = exactAudioPath;
+        }
+      }
+      if (target === path.join(archiveDir, safeName)) {
+        for (const ext of RECORDING_AUDIO_EXTS) {
+          const candidate = path.join(archiveDir, `${stem}${ext}`);
+          if (fs.existsSync(candidate)) {
+            target = candidate;
+            break;
+          }
+        }
       }
       try {
         shell.showItemInFolder(target);
@@ -6205,17 +6224,23 @@ async function createWindow(options = {}) {
   });
 
   const mediaPermissions = new Set(["media", "microphone", "audioCapture", "videoCapture"]);
+  const clipboardWritePermissions = new Set([
+    "clipboard-write",
+    "clipboard-sanitized-write",
+  ]);
   // Origin gate: only the backend's own origin is allowed to request
-  // media permissions. Without this check, a navigation race or a
+  // media permissions and clipboard-write. Clipboard-read stays
+  // denied; copy buttons only need writeText. Without this check, a
+  // navigation race or a
   // shared-session future (Electron 30+ shares the default session
   // across BrowserWindow instances) could let any other origin
-  // inherit our microphone grant. Tightened to ``_isBackendOrigin``
+  // inherit our microphone / clipboard grants. Tightened to ``_isBackendOrigin``
   // so the renderer must be on http://127.0.0.1:<our-port> to be
   // allowed.
   win.webContents.session.setPermissionRequestHandler((wc, permission, cb) => {
     const perm = String(permission || "");
     const url = wc?.getURL?.() || "";
-    const knownPerm = mediaPermissions.has(perm);
+    const knownPerm = mediaPermissions.has(perm) || clipboardWritePermissions.has(perm);
     const fromBackend = _isBackendOrigin(url);
     const allow = knownPerm && fromBackend;
     if (knownPerm && !fromBackend) {
@@ -6228,7 +6253,7 @@ async function createWindow(options = {}) {
   win.webContents.session.setPermissionCheckHandler((wc, permission) => {
     const perm = String(permission || "");
     const url = wc?.getURL?.() || "";
-    const knownPerm = mediaPermissions.has(perm);
+    const knownPerm = mediaPermissions.has(perm) || clipboardWritePermissions.has(perm);
     const fromBackend = _isBackendOrigin(url);
     const allow = knownPerm && fromBackend;
     if (knownPerm && !fromBackend) {
