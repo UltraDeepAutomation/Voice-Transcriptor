@@ -2120,6 +2120,16 @@ textarea:focus-visible,
   background: var(--interactive-hover);
 }
 
+.icon-btn.is-copy-ok {
+  border-color: rgba(98, 199, 123, 0.65);
+  background: rgba(98, 199, 123, 0.14);
+}
+
+.icon-btn.is-copy-failed {
+  border-color: rgba(255, 103, 103, 0.7);
+  background: rgba(255, 103, 103, 0.14);
+}
+
 .icon-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;

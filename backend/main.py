@@ -2422,6 +2422,8 @@ def _mark_recovery_error(recovery: Optional[dict]) -> None:
 def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
     if recovery is None:
         return
+    if recovery.get("write_failed"):
+        return
     # Hard cap on the per-session recovery spool. Without this a user
     # who leaves a tab streaming overnight (or a runaway reconnect loop)
     # can fill a small SSD. We stop writing silently once the ceiling is
@@ -2446,7 +2448,16 @@ def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
     try:
         recovery["pcm_file"].write(data)
     except OSError as e:
-        logger.warning("live recovery write failed: %s", e)
+        recovery["write_failed"] = True
+        recovery["had_error"] = True
+        recovery["write_error"] = _safe_error_text(e)
+        logger.warning(
+            "live recovery write failed; disabling recovery writes for this session "
+            "(bytes=%d chunks=%d): %s",
+            int(recovery.get("bytes") or 0),
+            int(recovery.get("chunks") or 0),
+            e,
+        )
         return
     recovery["chunks"] += 1
     recovery["bytes"] += len(data)
@@ -2498,6 +2509,7 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 "bytes": recovery["bytes"],
                 "chunks": recovery["chunks"],
                 "status": "error" if recovery["had_error"] else "recoverable",
+                "write_error": str(recovery.get("write_error") or ""),
             }
         )
         # SSOT atomic write — finalize path. Same rationale as the

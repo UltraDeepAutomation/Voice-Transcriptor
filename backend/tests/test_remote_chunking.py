@@ -108,6 +108,35 @@ class RemoteChunkingTests(unittest.TestCase):
         self.main._record_recovery_chunk(None, b"pcm")
         self.main._mark_recovery_error(None)
 
+    def test_live_recovery_write_failure_is_latched(self):
+        class FailingPcmFile:
+            def __init__(self):
+                self.write_calls = 0
+
+            def write(self, _data):
+                self.write_calls += 1
+                raise OSError("No space left on device")
+
+        pcm = FailingPcmFile()
+        recovery = {
+            "pcm_file": pcm,
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+        with mock.patch.object(self.main.logger, "warning") as warn:
+            self.main._record_recovery_chunk(recovery, b"first")
+            self.main._record_recovery_chunk(recovery, b"second")
+
+        self.assertEqual(pcm.write_calls, 1)
+        self.assertEqual(recovery["bytes"], 0)
+        self.assertEqual(recovery["chunks"], 0)
+        self.assertTrue(recovery["had_error"])
+        self.assertTrue(recovery["write_failed"])
+        self.assertIn("No space left", recovery["write_error"])
+        warn.assert_called_once()
+
     def test_unique_recording_stem_skips_existing_stem(self):
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()

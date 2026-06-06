@@ -4551,9 +4551,12 @@ function setRecordingsUiLoading(nextLoading: boolean): void {
 function flashButtonFeedback(btn: HTMLButtonElement, copiedLabel: string, defaultTitle: string): void {
   const prevAria = btn.getAttribute("aria-label") || defaultTitle;
   const prevTitle = btn.title || defaultTitle;
+  btn.classList.remove("is-copy-ok", "is-copy-failed");
+  btn.classList.add(copiedLabel === "Copied" ? "is-copy-ok" : "is-copy-failed");
   btn.setAttribute("aria-label", copiedLabel);
   btn.title = copiedLabel;
   window.setTimeout(() => {
+    btn.classList.remove("is-copy-ok", "is-copy-failed");
     btn.setAttribute("aria-label", prevAria);
     btn.title = prevTitle;
   }, 900);
@@ -9517,6 +9520,7 @@ const uploadQueue: UploadQueueItem[] = [];
 let uploadActiveProcessors = 0;
 let uploadProcessorPumpScheduled = false;
 let uploadHideFinished = false;
+const UPLOAD_EMPTY_TRANSCRIPT_TEXT = "[No speech captured]";
 // Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
 // which mirrors backend MAX_UPLOAD_BYTES via /api/health. Even though
 // the backend later demuxes audio out of video containers, it still has
@@ -9543,6 +9547,10 @@ function uploadItemName(item: UploadQueueItem): string {
 function uploadItemSize(item: UploadQueueItem): number {
   const size = Number(item.sizeBytes || item.file?.size || 0);
   return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+function uploadItemResultText(item: UploadQueueItem): string {
+  return String(item.text || "").trim() || UPLOAD_EMPTY_TRANSCRIPT_TEXT;
 }
 
 function isUploadTerminalStatus(status: UploadQueueStatus): boolean {
@@ -9951,37 +9959,35 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     // file so the audio is saved alongside the transcript and is
     // playable from the History row. `refreshList: true` triggers a
     // single archive reload at the end of each successful save.
-    if (text) {
-      try {
-        const saveOut = await saveRecordingText({
-          title: (sourceFile.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
-          sourceText: text,
-          transcriptText: text,
-          provider,
-          model: modelLabel,
-          language,
-          audioFile: sourceFile,
-          refreshList: true,
-        });
-        if (saveOut && typeof saveOut === "object") {
-          item.savedName = String((saveOut as { name?: string }).name || "");
-          // ``saveRecordingText`` returns ``SavedRecordingRef`` whose
-          // shape is ``{ name, archiveDir }`` (camelCase — see
-          // SavedRecordingRef interface). The previous read used
-          // ``archive_dir`` (snake_case) which is always undefined →
-          // savedArchiveDir was always "" and the Upload-pane Reveal-
-          // in-Finder button silently sent an empty archiveDir IPC
-          // payload. The main process logged "archive_dir empty" and
-          // the user saw nothing happen.
-          item.savedArchiveDir = String(
-            (saveOut as { archiveDir?: string }).archiveDir || "",
-          );
-        }
-      } catch (saveErr) {
-        // Persist failure is non-fatal — the transcript is still
-        // shown to the user; only the History entry is missing.
-        console.warn("Upload: saveRecordingText failed", saveErr);
+    try {
+      const saveOut = await saveRecordingText({
+        title: (sourceFile.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
+        sourceText: text,
+        transcriptText: text,
+        provider,
+        model: modelLabel,
+        language,
+        audioFile: sourceFile,
+        refreshList: true,
+      });
+      if (saveOut && typeof saveOut === "object") {
+        item.savedName = String((saveOut as { name?: string }).name || "");
+        // ``saveRecordingText`` returns ``SavedRecordingRef`` whose
+        // shape is ``{ name, archiveDir }`` (camelCase — see
+        // SavedRecordingRef interface). The previous read used
+        // ``archive_dir`` (snake_case) which is always undefined →
+        // savedArchiveDir was always "" and the Upload-pane Reveal-
+        // in-Finder button silently sent an empty archiveDir IPC
+        // payload. The main process logged "archive_dir empty" and
+        // the user saw nothing happen.
+        item.savedArchiveDir = String(
+          (saveOut as { archiveDir?: string }).archiveDir || "",
+        );
       }
+    } catch (saveErr) {
+      // Persist failure is non-fatal — the transcript is still
+      // shown to the user; only the History entry is missing.
+      console.warn("Upload: saveRecordingText failed", saveErr);
     }
     // Auto-select the just-completed item in the result pane unless
     // the user has already clicked another item — gives a clear
@@ -10235,10 +10241,10 @@ function renderUploadQueue(): void {
       li.appendChild(progress);
     }
 
-    if (item.status === "done" && item.text) {
+    if (item.status === "done") {
       const body = document.createElement("div");
       body.className = "upload-queue-item-body";
-      body.textContent = item.text;
+      body.textContent = uploadItemResultText(item);
       li.appendChild(body);
       const actions = document.createElement("div");
       actions.className = "upload-queue-item-actions";
@@ -10253,7 +10259,7 @@ function renderUploadQueue(): void {
       copyBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         void (async () => {
-          const ok = await writeTextToClipboard(item.text || "");
+          const ok = await writeTextToClipboard(uploadItemResultText(item));
           copyBtn.textContent = ok ? "Copied" : "Copy failed";
           setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
         })();
@@ -10309,7 +10315,6 @@ function renderUploadResultPane(): void {
     // restored queue snapshots and fresh completions share one order.
     const dones = uploadQueue.filter((it) =>
       it.status === "done" &&
-      it.text &&
       isUploadVisibleUnderCurrentFilter(it)
     );
     dones.sort((a, b) => (b.completedAt || b.endedAt || 0) - (a.completedAt || a.endedAt || 0));
@@ -10329,8 +10334,9 @@ function renderUploadResultPane(): void {
       ? "Result"
       : `Result · ${itemName}`;
   }
-  if (item.status === "done" && item.text) {
-    textEl.textContent = item.text;
+  if (item.status === "done") {
+    const resultText = uploadItemResultText(item);
+    textEl.textContent = resultText;
     metaEl.hidden = false;
     metaEl.innerHTML = "";
     const append = (k: string, v: string) => {
@@ -10345,18 +10351,13 @@ function renderUploadResultPane(): void {
     const dur = item.endedAt && item.startedAt ? `${((item.endedAt - item.startedAt) / 1000).toFixed(1)}s` : "";
     append("duration", dur);
     append("size", formatUploadFileSize(uploadItemSize(item)));
-    append("words", String((item.text.match(/\S+/g) || []).length));
+    append("words", String(((item.text || "").match(/\S+/g) || []).length));
     if (copyBtn) {
       copyBtn.hidden = false;
       copyBtn.onclick = () => {
         void (async () => {
-          const ok = await writeTextToClipboard(item!.text || "");
-          copyBtn.title = ok ? "Copied" : "Copy failed";
-          copyBtn.setAttribute("aria-label", ok ? "Copied" : "Copy failed");
-          setTimeout(() => {
-            copyBtn.title = "Copy transcript";
-            copyBtn.setAttribute("aria-label", "Copy transcript");
-          }, 1200);
+          const ok = await writeTextToClipboard(uploadItemResultText(item!));
+          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript");
         })();
       };
     }
