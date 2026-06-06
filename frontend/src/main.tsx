@@ -5618,7 +5618,9 @@ interface LiveTranscriptBuffer {
   committedText: string;
   committedDisplayText: string;
   interimText: string;
+  interimSegment: TranscriptSegment | null;
   lastInterimText: string;
+  lastInterimSegment: TranscriptSegment | null;
   committedDisplayCache: string;
   wsMode: LiveWsMode;
 }
@@ -5649,7 +5651,9 @@ function createLiveTranscriptBuffer(wsMode: LiveWsMode): LiveTranscriptBuffer {
     committedText: "",
     committedDisplayText: "",
     interimText: "",
+    interimSegment: null,
     lastInterimText: "",
+    lastInterimSegment: null,
     committedDisplayCache: "",
     wsMode,
   };
@@ -5687,10 +5691,32 @@ function composeCanonicalLiveSourceText(
     s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
   const interimWords = normalizeWords(interim);
   if (interimWords.length === 0) return committed;
+  const normalizeComparable = (s: string): string =>
+    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+  const committedComparable = normalizeComparable(committed);
+  const interimComparable = normalizeComparable(interim);
+  if (interimComparable && committedComparable.includes(interimComparable)) {
+    return committed;
+  }
   const lastCommittedWords = committed.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
   const lastCommittedNorm = normalizeWords(lastCommittedWords).join(" ");
   const interimNorm = interimWords.join(" ");
   if (lastCommittedNorm.endsWith(interimNorm)) return committed;
+
+  // Interim hypotheses can overlap committed text with a shifted
+  // boundary, e.g. committed="... сказал больше" and interim="больше
+  // завершил". Merge the longest normalized suffix/prefix overlap so
+  // the fast stop path keeps the tail without duplicating the overlap.
+  const committedNormWords = normalizeWords(committed);
+  const interimRawWords = interim.split(/\s+/).filter(Boolean);
+  const maxOverlap = Math.min(committedNormWords.length, interimWords.length);
+  for (let n = maxOverlap; n > 0; n--) {
+    const committedSuffix = committedNormWords.slice(-n).join(" ");
+    const interimPrefix = interimWords.slice(0, n).join(" ");
+    if (committedSuffix !== interimPrefix) continue;
+    const remainder = interimRawWords.slice(n).join(" ").trim();
+    return remainder ? `${committed} ${remainder}` : committed;
+  }
   return `${committed} ${interim}`;
 }
 
@@ -5730,7 +5756,11 @@ function appendSegmentsToBuffer(
   if (buffer.interimText) {
     buffer.lastInterimText = buffer.interimText;
   }
+  if (buffer.interimSegment) {
+    buffer.lastInterimSegment = buffer.interimSegment;
+  }
   buffer.interimText = "";
+  buffer.interimSegment = null;
 
   const separator = buffer.wsMode === "deepgram-stream" ? " " : "\n";
   const hasDiarization = buffer.segments.some((s) => s.speaker !== undefined);
@@ -5762,6 +5792,42 @@ function appendSegmentsToBuffer(
 
 function maxSegmentEnd(segments: TranscriptSegment[]): number {
   return segments.reduce((max, seg) => (seg.end > max ? seg.end : max), 0);
+}
+
+function maxLiveBufferSpeechEnd(buffer: LiveTranscriptBuffer | null): number {
+  if (!buffer) return 0;
+  return Math.max(
+    maxSegmentEnd(buffer.segments),
+    buffer.interimSegment?.end || 0,
+    buffer.lastInterimSegment?.end || 0,
+  );
+}
+
+function textFromLiveFinalEnvelope(envelope: LiveFinalEnvelope | null | undefined): string {
+  if (!envelope) return "";
+  const text = normalizeTranscriptWhitespace(envelope.text || "");
+  const segmentsText = joinTranscriptSegments(envelope.segments || []);
+  return countWords(text) >= countWords(segmentsText) ? text : segmentsText;
+}
+
+function richerTranscript(currentText: string, candidateText: string): string {
+  const current = normalizeTranscriptWhitespace(currentText);
+  const candidate = normalizeTranscriptWhitespace(candidateText);
+  if (!candidate) return current;
+  if (!current) return candidate;
+  const currentWords = countWords(current);
+  const candidateWords = countWords(candidate);
+  if (candidateWords > currentWords) return candidate;
+  if (candidateWords === currentWords && candidate.length > current.length) {
+    const normalizeComparable = (s: string): string =>
+      s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+    const currentNorm = normalizeComparable(current);
+    const candidateNorm = normalizeComparable(candidate);
+    if (candidateNorm.startsWith(currentNorm) || candidateNorm.endsWith(currentNorm)) {
+      return candidate;
+    }
+  }
+  return current;
 }
 
 function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
@@ -6483,6 +6549,7 @@ async function startLive(): Promise<void> {
       }
       case "interim": {
         sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
+        sessionBuffer.interimSegment = msg.segment;
         if (isActiveSession) {
           projectLiveTranscriptBufferToActiveState(sessionBuffer);
         }
@@ -7796,21 +7863,27 @@ async function stopLive(enhance: boolean): Promise<void> {
           // (Unicode handling, whitespace normalisation), and avoids
           // the maintenance hazard of two divergent definitions.
           const wordCountOf = countWords;
-          // 1.1.25 fix: previously read ``liveTranscriptSegments[last].end``
-          // — but ``mergeTranscriptSegments`` sorts by ``start asc, end desc,
-          // speaker asc``. With diarized recordings or out-of-order
-          // arrivals, the array tail does NOT necessarily have the maximum
-          // ``end``. Tail-gap math must use Math.max(end) so the recovery
-          // decision matches "where did finalized audio actually stop?",
-          // not "what was the last array entry?".
-          const lastSegEnd = maxSegmentEnd(instantSegments);
-          const tailGapSec = recordedSec - lastSegEnd;
+          const alreadyResolvedEnvelope = liveFinalSlots.get(sessionUiToken)?.envelope || null;
+          const opportunisticEnvelopeText = textFromLiveFinalEnvelope(alreadyResolvedEnvelope);
+          const opportunisticTranscript = richerTranscript(transcriptRaw, opportunisticEnvelopeText);
+          if (opportunisticTranscript !== transcriptRaw) {
+            transcriptRaw = opportunisticTranscript;
+            console.log(`[trace stopLive] opportunistic-envelope used words=${wordCountOf(transcriptRaw)} tail="${transcriptRaw.slice(-60).replace(/\n/g, "\\n")}"`);
+          }
+
+          // Tail coverage is committed + current interim + the last
+          // interim snapshot. Using committed segments only made every
+          // stop-with-interim look truncated, so the slow REST recovery
+          // path ran even when the visible live preview already had the
+          // full utterance tail.
+          const lastSpeechEnd = maxLiveBufferSpeechEnd(instantBuffer);
+          const tailGapSec = recordedSec - lastSpeechEnd;
           // Skip the check on very short recordings (< 1 s) where the
           // gap arithmetic isn't meaningful. Skip when the user had
           // streaming-error already (handled by the dedicated branch).
           const tailLikelyMissing =
             recordedSec > 1.0 && tailGapSec > 0.6 && !liveStreamErrorAtStop;
-          console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSegEnd=${lastSegEnd.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
+          console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
           if (tailLikelyMissing) {
             // ── Parallel race: envelope + REST recovery ─────────────
             //
@@ -7837,7 +7910,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             //     env + recovery.
             //
             // Net for the user's case: 7.6 s → ~3 s.
-            const skipEnvelope = instantSegments.length === 0;
+            const skipEnvelope = instantSegments.length === 0 && lastSpeechEnd <= 0;
             patchCurrentRecordingSummary({
               title: provisionalTitle,
               status: skipEnvelope
@@ -7876,11 +7949,10 @@ async function stopLive(enhance: boolean): Promise<void> {
             //
             // Saves ~1.5 s per long recording in the typical case.
             type Cand = { label: "envelope" | "recovery"; text: string; words: number };
-            const wcInstant = wordCountOf(instantTranscript);
+            const baseTranscriptForRace = transcriptRaw;
+            const wcInstant = wordCountOf(baseTranscriptForRace);
             const envelopeCand: Promise<Cand> = envelopePromise.then((env) => {
-              const t = (env?.text || "").trim();
-              const j = env ? joinTranscriptSegments(env.segments) : "";
-              const text = t.length >= j.length ? t : j;
+              const text = textFromLiveFinalEnvelope(env);
               return { label: "envelope" as const, text, words: wordCountOf(text) };
             });
             const recoveryCand: Promise<Cand> = recoveryPromise.then((text) => ({
@@ -7889,13 +7961,19 @@ async function stopLive(enhance: boolean): Promise<void> {
             const first = await Promise.race([envelopeCand, recoveryCand]);
             const firstMs = performance.now() - tRace;
             console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} tail="${first.text.slice(-60).replace(/\n/g, "\\n")}"`);
-            let chose: Cand | null = first.words > wcInstant && first.text ? first : null;
+            let improvedText = richerTranscript(baseTranscriptForRace, first.text);
+            let chose: Cand | null = improvedText !== baseTranscriptForRace
+              ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
+              : null;
             if (!chose) {
               // First didn't improve — wait for the OTHER.
               const other = first.label === "envelope" ? await recoveryCand : await envelopeCand;
               const otherMs = performance.now() - tRace;
               console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} tail="${other.text.slice(-60).replace(/\n/g, "\\n")}"`);
-              if (other.words > wcInstant && other.text) chose = other;
+              improvedText = richerTranscript(baseTranscriptForRace, other.text);
+              if (improvedText !== baseTranscriptForRace) {
+                chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
+              }
             }
             const totalRaceMs = performance.now() - tRace;
             if (chose) {
@@ -7969,10 +8047,9 @@ async function stopLive(enhance: boolean): Promise<void> {
           }, sessionUiToken);
           const envelope = liveFinalPromise ? await liveFinalPromise : null;
           const envelopeError = envelope?.error || getLiveStreamError(sessionUiToken) || "";
-          if (envelope && envelope.text && !envelopeError) {
-            transcriptRaw = envelope.text.trim();
-          } else if (envelope && envelope.segments.length && !envelopeError) {
-            transcriptRaw = joinTranscriptSegments(envelope.segments);
+          const envelopeText = textFromLiveFinalEnvelope(envelope);
+          if (envelopeText && !envelopeError) {
+            transcriptRaw = envelopeText;
           } else if (envelopeError) {
             // Migrated to ``recoverFromEmptyTranscript`` in 1.1.17:
             // the previous bespoke chain at this branch read
@@ -8043,7 +8120,8 @@ async function stopLive(enhance: boolean): Promise<void> {
         // recovers in that case (residue is non-empty → falls through
         // to the recovery branch below).
         const noStreamingActivity = !hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken));
-        if (noStreamingActivity) {
+        const definitelySilent = noStreamingActivity && (hardSilence || likelySilenceWithoutPreview);
+        if (definitelySilent) {
           console.log(`[trace stopLive] silent recording — skipping recovery (no streaming activity at all)`);
           patchCurrentRecordingSummary({
             title: provisionalTitle,
@@ -8052,7 +8130,9 @@ async function stopLive(enhance: boolean): Promise<void> {
           }, sessionUiToken);
         } else {
           transcriptRaw = await recoverFromEmptyTranscript(
-            "Live stream returned no text.",
+            noStreamingActivity
+              ? "Live stream returned no text, but microphone audio was captured."
+              : "Live stream returned no text.",
           );
         }
       }

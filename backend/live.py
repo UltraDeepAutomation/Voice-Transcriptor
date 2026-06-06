@@ -103,13 +103,15 @@ class LiveSession:
                 dropped = self._ring.popleft()
                 self._ring_samples -= int(dropped.shape[0])
 
-    async def maybe_transcribe(self):
+    async def maybe_transcribe(self, *, force: bool = False):
         sr = self.cfg.sample_rate
 
         async with self._lock:
             total_samples = int(self._total_samples)
             total_sec = total_samples / float(sr)
-            if total_sec - self._last_transcribe_sec < self.cfg.min_step_sec:
+            if force and total_sec <= self._last_transcribe_sec + self.cfg.emit_epsilon_sec:
+                return None
+            if not force and total_sec - self._last_transcribe_sec < self.cfg.min_step_sec:
                 return None
 
             win = int(self.cfg.window_sec * sr)

@@ -2682,7 +2682,7 @@ async def _run_local_live_session(
                 pass
         # Best-effort final emit in case transcriber missed the tail
         try:
-            tail = await session.maybe_transcribe()
+            tail = await session.maybe_transcribe(force=True)
             if tail:
                 await _ws_send_json(websocket, tail)
         except Exception as e:
