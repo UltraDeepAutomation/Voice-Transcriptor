@@ -9,10 +9,10 @@
     "start": "electron .",
     "dev": "NODE_ENV=development electron .",
     "build:frontend": "npm --prefix ../frontend run build",
-    "dist": "npm run build:frontend && electron-builder --mac dmg --arm64",
-    "dist:dir": "npm run build:frontend && electron-builder --mac --dir --arm64",
-    "dist:win": "npm run build:frontend && electron-builder --win --x64",
-    "dist:linux": "npm run build:frontend && electron-builder --linux AppImage --x64"
+    "dist": "node ./unlockDist.js && npm run build:frontend && electron-builder --mac dmg --arm64",
+    "dist:dir": "node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
+    "dist:win": "node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
+    "dist:linux": "node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
   },
   "devDependencies": {
     "electron": "30.5.1",

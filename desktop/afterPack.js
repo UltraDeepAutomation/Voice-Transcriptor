@@ -57,11 +57,78 @@
 
 const { execFileSync, execSync } = require("node:child_process");
 const {
-  existsSync, readdirSync, lstatSync, openSync, readSync, closeSync,
+  existsSync, readdirSync, lstatSync, openSync, readSync, closeSync, chmodSync,
 } = require("node:fs");
 const path = require("node:path");
 
 const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
+const PYTHON_IMPORT_TREES = Object.freeze([
+  path.join("Contents", "Resources", "runtime", "python"),
+  path.join("Contents", "Resources", "backend"),
+]);
+
+function walkTree(root, visitor) {
+  const visit = (entryPath) => {
+    let st;
+    try { st = lstatSync(entryPath); } catch { return; }
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) {
+      let entries;
+      try { entries = readdirSync(entryPath); } catch { return; }
+      for (const name of entries) {
+        visit(path.join(entryPath, name));
+      }
+      visitor(entryPath, st);
+      return;
+    }
+    if (st.isFile()) {
+      visitor(entryPath, st);
+    }
+  };
+  visit(root);
+}
+
+function assertNoBundledBytecode(appPath) {
+  const offenders = [];
+  for (const relRoot of PYTHON_IMPORT_TREES) {
+    const root = path.join(appPath, relRoot);
+    if (!existsSync(root)) continue;
+    walkTree(root, (entryPath, st) => {
+      if (
+        (st.isDirectory() && path.basename(entryPath) === "__pycache__") ||
+        (st.isFile() && entryPath.endsWith(".pyc"))
+      ) {
+        offenders.push(entryPath);
+      }
+    });
+  }
+  if (offenders.length > 0) {
+    throw new Error(
+      "afterPack: bundled Python bytecode is forbidden inside the signed app. " +
+        `First offenders:\n${offenders.slice(0, 20).join("\n")}`,
+    );
+  }
+}
+
+function makeBundledPythonImportsReadOnly(appPath) {
+  let fileCount = 0;
+  let dirCount = 0;
+  for (const relRoot of PYTHON_IMPORT_TREES) {
+    const root = path.join(appPath, relRoot);
+    if (!existsSync(root)) continue;
+    walkTree(root, (entryPath, st) => {
+      const executable = (st.mode & 0o111) !== 0;
+      const mode = st.isDirectory() ? 0o555 : (executable ? 0o555 : 0o444);
+      chmodSync(entryPath, mode);
+      if (st.isDirectory()) dirCount += 1;
+      if (st.isFile()) fileCount += 1;
+    });
+  }
+  console.log(
+    `[afterPack] Locked bundled Python import trees read-only ` +
+    `(${fileCount} files + ${dirCount} directories)`,
+  );
+}
 
 /**
  * Return ``true`` if the preferred signing identity is currently
@@ -366,6 +433,16 @@ exports.default = async function afterPack(context) {
       };
     },
   });
+
+  // Python bytecode caches are not allowed to appear inside the
+  // signed .app after install. Python normally treats failed bytecode
+  // writes as non-fatal, so make the import trees themselves
+  // immutable. This protects the code signature even if a future
+  // interpreter build ignores PYTHONDONTWRITEBYTECODE / -B during
+  // early bootstrap imports.
+  assertNoBundledBytecode(appPath);
+  makeBundledPythonImportsReadOnly(appPath);
+  assertNoBundledBytecode(appPath);
 
   // Verify the finished signature. ``--strict`` catches any resource
   // envelope drift, ``--deep`` walks all nested items. On failure
