@@ -5581,6 +5581,8 @@ let captureRmsAccum = 0;
 // in dynamic audio and inflates false-silence classification).
 let captureRmsSqAccum = 0;
 let capturePeakMax = 0;
+let capturePcmSampleCount = 0;
+let captureLastActivePcmSample = 0;
 let liveDraftText = "";
 let liveDraftDisplayText = "";
 let liveInterimText = "";
@@ -6193,6 +6195,8 @@ function resetOutputs(): void {
 // gaps without dropping to zero.
 let captureRmsEma = 0;
 const CAPTURE_RMS_EMA_ALPHA = 0.06;
+const CAPTURE_TAIL_ACTIVITY_RMS = 0.003;
+const CAPTURE_TAIL_ACTIVITY_PEAK = 0.045;
 
 function pushCapturedFrame(input: Float32Array): void {
   if (!(input instanceof Float32Array) || !input.length) return;
@@ -6222,6 +6226,11 @@ function pushCapturedFrame(input: Float32Array): void {
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
+  const frameStartSample = capturePcmSampleCount;
+  capturePcmSampleCount += ds.length;
+  if (rms >= CAPTURE_TAIL_ACTIVITY_RMS || peak >= CAPTURE_TAIL_ACTIVITY_PEAK) {
+    captureLastActivePcmSample = frameStartSample + ds.length;
+  }
 
   // ── Canonical-audio sink path ──────────────────────────────────────
   // Samples go into the session's ``PcmSink``. The OPFS-backed
@@ -6400,6 +6409,8 @@ async function startLive(): Promise<void> {
   captureRmsAccum = 0;
   captureRmsSqAccum = 0;
   capturePeakMax = 0;
+  capturePcmSampleCount = 0;
+  captureLastActivePcmSample = 0;
   captureRmsEma = 0;
   lastInterimSnapshot = "";
   wsPendingFrames = [];
@@ -6893,21 +6904,30 @@ async function stopLive(enhance: boolean): Promise<void> {
   const effectiveProvider = liveSnapshot.effectiveProvider;
   const modelValue = liveSnapshot.model;
   const sourceLiveText = getSessionCanonicalLiveSourceText(sessionUiToken);
-  // True session-level RMS is sqrt(mean of per-frame squared RMS),
-  // not mean of per-frame RMS. The mean-of-RMS metric underestimates
-  // dynamic-signal energy (speech peaks get diluted by inter-syllable
-  // gaps) and produced false-positive silence classifications on real
-  // recordings shorter than ~2.5 s.
-  const avgCaptureRms = captureFrameCount > 0
-    ? Math.sqrt(captureRmsSqAccum / captureFrameCount)
-    : 0;
-  const noLiveText = !sourceLiveText;
-  const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
-  const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.003 && capturePeakMax < 0.045;
-  const tooShortToTrust = recordedSec < 1.25;
-  const silentCapture =
-    (tooShortToTrust && hardSilence) ||
-    (tooShortToTrust && likelySilenceWithoutPreview);
+  const captureSilenceSnapshot = (liveText: string): {
+    hardSilence: boolean;
+    likelySilenceWithoutPreview: boolean;
+    silentCapture: boolean;
+  } => {
+    // True session-level RMS is sqrt(mean of per-frame squared RMS),
+    // not mean of per-frame RMS. Compute this only at decision time:
+    // stopLive drains the worklet after entry, so an early snapshot can
+    // miss the final frames and misclassify a short spoken clip as silence.
+    const avgCaptureRms = captureFrameCount > 0
+      ? Math.sqrt(captureRmsSqAccum / captureFrameCount)
+      : 0;
+    const noLiveText = !String(liveText || "").trim();
+    const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
+    const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.003 && capturePeakMax < 0.045;
+    const tooShortToTrust = recordedSec < 1.25;
+    return {
+      hardSilence,
+      likelySilenceWithoutPreview,
+      silentCapture:
+        (tooShortToTrust && hardSilence) ||
+        (tooShortToTrust && likelySilenceWithoutPreview),
+    };
+  };
   const provider = effectiveProvider;
   let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
   let savedAudioFile: File | null = null;
@@ -7347,7 +7367,9 @@ async function stopLive(enhance: boolean): Promise<void> {
     return;
   }
 
-  if (silentCapture) {
+  const drainedSourceLiveText = getSessionCanonicalLiveSourceText(sessionUiToken) || sourceLiveText;
+  const drainedSilence = captureSilenceSnapshot(drainedSourceLiveText);
+  if (drainedSilence.silentCapture) {
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
@@ -7877,13 +7899,24 @@ async function stopLive(enhance: boolean): Promise<void> {
           // path ran even when the visible live preview already had the
           // full utterance tail.
           const lastSpeechEnd = maxLiveBufferSpeechEnd(instantBuffer);
+          const lastCapturedActivitySec = captureLastActivePcmSample / AUDIO_TOKENS.liveSampleRateHz;
           const tailGapSec = recordedSec - lastSpeechEnd;
+          const tailActivityGapSec = lastCapturedActivitySec - lastSpeechEnd;
+          const hasTimestampedLiveCoverage = lastSpeechEnd > 0;
+          const tailHasCapturedActivity = tailActivityGapSec > 0.2;
           // Skip the check on very short recordings (< 1 s) where the
           // gap arithmetic isn't meaningful. Skip when the user had
           // streaming-error already (handled by the dedicated branch).
+          // Also skip when the only gap is trailing silence; otherwise
+          // a normal pause before Stop looks like missing speech and
+          // starts the expensive REST recovery path.
           const tailLikelyMissing =
-            recordedSec > 1.0 && tailGapSec > 0.6 && !liveStreamErrorAtStop;
-          console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
+            recordedSec > 1.0 &&
+            hasTimestampedLiveCoverage &&
+            tailGapSec > 0.6 &&
+            tailHasCapturedActivity &&
+            !liveStreamErrorAtStop;
+          console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} lastCapturedActivitySec=${lastCapturedActivitySec.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} tailActivityGapSec=${tailActivityGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
           if (tailLikelyMissing) {
             // ── Parallel race: envelope + REST recovery ─────────────
             //
@@ -8120,7 +8153,11 @@ async function stopLive(enhance: boolean): Promise<void> {
         // recovers in that case (residue is non-empty → falls through
         // to the recovery branch below).
         const noStreamingActivity = !hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken));
-        const definitelySilent = noStreamingActivity && (hardSilence || likelySilenceWithoutPreview);
+        const finalSilence = captureSilenceSnapshot(getSessionCanonicalLiveSourceText(sessionUiToken) || transcriptRaw);
+        const definitelySilent = noStreamingActivity && (
+          finalSilence.hardSilence ||
+          finalSilence.likelySilenceWithoutPreview
+        );
         if (definitelySilent) {
           console.log(`[trace stopLive] silent recording — skipping recovery (no streaming activity at all)`);
           patchCurrentRecordingSummary({
@@ -9662,9 +9699,9 @@ function extractRecordingTranscriptForUploadMatch(content: string, displayText =
 type UploadRevealTarget = { name: string; archiveDir: string };
 
 function normalizeTranscriptRecordingName(name: string): string {
-  const safe = String(name || "").trim().replace(/[\\/]/g, "");
-  if (!safe || safe.includes("..") || !safe.toLowerCase().endsWith(".txt")) return "";
-  return safe;
+  const raw = String(name || "").trim();
+  if (!raw || raw.includes("..") || /[\\/]/.test(raw) || !raw.toLowerCase().endsWith(".txt")) return "";
+  return raw;
 }
 
 function installRevealRecordingBridge(): void {
