@@ -11,6 +11,7 @@ import time
 import subprocess
 import mimetypes
 import tempfile
+import unicodedata
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -1162,24 +1163,44 @@ def _atomic_write_text(path: Path, content: str) -> None:
     atomic_write_text(path, content)
 
 
+def _safe_user_filename_part(value: str, *, fallback: str = "recording", max_len: int = 120) -> str:
+    raw = unicodedata.normalize("NFC", str(value or ""))
+    raw = raw.replace("\\", "/")
+    raw = os.path.basename(raw).strip()
+    chars: list[str] = []
+    for ch in raw:
+        if ch.isalnum() or ch in {" ", ".", "_", "-"}:
+            chars.append(ch)
+        else:
+            chars.append("_")
+    cleaned = "".join(chars)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    cleaned = cleaned[:max_len].strip(" ._-")
+    if not cleaned:
+        cleaned = fallback
+    if cleaned.lower() in _WINDOWS_RESERVED_BASENAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
 def _normalize_filename(name: str) -> str:
     # 1.1.25: strip BOTH POSIX and NT path separators regardless of host
     # OS, so a Windows-style filename submitted to a POSIX backend can't
     # keep its backslashes through ``os.path.basename`` (POSIX
     # ``basename`` does NOT split on backslash). Defence-in-depth.
-    raw = (name or "audio.wav").replace("\\", "/")
-    base = os.path.basename(raw)
-    # Keep alnum, dot, dash, underscore only to avoid strange filenames.
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
-    if not cleaned:
-        return "audio.wav"
+    raw = unicodedata.normalize("NFC", str(name or "audio.wav")).replace("\\", "/")
+    base = os.path.basename(raw).strip()
+    raw_ext = Path(base).suffix.lower()
+    ext = raw_ext if re.fullmatch(r"\.[A-Za-z0-9]{1,12}", raw_ext or "") else ".wav"
+    stem = Path(base).stem if base else "audio"
+    cleaned_stem = _safe_user_filename_part(stem, fallback="audio", max_len=120)
+    cleaned = f"{cleaned_stem}{ext}"
     # 1.1.25: previous form returned ``cleaned`` even when it lacked an
     # extension entirely (e.g. input "audio." → cleaned "audio" → no
     # extension), letting downstream content-type / retention paths
     # treat it as an unknown format. Always ensure a fallback ``.wav``
     # extension when the user-supplied name didn't produce one.
-    if "." not in cleaned:
-        return f"{cleaned}.wav"
     return cleaned
 
 
@@ -1489,8 +1510,7 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
 
 
 def _sanitize_name(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", (value or "").strip())
-    return cleaned[:80].strip(" ._-") or "recording"
+    return _safe_user_filename_part(value, fallback="recording", max_len=120)
 
 
 def _recording_stem(name_or_title: str) -> str:
@@ -1505,6 +1525,22 @@ def _recording_stem_available(target_dir: Path, stem: str) -> bool:
     return not (target_dir / f"{stem}.txt").exists() and not any(target_dir.glob(f"{stem}.*"))
 
 
+def _unique_stem_from_base(target_dir: Path, base: str, *, collision_suffix: str = "timestamp") -> str:
+    safe_base = _sanitize_name(base)
+    if _recording_stem_available(target_dir, safe_base):
+        return safe_base
+    if collision_suffix == "timestamp":
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        candidate = f"{safe_base}__{ts}"
+        if _recording_stem_available(target_dir, candidate):
+            return candidate
+    for _ in range(128):
+        candidate = f"{safe_base}-{uuid.uuid4().hex[:8]}"
+        if _recording_stem_available(target_dir, candidate):
+            return candidate
+    raise HTTPException(status_code=500, detail="could not allocate unique recording name")
+
+
 def _unique_recording_stem(target_dir: Path, title: str) -> str:
     base = _recording_stem(title)
     if _recording_stem_available(target_dir, base):
@@ -1514,6 +1550,27 @@ def _unique_recording_stem(target_dir: Path, title: str) -> str:
         if _recording_stem_available(target_dir, candidate):
             return candidate
     raise HTTPException(status_code=500, detail="could not allocate unique recording name")
+
+
+def _is_generic_capture_filename(filename: str) -> bool:
+    stem = Path(_normalize_filename(filename or "recording.wav")).stem.lower()
+    if stem in {"audio", "recording", "microphone", "session-audio", "session_audio"}:
+        return True
+    return bool(re.fullmatch(r"live[-_]\d{8,}", stem))
+
+
+def _source_recording_display_name(filename: str) -> str:
+    normalized = _normalize_filename(filename or "")
+    if not normalized or _is_generic_capture_filename(normalized):
+        return ""
+    return normalized
+
+
+def _unique_recording_stem_for_source_file(target_dir: Path, filename: str, fallback_title: str) -> str:
+    source_name = _source_recording_display_name(filename)
+    if source_name:
+        return _unique_stem_from_base(target_dir, Path(source_name).stem, collision_suffix="timestamp")
+    return _unique_recording_stem(target_dir, fallback_title)
 
 
 def _atomic_temp_path(final_path: Path) -> Path:
@@ -1941,6 +1998,7 @@ def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> di
 def _render_recording_content(
     *,
     title: str,
+    source_file: str = "",
     source_text: str,
     transcript_text: str,
     provider: str,
@@ -1953,8 +2011,10 @@ def _render_recording_content(
         f"Language: {language or 'auto'}",
         f"Provider: {provider or 'local'}",
         f"Model: {model or '-'}",
-        "",
     ]
+    if source_file:
+        lines.append(f"Source file: {source_file}")
+    lines.append("")
     if source_text:
         lines.extend(["Original:", source_text, ""])
     if transcript_text:
@@ -1966,6 +2026,7 @@ def _write_recording_text_file(
     *,
     out: Path,
     title: str,
+    source_file: str = "",
     source_text: str,
     transcript_text: str,
     provider: str,
@@ -1976,6 +2037,7 @@ def _write_recording_text_file(
         out,
         _render_recording_content(
             title=title,
+            source_file=source_file,
             source_text=source_text,
             transcript_text=transcript_text,
             provider=provider,
@@ -2039,6 +2101,23 @@ def _first_words(content: str, max_words: int = 8) -> str:
     if len(preview) > 80:
         preview = preview[:77] + "..."
     return preview
+
+
+def _recording_source_file(content: str) -> str:
+    return _extract_meta_field(content, "Source file")
+
+
+def _recording_display_name_from_content(content: str, fallback_stem: str) -> str:
+    source_file = _recording_source_file(content)
+    if source_file:
+        return source_file
+    first = _first_words(content)
+    if first:
+        return first
+    title = _extract_meta_field(content, "Title")
+    if title and title.lower() not in {"recording", "uploaded file"}:
+        return title
+    return fallback_stem
 
 
 def _tokenize_words(text: str) -> list[str]:
@@ -4020,14 +4099,15 @@ def _build_recordings_list_payload(d: "Path") -> dict:
         try:
             st = p.stat()
             raw = p.read_text(encoding="utf-8", errors="replace")
-            first = _first_words(raw)
-            display = first if first else p.stem
+            source_file = _recording_source_file(raw)
+            display = _recording_display_name_from_content(raw, p.stem)
             provider = _extract_meta_field(raw, "Provider").lower() or ""
             language = _extract_meta_field(raw, "Language").lower() or ""
             items.append(
                 {
                     "name": p.name,
                     "display_name": display,
+                    "source_file": source_file,
                     "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
                     "size_bytes": st.st_size,
                     "provider": provider,
@@ -4138,8 +4218,8 @@ def _build_recordings_graph_payload(d: "Path") -> dict:
         try:
             st = p.stat()
             raw = p.read_text(encoding="utf-8", errors="replace")
-            first = _first_words(raw)
-            display = first if first else p.stem
+            source_file = _recording_source_file(raw)
+            display = _recording_display_name_from_content(raw, p.stem)
             provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
             text = _extract_stats_text(raw)
             keywords = _tokenize_words(text)
@@ -4151,6 +4231,7 @@ def _build_recordings_graph_payload(d: "Path") -> dict:
                 {
                     "name": p.name,
                     "display_name": display,
+                    "source_file": source_file,
                     "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
                     "size_bytes": st.st_size,
                     "provider": provider,
@@ -4256,8 +4337,10 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
     st = p.stat()
     raw = p.read_text(encoding="utf-8", errors="replace")
     display = _extract_transcript_text(raw)
+    source_file = _recording_source_file(raw)
     return {
         "name": p.name,
+        "source_file": source_file,
         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
         "size_bytes": st.st_size,
         "content": raw,
@@ -4482,6 +4565,7 @@ async def save_recording_with_audio(
     orig_name = _normalize_filename(file.filename or "recording.wav")
     _validate_audio_filename(orig_name)
     ext = Path(orig_name).suffix.lower() or ".wav"
+    source_file_name = _source_recording_display_name(orig_name)
 
     target_dir = _resolve_recordings_target_dir(archive_dir, create=not bool(require_existing))
     # Persist this dir so startup retroactive retention covers it even if
@@ -4496,7 +4580,7 @@ async def save_recording_with_audio(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem = _unique_recording_stem(target_dir, safe_title)
+        stem = _unique_recording_stem_for_source_file(target_dir, orig_name, safe_title)
 
     out_text = target_dir / f"{stem}.txt"
     out_audio = target_dir / f"{stem}{ext}"
@@ -4527,6 +4611,7 @@ async def save_recording_with_audio(
             _write_recording_text_file(
                 out=out_text,
                 title=safe_title,
+                source_file=source_file_name,
                 source_text=safe_source_text,
                 transcript_text=safe_transcript_text,
                 provider=safe_provider,

@@ -4836,6 +4836,7 @@ async function processPostStopTask(task) {
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
   let overlayPhase = "";
+  let doneStatusTranscriptSince = 0;
 
   while (Date.now() < deadline) {
     pollCount += 1;
@@ -4923,6 +4924,14 @@ async function processPostStopTask(task) {
       : null;
     const uiFinalKind = String(state.uiFinalKind || "").trim().toLowerCase();
     const uiFinalText = normalizeTranscriptText(state.uiFinalText || "");
+    const uiFinalBelongsToTask =
+      task.recordingId > 0
+        ? Number(state.uiFinalRecordingId || 0) === task.recordingId
+        : Number(state.uiFinalAt || 0) > stopRequestedAt;
+    const uiFinalStatusHasTranscript =
+      uiFinalKind === "status" &&
+      uiFinalBelongsToTask &&
+      isMeaningfulTranscriptText(uiFinalText);
     const uiFinalReadyByRecording =
       uiFinalKind === "transcript" &&
       isMeaningfulTranscriptText(uiFinalText) &&
@@ -4962,6 +4971,28 @@ async function processPostStopTask(task) {
     }
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
       (state.status === "Done" || state.status === "Error" || state.status === "Idle");
+    if (doneLike && state.status === "Done" && uiFinalStatusHasTranscript) {
+      if (!doneStatusTranscriptSince) doneStatusTranscriptSince = Date.now();
+      if (Date.now() - doneStatusTranscriptSince >= 600) {
+        transcript = uiFinalText;
+        traceStep(trace, "done_status_transcript_fallback", {
+          pollCount,
+          expectedRecordingId: task.recordingId || 0,
+          uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
+          textLen: transcript.length,
+        });
+        break;
+      }
+      traceStep(trace, "done_waiting_for_paste_ready", {
+        pollCount,
+        expectedRecordingId: task.recordingId || 0,
+        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
+        textLen: uiFinalText.length,
+      });
+      await sleep(30);
+      continue;
+    }
+    doneStatusTranscriptSince = 0;
     if (doneLike) break;
     await sleep(30);
   }
@@ -6199,6 +6230,16 @@ async function createWindow(options = {}) {
     "clipboard-write",
     "clipboard-sanitized-write",
   ]);
+  const permissionLogUrl = (url) => {
+    const raw = String(url || "");
+    if (!raw) return "";
+    if (raw.startsWith("data:")) {
+      const comma = raw.indexOf(",");
+      const mime = raw.slice(5, comma >= 0 ? comma : Math.min(raw.length, 80)).split(";")[0] || "inline";
+      return `data:${mime};bytes=${Buffer.byteLength(raw, "utf8")}`;
+    }
+    return compactLogText(raw, 240);
+  };
   // Origin gate: only the backend's own origin is allowed to request
   // media permissions and clipboard-write. Clipboard-read stays
   // denied; copy buttons only need writeText. Without this check, a
@@ -6214,10 +6255,11 @@ async function createWindow(options = {}) {
     const knownPerm = mediaPermissions.has(perm) || clipboardWritePermissions.has(perm);
     const fromBackend = _isBackendOrigin(url);
     const allow = knownPerm && fromBackend;
+    const logUrl = permissionLogUrl(url);
     if (knownPerm && !fromBackend) {
-      appendMainLog(`[perm-request] DENY non-backend origin: perm=${perm} url=${url}`);
+      appendMainLog(`[perm-request] DENY non-backend origin: perm=${perm} url=${logUrl}`);
     } else {
-      appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${url}`);
+      appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${logUrl}`);
     }
     cb(allow);
   });
@@ -6227,10 +6269,11 @@ async function createWindow(options = {}) {
     const knownPerm = mediaPermissions.has(perm) || clipboardWritePermissions.has(perm);
     const fromBackend = _isBackendOrigin(url);
     const allow = knownPerm && fromBackend;
+    const logUrl = permissionLogUrl(url);
     if (knownPerm && !fromBackend) {
-      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} url=${url}`);
+      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} url=${logUrl}`);
     } else {
-      appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${url}`);
+      appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${logUrl}`);
     }
     return allow;
   });

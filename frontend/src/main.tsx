@@ -59,6 +59,7 @@ interface AppConfig {
 interface RecordingItem {
   name: string;
   display_name: string;
+  source_file?: string;
   modified_at: string;
   size_bytes: number;
   provider: string;
@@ -3732,9 +3733,14 @@ function populateBuiltinUpscalePresetOptions(): void {
  */
 const upscaleInFlightBySession = new Map<string, Promise<string>>();
 
-async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<string> {
+async function runUpscaleIfEnabled(
+  text: string,
+  sessionToken = "",
+  opts: { setDoneStatus?: boolean } = {},
+): Promise<string> {
   const input = String(text || "").trim();
   if (!input) return "";
+  const setDoneStatus = opts.setDoneStatus !== false;
   if (!shouldUpscale()) {
     if (isCurrentUiSession(sessionToken)) {
       $("upscaleOutput").textContent = "";
@@ -3806,7 +3812,7 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
         upscaleOutputEl.dataset.upscaleNonce = "";
         $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
       }
-      setStatusScoped(sessionToken, "Done");
+      if (setDoneStatus) setStatusScoped(sessionToken, "Done");
       return out;
     } catch (e) {
       const rawMsg = e instanceof Error ? e.message : String(e || "Unknown upscale error");
@@ -3855,7 +3861,7 @@ async function runUpscaleIfEnabled(text: string, sessionToken = ""): Promise<str
         upscaleOutputEl.dataset.upscaleNonce = "";
         $("upscaleLatency").textContent = fmtMs(performance.now() - t0);
       }
-      setStatusScoped(sessionToken, "Done");
+      if (setDoneStatus) setStatusScoped(sessionToken, "Done");
       return input;
     } finally {
       upscaleInFlightBySession.delete(inflightKey);
@@ -4536,7 +4542,7 @@ function getFilteredRecordings(): RecordingItem[] {
   const query = recordingsSearchQuery.trim().toLowerCase();
   if (!query) return recordingItems;
   return recordingItems.filter((item) => {
-    const haystack = [item.display_name, item.name, item.provider, item.language].join(" ").toLowerCase();
+    const haystack = [item.display_name, item.source_file || "", item.name, item.provider, item.language].join(" ").toLowerCase();
     return haystack.includes(query);
   });
 }
@@ -4877,6 +4883,7 @@ async function openRecording(name: string): Promise<void> {
       modified_at: string;
       size_bytes: number;
       content: string;
+      source_file?: string;
       has_audio?: boolean;
       audio_name?: string;
       audio_size_bytes?: number;
@@ -8266,10 +8273,13 @@ async function stopLive(enhance: boolean): Promise<void> {
       $("progressText").textContent = "100%";
       $("progressRow").hidden = true;
     }
-    setStatusScoped(sessionUiToken, "Done");
     let pasteReadyText = "";
     if (transcriptRaw) {
-      transcriptForPaste = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
+      transcriptForPaste = await runUpscaleIfEnabled(
+        transcriptRaw,
+        sessionUiToken,
+        { setDoneStatus: false },
+      );
       pasteReadyText = transcriptForPaste || transcriptRaw;
       publishRecordingFinalSignal({
         recordingId,
@@ -8279,6 +8289,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         sessionToken: sessionUiToken,
       });
     }
+    setStatusScoped(sessionUiToken, "Done");
     // saveRecordingText is non-blocking for recordings list reload.
     try {
       title = _smartTitle(transcriptRaw);
@@ -8572,9 +8583,12 @@ async function transcribeSelectedFile(): Promise<void> {
         $("progressText").textContent = "100%";
         $("progressRow").hidden = true;
       }
-      setStatusScoped(sessionUiToken, "Done");
       if (transcriptRaw) {
-        const pasteReadyText = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
+        const pasteReadyText = await runUpscaleIfEnabled(
+          transcriptRaw,
+          sessionUiToken,
+          { setDoneStatus: false },
+        );
         publishRecordingFinalSignal({
           recordingId: 0,
           signalText: pasteReadyText || transcriptRaw,
@@ -8583,6 +8597,7 @@ async function transcribeSelectedFile(): Promise<void> {
           sessionToken: sessionUiToken,
         });
       }
+      setStatusScoped(sessionUiToken, "Done");
       const latencyMs = performance.now() - transcribeStartedAt;
       patchCurrentRecordingSummary({
         status: transcriptRaw ? "File transcript is ready." : "Recording completed, no speech detected.",
@@ -8611,9 +8626,12 @@ async function transcribeSelectedFile(): Promise<void> {
         $("progressText").textContent = "100%";
         $("progressRow").hidden = true;
       }
-      setStatusScoped(sessionUiToken, "Done");
       if (transcriptRaw) {
-        const pasteReadyText = await runUpscaleIfEnabled(transcriptRaw, sessionUiToken);
+        const pasteReadyText = await runUpscaleIfEnabled(
+          transcriptRaw,
+          sessionUiToken,
+          { setDoneStatus: false },
+        );
         publishRecordingFinalSignal({
           recordingId: 0,
           signalText: pasteReadyText || transcriptRaw,
@@ -8622,6 +8640,7 @@ async function transcribeSelectedFile(): Promise<void> {
           sessionToken: sessionUiToken,
         });
       }
+      setStatusScoped(sessionUiToken, "Done");
       const latencyMs = performance.now() - transcribeStartedAt;
       patchCurrentRecordingSummary({
         status: transcriptRaw ? "File transcript is ready." : "Recording completed, no speech detected.",
@@ -8981,17 +9000,19 @@ function gExtractKeywordsFromTitle(title: string): string[] {
 async function loadGraphData(): Promise<void> {
   try {
     $("graphContainer").setAttribute("aria-busy", "true");
-    let items: Array<{ name: string; display_name: string; provider: string; keywords: string[] }> = [];
+    let items: Array<{ name: string; display_name: string; source_file?: string; provider: string; keywords: string[] }> = [];
     try {
-      const r = await apiGet<{ nodes: Array<{ name: string; display_name: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
+      const r = await apiGet<{ nodes: Array<{ name: string; display_name: string; source_file?: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
       items = (r.nodes || []).map((it) => ({
         name: it.name, display_name: it.display_name,
+        source_file: it.source_file || "",
         provider: it.provider || "unknown", keywords: it.keywords || [],
       }));
     } catch {
       const r = await apiGet<{ items: RecordingItem[] }>("/api/recordings");
       items = (r.items || []).map((it) => ({
         name: it.name, display_name: it.display_name,
+        source_file: it.source_file || "",
         provider: it.provider || "unknown",
         keywords: gExtractKeywordsFromTitle(it.display_name),
       }));
