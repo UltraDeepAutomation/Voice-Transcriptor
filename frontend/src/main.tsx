@@ -8042,13 +8042,14 @@ async function stopLive(enhance: boolean): Promise<void> {
             let chose: Cand | null = improvedText !== baseTranscriptForRace
               ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
               : null;
-            const firstConfirmsInstant =
+            const recoveryConfirmsInstant =
+              first.label === "recovery" &&
               wcInstant > 0 &&
               first.words >= Math.max(1, Math.floor(wcInstant * 0.9));
-            if (!chose && firstConfirmsInstant) {
-              console.log(`[trace tail-gap] decision=KEEP_INSTANT_EARLY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
+            if (!chose && recoveryConfirmsInstant) {
+              console.log(`[trace tail-gap] decision=KEEP_INSTANT_AFTER_RECOVERY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
             }
-            if (!chose && !firstConfirmsInstant) {
+            if (!chose && !recoveryConfirmsInstant) {
               // First didn't improve — wait for the OTHER.
               const other = first.label === "envelope" ? await recoveryCand : await envelopeCand;
               const otherMs = performance.now() - tRace;
@@ -8069,7 +8070,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                   tone: "success",
                 }, sessionUiToken);
               }
-            } else if (!firstConfirmsInstant) {
+            } else if (!recoveryConfirmsInstant) {
               console.log(`[trace tail-gap] decision=KEEP_INSTANT (no improvement) totalMs=${totalRaceMs.toFixed(0)}`);
             }
           }
