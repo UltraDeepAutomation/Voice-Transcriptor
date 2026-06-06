@@ -2597,7 +2597,7 @@ function getCanonicalLiveSourceText(): string {
   // the tail of the utterance is never lost.
   //
   // Why ``lastInterimSnapshot``: when Deepgram sends an ``is_final``
-  // event, ``appendLiveTranscriptSegments`` clears ``liveInterimText``
+  // event, the session buffer commit projection clears ``liveInterimText``
   // (correct for live display — the interim is replaced by the final).
   // But if Deepgram finalized only PART of what was in the interim
   // (e.g. "последние" out of "последние слова"), the cleared interim
@@ -2613,34 +2613,11 @@ function getCanonicalLiveSourceText(): string {
   //
   // Deduplication: if the chosen interim is already a SUBSTRING of
   // ``committed``, skip it to avoid "foo bar bar" artifacts.
-  const committed = liveDraftText.trim();
-  const currentInterim = liveInterimText.trim();
-  const snapshotInterim = lastInterimSnapshot.trim();
-  const interim =
-    currentInterim.length >= snapshotInterim.length
-      ? currentInterim
-      : snapshotInterim;
-  if (!interim) return committed;
-  if (!committed) return interim;
-  // Dedup: if committed already ends with the exact interim text, skip.
-  if (committed.endsWith(interim)) return committed;
-  // Dedup: word-normalised comparison so "world." vs "world" or
-  // "world!" vs "world" do not produce "hello world world!" artifacts.
-  // Strip punctuation from both sides and compare at word level.
-  // Unicode-aware: \p{L} matches any letter (Latin, Cyrillic, CJK, Arabic …),
-  // \p{N} any digit — so Russian and other non-ASCII scripts are NOT stripped.
-  const normalizeWords = (s: string): string[] =>
-    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
-  const interimWords = normalizeWords(interim);
-  if (interimWords.length === 0) return committed;
-  const lastCommittedWords = committed.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
-  const lastCommittedNorm = normalizeWords(lastCommittedWords).join(" ");
-  const interimNorm = interimWords.join(" ");
-  // Substring check on normalised forms covers: exact match, punctuation
-  // variation ("world." == "world"), and phrase inclusion ("bar foo" in
-  // "hello world foo bar" correctly NOT matching because the join order differs).
-  if (lastCommittedNorm.endsWith(interimNorm)) return committed;
-  return `${committed} ${interim}`;
+  return composeCanonicalLiveSourceText(
+    liveDraftText,
+    liveInterimText,
+    lastInterimSnapshot,
+  );
 }
 
 function getVisibleLivePreviewText(): string {
@@ -3015,6 +2992,7 @@ function persistLiveDraft(recording: boolean): void {
     const timerText = ($("timer").textContent || "00:00").trim();
     const title = "Recording " + new Date(startAt || Date.now()).toLocaleString();
     const draft = {
+      session_id: activeLiveSessionId || activeUiSessionToken || "",
       started_at: startAt || Date.now(),
       updated_at: Date.now(),
       recording,
@@ -3036,8 +3014,16 @@ function persistLiveDraft(recording: boolean): void {
   }
 }
 
-function clearLiveDraft(): void {
+function clearLiveDraft(sessionToken = ""): void {
   try {
+    if (sessionToken) {
+      const raw = localStorage.getItem(LIVE_DRAFT_KEY) || "";
+      if (raw) {
+        const parsed = JSON.parse(raw) as { session_id?: unknown };
+        const owner = String(parsed.session_id || "").trim();
+        if (owner && owner !== sessionToken) return;
+      }
+    }
     localStorage.removeItem(LIVE_DRAFT_KEY);
   } catch (e) {
     console.debug("clearLiveDraft skipped", e);
@@ -5620,7 +5606,19 @@ interface LiveFinalSlot {
   envelope: LiveFinalEnvelope | null;
   waiters: Array<(envelope: LiveFinalEnvelope | null) => void>;
 }
+
+interface LiveTranscriptBuffer {
+  segments: TranscriptSegment[];
+  committedText: string;
+  committedDisplayText: string;
+  interimText: string;
+  lastInterimText: string;
+  committedDisplayCache: string;
+  wsMode: LiveWsMode;
+}
+
 const liveFinalSlots = new Map<string, LiveFinalSlot>();
+const liveTranscriptBuffers = new Map<string, LiveTranscriptBuffer>();
 // Session-scoped live-stream error map. Was previously a single
 // global ``let liveStreamError = ""``; that allowed an OLD session's
 // error event (fired through a buffered ws.onmessage tick) to bleed
@@ -5637,6 +5635,145 @@ function setLiveStreamError(token: string, err: string): void {
   if (!token) return;
   if (err) liveStreamErrors.set(token, err);
   else liveStreamErrors.delete(token);
+}
+
+function createLiveTranscriptBuffer(wsMode: LiveWsMode): LiveTranscriptBuffer {
+  return {
+    segments: [],
+    committedText: "",
+    committedDisplayText: "",
+    interimText: "",
+    lastInterimText: "",
+    committedDisplayCache: "",
+    wsMode,
+  };
+}
+
+function getLiveTranscriptBuffer(token: string): LiveTranscriptBuffer | null {
+  if (!token) return null;
+  return liveTranscriptBuffers.get(token) || null;
+}
+
+function ensureLiveTranscriptBuffer(token: string, wsMode: LiveWsMode): LiveTranscriptBuffer {
+  const existing = getLiveTranscriptBuffer(token);
+  if (existing) return existing;
+  const buffer = createLiveTranscriptBuffer(wsMode);
+  liveTranscriptBuffers.set(token, buffer);
+  return buffer;
+}
+
+function composeCanonicalLiveSourceText(
+  committedRaw: string,
+  currentInterimRaw: string,
+  snapshotInterimRaw: string,
+): string {
+  const committed = normalizeTranscriptWhitespace(committedRaw);
+  const currentInterim = normalizeTranscriptWhitespace(currentInterimRaw);
+  const snapshotInterim = normalizeTranscriptWhitespace(snapshotInterimRaw);
+  const interim =
+    currentInterim.length >= snapshotInterim.length
+      ? currentInterim
+      : snapshotInterim;
+  if (!interim) return committed;
+  if (!committed) return interim;
+  if (committed.endsWith(interim)) return committed;
+  const normalizeWords = (s: string): string[] =>
+    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
+  const interimWords = normalizeWords(interim);
+  if (interimWords.length === 0) return committed;
+  const lastCommittedWords = committed.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
+  const lastCommittedNorm = normalizeWords(lastCommittedWords).join(" ");
+  const interimNorm = interimWords.join(" ");
+  if (lastCommittedNorm.endsWith(interimNorm)) return committed;
+  return `${committed} ${interim}`;
+}
+
+function canonicalTextFromBuffer(buffer: LiveTranscriptBuffer): string {
+  return composeCanonicalLiveSourceText(
+    buffer.committedText,
+    buffer.interimText,
+    buffer.lastInterimText,
+  );
+}
+
+function getSessionCanonicalLiveSourceText(token: string): string {
+  const buffer = getLiveTranscriptBuffer(token);
+  return buffer ? canonicalTextFromBuffer(buffer) : getCanonicalLiveSourceText();
+}
+
+function appendSegmentsToBuffer(
+  buffer: LiveTranscriptBuffer,
+  rawSegments: unknown[],
+): void {
+  const nextSegments = Array.isArray(rawSegments)
+    ? rawSegments
+      .map((segment) => normalizeTranscriptSegment(segment))
+      .filter((segment): segment is TranscriptSegment => !!segment)
+    : [];
+  if (!nextSegments.length) return;
+
+  const prevLen = buffer.segments.length;
+  const combined = buffer.segments.concat(nextSegments);
+  const merged = mergeTranscriptSegments(combined);
+  const appendOnly =
+    merged.length === combined.length &&
+    merged.length >= prevLen &&
+    merged.slice(0, prevLen).every((seg, i) => seg === buffer.segments[i]);
+
+  buffer.segments = merged;
+  if (buffer.interimText) {
+    buffer.lastInterimText = buffer.interimText;
+  }
+  buffer.interimText = "";
+
+  const separator = buffer.wsMode === "deepgram-stream" ? " " : "\n";
+  const hasDiarization = buffer.segments.some((s) => s.speaker !== undefined);
+  if (hasDiarization) {
+    buffer.committedDisplayCache = formatSegmentsForDisplay(buffer.segments, separator);
+  } else if (appendOnly) {
+    let delta = "";
+    for (let i = prevLen; i < merged.length; i++) {
+      const t = merged[i].text;
+      if (!t) continue;
+      if (delta) delta += separator;
+      delta += t;
+    }
+    if (delta) {
+      buffer.committedDisplayCache = buffer.committedDisplayCache
+        ? `${buffer.committedDisplayCache}${separator}${delta}`
+        : delta;
+    }
+  } else {
+    buffer.committedDisplayCache = merged
+      .map((segment) => segment.text)
+      .filter(Boolean)
+      .join(separator)
+      .trim();
+  }
+  buffer.committedText = joinTranscriptSegments(buffer.segments);
+  buffer.committedDisplayText = buffer.committedDisplayCache || buffer.committedText;
+}
+
+function maxSegmentEnd(segments: TranscriptSegment[]): number {
+  return segments.reduce((max, seg) => (seg.end > max ? seg.end : max), 0);
+}
+
+function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
+  if (!buffer) return false;
+  return (
+    buffer.segments.length > 0 ||
+    !!buffer.committedText.trim() ||
+    !!buffer.interimText.trim() ||
+    !!buffer.lastInterimText.trim()
+  );
+}
+
+function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer): void {
+  liveTranscriptSegments = buffer.segments;
+  liveInterimText = buffer.interimText;
+  lastInterimSnapshot = buffer.lastInterimText;
+  liveCommittedDisplayCache = buffer.committedDisplayCache;
+  setLiveDraftState(buffer.committedText, buffer.committedDisplayText);
 }
 
 function ensureLiveFinalSlot(token: string): LiveFinalSlot {
@@ -5667,29 +5804,25 @@ function resolveLiveFinal(token: string, envelope: LiveFinalEnvelope): void {
 }
 
 function clearLiveStreamState(): void {
-  // Drop stale slots whose sessions are definitely over. We keep slots
-  // owned by the CURRENTLY active UI session so that a just-started
-  // session doesn't lose its future envelope. Old sessions release
-  // any lingering waiters with a null envelope so no promise hangs.
+  // Drop only stale slots that have no waiters. A previous stopLive may
+  // still be awaiting its final envelope while a new recording starts;
+  // forcing those waiters to null here breaks recording/transcription
+  // parallelism and discards the post-CloseStream tail.
   const activeToken = activeUiSessionToken || "";
   for (const [token, slot] of liveFinalSlots) {
     if (token === activeToken) continue;
-    const waiters = slot.waiters;
-    slot.waiters = [];
-    for (const waiter of waiters) {
-      try {
-        waiter(null);
-      } catch (e) {
-        console.warn("stale live final waiter threw", e);
-      }
-    }
-    liveFinalSlots.delete(token);
+    if (slot.waiters.length === 0) liveFinalSlots.delete(token);
   }
   // Session-scoped error map: drop entries for stale sessions only.
   // The active session's error (if any) is preserved so that a tail-
   // running stopLive can still see it.
   for (const token of [...liveStreamErrors.keys()]) {
-    if (token !== activeToken) liveStreamErrors.delete(token);
+    if (token !== activeToken && !liveFinalSlots.has(token)) liveStreamErrors.delete(token);
+  }
+  for (const token of [...liveTranscriptBuffers.keys()]) {
+    if (token !== activeToken && !liveFinalSlots.has(token)) {
+      liveTranscriptBuffers.delete(token);
+    }
   }
   liveInterimText = "";
 }
@@ -5929,22 +6062,12 @@ function setLiveDraftState(text: string, displayText = text): void {
   syncLiveOutputFromState();
 }
 
-function setLiveInterimText(text: string): void {
-  const next = normalizeTranscriptWhitespace(text);
-  if (next === liveInterimText) return;
-  liveInterimText = next;
-  syncLiveOutputFromState();
-}
-
 /**
- * Incremental committed-segment buffer.
+ * Active live-preview projection cache.
  *
- * ``mergeTranscriptSegments`` is O(n log n); rebuilding the flat join
- * on every append is O(n). For a 1-hour session with ~3000 committed
- * segments that's ~4.5M string operations on every interim event.
- * Instead we maintain an append-only cache that only rebuilds when
- * the merge detected an out-of-order segment (which shouldn't happen
- * with well-behaved streaming providers but we guard for it).
+ * The authoritative committed/interim state lives in LiveTranscriptBuffer
+ * per session. These globals are only the currently active UI projection,
+ * kept for the existing renderer/overlay read paths.
  */
 let liveCommittedDisplayCache = "";
 // Snapshot of ``liveInterimText`` taken JUST BEFORE it is cleared by
@@ -5957,67 +6080,9 @@ let liveCommittedDisplayCache = "";
 //
 // ``lastInterimSnapshot`` preserves the interim so stopLive can recover
 // it. It is reset to "" at the start of every new recording (startLive)
-// and updated every time ``appendLiveTranscriptSegments`` fires.
+// and updated when committed segments are projected from that session's
+// LiveTranscriptBuffer into the active preview state.
 let lastInterimSnapshot = "";
-
-function appendLiveTranscriptSegments(rawSegments: unknown[]): void {
-  const nextSegments = Array.isArray(rawSegments)
-    ? rawSegments
-      .map((segment) => normalizeTranscriptSegment(segment))
-      .filter((segment): segment is TranscriptSegment => !!segment)
-    : [];
-  if (!nextSegments.length) return;
-
-  const prevLen = liveTranscriptSegments.length;
-  const combined = liveTranscriptSegments.concat(nextSegments);
-  const merged = mergeTranscriptSegments(combined);
-  const appendOnly =
-    merged.length === combined.length &&
-    merged.length >= prevLen &&
-    merged.slice(0, prevLen).every((seg, i) => seg === liveTranscriptSegments[i]);
-
-  liveTranscriptSegments = merged;
-  // Snapshot the interim BEFORE clearing it so stopLive can recover
-  // trailing words that haven't been finalized yet.
-  if (liveInterimText) {
-    lastInterimSnapshot = liveInterimText;
-  }
-  // Committed-final text is the SSOT. Clear any lingering interim so
-  // the visible preview matches the committed stream.
-  liveInterimText = "";
-
-  const separator = liveWsMode === "deepgram-stream" ? " " : "\n";
-  // If diarize is on, rebuild via formatSegmentsForDisplay because the
-  // speaker prefix transitions can't be incrementally appended without
-  // losing the "same-speaker coalesce" behavior. For mono streams we
-  // take the fast append-only path.
-  const hasDiarization = liveTranscriptSegments.some((s) => s.speaker !== undefined);
-  if (hasDiarization) {
-    liveCommittedDisplayCache = formatSegmentsForDisplay(liveTranscriptSegments, separator);
-  } else if (appendOnly) {
-    // O(k) incremental append where k is the number of new segments.
-    let delta = "";
-    for (let i = prevLen; i < merged.length; i++) {
-      const t = merged[i].text;
-      if (!t) continue;
-      if (delta) delta += separator;
-      delta += t;
-    }
-    if (delta) {
-      liveCommittedDisplayCache = liveCommittedDisplayCache
-        ? `${liveCommittedDisplayCache}${separator}${delta}`
-        : delta;
-    }
-  } else {
-    // Segments reordered or deduped — rebuild from scratch.
-    liveCommittedDisplayCache = merged
-      .map((segment) => segment.text)
-      .filter(Boolean)
-      .join(separator)
-      .trim();
-  }
-  setLiveDraftState(joinTranscriptSegments(liveTranscriptSegments), liveCommittedDisplayCache);
-}
 
 function resetOutputs(): void {
   resetRecordSessionNotice();
@@ -6269,6 +6334,8 @@ async function startLive(): Promise<void> {
   resetLiveDraftState();
   clearLiveStreamState();
   liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
+  const sessionWsMode = liveWsMode;
+  liveTranscriptBuffers.set(sessionUiToken, createLiveTranscriptBuffer(sessionWsMode));
   setBusy(true, sessionUiToken);
   isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
@@ -6306,14 +6373,14 @@ async function startLive(): Promise<void> {
 
   const enableVisibleLivePreview = shouldLivePreview();
   const wsQuery = new URLSearchParams({
-    provider: liveWsMode === "deepgram-stream" ? "deepgram" : "local",
+    provider: sessionWsMode === "deepgram-stream" ? "deepgram" : "local",
     language: activeLiveSessionSnapshot.language,
     session_id: activeLiveSessionId,
     archive_dir: activeLiveArchiveDir,
     token: apiToken(),
     diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
   });
-  if (liveWsMode === "deepgram-stream") {
+  if (sessionWsMode === "deepgram-stream") {
     wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
   } else {
     wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
@@ -6322,7 +6389,7 @@ async function startLive(): Promise<void> {
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     const statusMsg =
-      liveWsMode === "deepgram-stream"
+      sessionWsMode === "deepgram-stream"
         ? enableVisibleLivePreview
           ? "Recording. Deepgram live streaming is active."
           : "Recording. Deepgram live stream is committing segments in the background."
@@ -6357,19 +6424,15 @@ async function startLive(): Promise<void> {
       text: "",
       segments: [],
       durationSec: 0,
-      source: liveWsMode,
+      source: sessionWsMode,
       error: `live stream closed unexpectedly (code=${ev.code})`,
     });
   };
   ws.onmessage = (ev: MessageEvent<string>) => {
-    // Guard: drop messages from a stale socket if this session's token
-    // no longer matches the active UI session. In the normal flow this
-    // never fires because stopLive closes the socket before setBusy(false)
-    // allows a new startLive, but a browser-buffered frame or a re-entrant
-    // auto-stop edge case can slip through without it.
-    if (activeUiSessionToken !== sessionUiToken) return;
     const msg = parseLiveWsMessage(ev.data);
     if (!msg) return;
+    const isActiveSession = activeUiSessionToken === sessionUiToken;
+    const sessionBuffer = ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
     switch (msg.type) {
       case "error": {
         setLiveStreamError(sessionUiToken, msg.error);
@@ -6380,7 +6443,7 @@ async function startLive(): Promise<void> {
         // recording keeps going, just not streaming to Deepgram
         // anymore. stopLive picks up the committed text as the
         // transcript so the user experience is seamless.
-        if (msg.fatal) {
+        if (isActiveSession && msg.fatal) {
           patchCurrentRecordingSummary(
             {
               status: `Live stream error: ${explainNetworkError(new Error(msg.error))}`,
@@ -6402,25 +6465,35 @@ async function startLive(): Promise<void> {
       }
       case "segments": {
         const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-        console.log(`[trace ws-segments] count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} lastText="${lastNew.text.slice(-50)}"` : "(empty)"}`);
-        appendLiveTranscriptSegments(msg.segments);
-        if (liveDraftText) {
-          persistLiveDraft(true);
+        console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} lastText="${lastNew.text.slice(-50)}"` : "(empty)"}`);
+        appendSegmentsToBuffer(sessionBuffer, msg.segments);
+        if (isActiveSession) {
+          projectLiveTranscriptBufferToActiveState(sessionBuffer);
+          if (liveDraftText) {
+            persistLiveDraft(true);
+          }
         }
         return;
       }
       case "interim": {
-        setLiveInterimText(msg.segment.text);
+        sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
+        if (isActiveSession) {
+          projectLiveTranscriptBufferToActiveState(sessionBuffer);
+        }
         return;
       }
       case "final": {
         const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-        console.log(`[trace ws-final] textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} lastText="${lastSeg.text.slice(-50)}"` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
+        console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} lastText="${lastSeg.text.slice(-50)}"` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
+        appendSegmentsToBuffer(sessionBuffer, msg.segments);
+        if (isActiveSession) {
+          projectLiveTranscriptBufferToActiveState(sessionBuffer);
+        }
         const envelope: LiveFinalEnvelope = {
           text: normalizeTranscriptWhitespace(msg.text),
           segments: msg.segments,
           durationSec: msg.durationSec,
-          source: msg.source || liveWsMode,
+          source: msg.source || sessionWsMode,
         };
         if (msg.error) envelope.error = msg.error;
         resolveLiveFinal(sessionUiToken, envelope);
@@ -6674,6 +6747,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   let _wsToCloseAtEnd: WebSocket | null = null;
   let stopTransitionReleased = false;
   let stoppedRecordingId = 0;
+  let stoppedSessionToken = "";
   // Wrap the entire body in try/finally so the in-flight guard is ALWAYS
   // cleared, even if a pre-main-try await (flushWorkletPort / waitForWorklet
   // Drain / stopMediaRecorderAndFlush / pcmSink.finalize / selectCanonical
@@ -6686,6 +6760,12 @@ async function stopLive(enhance: boolean): Promise<void> {
   stoppedRecordingId = recordingId;
   const liveSessionId = activeLiveSessionId;
   const sessionUiToken = liveSessionId;
+  stoppedSessionToken = sessionUiToken;
+  const disableStopButtonForSession = (): void => {
+    if (!isCurrentUiSession(sessionUiToken)) return;
+    const stopBtn = document.getElementById("btnStop") as HTMLButtonElement | null;
+    if (stopBtn) stopBtn.disabled = true;
+  };
   const releaseStopTransitionForNextRecording = (): void => {
     if (stopTransitionReleased) return;
     stopTransitionReleased = true;
@@ -6694,8 +6774,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       stopTransitionOwnerToken = "";
     }
     setBusy(false, sessionUiToken);
-    const stopBtn = document.getElementById("btnStop") as HTMLButtonElement | null;
-    if (stopBtn) stopBtn.disabled = true;
+    disableStopButtonForSession();
   };
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
@@ -6740,7 +6819,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   const languageValue = liveSnapshot.language;
   const effectiveProvider = liveSnapshot.effectiveProvider;
   const modelValue = liveSnapshot.model;
-  const sourceLiveText = getCanonicalLiveSourceText();
+  const sourceLiveText = getSessionCanonicalLiveSourceText(sessionUiToken);
   // True session-level RMS is sqrt(mean of per-frame squared RMS),
   // not mean of per-frame RMS. The mean-of-RMS metric underestimates
   // dynamic-signal energy (speech peaks get diluted by inter-syllable
@@ -6821,7 +6900,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   // being flushed, and those trailing frames could arrive at Deepgram
   // AFTER CloseStream and get dropped. Reordering stream.stop() to
   // step 1 fixes this at the root.
-  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${liveTranscriptSegments.length} liveDraftLen=${liveDraftText.length} liveInterimLen=${liveInterimText.length} lastInterimSnapshotLen=${lastInterimSnapshot.length}`);
+  const stopEntryBuffer = getLiveTranscriptBuffer(sessionUiToken);
+  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? liveTranscriptSegments.length} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length} lastInterimSnapshotLen=${stopEntryBuffer?.lastInterimText.length ?? lastInterimSnapshot.length}`);
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   } catch (e) {
@@ -6839,7 +6919,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   await stopMediaRecorderAndFlush();
   mark("stopMediaRecorderAndFlush");
   const recorderDur = performance.now() - t0Drain - flushDur - drainDur;
-  console.log(`[trace stopLive] drained flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms recorder=${recorderDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${liveTranscriptSegments.length}`);
+  console.log(`[trace stopLive] drained flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms recorder=${recorderDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? liveTranscriptSegments.length}`);
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
@@ -7181,9 +7261,9 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (isCurrentUiSession(sessionUiToken)) {
       $("progressRow").hidden = true;
     }
-    clearLiveDraft();
+    clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    disableStopButtonForSession();
     setStatusScoped(sessionUiToken, "Error");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -7224,9 +7304,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         }, sessionUiToken);
       }
     }
-    clearLiveDraft();
+    clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    disableStopButtonForSession();
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       status: "Silence detected. Audio remains available for review.",
@@ -7271,9 +7351,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         }, sessionUiToken);
       }
     }
-    clearLiveDraft();
+    clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    disableStopButtonForSession();
     setStatusScoped(sessionUiToken, skippedBySetting ? "Idle" : "Error");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -7318,9 +7398,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         }, sessionUiToken);
       }
     }
-    clearLiveDraft();
+    clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    disableStopButtonForSession();
     setStatusScoped(sessionUiToken, "Idle");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -7377,9 +7457,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         }, sessionUiToken);
       }
     }
-    clearLiveDraft();
+    clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    disableStopButtonForSession();
     return;
   }
   // (transcribeStartedAt is captured at the top of stopLive — line ~6510)
@@ -7636,8 +7716,11 @@ async function stopLive(enhance: boolean): Promise<void> {
       // shouldn't drop the recording silently when a higher-quality
       // recovery is available.
       if (liveStreamErrorAtStop) {
+        const errorBuffer = getLiveTranscriptBuffer(sessionUiToken);
         transcriptRaw =
-          liveCommittedDisplayCache || joinTranscriptSegments(liveTranscriptSegments);
+          errorBuffer?.committedDisplayText ||
+          errorBuffer?.committedText ||
+          (errorBuffer ? joinTranscriptSegments(errorBuffer.segments) : sourceLiveText);
         if (!transcriptRaw) {
           transcriptRaw = await recoverFromEmptyTranscript(
             `Live stream errored mid-recording (${liveStreamErrorAtStop}).`,
@@ -7660,8 +7743,10 @@ async function stopLive(enhance: boolean): Promise<void> {
         // enhancement could update the saved recording. For now, the
         // committed + interim path is the SSOT and matches exactly
         // what the Live Preview pane showed the user during recording.
-        const instantTranscript = getCanonicalLiveSourceText();
-        console.log(`[trace stopLive] fast-path enter committedLen=${liveDraftText.length} interimLen=${liveInterimText.length} lastInterimSnapshotLen=${lastInterimSnapshot.length} instantTranscriptLen=${instantTranscript.length} instantWordCount=${instantTranscript.split(/\s+/).filter(Boolean).length} instantTail="${instantTranscript.slice(-60).replace(/\n/g, "\\n")}"`);
+        const instantBuffer = getLiveTranscriptBuffer(sessionUiToken);
+        const instantTranscript = getSessionCanonicalLiveSourceText(sessionUiToken);
+        const instantSegments = instantBuffer?.segments || [];
+        console.log(`[trace stopLive] fast-path enter committedLen=${instantBuffer?.committedText.length ?? 0} interimLen=${instantBuffer?.interimText.length ?? 0} lastInterimSnapshotLen=${instantBuffer?.lastInterimText.length ?? 0} instantTranscriptLen=${instantTranscript.length} instantWordCount=${instantTranscript.split(/\s+/).filter(Boolean).length} instantTail="${instantTranscript.slice(-60).replace(/\n/g, "\\n")}"`);
         if (instantTranscript) {
           transcriptRaw = instantTranscript;
 
@@ -7712,10 +7797,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           // ``end``. Tail-gap math must use Math.max(end) so the recovery
           // decision matches "where did finalized audio actually stop?",
           // not "what was the last array entry?".
-          const lastSegEnd = liveTranscriptSegments.reduce(
-            (max, seg) => (seg.end > max ? seg.end : max),
-            0,
-          );
+          const lastSegEnd = maxSegmentEnd(instantSegments);
           const tailGapSec = recordedSec - lastSegEnd;
           // Skip the check on very short recordings (< 1 s) where the
           // gap arithmetic isn't meaningful. Skip when the user had
@@ -7749,7 +7831,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             //     env + recovery.
             //
             // Net for the user's case: 7.6 s → ~3 s.
-            const skipEnvelope = liveTranscriptSegments.length === 0;
+            const skipEnvelope = instantSegments.length === 0;
             patchCurrentRecordingSummary({
               title: provisionalTitle,
               status: skipEnvelope
@@ -7910,7 +7992,7 @@ async function stopLive(enhance: boolean): Promise<void> {
 
       // Very last resort: whatever the live source text captured.
       if (!transcriptRaw) {
-        const committed = getCanonicalLiveSourceText();
+        const committed = getSessionCanonicalLiveSourceText(sessionUiToken);
         if (committed) transcriptRaw = committed;
       }
 
@@ -7954,11 +8036,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         // from the pre-dropout speech, so this guard correctly
         // recovers in that case (residue is non-empty → falls through
         // to the recovery branch below).
-        const noStreamingActivity =
-          liveTranscriptSegments.length === 0
-          && !liveInterimText.trim()
-          && !lastInterimSnapshot.trim()
-          && !liveDraftText.trim();
+        const noStreamingActivity = !hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken));
         if (noStreamingActivity) {
           console.log(`[trace stopLive] silent recording — skipping recovery (no streaming activity at all)`);
           patchCurrentRecordingSummary({
@@ -7979,7 +8057,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         $("progressFill").style.width = "50%";
         $("progressText").textContent = "50%";
       }
-      const previewDraft = liveDraftDisplayText.trim() || sourceLiveText;
+      const previewDraft =
+        (getLiveTranscriptBuffer(sessionUiToken)?.committedDisplayText || "").trim()
+        || sourceLiveText;
       if (previewDraft) {
         setStatusScoped(sessionUiToken, "Transcribing");
         patchCurrentRecordingSummary({
@@ -8129,8 +8209,8 @@ async function stopLive(enhance: boolean): Promise<void> {
       ...(persistedRecordingName && !fallbackSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
     }, sessionUiToken);
   } finally {
-    clearLiveDraft();
-    (document.getElementById("btnStop") as HTMLButtonElement).disabled = true;
+    clearLiveDraft(sessionUiToken);
+    disableStopButtonForSession();
     mark("stopLive:done");
     const totalMs = performance.now() - stopT0;
     const labels = stopTimings
@@ -8177,6 +8257,22 @@ async function stopLive(enhance: boolean): Promise<void> {
         try { _wsToCloseAtEnd.close(); } catch { /* already closed */ }
       }
     } catch { /* defensive */ }
+    if (stoppedSessionToken) {
+      const slot = liveFinalSlots.get(stoppedSessionToken);
+      if (slot) {
+        const waiters = slot.waiters.splice(0);
+        for (const waiter of waiters) {
+          try {
+            waiter(null);
+          } catch (e) {
+            console.warn("live final waiter cleanup threw", e);
+          }
+        }
+        liveFinalSlots.delete(stoppedSessionToken);
+      }
+      liveStreamErrors.delete(stoppedSessionToken);
+      liveTranscriptBuffers.delete(stoppedSessionToken);
+    }
   }
 }
 
