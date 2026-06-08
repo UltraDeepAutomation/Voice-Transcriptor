@@ -60,6 +60,8 @@ interface RecordingItem {
   name: string;
   display_name: string;
   source_file?: string;
+  archive_dir?: string;
+  recording_collection?: string;
   modified_at: string;
   size_bytes: number;
   provider: string;
@@ -142,6 +144,12 @@ interface SavedRecordingRef {
   name: string;
   archiveDir: string;
 }
+
+const RECORDING_COLLECTIONS = {
+  live: "live",
+  uploads: "uploads",
+} as const;
+type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
 
 interface TranscriptSegment {
   start: number;
@@ -2516,7 +2524,10 @@ async function recoverBackendAudioSessions(): Promise<void> {
           ...authHeaders(),
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(archiveDir ? { archive_dir: archiveDir } : {}),
+        body: JSON.stringify({
+          ...(archiveDir ? { archive_dir: archiveDir } : {}),
+          recording_collection: RECORDING_COLLECTIONS.live,
+        }),
       });
       if (!resp.ok) {
         failed += 1;
@@ -3008,6 +3019,7 @@ function persistLiveDraft(recording: boolean): void {
         getRemoteModelValue((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
       language: activeLiveSessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
       archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
+      recording_collection: RECORDING_COLLECTIONS.live,
     };
     localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
   } catch (e) {
@@ -3040,6 +3052,7 @@ interface PersistedLiveDraft {
   model?: string;
   language?: string;
   archive_dir?: string;
+  recording_collection?: string;
   updated_at?: number;
 }
 
@@ -3078,6 +3091,7 @@ function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
     model: pickString("model"),
     language: pickString("language"),
     archive_dir: pickString("archive_dir"),
+    recording_collection: pickString("recording_collection"),
     updated_at: pickNumber("updated_at"),
   };
 }
@@ -3112,6 +3126,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       provider: String(draft.provider || "local"),
       model: String(draft.model || "-"),
       language: String(draft.language || "auto"),
+      recordingCollection: RECORDING_COLLECTIONS.live,
     });
     const recoveredText = transcriptText || sourceText;
     publishRecordingOutput({
@@ -4431,6 +4446,7 @@ $("resetShortcutsBtn").addEventListener("click", () => {
 
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";
+let selectedRecordingArchiveDir = "";
 let recordingsStatsOpen = false;
 let recordingsSearchQuery = "";
 let recordingsLoadRequestSeq = 0;
@@ -4497,7 +4513,11 @@ function setRecordingViewerLoading(displayName: string): void {
 function reconcileCurrentRecordingSummaryWithArchive(): void {
   const savedName = String(currentRecordingSummary?.savedName || "").trim();
   if (!savedName) return;
-  if (recordingItems.some((item) => item.name === savedName)) return;
+  const savedArchiveDir = String(latestSavedAudioState?.archiveDir || "").trim();
+  if (recordingItems.some((item) =>
+    item.name === savedName &&
+    (!savedArchiveDir || recordingArchiveDir(item) === savedArchiveDir)
+  )) return;
   setCurrentRecordingSummary({
     ...(currentRecordingSummary as CurrentRecordingSummary),
     savedName: "",
@@ -4526,11 +4546,14 @@ function syncLatestSavedAudioFromRecordings(): void {
     return;
   }
   const current = latestSavedAudioState;
-  const sameRecording = !!current?.savedName && current.savedName === freshestWithAudio.name;
+  const archiveDir = recordingArchiveDir(freshestWithAudio);
+  const sameRecording = !!current?.savedName &&
+    current.savedName === freshestWithAudio.name &&
+    (!current.archiveDir || current.archiveDir === archiveDir);
   setLatestSavedAudio({
     title: freshestWithAudio.display_name || recordingTitleFromName(freshestWithAudio.name),
     savedName: freshestWithAudio.name,
-    archiveDir: currentArchiveDirSnapshot(),
+    archiveDir,
     sizeBytes: Number(freshestWithAudio.audio_size_bytes || current?.sizeBytes || 0),
     downloadName: freshestWithAudio.audio_name || current?.downloadName || `${freshestWithAudio.name.replace(/\.txt$/i, "")}.wav`,
     mimeType: freshestWithAudio.audio_mime || current?.mimeType || "",
@@ -4542,7 +4565,14 @@ function getFilteredRecordings(): RecordingItem[] {
   const query = recordingsSearchQuery.trim().toLowerCase();
   if (!query) return recordingItems;
   return recordingItems.filter((item) => {
-    const haystack = [item.display_name, item.source_file || "", item.name, item.provider, item.language].join(" ").toLowerCase();
+    const haystack = [
+      item.display_name,
+      item.source_file || "",
+      item.name,
+      item.provider,
+      item.language,
+      item.recording_collection || "",
+    ].join(" ").toLowerCase();
     return haystack.includes(query);
   });
 }
@@ -4628,6 +4658,48 @@ function currentArchiveDirSnapshot(): string {
   return String(activeResolvedRecordingsDir || "").trim();
 }
 
+function recordingArchiveDir(item: RecordingItem | null | undefined): string {
+  return String(item?.archive_dir || currentArchiveDirSnapshot() || "").trim();
+}
+
+function recordingIdentityKey(name: string, archiveDir = ""): string {
+  return `${String(archiveDir || "").trim()}\u0000${String(name || "").trim()}`;
+}
+
+function recordingItemKey(item: RecordingItem | null | undefined): string {
+  if (!item) return "";
+  return recordingIdentityKey(item.name, recordingArchiveDir(item));
+}
+
+function selectedRecordingKey(): string {
+  return recordingIdentityKey(selectedRecordingName, selectedRecordingArchiveDir);
+}
+
+function isSelectedRecordingItem(item: RecordingItem): boolean {
+  return recordingItemKey(item) === selectedRecordingKey();
+}
+
+function setSelectedRecording(item: RecordingItem | null | undefined): void {
+  selectedRecordingName = item?.name || "";
+  selectedRecordingArchiveDir = item ? recordingArchiveDir(item) : "";
+}
+
+function findRecordingItem(name: string, archiveDir = ""): RecordingItem | undefined {
+  const safeName = String(name || "").trim();
+  if (!safeName) return undefined;
+  const safeArchiveDir = String(archiveDir || "").trim();
+  if (safeArchiveDir) {
+    const key = recordingIdentityKey(safeName, safeArchiveDir);
+    const exact = recordingItems.find((item) => recordingItemKey(item) === key);
+    if (exact) return exact;
+  }
+  return recordingItems.find((item) => item.name === safeName);
+}
+
+function recordingDomKey(item: RecordingItem): string {
+  return encodeURIComponent(recordingItemKey(item));
+}
+
 async function ensureRecordingsArchiveReady(): Promise<string> {
   if (currentArchiveDirSnapshot()) {
     recordingsBootstrapReady = true;
@@ -4687,19 +4759,25 @@ function renderRecordingsList(): void {
         input.value = "";
         renderRecordingsList();
         if (!selectedRecordingName && recordingItems.length) {
-          selectedRecordingName = recordingItems[0].name;
-          void openRecording(selectedRecordingName);
+          const first = recordingItems[0];
+          setSelectedRecording(first);
+          void openRecording(first.name, recordingArchiveDir(first));
         }
       })
     );
     return;
   }
   filteredItems.forEach((it) => {
+    const itemKey = recordingItemKey(it);
+    const itemDomKey = recordingDomKey(it);
+    const isActive = itemKey === selectedRecordingKey();
     const btn = document.createElement("button");
-    btn.className = "recording-item" + (it.name === selectedRecordingName ? " active" : "");
+    btn.className = "recording-item" + (isActive ? " active" : "");
     btn.type = "button";
     btn.dataset.recordingName = it.name;
-    btn.setAttribute("aria-current", it.name === selectedRecordingName ? "true" : "false");
+    btn.dataset.recordingKey = itemDomKey;
+    btn.dataset.archiveDir = recordingArchiveDir(it);
+    btn.setAttribute("aria-current", isActive ? "true" : "false");
     const title = document.createElement("span");
     title.className = "rec-title";
     title.textContent = it.display_name;
@@ -4736,7 +4814,7 @@ function renderRecordingsList(): void {
     // размера разросшиеся" report was caused by the mix of
     // differently-tall items across new/old content.
     btn.appendChild(badges);
-    btn.onclick = () => void openRecording(it.name);
+    btn.onclick = () => void openRecording(it.name, recordingArchiveDir(it));
     list.appendChild(btn);
   });
 }
@@ -4744,14 +4822,14 @@ function renderRecordingsList(): void {
 async function moveRecordingSelection(step: number): Promise<void> {
   const filteredItems = getFilteredRecordings();
   if (!filteredItems.length) return;
-  const currentIndex = Math.max(0, filteredItems.findIndex((item) => item.name === selectedRecordingName));
+  const currentIndex = Math.max(0, filteredItems.findIndex((item) => isSelectedRecordingItem(item)));
   const nextIndex = Math.min(filteredItems.length - 1, Math.max(0, currentIndex + step));
   const next = filteredItems[nextIndex];
   if (!next) return;
-  selectedRecordingName = next.name;
+  setSelectedRecording(next);
   renderRecordingsList();
-  await openRecording(next.name);
-  const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-name="${CSS.escape(next.name)}"]`);
+  await openRecording(next.name, recordingArchiveDir(next));
+  const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${CSS.escape(recordingDomKey(next))}"]`);
   target?.focus();
 }
 
@@ -4765,13 +4843,13 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
     activeResolvedRecordingsDir = String(r.directory || "").trim();
     syncLatestSavedAudioFromRecordings();
     const filteredItems = getFilteredRecordings();
-    if (!keepSelection || !filteredItems.some((x) => x.name === selectedRecordingName)) {
-      selectedRecordingName = filteredItems[0]?.name || "";
+    if (!keepSelection || !filteredItems.some((x) => isSelectedRecordingItem(x))) {
+      setSelectedRecording(filteredItems[0] || null);
     }
     renderRecordingsList();
     await loadRecordingsStats();
     if (selectedRecordingName) {
-      await openRecording(selectedRecordingName);
+      await openRecording(selectedRecordingName, selectedRecordingArchiveDir);
     } else {
       resetRecordingViewer(recordingsSearchQuery ? "No recordings match the current search." : "Choose a recording from the left list...");
     }
@@ -4871,15 +4949,25 @@ async function loadRecordingsStats(): Promise<void> {
   });
 }
 
-async function openRecording(name: string): Promise<void> {
+async function openRecording(name: string, archiveDir = ""): Promise<void> {
+  const matchedItem = findRecordingItem(name, archiveDir);
+  const effectiveArchiveDir = matchedItem
+    ? recordingArchiveDir(matchedItem)
+    : String(archiveDir || selectedRecordingArchiveDir || currentArchiveDirSnapshot()).trim();
   selectedRecordingName = name;
+  selectedRecordingArchiveDir = effectiveArchiveDir;
   renderRecordingsList();
   const requestSeq = ++recordingOpenRequestSeq;
-  const pendingDisplayName = recordingItems.find((item) => item.name === name)?.display_name || recordingTitleFromName(name);
+  const requestKey = selectedRecordingKey();
+  const pendingDisplayName = matchedItem?.display_name || recordingTitleFromName(name);
   setRecordingViewerLoading(pendingDisplayName);
   try {
+    const params = new URLSearchParams();
+    if (effectiveArchiveDir) params.set("archive_dir", effectiveArchiveDir);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
     const r = await apiGet<{
       name: string;
+      archive_dir?: string;
       modified_at: string;
       size_bytes: number;
       content: string;
@@ -4888,10 +4976,10 @@ async function openRecording(name: string): Promise<void> {
       audio_name?: string;
       audio_size_bytes?: number;
     }>(
-      "/api/recordings/" + encodeURIComponent(name)
+      "/api/recordings/" + encodeURIComponent(name) + suffix
     );
-    if (requestSeq !== recordingOpenRequestSeq || selectedRecordingName !== name) return;
-    const displayName = recordingItems.find((item) => item.name === name)?.display_name || recordingTitleFromName(name);
+    if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+    const displayName = matchedItem?.display_name || recordingTitleFromName(name);
     $("recordingTitleLabel").textContent = displayName;
     $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}`;
     $("recordingContent").setAttribute("aria-busy", "false");
@@ -4900,7 +4988,7 @@ async function openRecording(name: string): Promise<void> {
     const player = $("recordingAudio") as HTMLAudioElement;
     const audioRow = $("recordingAudioRow");
     if (r.has_audio) {
-      const audioUrl = latestRecordingAudioUrl(name, currentArchiveDirSnapshot());
+      const audioUrl = latestRecordingAudioUrl(name, String(r.archive_dir || effectiveArchiveDir).trim());
       audioRow.hidden = false;
       player.src = audioUrl;
       player.load();
@@ -4920,12 +5008,12 @@ async function openRecording(name: string): Promise<void> {
       revealBtn.hidden = !hasReveal;
       revealBtn.onclick = () => {
         const fn = window.__transcriptorRevealRecording;
-        if (fn) fn(name, currentArchiveDirSnapshot());
+        if (fn) fn(name, String(r.archive_dir || effectiveArchiveDir).trim());
       };
     }
     updateRecordingCopyState();
   } catch (e) {
-    if (requestSeq !== recordingOpenRequestSeq || selectedRecordingName !== name) return;
+    if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
     const message = sanitizeUiErrorMessage(e, "Could not open this recording.");
     $("recordingTitleLabel").textContent = pendingDisplayName;
     $("recordingMeta").textContent = "Load failed";
@@ -4953,6 +5041,7 @@ async function saveRecordingText(opts: {
   provider: string;
   model: string;
   language: string;
+  recordingCollection?: RecordingCollection;
   audioFile?: File | null;
   /** When set, the backend atomically discards the live-recovery spool
    *  for this session ID immediately after the audio is persisted —
@@ -4969,6 +5058,7 @@ async function saveRecordingText(opts: {
   const audioFile = opts.audioFile || null;
   const existingName = (opts.name || "").trim();
   const archiveDir = (opts.archiveDir || currentArchiveDirSnapshot()).trim();
+  const recordingCollection = String(opts.recordingCollection || "").trim();
   const requireExisting = !!opts.requireExisting;
   if (!sourceText && !transcriptText && !audioFile) {
     return { name: existingName, archiveDir };
@@ -4980,6 +5070,7 @@ async function saveRecordingText(opts: {
     fd.append("file", audioFile, audioFile.name || "recording.wav");
     if (existingName) fd.set("name", existingName);
     if (archiveDir) fd.set("archive_dir", archiveDir);
+    if (recordingCollection) fd.set("recording_collection", recordingCollection);
     if (requireExisting) fd.set("require_existing", "true");
     fd.set("title", opts.title);
     fd.set("source_text", sourceText);
@@ -4997,6 +5088,7 @@ async function saveRecordingText(opts: {
     const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
       name: existingName,
       archive_dir: archiveDir,
+      recording_collection: recordingCollection,
       require_existing: requireExisting,
       title: opts.title,
       source_text: sourceText,
@@ -5027,11 +5119,11 @@ $("recordingsRefreshBtn").addEventListener("click", () =>
 $("recordingsSearchInput").addEventListener("input", (ev) => {
   recordingsSearchQuery = String((ev.target as HTMLInputElement).value || "").trim().toLowerCase();
   const filteredItems = getFilteredRecordings();
-  if (selectedRecordingName && !filteredItems.some((item) => item.name === selectedRecordingName)) {
-    selectedRecordingName = filteredItems[0]?.name || "";
+  if (selectedRecordingName && !filteredItems.some((item) => isSelectedRecordingItem(item))) {
+    setSelectedRecording(filteredItems[0] || null);
     renderRecordingsList();
     if (selectedRecordingName) {
-      void openRecording(selectedRecordingName);
+      void openRecording(selectedRecordingName, selectedRecordingArchiveDir);
     } else {
       resetRecordingViewer("No recordings match the current search.");
     }
@@ -5046,8 +5138,9 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
   input.value = "";
   renderRecordingsList();
   if (!selectedRecordingName && recordingItems.length) {
-    selectedRecordingName = recordingItems[0].name;
-    void openRecording(selectedRecordingName);
+    const first = recordingItems[0];
+    setSelectedRecording(first);
+    void openRecording(first.name, recordingArchiveDir(first));
   }
 });
 ($("recordingsList") as HTMLDivElement).addEventListener("keydown", (ev) => {
@@ -5065,10 +5158,10 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
     ev.preventDefault();
     const first = getFilteredRecordings()[0];
     if (!first) return;
-    selectedRecordingName = first.name;
+    setSelectedRecording(first);
     renderRecordingsList();
-    void openRecording(first.name).then(() => {
-      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-name="${CSS.escape(first.name)}"]`);
+    void openRecording(first.name, recordingArchiveDir(first)).then(() => {
+      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${CSS.escape(recordingDomKey(first))}"]`);
       target?.focus();
     });
     return;
@@ -5078,10 +5171,10 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
     const filtered = getFilteredRecordings();
     const last = filtered[filtered.length - 1];
     if (!last) return;
-    selectedRecordingName = last.name;
+    setSelectedRecording(last);
     renderRecordingsList();
-    void openRecording(last.name).then(() => {
-      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-name="${CSS.escape(last.name)}"]`);
+    void openRecording(last.name, recordingArchiveDir(last)).then(() => {
+      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${CSS.escape(recordingDomKey(last))}"]`);
       target?.focus();
     });
   }
@@ -5094,16 +5187,17 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
     input.value = "";
     renderRecordingsList();
     if (!selectedRecordingName && recordingItems.length) {
-      selectedRecordingName = recordingItems[0].name;
-      void openRecording(selectedRecordingName);
+      const first = recordingItems[0];
+      setSelectedRecording(first);
+      void openRecording(first.name, recordingArchiveDir(first));
     }
     return;
   }
   if (ev.key === "Enter") {
     const first = getFilteredRecordings()[0];
     if (!first) return;
-    selectedRecordingName = first.name;
-    void openRecording(first.name);
+    setSelectedRecording(first);
+    void openRecording(first.name, recordingArchiveDir(first));
   }
 });
 $("recordingsStatsBtn").addEventListener("click", () => {
@@ -6507,6 +6601,7 @@ async function startLive(): Promise<void> {
     language: activeLiveSessionSnapshot.language,
     session_id: activeLiveSessionId,
     archive_dir: activeLiveArchiveDir,
+    recording_collection: RECORDING_COLLECTIONS.live,
     token: apiToken(),
     diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
   });
@@ -7340,6 +7435,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           provider: providerValue || "local",
           model: modelValue,
           language: languageValue,
+          recordingCollection: RECORDING_COLLECTIONS.live,
           audioFile: savedAudioFile,
           liveSessionId: liveSessionId,
           refreshList: false,
@@ -7447,6 +7543,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         provider: providerValue,
         model: modelValue,
         language: languageValue,
+        recordingCollection: RECORDING_COLLECTIONS.live,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -7494,6 +7591,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         provider: providerValue,
         model: modelValue,
         language: languageValue,
+        recordingCollection: RECORDING_COLLECTIONS.live,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -7541,6 +7639,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         provider: "local",
         model: modelValue,
         language: languageValue,
+        recordingCollection: RECORDING_COLLECTIONS.live,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -7599,6 +7698,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         provider,
         model: modelValue,
         language: languageValue,
+        recordingCollection: RECORDING_COLLECTIONS.live,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -8334,6 +8434,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         provider,
         model: modelValue,
         language: languageValue,
+        recordingCollection: RECORDING_COLLECTIONS.live,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -8383,6 +8484,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         provider,
         model: modelValue,
         language: languageValue,
+        recordingCollection: RECORDING_COLLECTIONS.live,
       });
     } catch (saveError) {
       if (isArchiveMutationConflict(saveError)) {
@@ -8766,6 +8868,7 @@ window.addEventListener("transcriptor-hotkey-stop", () => {
 
 interface GraphNode {
   name: string;
+  archiveDir: string;
   displayName: string;
   provider: string;
   keywords: string[];
@@ -9031,18 +9134,18 @@ function gExtractKeywordsFromTitle(title: string): string[] {
 async function loadGraphData(): Promise<void> {
   try {
     $("graphContainer").setAttribute("aria-busy", "true");
-    let items: Array<{ name: string; display_name: string; source_file?: string; provider: string; keywords: string[] }> = [];
+    let items: Array<{ name: string; archive_dir?: string; display_name: string; source_file?: string; provider: string; keywords: string[] }> = [];
     try {
-      const r = await apiGet<{ nodes: Array<{ name: string; display_name: string; source_file?: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
+      const r = await apiGet<{ nodes: Array<{ name: string; archive_dir?: string; display_name: string; source_file?: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
       items = (r.nodes || []).map((it) => ({
-        name: it.name, display_name: it.display_name,
+        name: it.name, archive_dir: it.archive_dir || "", display_name: it.display_name,
         source_file: it.source_file || "",
         provider: it.provider || "unknown", keywords: it.keywords || [],
       }));
     } catch {
       const r = await apiGet<{ items: RecordingItem[] }>("/api/recordings");
       items = (r.items || []).map((it) => ({
-        name: it.name, display_name: it.display_name,
+        name: it.name, archive_dir: it.archive_dir || "", display_name: it.display_name,
         source_file: it.source_file || "",
         provider: it.provider || "unknown",
         keywords: gExtractKeywordsFromTitle(it.display_name),
@@ -9050,7 +9153,7 @@ async function loadGraphData(): Promise<void> {
     }
 
     gNodes = items.map((it) => ({
-      name: it.name, displayName: it.display_name,
+      name: it.name, archiveDir: String(it.archive_dir || "").trim(), displayName: it.display_name,
       provider: it.provider || "unknown", keywords: it.keywords || [],
       x: 0, y: 0, vx: 0, vy: 0,
       // Larger baseline radius so clusters feel substantial. The
@@ -9279,11 +9382,12 @@ function gNavToRecording(node: GraphNode): void {
   recordingsSearchQuery = "";
   ($("recordingsSearchInput") as HTMLInputElement).value = "";
   selectedRecordingName = node.name;
+  selectedRecordingArchiveDir = String(node.archiveDir || "").trim();
   switchView("recordings");
   // switchView only refreshes the list when it was empty; without an
   // explicit openRecording call, the detail pane keeps showing whatever
   // was open before, so the click "navigates" but shows the wrong content.
-  void openRecording(node.name);
+  void openRecording(node.name, node.archiveDir);
 }
 
 async function initRecordingsBootstrap(): Promise<void> {
@@ -9843,8 +9947,7 @@ async function reconcileUploadQueueRevealTargetsFromArchive(): Promise<void> {
   uploadRevealReconcileInFlight = (async () => {
     try {
       await ensureRecordingsArchiveReady();
-      const archiveDir = currentArchiveDirSnapshot();
-      if (!archiveDir || !recordingItems.length) return;
+      if (!currentArchiveDirSnapshot() || !recordingItems.length) return;
 
       const previews = new Set(
         legacyItems
@@ -9853,18 +9956,24 @@ async function reconcileUploadQueueRevealTargetsFromArchive(): Promise<void> {
       );
       if (!previews.size) return;
 
-      const candidateNames = Array.from(new Set(
+      const candidateRecordings = Array.from(new Map<string, UploadRevealTarget>(
         recordingItems
           .filter((recording) => previews.has(String(recording.display_name || "")))
-          .map((recording) => recording.name),
-      ));
-      if (!candidateNames.length) return;
+          .map((recording): [string, UploadRevealTarget] => [
+            recordingItemKey(recording),
+            { name: recording.name, archiveDir: recordingArchiveDir(recording) },
+          ]),
+      ).values());
+      if (!candidateRecordings.length) return;
 
-      const matchesByText = new Map<string, string[]>();
-      for (const name of candidateNames) {
+      const matchesByText = new Map<string, UploadRevealTarget[]>();
+      for (const recording of candidateRecordings) {
         try {
+          const params = new URLSearchParams();
+          if (recording.archiveDir) params.set("archive_dir", recording.archiveDir);
+          const suffix = params.toString() ? `?${params.toString()}` : "";
           const payload = await apiGet<{ content?: string; display_text?: string }>(
-            "/api/recordings/" + encodeURIComponent(name),
+            "/api/recordings/" + encodeURIComponent(recording.name) + suffix,
           );
           const identity = normalizeUploadTranscriptIdentity(
             extractRecordingTranscriptForUploadMatch(
@@ -9874,10 +9983,10 @@ async function reconcileUploadQueueRevealTargetsFromArchive(): Promise<void> {
           );
           if (!identity) continue;
           const matches = matchesByText.get(identity) || [];
-          matches.push(name);
+          matches.push(recording);
           matchesByText.set(identity, matches);
         } catch (e) {
-          console.warn("Upload queue reveal target reconcile skipped recording", name, e);
+          console.warn("Upload queue reveal target reconcile skipped recording", recording.name, e);
         }
       }
 
@@ -9886,8 +9995,8 @@ async function reconcileUploadQueueRevealTargetsFromArchive(): Promise<void> {
         const identity = normalizeUploadTranscriptIdentity(item.text || "");
         const matches = matchesByText.get(identity) || [];
         if (matches.length !== 1) continue;
-        item.savedName = matches[0];
-        item.savedArchiveDir = archiveDir;
+        item.savedName = matches[0].name;
+        item.savedArchiveDir = matches[0].archiveDir;
         changed = true;
       }
       if (changed) {
@@ -10316,6 +10425,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         provider,
         model: modelLabel,
         language,
+        recordingCollection: RECORDING_COLLECTIONS.uploads,
         audioFile: sourceFile,
         refreshList: true,
       });

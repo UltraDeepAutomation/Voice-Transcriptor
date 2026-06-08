@@ -1,4 +1,6 @@
 import importlib
+import asyncio
+import io
 import os
 import sys
 import tempfile
@@ -16,7 +18,7 @@ def _fresh_main_module(data_dir: str):
 
 class RecordingNameTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(dir=str(Path.home()))
         self.main = _fresh_main_module(self._tmp.name)
 
     def tearDown(self):
@@ -87,6 +89,108 @@ class RecordingNameTests(unittest.TestCase):
         )
 
         self.assertRegex(stem, r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}__spoken title$")
+
+    def test_recording_collections_save_into_source_specific_folders(self):
+        live = self.main.save_recording({
+            "title": "Live note",
+            "source_text": "live source",
+            "transcript_text": "live transcript",
+            "provider": "local",
+            "model": "small",
+            "language": "ru",
+            "recording_collection": "live",
+        })
+        upload = self.main.save_recording({
+            "title": "Upload note",
+            "source_text": "upload source",
+            "transcript_text": "upload transcript",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+            "recording_collection": "uploads",
+        })
+
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        live_dir = root / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE]
+        uploads_dir = root / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_UPLOADS]
+
+        self.assertTrue((live_dir / live["name"]).exists())
+        self.assertTrue((uploads_dir / upload["name"]).exists())
+        self.assertEqual(Path(live["archive_dir"]), live_dir)
+        self.assertEqual(Path(upload["archive_dir"]), uploads_dir)
+
+        payload = self.main._build_recordings_list_payload(root)
+        by_name = {item["name"]: item for item in payload["items"]}
+        self.assertEqual(by_name[live["name"]]["recording_collection"], "live")
+        self.assertEqual(by_name[upload["name"]]["recording_collection"], "uploads")
+        self.assertEqual(Path(by_name[live["name"]]["archive_dir"]), live_dir)
+        self.assertEqual(Path(by_name[upload["name"]]["archive_dir"]), uploads_dir)
+
+        stats = self.main._build_recordings_stats_payload(root)
+        self.assertEqual(stats["total_recordings"], 2)
+
+    def test_get_recording_uses_archive_dir_for_duplicate_names(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        live_dir = root / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE]
+        uploads_dir = root / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_UPLOADS]
+        live_dir.mkdir(parents=True)
+        uploads_dir.mkdir(parents=True)
+        self.main._write_recording_text_file(
+            out=live_dir / "same.txt",
+            title="same",
+            source_text="live source",
+            transcript_text="live transcript",
+            provider="local",
+            model="small",
+            language="ru",
+        )
+        self.main._write_recording_text_file(
+            out=uploads_dir / "same.txt",
+            title="same",
+            source_text="upload source",
+            transcript_text="upload transcript",
+            provider="deepgram",
+            model="nova-3",
+            language="ru",
+        )
+
+        payload = asyncio.run(
+            self.main.get_recording("same.txt", archive_dir=str(uploads_dir))
+        )
+
+        self.assertIn("upload transcript", payload["content"])
+        self.assertEqual(Path(payload["archive_dir"]), uploads_dir)
+        self.assertEqual(payload["recording_collection"], "uploads")
+
+    def test_save_with_audio_upload_collection_writes_uploaded_media_folder(self):
+        upload_file = self.main.UploadFile(
+            io.BytesIO(b"tiny mp3 payload"),
+            filename="lecture.mp3",
+            size=len(b"tiny mp3 payload"),
+        )
+
+        result = asyncio.run(self.main.save_recording_with_audio(
+            file=upload_file,
+            name="",
+            archive_dir="",
+            require_existing=False,
+            title="Lecture",
+            source_text="source",
+            transcript_text="transcript",
+            provider="deepgram",
+            model="nova-3",
+            language="ru",
+            recording_collection="uploads",
+            live_session_id="",
+        ))
+
+        target_dir = Path(result["archive_dir"])
+        self.assertEqual(
+            target_dir.name,
+            self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_UPLOADS],
+        )
+        self.assertTrue((target_dir / result["name"]).exists())
+        self.assertTrue((target_dir / result["audio_name"]).exists())
 
 
 if __name__ == "__main__":

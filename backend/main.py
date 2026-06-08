@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Iterable, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -553,7 +553,7 @@ def _sweep_orphan_tmp_files() -> None:
     cutoff = time.time() - 60.0
     targets: list[Path] = [DATA_DIR, UPSCALE_PRESETS_DIR]
     try:
-        targets.extend(_get_known_archive_dirs())
+        targets.extend(_recordings_storage_dirs_for_roots(_get_known_archive_dirs()))
     except Exception:
         pass
     removed = 0
@@ -866,7 +866,11 @@ def _store_live_promote_cache(session_id: str, payload: dict) -> None:
         _live_promote_cache[session_id] = (now, dict(payload))
 
 
-def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, Any]:
+def _promote_live_recovery(
+    session_id: str,
+    archive_dir: str = "",
+    recording_collection: str = "live",
+) -> dict[str, Any]:
     # Fast path: a freshly cached success means we served this promotion
     # recently. Return the stored result so UI retries are idempotent
     # instead of producing a 404 or a duplicate WAV.
@@ -921,8 +925,16 @@ def _promote_live_recovery(session_id: str, archive_dir: str = "") -> dict[str, 
             model = str(meta.get("model") or "small").strip() or "small"
             language = str(meta.get("language") or "auto").strip() or "auto"
             pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
+            collection = _normalize_recording_collection(
+                recording_collection
+                or meta.get("recording_collection")
+                or RECORDING_COLLECTION_LIVE
+            )
             title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            target_dir = _resolve_recordings_target_dir(archive_dir or pinned_archive_dir)
+            target_dir = _resolve_recordings_collection_target_dir(
+                archive_dir or pinned_archive_dir,
+                collection=collection,
+            )
             stem = _unique_recording_stem(target_dir, title)
             audio_out = target_dir / f"{stem}.wav"
             text_out = target_dir / f"{stem}.txt"
@@ -1634,6 +1646,127 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
     return resolved
 
 
+RECORDING_COLLECTION_LIVE = "live"
+RECORDING_COLLECTION_UPLOADS = "uploads"
+RECORDING_COLLECTION_DIR_NAMES: dict[str, str] = {
+    RECORDING_COLLECTION_LIVE: "Live Capsule",
+    RECORDING_COLLECTION_UPLOADS: "Uploaded Media",
+}
+_RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
+    folder_name: key for key, folder_name in RECORDING_COLLECTION_DIR_NAMES.items()
+}
+
+
+def _normalize_recording_collection(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    aliases = {
+        "live": RECORDING_COLLECTION_LIVE,
+        "capsule": RECORDING_COLLECTION_LIVE,
+        "live_capsule": RECORDING_COLLECTION_LIVE,
+        "live-capsule": RECORDING_COLLECTION_LIVE,
+        "uploads": RECORDING_COLLECTION_UPLOADS,
+        "upload": RECORDING_COLLECTION_UPLOADS,
+        "uploaded": RECORDING_COLLECTION_UPLOADS,
+        "uploaded_media": RECORDING_COLLECTION_UPLOADS,
+        "uploaded-media": RECORDING_COLLECTION_UPLOADS,
+    }
+    normalized = aliases.get(raw, raw)
+    if normalized not in RECORDING_COLLECTION_DIR_NAMES:
+        raise HTTPException(status_code=400, detail="unsupported recording collection")
+    return normalized
+
+
+def _recording_collection_for_dir(path: Path) -> str:
+    return _RECORDING_COLLECTION_DIR_NAME_TO_KEY.get(path.name, "")
+
+
+def _resolve_recordings_collection_target_dir(
+    archive_dir: str = "",
+    *,
+    collection: str = "",
+    create: bool = True,
+) -> Path:
+    """Resolve the physical archive dir for a semantic recording source.
+
+    Callers pass a stable collection id (``live`` / ``uploads``), never a
+    folder name. The backend is the SSOT for the on-disk layout, and the
+    helper is idempotent when an existing child archive_dir is supplied
+    back during a later metadata update.
+    """
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=create)
+    normalized = _normalize_recording_collection(collection)
+    if not normalized:
+        return target_dir
+
+    folder_name = RECORDING_COLLECTION_DIR_NAMES[normalized]
+    known_collection_names = set(RECORDING_COLLECTION_DIR_NAMES.values())
+    if target_dir.name == folder_name:
+        return target_dir
+    if target_dir.name in known_collection_names:
+        raise HTTPException(status_code=409, detail="archive_dir points to a different recording collection")
+
+    collection_dir = target_dir / folder_name
+    if create:
+        collection_dir.mkdir(parents=True, exist_ok=True)
+    elif not collection_dir.exists() or not collection_dir.is_dir():
+        raise HTTPException(status_code=409, detail="archive directory is no longer available")
+    return collection_dir.resolve()
+
+
+def _recordings_scan_dirs(root: Path) -> list[Path]:
+    """Return archive dirs visible in the active History surface."""
+    candidates = [root]
+    for folder_name in RECORDING_COLLECTION_DIR_NAMES.values():
+        child = root / folder_name
+        if child.exists() and child.is_dir():
+            candidates.append(child)
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            key = str(resolved)
+        except OSError:
+            resolved = candidate
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(resolved)
+    return dirs
+
+
+def _recordings_scan_cache_key(root: Path) -> tuple:
+    parts: list[tuple[str, float, int]] = []
+    for d in _recordings_scan_dirs(root):
+        try:
+            dir_mtime = d.stat().st_mtime
+            file_count = sum(1 for _ in d.glob("*.txt"))
+        except Exception:
+            dir_mtime = 0.0
+            file_count = -1
+        parts.append((str(d), dir_mtime, file_count))
+    return tuple(parts)
+
+
+def _recordings_storage_dirs_for_roots(roots: Iterable[Path]) -> list[Path]:
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for root in roots:
+        for d in _recordings_scan_dirs(root):
+            try:
+                key = str(d.resolve())
+            except OSError:
+                key = str(d)
+            if key in seen:
+                continue
+            seen.add(key)
+            dirs.append(d)
+    return dirs
+
+
 # SSOT: audio extensions a saved recording can carry alongside its
 # .txt transcript. Both ``_recording_audio_path`` (retrieval lookup
 # for the History tab's audio player and Re-transcribe path) AND
@@ -1930,7 +2063,7 @@ def _retroactive_audio_retention(target_dir: Optional[Path] = None) -> int:
     # Multi-dir startup sweep: iterate every known archive dir.
     if target_dir is None:
         total = 0
-        for d in _get_known_archive_dirs():
+        for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
             total += _retroactive_audio_retention(target_dir=d)
         return total
 
@@ -2327,6 +2460,9 @@ async def ws_transcribe(websocket: WebSocket):
     lang_opt: Optional[str] = None if language in ("", "auto", "Auto") else language
     session_id = _normalize_live_session_id(qp.get("session_id") or "")
     archive_dir = str(qp.get("archive_dir") or "").strip()
+    recording_collection = _normalize_recording_collection(
+        qp.get("recording_collection") or RECORDING_COLLECTION_LIVE
+    )
     diarize = str(qp.get("diarize") or "").strip().lower() in ("1", "true", "yes", "on")
 
     started_at = datetime.now()
@@ -2340,6 +2476,7 @@ async def ws_transcribe(websocket: WebSocket):
                 model=model or ("nova-3" if provider == "deepgram" else "small"),
                 language=lang_opt or "auto",
                 archive_dir=archive_dir,
+                recording_collection=recording_collection,
             )
         except Exception as e:
             recovery_ctx = None
@@ -2432,6 +2569,7 @@ def _open_live_recovery(
     model: str,
     language: str,
     archive_dir: str,
+    recording_collection: str,
 ) -> dict:
     """Create a recovery PCM file + metadata for a live session.
 
@@ -2460,6 +2598,7 @@ def _open_live_recovery(
         "model": model,
         "language": language,
         "archive_dir": archive_dir,
+        "recording_collection": recording_collection,
         "status": "recording",
         "provider": provider,
     }
@@ -3036,7 +3175,13 @@ async def promote_live_recovery(
     # serialised. Now scheduled on the threadpool with the event
     # loop free to keep WS frames flowing.
     archive_dir = str((payload or {}).get("archive_dir") or "").strip()
-    result = await asyncio.to_thread(_promote_live_recovery, session_id, archive_dir)
+    recording_collection = str((payload or {}).get("recording_collection") or "live").strip()
+    result = await asyncio.to_thread(
+        _promote_live_recovery,
+        session_id,
+        archive_dir,
+        recording_collection,
+    )
     return {"ok": True, **result}
 
 
@@ -4095,45 +4240,49 @@ def _build_recordings_list_payload(d: "Path") -> dict:
     there's no async stdlib equivalent.
     """
     items = []
-    for p in d.glob("*.txt"):
-        try:
-            st = p.stat()
-            raw = p.read_text(encoding="utf-8", errors="replace")
-            source_file = _recording_source_file(raw)
-            display = _recording_display_name_from_content(raw, p.stem)
-            provider = _extract_meta_field(raw, "Provider").lower() or ""
-            language = _extract_meta_field(raw, "Language").lower() or ""
-            items.append(
-                {
-                    "name": p.name,
-                    "display_name": display,
-                    "source_file": source_file,
-                    "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                    "size_bytes": st.st_size,
-                    "provider": provider,
-                    "language": language,
-                    # 1.1.25 fix: thread the listed directory through to
-                    # ``_recording_audio_payload``. Previously called
-                    # without target_dir, which silently fell back to
-                    # ``_resolve_recordings_dir()``. Currently the
-                    # caller passes the resolved default dir, so values
-                    # match — but a future caller listing a non-default
-                    # archive would silently report has_audio=false on
-                    # every entry. Mirrors the pattern in
-                    # ``get_recording_audio`` and
-                    # ``transcribe_recording_on_disk``.
-                    **_recording_audio_payload(p.name, target_dir=d),
-                }
-            )
-        except Exception as e:
-            # Silent skip used to be a black box: a corrupt recording
-            # disappeared from the list with no log, no UI signal, no
-            # way for the user to know why a file they can see in
-            # Finder is missing from History. ``debug``-level so a
-            # routine truncated-during-save won't spam ops, but the
-            # name and exception class are still in the support log.
-            logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
-            continue
+    for archive_dir in _recordings_scan_dirs(d):
+        collection = _recording_collection_for_dir(archive_dir)
+        for p in archive_dir.glob("*.txt"):
+            try:
+                st = p.stat()
+                raw = p.read_text(encoding="utf-8", errors="replace")
+                source_file = _recording_source_file(raw)
+                display = _recording_display_name_from_content(raw, p.stem)
+                provider = _extract_meta_field(raw, "Provider").lower() or ""
+                language = _extract_meta_field(raw, "Language").lower() or ""
+                items.append(
+                    {
+                        "name": p.name,
+                        "display_name": display,
+                        "source_file": source_file,
+                        "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                        "size_bytes": st.st_size,
+                        "provider": provider,
+                        "language": language,
+                        "archive_dir": str(archive_dir),
+                        "recording_collection": collection,
+                        # 1.1.25 fix: thread the listed directory through to
+                        # ``_recording_audio_payload``. Previously called
+                        # without target_dir, which silently fell back to
+                        # ``_resolve_recordings_dir()``. Currently the
+                        # caller passes the resolved default dir, so values
+                        # match — but a future caller listing a non-default
+                        # archive would silently report has_audio=false on
+                        # every entry. Mirrors the pattern in
+                        # ``get_recording_audio`` and
+                        # ``transcribe_recording_on_disk``.
+                        **_recording_audio_payload(p.name, target_dir=archive_dir),
+                    }
+                )
+            except Exception as e:
+                # Silent skip used to be a black box: a corrupt recording
+                # disappeared from the list with no log, no UI signal, no
+                # way for the user to know why a file they can see in
+                # Finder is missing from History. ``debug``-level so a
+                # routine truncated-during-save won't spam ops, but the
+                # name and exception class are still in the support log.
+                logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
+                continue
     items.sort(key=lambda x: x["modified_at"], reverse=True)
     return {"items": items, "directory": str(d)}
 
@@ -4153,14 +4302,8 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
     d = _resolve_recordings_dir()
     now = time.monotonic()
 
-    # Cache key probe — cheap (1 stat + 1 glob), kept sync.
-    try:
-        dir_mtime = d.stat().st_mtime
-        file_count = sum(1 for _ in d.glob("*.txt"))
-    except Exception:
-        dir_mtime = 0.0
-        file_count = -1
-    cache_key = (str(d), dir_mtime, file_count)
+    # Cache key probe — cheap per active storage dir, kept sync.
+    cache_key = _recordings_scan_cache_key(d)
 
     # Fast path: cache hit.
     with _recordings_caches_lock:
@@ -4214,32 +4357,36 @@ def _build_recordings_graph_payload(d: "Path") -> dict:
     file — this is the workload the previous sync `def` was pinning
     an executor thread for."""
     nodes = []
-    for p in d.glob("*.txt"):
-        try:
-            st = p.stat()
-            raw = p.read_text(encoding="utf-8", errors="replace")
-            source_file = _recording_source_file(raw)
-            display = _recording_display_name_from_content(raw, p.stem)
-            provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
-            text = _extract_stats_text(raw)
-            keywords = _tokenize_words(text)
-            freq: dict[str, int] = {}
-            for w in keywords:
-                freq[w] = freq.get(w, 0) + 1
-            top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
-            nodes.append(
-                {
-                    "name": p.name,
-                    "display_name": display,
-                    "source_file": source_file,
-                    "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                    "size_bytes": st.st_size,
-                    "provider": provider,
-                    "keywords": [w for w, _ in top],
-                }
-            )
-        except Exception:
-            continue
+    for archive_dir in _recordings_scan_dirs(d):
+        collection = _recording_collection_for_dir(archive_dir)
+        for p in archive_dir.glob("*.txt"):
+            try:
+                st = p.stat()
+                raw = p.read_text(encoding="utf-8", errors="replace")
+                source_file = _recording_source_file(raw)
+                display = _recording_display_name_from_content(raw, p.stem)
+                provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
+                text = _extract_stats_text(raw)
+                keywords = _tokenize_words(text)
+                freq: dict[str, int] = {}
+                for w in keywords:
+                    freq[w] = freq.get(w, 0) + 1
+                top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
+                nodes.append(
+                    {
+                        "name": p.name,
+                        "display_name": display,
+                        "source_file": source_file,
+                        "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                        "size_bytes": st.st_size,
+                        "provider": provider,
+                        "keywords": [w for w, _ in top],
+                        "archive_dir": str(archive_dir),
+                        "recording_collection": collection,
+                    }
+                )
+            except Exception:
+                continue
     return {"nodes": nodes}
 
 
@@ -4256,13 +4403,7 @@ async def recordings_graph(_auth: None = Depends(_require_api_auth)):
     d = _resolve_recordings_dir()
     now = time.monotonic()
 
-    try:
-        dir_mtime = d.stat().st_mtime
-        file_count = sum(1 for _ in d.glob("*.txt"))
-    except Exception:
-        dir_mtime = 0.0
-        file_count = -1
-    cache_key = (str(d), dir_mtime, file_count)
+    cache_key = _recordings_scan_cache_key(d)
 
     with _recordings_caches_lock:
         if (
@@ -4300,7 +4441,7 @@ def _delete_all_recordings_sync() -> dict:
     purging thousands of files."""
     deleted = 0
     failed = 0
-    for d in _get_known_archive_dirs():
+    for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
         for p in list(d.glob("*.txt")):
             try:
                 p.unlink()
@@ -4338,6 +4479,7 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
     raw = p.read_text(encoding="utf-8", errors="replace")
     display = _extract_transcript_text(raw)
     source_file = _recording_source_file(raw)
+    archive_dir = target_dir or p.parent
     return {
         "name": p.name,
         "source_file": source_file,
@@ -4345,22 +4487,29 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
         "size_bytes": st.st_size,
         "content": raw,
         "display_text": display or raw,
+        "archive_dir": str(archive_dir),
+        "recording_collection": _recording_collection_for_dir(archive_dir),
         # 1.1.25 fix: thread the resolved directory through so a
         # call against a non-default archive correctly looks up the
         # audio within that archive instead of falling back to
         # ``_resolve_recordings_dir()`` and reporting has_audio=false
         # for every entry in custom archives.
-        **_recording_audio_payload(p.name, target_dir=(target_dir or p.parent)),
+        **_recording_audio_payload(p.name, target_dir=archive_dir),
     }
 
 
 @app.get("/api/recordings/{recording_name}")
-async def get_recording(recording_name: str, _auth: None = Depends(_require_api_auth)):
+async def get_recording(
+    recording_name: str,
+    archive_dir: str = "",
+    _auth: None = Depends(_require_api_auth),
+):
     # ``display_text`` strips the file header (Title/Saved at/Language/
     # Provider/Model) and returns only the transcript body. The raw
     # ``content`` is still returned for backwards compat / export.
-    p = _recording_path_or_404(recording_name)
-    return await asyncio.to_thread(_read_recording_payload, p)
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=False) if str(archive_dir or "").strip() else None
+    p = _recording_path_or_404(recording_name, target_dir=target_dir)
+    return await asyncio.to_thread(_read_recording_payload, p, target_dir)
 
 
 @app.get("/api/recordings/{recording_name}/audio")
@@ -4390,7 +4539,10 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
     Reads + tokenises every transcript in the archive — O(N) on file
     count and O(M) on transcript size; pinning an executor thread for
     seconds is the previous regression."""
-    files = sorted(d.glob("*.txt"))
+    files: list[Path] = []
+    for archive_dir in _recordings_scan_dirs(d):
+        files.extend(archive_dir.glob("*.txt"))
+    files.sort()
     total_recordings = len(files)
     total_words = 0
     total_chars = 0
@@ -4452,13 +4604,7 @@ async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
     d = _resolve_recordings_dir()
     now = time.monotonic()
 
-    try:
-        dir_mtime = d.stat().st_mtime
-        file_count = sum(1 for _ in d.glob("*.txt"))
-    except Exception:
-        dir_mtime = 0.0
-        file_count = -1
-    cache_key = (str(d), dir_mtime, file_count)
+    cache_key = _recordings_scan_cache_key(d)
 
     with _recordings_caches_lock:
         if (
@@ -4495,6 +4641,7 @@ def save_recording(
 ):
     existing_name = os.path.basename(str(payload.get("name") or "").strip())
     archive_dir = str(payload.get("archive_dir") or "").strip()
+    recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
     require_existing = bool(payload.get("require_existing"))
     title = _sanitize_name(str(payload.get("title") or "recording"))
     source_text = str(payload.get("source_text") or "").strip()
@@ -4505,7 +4652,11 @@ def save_recording(
     if not source_text and not transcript_text:
         source_text = "[No speech captured]"
 
-    target_dir = _resolve_recordings_target_dir(archive_dir, create=not require_existing)
+    target_dir = _resolve_recordings_collection_target_dir(
+        archive_dir,
+        collection=recording_collection,
+        create=not require_existing,
+    )
     # SSOT consistency with save_recording_with_audio (line 3799): every
     # save into a custom archive dir must register that dir so
     # `_retroactive_audio_retention` and `_get_known_archive_dirs`
@@ -4543,6 +4694,7 @@ async def save_recording_with_audio(
     file: UploadFile = File(...),
     name: str = Form(""),
     archive_dir: str = Form(""),
+    recording_collection: str = Form(""),
     require_existing: bool = Form(False),
     title: str = Form("recording"),
     source_text: str = Form(""),
@@ -4567,7 +4719,11 @@ async def save_recording_with_audio(
     ext = Path(orig_name).suffix.lower() or ".wav"
     source_file_name = _source_recording_display_name(orig_name)
 
-    target_dir = _resolve_recordings_target_dir(archive_dir, create=not bool(require_existing))
+    target_dir = _resolve_recordings_collection_target_dir(
+        archive_dir,
+        collection=recording_collection,
+        create=not bool(require_existing),
+    )
     # Persist this dir so startup retroactive retention covers it even if
     # the user changes their default recordings_dir between app launches.
     _register_archive_dir(target_dir)
