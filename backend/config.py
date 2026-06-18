@@ -44,6 +44,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict
 
@@ -107,7 +108,8 @@ def _load_or_create_fernet_key() -> bytes:
     """
     if not _HAS_CRYPTO:
         return b""
-    if _KEYFILE.exists():
+
+    def _read_existing_keyfile() -> bytes:
         try:
             raw = _KEYFILE.read_bytes().strip()
         except OSError as e:
@@ -115,7 +117,7 @@ def _load_or_create_fernet_key() -> bytes:
                 "encryption keyfile unreadable at %s: %s — regenerating",
                 _KEYFILE, e,
             )
-            raw = b""
+            return b""
         if raw:
             try:
                 # Validate it is a real Fernet key.
@@ -127,6 +129,12 @@ def _load_or_create_fernet_key() -> bytes:
                     "(previously-encrypted values will become unreadable)",
                     _KEYFILE, e,
                 )
+        return b""
+
+    if _KEYFILE.exists():
+        raw = _read_existing_keyfile()
+        if raw:
+            return raw
     key = Fernet.generate_key()
     # Direct write through ``os.open`` with O_CREAT | O_EXCL | mode=0o600
     # so the file is NEVER readable by other users on the system, not
@@ -164,7 +172,7 @@ def _load_or_create_fernet_key() -> bytes:
             _KEYFILE.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(
                 str(_KEYFILE),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 0o600,
             )
             try:
@@ -177,6 +185,19 @@ def _load_or_create_fernet_key() -> bytes:
                 os.chmod(_KEYFILE, 0o600)
             except OSError:
                 pass
+        except FileExistsError:
+            # Another Transcriptor process won the first-start race after
+            # our initial existence check. Re-read the persisted key instead
+            # of truncating it and silently splitting encryption state.
+            raced_key = _read_existing_keyfile()
+            if raced_key:
+                return raced_key
+            logger.error(
+                "encryption keyfile appeared during creation but is not usable at %s; "
+                "REFUSING to use a session-only key.",
+                _KEYFILE,
+            )
+            return b""
         except OSError as e:
             # 1.1.25 fix: previously returned the in-memory ``key`` here.
             # That looked safe ("encryption keeps working this session")
@@ -350,6 +371,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # `_atomic_write_json` + backup-rotation so a crash at any point
 # leaves the system recoverable from at least one of {config, .bak}.
 _CONFIG_BACKUP_PATH = CONFIG_PATH.with_suffix(".json.bak")
+_CONFIG_IO_LOCK = threading.RLock()
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -523,7 +545,27 @@ def _read_json_file(path: Path) -> Dict[str, Any]:
     return obj
 
 
-def load_config() -> Dict[str, Any]:
+def _rotate_backup_if_primary_valid() -> None:
+    """Rotate config backup only when the current primary is readable JSON.
+
+    ``load_config`` can recover from ``config.json.bak`` while leaving a
+    corrupt ``config.json`` in place for diagnostics. The next save must not
+    copy that corrupt primary over the last good backup.
+    """
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        _read_json_file(CONFIG_PATH)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        logger.warning(
+            "skipping config backup rotation because primary config is unusable at %s: %s",
+            CONFIG_PATH, e,
+        )
+        return
+    _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
+
+
+def _load_config_unlocked() -> Dict[str, Any]:
     """Load config and return a migrated, validated, decrypted view.
 
     Pipeline (in order):
@@ -622,7 +664,7 @@ def load_config() -> Dict[str, Any]:
     if needs_key_migration:
         try:
             encrypted_cfg = _encrypt_provider_keys(merged)
-            _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
+            _rotate_backup_if_primary_valid()
             _atomic_write_json(CONFIG_PATH, encrypted_cfg)
             logger.info(
                 "migrated plain-text provider keys to Fernet-encrypted form at %s",
@@ -649,7 +691,7 @@ def load_config() -> Dict[str, Any]:
         # would always be False and the stamp would never run.
         if original_schema_version != SCHEMA_VERSION and CONFIG_PATH.exists():
             try:
-                _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
+                _rotate_backup_if_primary_valid()
                 _atomic_write_json(CONFIG_PATH, _encrypt_provider_keys(merged))
                 logger.info(
                     "config schema stamped with version=%d at %s (was: %r)",
@@ -669,6 +711,11 @@ def load_config() -> Dict[str, Any]:
         return copy.deepcopy(DEFAULT_CONFIG)
 
 
+def load_config() -> Dict[str, Any]:
+    with _CONFIG_IO_LOCK:
+        return _load_config_unlocked()
+
+
 def save_config(cfg: Dict[str, Any]) -> None:
     """Merge *cfg* into the current config and persist it atomically.
 
@@ -685,26 +732,27 @@ def save_config(cfg: Dict[str, Any]) -> None:
       * Raises ``OSError`` on disk failures so API endpoints can
         surface a meaningful 500.
     """
-    current = load_config()
-    merged_current = _deep_merge(current, cfg or {})
-    merged = _deep_merge(DEFAULT_CONFIG, merged_current)
-    # Always stamp the current schema version on write — callers may
-    # POST partial configs without it; _deep_merge already inserted
-    # DEFAULT_CONFIG['schema_version'], but explicit is safer.
-    merged["schema_version"] = SCHEMA_VERSION
-    # Shape-validate merged result so we never persist a structurally
-    # broken config just because a migration or caller went wrong.
-    merged = _validate_config_shape(merged)
-    encrypted = _encrypt_provider_keys(merged)
-    # Rotate the current on-disk file to .bak BEFORE the write. If the
-    # new write fails mid-flight, load_config's fallback recovers from
-    # the backup on the next boot.
-    _rotate_backup(CONFIG_PATH, _CONFIG_BACKUP_PATH)
-    try:
-        _atomic_write_json(CONFIG_PATH, encrypted)
-    except OSError as e:
-        logger.error("failed to persist config at %s: %s", CONFIG_PATH, e)
-        raise
+    with _CONFIG_IO_LOCK:
+        current = _load_config_unlocked()
+        merged_current = _deep_merge(current, cfg or {})
+        merged = _deep_merge(DEFAULT_CONFIG, merged_current)
+        # Always stamp the current schema version on write — callers may
+        # POST partial configs without it; _deep_merge already inserted
+        # DEFAULT_CONFIG['schema_version'], but explicit is safer.
+        merged["schema_version"] = SCHEMA_VERSION
+        # Shape-validate merged result so we never persist a structurally
+        # broken config just because a migration or caller went wrong.
+        merged = _validate_config_shape(merged)
+        encrypted = _encrypt_provider_keys(merged)
+        # Rotate the current on-disk file to .bak BEFORE the write. If the
+        # new write fails mid-flight, load_config's fallback recovers from
+        # the backup on the next boot.
+        _rotate_backup_if_primary_valid()
+        try:
+            _atomic_write_json(CONFIG_PATH, encrypted)
+        except OSError as e:
+            logger.error("failed to persist config at %s: %s", CONFIG_PATH, e)
+            raise
 
 
 def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:

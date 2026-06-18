@@ -4,6 +4,7 @@ const http = require("http");
 const net = require("net");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 
 // Register process-level crash handlers IMMEDIATELY — the previous
 // registration happened inside app.whenReady().then(...), meaning any
@@ -236,6 +237,7 @@ const HOST = "127.0.0.1";
 const DEFAULT_BACKEND_PORT = 8321;
 let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
+let BACKEND_BOOT_NONCE = "";
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 const OVERLAY_TOKENS = Object.freeze({
@@ -4827,7 +4829,13 @@ async function processPostStopTask(task) {
   // Bound overlay wait to the renderer's live-recovery SLA. Fast paths
   // exit immediately on paste-ready; this ceiling only protects the
   // rare "stream dropped, REST/local recovery is still running" case.
-  const POST_STOP_TRANSCRIPT_TIMEOUT_MS = 24000;
+  // Mirrors the renderer's slow-path SLA: Deepgram final envelope
+  // (up to ~4s) + REST/local recovery hard cap (20s) + bounded live
+  // paste-upscale wait (3s) + disk/IPC headroom. Fast paths exit on
+  // the first paste-ready signal, so increasing this ceiling does not
+  // add latency to healthy recordings; it only prevents legitimate
+  // slow recovery from degrading into "Saved To App" with no paste.
+  const POST_STOP_TRANSCRIPT_TIMEOUT_MS = 32000;
   const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
   let transcript = "";
   let pollCount = 0;
@@ -5609,8 +5617,8 @@ async function resolvePython(repoRoot) {
     appendMainLog(`[resolvePython] bundled runtime failed probe: ${(check.stderr || "").trim()}`);
   }
 
-  // 1) Try app venv (used by install scripts on Mac/Linux when user
-  // ran setup.command/setup.sh; older Windows installs prior to 1.1.0).
+  // 1) Try app venv (used by legacy source installers and older
+  // Windows installs prior to 1.1.0).
   const appVenvPy = process.platform === "win32"
     ? path.join(getAppVenvDir(), "Scripts", "python.exe")
     : path.join(getAppVenvDir(), "bin", "python3");
@@ -5840,6 +5848,7 @@ async function startBackend() {
   }
   PORT = await pickBackendPort(HOST, preferredPort);
   BASE_URL = `http://${HOST}:${PORT}`;
+  BACKEND_BOOT_NONCE = crypto.randomBytes(32).toString("hex");
   appendMainLog(`[backend-start] python="${python}" host=${HOST} port=${PORT} repo="${repoRoot}"`);
 
   // --app-dir tells uvicorn where to find the "backend.main" module
@@ -5910,6 +5919,7 @@ async function startBackend() {
     PYTHONDONTWRITEBYTECODE: "1",
     PYTHONPYCACHEPREFIX: pythonCacheDir,
     TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
+    TRANSCRIPTOR_BOOT_NONCE: BACKEND_BOOT_NONCE,
   };
   backend = spawn(python, args, {
     cwd: repoRoot,
@@ -6005,7 +6015,7 @@ async function startBackend() {
   }
 }
 
-function waitForHttp(url, timeoutMs) {
+function waitForBackendHealth(url, timeoutMs) {
   const started = Date.now();
   return new Promise((resolve, reject) => {
     const tick = () => {
@@ -6014,12 +6024,26 @@ function waitForHttp(url, timeoutMs) {
         return;
       }
       const req = http.get(url, (res) => {
-        res.resume();
-        if (res.statusCode === 200) {
-          resolve();
-        } else {
-          setTimeout(tick, 250);
-        }
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 16 * 1024) {
+            try { req.destroy(new Error("health response too large")); } catch { }
+          }
+        });
+        res.on("end", () => {
+          try {
+            if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
+            const payload = JSON.parse(body || "{}");
+            if (payload?.boot_nonce !== BACKEND_BOOT_NONCE) {
+              throw new Error("backend boot nonce mismatch");
+            }
+            resolve();
+          } catch {
+            setTimeout(tick, 250);
+          }
+        });
       });
       // Per-request timeout so a hanging connection (backend mid-boot,
       // accept queue full, kernel pause) doesn't sit on a half-open
@@ -6075,6 +6099,7 @@ async function createWindow(options = {}) {
     icon: process.platform !== "darwin" ? appIconPath : undefined,
     show: false,
     webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
       enableRemoteModule: false,
@@ -6137,8 +6162,8 @@ async function createWindow(options = {}) {
     return { action: "deny" };
   });
   // Renderer → main IPC over the document-title channel. The renderer
-  // (sandbox: true, contextIsolation: true, no preload) cannot use
-  // ipcRenderer; the canonical workaround used elsewhere in this file
+  // (sandbox: true, contextIsolation: true) cannot use ipcRenderer;
+  // the canonical workaround used elsewhere in this file
   // is to set ``document.title = "__app_<verb>__<payload>"`` and have
   // the main process intercept the page-title-updated event. We
   // restrict accepted verbs to a closed list and decode the payload
@@ -6222,7 +6247,7 @@ async function createWindow(options = {}) {
     }
   });
 
-  const mediaPermissions = new Set(["media", "microphone", "audioCapture", "videoCapture"]);
+  const audioPermissions = new Set(["microphone", "audioCapture"]);
   const clipboardWritePermissions = new Set([
     "clipboard-write",
     "clipboard-sanitized-write",
@@ -6246,28 +6271,43 @@ async function createWindow(options = {}) {
   // inherit our microphone / clipboard grants. Tightened to ``_isBackendOrigin``
   // so the renderer must be on http://127.0.0.1:<our-port> to be
   // allowed.
-  win.webContents.session.setPermissionRequestHandler((wc, permission, cb) => {
+  const mediaTypesAreAudioOnly = (details) => {
+    const mediaTypes = Array.isArray(details?.mediaTypes) ? details.mediaTypes.map(String) : [];
+    return mediaTypes.length > 0 && mediaTypes.every((type) => type === "audio");
+  };
+  const permissionDecision = (permission, details = {}) => {
     const perm = String(permission || "");
+    const audioOnlyMedia = perm === "media" && mediaTypesAreAudioOnly(details);
+    const allowedCapability =
+      audioPermissions.has(perm) ||
+      audioOnlyMedia ||
+      clipboardWritePermissions.has(perm);
+    const known =
+      allowedCapability ||
+      perm === "media" ||
+      perm === "videoCapture";
+    return { perm, known, allowedCapability };
+  };
+  win.webContents.session.setPermissionRequestHandler((wc, permission, cb, details = {}) => {
+    const { perm, known, allowedCapability } = permissionDecision(permission, details);
     const url = wc?.getURL?.() || "";
-    const knownPerm = mediaPermissions.has(perm) || clipboardWritePermissions.has(perm);
     const fromBackend = _isBackendOrigin(url);
-    const allow = knownPerm && fromBackend;
+    const allow = allowedCapability && fromBackend;
     const logUrl = permissionLogUrl(url);
-    if (knownPerm && !fromBackend) {
+    if (known && !fromBackend) {
       appendMainLog(`[perm-request] DENY non-backend origin: perm=${perm} url=${logUrl}`);
     } else {
       appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${logUrl}`);
     }
     cb(allow);
   });
-  win.webContents.session.setPermissionCheckHandler((wc, permission) => {
-    const perm = String(permission || "");
+  win.webContents.session.setPermissionCheckHandler((wc, permission, _requestingOrigin, details = {}) => {
+    const { perm, known, allowedCapability } = permissionDecision(permission, details);
     const url = wc?.getURL?.() || "";
-    const knownPerm = mediaPermissions.has(perm) || clipboardWritePermissions.has(perm);
     const fromBackend = _isBackendOrigin(url);
-    const allow = knownPerm && fromBackend;
+    const allow = allowedCapability && fromBackend;
     const logUrl = permissionLogUrl(url);
-    if (knownPerm && !fromBackend) {
+    if (known && !fromBackend) {
       appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} url=${logUrl}`);
     } else {
       appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${logUrl}`);
@@ -6544,7 +6584,7 @@ async function createWindow(options = {}) {
     // 60 s ceiling: cold-start on a fresh install with bundled
     // runtime is typically <5 s; the budget just bounds the wait
     // before the catch branch surfaces a real error to the user.
-    await waitForHttp(`${BASE_URL}/api/health`, 60_000);
+    await waitForBackendHealth(`${BASE_URL}/api/health`, 60_000);
     // Backend is healthy — treat this as a successful recovery signal
     // and clear the restart-attempt counter. Without this reset the
     // counter only decayed on a clean `exit code 0`, which never fires
@@ -6586,9 +6626,8 @@ async function createWindow(options = {}) {
       .filter(Boolean)
       .join("\n\n");
 
-    // Platform-specific recovery instructions. The old fallback HTML
-    // hardcoded `setup.command` (macOS-only), leaving Windows/Linux
-    // users with irrelevant instructions.
+    // Platform-specific recovery instructions. Keep these tied to the
+    // current root entrypoints instead of deleted legacy install scripts.
     const logPath = path.join(app.getPath("userData"), "main.log");
     let recoveryHtml;
     if (process.platform === "win32") {
@@ -6614,9 +6653,8 @@ async function createWindow(options = {}) {
       recoveryHtml = (
         `<h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>` +
         `<p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>` +
-        `<p style="color:#ddd;margin:8px 0"><b>→ Right-click</b> on <code style="background:#333;padding:2px 6px;border-radius:4px">setup.command</code> → <b>Open</b> → <b>Open</b></p>` +
-        `<p style="color:#666;font-size:12px;margin:12px 0 4px">Or paste in Terminal:</p>` +
-        `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">bash ~/Downloads/Voice\\\\ Transcriptor/setup.command</pre>` +
+        `<p style="color:#ddd;margin:8px 0">Quit and reopen Transcriptor. For a source checkout, run the current root installer:</p>` +
+        `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">cd ~/Downloads/Voice\\\\ Transcriptor && ./INSTALL.command</pre>` +
         `<p style="color:#888;font-size:12px;margin-top:14px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
       );
     }
@@ -6631,12 +6669,14 @@ async function createWindow(options = {}) {
           ${recoveryHtml}
           <script>
             let attempt = 0;
+            const expectedBootNonce = ${JSON.stringify(BACKEND_BOOT_NONCE)};
             function checkHealth() {
               attempt++;
               const s = document.getElementById('status');
               s.textContent = '⏳ Waiting for backend... (attempt ' + attempt + ')';
               fetch('${BASE_URL}/api/health', { signal: AbortSignal.timeout(3000) })
-                .then(r => { if (r.ok) { s.textContent = '✅ Backend is up! Reloading...'; s.style.background='#1a3a1a'; s.style.borderColor='#2a6a2a'; setTimeout(() => location.reload(), 500); } else { setTimeout(checkHealth, 3000); } })
+                .then(r => r.ok ? r.json() : Promise.reject(new Error('health not ready')))
+                .then(body => { if (body && body.boot_nonce === expectedBootNonce) { s.textContent = '✅ Backend is up! Loading app...'; s.style.background='#1a3a1a'; s.style.borderColor='#2a6a2a'; setTimeout(() => { window.location.href = '${BASE_URL}/'; }, 500); } else { setTimeout(checkHealth, 3000); } })
                 .catch(() => setTimeout(checkHealth, 3000));
             }
             checkHealth();

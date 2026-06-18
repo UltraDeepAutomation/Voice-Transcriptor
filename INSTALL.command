@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  Transcriptor — Cross-platform one-click installer
+#  Transcriptor - cross-platform one-click builder
 #  ----------------------------------------------------------------------------
-#  Double-click this file (macOS/Linux). Detects the host OS and dispatches
-#  to the matching installer under install/<os>/:
-#
-#     macOS   → install/mac/setup.command   (brew + venv + build + /Applications)
-#     Linux   → install/linux/setup.sh      (apt/dnf/pacman + venv + AppImage)
-#     Windows → user must run install\win\setup.bat instead — .command files
-#               aren't executable on Windows Explorer. README points them there.
+#  Double-click this file on macOS/Linux. It uses the current build SSOT:
+#  desktop/package.json scripts plus desktop/scripts/prepare-runtime.sh.
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,14 +11,21 @@ OS="$(uname -s)"
 
 case "$OS" in
   Darwin)
-    exec "$SCRIPT_DIR/install/mac/setup.command" "$@"
+    exec "$SCRIPT_DIR/BUILD.command" "$@"
     ;;
   Linux)
-    exec "$SCRIPT_DIR/install/linux/setup.sh" "$@"
+    cd "$SCRIPT_DIR"
+    npm --prefix frontend ci
+    npm --prefix desktop ci
+    desktop/scripts/prepare-runtime.sh linux-x64
+    npm --prefix frontend run build
+    cd "$SCRIPT_DIR/desktop"
+    node ./unlockDist.js
+    npx electron-builder --linux AppImage --x64 "$@"
     ;;
   *)
     echo "Unsupported OS: $OS"
-    echo "Windows: double-click install\\win\\setup.bat"
+    echo "Windows: run npm --prefix desktop run dist:win from a Windows shell."
     exit 1
     ;;
 esac

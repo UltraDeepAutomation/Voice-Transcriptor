@@ -3494,6 +3494,29 @@ canvas,
   outline: none;
 }
 
+.upload-queue-item-retry {
+  appearance: none;
+  background: var(--surface-2, #202020);
+  border: 1px solid var(--surface-3, #3a3a3a);
+  color: var(--text-1, #e5e7eb);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.upload-queue-item-retry:hover,
+.upload-queue-item-retry:focus-visible {
+  background: var(--surface-3, #2a2a2a);
+  border-color: var(--text-2, #6b7280);
+  outline: none;
+}
+.upload-queue-item-retry:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .upload-queue-item-body {
   margin-top: 8px;
   font-size: 13px;

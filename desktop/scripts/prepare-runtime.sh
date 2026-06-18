@@ -167,8 +167,13 @@ install_ffmpeg_mac() {
   if [ -f "${tmp}/ffmpeg" ]; then
     cp "${tmp}/ffmpeg" "${out_dir}/ffmpeg/bin/ffmpeg"
   else
-    find "${tmp}" -name "ffmpeg" -type f -not -path "*/__MACOSX/*" -print0 \
-      | head -z -n 1 | xargs -0 -I {} cp {} "${out_dir}/ffmpeg/bin/ffmpeg"
+    local found=""
+    while IFS= read -r -d '' f; do
+      found="$f"
+      break
+    done < <(find "${tmp}" -name "ffmpeg" -type f -not -path "*/__MACOSX/*" -print0)
+    [ -n "${found}" ] || die "ffmpeg binary not found in archive"
+    cp "${found}" "${out_dir}/ffmpeg/bin/ffmpeg"
   fi
   rm -rf "${tmp}"
   chmod +x "${out_dir}/ffmpeg/bin/ffmpeg"

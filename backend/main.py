@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -45,6 +45,7 @@ from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
     ensure_wav_16k,
+    ensure_wav_16k_preserve_channels,
     split_channels,
     write_wav,
 )
@@ -347,6 +348,7 @@ REMOTE_RAW_FALLBACK_MAX_BYTES = max(
     1 * 1024 * 1024,
     _env_int("TRANSCRIPTOR_REMOTE_RAW_FALLBACK_MAX_BYTES", 8 * 1024 * 1024),
 )
+BOOT_NONCE = (os.environ.get("TRANSCRIPTOR_BOOT_NONCE") or "").strip()
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 ALLOWED_REMOTE_PROVIDERS = {"openrouter", "deepgram"}
 ALLOWED_AUDIO_EXTS = {
@@ -1065,6 +1067,7 @@ def health():
     return {
         "ok": True,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "boot_nonce": BOOT_NONCE,
     }
 
 
@@ -1229,6 +1232,72 @@ def _validate_audio_filename(name: str) -> None:
         raise HTTPException(status_code=400, detail="unsupported audio file extension")
 
 
+def _resolve_source_media_path(source_path: object) -> Path:
+    """Resolve a user-selected source media path for retry-by-path flows.
+
+    The frontend can only persist a path after Electron's file picker or
+    drag-drop grants a File object. The backend still owns the trust
+    boundary: it accepts only an absolute, existing, regular media file
+    within the same size/extension contract as UploadFile endpoints.
+    """
+    hint = str(source_path or "").strip()
+    if not hint:
+        raise HTTPException(status_code=400, detail="source_path is required")
+    candidate = Path(hint).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=400, detail="source_path must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="source file is no longer available") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="source file path is not accessible") from exc
+    if not resolved.is_file():
+        raise HTTPException(status_code=400, detail="source_path must point to a file")
+    orig_name = _normalize_filename(resolved.name)
+    _validate_audio_filename(orig_name)
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="source file is not accessible") from exc
+    if size <= 0:
+        raise HTTPException(status_code=400, detail="source file is empty")
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+        )
+    return resolved
+
+
+def _copy_source_media_file(source_path: Path, target: Path) -> int:
+    total = 0
+    try:
+        with source_path.open("rb") as src, target.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+                    )
+                dst.write(chunk)
+        return total
+    except BaseException:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as cleanup_err:
+            logger.warning(
+                "partial source media copy cleanup failed for %s: %s",
+                target,
+                cleanup_err,
+            )
+        raise
+
+
 def _normalize_language(value: str) -> Optional[str]:
     language = (value or "auto").strip()
     if language.lower() in {"", "auto"}:
@@ -1237,6 +1306,25 @@ def _normalize_language(value: str) -> Optional[str]:
     if not re.fullmatch(r"[A-Za-z]{2,8}(-[A-Za-z]{2,8}){0,2}", language):
         raise HTTPException(status_code=400, detail="invalid language code")
     return language
+
+
+def _payload_bool(payload: Optional[dict], key: str, default: bool = False) -> bool:
+    """Parse JSON boolean fields with the same semantics as form booleans."""
+    if not isinstance(payload, dict) or key not in payload or payload.get(key) is None:
+        return bool(default)
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    raise HTTPException(status_code=400, detail=f"{key} must be a boolean")
 
 
 def _is_broken_pipe_error(exc: Exception) -> bool:
@@ -1329,7 +1417,7 @@ def _run_local_transcribe_once(
         if split_stereo:
             wav_path = str(RESULTS_DIR / f"{run_id}.16k.wav")
             temp_paths.append(wav_path)
-            ensure_wav_16k(str(upload_path), wav_path, channels=2)
+            ensure_wav_16k_preserve_channels(str(upload_path), wav_path)
             set_progress(0.15)
             ch1, ch2 = split_channels(wav_path)
         else:
@@ -1362,6 +1450,72 @@ def _run_local_transcribe_once(
                 os.remove(p)
             except OSError as e:
                 logger.debug("temp file removal skipped for %s: %s", p, e)
+
+
+def _submit_local_transcription_job(
+    *,
+    job_id: str,
+    upload_path: Path,
+    model: str,
+    language: Optional[str],
+    split_stereo: bool,
+    word_timestamps: bool,
+    cleanup_upload_path: bool,
+) -> None:
+    def run():
+        try:
+            jobs.raise_if_cancelled(job_id)
+            jobs.set_running(job_id)
+            result = _run_local_transcribe_once(
+                run_id=job_id,
+                upload_path=upload_path,
+                model=model,
+                language=language,
+                split_stereo=split_stereo,
+                word_timestamps=word_timestamps,
+                progress_cb=lambda value: (
+                    jobs.raise_if_cancelled(job_id),
+                    jobs.set_progress(job_id, value),
+                ),
+            )
+            jobs.raise_if_cancelled(job_id)
+
+            result_json_path = RESULTS_DIR / f"{job_id}.json"
+            result_txt_path = RESULTS_DIR / f"{job_id}.txt"
+            # SSOT atomic write — the lifespan shutdown hook exists to
+            # prevent half-written result files on SIGTERM, but bare
+            # ``Path.write_text`` is NOT atomic nor fsync'd: a kill
+            # between open() and final flush leaves a zero-byte
+            # result.json that parses as corrupt on next boot.
+            atomic_write_json(result_json_path, result)
+            atomic_write_text(result_txt_path, result.get("text", ""))
+            jobs.set_done(
+                job_id,
+                result,
+                {
+                    "json": str(result_json_path),
+                    "txt": str(result_txt_path),
+                },
+            )
+        except JobCancelledError:
+            jobs.cancel(job_id)
+        except AudioError as e:
+            jobs.set_error(job_id, _safe_error_text(e))
+        except Exception as e:
+            # Log the full exception locally so operators still have
+            # the trace (paths, ffmpeg stderr, etc.), but redact before
+            # persisting to the job store — job errors are returned
+            # verbatim to the renderer.
+            logger.exception("local transcription job failed (job_id=%s)", job_id)
+            jobs.set_error(job_id, f"Transcription failed: {_safe_error_text(e)}")
+        finally:
+            if cleanup_upload_path:
+                try:
+                    os.remove(upload_path)
+                except OSError as e:
+                    logger.debug("upload cleanup skipped for %s: %s", upload_path, e)
+
+    jobs.submit(run)
 
 
 def _validate_config_payload(payload: dict) -> None:
@@ -1845,10 +1999,11 @@ _AUDIO_EXT_TO_MIME: dict[str, str] = {
 # MIME entry now fails on backend startup instead of silently
 # falling through to ``application/octet-stream``.
 _missing_mime_exts = ALLOWED_AUDIO_EXTS - _AUDIO_EXT_TO_MIME.keys()
-assert not _missing_mime_exts, (
-    f"ALLOWED_AUDIO_EXTS / _AUDIO_EXT_TO_MIME drift: missing MIME "
-    f"mapping for {sorted(_missing_mime_exts)}"
-)
+if _missing_mime_exts:
+    raise RuntimeError(
+        f"ALLOWED_AUDIO_EXTS / _AUDIO_EXT_TO_MIME drift: missing MIME "
+        f"mapping for {sorted(_missing_mime_exts)}"
+    )
 
 
 def _audio_content_type(filename: str) -> str:
@@ -3207,60 +3362,44 @@ async def create_job(
     await _save_upload_file(file, upload_path)
 
     lang_opt = _normalize_language(language)
+    _submit_local_transcription_job(
+        job_id=job_id,
+        upload_path=upload_path,
+        model=model,
+        language=lang_opt,
+        split_stereo=split_stereo,
+        word_timestamps=word_timestamps,
+        cleanup_upload_path=True,
+    )
+    return {"job_id": job_id}
 
-    def run():
-        try:
-            jobs.raise_if_cancelled(job_id)
-            jobs.set_running(job_id)
-            result = _run_local_transcribe_once(
-                run_id=job_id,
-                upload_path=upload_path,
-                model=model,
-                language=lang_opt,
-                split_stereo=split_stereo,
-                word_timestamps=word_timestamps,
-                progress_cb=lambda value: (
-                    jobs.raise_if_cancelled(job_id),
-                    jobs.set_progress(job_id, value),
-                ),
-            )
-            jobs.raise_if_cancelled(job_id)
 
-            result_json_path = RESULTS_DIR / f"{job_id}.json"
-            result_txt_path = RESULTS_DIR / f"{job_id}.txt"
-            # SSOT atomic write — the lifespan shutdown hook exists to
-            # prevent half-written result files on SIGTERM, but bare
-            # ``Path.write_text`` is NOT atomic nor fsync'd: a kill
-            # between open() and final flush leaves a zero-byte
-            # result.json that parses as corrupt on next boot.
-            atomic_write_json(result_json_path, result)
-            atomic_write_text(result_txt_path, result.get("text", ""))
-            jobs.set_done(
-                job_id,
-                result,
-                {
-                    "json": str(result_json_path),
-                    "txt": str(result_txt_path),
-                },
-            )
-        except JobCancelledError:
-            jobs.cancel(job_id)
-        except AudioError as e:
-            jobs.set_error(job_id, _safe_error_text(e))
-        except Exception as e:
-            # Log the full exception locally so operators still have
-            # the trace (paths, ffmpeg stderr, etc.), but redact before
-            # persisting to the job store — job errors are returned
-            # verbatim to the renderer.
-            logger.exception("local transcription job failed (job_id=%s)", job_id)
-            jobs.set_error(job_id, f"Transcription failed: {_safe_error_text(e)}")
-        finally:
-            try:
-                os.remove(upload_path)
-            except OSError as e:
-                logger.debug("upload cleanup skipped for %s: %s", upload_path, e)
+@app.post("/api/jobs/from-path")
+async def create_job_from_path(
+    payload: dict = Body(...),
+    _auth: None = Depends(_require_api_auth),
+):
+    _cleanup_expired_files()
+    model = str((payload or {}).get("model") or "small").strip()
+    if model not in ALLOWED_LOCAL_MODELS:
+        raise HTTPException(status_code=400, detail="unsupported model")
 
-    jobs.submit(run)
+    source_path = _resolve_source_media_path((payload or {}).get("source_path") or (payload or {}).get("path"))
+    lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
+    split_stereo = _payload_bool(payload, "split_stereo", True)
+    word_timestamps = _payload_bool(payload, "word_timestamps", False)
+
+    job_id = str(uuid.uuid4())
+    jobs.create(job_id)
+    _submit_local_transcription_job(
+        job_id=job_id,
+        upload_path=source_path,
+        model=model,
+        language=lang_opt,
+        split_stereo=split_stereo,
+        word_timestamps=word_timestamps,
+        cleanup_upload_path=False,
+    )
     return {"job_id": job_id}
 
 
@@ -3525,31 +3664,19 @@ def _run_remote_transcribe_once(
         }
 
 
-@app.post("/api/remote/jobs")
-async def create_remote_job(
-    _auth: None = Depends(_require_api_auth),
-    file: UploadFile = File(...),
-    provider: str = Form(""),
-    language: str = Form("auto"),
-    diarize: bool = Form(False),
-    num_speakers: str = Form(""),
-    openrouter_model: str = Form(""),
-):
-    _cleanup_expired_files()
-    provider_norm = (provider or "").strip()
-    if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
-        raise HTTPException(status_code=400, detail="unsupported provider")
-
-    job_id = str(uuid.uuid4())
-    jobs.create(job_id)
+def _submit_remote_transcription_job(
+    *,
+    job_id: str,
+    provider_norm: str,
+    upload_path: Path,
+    orig_name: str,
+    language: Optional[str],
+    diarize: bool,
+    num_speakers: str,
+    openrouter_model: str,
+    cleanup_upload_path: bool,
+) -> None:
     cancel_event = jobs.cancel_event(job_id)
-
-    orig_name = _normalize_filename(file.filename or "audio.wav")
-    _validate_audio_filename(orig_name)
-    upload_path = UPLOADS_DIR / f"{job_id}.{orig_name}"
-    await _save_upload_file(file, upload_path)
-
-    lang_opt = _normalize_language(language)
 
     def run():
         def _check_cancelled() -> None:
@@ -3566,7 +3693,7 @@ async def create_remote_job(
                 provider_norm=provider_norm,
                 upload_path=upload_path,
                 orig_name=orig_name,
-                language=lang_opt,
+                language=language,
                 diarize=diarize,
                 num_speakers=num_speakers,
                 openrouter_model=openrouter_model,
@@ -3618,12 +3745,80 @@ async def create_remote_job(
             logger.exception("remote transcription job failed (job_id=%s)", job_id)
             jobs.set_error(job_id, f"Remote transcription failed: {_safe_error_text(e)}")
         finally:
-            try:
-                os.remove(upload_path)
-            except OSError as e:
-                logger.debug("upload cleanup skipped for %s: %s", upload_path, e)
+            if cleanup_upload_path:
+                try:
+                    os.remove(upload_path)
+                except OSError as e:
+                    logger.debug("upload cleanup skipped for %s: %s", upload_path, e)
 
     jobs.submit(run)
+
+
+@app.post("/api/remote/jobs")
+async def create_remote_job(
+    _auth: None = Depends(_require_api_auth),
+    file: UploadFile = File(...),
+    provider: str = Form(""),
+    language: str = Form("auto"),
+    diarize: bool = Form(False),
+    num_speakers: str = Form(""),
+    openrouter_model: str = Form(""),
+):
+    _cleanup_expired_files()
+    provider_norm = (provider or "").strip()
+    if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
+        raise HTTPException(status_code=400, detail="unsupported provider")
+
+    job_id = str(uuid.uuid4())
+    jobs.create(job_id)
+
+    orig_name = _normalize_filename(file.filename or "audio.wav")
+    _validate_audio_filename(orig_name)
+    upload_path = UPLOADS_DIR / f"{job_id}.{orig_name}"
+    await _save_upload_file(file, upload_path)
+
+    lang_opt = _normalize_language(language)
+    _submit_remote_transcription_job(
+        job_id=job_id,
+        provider_norm=provider_norm,
+        upload_path=upload_path,
+        orig_name=orig_name,
+        language=lang_opt,
+        diarize=diarize,
+        num_speakers=num_speakers,
+        openrouter_model=openrouter_model,
+        cleanup_upload_path=True,
+    )
+    return {"job_id": job_id}
+
+
+@app.post("/api/remote/jobs/from-path")
+async def create_remote_job_from_path(
+    payload: dict = Body(...),
+    _auth: None = Depends(_require_api_auth),
+):
+    _cleanup_expired_files()
+    provider_norm = str((payload or {}).get("provider") or "").strip()
+    if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
+        raise HTTPException(status_code=400, detail="unsupported provider")
+
+    source_path = _resolve_source_media_path((payload or {}).get("source_path") or (payload or {}).get("path"))
+    orig_name = _normalize_filename(source_path.name)
+    lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
+
+    job_id = str(uuid.uuid4())
+    jobs.create(job_id)
+    _submit_remote_transcription_job(
+        job_id=job_id,
+        provider_norm=provider_norm,
+        upload_path=source_path,
+        orig_name=orig_name,
+        language=lang_opt,
+        diarize=_payload_bool(payload, "diarize", False),
+        num_speakers=str((payload or {}).get("num_speakers") or ""),
+        openrouter_model=str((payload or {}).get("openrouter_model") or ""),
+        cleanup_upload_path=False,
+    )
     return {"job_id": job_id}
 
 
@@ -3750,7 +3945,7 @@ async def transcribe_recording_on_disk(
                 upload_path=audio_path,
                 orig_name=audio_path.name,
                 language=lang_opt,
-                diarize=bool(payload.get("diarize") or False),
+                diarize=_payload_bool(payload, "diarize", False),
                 num_speakers=str(payload.get("num_speakers") or ""),
                 openrouter_model=str(payload.get("openrouter_model") or ""),
                 cfg=cfg,
@@ -4642,7 +4837,7 @@ def save_recording(
     existing_name = os.path.basename(str(payload.get("name") or "").strip())
     archive_dir = str(payload.get("archive_dir") or "").strip()
     recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
-    require_existing = bool(payload.get("require_existing"))
+    require_existing = _payload_bool(payload, "require_existing", False)
     title = _sanitize_name(str(payload.get("title") or "recording"))
     source_text = str(payload.get("source_text") or "").strip()
     transcript_text = str(payload.get("transcript_text") or "").strip()
@@ -4665,7 +4860,7 @@ def save_recording(
     # custom folder left the dir invisible to retention sweeps.
     _register_archive_dir(target_dir)
     if existing_name:
-        if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
+        if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
         out = target_dir / existing_name
         if require_existing and not out.exists():
@@ -4688,22 +4883,22 @@ def save_recording(
     return {"ok": True, "name": out.name, "archive_dir": str(target_dir)}
 
 
-@app.post("/api/recordings/save-with-audio")
-async def save_recording_with_audio(
-    _auth: None = Depends(_require_api_auth),
-    file: UploadFile = File(...),
-    name: str = Form(""),
-    archive_dir: str = Form(""),
-    recording_collection: str = Form(""),
-    require_existing: bool = Form(False),
-    title: str = Form("recording"),
-    source_text: str = Form(""),
-    transcript_text: str = Form(""),
-    provider: str = Form(""),
-    model: str = Form(""),
-    language: str = Form(""),
-    live_session_id: str = Form(""),
-):
+async def _save_recording_audio_source(
+    *,
+    orig_name: str,
+    write_tmp_audio: Callable[[Path], Awaitable[Any]],
+    name: str = "",
+    archive_dir: str = "",
+    recording_collection: str = "",
+    require_existing: bool = False,
+    title: str = "recording",
+    source_text: str = "",
+    transcript_text: str = "",
+    provider: str = "",
+    model: str = "",
+    language: str = "",
+    live_session_id: str = "",
+) -> dict[str, Any]:
     existing_name = os.path.basename(str(name or "").strip())
     safe_title = _sanitize_name(str(title or "recording"))
     safe_source_text = str(source_text or "").strip()
@@ -4714,10 +4909,10 @@ async def save_recording_with_audio(
     if not safe_source_text and not safe_transcript_text:
         safe_source_text = "[No speech captured]"
 
-    orig_name = _normalize_filename(file.filename or "recording.wav")
-    _validate_audio_filename(orig_name)
-    ext = Path(orig_name).suffix.lower() or ".wav"
-    source_file_name = _source_recording_display_name(orig_name)
+    safe_orig_name = _normalize_filename(orig_name or "recording.wav")
+    _validate_audio_filename(safe_orig_name)
+    ext = Path(safe_orig_name).suffix.lower() or ".wav"
+    source_file_name = _source_recording_display_name(safe_orig_name)
 
     target_dir = _resolve_recordings_collection_target_dir(
         archive_dir,
@@ -4728,7 +4923,7 @@ async def save_recording_with_audio(
     # the user changes their default recordings_dir between app launches.
     _register_archive_dir(target_dir)
     if existing_name:
-        if existing_name in {"", ".", ".."} or not existing_name.endswith(".txt"):
+        if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
         stem = Path(existing_name).stem
         if require_existing and not (target_dir / existing_name).exists():
@@ -4736,7 +4931,7 @@ async def save_recording_with_audio(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem = _unique_recording_stem_for_source_file(target_dir, orig_name, safe_title)
+        stem = _unique_recording_stem_for_source_file(target_dir, safe_orig_name, safe_title)
 
     out_text = target_dir / f"{stem}.txt"
     out_audio = target_dir / f"{stem}{ext}"
@@ -4761,7 +4956,7 @@ async def save_recording_with_audio(
         except OSError:
             audio_backup = None  # Couldn't backup — rollback will only be safe for new-recording path
     try:
-        await _save_upload_file(file, tmp_audio)
+        await write_tmp_audio(tmp_audio)
         os.replace(tmp_audio, out_audio)
         try:
             _write_recording_text_file(
@@ -4830,3 +5025,64 @@ async def save_recording_with_audio(
         "archive_dir": str(target_dir),
         "pruned_audio_count": pruned,
     }
+
+
+@app.post("/api/recordings/save-with-audio")
+async def save_recording_with_audio(
+    _auth: None = Depends(_require_api_auth),
+    file: UploadFile = File(...),
+    name: str = Form(""),
+    archive_dir: str = Form(""),
+    recording_collection: str = Form(""),
+    require_existing: bool = Form(False),
+    title: str = Form("recording"),
+    source_text: str = Form(""),
+    transcript_text: str = Form(""),
+    provider: str = Form(""),
+    model: str = Form(""),
+    language: str = Form(""),
+    live_session_id: str = Form(""),
+):
+    orig_name = _normalize_filename(file.filename or "recording.wav")
+    return await _save_recording_audio_source(
+        orig_name=orig_name,
+        write_tmp_audio=lambda tmp_audio: _save_upload_file(file, tmp_audio),
+        name=name,
+        archive_dir=archive_dir,
+        recording_collection=recording_collection,
+        require_existing=require_existing,
+        title=title,
+        source_text=source_text,
+        transcript_text=transcript_text,
+        provider=provider,
+        model=model,
+        language=language,
+        live_session_id=live_session_id,
+    )
+
+
+@app.post("/api/recordings/save-from-path")
+async def save_recording_from_path(
+    payload: dict = Body(...),
+    _auth: None = Depends(_require_api_auth),
+):
+    source_path = _resolve_source_media_path((payload or {}).get("source_path") or (payload or {}).get("path"))
+
+    async def write_tmp_audio(tmp_audio: Path) -> None:
+        await asyncio.to_thread(_copy_source_media_file, source_path, tmp_audio)
+
+    return await _save_recording_audio_source(
+        orig_name=_normalize_filename(source_path.name),
+        write_tmp_audio=write_tmp_audio,
+        name=str((payload or {}).get("name") or ""),
+        archive_dir=str((payload or {}).get("archive_dir") or ""),
+        recording_collection=str((payload or {}).get("recording_collection") or ""),
+        require_existing=_payload_bool(payload, "require_existing", False),
+        title=str((payload or {}).get("title") or "recording"),
+        source_text=str((payload or {}).get("source_text") or ""),
+        transcript_text=str((payload or {}).get("transcript_text") or ""),
+        provider=str((payload or {}).get("provider") or ""),
+        model=str((payload or {}).get("model") or ""),
+        language=str((payload or {}).get("language") or ""),
+        live_session_id="",
+    )

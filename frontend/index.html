@@ -119,7 +119,11 @@
         <button class="sb-item" data-view="record">Live</button>
         <button class="sb-item" data-view="recordings">History</button>
         <button class="sb-item" data-view="settings">Settings</button>
+        <!-- Graph view is temporarily disabled; keep the markup below commented
+             and GRAPH_VIEW_ENABLED=false in main.tsx so it consumes no runtime resources. -->
+        <!--
         <button class="sb-item" data-view="graph">Graph</button>
+        -->
       </div>
     </nav>
 
@@ -584,6 +588,8 @@
         </div>
       </section>
 
+      <!-- Graph view temporarily disabled; leave commented for an easy restore. -->
+      <!--
       <section class="view" data-view="graph" hidden>
         <div class="graph-shell">
           <div class="screen-header">
@@ -618,6 +624,7 @@
           </div>
         </div>
       </section>
+      -->
 
       <section class="view" data-view="settings" hidden>
         <div class="settings-shell">
@@ -628,11 +635,11 @@
                 <!-- ``#appVersionNumber`` text is set by main.tsx on boot
                      from the compile-time-injected ``__APP_VERSION__``
                      constant (vite.config.ts ``define`` block reads
-                     frontend/package.json's version field). The "—"
+                     desktop/package.json's version field). The "—"
                      placeholder is what renders during the brief
                      pre-script window; users never see it because the
                      script runs synchronously after parse. SSOT for
-                     this label is now frontend/package.json. -->
+                     this label is now desktop/package.json. -->
                 Transcriptor v<span id="appVersionNumber">—</span>
               </div>
             </div>
@@ -731,9 +738,10 @@
     </main>
   </div>
 
-  <div class="modal-backdrop" id="upscalePresetModal" hidden>
+  <div class="modal-backdrop" id="upscalePresetModal" role="dialog" aria-modal="true"
+    aria-labelledby="upscalePresetTitle" hidden>
     <div class="modal-card">
-      <h3>New Upscale Preset</h3>
+      <h3 id="upscalePresetTitle">New Upscale Preset</h3>
       <label class="field">
         <span class="lbl">Name</span>
         <input id="upscalePresetNameInput" type="text" maxlength="60" placeholder="My Preset" />
@@ -751,9 +759,10 @@
     </div>
   </div>
 
-  <div class="modal-backdrop" id="upscalePromptModal" hidden>
+  <div class="modal-backdrop" id="upscalePromptModal" role="dialog" aria-modal="true"
+    aria-labelledby="upscalePromptTitle" hidden>
     <div class="modal-card">
-      <h3>Preset Prompt</h3>
+      <h3 id="upscalePromptTitle">Preset Prompt</h3>
       <label class="modal-field">
         <span>Name</span>
         <input id="upscalePromptPresetName" type="text" readonly />
@@ -772,9 +781,10 @@
     </div>
   </div>
 
-  <div class="modal-backdrop" id="deleteAllModal" hidden>
+  <div class="modal-backdrop" id="deleteAllModal" role="dialog" aria-modal="true"
+    aria-labelledby="deleteAllTitle" hidden>
     <div class="modal-card">
-      <h3>Delete All Recordings</h3>
+      <h3 id="deleteAllTitle">Delete All Recordings</h3>
       <p class="modal-body-text">Are you sure you want to delete all recordings? This action cannot be
         undone.</p>
       <div class="modal-actions">

@@ -24,6 +24,7 @@
     "afterPack": "./afterPack.js",
     "files": [
       "main.js",
+      "preload.js",
       "package.json",
       "icon.png",
       "icon.ico",

@@ -4,8 +4,10 @@ import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def _fresh_main_module(data_dir: str):
@@ -129,6 +131,31 @@ class RecordingNameTests(unittest.TestCase):
         stats = self.main._build_recordings_stats_payload(root)
         self.assertEqual(stats["total_recordings"], 2)
 
+    def test_json_boolean_parser_matches_form_semantics(self):
+        self.assertFalse(self.main._payload_bool({"enabled": "false"}, "enabled", True))
+        self.assertFalse(self.main._payload_bool({"enabled": "0"}, "enabled", True))
+        self.assertTrue(self.main._payload_bool({"enabled": "true"}, "enabled", False))
+        self.assertTrue(self.main._payload_bool({}, "enabled", True))
+        with self.assertRaises(self.main.HTTPException):
+            self.main._payload_bool({"enabled": "definitely"}, "enabled", False)
+
+    def test_save_recording_accepts_case_insensitive_txt_extension(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        (target / "Existing.TXT").write_text("old", encoding="utf-8")
+
+        result = self.main.save_recording({
+            "name": "Existing.TXT",
+            "archive_dir": str(target),
+            "require_existing": "true",
+            "title": "Existing",
+            "source_text": "source",
+            "transcript_text": "updated",
+        })
+
+        self.assertEqual(result["name"], "Existing.TXT")
+        self.assertIn("updated", (target / "Existing.TXT").read_text(encoding="utf-8"))
+
     def test_get_recording_uses_archive_dir_for_duplicate_names(self):
         root = (Path(self._tmp.name) / "recordings").resolve()
         live_dir = root / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE]
@@ -191,6 +218,63 @@ class RecordingNameTests(unittest.TestCase):
         )
         self.assertTrue((target_dir / result["name"]).exists())
         self.assertTrue((target_dir / result["audio_name"]).exists())
+
+    def test_save_from_path_upload_collection_copies_source_without_deleting_it(self):
+        source = Path(self._tmp.name) / "lecture source.mp3"
+        payload = b"tiny mp3 payload"
+        source.write_bytes(payload)
+
+        result = asyncio.run(self.main.save_recording_from_path({
+            "source_path": str(source),
+            "title": "Lecture",
+            "source_text": "source",
+            "transcript_text": "transcript",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+            "recording_collection": "uploads",
+        }))
+
+        target_dir = Path(result["archive_dir"])
+        self.assertTrue(source.exists())
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual(
+            target_dir.name,
+            self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_UPLOADS],
+        )
+        self.assertEqual((target_dir / result["audio_name"]).read_bytes(), payload)
+        raw = (target_dir / result["name"]).read_text(encoding="utf-8")
+        self.assertIn("Source file: lecture source.mp3", raw)
+
+    def test_local_job_from_path_does_not_delete_source_file(self):
+        source = Path(self._tmp.name) / "source.mp3"
+        source.write_bytes(b"tiny mp3 payload")
+
+        with mock.patch.object(
+            self.main,
+            "_run_local_transcribe_once",
+            return_value={"text": "ok", "duration": 0, "segments": []},
+        ) as run_once:
+            created = asyncio.run(self.main.create_job_from_path({
+                "source_path": str(source),
+                "language": "ru",
+                "model": "small",
+                "split_stereo": True,
+                "word_timestamps": False,
+            }))
+            job_id = created["job_id"]
+            deadline = time.time() + 5
+            job = None
+            while time.time() < deadline:
+                job = self.main.jobs.get(job_id)
+                if job and job.status in {"done", "error", "cancelled"}:
+                    break
+                time.sleep(0.02)
+
+        self.assertIsNotNone(job)
+        self.assertEqual(job.status, "done")
+        self.assertTrue(source.exists())
+        run_once.assert_called_once()
 
 
 if __name__ == "__main__":

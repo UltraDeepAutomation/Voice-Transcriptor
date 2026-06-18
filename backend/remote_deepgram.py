@@ -47,6 +47,54 @@ RemoteError = DeepgramRemoteError  # type: ignore[misc]
 from backend.deepgram_endpoints import DEEPGRAM_REST_BASE as DEEPGRAM_API_BASE  # noqa: E402,F401
 
 
+def _format_deepgram_speaker_words(words: object) -> str:
+    """Return a speaker-labelled transcript from Deepgram word objects."""
+    if not isinstance(words, list) or not words:
+        return ""
+    parts: list[str] = []
+    current_speaker: Optional[int] = None
+    current_words: list[str] = []
+    saw_speaker = False
+
+    def flush() -> None:
+        nonlocal current_words
+        if not current_words:
+            return
+        text = " ".join(current_words).strip()
+        if not text:
+            current_words = []
+            return
+        if current_speaker is None:
+            parts.append(text)
+        else:
+            parts.append(f"Speaker {current_speaker}: {text}")
+        current_words = []
+
+    for item in words:
+        if not isinstance(item, dict):
+            continue
+        token = str(item.get("punctuated_word") or item.get("word") or "").strip()
+        if not token:
+            continue
+        speaker_raw = item.get("speaker")
+        speaker: Optional[int] = None
+        if speaker_raw is not None:
+            try:
+                speaker = int(speaker_raw)
+                saw_speaker = True
+            except (TypeError, ValueError):
+                speaker = current_speaker
+        else:
+            speaker = current_speaker
+        if current_words and speaker != current_speaker:
+            flush()
+        current_speaker = speaker
+        current_words.append(token)
+
+    flush()
+    return "\n\n".join(parts) if saw_speaker else ""
+
+
 def deepgram_transcribe(
     *,
     api_key: str,
@@ -80,9 +128,8 @@ def deepgram_transcribe(
     }
     if diarize:
         # Deepgram REST flag for speaker labelling. The response adds
-        # ``words[...].speaker`` which we ignore for the simple text
-        # path — caller receives the full transcript and can inspect
-        # ``raw`` for speaker segmentation.
+        # ``words[...].speaker`` and the user-facing text below renders
+        # speaker-labelled paragraphs from that canonical word list.
         params["diarize"] = "true"
     if language and language.lower() not in ("auto", ""):
         params["language"] = language
@@ -177,9 +224,13 @@ def deepgram_transcribe(
     text = ""
     try:
         channel = result["results"]["channels"][0]
+        alternatives = channel.get("alternatives", [])
+        alternative = alternatives[0] if alternatives else {}
+        if diarize:
+            text = _format_deepgram_speaker_words(alternative.get("words"))
         # Try paragraphs first (structured paragraph output)
-        paragraphs_obj = channel.get("alternatives", [{}])[0].get("paragraphs")
-        if paragraphs_obj and isinstance(paragraphs_obj, dict):
+        paragraphs_obj = alternative.get("paragraphs")
+        if not text and paragraphs_obj and isinstance(paragraphs_obj, dict):
             paragraph_list = paragraphs_obj.get("paragraphs", [])
             if paragraph_list:
                 para_texts = []
@@ -194,7 +245,6 @@ def deepgram_transcribe(
                     text = "\n\n".join(para_texts)
         # Fallback to flat transcript
         if not text:
-            alternatives = channel.get("alternatives", [])
             if alternatives:
                 text = alternatives[0].get("transcript", "")
     except (KeyError, IndexError) as e:

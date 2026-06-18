@@ -6,19 +6,18 @@ import { dirname, resolve } from "node:path";
 // 1.1.25: read the version from desktop/package.json — the SINGLE
 // source of truth for the shipped artifact's version. electron-builder
 // uses ``desktop/package.json`` for the DMG title, NSIS installer
-// filename, and CFBundleShortVersionString; install/{linux,win}/
-// build.* scripts ALSO read ``desktop/package.json`` for their
-// echo banners. Previously ``vite.config.ts`` read frontend/
-// package.json, so the maintainer had to bump TWO files in lock-
+// filename, and CFBundleShortVersionString; BUILD.command,
+// INSTALL.command, and desktop/package.json scripts all read the same
+// manifest. Previously ``vite.config.ts`` read frontend/package.json,
+// so the maintainer had to bump TWO files in lock-
 // step every release — the exact drift the SSOT comment in 1.1.13
 // claimed to prevent.
 //
 // Reading the desktop manifest from inside the frontend's vite
 // build is OK at build time: the file is always present in the
 // repo at the parent's sibling, and is part of the release
-// pipeline. ``frontend/package.json``'s ``version`` field is now
-// ignored (vestigial, but kept for npm tooling that occasionally
-// reads it).
+// pipeline. ``frontend/package.json`` is package metadata only, not
+// the shipped application version SSOT.
 const PKG_VERSION: string = (() => {
   const here = dirname(fileURLToPath(import.meta.url));
   const pkgPath = resolve(here, "../desktop/package.json");

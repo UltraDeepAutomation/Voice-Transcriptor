@@ -6,6 +6,9 @@ type KeyProvider = "openrouter" | "deepgram";
 type ViewName = "upload" | "record" | "recordings" | "settings" | "graph";
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
 
+// Temporarily keep Graph dormant: no sidebar entry, no API load, no canvas listeners.
+const GRAPH_VIEW_ENABLED = false;
+
 interface NetworkStatusResponse {
   online: boolean;
   latency_ms: number | null;
@@ -279,7 +282,7 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
 type UiStatusTone = "neutral" | "info" | "success" | "warning" | "error";
 type RecordingFinalSignalKind = "" | "transcript" | "status" | "error";
 
-// Compile-time injected by vite.config.ts from frontend/package.json's
+// Compile-time injected by vite.config.ts from desktop/package.json's
 // ``version`` field. SSOT for the version label rendered in the
 // Settings tab — previously hardcoded ``1.1.1`` in index.html and
 // drifted across every release.
@@ -312,6 +315,12 @@ declare global {
      * ``shell.showItemInFolder``. No-op in plain-browser dev preview.
      */
     __transcriptorRevealRecording?: (name: string, archiveDir: string) => void;
+    /**
+     * Electron preload bridge. Returns an absolute filesystem path for
+     * a File obtained from the OS picker/drag-drop, or "" in browser dev
+     * preview and other unsupported contexts.
+     */
+    __transcriptorFilePathForFile?: (file: File) => string;
   }
 }
 
@@ -374,6 +383,9 @@ const UI_TOKENS = {
   settings: {
     saveDebounceMs: 260,
   },
+  upscale: {
+    livePasteReadyTimeoutMs: 3_000,
+  },
   capture: {
     fallbackInitDelayMs: 1_300,
     vuAmplify: 4,
@@ -382,6 +394,7 @@ const UI_TOKENS = {
   },
   finalize: {
     segmentEpsilonSec: 0.08,
+    tailRecoverySecondCandidateWaitMs: 2_500,
   },
   drain: {
     maxWaitMs: 450,
@@ -2213,6 +2226,46 @@ async function localJob(
   return (await r.json()) as { job_id: string };
 }
 
+async function remoteJobFromPath(
+  sourcePath: string,
+  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal },
+): Promise<{ job_id: string }> {
+  const r = await fetch("/api/remote/jobs/from-path", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    signal: opts.signal,
+    body: JSON.stringify({
+      source_path: sourcePath,
+      provider: opts.provider || "openrouter",
+      language: opts.language || "auto",
+      diarize: !!opts.diarize,
+      openrouter_model: (opts.openrouterModel || "").trim(),
+    }),
+  });
+  if (!r.ok) throw new Error(await parseError(r));
+  return (await r.json()) as { job_id: string };
+}
+
+async function localJobFromPath(
+  sourcePath: string,
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+): Promise<{ job_id: string }> {
+  const r = await fetch("/api/jobs/from-path", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    signal: opts.signal,
+    body: JSON.stringify({
+      source_path: sourcePath,
+      language: opts.language || "auto",
+      model: opts.model || "small",
+      split_stereo: !!opts.splitStereo,
+      word_timestamps: !!opts.wordTimestamps,
+    }),
+  });
+  if (!r.ok) throw new Error(await parseError(r));
+  return (await r.json()) as { job_id: string };
+}
+
 async function cancelBackendJob(jobId: string): Promise<void> {
   try {
     await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
@@ -2274,8 +2327,8 @@ async function waitForBackendJob<T>(
   }
 }
 
-async function remoteJobQueued(
-  file: File,
+async function waitForQueuedRemoteJob(
+  created: { job_id: string },
   opts: {
     provider: Provider;
     language: string;
@@ -2285,7 +2338,6 @@ async function remoteJobQueued(
     onProcessingProgress?: (fraction: number) => void;
   },
 ): Promise<RemoteTranscriptionResult> {
-  const created = await remoteJob(file, opts);
   const onAbort = () => { void cancelBackendJob(created.job_id); };
   if (opts.signal?.aborted) {
     await cancelBackendJob(created.job_id);
@@ -2310,6 +2362,34 @@ async function remoteJobQueued(
   };
 }
 
+async function remoteJobQueued(
+  file: File,
+  opts: {
+    provider: Provider;
+    language: string;
+    diarize: boolean;
+    openrouterModel?: string;
+    signal?: AbortSignal;
+    onProcessingProgress?: (fraction: number) => void;
+  },
+): Promise<RemoteTranscriptionResult> {
+  return waitForQueuedRemoteJob(await remoteJob(file, opts), opts);
+}
+
+async function remoteJobQueuedFromPath(
+  sourcePath: string,
+  opts: {
+    provider: Provider;
+    language: string;
+    diarize: boolean;
+    openrouterModel?: string;
+    signal?: AbortSignal;
+    onProcessingProgress?: (fraction: number) => void;
+  },
+): Promise<RemoteTranscriptionResult> {
+  return waitForQueuedRemoteJob(await remoteJobFromPath(sourcePath, opts), opts);
+}
+
 function normalizeLocalTranscriptionResult(raw: { text?: string; duration?: number; segments?: Array<{ start?: number; end?: number; text?: string }> } | null | undefined): LocalTranscriptionResult {
   const rawSegments = Array.isArray(raw?.segments) ? raw?.segments || [] : [];
   const segments = rawSegments
@@ -2322,11 +2402,10 @@ function normalizeLocalTranscriptionResult(raw: { text?: string; duration?: numb
   };
 }
 
-async function localJobQueued(
-  file: File,
+async function waitForQueuedLocalJob(
+  created: { job_id: string },
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
 ): Promise<LocalTranscriptionResult> {
-  const created = await localJob(file, opts);
   const onAbort = () => { void cancelBackendJob(created.job_id); };
   if (opts.signal?.aborted) {
     await cancelBackendJob(created.job_id);
@@ -2340,6 +2419,20 @@ async function localJobQueued(
     opts.signal?.removeEventListener("abort", onAbort);
   }
   return normalizeLocalTranscriptionResult(result);
+}
+
+async function localJobQueued(
+  file: File,
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+): Promise<LocalTranscriptionResult> {
+  return waitForQueuedLocalJob(await localJob(file, opts), opts);
+}
+
+async function localJobQueuedFromPath(
+  sourcePath: string,
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+): Promise<LocalTranscriptionResult> {
+  return waitForQueuedLocalJob(await localJobFromPath(sourcePath, opts), opts);
 }
 
 async function remoteJobSync(
@@ -2692,7 +2785,10 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
 }
 
-function switchView(view: ViewName): void {
+function switchView(requestedView: ViewName): void {
+  const view: ViewName = requestedView === "graph" && !GRAPH_VIEW_ENABLED
+    ? "recordings"
+    : requestedView;
   document.querySelectorAll(".view").forEach((el) => {
     const node = el as HTMLElement;
     node.hidden = node.dataset.view !== view;
@@ -2710,7 +2806,7 @@ function switchView(view: ViewName): void {
     view === "upload" ? "Upload"
       : view === "settings" ? "Settings"
       : view === "recordings" ? "History"
-      : view === "graph" ? "Graph"
+      : view === "graph" && GRAPH_VIEW_ENABLED ? "Graph"
       : "Live";
   if (view === "recordings") {
     // Only reload from the server if we have no cached items yet. If
@@ -2723,7 +2819,7 @@ function switchView(view: ViewName): void {
       void loadRecordings(true).catch(() => { });
     }
   }
-  if (view === "graph") {
+  if (view === "graph" && GRAPH_VIEW_ENABLED) {
     void loadGraphData();
   }
 }
@@ -2804,6 +2900,7 @@ function hideBootOverlayOnce(): void {
 document.querySelectorAll(".sb-item").forEach((e) => {
   e.addEventListener("click", () => {
     const v = ((e as HTMLElement).dataset.view || "record") as ViewName;
+    if (v === "graph" && !GRAPH_VIEW_ENABLED) return;
     switchView(v);
   });
 });
@@ -3886,6 +3983,48 @@ async function runUpscaleIfEnabled(
   return promise;
 }
 
+const ASYNC_TIMEOUT_SENTINEL = Symbol("async-timeout");
+
+function waitForTimeoutMs(ms: number): Promise<typeof ASYNC_TIMEOUT_SENTINEL> {
+  return new Promise((resolve) => {
+    window.setTimeout(() => resolve(ASYNC_TIMEOUT_SENTINEL), Math.max(0, ms));
+  });
+}
+
+async function runLivePasteUpscaleWithinSla(
+  text: string,
+  sessionToken: string,
+  opts: { setDoneStatus?: boolean } = {},
+): Promise<string> {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  if (!shouldUpscale()) {
+    return runUpscaleIfEnabled(raw, sessionToken, opts);
+  }
+  const timeoutMs = UI_TOKENS.upscale.livePasteReadyTimeoutMs;
+  const upscalePromise = runUpscaleIfEnabled(raw, sessionToken, opts);
+  const result = await Promise.race([
+    upscalePromise,
+    waitForTimeoutMs(timeoutMs),
+  ]);
+  if (result !== ASYNC_TIMEOUT_SENTINEL) {
+    return String(result || raw).trim() || raw;
+  }
+  console.warn(
+    `Live paste-ready upscale exceeded ${timeoutMs}ms; publishing original transcript and letting upscale finish in background.`,
+  );
+  void upscalePromise.catch((e) => {
+    console.warn("Late live upscale failed after paste-ready fallback:", e);
+  });
+  if (isCurrentUiSession(sessionToken)) {
+    patchCurrentRecordingSummary({
+      status: "Transcript is ready. Upscale is still finishing in the background.",
+      tone: "info",
+    }, sessionToken);
+  }
+  return raw;
+}
+
 // Serialized settings-save pipeline.
 //
 // ``queueUiPreferencesSave`` can be called many times per second
@@ -4054,10 +4193,12 @@ async function loadCfg(): Promise<void> {
     // the Upload tab (or with a different option set) gracefully falls
     // through to the HTML default instead of crashing on missing DOM.
     const uploadProviderEl = document.getElementById("uploadProvider") as HTMLSelectElement | null;
-    if (uploadProviderEl && ui.upload_provider) {
-      const wanted = String(ui.upload_provider).trim();
-      if (Array.from(uploadProviderEl.options).some((o) => o.value === wanted)) {
-        uploadProviderEl.value = wanted;
+    if (uploadProviderEl) {
+      const wanted = String(ui.upload_provider || "").trim();
+      const fallback: Provider = isProviderKeyConfigured("deepgram") ? "deepgram" : "local";
+      const next = wanted || fallback;
+      if (Array.from(uploadProviderEl.options).some((o) => o.value === next)) {
+        uploadProviderEl.value = next;
       }
     }
     const uploadLanguageEl = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
@@ -5043,6 +5184,7 @@ async function saveRecordingText(opts: {
   language: string;
   recordingCollection?: RecordingCollection;
   audioFile?: File | null;
+  audioSourcePath?: string;
   /** When set, the backend atomically discards the live-recovery spool
    *  for this session ID immediately after the audio is persisted —
    *  closing the race window between a successful save and the
@@ -5056,11 +5198,12 @@ async function saveRecordingText(opts: {
   const sourceText = (opts.sourceText || "").trim();
   const transcriptText = (opts.transcriptText || "").trim();
   const audioFile = opts.audioFile || null;
+  const audioSourcePath = normalizeUploadSourcePath(opts.audioSourcePath || "");
   const existingName = (opts.name || "").trim();
   const archiveDir = (opts.archiveDir || currentArchiveDirSnapshot()).trim();
   const recordingCollection = String(opts.recordingCollection || "").trim();
   const requireExisting = !!opts.requireExisting;
-  if (!sourceText && !transcriptText && !audioFile) {
+  if (!sourceText && !transcriptText && !audioFile && !audioSourcePath) {
     return { name: existingName, archiveDir };
   }
   let savedName = existingName;
@@ -5082,6 +5225,22 @@ async function saveRecordingText(opts: {
     const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
     if (!r.ok) throw new Error(await parseError(r));
     const js = (await r.json()) as { name?: string; archive_dir?: string };
+    savedName = String(js.name || existingName || "").trim();
+    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+  } else if (audioSourcePath) {
+    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save-from-path", {
+      source_path: audioSourcePath,
+      name: existingName,
+      archive_dir: archiveDir,
+      recording_collection: recordingCollection,
+      require_existing: requireExisting,
+      title: opts.title,
+      source_text: sourceText,
+      transcript_text: transcriptText,
+      provider: opts.provider,
+      model: opts.model,
+      language: opts.language,
+    });
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
   } else {
@@ -5615,9 +5774,10 @@ function syncQuickSettingsVisibility(open: boolean): void {
 
 function applyQuickSettingsFromMain(open: boolean): boolean {
   const panel = $("quickSettingsPanel");
-  const next = !!open;
-  const changed = panel.hidden !== next;
-  syncQuickSettingsVisibility(next);
+  const nextOpen = !!open;
+  const currentOpen = !panel.hidden;
+  const changed = currentOpen !== nextOpen;
+  syncQuickSettingsVisibility(nextOpen);
   if (changed) queueUiPreferencesSave();
   return changed;
 }
@@ -8165,18 +8325,43 @@ async function stopLive(enhance: boolean): Promise<void> {
               baseTranscriptForRace,
               first.text,
             );
+            const waitForRecoveryDespiteEnvelopeConfirmation =
+              first.label === "envelope" &&
+              firstConfirmsInstant &&
+              !chose;
+            if (!chose && (!firstConfirmsInstant || waitForRecoveryDespiteEnvelopeConfirmation)) {
+              // First didn't improve. If it was the envelope and we
+              // are already in the tail-likely-missing branch, give
+              // the in-flight REST/local recovery a short bounded
+              // second chance before keeping the instant transcript.
+              // This avoids the equal-word-count trap where the final
+              // envelope "confirms" a clipped live transcript while
+              // recovery would have returned the missing last phrase.
+              const otherPromise = first.label === "envelope" ? recoveryCand : envelopeCand;
+              const other = waitForRecoveryDespiteEnvelopeConfirmation
+                ? await Promise.race([
+                  otherPromise,
+                  new Promise<Cand | null>((resolve) => {
+                    window.setTimeout(
+                      () => resolve(null),
+                      UI_TOKENS.finalize.tailRecoverySecondCandidateWaitMs,
+                    );
+                  }),
+                ])
+                : await otherPromise;
+              const otherMs = performance.now() - tRace;
+              if (other) {
+                console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} tail="${other.text.slice(-60).replace(/\n/g, "\\n")}"`);
+                improvedText = richerTranscript(baseTranscriptForRace, other.text);
+                if (improvedText !== baseTranscriptForRace) {
+                  chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
+                }
+              } else {
+                console.log(`[trace tail-gap] race-second timeout ms=${otherMs.toFixed(0)} first=${first.label} words=${wcInstant}`);
+              }
+            }
             if (!chose && firstConfirmsInstant) {
               console.log(`[trace tail-gap] decision=KEEP_INSTANT_EARLY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
-            }
-            if (!chose && !firstConfirmsInstant) {
-              // First didn't improve — wait for the OTHER.
-              const other = first.label === "envelope" ? await recoveryCand : await envelopeCand;
-              const otherMs = performance.now() - tRace;
-              console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} tail="${other.text.slice(-60).replace(/\n/g, "\\n")}"`);
-              improvedText = richerTranscript(baseTranscriptForRace, other.text);
-              if (improvedText !== baseTranscriptForRace) {
-                chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
-              }
             }
             const totalRaceMs = performance.now() - tRace;
             if (chose) {
@@ -8406,7 +8591,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     let pasteReadyText = "";
     if (transcriptRaw) {
-      transcriptForPaste = await runUpscaleIfEnabled(
+      transcriptForPaste = await runLivePasteUpscaleWithinSla(
         transcriptRaw,
         sessionUiToken,
         { setDoneStatus: false },
@@ -9410,7 +9595,7 @@ async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = !!currentArchiveDirSnapshot();
 }
 
-(() => {
+function initGraphInteractions(): void {
   const gc = $("graphCanvas") as HTMLCanvasElement;
   const ct = $("graphContainer");
 
@@ -9506,12 +9691,16 @@ async function initRecordingsBootstrap(): Promise<void> {
   new ResizeObserver(() => {
     if (!ct.closest("[hidden]")) gRender();
   }).observe(ct);
-})();
+}
+
+if (GRAPH_VIEW_ENABLED) {
+  initGraphInteractions();
+}
 
 // Stamp the version badge on boot. The HTML at #appVersionNumber
 // holds a build-time placeholder that vite/index.html templating
 // can't reach without a separate build step; updating it from JS
-// lets us keep frontend/package.json as the single SSOT for the
+// lets us keep desktop/package.json as the single SSOT for the
 // version string. The vite.config.ts ``define`` block injects
 // ``__APP_VERSION__`` at compile time so this read is a string
 // literal in the bundle, not a runtime fetch.
@@ -9748,8 +9937,8 @@ if (_bootRetry) {
 //   2. processUploadItem(item) — provider-aware transcribe call.
 //      Auto-falls back to local when the chosen remote provider has
 //      no key (rather than silently failing per-item).
-//   3. saveRecordingText({audioFile: sourceFile, …}) — persist into
-//      the same archive the History tab reads, so the recording
+//   3. saveRecordingText({audioFile | audioSourcePath, …}) — persist
+//      into the same archive the History tab reads, so the recording
 //      shows up in History without an extra round-trip.
 //   4. renderUploadQueue() — re-render the right pane.
 //
@@ -9763,6 +9952,7 @@ interface UploadQueueSnapshotItem {
   id: string;
   displayName: string;
   sizeBytes: number;
+  sourcePath?: string;
   status: UploadQueueStatus;
   text?: string;
   error?: string;
@@ -9787,6 +9977,7 @@ interface UploadQueueItem {
   file?: File;
   displayName: string;
   sizeBytes: number;
+  sourcePath?: string;
   // ``stage`` is a finer-grained signal than ``status`` — multiple
   // stages share the same outer ``status`` of "transcribing" but
   // surface different labels in the queue UI:
@@ -9846,8 +10037,77 @@ function uploadFileSizeCap(): number {
 // now a one-line change in ACCEPTED_AUDIO_VIDEO_EXTS.
 const UPLOAD_ALLOWED_EXTS = ACCEPTED_AUDIO_VIDEO_EXTS;
 
+function uploadExtensionFromName(name: string): string {
+  const leaf = String(name || "").split(/[\\/]/).filter(Boolean).pop() || "";
+  const dot = leaf.lastIndexOf(".");
+  if (dot <= 0 || dot >= leaf.length - 1) return "";
+  return leaf.slice(dot + 1).toLowerCase();
+}
+
+function uploadFileValidationError(file: File): string {
+  const cap = uploadFileSizeCap();
+  if (file.size > cap) {
+    return `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`;
+  }
+  const ext = uploadExtensionFromName(file.name);
+  if (!ext) {
+    return "Unsupported file type. Drop an audio or video file with a supported extension.";
+  }
+  if (!UPLOAD_ALLOWED_EXTS.has(ext)) {
+    return `Unsupported file type ".${ext}". Drop an audio or video file.`;
+  }
+  return "";
+}
+
+function normalizeUploadSourcePath(rawPath: unknown): string {
+  const path = String(rawPath || "").trim();
+  if (!path) return "";
+  // Keep this as a UI-side sanity filter only; backend remains the
+  // trust boundary and revalidates absolute path, extension, size and
+  // existence before touching the filesystem.
+  if (path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) || /^\\\\[^\\]/.test(path)) {
+    return path;
+  }
+  return "";
+}
+
+function uploadSourcePathFromFile(file: File): string {
+  try {
+    const fromBridge = window.__transcriptorFilePathForFile?.(file);
+    const normalized = normalizeUploadSourcePath(fromBridge);
+    if (normalized) return normalized;
+  } catch (e) {
+    console.debug("Upload source path bridge failed", e);
+  }
+  // Development/older-Electron fallback. Browser File does not define
+  // this field; Electron historically did on selected files.
+  return normalizeUploadSourcePath((file as unknown as { path?: string }).path);
+}
+
+function uploadPathBasename(sourcePath: string): string {
+  const leaf = String(sourcePath || "").split(/[\\/]/).filter(Boolean).pop() || "";
+  return leaf.trim();
+}
+
+function uploadSourcePathValidationError(sourcePath: string, sizeBytes = 0): string {
+  const path = normalizeUploadSourcePath(sourcePath);
+  if (!path) return "Source file path is missing. Choose the file again.";
+  const cap = uploadFileSizeCap();
+  if (sizeBytes > cap) {
+    return `File too large (${Math.round(sizeBytes / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`;
+  }
+  const ext = uploadExtensionFromName(uploadPathBasename(path));
+  if (!ext) {
+    return "Unsupported file type. Choose an audio or video file with a supported extension.";
+  }
+  if (!UPLOAD_ALLOWED_EXTS.has(ext)) {
+    return `Unsupported file type ".${ext}". Drop an audio or video file.`;
+  }
+  return "";
+}
+
 function uploadItemName(item: UploadQueueItem): string {
-  return String(item.displayName || item.file?.name || "Uploaded file");
+  return String(item.displayName || item.file?.name || uploadPathBasename(item.sourcePath || "") || "Uploaded file");
 }
 
 function uploadItemSize(item: UploadQueueItem): number {
@@ -10027,6 +10287,7 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
     id: item.id,
     displayName: uploadItemName(item),
     sizeBytes: uploadItemSize(item),
+    sourcePath: normalizeUploadSourcePath(item.sourcePath || ""),
     status: item.status,
     text: item.text || "",
     error: item.error || "",
@@ -10075,15 +10336,18 @@ function restoreUploadQueueSnapshot(): void {
       if (!displayName) continue;
       const status = String(src.status || "error") as UploadQueueStatus;
       const interrupted = status === "queued" || status === "transcribing";
+      const restoredError = interrupted
+        ? "Interrupted by app restart before this file finished."
+        : String(src.error || "");
+      const sourcePath = normalizeUploadSourcePath(src.sourcePath || "");
       uploadQueue.push({
         id: String(src.id || createClientSessionId()),
         displayName,
         sizeBytes: Number(src.sizeBytes || 0),
+        sourcePath,
         status: interrupted ? "error" : (isUploadTerminalStatus(status) ? status : "error"),
         text: String(src.text || ""),
-        error: interrupted
-          ? "Interrupted by app restart before this file finished."
-          : String(src.error || ""),
+        error: restoredError,
         startedAt: typeof src.startedAt === "number" ? src.startedAt : undefined,
         endedAt: typeof src.endedAt === "number" ? src.endedAt : undefined,
         completedAt: typeof src.completedAt === "number"
@@ -10259,33 +10523,20 @@ function updateUploadProviderHint(): void {
 }
 
 function enqueueUploadFile(file: File): void {
-  // Size gate — backend has its own 413, but rejecting client-side
-  // saves the upload time + spares the server.
-  const cap = uploadFileSizeCap();
-  if (file.size > cap) {
+  // Validation mirrors backend acceptance before we spend time
+  // uploading. Retry uses the same helper so it cannot bypass the
+  // first-enqueue gate.
+  const sourcePath = uploadSourcePathFromFile(file);
+  const validationError = uploadFileValidationError(file);
+  if (validationError) {
     addUploadQueueItem({
       id: createClientSessionId(),
       file,
       displayName: file.name,
       sizeBytes: file.size,
+      sourcePath,
       status: "error",
-      error: `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`,
-    });
-    renderUploadQueue();
-    return;
-  }
-  // Format gate — drag-drop browsers ignore the `accept` attribute.
-  // We accept anything the backend's ffmpeg can demux, which is
-  // basically all common audio + video containers.
-  const ext = (file.name.split(".").pop() || "").toLowerCase();
-  if (ext && !UPLOAD_ALLOWED_EXTS.has(ext)) {
-    addUploadQueueItem({
-      id: createClientSessionId(),
-      file,
-      displayName: file.name,
-      sizeBytes: file.size,
-      status: "error",
-      error: `Unsupported file type ".${ext}". Drop an audio or video file.`,
+      error: validationError,
     });
     renderUploadQueue();
     return;
@@ -10295,6 +10546,7 @@ function enqueueUploadFile(file: File): void {
     file,
     displayName: file.name,
     sizeBytes: file.size,
+    sourcePath,
     status: "queued",
   });
   renderUploadQueue();
@@ -10324,18 +10576,27 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // reached the head of the queue, it's already in cancelled
   // state — don't transition it back to transcribing.
   if (item.status === "cancelled") return;
-  if (!item.file) {
+  let sourceFile = item.file || null;
+  let sourcePath = normalizeUploadSourcePath(item.sourcePath || "");
+  if (!sourcePath && sourceFile) {
+    sourcePath = uploadSourcePathFromFile(sourceFile);
+    item.sourcePath = sourcePath;
+  }
+  const pathValidationError = sourcePath
+    ? uploadSourcePathValidationError(sourcePath, uploadItemSize(item))
+    : "";
+  const useSourcePath = !!sourcePath && !pathValidationError;
+  if (!sourceFile && !useSourcePath) {
     item.status = "error";
-    item.error = "Source file is no longer available. Re-add the file to transcribe it again.";
+    item.error = pathValidationError || "Source file is no longer available. Choose the file again to retry.";
     item.endedAt = performance.now();
     item.completedAt = Date.now();
     saveUploadQueueSnapshot();
     renderUploadQueue();
     return;
   }
-  const sourceFile = item.file;
   item.status = "transcribing";
-  item.stage = "uploading";
+  item.stage = useSourcePath ? "processing" : "uploading";
   item.startedAt = performance.now();
   // Per-item AbortController. Threaded through every fetch so
   // the user's Stop button can yank the in-flight request even
@@ -10353,13 +10614,15 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // backend's actual response time then takes over the "processing"
   // perception. The crossover is replaced by the real transition
   // when the response arrives below.
-  const _stageCrossoverDelay = Math.min(8000, Math.max(800, sourceFile.size / 10000));
-  const _stageTimer = window.setTimeout(() => {
-    if (item.status === "transcribing" && item.stage === "uploading") {
-      item.stage = "processing";
-      renderUploadQueue();
-    }
-  }, _stageCrossoverDelay);
+  const _stageCrossoverDelay = sourceFile ? Math.min(8000, Math.max(800, sourceFile.size / 10000)) : 0;
+  const _stageTimer = sourceFile && !useSourcePath
+    ? window.setTimeout(() => {
+      if (item.status === "transcribing" && item.stage === "uploading") {
+        item.stage = "processing";
+        renderUploadQueue();
+      }
+    }, _stageCrossoverDelay)
+    : 0;
   const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
   const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   const diarize = !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked;
@@ -10377,17 +10640,20 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     let modelLabel = "";
     if (provider === "local") {
       modelLabel = "small";
-      const out = await localJobQueued(sourceFile, {
+      const localOpts = {
         language: resolveFastLocalLanguage(language),
         model: modelLabel,
         splitStereo: true,
         wordTimestamps: false,
         signal: item.abortController.signal,
-      });
+      };
+      const out = useSourcePath
+        ? await localJobQueuedFromPath(sourcePath, localOpts)
+        : await localJobQueued(sourceFile as File, localOpts);
       text = String(out.text || "").trim();
     } else {
       modelLabel = getRemoteModelValue(provider) || "";
-      const out = await remoteJobQueued(sourceFile, {
+      const remoteOpts = {
         provider,
         language,
         diarize,
@@ -10403,7 +10669,10 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
           item.uploadProgress = undefined;
           renderUploadQueue();
         },
-      });
+      };
+      const out = useSourcePath
+        ? await remoteJobQueuedFromPath(sourcePath, remoteOpts)
+        : await remoteJobQueued(sourceFile as File, remoteOpts);
       text = String(out.text || "").trim();
     }
     item.text = text;
@@ -10418,15 +10687,17 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     // playable from the History row. `refreshList: true` triggers a
     // single archive reload at the end of each successful save.
     try {
+      const sourceName = sourceFile?.name || uploadPathBasename(sourcePath) || uploadItemName(item);
       const saveOut = await saveRecordingText({
-        title: (sourceFile.name.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
+        title: (sourceName.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
         sourceText: text,
         transcriptText: text,
         provider,
         model: modelLabel,
         language,
         recordingCollection: RECORDING_COLLECTIONS.uploads,
-        audioFile: sourceFile,
+        audioFile: useSourcePath ? null : sourceFile,
+        audioSourcePath: useSourcePath ? sourcePath : "",
         refreshList: true,
       });
       if (saveOut && typeof saveOut === "object") {
@@ -10557,6 +10828,85 @@ function cancelUploadItem(id: string): void {
   }
 }
 
+function pickUploadRetryFile(): Promise<File | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "audio/*,video/*";
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    input.style.top = "0";
+    input.style.opacity = "0";
+    let settled = false;
+    const finish = (file: File | null): void => {
+      if (settled) return;
+      settled = true;
+      window.setTimeout(() => input.remove(), 0);
+      resolve(file);
+    };
+    input.addEventListener("change", () => {
+      finish(input.files?.[0] || null);
+    }, { once: true });
+    window.addEventListener("focus", () => {
+      window.setTimeout(() => {
+        if (!settled && (!input.files || input.files.length === 0)) {
+          finish(null);
+        }
+      }, 250);
+    }, { once: true });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+function assignUploadRetryFile(item: UploadQueueItem, file: File): void {
+  item.file = file;
+  item.displayName = file.name;
+  item.sizeBytes = file.size;
+  item.sourcePath = uploadSourcePathFromFile(file);
+}
+
+async function retryUploadItem(id: string): Promise<void> {
+  const item = uploadQueue.find((it) => it.id === id);
+  if (!item || item.status !== "error") return;
+  if (!item.file && !normalizeUploadSourcePath(item.sourcePath || "")) {
+    const file = await pickUploadRetryFile();
+    if (!file) return;
+    assignUploadRetryFile(item, file);
+  }
+  let sourcePath = normalizeUploadSourcePath(item.sourcePath || "");
+  let validationError = item.file
+    ? uploadFileValidationError(item.file)
+    : uploadSourcePathValidationError(sourcePath, uploadItemSize(item));
+  if (validationError) {
+    item.error = validationError;
+    item.completedAt = Date.now();
+    saveUploadQueueSnapshot();
+    renderUploadQueue();
+    return;
+  }
+  item.status = "queued";
+  item.stage = "queued";
+  item.uploadProgress = undefined;
+  item.text = "";
+  item.error = "";
+  item.startedAt = undefined;
+  item.endedAt = undefined;
+  item.completedAt = undefined;
+  item.provider = undefined;
+  item.model = "";
+  item.language = "";
+  item.savedName = "";
+  item.savedArchiveDir = "";
+  try { item.abortController?.abort(); } catch { /* idempotent */ }
+  item.abortController = undefined;
+  uploadSelectedId = item.id;
+  saveUploadQueueSnapshot();
+  renderUploadQueue();
+  renderUploadResultPane();
+  runUploadProcessor();
+}
+
 function renderUploadQueue(): void {
   const list = document.getElementById("uploadQueueList") as HTMLUListElement | null;
   const empty = document.getElementById("uploadEmptyState");
@@ -10666,6 +11016,25 @@ function renderUploadQueue(): void {
       });
       tail.appendChild(stopBtn);
     } else {
+      if (item.status === "error") {
+        const retrySourcePath = normalizeUploadSourcePath(item.sourcePath || "");
+        const retryBlockReason = item.file
+          ? uploadFileValidationError(item.file)
+          : (retrySourcePath ? uploadSourcePathValidationError(retrySourcePath, uploadItemSize(item)) : "");
+        const retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.className = "upload-queue-item-retry";
+        retryBtn.textContent = "Retry";
+        retryBtn.setAttribute("aria-label", "Retry transcription");
+        retryBtn.title = retrySourcePath
+          ? `Retry transcription from saved file path: ${retrySourcePath}`
+          : (retryBlockReason || "Choose source file and retry");
+        retryBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          void retryUploadItem(item.id);
+        });
+        tail.appendChild(retryBtn);
+      }
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "upload-queue-item-remove";

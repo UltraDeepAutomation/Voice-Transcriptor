@@ -318,6 +318,21 @@ def compact_audio_chunks_for_remote(
     return chunks
 
 
+def _copy_file_atomic(path_in: str, path_out: str) -> None:
+    # Tmp name MUST match the hex-only convention `\.tmp-[0-9a-f]{6,}`
+    # used by `_sweep_orphan_tmp_files` in backend/main.py.
+    tmp_out = f"{path_out}.tmp-{uuid.uuid4().hex}"
+    try:
+        shutil.copyfile(path_in, tmp_out)
+        os.replace(tmp_out, path_out)
+    except Exception:
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
+        raise
+
+
 def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     """Ensure 16k WAV PCM output using ffmpeg when needed.
 
@@ -337,22 +352,7 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
                 # prevents truncated-WAV transcribe silently succeeding
                 # with garbage audio).
                 if os.path.abspath(path_in) != os.path.abspath(path_out):
-                    # Match the .tmp-<hex> convention used by every other
-                    # atomic writer in the project so _sweep_orphan_tmp_files
-                    # can clean it up after a crash. The uuid4-hex is
-                    # already globally unique; a pid prefix would break
-                    # the `_TMP_ORPHAN_RE = \.tmp-[0-9a-f]{6,}...` pattern
-                    # in backend/main.py.
-                    tmp_out = f"{path_out}.tmp-{uuid.uuid4().hex}"
-                    try:
-                        shutil.copyfile(path_in, tmp_out)
-                        os.replace(tmp_out, path_out)
-                    except Exception:
-                        try:
-                            os.unlink(tmp_out)
-                        except OSError:
-                            pass
-                        raise
+                    _copy_file_atomic(path_in, path_out)
                 return path_out
         except Exception:
             pass  # Fall through to ffmpeg conversion
@@ -454,22 +454,71 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     # Copy atomically: write to tmp then rename. A raw copyfile()
     # leaves the destination truncated on ENOSPC, and a subsequent
     # transcribe would silently use the fragment.
-    # Tmp name MUST match the hex-only convention `\.tmp-[0-9a-f]{6,}`
-    # used by `_sweep_orphan_tmp_files` in backend/main.py. The old
-    # `{os.getpid()}-{uuid}` form contained decimal PID digits and
-    # broke the sweep regex, so crashed writers left permanent
-    # orphan tmps in DATA_DIR. uuid4.hex alone is already globally
-    # unique (128-bit space); the PID prefix bought nothing.
-    tmp_out = f"{path_out}.tmp-{uuid.uuid4().hex}"
-    try:
-        shutil.copyfile(path_in, tmp_out)
-        os.replace(tmp_out, path_out)
-    except Exception:
+    _copy_file_atomic(path_in, path_out)
+    return path_out
+
+
+def ensure_wav_16k_preserve_channels(path_in: str, path_out: str) -> str:
+    """Ensure 16k PCM WAV while preserving the source channel count."""
+    ext = os.path.splitext(path_in)[1].lower()
+    if ext == ".wav":
         try:
-            os.unlink(tmp_out)
-        except OSError:
+            info = sf.info(path_in)
+            if (
+                info.samplerate == LIVE_SAMPLE_RATE_HZ
+                and info.channels >= 1
+                and info.subtype == "PCM_16"
+            ):
+                if os.path.abspath(path_in) != os.path.abspath(path_out):
+                    _copy_file_atomic(path_in, path_out)
+                return path_out
+        except Exception:
             pass
-        raise
+
+    if _has_ffmpeg():
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            path_in,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-ar",
+            str(LIVE_SAMPLE_RATE_HZ),
+            "-c:a",
+            "pcm_s16le",
+            path_out,
+        ]
+        try:
+            _run_ffmpeg(cmd, timeout_sec=300)
+        except AudioError:
+            try:
+                os.unlink(path_out)
+            except OSError:
+                pass
+            raise
+        return path_out
+
+    if ext != ".wav":
+        raise AudioError(
+            "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg`) or upload a WAV file."
+        )
+
+    data, sr = sf.read(path_in, always_2d=True)
+    if sr != LIVE_SAMPLE_RATE_HZ:
+        raise AudioError(
+            f"ffmpeg is not installed. Please upload a {LIVE_SAMPLE_RATE_HZ} Hz WAV "
+            "(or install ffmpeg for auto-convert)."
+        )
+    if data.shape[1] < 1:
+        raise AudioError("Audio has no readable channels")
+    _copy_file_atomic(path_in, path_out)
     return path_out
 
 

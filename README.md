@@ -6,7 +6,7 @@
 >
 > **Дефолтные комбинации:**
 > - **macOS:** `Option+Left` старт/стоп записи, `Option+Shift+V` вставить последний транскрипт.
-> - **Windows / Linux:** `F9` старт/стоп записи, `Alt+Shift+V` вставить последний транскрипт.
+> - **Windows / Linux:** `F9` старт/стоп записи, `F10` вставить последний транскрипт.
 >
 > Обе клавиши настраиваются в Settings.
 
@@ -17,7 +17,7 @@
 - 🎤 **Live-транскрипция** — запись с микрофона в реальном времени с промежуточными результатами
 - 🤖 **AI Upscale** — улучшение текста через OpenRouter (Gemini, GPT-4o, Claude) с пресетами: Clean, Business, AI & Code
 - 📋 **Auto-paste** — автоматическая вставка результата в активное приложение с платформенными шорткатами (`Cmd+V` / `Ctrl+V`, затем `Cmd+Enter` / `Ctrl+Enter`, если включён auto-send)
-- ⌨️ **Глобальная горячая клавиша** — старт/стоп записи + повтор-paste. Дефолты: `Option+Left` / `Option+Shift+V` (macOS), `F9` / `Alt+Shift+V` (Windows / Linux). Переназначаются в Settings
+- ⌨️ **Глобальная горячая клавиша** — старт/стоп записи + повтор-paste. Дефолты: `Option+Left` / `Option+Shift+V` (macOS), `F9` / `F10` (Windows / Linux). Переназначаются в Settings
 - 🔇 **Auto-stop по тишине** — автоматическая остановка записи при паузе в речи (настраивается прямо в overlay-капсуле во время записи: +/- кнопки с click-and-hold)
 - 🌐 **3 провайдера** — локальный Whisper (offline, работает без интернета), OpenRouter, Deepgram Nova-3
 - 💊 **Overlay** — компактный pill-виджет поверх всех окон с таймером, VU-метром и быстрыми настройками
@@ -34,7 +34,7 @@
 > Имена файлов в инструкциях ниже используют `<version>` как плейсхолдер.
 > Подставь актуальную версию из release-страницы (текущая релизная — `1.1.25`).
 > SSOT для версии: `desktop/package.json` → используется vite-инжектом `__APP_VERSION__`,
-> electron-builder, и build-скриптами `install/{linux,win}/build.*`.
+> electron-builder, `BUILD.command`, `INSTALL.command`, и скриптами `desktop/package.json`.
 
 ### Windows x64 (~201 MB)
 1. Скачать `Transcriptor Setup <version>.exe`
@@ -74,15 +74,17 @@ sudo usermod -aG input $USER  # потом выйти и войти заново
 cd "Voice Transcriptor"
 
 # macOS
-./INSTALL.command          # первая установка: venv + deps + DMG
-./BUILD.command            # пересборка .dmg после git pull
+./INSTALL.command          # подготовить runtime и собрать .dmg
+./BUILD.command            # то же самое, macOS-only entrypoint
 
-# Windows
-install\win\setup.bat
-install\win\build.bat
+# Windows (из Windows shell)
+npm --prefix frontend ci
+npm --prefix desktop ci
+desktop\scripts\prepare-runtime.sh win-x64
+npm --prefix desktop run dist:win
 
 # Linux
-install/linux/build.sh
+./INSTALL.command          # подготовить runtime и собрать AppImage
 ```
 
 Эти скрипты — для **разработчиков**, собирающих приложение из исходников. Для конечных пользователей достаточно скачать готовый инсталлятор (см. выше).
@@ -91,18 +93,16 @@ Release build: см. `desktop/scripts/prepare-runtime.sh` + `npm run dist` / `np
 
 ---
 
-## 📋 Что устанавливается автоматически
+## 📋 Что делает сборочный entrypoint
 
-`setup.command` проверяет и при необходимости устанавливает:
+`BUILD.command` / `INSTALL.command` используют текущий SSOT сборки:
 
 | Компонент | Версия | Назначение |
 |-----------|--------|------------|
-| **Xcode CLI Tools** | Latest | Базовые инструменты сборки |
-| **Homebrew** | Latest | Менеджер пакетов |
-| **Python** | 3.9+ | Бэкенд (FastAPI, Whisper) |
-| **Node.js** | 18+ | Фронтенд (Vite) + Electron |
-| **FFmpeg** | Latest | Аудио-конвертация |
-| **Python venv** | — | Изолированное окружение в `~/Library/Application Support/Transcriptor/.venv` |
+| **npm ci** | lockfile | Установка frontend/desktop зависимостей |
+| **desktop/scripts/prepare-runtime.sh** | pinned Python tag | Сборка bundled Python runtime и ffmpeg |
+| **Vite build** | `frontend/package.json` | Сборка `frontend/dist` |
+| **electron-builder** | `desktop/package.json` | DMG / AppImage / Windows installer |
 
 ---
 
@@ -138,14 +138,6 @@ Release build: см. `desktop/scripts/prepare-runtime.sh` + `npm run dist` / `np
 Для запуска из исходников без сборки `.app`:
 
 ```bash
-# macOS
-chmod +x install/mac/run.command
-./install/mac/run.command
-```
-
-Или вручную:
-
-```bash
 # 1. Python venv
 python3 -m venv "$HOME/Library/Application Support/Transcriptor/.venv"
 source "$HOME/Library/Application Support/Transcriptor/.venv/bin/activate"
@@ -161,8 +153,6 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8321
 cd desktop && npm install && npm start
 ```
 
-> 💡 `install/mac/run.command` делает всё это автоматически в одну команду.
-
 ---
 
 ## 🔄 Пересборка приложения
@@ -170,22 +160,20 @@ cd desktop && npm install && npm start
 Если вы изменили код и хотите обновить установленное приложение:
 
 ```bash
-# macOS — корневой dispatcher
+# macOS
 chmod +x BUILD.command
 ./BUILD.command
-
-# или напрямую: install/mac/BUILD.sh
 ```
 
-Скрипт соберёт фронтенд, упакует Electron-приложение и установит его в `~/Applications`.
+Скрипт соберёт frontend, подготовит bundled runtime и положит artifacts в `desktop/dist`.
 
 ```bash
-# Windows
-install\win\build.bat
+# Windows (из Windows shell)
+npm --prefix desktop run dist:win
 
 # Linux
-chmod +x install/linux/build.sh
-./install/linux/build.sh
+chmod +x INSTALL.command
+./INSTALL.command
 ```
 
 ---
@@ -203,7 +191,7 @@ cp .env.example .env
 | `TRANSCRIPTOR_DATA_DIR` | Директория данных | `~/Library/Application Support/Transcriptor` |
 | `TRANSCRIPTOR_API_TOKEN` | Токен API-авторизации | Auto-generated |
 | `TRANSCRIPTOR_RESULT_RETENTION_SEC` | Время хранения результатов | `86400` (24ч) |
-| `TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC` | Время хранения recovery-данных | `3600` (1ч) |
+| `TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC` | Время хранения recovery-данных | `86400` (24ч) |
 | `PYTHON` | Путь к Python | Auto-detect |
 
 ---
@@ -237,8 +225,8 @@ cp .env.example .env
 # Удалить quarantine-атрибут
 xattr -cr ~/Applications/Transcriptor.app
 
-# Или переустановить
-./install/mac/setup.command
+# Или пересобрать source checkout
+./INSTALL.command
 ```
 
 ### Бэкенд не стартует (порт занят)
@@ -253,7 +241,7 @@ lsof -ti tcp:8321 | xargs kill -9
 ```bash
 # Пересоздать venv
 rm -rf "$HOME/Library/Application Support/Transcriptor/.venv"
-./install/mac/setup.command
+python3 -m venv "$HOME/Library/Application Support/Transcriptor/.venv"
 ```
 
 ### Whisper скачивает модель при каждом запуске
@@ -278,9 +266,8 @@ rm -rf "$HOME/Library/Application Support/Transcriptor/.venv"
 
 | Файл / Папка | Описание |
 |-------------|----------|
-| `setup.command` | 🚀 Полная установка одной командой |
-| `run.command` | ▶️ Быстрый запуск (или dev-mode) |
-| `BUILD.sh` | 🔄 Пересборка .app |
+| `INSTALL.command` | 🚀 Cross-platform source build entrypoint |
+| `BUILD.command` | 🔄 macOS source build entrypoint |
 | `backend/` | 🐍 Python бэкенд (FastAPI + Whisper) |
 | `frontend/` | ⚛️ TypeScript фронтенд (Vite) |
 | `desktop/` | 🖥️ Electron обёртка |
