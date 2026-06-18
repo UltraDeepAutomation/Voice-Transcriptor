@@ -1030,16 +1030,146 @@ npm --prefix desktop run dist:linux -- "$@"
 
 Объяснение: frontend lock metadata now matches the package version SSOT.
 
+## 46. P1 FIXED — release npm graph used old vulnerable build/runtime stack
+
+Файл и строка: `frontend/package.json:12`, `desktop/package.json:17`
+
+Суть: frontend and desktop release builds were pinned to old Vite/Electron/electron-builder generations.
+
+Последствие: `npm audit` reported vulnerabilities, the packaged app shipped on Electron 30, and the release pipeline missed the stricter validation available in the current builder.
+
+Было:
+```json
+"devDependencies": {
+  "typescript": "^5.6.3",
+  "vite": "^5.4.10"
+}
+```
+
+```json
+"devDependencies": {
+  "electron": "30.5.1",
+  "electron-builder": "24.13.3"
+}
+```
+
+Стало:
+```json
+"devDependencies": {
+  "@types/node": "25.9.3",
+  "typescript": "6.0.3",
+  "vite": "8.0.16"
+}
+```
+
+```json
+"devDependencies": {
+  "@electron/osx-sign": "2.4.0",
+  "electron": "42.4.1",
+  "electron-builder": "26.15.3"
+}
+```
+
+Объяснение: package manifests and lockfiles now pin the current audited release toolchain. `npm audit --audit-level=moderate` passes for both npm workspaces.
+
+## 47. P1 FIXED — mac signing hook imported a transitive package as if it were direct
+
+Файл и строка: `desktop/afterPack.js:1`, `desktop/package.json:17`
+
+Суть: `afterPack.js` required `@electron/osx-sign`, but `desktop/package.json` did not declare it directly.
+
+Последствие: a package-manager graph change could prune or move the transitive module and make macOS release signing fail at package time.
+
+Было:
+```json
+"devDependencies": {
+  "electron": "30.5.1",
+  "electron-builder": "24.13.3"
+}
+```
+
+Стало:
+```json
+"devDependencies": {
+  "@electron/osx-sign": "2.4.0",
+  "electron": "42.4.1",
+  "electron-builder": "26.15.3"
+}
+```
+
+Объяснение: direct imports now have direct dependencies; signing no longer depends on electron-builder's private dependency graph.
+
+## 48. P1 FIXED — electron-builder 26 rejected stale Windows/Linux config
+
+Файл и строка: `desktop/package.json:106`, `desktop/package.json:129`
+
+Суть: after upgrading builder, the config still used fields that are no longer valid in the installed schema.
+
+Последствие: `./BUILD.command` failed before packaging with `Invalid configuration object`, so the app could not be rebuilt.
+
+Было:
+```json
+"win": {
+  "publisherName": "Transcriptor",
+  "signAndEditExecutable": false,
+  "sign": null
+},
+"linux": {
+  "desktop": {
+    "StartupWMClass": "Transcriptor"
+  }
+}
+```
+
+Стало:
+```json
+"win": {
+  "signExecutable": false
+},
+"linux": {
+  "category": "Audio",
+  "synopsis": "Voice-to-text transcription with auto-paste"
+}
+```
+
+Объяснение: config now matches `app-builder-lib/scheme.json` for `MacConfiguration`, `WindowsConfiguration`, and `LinuxConfiguration`; macOS packaging no longer fails on unrelated cross-platform config validation.
+
+## 49. P1 FIXED — TypeScript 6 DOM types broke quick-settings toggle build
+
+Файл и строка: `frontend/src/main.tsx:5835`
+
+Суть: code passed `HTMLElement.hidden` directly into a boolean-only function, but current DOM types expose it as `string | boolean`.
+
+Последствие: release frontend typecheck failed inside `./BUILD.command`, blocking app rebuilds.
+
+Было:
+```ts
+const next = $("quickSettingsPanel").hidden;
+syncQuickSettingsVisibility(next);
+```
+
+Стало:
+```ts
+const next = $("quickSettingsPanel").hidden !== false;
+syncQuickSettingsVisibility(next);
+```
+
+Объяснение: the UI boundary now normalizes the DOM state to a strict boolean before calling the app state helper.
+
 ## Verification
 
 Пройдено:
 ```text
 python3 -m unittest discover backend/tests -q
 python3 -m compileall -q backend
-(cd frontend && ./node_modules/.bin/tsc --noEmit)
+npm --prefix frontend audit --audit-level=moderate
+npm --prefix desktop audit --audit-level=moderate
 npm --prefix frontend run build
 npm --prefix desktop run build:frontend
 node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/unlockDist.js && node --check desktop/afterPack.js
 bash -n BUILD.command INSTALL.command desktop/scripts/prepare-runtime.sh
+./BUILD.command
+codesign --verify --deep --strict /Applications/Transcriptor.app
+codesign --verify --deep --strict ~/Applications/Transcriptor.app
 git diff --check
 ```

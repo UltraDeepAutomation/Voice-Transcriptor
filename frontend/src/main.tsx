@@ -5832,7 +5832,7 @@ function initQuickControls(): void {
   syncRemoteModelOptions();
 
   ($("quickSettingsToggle") as HTMLButtonElement).addEventListener("click", () => {
-    const next = $("quickSettingsPanel").hidden;
+    const next = $("quickSettingsPanel").hidden !== false;
     syncQuickSettingsVisibility(next);
     queueUiPreferencesSave();
   });

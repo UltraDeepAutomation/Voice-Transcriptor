@@ -15,8 +15,9 @@
     "dist:linux": "bash ./scripts/prepare-runtime.sh linux-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
   },
   "devDependencies": {
-    "electron": "30.5.1",
-    "electron-builder": "24.13.3"
+    "@electron/osx-sign": "2.4.0",
+    "electron": "42.4.1",
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "local.transcriptor.app",
@@ -112,9 +113,7 @@
         }
       ],
       "icon": "icon.ico",
-      "publisherName": "Transcriptor",
-      "signAndEditExecutable": false,
-      "sign": null,
+      "signExecutable": false,
       "extraResources": [
         {
           "from": "runtime/win-x64",
@@ -149,10 +148,7 @@
       ],
       "icon": "icon.png",
       "category": "Audio",
-      "synopsis": "Voice-to-text transcription with auto-paste",
-      "desktop": {
-        "StartupWMClass": "Transcriptor"
-      }
+      "synopsis": "Voice-to-text transcription with auto-paste"
     },
     "nsis": {
       "oneClick": true,
