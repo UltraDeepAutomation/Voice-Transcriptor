@@ -51,7 +51,7 @@ from backend.audio import (
     split_channels,
     write_wav,
 )
-from backend.config import APP_ROOT, CONFIG_PATH, DATA_DIR, load_config, redact_config, save_config
+from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
 from backend.storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from backend.live import LiveSession
 from backend.jobs import JobCancelledError, JobStore
@@ -4711,8 +4711,8 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
         return result
 
 
-# Graph is intentionally dormant. The frontend sidebar/view and TS/CSS
-# implementation are commented out, and the backend route is not registered
+# Graph is intentionally dormant. The frontend sidebar/view markup and TS/CSS
+# implementation are removed, and the backend route is not registered
 # so no graph scan can be triggered by OpenAPI or direct HTTP calls.
 
 
@@ -4726,10 +4726,10 @@ def _delete_all_recordings_sync() -> dict:
     for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
         for p in _iter_recording_text_files(d):
             try:
-                p.unlink()
                 audio_path = _recording_audio_path(p.name, target_dir=d)
                 if audio_path is not None:
                     audio_path.unlink(missing_ok=True)
+                p.unlink()
                 deleted += 1
             except Exception:
                 failed += 1

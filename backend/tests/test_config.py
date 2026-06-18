@@ -26,7 +26,6 @@ import os
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 
 
 def _reload_config_module(data_dir: str):

@@ -60,7 +60,7 @@ Graph is dormant: no backend graph route is registered.
 
 ```text
 frontend/
-├── index.html              # renderer DOM shell; Graph markup is commented out
+├── index.html              # renderer DOM shell; dormant Graph markup removed
 ├── package.json            # frontend build dependencies/scripts
 ├── tsconfig.json           # TypeScript config
 ├── vite.config.ts          # Vite config and app-version injection

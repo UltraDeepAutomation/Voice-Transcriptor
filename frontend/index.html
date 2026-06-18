@@ -119,11 +119,6 @@
         <button class="sb-item" data-view="record">Live</button>
         <button class="sb-item" data-view="recordings">History</button>
         <button class="sb-item" data-view="settings">Settings</button>
-        <!-- Graph view is temporarily disabled. Keep this sidebar entry commented
-             with the view markup below so it has no DOM or runtime work. -->
-        <!--
-        <button class="sb-item" data-view="graph">Graph</button>
-        -->
       </div>
     </nav>
 
@@ -162,12 +157,12 @@
                 <option value="en">EN</option>
               </select>
             </label>
-            <label class="top-item top-item-toggle upload-diarize-item">
+            <div class="top-item top-item-toggle upload-diarize-item">
               <span class="lbl">Diarize</span>
               <label class="toggle-inline toggle-neutral">
                 <input type="checkbox" id="uploadDiarize" />
               </label>
-            </label>
+            </div>
           </div>
         </div>
 
@@ -222,7 +217,7 @@
           </div>
           <!--
             Result pane — shows the latest completed transcript so the
-            user can read / copy / open in Finder the saved file
+            user can read / copy / reveal the saved file
             without leaving the Upload tab. Selecting any item in the
             queue swaps the content here.
           -->
@@ -236,7 +231,7 @@
                     <span class="copy-ico" aria-hidden="true"></span>
                   </button>
                   <button class="btn btn-ghost upload-result-reveal" id="uploadResultRevealBtn"
-                    type="button" hidden>Reveal in Finder</button>
+                    type="button" hidden>Reveal in folder</button>
                 </div>
               </div>
             </div>
@@ -273,26 +268,21 @@
                 <option value="en">EN</option>
               </select>
             </label>
-            <div class="top-item top-item-recording">
-              <span class="lbl">Recording</span>
+          </div>
+          <div id="vuFill" hidden></div>
+          <div hidden>
+            <!-- Internal state sinks for legacy recording DOM ids; the visible recorder is the overlay. -->
+            <div class="legacy-recording-sinks" id="legacyRecordingSinks" hidden aria-hidden="true">
               <div class="status-pill">
                 <div class="status-dot" id="statusDot"></div>
                 <span class="status-text" id="statusText">Idle</span>
                 <span class="timer" id="timer">00:00</span>
               </div>
-            </div>
-            <div class="top-item top-item-waveform">
-              <span class="lbl">Waveform</span>
               <canvas class="mini-wave" id="waveCanvas" width="240" height="44"></canvas>
+              <button class="btn mic-btn" id="btnStart" type="button" aria-label="Legacy recording sink"
+                tabindex="-1"></button>
+              <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden tabindex="-1">Stop</button>
             </div>
-            <div class="top-item top-item-stop">
-              <span class="lbl">Stop</span>
-              <button class="btn mic-btn" id="btnStart" type="button" aria-label="Toggle recording"></button>
-              <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden>Stop</button>
-            </div>
-          </div>
-          <div id="vuFill" hidden></div>
-          <div hidden>
             <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
               <label class="quick-field">
                 <span class="quick-lbl">Provider</span>
@@ -571,8 +561,8 @@
               </div>
               <div class="recording-header-actions">
                 <button class="btn btn-ghost recording-reveal-btn" id="recordingRevealBtn" type="button"
-                  aria-label="Reveal saved file in Finder" title="Reveal saved file in Finder" hidden>
-                  Reveal in Finder
+                  aria-label="Reveal saved file in folder" title="Reveal saved file in folder" hidden>
+                  Reveal in folder
                 </button>
                 <button class="icon-btn" id="recordingCopyBtn" type="button" aria-label="Copy recording text"
                   title="Copy">
@@ -587,44 +577,6 @@
           </div>
         </div>
       </section>
-
-      <!-- Graph view temporarily disabled; leave commented for an easy restore. -->
-      <!--
-      <section class="view" data-view="graph" hidden>
-        <div class="graph-shell">
-          <div class="screen-header">
-            <div class="screen-header-copy">
-              <h2>Graph</h2>
-            </div>
-            <div class="screen-header-actions">
-              <button class="btn btn-ghost refresh-btn" id="graphRefreshBtn" type="button" aria-label="Refresh graph">
-                <span class="refresh-ico" aria-hidden="true"></span>
-                <span>Refresh</span>
-              </button>
-              <button class="btn btn-ghost" id="graphOpenRecordingsBtn" type="button">Open Recordings</button>
-            </div>
-          </div>
-          <div class="graph-body">
-            <div class="graph-container" id="graphContainer">
-              <canvas id="graphCanvas"></canvas>
-              <div class="graph-controls">
-                <button class="graph-ctrl-btn" id="graphZoomIn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
-                <button class="graph-ctrl-btn" id="graphZoomOut" type="button" title="Zoom out" aria-label="Zoom out">−</button>
-                <button class="graph-ctrl-btn" id="graphZoomReset" type="button" title="Reset view" aria-label="Reset view">⟲</button>
-              </div>
-              <div class="graph-tooltip" id="graphTooltip" hidden>
-                <span class="graph-tooltip-title" id="graphTooltipTitle"></span>
-                <span class="graph-tooltip-meta" id="graphTooltipMeta"></span>
-                <span class="graph-tooltip-preview" id="graphTooltipPreview"></span>
-              </div>
-              <div class="graph-info" id="graphInfo">
-                <span class="graph-info-text" id="graphInfoText">0 recordings</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-      -->
 
       <section class="view" data-view="settings" hidden>
         <div class="settings-shell">

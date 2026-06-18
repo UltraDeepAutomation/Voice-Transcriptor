@@ -36,6 +36,13 @@ body {
   --text: #efefef;
   --text-2: #bdbdbd;
   --text-3: #8f8f8f;
+  --text-1: var(--text);
+  --text-muted: var(--text-2);
+  --surface-1: var(--bg-2);
+  --surface-2: var(--bg-3);
+  --surface-3: var(--bg-9);
+  --surface-border: var(--line);
+  --status-error: var(--danger-text);
   --text-mute-strong: #dcdcdc;
   --icon-stroke: #d4d4d4;
   --status-neutral: #969696;
@@ -551,23 +558,11 @@ textarea:focus-visible,
   outline: none;
 }
 
-.top-item select,
-.top-item .status-pill,
-.top-item .mini-wave,
-.top-item .mic-btn {
+.top-item select {
   width: 100%;
 }
 
-.top-item-stop {
-  align-items: stretch;
-  width: 52px;
-  justify-self: start;
-}
-
-.topbar .top-item select,
-.topbar .status-pill,
-.topbar .mini-wave,
-.topbar .mic-btn {
+.topbar .top-item select {
   height: var(--h-topbar-control);
 }
 
@@ -578,11 +573,8 @@ textarea:focus-visible,
   line-height: 1.2;
 }
 
-.topbar .status-pill {
-  padding: 0 10px;
-}
-
 /* Quick settings are controlled from the recording capsule, not from the main top bar. */
+#legacyRecordingSinks,
 #quickSettingsPanel,
 #quickSettingsToggle {
   display: none !important;
@@ -789,37 +781,6 @@ textarea:focus-visible,
   display: inline-flex;
   align-items: center;
   justify-content: center;
-}
-
-.top-item-stop .mic-btn::before {
-  width: 10px;
-  height: 10px;
-  border: 0;
-  border-radius: 50%;
-  background: var(--record-stop-dot);
-  background-image: none;
-}
-
-.top-item-stop .mic-btn {
-  border-color: var(--line-2);
-  background: var(--bg-7);
-}
-
-.top-item-stop .mic-btn:hover {
-  border-color: var(--record-stop-hover-border);
-  background: var(--record-stop-hover-bg);
-}
-
-.top-item-stop .mic-btn.recording {
-  border-color: var(--record-stop-active-border);
-  background: linear-gradient(180deg, var(--record-stop-active-top), var(--record-stop-active-bottom));
-}
-
-.top-item-stop .mic-btn.recording::before {
-  width: 9px;
-  height: 9px;
-  border-radius: 1px;
-  background: var(--record-stop-icon);
 }
 
 .mic-btn::before {
@@ -2684,20 +2645,6 @@ canvas,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .top-item-stop,
-  .top-item-waveform {
-    width: auto;
-  }
-
-  .top-item-waveform {
-    grid-column: 1 / -1;
-  }
-
-  .top-item-stop {
-    grid-column: 2;
-    justify-self: stretch;
-  }
-
   .context-chip {
     white-space: normal;
   }
@@ -2806,7 +2753,7 @@ canvas,
 }
 
 /* Graph view styles are intentionally removed while the Graph view is dormant.
-   Restore together with the commented markup in index.html and graph code in main.tsx. */
+   Restore together with Graph markup in index.html and Graph code in main.tsx. */
 
 /* ──────────────────────────────────────────────────────────────────────
  * Boot overlay — enterprise-grade first-launch UX.

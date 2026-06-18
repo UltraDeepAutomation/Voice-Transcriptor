@@ -277,7 +277,6 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
   return null;
 }
 
-type UiStatusTone = "neutral" | "info" | "success" | "warning" | "error";
 type RecordingFinalSignalKind = "" | "transcript" | "status" | "error";
 
 // Compile-time injected by vite.config.ts from desktop/package.json's
@@ -501,8 +500,6 @@ let suppressUiPrefAutosave = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
-let silenceStartedAtMs = 0;
-let autoStopTriggered = false;
 let currentRecordingAudioObjectUrl = "";
 let currentRecordingAudioSourceKey = "";
 let currentRecordingAudioRenderSeq = 0;
@@ -518,7 +515,7 @@ let busyScopeToken = "";
 let liveStartAbortReason = "";
 const remoteModelByProvider: Record<RemoteProvider, string> = {
   openrouter: DEFAULT_OPENROUTER_AUDIO_MODEL,
-  deepgram: DEEPGRAM_AUDIO_MODELS[0],
+  deepgram: DEFAULT_DEEPGRAM_AUDIO_MODEL,
 };
 const MASKED_KEY_VALUE = "••••••••••••••••••••••••••••••••••••••••";
 const keySavedState: Record<KeyProvider, boolean> = {
@@ -682,12 +679,12 @@ async function fetchSavedAudioFromBackend(
   if (!audioUrl) throw new Error("Saved recording name is missing.");
   const audioResp = await fetch(audioUrl, { headers: authHeaders() });
   if (!audioResp.ok) {
-    console.log(`[trace fetchAudio] FAIL savedName="${savedName}" archiveDir="${archiveDir}" status=${audioResp.status} statusText="${audioResp.statusText}" durMs=${(performance.now() - tFetch).toFixed(0)}`);
+    console.log(`[trace fetchAudio] FAIL ${traceAudioRefStats(savedName, archiveDir)} status=${audioResp.status} statusText="${audioResp.statusText}" durMs=${(performance.now() - tFetch).toFixed(0)}`);
     throw new Error(`Audio fetch failed: HTTP ${audioResp.status} ${audioResp.statusText}`.trim());
   }
   const audioBlob = await audioResp.blob();
   if (audioBlob.size === 0) {
-    console.log(`[trace fetchAudio] FAIL empty body savedName="${savedName}" archiveDir="${archiveDir}" durMs=${(performance.now() - tFetch).toFixed(0)}`);
+    console.log(`[trace fetchAudio] FAIL empty body ${traceAudioRefStats(savedName, archiveDir)} durMs=${(performance.now() - tFetch).toFixed(0)}`);
     // Defensive: a 200 OK with an empty body would otherwise look
     // healthy at the upload boundary and only fail downstream inside
     // ffmpeg/libsndfile with a vague "invalid data" error. Surface
@@ -710,7 +707,7 @@ async function fetchSavedAudioFromBackend(
     || (savedName.endsWith(".txt")
       ? savedName.replace(/\.txt$/, "." + (MIME_TO_AUDIO_EXT[mimeType] || "bin"))
       : savedName);
-  console.log(`[trace fetchAudio] OK savedName="${savedName}" filename="${filename}" mime="${mimeType}" sizeBytes=${audioBlob.size} durMs=${(performance.now() - tFetch).toFixed(0)}`);
+  console.log(`[trace fetchAudio] OK ${traceAudioRefStats(savedName, archiveDir, filename)} mime="${mimeType}" sizeBytes=${audioBlob.size} durMs=${(performance.now() - tFetch).toFixed(0)}`);
   return new File([audioBlob], filename, { type: mimeType });
 }
 
@@ -960,6 +957,18 @@ function countWords(text: string): number {
   const value = String(text || "").trim();
   if (!value) return 0;
   return value.split(/\s+/).filter(Boolean).length;
+}
+
+function traceTextStats(label: string, text: string): string {
+  const value = String(text || "");
+  return `${label}Len=${value.length} ${label}Words=${countWords(value)}`;
+}
+
+function traceAudioRefStats(savedName = "", archiveDir = "", filename = ""): string {
+  const name = String(savedName || "");
+  const dir = String(archiveDir || "");
+  const file = String(filename || "");
+  return `savedNameLen=${name.length} archiveDirSet=${dir.trim() ? "1" : "0"} filenameLen=${file.length}`;
 }
 
 function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
@@ -1625,45 +1634,6 @@ function downsample(buf: Float32Array, inRate: number, outRate: number): Float32
   return out;
 }
 
-function encodeWav(float32: Float32Array, sr: number): Blob {
-  const n = float32.length;
-  const buf = new ArrayBuffer(44 + n * 2);
-  const v = new DataView(buf);
-  const s = (o: number, str: string): void => {
-    for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i));
-  };
-  s(0, "RIFF");
-  v.setUint32(4, 36 + n * 2, true);
-  s(8, "WAVE");
-  s(12, "fmt ");
-  v.setUint32(16, 16, true);
-  v.setUint16(20, 1, true);
-  v.setUint16(22, 1, true);
-  v.setUint32(24, sr, true);
-  v.setUint32(28, sr * 2, true);
-  v.setUint16(32, 2, true);
-  v.setUint16(34, 16, true);
-  s(36, "data");
-  v.setUint32(40, n * 2, true);
-  let off = 44;
-  for (let i = 0; i < n; i++) {
-    const x = Math.max(-1, Math.min(1, float32[i]));
-    // Explicit Math.round — setInt16 truncates toward zero on a raw
-    // float multiply, introducing a systematic ~0.5-LSB negative bias
-    // on positive samples. floatSamplesToInt16LE already rounds; this
-    // path must match to produce bit-identical output for the same
-    // input samples.
-    v.setInt16(off, Math.round(x < 0 ? x * 0x8000 : x * 0x7fff), true);
-    off += 2;
-  }
-  return new Blob([buf], { type: "audio/wav" });
-}
-
-function createWavFileFromSamples(samples: Float32Array, sampleRate: number, name: string): File {
-  const audioBlob = encodeWav(samples, sampleRate);
-  return new File([audioBlob], name, { type: audioBlob.type || "audio/wav" });
-}
-
 // ── PCM capture sink ──────────────────────────────────────────────────
 //
 // A bounded-memory replacement for the old ``chunks: Float32Array[]``
@@ -2176,7 +2146,7 @@ function getRemoteModelValue(provider: Provider): string {
   }
   if (provider === "deepgram") {
     const v = (remoteModelByProvider.deepgram || "").trim();
-    return v || DEEPGRAM_AUDIO_MODELS[0];
+    return v || DEFAULT_DEEPGRAM_AUDIO_MODEL;
   }
   return ($("model") as HTMLSelectElement).value || "small";
 }
@@ -2213,8 +2183,8 @@ function syncRemoteModelOptions(): void {
       opt.textContent = model;
       sel.appendChild(opt);
     });
-    const preferredDeepgram = (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
-    sel.value = DEEPGRAM_AUDIO_MODELS.includes(preferredDeepgram) ? preferredDeepgram : DEEPGRAM_AUDIO_MODELS[0];
+    const preferredDeepgram = (remoteModelByProvider.deepgram || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
+    sel.value = DEEPGRAM_AUDIO_MODELS.includes(preferredDeepgram) ? preferredDeepgram : DEFAULT_DEEPGRAM_AUDIO_MODEL;
     remoteModelByProvider.deepgram = sel.value;
     return;
   }
@@ -2517,21 +2487,6 @@ async function remoteJobSync(
   };
 }
 
-function isTransientRemoteNetworkError(err: unknown): boolean {
-  const msg = String((err as Error)?.message || err || "").toLowerCase();
-  return (
-    msg.includes("bad gateway") ||
-    msg.includes("httpsconnectionpool") ||
-    msg.includes("failed to establish a new connection") ||
-    msg.includes("nodename nor servname provided") ||
-    msg.includes("name or service not known") ||
-    msg.includes("temporary failure in name resolution") ||
-    msg.includes("network error") ||
-    msg.includes("connection error") ||
-    msg.includes("timed out")
-  );
-}
-
 function isProviderKeyConfigured(provider: Provider): boolean {
   if (provider === "local" || !provider) return true;
   if (provider === "openrouter") {
@@ -2803,15 +2758,14 @@ function scheduleLocalWarmup(): void {
 
 // Formerly toggled between "live recording" and "file upload" modes
 // based on a switch that no longer exists — live mode is the only
-// supported surface. Keep the DOM-visibility side effects so existing
-// callers don't need to change; the dead upload-mode branches are
-// removed.
+// supported surface. Recording controls now live in the overlay, while
+// the old required DOM ids remain hidden as internal state sinks.
 function syncMode(): void {
   $("livePane").hidden = false;
   $("splitGap").hidden = false;
-  $("waveCanvas").hidden = false;
+  $("waveCanvas").hidden = true;
   $("uploadPanel").hidden = true;
-  $("btnStart").style.display = "inline-flex";
+  $("btnStart").style.display = "none";
   // Removed: setSelectedFile(null). The Live tab no longer surfaces a
   // file picker — the Upload tab fully owns batch transcription. The
   // call here was a vestige of the pre-Upload-tab era; resetting
@@ -3308,7 +3262,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_stop_silence_seconds: silence.seconds,
     auto_stop_silence_db: silence.thresholdDb,
     remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL,
-    remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEEPGRAM_AUDIO_MODELS[0],
+    remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL,
     shortcut_record: currentShortcuts.record,
     shortcut_paste: currentShortcuts.paste,
     // Upload tab — mirrors current DOM values. Optional-chained because
@@ -4164,7 +4118,7 @@ async function loadCfg(): Promise<void> {
     ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;
     const ui = (cfg.preferences || {}).ui || {};
     remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
-    remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEEPGRAM_AUDIO_MODELS[0] || "").trim() || DEEPGRAM_AUDIO_MODELS[0];
+    remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEFAULT_DEEPGRAM_AUDIO_MODEL || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
     const languageSel = $("language") as HTMLSelectElement;
     const providerSel = $("providerSelect") as HTMLSelectElement;
     const quickProviderSel = $("quickProviderSelect") as HTMLSelectElement;
@@ -5200,7 +5154,7 @@ async function openRecording(name: string, archiveDir = ""): Promise<void> {
       player.load();
       audioRow.hidden = true;
     }
-    // Reveal-in-Finder button — surfaced when running inside Electron
+    // Reveal-in-folder button — surfaced when running inside Electron
     // (``__transcriptorRevealRecording`` injected by main.tsx and
     // dispatched by main.js via the page-title-updated channel).
     // Hidden in plain-browser dev preview where the helper is undefined.
@@ -5545,7 +5499,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
     // 1. Try Deepgram REST — higher accuracy than local Whisper for most
     //    languages. Only attempted when the user has a key configured.
     if (isProviderKeyConfigured("deepgram")) {
-      const dgModel = getRemoteModelValue("deepgram") || "nova-3";
+      const dgModel = getRemoteModelValue("deepgram") || DEFAULT_DEEPGRAM_AUDIO_MODEL;
       triedProviders.push(`Deepgram ${dgModel}`);
       setRetranscribeStatus(`Re-transcribing via Deepgram (${dgModel})…`);
       try {
@@ -6209,7 +6163,6 @@ function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer):
   liveTranscriptSegments = buffer.segments;
   liveInterimText = buffer.interimText;
   lastInterimSnapshot = buffer.lastInterimText;
-  liveCommittedDisplayCache = buffer.committedDisplayCache;
   setLiveDraftState(buffer.committedText, buffer.committedDisplayText);
 }
 
@@ -6390,7 +6343,6 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
       liveDraftDisplayText = "";
       liveInterimText = "";
       liveTranscriptSegments = [];
-      liveCommittedDisplayCache = "";
       scheduleLiveOutputRender();
     }
   }
@@ -6489,7 +6441,6 @@ function resetLiveDraftState(): void {
   liveDraftDisplayText = "";
   liveInterimText = "";
   liveTranscriptSegments = [];
-  liveCommittedDisplayCache = "";
   syncLiveOutputFromState();
 }
 
@@ -6499,14 +6450,9 @@ function setLiveDraftState(text: string, displayText = text): void {
   syncLiveOutputFromState();
 }
 
-/**
- * Active live-preview projection cache.
- *
- * The authoritative committed/interim state lives in LiveTranscriptBuffer
- * per session. These globals are only the currently active UI projection,
- * kept for the existing renderer/overlay read paths.
- */
-let liveCommittedDisplayCache = "";
+// The authoritative committed/interim state lives in LiveTranscriptBuffer
+// per session. These globals are only the currently active UI projection
+// kept for the existing renderer/overlay read paths.
 // Snapshot of ``liveInterimText`` taken JUST BEFORE it is cleared by
 // an incoming ``is_final`` event. When the user presses Stop while
 // Deepgram is mid-utterance, the live interim may contain words that
@@ -6766,8 +6712,6 @@ async function startLive(): Promise<void> {
   // async OPFS init resolved (~50 ms, but up to 500 ms on slow devices).
   pcmSink = await createPcmSink(sessionUiToken);
   workletLastFrameAt = 0;
-  silenceStartedAtMs = 0;
-  autoStopTriggered = false;
   captureFrameCount = 0;
   captureRmsAccum = 0;
   captureRmsSqAccum = 0;
@@ -6911,7 +6855,7 @@ async function startLive(): Promise<void> {
       }
       case "segments": {
         const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-        console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} lastText="${lastNew.text.slice(-50)}"` : "(empty)"}`);
+        console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
         appendSegmentsToBuffer(sessionBuffer, msg.segments);
         if (isActiveSession) {
           projectLiveTranscriptBufferToActiveState(sessionBuffer);
@@ -6931,7 +6875,7 @@ async function startLive(): Promise<void> {
       }
       case "final": {
         const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-        console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} lastText="${lastSeg.text.slice(-50)}"` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
+        console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
         appendSegmentsToBuffer(sessionBuffer, msg.segments);
         if (isActiveSession) {
           projectLiveTranscriptBufferToActiveState(sessionBuffer);
@@ -7610,8 +7554,6 @@ async function stopLive(enhance: boolean): Promise<void> {
   activeLiveArchiveDir = "";
   activeLiveSessionSnapshot = null;
   isRecording = false;
-  silenceStartedAtMs = 0;
-  autoStopTriggered = false;
   // currentRecordingId / window.__transcriptorCurrentRecordingId are also
   // cleared in the outer finally below so they are guaranteed to reset on
   // every exit path — including uncaught throws before this point.
@@ -7690,7 +7632,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         saveDone = true;
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e || "");
-        console.warn(`Audio persistence attempt failed (archiveDir="${tryArchiveDir}", fileSize=${savedAudioFile?.size || 0}, fileName=${savedAudioFile?.name || "?"})`, e);
+        console.warn(`Audio persistence attempt failed (archiveDirSet=${String(tryArchiveDir || "").trim() ? "1" : "0"}, fileSize=${savedAudioFile?.size || 0}, fileNameLen=${String(savedAudioFile?.name || "").length})`, e);
         if (tryArchiveDir === "" || saveDirs.length === 1) {
           // Both attempts failed — truly broken. Surface the ACTUAL
           // backend error message instead of a generic "check folder
@@ -8219,7 +8161,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         const instantBuffer = getLiveTranscriptBuffer(sessionUiToken);
         const instantTranscript = getSessionCanonicalLiveSourceText(sessionUiToken);
         const instantSegments = instantBuffer?.segments || [];
-        console.log(`[trace stopLive] fast-path enter committedLen=${instantBuffer?.committedText.length ?? 0} interimLen=${instantBuffer?.interimText.length ?? 0} lastInterimSnapshotLen=${instantBuffer?.lastInterimText.length ?? 0} instantTranscriptLen=${instantTranscript.length} instantWordCount=${instantTranscript.split(/\s+/).filter(Boolean).length} instantTail="${instantTranscript.slice(-60).replace(/\n/g, "\\n")}"`);
+        console.log(`[trace stopLive] fast-path enter committedLen=${instantBuffer?.committedText.length ?? 0} interimLen=${instantBuffer?.interimText.length ?? 0} lastInterimSnapshotLen=${instantBuffer?.lastInterimText.length ?? 0} ${traceTextStats("instantTranscript", instantTranscript)}`);
         if (instantTranscript) {
           transcriptRaw = instantTranscript;
 
@@ -8268,7 +8210,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           const opportunisticTranscript = richerTranscript(transcriptRaw, opportunisticEnvelopeText);
           if (opportunisticTranscript !== transcriptRaw) {
             transcriptRaw = opportunisticTranscript;
-            console.log(`[trace stopLive] opportunistic-envelope used words=${wordCountOf(transcriptRaw)} tail="${transcriptRaw.slice(-60).replace(/\n/g, "\\n")}"`);
+            console.log(`[trace stopLive] opportunistic-envelope used ${traceTextStats("transcript", transcriptRaw)}`);
           }
 
           // Tail coverage is committed + current interim + the last
@@ -8376,7 +8318,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             }));
             const first = await Promise.race([envelopeCand, recoveryCand]);
             const firstMs = performance.now() - tRace;
-            console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} tail="${first.text.slice(-60).replace(/\n/g, "\\n")}"`);
+            console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} ${traceTextStats("candidate", first.text)}`);
             let improvedText = richerTranscript(baseTranscriptForRace, first.text);
             let chose: Cand | null = improvedText !== baseTranscriptForRace
               ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
@@ -8411,7 +8353,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                 : await otherPromise;
               const otherMs = performance.now() - tRace;
               if (other) {
-                console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} tail="${other.text.slice(-60).replace(/\n/g, "\\n")}"`);
+                console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} ${traceTextStats("candidate", other.text)}`);
                 improvedText = richerTranscript(baseTranscriptForRace, other.text);
                 if (improvedText !== baseTranscriptForRace) {
                   chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
@@ -8635,7 +8577,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
     }
 
-    console.log(`[trace stopLive] FINAL transcriptRaw len=${transcriptRaw.length} wordCount=${transcriptRaw.split(/\s+/).filter(Boolean).length} tail="${transcriptRaw.slice(-80).replace(/\n/g, "\\n")}"`);
+    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)}`);
 
     publishRecordingFinalSignal({
       recordingId,
@@ -8943,7 +8885,7 @@ async function transcribeSelectedFile(): Promise<void> {
       }
       const syncOut = await localJobSync(selectedFile, {
         language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
-        model: ($("model") as HTMLSelectElement).value,
+        model: modelValue,
         splitStereo: ($("splitStereoCheck") as HTMLInputElement).checked,
         wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
         signal: pollAbortController.signal,
@@ -8988,7 +8930,7 @@ async function transcribeSelectedFile(): Promise<void> {
         provider,
         language: ($("language") as HTMLSelectElement).value,
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-        openrouterModel: getRemoteModelValue(provider),
+        openrouterModel: modelValue,
         signal: pollAbortController.signal,
       });
       const transcriptRaw = String(syncOut.text || "").trim();
@@ -9083,14 +9025,8 @@ drop.addEventListener("drop", (e: DragEvent) => {
 });
 
 $("btnTranscribeFile").addEventListener("click", () => void transcribeSelectedFile());
-$("btnStart").addEventListener("click", () => {
-  if (isRecording) {
-    void stopLive(shouldAutoTranscribe());
-  } else {
-    void startLive();
-  }
-});
-$("btnStop").addEventListener("click", () => void stopLive(shouldAutoTranscribe()));
+// Legacy topbar recording buttons stay mounted only for state compatibility.
+// User-facing recording is controlled by the overlay and global hotkey events.
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
   if (isRecording) {
@@ -9107,9 +9043,9 @@ window.addEventListener("transcriptor-hotkey-stop", () => {
   }
 });
 
-// Graph is intentionally dormant. The sidebar/markup is commented out in
-// index.html, and the implementation block is kept out of the active bundle
-// so it cannot allocate canvas state, register listeners, or call graph APIs.
+// Graph is intentionally dormant. The sidebar/markup/styles are removed, and
+// the implementation block is kept out of the active bundle so it cannot
+// allocate canvas state, register listeners, or call graph APIs.
 
 async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = false;
@@ -9132,7 +9068,7 @@ async function initRecordingsBootstrap(): Promise<void> {
 }
 
 // Graph interactions are disabled with the Graph view. Restore together with
-// the commented markup in index.html and the graph styles in styles.css.
+// Graph markup in index.html and Graph styles in styles.css.
 
 // Stamp the version badge on boot. The HTML at #appVersionNumber
 // holds a build-time placeholder that vite/index.html templating
@@ -9624,7 +9560,7 @@ function createUploadRevealButton(item: UploadQueueItem): HTMLButtonElement | nu
   const btn = document.createElement("button");
   btn.className = "btn btn-ghost upload-queue-item-action upload-queue-item-reveal";
   btn.type = "button";
-  btn.textContent = "Reveal in Finder";
+  btn.textContent = "Reveal in folder";
   btn.addEventListener("click", (ev) => {
     ev.stopPropagation();
     revealUploadItem(item);
@@ -10540,7 +10476,7 @@ function renderUploadQueue(): void {
 // ── Upload result pane (right column) ──────────────────────────────
 //
 // Renders the currently-selected queue item's transcript + metadata
-// + a "Reveal in Finder" button that asks the Electron main process
+// + a "Reveal in folder" button that asks the Electron main process
 // to open the saved transcript file in the OS file manager. Falls back
 // gracefully on platforms without ``shell.showItemInFolder`` IPC.
 function renderUploadResultPane(): void {

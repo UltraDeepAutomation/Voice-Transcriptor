@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, session } = require("electron");
+const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -666,39 +666,6 @@ async function getRendererLocalModelChoice() {
     "small",
   );
   return normalizeLocalModelChoice(v);
-}
-
-async function getRendererModelContext() {
-  if (!win || win.isDestroyed() || !win.webContents) {
-    return { provider: "local", model: "small", models: [...LOCAL_MODELS] };
-  }
-  const DEFAULT_CONTEXT = { provider: "local", model: "small", models: [...LOCAL_MODELS] };
-  const state = await execRendererJsWithTimeout(
-    `
-    (() => {
-      const provider = String((document.getElementById('providerSelect')?.value || 'local')).trim();
-      const modelSel = document.getElementById('model');
-      const remoteSel = document.getElementById('remoteModelSelect');
-      const orModel = document.getElementById('orModel');
-      const localModel = String(modelSel?.value || 'small').trim();
-      const remoteModel = String(remoteSel?.value || orModel?.value || '').trim();
-      const localOptions = Array.from(modelSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
-      const remoteOptions = Array.from(remoteSel?.options || []).map((o) => String(o.value || '').trim()).filter(Boolean);
-      const models = provider === 'local'
-        ? (localOptions.length ? localOptions : ${JSON.stringify(LOCAL_MODELS)})
-        : (remoteOptions.length ? remoteOptions : (remoteModel ? [remoteModel] : []));
-      const model = provider === 'local' ? localModel : remoteModel;
-      return { provider, model, models };
-    })();
-    `,
-    null,
-  );
-  if (!state) return DEFAULT_CONTEXT;
-  return {
-    provider: normalizeProviderChoice(state.provider),
-    model: String(state.model || "").trim() || "small",
-    models: Array.isArray(state.models) ? state.models.map((x) => String(x || "").trim()).filter(Boolean) : [...LOCAL_MODELS],
-  };
 }
 
 async function getRendererQuickSettingsOpen() {
@@ -5198,68 +5165,6 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
-function logPathForLoader() {
-  try { return path.join(app.getPath("userData"), "main.log"); } catch { return ""; }
-}
-
-/**
- * Progressive boot-loading page.
- *
- * Rendered BEFORE /api/health comes back so the user sees a polished
- * "starting up" screen instead of a blank window (or worse, the
- * "Backend startup failed" error page as their first impression on a
- * cold-start that happens to take >2 s). Self-contained data: URL —
- * no backend dependency, renders instantly. Ticks a live elapsed
- * counter so the user knows the app hasn't frozen.
- *
- * The outer `createWindow` flow swaps this away via `win.loadURL(url)`
- * the moment /api/health responds OK; on timeout / fatal the `catch`
- * branch loads the existing error HTML.
- */
-function _bootLoadingDataUrl(logPath) {
-  const safeLog = escapeHtml(logPath || "");
-  const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>Transcriptor</title>
-<style>
-  html, body { margin: 0; padding: 0; background: #0f1115; color: #e5e7eb;
-    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-    height: 100%; display: flex; align-items: center; justify-content: center; }
-  .wrap { text-align: center; max-width: 440px; padding: 32px; }
-  .pulse { width: 56px; height: 56px; border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #7dd3fc 0%, #2563eb 60%, #0c4a6e 100%);
-    margin: 0 auto 20px; animation: p 2s ease-in-out infinite;
-    box-shadow: 0 0 24px 2px rgba(37, 99, 235, 0.35); }
-  @keyframes p { 0%,100%{transform:scale(1);opacity:0.9} 50%{transform:scale(1.08);opacity:1} }
-  h1 { margin: 0 0 6px; font-size: 18px; font-weight: 600; color: #f3f4f6; }
-  .sub { color: #9ca3af; font-size: 13px; line-height: 1.55; margin-bottom: 18px; }
-  .timer { color: #60a5fa; font-variant-numeric: tabular-nums; font-size: 12px; }
-  .slow { color: #fbbf24; font-size: 12px; margin-top: 12px; display: none; }
-  .slow.show { display: block; }
-  .log { margin-top: 24px; color: #6b7280; font-size: 11px; word-break: break-all; }
-  .log code { background: #1f2937; padding: 2px 6px; border-radius: 4px; user-select: all; }
-</style></head><body>
-<div class="wrap">
-  <div class="pulse"></div>
-  <h1>Starting Transcriptor…</h1>
-  <div class="sub">Warming up the transcription engine.<br>This can take a few seconds on first launch.</div>
-  <div class="timer" id="t">0.0 s</div>
-  <div class="slow" id="s">Taking longer than usual — check the log if it stays stuck.</div>
-  <div class="log">Log file:<br><code>${safeLog}</code></div>
-</div>
-<script>
-  var start = performance.now();
-  var t = document.getElementById('t');
-  var s = document.getElementById('s');
-  setInterval(function() {
-    var secs = (performance.now() - start) / 1000;
-    t.textContent = secs.toFixed(1) + ' s';
-    if (secs > 15) s.classList.add('show');
-  }, 100);
-</script>
-</body></html>`;
-  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
-}
-
 function fileExists(p) {
   // Accept BOTH POSIX absolute paths ("/…") AND Windows drive paths
   // ("C:\…"). The original "/"-prefix gate was a defence against bare
@@ -5272,57 +5177,6 @@ function fileExists(p) {
   if (!p) return false;
   if (!path.isAbsolute(p)) return false;
   try { return fs.existsSync(p); } catch { return false; }
-}
-
-function getPythonCandidates(repoRoot) {
-  const fromEnv = (process.env.PYTHON || "").trim();
-  const winAppVenvPy = path.join(getAppVenvDir(), "Scripts", "python.exe");
-  const unixAppVenvPy = path.join(getAppVenvDir(), "bin", "python3");
-  const appVenvPy = process.platform === "win32" ? winAppVenvPy : unixAppVenvPy;
-  const winDevVenvPy = path.join(repoRoot, ".venv", "Scripts", "python.exe");
-  const unixDevVenvPy = path.join(repoRoot, ".venv", "bin", "python3");
-  const candidates = [
-    fromEnv,
-    appVenvPy,
-    process.platform === "win32" ? winDevVenvPy : unixDevVenvPy,
-    ...(process.platform === "win32" ? [] : [
-      path.join(repoRoot, ".venv", "bin", "python"),
-      "/opt/homebrew/bin/python3",
-      "/usr/local/bin/python3",
-      "/usr/bin/python3",
-      // Versioned absolute paths — some minimal Debian/Alpine/RHEL
-      // images ship only `/usr/bin/python3.12` without a generic
-      // `python3` symlink. Probe explicitly so Linux AppImage users
-      // on those systems get a working fallback instead of "Python
-      // 3 interpreter was not found".
-      "/usr/bin/python3.12",
-      "/usr/bin/python3.11",
-      "/usr/bin/python3.10",
-      "/usr/bin/python3.9",
-      "/opt/homebrew/bin/python3.12",
-      "/opt/homebrew/bin/python3.11",
-      "/usr/local/bin/python3.12",
-      "/usr/local/bin/python3.11",
-    ]),
-    "python3",
-    "python",
-    ...(process.platform === "win32" ? [] : ["python3.12", "python3.11", "python3.10"]),
-  ].filter(Boolean);
-
-  const out = [];
-  for (const c of candidates) {
-    // path.isAbsolute handles BOTH POSIX absolute ("/…") AND Windows
-    // drive paths ("C:\…"). The previous startsWith("/") gate filtered
-    // Windows paths into the "bare name" branch, letting bogus
-    // non-existent C:\…\python.exe paths leak through and crash at
-    // spawn() time with ENOENT instead of being filtered out here.
-    if (path.isAbsolute(c)) {
-      if (fileExists(c)) out.push(c);
-      continue;
-    }
-    out.push(c);
-  }
-  return [...new Set(out)];
 }
 
 function runCommand(cmd, args, options = {}) {
@@ -6644,13 +6498,23 @@ async function createWindow(options = {}) {
     // current root entrypoints instead of deleted legacy install scripts.
     const logPath = path.join(app.getPath("userData"), "main.log");
     let recoveryHtml;
-    if (process.platform === "win32") {
+    if (app.isPackaged) {
       recoveryHtml = (
         `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
         `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
-        `<li>Close Transcriptor fully and reopen it (sometimes the Python venv needs an extra minute on first launch).</li>` +
+        `<li>Close Transcriptor fully and reopen it once.</li>` +
+        `<li>Reinstall the current release if the bundled runtime was quarantined or removed.</li>` +
+        `<li>If the problem persists, send the log file shown below.</li>` +
+        `</ol>` +
+        `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+      );
+    } else if (process.platform === "win32") {
+      recoveryHtml = (
+        `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
+        `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
+        `<li>Close Transcriptor fully and reopen it.</li>` +
         `<li>Make sure Python 3.12 is installed: <code style="background:#333;padding:2px 6px;border-radius:4px">winget install Python.Python.3.12</code></li>` +
-        `<li>If the problem persists, reinstall from the Setup .exe.</li>` +
+        `<li>If the problem persists, rebuild from the source checkout.</li>` +
         `</ol>` +
         `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
       );

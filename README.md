@@ -9,7 +9,7 @@ Desktop voice transcription app with live recording, file upload transcription, 
 - History with saved transcripts, saved source audio, search, stats, re-transcribe, and reveal/open actions.
 - AI Upscale presets through OpenRouter.
 - macOS arm64, Windows x64, and Linux x64 packaged runtime support.
-- Graph view is dormant: sidebar/view markup is commented out, active frontend code/styles are removed, and the backend graph route is not registered.
+- Graph view is dormant: sidebar/view markup, active frontend code/styles, and the backend graph route are removed.
 
 ## Install
 
@@ -47,7 +47,8 @@ Prerequisites:
 
 - Node.js `>=22.12.0`; `.node-version` and `.nvmrc` are the local SSOT.
 - npm `>=10` from the same Node distribution.
-- macOS arm64 builds require `bash`, Xcode Command Line Tools, and `codesign`; a signing identity is optional for local builds.
+- Runtime preparation requires `python3` with `pip`, `curl`, `tar`, and `unzip` for macOS/Windows archives.
+- macOS arm64 release builds require `bash`, Xcode Command Line Tools, `codesign`, and a configured signing identity. Use `npm --prefix desktop run dist:adhoc` only for explicit local ad-hoc builds.
 - Windows release packaging requires a Bash-capable shell because `desktop/scripts/prepare-runtime.sh` prepares the bundled runtime.
 - Linux desktop integration still depends on distro packages such as `xdotool`, `wmctrl`, and `zenity`.
 

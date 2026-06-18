@@ -33,9 +33,10 @@
 // ``@electron/osx-sign`` is the canonical Electron signing tool
 // written specifically for this structure. It walks the bundle
 // innermost-first, preserves each nested item's natural identifier,
-// applies helper-specific default entitlements from its bundled
-// templates (``default.darwin.{renderer,plugin,gpu}.plist``), and
-// uses a full custom entitlements file only for the top-level .app.
+// signs innermost-first, preserves each nested item's natural
+// identifier, and lets us apply the top-level entitlements to the
+// bundle while applying the inherit entitlement subset to helpers and
+// frameworks.
 // Library validation passes because every item keeps its own
 // identifier and they all share the same signing authority.
 //
@@ -45,7 +46,8 @@
 // user's self-signed 10-year code-signing certificate). When found,
 // uses it as the ``identity`` option. When absent (fresh machine,
 // CI runner), drops to ad-hoc via ``-`` and logs a warning — the
-// build never fails on a missing certificate.
+// build fails on a missing certificate unless TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1
+// is set explicitly for local ad-hoc builds.
 //
 // TCC persistence
 // ---------------

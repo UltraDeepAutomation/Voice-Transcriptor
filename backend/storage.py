@@ -42,7 +42,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +139,22 @@ def rotate_backup(path: Path, backup: Path) -> None:
     """
     if not path.exists():
         return
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path_for(backup)
     try:
-        # ``shutil.copy2`` preserves timestamps + permissions so the
-        # backup looks identical to the original for diagnostic
-        # purposes. Destination is overwritten if it already exists.
-        shutil.copy2(path, backup)
+        with open(path, "rb") as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        try:
+            shutil.copystat(path, tmp)
+        except OSError as stat_error:
+            logger.warning("backup metadata copy skipped for %s → %s: %s", path, backup, stat_error)
+        os.replace(tmp, backup)
+        _fsync_parent_dir(backup)
     except OSError as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         logger.warning("backup rotation failed for %s → %s: %s", path, backup, e)

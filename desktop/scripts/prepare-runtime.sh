@@ -49,6 +49,23 @@ log()  { printf '\033[1;36m[prep]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[prep]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[prep]\033[0m %s\n' "$*" >&2; exit 1; }
 
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+preflight() {
+  local target="$1"
+  require_cmd curl
+  require_cmd tar
+  require_cmd python3
+  python3 -m pip --version >/dev/null 2>&1 || die "missing python3 pip module"
+  case "${target}" in
+    win-x64|mac-arm64|all)
+      require_cmd unzip
+      ;;
+  esac
+}
+
 # -----------------------------------------------------------------------------
 # Download a file to CACHE_DIR once; reuse on subsequent runs.
 # -----------------------------------------------------------------------------
@@ -314,10 +331,11 @@ build_linux_x64() {
 
 target="${1:-}"
 case "${target}" in
-  win-x64)    build_win_x64 ;;
-  mac-arm64)  build_mac_arm64 ;;
-  linux-x64)  build_linux_x64 ;;
+  win-x64)    preflight "${target}"; build_win_x64 ;;
+  mac-arm64)  preflight "${target}"; build_mac_arm64 ;;
+  linux-x64)  preflight "${target}"; build_linux_x64 ;;
   all)
+    preflight "${target}"
     build_win_x64
     build_mac_arm64
     build_linux_x64

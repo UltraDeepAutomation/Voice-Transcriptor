@@ -47,7 +47,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 from urllib.parse import urlencode
 
@@ -731,36 +731,30 @@ class DeepgramLiveSession:
                     self._event_queue.maxsize,
                 )
             return
-        # Critical (non-sentinel): try to evict one oldest interim and re-enqueue.
+        # Critical (non-sentinel): evict the oldest queued interim, even
+        # if earlier queue slots hold final/error events. The previous
+        # implementation inspected only one victim, so a queue like
+        # [final, interim, ...] dropped the new critical event even
+        # though a disposable interim was available.
+        preserved = []
+        evicted_interim = False
         try:
-            victim = self._event_queue.get_nowait()
-        except (asyncio.QueueEmpty, RuntimeError):
-            return
-        if isinstance(victim, dict) and victim.get("type") == "interim":
-            # Discarded an interim; room is now available.
+            while True:
+                victim = self._event_queue.get_nowait()
+                if isinstance(victim, dict) and victim.get("type") == "interim":
+                    evicted_interim = True
+                    break
+                preserved.append(victim)
+        except asyncio.QueueEmpty:
             pass
-        elif victim is self._QUEUE_SENTINEL:
-            # Sentinel was at the tail — put the critical event FIRST,
-            # then re-enqueue the sentinel behind it so the consumer
-            # sees the error/final before termination. Dropping a late
-            # error during close is observable (user misses Deepgram's
-            # upstream reason code); this shuffle preserves both.
-            try:
-                self._event_queue.put_nowait(event)
-                self._event_queue.put_nowait(victim)
-            except (asyncio.QueueFull, RuntimeError) as e:
-                logger.error(
-                    "deepgram-live: sentinel/critical shuffle failed: %s", e
-                )
+        except RuntimeError:
             return
-        else:
-            # Non-interim, non-sentinel (shouldn't happen — all queued
-            # items are dicts or the sentinel). Preserve the victim and
-            # log the anomaly.
-            try:
-                self._event_queue.put_nowait(victim)
-            except (asyncio.QueueFull, RuntimeError):
-                pass
+        if not evicted_interim:
+            for item in preserved:
+                try:
+                    self._event_queue.put_nowait(item)
+                except (asyncio.QueueFull, RuntimeError):
+                    break
             logger.error(
                 "deepgram-live: queue full with no interim to evict; "
                 "critical event dropped: %r",
@@ -768,7 +762,14 @@ class DeepgramLiveSession:
             )
             return
         try:
-            self._event_queue.put_nowait(event)
+            inserted = False
+            for item in preserved:
+                if item is self._QUEUE_SENTINEL and not inserted:
+                    self._event_queue.put_nowait(event)
+                    inserted = True
+                self._event_queue.put_nowait(item)
+            if not inserted:
+                self._event_queue.put_nowait(event)
         except (asyncio.QueueFull, RuntimeError) as e:
             logger.error("deepgram-live: critical event re-enqueue failed: %s", e)
 

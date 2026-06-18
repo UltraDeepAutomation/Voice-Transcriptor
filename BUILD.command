@@ -13,12 +13,12 @@ cd "$SCRIPT_DIR"
 ARCH="$(uname -m)"
 case "$ARCH" in
   arm64)
-    RUNTIME_PLATFORM="mac-arm64"
     BUILDER_ARCH="arm64"
     ;;
   x86_64)
-    RUNTIME_PLATFORM="mac-x64"
-    BUILDER_ARCH="x64"
+    echo "macOS release builds are arm64-only in this release line." >&2
+    echo "Intel Macs are unsupported because the bundled runtime graph is arm64-only." >&2
+    exit 1
     ;;
   *)
     echo "Unsupported macOS architecture: $ARCH" >&2
@@ -28,17 +28,11 @@ esac
 
 npm --prefix frontend ci
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix desktop ci
-desktop/scripts/prepare-runtime.sh "$RUNTIME_PLATFORM"
-npm --prefix frontend run build
 
 cd "$SCRIPT_DIR/desktop"
-node ./unlockDist.js
-TRANSCRIPTOR_ALLOW_ADHOC_SIGN="${TRANSCRIPTOR_ALLOW_ADHOC_SIGN:-1}" npx electron-builder --mac dmg "--${BUILDER_ARCH}" "$@"
+npm run dist -- "$@"
 
 APP_DIR="$SCRIPT_DIR/desktop/dist/mac-${BUILDER_ARCH}/Transcriptor.app"
-if [ "$BUILDER_ARCH" = "x64" ] && [ ! -d "$APP_DIR" ]; then
-  APP_DIR="$SCRIPT_DIR/desktop/dist/mac/Transcriptor.app"
-fi
 if [ ! -d "$APP_DIR" ]; then
   echo "Built app bundle not found: $APP_DIR" >&2
   exit 1
@@ -54,9 +48,28 @@ install_app_bundle() {
   target_name="$(basename "$target_app")"
   tmp_app="$target_root/.${target_name}.installing.$$"
   backup_app="$target_app.backup-$(date -u +%Y%m%dT%H%M%SZ)"
+  cleanup_tmp_app() {
+    if [ -e "$tmp_app" ]; then
+      chmod -R u+w "$tmp_app" 2>/dev/null || true
+      rm -rf "$tmp_app"
+    fi
+  }
+  cleanup_backup_app() {
+    if [ -e "$backup_app" ]; then
+      chmod -R u+w "$backup_app" 2>/dev/null || true
+      rm -rf "$backup_app"
+    fi
+  }
   mkdir -p "$target_root"
-  ditto "$APP_DIR" "$tmp_app"
-  codesign --verify --deep --strict "$tmp_app"
+  cleanup_tmp_app
+  if ! ditto "$APP_DIR" "$tmp_app"; then
+    cleanup_tmp_app
+    return 1
+  fi
+  if ! codesign --verify --deep --strict "$tmp_app"; then
+    cleanup_tmp_app
+    return 1
+  fi
   if [ -e "$target_app" ]; then
     mv "$target_app" "$backup_app"
   fi
@@ -64,8 +77,10 @@ install_app_bundle() {
     if [ -e "$backup_app" ] && [ ! -e "$target_app" ]; then
       mv "$backup_app" "$target_app"
     fi
-    exit 1
+    cleanup_tmp_app
+    return 1
   fi
+  cleanup_backup_app
   echo "Installed $target_app"
 }
 

@@ -39,6 +39,16 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _json_response(response: Any, context: str) -> Dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RemoteError(f"{context}: invalid JSON response") from exc
+    if not isinstance(payload, dict):
+        raise RemoteError(f"{context}: unexpected JSON response type {type(payload).__name__}")
+    return payload
+
+
 def openrouter_transcribe(
     *, api_key: str, model: str, audio_bytes: bytes, filename: str
 ) -> Dict[str, Any]:
@@ -111,7 +121,7 @@ def openrouter_transcribe(
             )
         raise RemoteError(f"openrouter failed: HTTP {r.status_code} {error_text}")
 
-    js = r.json()
+    js = _json_response(r, "OpenRouter transcribe")
     text = ""
     try:
         text = js["choices"][0]["message"]["content"]
@@ -177,7 +187,7 @@ def openrouter_upscale_text(
     if r.status_code >= 400:
         raise RemoteError(f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}")
 
-    js = r.json()
+    js = _json_response(r, "OpenRouter upscale")
     out_text = ""
     try:
         out_text = (js["choices"][0]["message"]["content"] or "").strip()

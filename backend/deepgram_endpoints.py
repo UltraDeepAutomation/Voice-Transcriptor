@@ -24,7 +24,23 @@ import os
 # override exists so an operator can point a deployment at a
 # regional endpoint (e.g. ``api-eu.deepgram.com``) or a mock
 # server during integration tests, without touching the code.
-_HOST = (os.environ.get("TRANSCRIPTOR_DEEPGRAM_HOST") or "api.deepgram.com").strip()
+_DEFAULT_HOST = "api.deepgram.com"
+
+
+def _deepgram_host_from_env() -> str:
+    host = (os.environ.get("TRANSCRIPTOR_DEEPGRAM_HOST") or "").strip() or _DEFAULT_HOST
+    if (
+        "://" in host
+        or "/" in host
+        or "?" in host
+        or "#" in host
+        or any(ch.isspace() for ch in host)
+    ):
+        raise ValueError("TRANSCRIPTOR_DEEPGRAM_HOST must be a host[:port] value without scheme or path")
+    return host
+
+
+_HOST = _deepgram_host_from_env()
 
 DEEPGRAM_REST_BASE = f"https://{_HOST}/v1"
 DEEPGRAM_LIVE_URL = f"wss://{_HOST}/v1/listen"

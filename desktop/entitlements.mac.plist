@@ -29,12 +29,11 @@
 		documentation recommends this entitlement when shipping
 		outside a notarized Developer ID workflow.
 
-		Keeping this entitlement here is the SSOT: every signing run
-		(afterPack.js) passes entitlements.mac.plist to the top-level
-		bundle, so the flag is automatically sealed into the main
-		binary's code signature. The nested helpers do not need this
-		entitlement because they are loaded BY the main binary, not
-		the other way around — the check only runs on the consumer.
+			Keeping this entitlement here is the SSOT for the top-level app.
+			afterPack.js passes entitlements.mac.plist to Transcriptor.app
+			and entitlements.mac.inherit.plist to nested helpers/frameworks,
+			because each helper also loads Electron Framework under the
+			same hardened-runtime library-validation path.
 	-->
 	<key>com.apple.security.cs.disable-library-validation</key>
 	<true/>

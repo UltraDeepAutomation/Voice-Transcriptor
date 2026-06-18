@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from faster_whisper import WhisperModel
 
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+
 logger = logging.getLogger(__name__)
 
 # Per-model locks: loading model A must not serialise with loading
@@ -174,7 +176,7 @@ def warm_model(model_name: str, probe: bool = False) -> Dict[str, float]:
         probe_started = time.perf_counter()
         try:
             transcribe_audio(
-                np.zeros((16000,), dtype=np.float32),
+                np.zeros((LIVE_SAMPLE_RATE_HZ,), dtype=np.float32),
                 model_name,
                 language=None,
                 vad_filter=True,
@@ -306,7 +308,7 @@ def transcribe_audio(
             # ternary — line 245 above already raises ValueError on
             # None, so by the time control reaches this except branch
             # ``audio_16k_mono`` is guaranteed to be a real ndarray.
-            duration = float(audio_16k_mono.shape[0]) / 16000.0
+            duration = float(audio_16k_mono.shape[0]) / float(LIVE_SAMPLE_RATE_HZ)
             return _empty_transcribe_result(duration)
         raise
 

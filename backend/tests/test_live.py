@@ -6,14 +6,19 @@ import io
 import json
 import os
 import sys
+import tempfile
 from unittest import mock
 
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
 from backend.live import LiveConfig, LiveSession
 
 
-class WebSocketAuthTokenTests(unittest.TestCase):
+class IsolatedBackendMainImportMixin:
     def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self._tmp_data_dir = tempfile.TemporaryDirectory()
         os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
+        os.environ["TRANSCRIPTOR_DATA_DIR"] = self._tmp_data_dir.name
         for name in ("backend.main", "backend.config"):
             sys.modules.pop(name, None)
         self.main = importlib.import_module("backend.main")
@@ -26,7 +31,14 @@ class WebSocketAuthTokenTests(unittest.TestCase):
         for name in ("backend.main", "backend.config"):
             sys.modules.pop(name, None)
         os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
+        self._tmp_data_dir.cleanup()
 
+
+class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase):
     def test_websocket_token_comes_from_subprotocol_not_query(self):
         token = "tok value/with unicode ью"
         encoded = base64.urlsafe_b64encode(token.encode("utf-8")).decode("ascii").rstrip("=")
@@ -104,7 +116,7 @@ class WebSocketAuthTokenTests(unittest.TestCase):
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):
     async def test_force_transcribe_bypasses_min_step_for_stop_tail(self):
-        sr = 16_000
+        sr = LIVE_SAMPLE_RATE_HZ
         session = LiveSession(
             model_name="tiny",
             language=None,
@@ -143,22 +155,7 @@ class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [sr])
 
 
-class DeepgramLiveSessionTailTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
-        for name in ("backend.main", "backend.config"):
-            sys.modules.pop(name, None)
-        self.main = importlib.import_module("backend.main")
-
-    def tearDown(self):
-        try:
-            self.main.jobs.shutdown(timeout=0.1)
-        except Exception:
-            pass
-        for name in ("backend.main", "backend.config"):
-            sys.modules.pop(name, None)
-        os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
-
+class DeepgramLiveSessionTailTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):
     async def test_deepgram_upstream_close_keeps_receiving_tail_pcm_until_finalize(self):
         class FakeStats:
             bytes_sent = 0
