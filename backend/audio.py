@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -23,6 +24,7 @@ import soundfile as sf
 # announces / Whisper input contract / WAV writer rate stay in
 # lock-step from a single source.
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.storage import atomic_promote_file
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +326,7 @@ def _copy_file_atomic(path_in: str, path_out: str) -> None:
     tmp_out = f"{path_out}.tmp-{uuid.uuid4().hex}"
     try:
         shutil.copyfile(path_in, tmp_out)
-        os.replace(tmp_out, path_out)
+        atomic_promote_file(Path(tmp_out), Path(path_out))
     except Exception:
         try:
             os.unlink(tmp_out)

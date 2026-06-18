@@ -1,12 +1,12 @@
-# Voice Transcriptor — Verified Audit, 18 June 2026
+# Voice Transcriptor — Verified Audit, 18-19 June 2026
 
-Итог: подтверждено 58 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
+Итог: подтверждено 60 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
 
 Статус:
-- Исправлено: 58
+- Исправлено: 60
 - Оставлено с явным стопом: 0
 - P0: 0 найдено
-- P1: 31 найдено, 31 исправлено (100%)
+- P1: 33 найдено, 33 исправлено (100%)
 
 ## 1. P1 FIXED — keyfile race could overwrite Fernet key
 
@@ -1414,6 +1414,75 @@ all)
 
 Объяснение: platform support now has one truth across script usage, README, LICENSE, PROJECT_STRUCTURE, and changelog: macOS arm64, Windows x64, Linux x64. The impossible Intel runtime path no longer breaks `all`.
 
+## 59. P1 FIXED — audio file promotion bypassed durable storage SSOT
+
+Файл и строка: `backend/main.py:985`, `backend/main.py:5037`, `backend/audio.py:329`, `backend/storage.py:92`
+
+Суть: live recovery, edited recording audio, and atomic audio copies used raw `os.replace()` after writing tmp audio files instead of the shared durable storage primitive.
+
+Последствие: after a kernel crash or power loss, a transcript sidecar could be durable while the matching audio rename metadata was not, leaving a saved recording without its audio despite the UI reporting success.
+
+Было:
+```python
+write_wav(str(tmp_audio), pcm, LIVE_SAMPLE_RATE_HZ)
+os.replace(tmp_audio, audio_out)
+
+await write_tmp_audio(tmp_audio)
+os.replace(tmp_audio, out_audio)
+
+shutil.copyfile(path_in, tmp_out)
+os.replace(tmp_out, path_out)
+```
+
+Стало:
+```python
+write_wav(str(tmp_audio), pcm, LIVE_SAMPLE_RATE_HZ)
+atomic_promote_file(tmp_audio, audio_out)
+
+await write_tmp_audio(tmp_audio)
+atomic_promote_file(tmp_audio, out_audio)
+
+shutil.copyfile(path_in, tmp_out)
+atomic_promote_file(Path(tmp_out), Path(path_out))
+```
+
+Объяснение: `atomic_promote_file()` fsyncs the already-written tmp file, promotes it with atomic rename, fsyncs the parent directory on POSIX, and cleans up the tmp file on failure. Binary audio persistence now shares one SSOT with JSON/text writes instead of re-implementing rename durability at call sites.
+
+## 60. P1 FIXED — API token persistence duplicated the atomic-write layer
+
+Файл и строка: `backend/main.py:555`, `backend/storage.py:109`, `backend/tests/test_storage.py:124`
+
+Суть: API token persistence had a private `_secure_atomic_write_text()` implementation in `backend.main` instead of using the storage SSOT.
+
+Последствие: the most sensitive local secret used separate tmp cleanup, chmod, fsync, and rename semantics from the rest of the backend, so future storage hardening could miss the API token path.
+
+Было:
+```python
+def _secure_atomic_write_text(path: Path, content: str) -> None:
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    ...
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+_secure_atomic_write_text(API_TOKEN_PATH, token)
+```
+
+Стало:
+```python
+def atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    mode: Optional[int] = None,
+) -> None:
+    atomic_write_bytes(path, text.encode(encoding), mode=mode)
+
+atomic_write_text(API_TOKEN_PATH, token, mode=0o600)
+```
+
+Объяснение: secure file mode is now a feature of the shared storage primitive. The token path keeps `0600` permissions, but no longer carries a second atomic-write implementation in `main.py`.
+
 ## Verification
 
 Пройдено:
@@ -1430,8 +1499,11 @@ node --check desktop/main.js && node --check desktop/preload.js && node --check 
 bash -n BUILD.command INSTALL.command desktop/scripts/prepare-runtime.sh
 node desktop/scripts/require-bash.js win-x64
 bash desktop/scripts/prepare-runtime.sh all
-./BUILD.command
+(cd desktop && ./node_modules/.bin/electron-builder --mac dmg --arm64 --prepackaged dist/mac-arm64 --projectDir .)
+hdiutil verify desktop/dist/Transcriptor-1.1.25-arm64.dmg
 codesign --verify --deep --strict /Applications/Transcriptor.app
 codesign --verify --deep --strict ~/Applications/Transcriptor.app
 git diff --check
 ```
+
+Примечание 2026-06-19: повторный `./BUILD.command` дошел до валидного signed `Transcriptor.app`, но дважды падал на этапе `hdiutil` с `No space left on device` из-за почти полного диска. После очистки сгенерированных build/runtime/cache артефактов DMG был собран из уже подписанного prepackaged app и установлен в `/Applications` и `~/Applications`.

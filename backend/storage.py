@@ -23,12 +23,12 @@ helpers. The goals are uniform and non-negotiable across call sites:
        backend.main expects, so a crash mid-write does not leave
        permanent clutter.
 
-    5. SINGLE IMPLEMENTATION — NO caller opens a file for write
-       directly. All JSON / text / bytes persistence routes here.
-       This keeps fsync semantics, tmp-naming conventions, and
-       error handling identical across the whole codebase, so a
-       future improvement (say, async writes or a different tmp
-       location under a ramdisk) is a one-file change.
+    5. SINGLE IMPLEMENTATION — NO caller opens a final persistent file
+       for write directly. JSON / text / bytes writes and already-written
+       tmp-file promotions route here. This keeps fsync semantics,
+       tmp-naming conventions, and error handling identical across the
+       whole codebase, so a future improvement (say, async writes or a
+       different tmp location under a ramdisk) is a one-file change.
 
 The helpers raise ``OSError`` on any failure. They clean up the tmp
 file before re-raising so no half-written artefact lingers.
@@ -42,7 +42,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,29 @@ def _fsync_parent_dir(path: Path) -> None:
         logger.warning("parent dir fsync skipped at %s: %s", path.parent, e)
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def _fsync_file(path: Path) -> None:
+    with open(path, "rb") as f:
+        os.fsync(f.fileno())
+
+
+def atomic_promote_file(tmp_path: Path, path: Path) -> None:
+    """Promote an already-written tmp file into place atomically + durably."""
+    tmp_path = Path(tmp_path)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _fsync_file(tmp_path)
+        os.replace(tmp_path, path)
+        _fsync_parent_dir(path)
+    except OSError:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_bytes(path: Path, data: bytes, *, mode: Optional[int] = None) -> None:
     """Write *data* to *path* atomically and durably.
 
     Raises ``OSError`` on disk failures; always cleans up the tmp
@@ -95,15 +117,34 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     try:
         # Open explicitly so we can fsync the file descriptor after
         # writing — ``Path.write_bytes`` does not expose that hook.
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+        if mode is None:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            fd: Optional[int] = None
+            try:
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+                with os.fdopen(fd, "wb") as f:
+                    fd = None
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+            finally:
+                if fd is not None:
+                    os.close(fd)
         # Atomic rename. Both POSIX (``rename(2)``) and Windows
         # (``MoveFileExW`` with MOVEFILE_REPLACE_EXISTING) guarantee
         # the target is either the old file or the new file, never a
         # torn in-between state.
         os.replace(tmp, path)
+        if mode is not None:
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                if os.name != "nt":
+                    raise
         _fsync_parent_dir(path)
     except OSError:
         try:
@@ -113,13 +154,19 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+def atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    mode: Optional[int] = None,
+) -> None:
     """UTF-8 text flavour of ``atomic_write_bytes``.
 
     Splits via ``text.encode()`` so callers who pass already-computed
     bytes do not double-encode.
     """
-    atomic_write_bytes(path, text.encode(encoding))
+    atomic_write_bytes(path, text.encode(encoding), mode=mode)
 
 
 def atomic_write_json(path: Path, data: JSONData, *, indent: int = 2) -> None:

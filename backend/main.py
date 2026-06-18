@@ -52,7 +52,7 @@ from backend.audio import (
     write_wav,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
-from backend.storage import atomic_write_bytes, atomic_write_json, atomic_write_text
+from backend.storage import atomic_promote_file, atomic_write_bytes, atomic_write_json, atomic_write_text
 from backend.live import LiveSession
 from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
@@ -523,35 +523,6 @@ _live_promote_cache: dict[str, tuple[float, dict]] = {}
 _LIVE_PROMOTE_CACHE_TTL_SEC = 60.0
 
 
-def _secure_atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
-    fd: Optional[int] = None
-    try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            fd = None
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            if os.name != "nt":
-                raise
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def _load_or_create_api_token() -> str:
     env_token = os.environ.get("TRANSCRIPTOR_API_TOKEN", "").strip()
     if env_token:
@@ -581,7 +552,7 @@ def _load_or_create_api_token() -> str:
         # A zero-length token file would pass the `API_TOKEN_PATH.exists()`
         # probe on next boot, read as empty, and the auth guard would
         # lock the user out until the file is manually deleted.
-        _secure_atomic_write_text(API_TOKEN_PATH, token)
+        atomic_write_text(API_TOKEN_PATH, token, mode=0o600)
     except OSError as e:
         logger.error(
             "api token persist failed at %s: %s — using in-memory token "
@@ -1011,7 +982,7 @@ def _promote_live_recovery(
             tmp_audio = _atomic_temp_path(audio_out)
             try:
                 write_wav(str(tmp_audio), pcm, LIVE_SAMPLE_RATE_HZ)
-                os.replace(tmp_audio, audio_out)
+                atomic_promote_file(tmp_audio, audio_out)
                 _write_recording_text_file(
                     out=text_out,
                     title=title,
@@ -5063,7 +5034,7 @@ async def _save_recording_audio_source(
     save_completed = False
     try:
         await write_tmp_audio(tmp_audio)
-        os.replace(tmp_audio, out_audio)
+        atomic_promote_file(tmp_audio, out_audio)
         new_audio_placed = True
         _write_recording_text_file(
             out=out_text,

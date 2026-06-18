@@ -28,6 +28,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from backend.storage import (
+    atomic_promote_file,
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
@@ -80,6 +81,33 @@ class TestAtomicWriteBytes(unittest.TestCase):
             self.assertEqual(stale, [], f"tmp left on failure: {stale}")
 
 
+class TestAtomicPromoteFile(unittest.TestCase):
+    def test_promotes_existing_tmp_file_durably(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            tmp = root / "recording.wav.tmp-abcdef"
+            target = root / "recording.wav"
+            tmp.write_bytes(b"audio-payload")
+
+            atomic_promote_file(tmp, target)
+
+            self.assertEqual(target.read_bytes(), b"audio-payload")
+            self.assertFalse(tmp.exists())
+            self.assertEqual(list(root.glob("*.tmp-*")), [])
+
+    def test_cleanup_on_missing_tmp_failure(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            tmp = root / "missing.wav.tmp-abcdef"
+            target = root / "missing.wav"
+
+            with self.assertRaises(OSError):
+                atomic_promote_file(tmp, target)
+
+            self.assertFalse(target.exists())
+            self.assertFalse(tmp.exists())
+
+
 class TestAtomicWriteText(unittest.TestCase):
     def test_utf8(self):
         with TemporaryDirectory() as td:
@@ -92,6 +120,14 @@ class TestAtomicWriteText(unittest.TestCase):
             p = Path(td) / "empty.txt"
             atomic_write_text(p, "")
             self.assertEqual(p.read_text(encoding="utf-8"), "")
+
+    def test_mode_applied_for_secret_file(self):
+        with TemporaryDirectory() as td:
+            p = Path(td) / "secret.txt"
+            atomic_write_text(p, "token", mode=0o600)
+            self.assertEqual(p.read_text(encoding="utf-8"), "token")
+            if os.name != "nt":
+                self.assertEqual(p.stat().st_mode & 0o777, 0o600)
 
 
 class TestAtomicWriteJson(unittest.TestCase):
