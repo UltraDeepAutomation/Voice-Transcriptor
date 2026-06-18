@@ -1,12 +1,12 @@
 # Voice Transcriptor — Verified Audit, 18 June 2026
 
-Итог: подтверждено 45 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
+Итог: подтверждено 58 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
 
 Статус:
-- Исправлено: 45
+- Исправлено: 58
 - Оставлено с явным стопом: 0
 - P0: 0 найдено
-- P1: 20 найдено, 20 исправлено (100%)
+- P1: 31 найдено, 31 исправлено (100%)
 
 ## 1. P1 FIXED — keyfile race could overwrite Fernet key
 
@@ -1156,6 +1156,264 @@ syncQuickSettingsVisibility(next);
 
 Объяснение: the UI boundary now normalizes the DOM state to a strict boolean before calling the app state helper.
 
+## 50. P1 FIXED — API token leaked through HTTP and WebSocket query strings
+
+Файл и строка: `backend/main.py:1064`, `backend/main.py:2758`, `frontend/src/main.tsx:6833`
+
+Суть: HTTP auth accepted `?token=...`, and live WebSocket auth sent the API token in the URL query.
+
+Последствие: local access logs, crash logs, browser/devtools history, proxies, or screenshots could expose the API token.
+
+Было:
+```python
+provided = (request.headers.get("x-api-token") or request.query_params.get("token") or "").strip()
+token = (websocket.query_params.get("token") or "").strip()
+await websocket.accept()
+```
+
+```ts
+wsQuery.set("token", apiToken());
+ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString());
+```
+
+Стало:
+```python
+provided = (request.headers.get("x-api-token") or "").strip()
+token = _websocket_api_token(websocket)
+await websocket.accept(subprotocol=_websocket_accept_subprotocol(websocket))
+```
+
+```ts
+ws = new WebSocket(
+  wsBase() + "/ws/transcribe?" + wsQuery.toString(),
+  websocketAuthProtocols(),
+);
+```
+
+Объяснение: HTTP auth теперь принимает token только из `X-Api-Token`; browser WebSocket передает token как base64url subprotocol (`transcriptor-token.<payload>`), а accepted subprotocol возвращается без секрета.
+
+## 51. P1 FIXED — macOS arm64/Linux ffmpeg release inputs were not fully pinned
+
+Файл и строка: `desktop/scripts/prepare-runtime.sh:44`
+
+Суть: macOS arm64 ffmpeg archive was fetched without SHA256 validation, and Linux used the mutable `ffmpeg-release-amd64-static.tar.xz` alias.
+
+Последствие: release builds were not reproducible across platforms; a changed or corrupted upstream asset could enter the packaged runtime silently.
+
+Было:
+```bash
+FFMPEG_MAC_ARM64_URL="https://www.osxexperts.net/ffmpeg71arm.zip"
+FFMPEG_LINUX_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+fetch "${url}" "${zip}"
+fetch "${FFMPEG_LINUX_URL}" "${tar}"
+```
+
+Стало:
+```bash
+FFMPEG_MAC_ARM64_SHA256="0878f3313311c2c1b2c818e7c955c0bd828c97b357fa86211b42a5c36d01e36f"
+FFMPEG_LINUX_ASSET="ffmpeg-7.0.2-amd64-static.tar.xz"
+FFMPEG_LINUX_SHA256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
+fetch "${url}" "${zip}" "${sha256}"
+fetch "${FFMPEG_LINUX_URL}" "${tar}" "${FFMPEG_LINUX_SHA256}"
+```
+
+Объяснение: every bundled ffmpeg asset now has immutable URL intent plus SHA256 validation through the existing `fetch()` SSOT.
+
+## 52. P3 FIXED — LICENSE omitted Linux bundled runtime distribution
+
+Файл и строка: `LICENSE:30`
+
+Суть: license notes said bundled Python/ffmpeg were distributed only for Windows and macOS.
+
+Последствие: legal/docs inventory did not match the actual Linux AppImage packaging.
+
+Было:
+```text
+Windows + macOS installers.
+binary for Windows + macOS.
+```
+
+Стало:
+```text
+Windows x64, macOS arm64, and Linux x64 installers.
+binary for Windows x64, macOS arm64, and Linux x64.
+```
+
+Объяснение: third-party component disclosure now follows the same platform matrix as electron-builder `extraResources`.
+
+## 53. P2 FIXED — Windows release docs used PowerShell for a Bash-only build script
+
+Файл и строка: `README.md:75`, `desktop/package.json:18`, `desktop/scripts/require-bash.js:1`, `INSTALL.command:25`
+
+Суть: README showed the Windows package command inside a PowerShell block and the npm script failed with a raw missing-`bash` error.
+
+Последствие: Windows release builds could fail immediately for users running the documented command in plain PowerShell/cmd, without explaining the required shell.
+
+Было:
+```powershell
+npm --prefix desktop run dist:win
+```
+
+Стало:
+```bash
+npm --prefix desktop run dist:win
+```
+
+```js
+"dist:win": "node ./scripts/require-bash.js win-x64 && bash ./scripts/prepare-runtime.sh win-x64 && ..."
+```
+
+Объяснение: README and INSTALL now state the Bash requirement, and `dist:win` fail-fast reports the required shell before runtime preparation starts.
+
+## 54. P1 FIXED — Node version requirement was implicit and not enforced by repo metadata
+
+Файл и строка: `README.md:46`, `frontend/package.json:6`, `desktop/package.json:8`
+
+Суть: current Vite/Electron release tooling requires modern Node, but the repo had no `.node-version`, `.nvmrc`, or package `engines`.
+
+Последствие: source builds could fail with opaque npm/engine errors on older Node installations.
+
+Было:
+```json
+{
+  "scripts": {
+    "build": "tsc --noEmit && vite build"
+  }
+}
+```
+
+Стало:
+```json
+{
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10"
+  }
+}
+```
+
+Объяснение: Node runtime expectations are now visible in README, package manifests, lockfiles, `.node-version`, and `.nvmrc`.
+
+## 55. P1 FIXED — backend runtime import check covered only a subset of runtime dependencies
+
+Файл и строка: `desktop/main.js:8`, `desktop/main.js:5681`
+
+Суть: Electron startup verified only `fastapi`, `uvicorn`, `multipart`, and `cryptography`, missing core runtime imports such as `faster_whisper`, `soundfile`, `numpy`, `requests`, and `websockets`.
+
+Последствие: a broken bundled runtime could pass boot checks and fail later during transcription or provider calls.
+
+Было:
+```js
+["-c", "import fastapi, uvicorn, multipart, cryptography"]
+```
+
+Стало:
+```js
+const BACKEND_RUNTIME_IMPORTS = Object.freeze([
+  "fastapi", "uvicorn", "multipart", "cryptography", "faster_whisper",
+  "soundfile", "numpy", "requests", "websockets",
+]);
+const BACKEND_RUNTIME_IMPORT_CHECK = `import ${BACKEND_RUNTIME_IMPORTS.join(", ")}`;
+["-c", BACKEND_RUNTIME_IMPORT_CHECK]
+```
+
+Объяснение: startup and post-install verification now share one runtime import SSOT, so dependency drift is caught before the app exposes a broken backend.
+
+## 56. P1 FIXED — python-build-standalone runtime downloads were unverified
+
+Файл и строка: `desktop/scripts/prepare-runtime.sh:61`, `desktop/scripts/prepare-runtime.sh:106`, `desktop/scripts/prepare-runtime.sh:137`
+
+Суть: Python runtime tarballs were pinned by version tag but fetched without SHA256 verification.
+
+Последствие: a corrupted or replaced Python runtime archive could be cached and packaged without detection.
+
+Было:
+```bash
+fetch "${url}" "${cached}"
+```
+
+Стало:
+```bash
+python_sha256_for_triple() {
+  case "${triple}" in
+    aarch64-apple-darwin) printf '%s\n' "38f71c324ae14ee5ef844c62e06b6faa5ba3040c898b4c1d03b8b6e88794356b" ;;
+    x86_64-apple-darwin) printf '%s\n' "bf9e2eb4834272cae196e4a8473d48f15878114cedbc278fe53cd85ab28dc0ed" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "d785d2e901a8194dcdb8c23c2b37a46ed84fdc04e87398dc5b832644330de71e" ;;
+    x86_64-unknown-linux-gnu) printf '%s\n' "3c3427e5628648478da2aa227472c350475a68bc58109f1b43849636a4aecb89" ;;
+  esac
+}
+fetch "${url}" "${cached}" "$(python_sha256_for_triple "${triple}")"
+```
+
+Объяснение: `fetch()` now requires SHA256 for every release artifact, including Python; unsupported triples fail closed instead of downloading unverified runtime code.
+
+## 57. P1 FIXED — macOS signer tried to codesign Electron binary resource files
+
+Файл и строка: `desktop/afterPack.js:90`, `desktop/afterPack.js:457`
+
+Суть: `@electron/osx-sign` walked every binary file under `Contents`, and our per-file hook gave entitlements to non-code Electron resources such as `*.pak` locale/resource files.
+
+Последствие: Electron 42 macOS packaging failed during signing with `No such file or directory` for `Electron Framework.framework/.../lv.lproj/locale.pak`, blocking release builds.
+
+Было:
+```js
+await signApp({
+  app: appPath,
+  optionsForFile: (filePath) => ({ entitlements: inheritEntitlements, hardenedRuntime: true }),
+});
+```
+
+Стало:
+```js
+function shouldIgnoreOsxSignPath(filePath, appPath, runtimeRoot) {
+  if (filePath === appPath) return false;
+  if (pathIsInside(filePath, runtimeRoot)) return true;
+  if (filePath.endsWith(".app") || filePath.endsWith(".framework")) return false;
+  const kind = classifyMacho(filePath);
+  return kind === "non-macho" || kind === "macho-other";
+}
+
+await signApp({
+  app: appPath,
+  ignore: (filePath) => shouldIgnoreOsxSignPath(filePath, appPath, runtimeRoot),
+  optionsForFile: (filePath) => ({ entitlements: inheritEntitlements, hardenedRuntime: true }),
+});
+```
+
+Объяснение: runtime Mach-O files are pre-signed once, Electron app/framework bundles are still signed by `osx-sign`, and non-Mach-O binary resources remain unsigned resources captured by the top-level CodeResources envelope.
+
+## 58. P1 FIXED — stale macOS Intel runtime target contradicted arm64-only build policy
+
+Файл и строка: `desktop/scripts/prepare-runtime.sh:12`, `README.md:11`, `PROJECT_STRUCTURE.md:95`
+
+Суть: changelog/build scripts already made macOS release packaging arm64-only, but `prepare-runtime.sh`, README, and project docs still advertised a mac-x64 bundled runtime path.
+
+Последствие: `prepare-runtime.sh mac-x64` and `prepare-runtime.sh all` failed because the wheel-only runtime graph pins `cryptography==49.0.0`, and that version publishes macOS arm64 wheels but no macOS x86_64 wheels.
+
+Было:
+```bash
+# Usage included mac-x64
+mac-x64) build_mac_x64 ;;
+all)
+  build_win_x64
+  build_mac_arm64
+  build_mac_x64
+  build_linux_x64
+  ;;
+```
+
+Стало:
+```bash
+# macOS packaged runtime support is arm64-only.
+all)
+  build_win_x64
+  build_mac_arm64
+  build_linux_x64
+  ;;
+```
+
+Объяснение: platform support now has one truth across script usage, README, LICENSE, PROJECT_STRUCTURE, and changelog: macOS arm64, Windows x64, Linux x64. The impossible Intel runtime path no longer breaks `all`.
+
 ## Verification
 
 Пройдено:
@@ -1164,10 +1422,14 @@ python3 -m unittest discover backend/tests -q
 python3 -m compileall -q backend
 npm --prefix frontend audit --audit-level=moderate
 npm --prefix desktop audit --audit-level=moderate
+npm --prefix frontend ci --dry-run --ignore-scripts
+npm --prefix desktop ci --dry-run --ignore-scripts
 npm --prefix frontend run build
 npm --prefix desktop run build:frontend
-node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/unlockDist.js && node --check desktop/afterPack.js
+node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/unlockDist.js && node --check desktop/afterPack.js && node --check desktop/scripts/require-bash.js
 bash -n BUILD.command INSTALL.command desktop/scripts/prepare-runtime.sh
+node desktop/scripts/require-bash.js win-x64
+bash desktop/scripts/prepare-runtime.sh all
 ./BUILD.command
 codesign --verify --deep --strict /Applications/Transcriptor.app
 codesign --verify --deep --strict ~/Applications/Transcriptor.app

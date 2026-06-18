@@ -88,6 +88,67 @@ function walkTree(root, visitor) {
   visit(root);
 }
 
+function pathIsInside(candidate, root) {
+  const rel = path.relative(root, candidate);
+  return rel === "" || (rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+// Read first 16 bytes to detect Mach-O filetype.
+//   magic (u32) + cputype (u32) + cpusubtype (u32) + filetype (u32)
+//   MH_EXECUTE = 2, MH_DYLIB = 6, MH_BUNDLE = 8
+function classifyMacho(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, "r");
+  } catch { return "non-macho"; }
+  try {
+    const buf = Buffer.alloc(16);
+    const n = readSync(fd, buf, 0, 16, 0);
+    if (n < 16) return "non-macho";
+    const magicLE = buf.readUInt32LE(0);
+    const magicBE = buf.readUInt32BE(0);
+    // Thin Mach-O: both 64-bit (feedfacf) and 32-bit (feedface).
+    // filetype at offset 12: MH_EXECUTE=2, MH_DYLIB=6, MH_BUNDLE=8
+    if (magicLE === 0xfeedfacf || magicLE === 0xfeedface) {
+      const filetype = buf.readUInt32LE(12);
+      if (filetype === 2) return "executable";
+      if (filetype === 6 || filetype === 8) return "dylib";
+      return "macho-other";
+    }
+    // Fat Mach-O: magic is BE (cafebabe / cafebabf). Read one
+    // nested arch's thin header to determine the real filetype.
+    if (magicBE === 0xcafebabe || magicBE === 0xcafebabf) {
+      const fatHdr = Buffer.alloc(24); // magic(4)+nfat(4)+first fat_arch(16)
+      if (readSync(fd, fatHdr, 0, 24, 0) < 24) return "macho-other";
+      const firstOff = fatHdr.readUInt32BE(16);
+      const thinHdr = Buffer.alloc(16);
+      if (readSync(fd, thinHdr, 0, 16, firstOff) < 16) return "macho-other";
+      const thinMagic = thinHdr.readUInt32LE(0);
+      if (thinMagic !== 0xfeedfacf && thinMagic !== 0xfeedface) {
+        return "macho-other";
+      }
+      const filetype = thinHdr.readUInt32LE(12);
+      if (filetype === 2) return "executable";
+      if (filetype === 6 || filetype === 8) return "dylib";
+      return "macho-other";
+    }
+    return "non-macho";
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+function shouldIgnoreOsxSignPath(filePath, appPath, runtimeRoot) {
+  if (filePath === appPath) return false;
+  if (pathIsInside(filePath, runtimeRoot)) return true;
+  if (filePath.endsWith(".app") || filePath.endsWith(".framework")) return false;
+  let st;
+  try { st = lstatSync(filePath); } catch { return true; }
+  if (!st.isFile()) return false;
+  const kind = classifyMacho(filePath);
+  return kind === "non-macho" || kind === "macho-other";
+}
+
 function assertNoBundledBytecode(appPath) {
   const offenders = [];
   for (const relRoot of PYTHON_IMPORT_TREES) {
@@ -264,60 +325,10 @@ exports.default = async function afterPack(context) {
     let execCount = 0;
     let dylibCount = 0;
 
-    // Read first 16 bytes to detect Mach-O filetype.
-    //   magic (u32) + cputype (u32) + cpusubtype (u32) + filetype (u32)
-    //   MH_EXECUTE = 2, MH_DYLIB = 6, MH_BUNDLE = 8
     // codesign REJECTS --entitlements / --options runtime on MH_DYLIB /
     // MH_BUNDLE. Passing them to a plain .so silently fails ("invalid
     // format for a code signature"), leaving the file unsigned and the
     // site-packages extension unloadable under hardened runtime.
-    const classifyMacho = (filePath) => {
-      let fd;
-      try {
-        fd = openSync(filePath, "r");
-      } catch { return "non-macho"; }
-      try {
-        const buf = Buffer.alloc(16);
-        const n = readSync(fd, buf, 0, 16, 0);
-        if (n < 16) return "non-macho";
-        const magicLE = buf.readUInt32LE(0);
-        const magicBE = buf.readUInt32BE(0);
-        // Thin Mach-O: both 64-bit (feedfacf) and 32-bit (feedface).
-        // filetype at offset 12: MH_EXECUTE=2, MH_DYLIB=6, MH_BUNDLE=8
-        if (magicLE === 0xfeedfacf || magicLE === 0xfeedface) {
-          const filetype = buf.readUInt32LE(12);
-          if (filetype === 2) return "executable";
-          if (filetype === 6 || filetype === 8) return "dylib";
-          return "macho-other";
-        }
-        // Fat Mach-O: magic is BE (cafebabe / cafebabf). Read one
-        // nested arch's thin header to determine the REAL filetype.
-        // Prior code assumed fat = executable; that sent runtime
-        // hardening + entitlements into fat DYLIBS (onnxruntime,
-        // cryptography _rust, numpy libgcc_s) where neither has
-        // any effect and where a future macOS codesign hardening
-        // could reject the combination.
-        if (magicBE === 0xcafebabe || magicBE === 0xcafebabf) {
-          const fatHdr = Buffer.alloc(24); // magic(4)+nfat(4)+first fat_arch(16)
-          if (readSync(fd, fatHdr, 0, 24, 0) < 24) return "macho-other";
-          const firstOff = fatHdr.readUInt32BE(16);
-          const thinHdr = Buffer.alloc(16);
-          if (readSync(fd, thinHdr, 0, 16, firstOff) < 16) return "macho-other";
-          const thinMagic = thinHdr.readUInt32LE(0);
-          if (thinMagic !== 0xfeedfacf && thinMagic !== 0xfeedface) {
-            return "macho-other";
-          }
-          const filetype = thinHdr.readUInt32LE(12);
-          if (filetype === 2) return "executable";
-          if (filetype === 6 || filetype === 8) return "dylib";
-          return "macho-other";
-        }
-        return "non-macho";
-      } finally {
-        try { closeSync(fd); } catch { /* ignore */ }
-      }
-    };
-
     const signOne = (filePath, kind) => {
       // Executables get hardened-runtime + entitlements.
       // Dylibs / bundles get a bare signature (entitlements aren't valid
@@ -401,6 +412,7 @@ exports.default = async function afterPack(context) {
     type: "distribution",
     hardenedRuntime: true,
     preAutoEntitlements: false,
+    ignore: (filePath) => shouldIgnoreOsxSignPath(filePath, appPath, runtimeRoot),
     // Per-file entitlements hook.
     //
     // Top-level .app bundle gets the full entitlements

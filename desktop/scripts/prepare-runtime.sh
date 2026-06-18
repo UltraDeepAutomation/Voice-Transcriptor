@@ -9,7 +9,6 @@
 #
 #  Usage:  prepare-runtime.sh win-x64
 #          prepare-runtime.sh mac-arm64
-#          prepare-runtime.sh mac-x64
 #          prepare-runtime.sh linux-x64
 #          prepare-runtime.sh all
 #
@@ -37,13 +36,14 @@ FFMPEG_WIN_RELEASE="autobuild-2026-06-18-14-21"
 FFMPEG_WIN_ASSET="ffmpeg-N-125093-gd2d371d10d-win64-gpl.zip"
 FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_WIN_RELEASE}/${FFMPEG_WIN_ASSET}"
 FFMPEG_WIN_SHA256="90582d696445953f154beac0f73180961fe8c079db1c50238f9f28b5f84dfc1c"
-# evermeet.cx only publishes x86_64 Mac ffmpeg — running it on Apple
-# Silicon requires Rosetta 2 (not installed by default on clean macOS
-# installs). osxexperts.net publishes an arm64-native ffmpeg 7.1
-# separately so arm64 users get a native binary.
-FFMPEG_MAC_X64_URL="https://evermeet.cx/ffmpeg/ffmpeg-7.1.zip"
+# macOS packaged runtime support is arm64-only. Intel packaging was
+# dropped before 1.1.25 and cannot use the current wheel-only runtime
+# graph because cryptography 49.0.0 publishes macOS arm64 wheels only.
 FFMPEG_MAC_ARM64_URL="https://www.osxexperts.net/ffmpeg71arm.zip"
-FFMPEG_LINUX_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+FFMPEG_MAC_ARM64_SHA256="0878f3313311c2c1b2c818e7c955c0bd828c97b357fa86211b42a5c36d01e36f"
+FFMPEG_LINUX_ASSET="ffmpeg-7.0.2-amd64-static.tar.xz"
+FFMPEG_LINUX_URL="https://johnvansickle.com/ffmpeg/releases/${FFMPEG_LINUX_ASSET}"
+FFMPEG_LINUX_SHA256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
 
 log()  { printf '\033[1;36m[prep]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[prep]\033[0m %s\n' "$*" >&2; }
@@ -57,12 +57,10 @@ fetch() {
   local sha256="${3:-}"
   local meta="${dest}.url"
   local sha_meta="${dest}.sha256"
+  [ -n "${sha256}" ] || die "missing SHA256 for ${dest##*/}"
   if [ -f "${dest}" ] && [ -s "${dest}" ] && [ -f "${meta}" ] && [ "$(cat "${meta}")" = "${url}" ]; then
-    if [ -z "${sha256}" ]; then
-      log "cached  ${dest##*/}"
-      return 0
-    fi
-    if [ -f "${sha_meta}" ] && [ "$(cat "${sha_meta}")" = "${sha256}" ] && [ "$(sha256_file "${dest}")" = "${sha256}" ]; then
+    if [ "$(sha256_file "${dest}")" = "${sha256}" ]; then
+      printf '%s\n' "${sha256}" > "${sha_meta}"
       log "cached  ${dest##*/}"
       return 0
     fi
@@ -71,20 +69,12 @@ fetch() {
   fi
   log "fetching ${url}"
   curl -fSL --retry 3 --retry-delay 2 -o "${dest}.part" "${url}"
-  if [ -n "${sha256}" ]; then
-    verify_sha256 "${dest}.part" "${sha256}"
-  fi
+  verify_sha256 "${dest}.part" "${sha256}"
   printf '%s\n' "${url}" > "${meta}.part"
-  if [ -n "${sha256}" ]; then
-    printf '%s\n' "${sha256}" > "${sha_meta}.part"
-  else
-    rm -f "${sha_meta}.part" "${sha_meta}"
-  fi
+  printf '%s\n' "${sha256}" > "${sha_meta}.part"
   mv "${dest}.part" "${dest}"
   mv "${meta}.part" "${meta}"
-  if [ -n "${sha256}" ]; then
-    mv "${sha_meta}.part" "${sha_meta}"
-  fi
+  mv "${sha_meta}.part" "${sha_meta}"
 }
 
 sha256_file() {
@@ -109,6 +99,24 @@ verify_sha256() {
   fi
 }
 
+python_sha256_for_triple() {
+  local triple="$1"
+  case "${triple}" in
+    aarch64-apple-darwin)
+      printf '%s\n' "38f71c324ae14ee5ef844c62e06b6faa5ba3040c898b4c1d03b8b6e88794356b"
+      ;;
+    x86_64-pc-windows-msvc)
+      printf '%s\n' "d785d2e901a8194dcdb8c23c2b37a46ed84fdc04e87398dc5b832644330de71e"
+      ;;
+    x86_64-unknown-linux-gnu)
+      printf '%s\n' "3c3427e5628648478da2aa227472c350475a68bc58109f1b43849636a4aecb89"
+      ;;
+    *)
+      die "missing python-build-standalone SHA256 for ${triple}"
+      ;;
+  esac
+}
+
 # -----------------------------------------------------------------------------
 # Download + extract python-build-standalone for the target triple.
 #   $1 = runtime platform dir (e.g. runtime/win-x64)
@@ -119,7 +127,7 @@ install_python() {
   local tarball="cpython-${PBS_PYVER}+${PBS_TAG}-${triple}-install_only_stripped.tar.gz"
   local url="https://github.com/indygreg/python-build-standalone/releases/download/${PBS_TAG}/${tarball}"
   local cached="${CACHE_DIR}/${tarball}"
-  fetch "${url}" "${cached}"
+  fetch "${url}" "${cached}" "$(python_sha256_for_triple "${triple}")"
   rm -rf "${out_dir}"
   mkdir -p "${out_dir}"
   log "extracting python for ${triple}"
@@ -198,16 +206,16 @@ install_ffmpeg_win() {
 
 install_ffmpeg_mac() {
   local out_dir="$1" arch="$2"
-  local url cache_name
+  local url cache_name sha256
   if [ "${arch}" = "arm64" ]; then
     url="${FFMPEG_MAC_ARM64_URL}"
     cache_name="ffmpeg-mac-arm64.zip"
+    sha256="${FFMPEG_MAC_ARM64_SHA256}"
   else
-    url="${FFMPEG_MAC_X64_URL}"
-    cache_name="ffmpeg-mac-x64.zip"
+    die "macOS bundled runtime is arm64-only; unsupported arch: ${arch}"
   fi
   local zip="${CACHE_DIR}/${cache_name}"
-  fetch "${url}" "${zip}"
+  fetch "${url}" "${zip}" "${sha256}"
   rm -rf "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
   # osxexperts arm zip contains __MACOSX/ metadata junk; extract only
@@ -242,7 +250,7 @@ install_ffmpeg_mac() {
 install_ffmpeg_linux() {
   local out_dir="$1"
   local tar="${CACHE_DIR}/ffmpeg-linux.tar.xz"
-  fetch "${FFMPEG_LINUX_URL}" "${tar}"
+  fetch "${FFMPEG_LINUX_URL}" "${tar}" "${FFMPEG_LINUX_SHA256}"
   rm -rf "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
   local tmp
@@ -292,16 +300,6 @@ build_mac_arm64() {
   du -sh "${out_dir}" | awk '{print "size:", $1}'
 }
 
-build_mac_x64() {
-  local out_dir="${RUNTIME_DIR}/mac-x64"
-  log "=== macOS x64 (Intel) ==="
-  install_python "${out_dir}" "x86_64-apple-darwin"
-  install_wheels "${out_dir}" "cp312" \
-    "macosx_13_0_x86_64" "macosx_12_0_x86_64" "macosx_10_13_x86_64"
-  install_ffmpeg_mac "${out_dir}" "x86_64"
-  du -sh "${out_dir}" | awk '{print "size:", $1}'
-}
-
 build_linux_x64() {
   local out_dir="${RUNTIME_DIR}/linux-x64"
   log "=== Linux x64 ==="
@@ -318,16 +316,14 @@ target="${1:-}"
 case "${target}" in
   win-x64)    build_win_x64 ;;
   mac-arm64)  build_mac_arm64 ;;
-  mac-x64)    build_mac_x64 ;;
   linux-x64)  build_linux_x64 ;;
   all)
     build_win_x64
     build_mac_arm64
-    build_mac_x64
     build_linux_x64
     ;;
   *)
-    die "usage: $0 <win-x64|mac-arm64|mac-x64|linux-x64|all>"
+    die "usage: $0 <win-x64|mac-arm64|linux-x64|all>"
     ;;
 esac
 

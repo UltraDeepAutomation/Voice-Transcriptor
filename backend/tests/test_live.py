@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+import base64
 import importlib
 import io
 import json
@@ -8,6 +9,97 @@ import sys
 from unittest import mock
 
 from backend.live import LiveConfig, LiveSession
+
+
+class WebSocketAuthTokenTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        self.main = importlib.import_module("backend.main")
+
+    def tearDown(self):
+        try:
+            self.main.jobs.shutdown(timeout=0.1)
+        except Exception:
+            pass
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
+
+    def test_websocket_token_comes_from_subprotocol_not_query(self):
+        token = "tok value/with unicode ью"
+        encoded = base64.urlsafe_b64encode(token.encode("utf-8")).decode("ascii").rstrip("=")
+
+        class FakeWebSocket:
+            headers = {
+                "sec-websocket-protocol": (
+                    f"{self.main.WS_AUTH_SUBPROTOCOL}, "
+                    f"{self.main.WS_AUTH_TOKEN_PREFIX}{encoded}"
+                )
+            }
+            query_params = {"token": "query-token-must-not-win"}
+
+        ws = FakeWebSocket()
+
+        self.assertEqual(self.main._websocket_api_token(ws), token)
+        self.assertEqual(
+            self.main._websocket_accept_subprotocol(ws),
+            self.main.WS_AUTH_SUBPROTOCOL,
+        )
+
+    def test_websocket_query_token_is_ignored(self):
+        class FakeWebSocket:
+            headers = {}
+            query_params = {"token": self.main.API_TOKEN}
+
+        self.assertEqual(self.main._websocket_api_token(FakeWebSocket()), "")
+
+    def test_websocket_header_token_still_supports_non_browser_clients(self):
+        class FakeWebSocket:
+            headers = {"x-api-token": "header-token"}
+            query_params = {}
+
+        self.assertEqual(self.main._websocket_api_token(FakeWebSocket()), "header-token")
+
+    def test_http_query_token_is_ignored(self):
+        request = type("FakeRequest", (), {})()
+        request.url = type("FakeURL", (), {"path": "/api/config"})()
+        request.headers = {}
+        request.query_params = {"token": self.main.API_TOKEN}
+        request.method = "GET"
+        request.client = type("FakeClient", (), {"host": "127.0.0.1"})()
+
+        with self.assertRaises(self.main.HTTPException) as raised:
+            asyncio.run(self.main._require_api_auth(request))
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_http_header_token_authenticates(self):
+        request = type("FakeRequest", (), {})()
+        request.url = type("FakeURL", (), {"path": "/api/config"})()
+        request.headers = {"x-api-token": self.main.API_TOKEN}
+        request.query_params = {}
+        request.method = "GET"
+        request.client = type("FakeClient", (), {"host": "127.0.0.1"})()
+
+        asyncio.run(self.main._require_api_auth(request))
+
+    def test_network_probe_requires_token_but_health_does_not(self):
+        request = type("FakeRequest", (), {})()
+        request.url = type("FakeURL", (), {"path": "/api/network"})()
+        request.headers = {}
+        request.query_params = {}
+        request.method = "GET"
+        request.client = type("FakeClient", (), {"host": "127.0.0.1"})()
+
+        with self.assertRaises(self.main.HTTPException) as raised:
+            asyncio.run(self.main._require_api_auth(request))
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+        request.url = type("FakeURL", (), {"path": "/api/health"})()
+        asyncio.run(self.main._require_api_auth(request))
 
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):

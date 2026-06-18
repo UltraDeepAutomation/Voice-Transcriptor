@@ -3,6 +3,8 @@ import logging
 import os
 import sys
 import asyncio
+import base64
+import binascii
 import uuid
 import re
 import secrets
@@ -318,6 +320,49 @@ MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
 MAX_LIVE_RECOVERY_BYTES = 2 * MAX_UPLOAD_BYTES
 RATE_LIMIT_PER_MIN = 120
 WS_CONNECT_LIMIT_PER_MIN = 20
+WS_AUTH_SUBPROTOCOL = "transcriptor-auth"
+WS_AUTH_TOKEN_PREFIX = "transcriptor-token."
+
+
+def _decode_ws_subprotocol_token(encoded: str) -> str:
+    raw = str(encoded or "").strip()
+    if not raw:
+        return ""
+    try:
+        padded = raw + ("=" * (-len(raw) % 4))
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8").strip()
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return ""
+
+
+def _websocket_api_token(websocket: WebSocket) -> str:
+    """Extract WS auth without reading query params.
+
+    Browser WebSocket does not allow custom headers, and query-string
+    tokens are logged by common access loggers. The renderer sends the
+    token as a base64url WebSocket subprotocol:
+
+      Sec-WebSocket-Protocol: transcriptor-auth, transcriptor-token.<b64url>
+
+    Non-browser clients may still use X-Api-Token.
+    """
+    header_token = (websocket.headers.get("x-api-token") or "").strip()
+    if header_token:
+        return header_token
+    raw_protocols = websocket.headers.get("sec-websocket-protocol") or ""
+    for item in raw_protocols.split(","):
+        proto = item.strip()
+        if proto.startswith(WS_AUTH_TOKEN_PREFIX):
+            return _decode_ws_subprotocol_token(proto[len(WS_AUTH_TOKEN_PREFIX):])
+    return ""
+
+
+def _websocket_accept_subprotocol(websocket: WebSocket) -> Optional[str]:
+    raw_protocols = websocket.headers.get("sec-websocket-protocol") or ""
+    offered = {item.strip() for item in raw_protocols.split(",") if item.strip()}
+    return WS_AUTH_SUBPROTOCOL if WS_AUTH_SUBPROTOCOL in offered else None
+
+
 def _env_int(name: str, default: int) -> int:
     """Parse an integer env var with graceful fallback.
 
@@ -1014,9 +1059,9 @@ def _promote_live_recovery(
 
 
 async def _require_api_auth(request: Request) -> None:
-    if request.url.path in {"/api/health", "/api/network"}:
+    if request.url.path == "/api/health":
         return
-    provided = (request.headers.get("x-api-token") or request.query_params.get("token") or "").strip()
+    provided = (request.headers.get("x-api-token") or "").strip()
     # Constant-time comparison — prevents a timing-attack-based byte-by-byte
     # recovery of API_TOKEN over the loopback/LAN. secrets.compare_digest
     # requires both operands to be the same type; encode to bytes so a
@@ -2710,7 +2755,7 @@ async def ws_transcribe(websocket: WebSocket):
             logger.warning("live recovery cleanup failed: %s", exc)
 
     _cleanup_future.add_done_callback(_log_cleanup_error)
-    token = (websocket.query_params.get("token") or "").strip()
+    token = _websocket_api_token(websocket)
     # Constant-time comparison — matches the HTTP auth path (see
     # `_require_api_auth`). Without this a local attacker can recover
     # API_TOKEN one byte at a time by measuring WS close latency.
@@ -2721,7 +2766,7 @@ async def ws_transcribe(websocket: WebSocket):
     if not _touch_rate_limit(_ws_windows, client_key, WS_CONNECT_LIMIT_PER_MIN):
         await websocket.close(code=4429, reason="rate limit exceeded")
         return
-    await websocket.accept()
+    await websocket.accept(subprotocol=_websocket_accept_subprotocol(websocket))
 
     qp = websocket.query_params
     provider = _normalize_live_provider(qp.get("provider"))

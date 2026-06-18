@@ -22,7 +22,7 @@ case "$OS" in
     ;;
   *)
     echo "Unsupported OS: $OS"
-    echo "Windows: run npm --prefix desktop run dist:win from a Windows shell."
+    echo "Windows: run npm --prefix desktop run dist:win from Git Bash/MSYS2, or from the macOS/Linux release host."
     exit 1
     ;;
 esac

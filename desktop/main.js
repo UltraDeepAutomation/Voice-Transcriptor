@@ -6,6 +6,19 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 
+const BACKEND_RUNTIME_IMPORTS = Object.freeze([
+  "fastapi",
+  "uvicorn",
+  "multipart",
+  "cryptography",
+  "faster_whisper",
+  "soundfile",
+  "numpy",
+  "requests",
+  "websockets",
+]);
+const BACKEND_RUNTIME_IMPORT_CHECK = `import ${BACKEND_RUNTIME_IMPORTS.join(", ")}`;
+
 // Register process-level crash handlers IMMEDIATELY — the previous
 // registration happened inside app.whenReady().then(...), meaning any
 // module-load-time crash (in requestSingleInstanceLock, createOverlayHtml,
@@ -5667,7 +5680,7 @@ function setBackendBootStatus(msg) {
 async function ensureBackendRuntime(python, repoRoot) {
   const importCheck = await runCommand(
     python,
-    ["-c", "import fastapi, uvicorn, multipart, cryptography"],
+    ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
     { cwd: repoRoot, timeoutMs: 12000 }
   );
 
@@ -5765,7 +5778,7 @@ async function ensureBackendRuntime(python, repoRoot) {
 
   const recheck = await runCommand(
     python,
-    ["-c", "import fastapi, uvicorn, multipart, cryptography"],
+    ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
     { cwd: repoRoot, timeoutMs: 12000 }
   );
 

@@ -8,7 +8,7 @@ Desktop voice transcription app with live recording, file upload transcription, 
 - Upload transcription through Local Whisper, Deepgram, or OpenRouter.
 - History with saved transcripts, saved source audio, search, stats, re-transcribe, and reveal/open actions.
 - AI Upscale presets through OpenRouter.
-- macOS/Windows/Linux packaged runtime support.
+- macOS arm64, Windows x64, and Linux x64 packaged runtime support.
 - Graph view is dormant: sidebar/view markup is commented out, active frontend code/styles are removed, and the backend graph route is not registered.
 
 ## Install
@@ -21,7 +21,7 @@ Use release artifacts when available.
 2. Open the DMG and move `Transcriptor.app` to Applications.
 3. On first launch, allow Microphone, Accessibility, and Automation permissions.
 
-Public macOS release builds are arm64-only. Intel Macs are source-build only and must use an x64-capable local build path.
+Public macOS release/build output is arm64-only. Intel macOS packaged runtime builds are intentionally unsupported in the current release line.
 
 ### Windows x64
 
@@ -43,6 +43,14 @@ On Wayland, install the matching paste tools for your compositor (`wtype` or `yd
 
 ## Source Build
 
+Prerequisites:
+
+- Node.js `>=22.12.0`; `.node-version` and `.nvmrc` are the local SSOT.
+- npm `>=10` from the same Node distribution.
+- macOS arm64 builds require `bash`, Xcode Command Line Tools, and `codesign`; a signing identity is optional for local builds.
+- Windows release packaging requires a Bash-capable shell because `desktop/scripts/prepare-runtime.sh` prepares the bundled runtime.
+- Linux desktop integration still depends on distro packages such as `xdotool`, `wmctrl`, and `zenity`.
+
 ```bash
 cd "Voice Transcriptor"
 ```
@@ -53,7 +61,7 @@ cd "Voice Transcriptor"
 ./BUILD.command
 ```
 
-`BUILD.command` installs frontend/desktop dependencies, prepares the bundled runtime, builds the frontend, packages the DMG, and replaces the installed app bundle with the freshly built bundle.
+`BUILD.command` installs frontend/desktop dependencies, prepares the arm64 bundled runtime, builds the frontend, packages the DMG, and replaces the installed app bundle with the freshly built bundle.
 
 `./INSTALL.command` delegates to `BUILD.command` on macOS.
 
@@ -67,9 +75,9 @@ Linux source builds install npm dependencies, prepare `desktop/runtime/linux-x64
 
 ### Windows
 
-Windows release packaging is driven from the desktop package scripts:
+Windows release packaging is driven from the desktop package scripts. Run it from Git Bash, WSL, or the macOS/Linux release host that can execute `desktop/scripts/prepare-runtime.sh`:
 
-```powershell
+```bash
 npm --prefix frontend ci
 npm --prefix desktop ci
 npm --prefix desktop run dist:win

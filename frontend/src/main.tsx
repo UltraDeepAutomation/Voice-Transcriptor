@@ -535,6 +535,24 @@ const apiToken = (): string => {
 };
 
 const authHeaders = (): HeadersInit => ({ "X-Api-Token": apiToken() });
+const WS_AUTH_SUBPROTOCOL = "transcriptor-auth";
+const WS_AUTH_TOKEN_PREFIX = "transcriptor-token.";
+
+function base64UrlEncodeUtf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function websocketAuthProtocols(): string[] {
+  return [
+    WS_AUTH_SUBPROTOCOL,
+    `${WS_AUTH_TOKEN_PREFIX}${base64UrlEncodeUtf8(apiToken())}`,
+  ];
+}
 
 function createClientSessionId(): string {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
@@ -2880,8 +2898,9 @@ async function refreshNetworkState(): Promise<void> {
     // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
     // so later refreshes don't re-trigger work after the first success.
     hideBootOverlayOnce();
-    // /api/network is public for UI indicator; token issues should not force Offline.
-    const netResp = await fetch("/api/network");
+    // /api/network performs outbound probes, so it stays behind the same
+    // token + rate-limit guard as the rest of the API.
+    const netResp = await fetch("/api/network", { headers: authHeaders() });
     if (!netResp.ok) {
       setNetworkState(true, null);
       return;
@@ -6805,7 +6824,6 @@ async function startLive(): Promise<void> {
     session_id: activeLiveSessionId,
     archive_dir: activeLiveArchiveDir,
     recording_collection: RECORDING_COLLECTIONS.live,
-    token: apiToken(),
     diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
   });
   if (sessionWsMode === "deepgram-stream") {
@@ -6813,7 +6831,7 @@ async function startLive(): Promise<void> {
   } else {
     wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
   }
-  ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString());
+  ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     const statusMsg =

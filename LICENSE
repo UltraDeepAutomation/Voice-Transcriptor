@@ -28,10 +28,11 @@ This software bundles and uses the following open-source third-party components:
 
 * **Python 3.12.13** (Python Software Foundation License) — distributed via
   python-build-standalone (Astral / indygreg) as the bundled runtime for
-  Windows + macOS installers.
+  Windows x64, macOS arm64, and Linux x64 installers.
 * **FFmpeg** (LGPL 2.1 / GPL 2.0 for the ``gpl`` build) — bundled as a static
-  binary for Windows + macOS. Source: github.com/BtbN/FFmpeg-Builds (Windows)
-  and evermeet.cx / osxexperts.net (macOS).
+  binary for Windows x64, macOS arm64, and Linux x64. Source:
+  github.com/BtbN/FFmpeg-Builds (Windows), osxexperts.net (macOS), and
+  johnvansickle.com (Linux).
 * **faster-whisper** (MIT) — speech-to-text inference runtime.
 * **ctranslate2** (MIT) — neural machine translation runtime used by
   faster-whisper.

@@ -92,7 +92,7 @@ desktop/
 ├── entitlements.mac.inherit.plist  # macOS helper entitlements
 ├── icon.png / icon.ico             # package icons
 └── scripts/
-    └── prepare-runtime.sh          # macOS/Windows/Linux bundled runtime builder
+    └── prepare-runtime.sh          # macOS arm64 / Windows x64 / Linux x64 runtime builder
 ```
 
 Desktop owns:
