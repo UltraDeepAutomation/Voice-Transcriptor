@@ -16,7 +16,7 @@ case "$OS" in
   Linux)
     cd "$SCRIPT_DIR"
     npm --prefix frontend ci
-    npm --prefix desktop ci
+    ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix desktop ci
     desktop/scripts/prepare-runtime.sh linux-x64
     npm --prefix frontend run build
     cd "$SCRIPT_DIR/desktop"

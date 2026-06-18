@@ -189,6 +189,64 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(Path(payload["archive_dir"]), uploads_dir)
         self.assertEqual(payload["recording_collection"], "uploads")
 
+    def test_recordings_cache_key_changes_when_existing_file_changes(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        recording = root / "note.txt"
+        recording.write_text("Title: note\nTranscription:\none\n", encoding="utf-8")
+        os.utime(recording, (1_700_000_000, 1_700_000_000))
+
+        first_key = self.main._recordings_scan_cache_key(root)
+
+        recording.write_text("Title: note\nTranscription:\ntwo changed\n", encoding="utf-8")
+        os.utime(recording, (1_700_000_010, 1_700_000_010))
+        second_key = self.main._recordings_scan_cache_key(root)
+
+        self.assertNotEqual(first_key, second_key)
+
+    def test_recordings_cache_key_tracks_audio_sidecars_and_uppercase_txt(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        recording = root / "Existing.TXT"
+        recording.write_text("Title: Existing\nTranscription:\none\n", encoding="utf-8")
+        os.utime(recording, (1_700_000_000, 1_700_000_000))
+
+        first_key = self.main._recordings_scan_cache_key(root)
+
+        audio = root / "Existing.webm"
+        audio.write_bytes(b"audio-v1")
+        os.utime(audio, (1_700_000_010, 1_700_000_010))
+        second_key = self.main._recordings_scan_cache_key(root)
+
+        audio.write_bytes(b"audio-v2-longer")
+        os.utime(audio, (1_700_000_020, 1_700_000_020))
+        third_key = self.main._recordings_scan_cache_key(root)
+
+        self.assertNotEqual(first_key, second_key)
+        self.assertNotEqual(second_key, third_key)
+
+    def test_uppercase_txt_recording_is_visible_in_history_graph_and_stats(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        recording = root / "Existing.TXT"
+        self.main._write_recording_text_file(
+            out=recording,
+            title="Existing",
+            source_text="source words",
+            transcript_text="visible transcript",
+            provider="local",
+            model="small",
+            language="ru",
+        )
+
+        list_payload = self.main._build_recordings_list_payload(root)
+        graph_payload = self.main._build_recordings_graph_payload(root)
+        stats_payload = self.main._build_recordings_stats_payload(root)
+
+        self.assertEqual([item["name"] for item in list_payload["items"]], ["Existing.TXT"])
+        self.assertEqual([node["name"] for node in graph_payload["nodes"]], ["Existing.TXT"])
+        self.assertEqual(stats_payload["total_recordings"], 1)
+
     def test_save_with_audio_upload_collection_writes_uploaded_media_folder(self):
         upload_file = self.main.UploadFile(
             io.BytesIO(b"tiny mp3 payload"),
@@ -218,6 +276,41 @@ class RecordingNameTests(unittest.TestCase):
         )
         self.assertTrue((target_dir / result["name"]).exists())
         self.assertTrue((target_dir / result["audio_name"]).exists())
+
+    def test_save_with_audio_preserves_existing_txt_extension_casing(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.TXT"
+        existing.write_text("old", encoding="utf-8")
+        upload_file = self.main.UploadFile(
+            io.BytesIO(b"tiny wav payload"),
+            filename="replacement.wav",
+            size=len(b"tiny wav payload"),
+        )
+
+        result = asyncio.run(self.main.save_recording_with_audio(
+            file=upload_file,
+            name="Existing.TXT",
+            archive_dir=str(target),
+            require_existing=True,
+            title="Existing",
+            source_text="source",
+            transcript_text="updated",
+            provider="local",
+            model="small",
+            language="ru",
+            recording_collection="",
+            live_session_id="",
+        ))
+
+        self.assertEqual(result["name"], "Existing.TXT")
+        self.assertTrue(existing.exists())
+        self.assertIn("Existing.TXT", {p.name for p in target.iterdir()})
+        self.assertEqual(
+            sum(1 for p in target.iterdir() if p.name.lower() == "existing.txt"),
+            1,
+        )
+        self.assertIn("updated", existing.read_text(encoding="utf-8"))
 
     def test_save_from_path_upload_collection_copies_source_without_deleting_it(self):
         source = Path(self._tmp.name) / "lecture source.mp3"

@@ -74,7 +74,7 @@ sudo usermod -aG input $USER  # потом выйти и войти заново
 cd "Voice Transcriptor"
 
 # macOS
-./INSTALL.command          # подготовить runtime и собрать .dmg
+./INSTALL.command          # подготовить runtime, собрать .dmg и обновить установленный .app
 ./BUILD.command            # то же самое, macOS-only entrypoint
 
 # Windows (из Windows shell)
@@ -103,6 +103,7 @@ Release build: см. `desktop/scripts/prepare-runtime.sh` + `npm run dist` / `np
 | **desktop/scripts/prepare-runtime.sh** | pinned Python tag | Сборка bundled Python runtime и ffmpeg |
 | **Vite build** | `frontend/package.json` | Сборка `frontend/dist` |
 | **electron-builder** | `desktop/package.json` | DMG / AppImage / Windows installer |
+| **ditto app install** | `BUILD.command` | Обновление `/Applications/Transcriptor.app` или `$HOME/Applications/Transcriptor.app` |
 
 ---
 
@@ -165,7 +166,7 @@ chmod +x BUILD.command
 ./BUILD.command
 ```
 
-Скрипт соберёт frontend, подготовит bundled runtime и положит artifacts в `desktop/dist`.
+Скрипт соберёт frontend, подготовит bundled runtime, положит artifacts в `desktop/dist` и обновит установленный `Transcriptor.app`.
 
 ```bash
 # Windows (из Windows shell)
@@ -223,7 +224,7 @@ cp .env.example .env
 
 ```bash
 # Удалить quarantine-атрибут
-xattr -cr ~/Applications/Transcriptor.app
+xattr -cr /Applications/Transcriptor.app
 
 # Или пересобрать source checkout
 ./INSTALL.command

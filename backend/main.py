@@ -1892,16 +1892,50 @@ def _recordings_scan_dirs(root: Path) -> list[Path]:
     return dirs
 
 
+def _iter_recording_files_by_suffix(directory: Path, suffixes: set[str]) -> list[Path]:
+    files: list[Path] = []
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return files
+    for entry in entries:
+        if entry.suffix.lower() not in suffixes:
+            continue
+        try:
+            if entry.is_file():
+                files.append(entry)
+        except OSError:
+            continue
+    return files
+
+
+def _iter_recording_text_files(directory: Path) -> list[Path]:
+    return _iter_recording_files_by_suffix(directory, {".txt"})
+
+
 def _recordings_scan_cache_key(root: Path) -> tuple:
-    parts: list[tuple[str, float, int]] = []
+    parts: list[tuple[str, float, int, int, int]] = []
+    tracked_exts = {".txt", *_RECORDING_AUDIO_EXTS}
     for d in _recordings_scan_dirs(root):
         try:
             dir_mtime = d.stat().st_mtime
-            file_count = sum(1 for _ in d.glob("*.txt"))
+            file_count = 0
+            newest_file_mtime_ns = 0
+            total_file_size = 0
+            for entry in _iter_recording_files_by_suffix(d, tracked_exts):
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                newest_file_mtime_ns = max(newest_file_mtime_ns, int(st.st_mtime_ns))
+                total_file_size += int(st.st_size)
         except Exception:
             dir_mtime = 0.0
             file_count = -1
-        parts.append((str(d), dir_mtime, file_count))
+            newest_file_mtime_ns = 0
+            total_file_size = -1
+        parts.append((str(d), dir_mtime, file_count, newest_file_mtime_ns, total_file_size))
     return tuple(parts)
 
 
@@ -3236,7 +3270,14 @@ async def _run_deepgram_live_session(
     rx = asyncio.create_task(receiver(), name="ws-dg-rx")
     fw = asyncio.create_task(forwarder(), name="ws-dg-fw")
     try:
-        await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
+        if fw in done and not rx.done() and session.is_closed and not session.last_fatal:
+            # Deepgram can close the upstream WS before the user presses Stop,
+            # especially on long idle/unstable links. Keep consuming client PCM
+            # until finalize/disconnect so REST/local recovery has the complete
+            # audio instead of only the prefix sent before upstream closed.
+            _mark_recovery_error(recovery)
+            await rx
     finally:
         stop.set()
         if not rx.done():
@@ -4437,7 +4478,7 @@ def _build_recordings_list_payload(d: "Path") -> dict:
     items = []
     for archive_dir in _recordings_scan_dirs(d):
         collection = _recording_collection_for_dir(archive_dir)
-        for p in archive_dir.glob("*.txt"):
+        for p in _iter_recording_text_files(archive_dir):
             try:
                 st = p.stat()
                 raw = p.read_text(encoding="utf-8", errors="replace")
@@ -4554,7 +4595,7 @@ def _build_recordings_graph_payload(d: "Path") -> dict:
     nodes = []
     for archive_dir in _recordings_scan_dirs(d):
         collection = _recording_collection_for_dir(archive_dir)
-        for p in archive_dir.glob("*.txt"):
+        for p in _iter_recording_text_files(archive_dir):
             try:
                 st = p.stat()
                 raw = p.read_text(encoding="utf-8", errors="replace")
@@ -4736,7 +4777,7 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
     seconds is the previous regression."""
     files: list[Path] = []
     for archive_dir in _recordings_scan_dirs(d):
-        files.extend(archive_dir.glob("*.txt"))
+        files.extend(_iter_recording_text_files(archive_dir))
     files.sort()
     total_recordings = len(files)
     total_words = 0
@@ -4926,14 +4967,16 @@ async def _save_recording_audio_source(
         if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
         stem = Path(existing_name).stem
+        text_name = existing_name
         if require_existing and not (target_dir / existing_name).exists():
             raise HTTPException(status_code=409, detail="recording no longer exists in the target archive")
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
         stem = _unique_recording_stem_for_source_file(target_dir, safe_orig_name, safe_title)
+        text_name = f"{stem}.txt"
 
-    out_text = target_dir / f"{stem}.txt"
+    out_text = target_dir / text_name
     out_audio = target_dir / f"{stem}{ext}"
     tmp_audio = _atomic_temp_path(out_audio)
     existing_audio = _recording_audio_path(f"{stem}.txt", target_dir=target_dir)

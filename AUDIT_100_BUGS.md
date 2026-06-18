@@ -1,12 +1,12 @@
 # Voice Transcriptor — Verified Audit, 18 June 2026
 
-Итог: подтверждено 29 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
+Итог: подтверждено 34 реальных бага/SSOT-рассинхрона. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
 
 Статус:
-- Исправлено: 27
-- Оставлено с явным стопом: 2
+- Исправлено: 33
+- Оставлено с явным стопом: 1
 - P0: 0 найдено
-- P1: 9 найдено, 8 исправлено (88%)
+- P1: 13 найдено, 13 исправлено (100%)
 
 ## 1. P1 FIXED — keyfile race could overwrite Fernet key
 
@@ -198,15 +198,15 @@ setTimeout(() => { window.location.href = '${BASE_URL}/'; }, 500);
 
 Объяснение: recovery должен явно навигировать на backend app URL. Теперь он еще проверяет boot nonce перед навигацией.
 
-## 9. P1 OPEN — Deepgram live forwarder can end receiver too early
+## 9. P1 FIXED — Deepgram live forwarder could end receiver too early
 
-Файл и строка: `backend/main.py:3216`
+Файл и строка: `backend/main.py:3251`
 
 Суть: `asyncio.wait(... FIRST_COMPLETED)` завершает session, когда первым заканчивается forwarder.
 
 Последствие: если upstream Deepgram WS закрылся во время записи, receiver отменяется и tail PCM после обрыва может потеряться.
 
-Текущий код:
+Было:
 ```python
 await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
 finally:
@@ -215,15 +215,15 @@ finally:
         rx.cancel()
 ```
 
-Предлагаемый код:
+Стало:
 ```python
-done, _ = await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
+done, _pending = await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
 if fw in done and not rx.done() and session.is_closed and not session.last_fatal:
     _mark_recovery_error(recovery)
     await rx
 ```
 
-Объяснение: это затрагивает live-session cancellation/recovery semantics. Я оставил пункт открытым, потому что нужен отдельный дизайн безопасного завершения Deepgram live tail.
+Объяснение: если upstream Deepgram закрылся без fatal error, backend теперь помечает recovery и продолжает принимать PCM до finalize/disconnect, чтобы fallback получил полный хвост аудио.
 
 ## 10. P2 FIXED — JSON bool `split_stereo` parsed `"false"` as true
 
@@ -648,15 +648,137 @@ printf '%s  %s\n' "$FFMPEG_WIN_SHA256" "${dest}.part" | shasum -a 256 -c -
 
 Объяснение: фикс требует выбрать конкретный upstream release artifact и checksum. Я не стал выдумывать external supply-chain pin без подтверждения.
 
+## 30. P1 FIXED — full release build could hang on Electron postinstall
+
+Файл и строка: `BUILD.command:30`, `INSTALL.command:19`
+
+Суть: release entrypoint запускал `desktop npm ci` без отключения Electron binary postinstall download.
+
+Последствие: full rebuild зависал на `desktop/node_modules/electron/install.js`; установленный `.app` оставался старым.
+
+Было:
+```bash
+npm --prefix desktop ci
+```
+
+Стало:
+```bash
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix desktop ci
+```
+
+Объяснение: release packaging берет Electron по версии из `desktop/package.json` через `electron-builder`; dev binary download во время `npm ci` не нужен для сборки DMG/AppImage и не должен блокировать релизный entrypoint.
+
+## 31. P1 FIXED — macOS build produced artifacts but did not update installed app
+
+Файл и строка: `BUILD.command:36`
+
+Суть: `BUILD.command` завершался после DMG packaging и не копировал свежий `Transcriptor.app` в install location.
+
+Последствие: build-check мог быть зеленым, но пользователь продолжал запускать старый `/Applications/Transcriptor.app` или `~/Applications/Transcriptor.app`.
+
+Было:
+```bash
+npx electron-builder --mac dmg "--${BUILDER_ARCH}" "$@"
+```
+
+Стало:
+```bash
+npx electron-builder --mac dmg "--${BUILDER_ARCH}" "$@"
+APP_DIR="$SCRIPT_DIR/desktop/dist/mac-${BUILDER_ARCH}/Transcriptor.app"
+ditto "$APP_DIR" "$PRIMARY_APP"
+```
+
+Объяснение: сборочный entrypoint теперь имеет единый результат: свежий DMG в `desktop/dist` и свежий установленный app bundle. Если есть legacy `~/Applications/Transcriptor.app`, он синхронизируется тем же bundle без удаления файлов.
+
+## 32. P1 FIXED — recordings cache ignored edits when file count was unchanged
+
+Файл и строка: `backend/main.py:1916`
+
+Суть: recordings list cache key учитывал directory mtime и количество lowercase `.txt`, но не mtime/size transcript/audio файлов.
+
+Последствие: изменение текста существующей записи или audio-sidecar могло не инвалидировать History/Stats/Graph cache, если число файлов не менялось.
+
+Было:
+```python
+parts: list[tuple[str, float, int]] = []
+dir_mtime = d.stat().st_mtime
+file_count = sum(1 for _ in d.glob("*.txt"))
+parts.append((str(d), dir_mtime, file_count))
+```
+
+Стало:
+```python
+parts: list[tuple[str, float, int, int, int]] = []
+tracked_exts = {".txt", *_RECORDING_AUDIO_EXTS}
+newest_file_mtime_ns = 0
+total_file_size = 0
+for entry in _iter_recording_files_by_suffix(d, tracked_exts):
+    st = entry.stat()
+    file_count += 1
+    newest_file_mtime_ns = max(newest_file_mtime_ns, int(st.st_mtime_ns))
+    total_file_size += int(st.st_size)
+parts.append((str(d), dir_mtime, file_count, newest_file_mtime_ns, total_file_size))
+```
+
+Объяснение: cache key теперь привязан к observable state transcript + audio sidecars через тот же suffix SSOT, а не только к составу директории.
+
+## 33. P1 FIXED — audio attach normalized existing `.TXT` recording into a second `.txt`
+
+Файл и строка: `backend/main.py:4948`
+
+Суть: `save_recording_with_audio()` валидировал существующий `Existing.TXT`, но путь записи строил заново через `f"{stem}.txt"`.
+
+Последствие: на case-sensitive FS или при нестандартном casing backend мог создать второй text file и привязать audio не к выбранной записи.
+
+Было:
+```python
+stem = Path(existing_name).stem
+out_text = target_dir / f"{stem}.txt"
+```
+
+Стало:
+```python
+stem = Path(existing_name).stem
+text_name = existing_name
+out_text = target_dir / text_name
+```
+
+Объяснение: выбранный пользователем filename теперь остается SSOT для существующей записи; stem используется только для связанного audio filename.
+
+## 34. P2 FIXED — uppercase `.TXT` recordings disappeared from History/Graph/Stats
+
+Файл и строка: `backend/main.py:4481`, `backend/main.py:4598`, `backend/main.py:4779`
+
+Суть: builders использовали `glob("*.txt")`, хотя save/get endpoints уже принимают `.TXT`.
+
+Последствие: на case-sensitive filesystem запись `Existing.TXT` можно было сохранить и открыть напрямую, но она пропадала из History list, Graph payload и Stats summary.
+
+Было:
+```python
+for p in archive_dir.glob("*.txt"):
+    ...
+files.extend(archive_dir.glob("*.txt"))
+```
+
+Стало:
+```python
+for p in _iter_recording_text_files(archive_dir):
+    ...
+files.extend(_iter_recording_text_files(archive_dir))
+```
+
+Объяснение: `_iter_recording_text_files()` делает case-insensitive suffix check (`entry.suffix.lower() == ".txt"`) и стал единым SSOT для всех transcript scans.
+
 ## Verification
 
 Пройдено:
 ```text
 python3 -m unittest discover backend/tests -q
 python3 -m compileall -q backend
-npm exec -- tsc --noEmit
+(cd frontend && ./node_modules/.bin/tsc --noEmit)
 npm --prefix frontend run build
 npm --prefix desktop run build:frontend
 node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/unlockDist.js && node --check desktop/afterPack.js
 bash -n BUILD.command INSTALL.command desktop/scripts/prepare-runtime.sh
+git diff --check
 ```
