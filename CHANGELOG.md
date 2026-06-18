@@ -5,9 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.1.25] — 2026-05-10
 
-Comprehensive 5-agent audit pass, **107 real bugs identified** across
-24K LOC; ~45 fixed in this release across 18 commits. All P0 closed,
-~80 % of P1 closed, principal SSOT violations eliminated.
+Historical release-audit batch across 24K LOC. This changelog keeps the
+1.1.25 release notes; the current verified bug audit lives in
+`VERIFIED_AUDIT.md` and intentionally lists only confirmed real bugs.
 
 ### Fixed (audit + post-audit batch)
 
@@ -194,8 +194,10 @@ Final tag at commit `a9a6da9` (chain: pass-15 → … → pass-24c).
 
 #### Async + concurrency
 - **6 sync routes converted to `async def`** with `asyncio.to_thread`
-  offload + per-cache `asyncio.Lock` rebuild gating: GET
-  `/api/recordings`, `/recordings/graph`, `/recordings/stats/summary`,
+  offload + per-cache `asyncio.Lock` rebuild gating. Historical batch
+  included the Graph route; Graph is now dormant and the backend route is
+  no longer registered. Current routes include GET
+  `/api/recordings`, `/recordings/stats/summary`,
   `/recordings/{name}`, DELETE `/api/recordings`, POST
   `/recordings/pick-folder`, `/recordings/open-folder`,
   `/live/recoveries/{id}/promote`. Cold-cache scans no longer pin
@@ -339,8 +341,8 @@ Final tag at commit `a9a6da9` (chain: pass-15 → … → pass-24c).
   freeze the WS forwarder.
 - Whisper LRU cache evicts oldest model on insert beyond cap
   (was unbounded, OOM on 8 GB hosts when cycling models).
-- 6 sync route handlers (graph, stats, promote, pickers, DELETE,
-  get_recording) converted to `async def` + `asyncio.to_thread` —
+- Historical sync route handlers (then including graph, stats, promote,
+  pickers, DELETE, get_recording) converted to `async def` + `asyncio.to_thread` —
   no longer pin the FastAPI executor pool on cold-cache scans.
 - 6 raw `str(e)` error leak sites routed through `_safe_error_text`
   (WS fatal, Deepgram WS connect, save_config, picker errors,

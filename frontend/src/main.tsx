@@ -3,11 +3,9 @@ import "./styles.css";
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type KeyProvider = "openrouter" | "deepgram";
-type ViewName = "upload" | "record" | "recordings" | "settings" | "graph";
+type ViewName = "upload" | "record" | "recordings" | "settings";
+type RequestedViewName = ViewName | "graph";
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
-
-// Temporarily keep Graph dormant: no sidebar entry, no API load, no canvas listeners.
-const GRAPH_VIEW_ENABLED = false;
 
 interface NetworkStatusResponse {
   online: boolean;
@@ -506,6 +504,9 @@ let pendingUpscalePresetId = "";
 let silenceStartedAtMs = 0;
 let autoStopTriggered = false;
 let currentRecordingAudioObjectUrl = "";
+let currentRecordingAudioSourceKey = "";
+let currentRecordingAudioRenderSeq = 0;
+let recordingViewerAudioObjectUrl = "";
 let activeLiveSessionId = "";
 let activeLiveArchiveDir = "";
 let activeLiveSessionSnapshot: LiveSessionSnapshot | null = null;
@@ -546,6 +547,13 @@ function revokeCurrentRecordingAudioUrl(): void {
   if (!currentRecordingAudioObjectUrl) return;
   URL.revokeObjectURL(currentRecordingAudioObjectUrl);
   currentRecordingAudioObjectUrl = "";
+  currentRecordingAudioSourceKey = "";
+}
+
+function revokeRecordingViewerAudioUrl(): void {
+  if (!recordingViewerAudioObjectUrl) return;
+  URL.revokeObjectURL(recordingViewerAudioObjectUrl);
+  recordingViewerAudioObjectUrl = "";
 }
 
 function isCurrentUiSession(token = ""): boolean {
@@ -556,10 +564,11 @@ function isCurrentUiSession(token = ""): boolean {
 function latestRecordingAudioUrl(savedName = "", archiveDir = ""): string {
   const safeName = String(savedName || "").trim();
   if (!safeName) return "";
-  const params = new URLSearchParams({ token: apiToken() });
+  const params = new URLSearchParams();
   const safeArchiveDir = String(archiveDir || "").trim();
   if (safeArchiveDir) params.set("archive_dir", safeArchiveDir);
-  return `/api/recordings/${encodeURIComponent(safeName)}/audio?${params.toString()}`;
+  const qs = params.toString();
+  return `/api/recordings/${encodeURIComponent(safeName)}/audio${qs ? `?${qs}` : ""}`;
 }
 
 // MIME → canonical extension mapping. Used when the backend's
@@ -687,7 +696,8 @@ async function fetchSavedAudioFromBackend(
   return new File([audioBlob], filename, { type: mimeType });
 }
 
-function renderLatestSavedAudio(): void {
+async function renderLatestSavedAudio(): Promise<void> {
+  const renderSeq = ++currentRecordingAudioRenderSeq;
   const row = $("currentRecordingAudioRow");
   const audioEl = $("currentRecordingAudio") as HTMLAudioElement;
   const metaEl = $("currentRecordingAudioMeta");
@@ -700,11 +710,8 @@ function renderLatestSavedAudio(): void {
   // Real-world symptom: user starts playing back audio via the
   // native <audio controls>, a concurrent save refresh fires this
   // function, and playback jumps to the start mid-listen.
-  const desiredBackendUrl = latestSavedAudioState
-    ? latestRecordingAudioUrl(
-        latestSavedAudioState.savedName || "",
-        latestSavedAudioState.archiveDir || ""
-      )
+  const desiredBackendKey = latestSavedAudioState?.savedName
+    ? `${latestSavedAudioState.savedName}\n${latestSavedAudioState.archiveDir || ""}`
     : "";
   // If the audio source isn't changing AND we already have a src
   // attribute, skip the disruptive reset. We only need to ensure
@@ -721,8 +728,9 @@ function renderLatestSavedAudio(): void {
   if (
     latestSavedAudioState
     && latestSavedAudioState.savedName
-    && desiredBackendUrl
-    && audioEl.getAttribute("src") === desiredBackendUrl
+    && desiredBackendKey
+    && currentRecordingAudioSourceKey === desiredBackendKey
+    && !!audioEl.getAttribute("src")
   ) {
     row.hidden = false;
     metaEl.textContent = latestSavedAudioState.sizeBytes
@@ -747,10 +755,9 @@ function renderLatestSavedAudio(): void {
   }
 
   // Source preference order:
-  //   1. Backend URL when savedName is known — DURABLE: the backend
-  //      wrote the file to disk via atomic_write_bytes, the audio
-  //      element can re-fetch any time, survives OPFS sink destroy,
-  //      survives renderer reloads.
+  //   1. Backend refetch when savedName is known — DURABLE: the backend
+  //      wrote the file to disk via atomic_write_bytes, and the renderer
+  //      fetches it with header auth before attaching a blob URL.
   //   2. In-memory blob URL when the file is fresh from MediaRecorder /
   //      PcmSink and not yet uploaded to backend (the recording-just-
   //      stopped window before save completes — typically <500 ms).
@@ -766,15 +773,31 @@ function renderLatestSavedAudio(): void {
   //   bytes lazily on play, hits the deleted OPFS handle, and the
   //   media element fires a silent error code=4 (src-not-supported).
   //
-  //   Switching to the backend URL once savedName is set bypasses
-  //   the OPFS lifecycle entirely — same URL, same bytes, durable.
+  //   Switching to a backend-authenticated blob once savedName is set
+  //   bypasses the OPFS lifecycle entirely — same bytes, durable.
   //   The blob URL stays as the first-render fallback for the brief
   //   pre-save window.
-  const playbackUrl = (latestSavedAudioState.savedName && desiredBackendUrl)
-    ? desiredBackendUrl
-    : latestSavedAudioState.file
-      ? URL.createObjectURL(latestSavedAudioState.file)
-      : "";
+  let playbackUrl = "";
+  let playbackSourceKey = "";
+  if (latestSavedAudioState.savedName) {
+    try {
+      const audioFile = await fetchSavedAudioFromBackend(
+        latestSavedAudioState.savedName,
+        latestSavedAudioState.archiveDir || "",
+      );
+      if (renderSeq !== currentRecordingAudioRenderSeq) return;
+      playbackUrl = URL.createObjectURL(audioFile);
+      playbackSourceKey = desiredBackendKey;
+    } catch (e) {
+      console.warn("Saved audio playback fetch failed; falling back to in-memory file", e);
+    }
+  }
+  if (!playbackUrl && latestSavedAudioState.file) {
+    playbackUrl = URL.createObjectURL(latestSavedAudioState.file);
+    playbackSourceKey = latestSavedAudioState.savedName
+      ? `${desiredBackendKey}\nfallback-file`
+      : "session-file";
+  }
   if (!playbackUrl) {
     row.hidden = true;
     audioEl.removeAttribute("src");
@@ -783,9 +806,9 @@ function renderLatestSavedAudio(): void {
     return;
   }
   // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
-  // free it later. Backend URLs are not ObjectURLs — nothing to revoke.
-  const isObjectUrl = playbackUrl.startsWith("blob:");
-  currentRecordingAudioObjectUrl = isObjectUrl ? playbackUrl : "";
+  // free it later. Media never receives the persistent API token in URL.
+  currentRecordingAudioObjectUrl = playbackUrl;
+  currentRecordingAudioSourceKey = playbackSourceKey;
   audioEl.src = playbackUrl;
   audioEl.load();
   row.hidden = false;
@@ -811,7 +834,7 @@ function setLatestSavedAudio(state: LatestSavedAudioState | null): void {
       file: state.file || null,
     }
     : null;
-  renderLatestSavedAudio();
+  void renderLatestSavedAudio();
 }
 
 function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir = "", sessionToken = ""): void {
@@ -842,7 +865,7 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
 (() => {
   const btn = document.getElementById("currentRecordingDownloadBtn") as HTMLButtonElement | null;
   if (!btn) return;
-  btn.addEventListener("click", () => {
+  btn.addEventListener("click", async () => {
     if (!latestSavedAudioState) return;
     const file = latestSavedAudioState.file;
     const fileName = latestSavedAudioState.downloadName
@@ -854,14 +877,22 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     // File blob only during the brief pre-save window.
     let url = "";
     let revokeAfter = false;
-    if (latestSavedAudioState.savedName) {
-      url = latestRecordingAudioUrl(
-        latestSavedAudioState.savedName,
-        latestSavedAudioState.archiveDir || "",
-      );
-    } else if (file) {
-      url = URL.createObjectURL(file);
-      revokeAfter = true;
+    try {
+      if (latestSavedAudioState.savedName) {
+        const audioFile = await fetchSavedAudioFromBackend(
+          latestSavedAudioState.savedName,
+          latestSavedAudioState.archiveDir || "",
+        );
+        url = URL.createObjectURL(audioFile);
+        revokeAfter = true;
+      } else if (file) {
+        url = URL.createObjectURL(file);
+        revokeAfter = true;
+      }
+    } catch (e) {
+      console.warn("Audio download fetch failed", e);
+      setStatus(`Audio download failed: ${sanitizeUiErrorMessage(e, "Could not download audio.")}`, "error");
+      return;
     }
     if (!url) return;
     const a = document.createElement("a");
@@ -2785,10 +2816,8 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
 }
 
-function switchView(requestedView: ViewName): void {
-  const view: ViewName = requestedView === "graph" && !GRAPH_VIEW_ENABLED
-    ? "recordings"
-    : requestedView;
+function switchView(requestedView: RequestedViewName): void {
+  const view: ViewName = requestedView === "graph" ? "recordings" : requestedView;
   document.querySelectorAll(".view").forEach((el) => {
     const node = el as HTMLElement;
     node.hidden = node.dataset.view !== view;
@@ -2806,7 +2835,6 @@ function switchView(requestedView: ViewName): void {
     view === "upload" ? "Upload"
       : view === "settings" ? "Settings"
       : view === "recordings" ? "History"
-      : view === "graph" && GRAPH_VIEW_ENABLED ? "Graph"
       : "Live";
   if (view === "recordings") {
     // Only reload from the server if we have no cached items yet. If
@@ -2818,9 +2846,6 @@ function switchView(requestedView: ViewName): void {
     if (!recordingItems.length) {
       void loadRecordings(true).catch(() => { });
     }
-  }
-  if (view === "graph" && GRAPH_VIEW_ENABLED) {
-    void loadGraphData();
   }
 }
 
@@ -2899,8 +2924,7 @@ function hideBootOverlayOnce(): void {
 
 document.querySelectorAll(".sb-item").forEach((e) => {
   e.addEventListener("click", () => {
-    const v = ((e as HTMLElement).dataset.view || "record") as ViewName;
-    if (v === "graph" && !GRAPH_VIEW_ENABLED) return;
+    const v = ((e as HTMLElement).dataset.view || "record") as RequestedViewName;
     switchView(v);
   });
 });
@@ -4090,8 +4114,10 @@ function queueUiPreferencesSave(): void {
             recordingsBootstrapReady = !!currentArchiveDirSnapshot();
           });
           recordingsBootstrapPromise = trackedReloadPromise;
-        } catch {
-          // Swallow: a transient 500 will retry on the next change.
+        } catch (e) {
+          const msg = sanitizeUiErrorMessage(e, "Settings were not saved.");
+          setStatus(`Settings save failed: ${msg}`, "error");
+          showRecordSessionNotice(`Settings were not saved: ${msg}`, "error", 7000);
         }
       });
   }, UI_TOKENS.settings.saveDebounceMs);
@@ -4631,6 +4657,7 @@ function resetRecordingViewer(placeholder = "Choose a recording from the left li
   $("recordingContent").textContent = "";
   const player = $("recordingAudio") as HTMLAudioElement;
   player.pause();
+  revokeRecordingViewerAudioUrl();
   player.removeAttribute("src");
   player.load();
   $("recordingAudioRow").hidden = true;
@@ -4645,6 +4672,7 @@ function setRecordingViewerLoading(displayName: string): void {
   $("recordingContent").textContent = "";
   const player = $("recordingAudio") as HTMLAudioElement;
   player.pause();
+  revokeRecordingViewerAudioUrl();
   player.removeAttribute("src");
   player.load();
   $("recordingAudioRow").hidden = true;
@@ -5129,12 +5157,26 @@ async function openRecording(name: string, archiveDir = ""): Promise<void> {
     const player = $("recordingAudio") as HTMLAudioElement;
     const audioRow = $("recordingAudioRow");
     if (r.has_audio) {
-      const audioUrl = latestRecordingAudioUrl(name, String(r.archive_dir || effectiveArchiveDir).trim());
-      audioRow.hidden = false;
-      player.src = audioUrl;
-      player.load();
+      try {
+        const audioFile = await fetchSavedAudioFromBackend(name, String(r.archive_dir || effectiveArchiveDir).trim());
+        if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+        revokeRecordingViewerAudioUrl();
+        recordingViewerAudioObjectUrl = URL.createObjectURL(audioFile);
+        audioRow.hidden = false;
+        player.src = recordingViewerAudioObjectUrl;
+        player.load();
+      } catch (audioErr) {
+        if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+        console.warn("Recording audio playback fetch failed", audioErr);
+        player.pause();
+        revokeRecordingViewerAudioUrl();
+        player.removeAttribute("src");
+        player.load();
+        audioRow.hidden = true;
+      }
     } else {
       player.pause();
+      revokeRecordingViewerAudioUrl();
       player.removeAttribute("src");
       player.load();
       audioRow.hidden = true;
@@ -5163,6 +5205,7 @@ async function openRecording(name: string, archiveDir = ""): Promise<void> {
     $("recordingContent").textContent = message;
     const player = $("recordingAudio") as HTMLAudioElement;
     player.pause();
+    revokeRecordingViewerAudioUrl();
     player.removeAttribute("src");
     player.load();
     $("recordingAudioRow").hidden = true;
@@ -7961,8 +8004,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     // the recording was successfully persisted (the common case).
     const deepgramRestOnDisk = async (): Promise<string | null> => {
       if (!persistedRecordingName) return null;
-      const params = new URLSearchParams({ token: apiToken() });
-      const url = `/api/recordings/${encodeURIComponent(persistedRecordingName)}/transcribe-on-disk?${params.toString()}`;
+      const url = `/api/recordings/${encodeURIComponent(persistedRecordingName)}/transcribe-on-disk`;
       const resp = await fetch(url, {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -9047,533 +9089,9 @@ window.addEventListener("transcriptor-hotkey-stop", () => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════
-// ██  Graph Tab — Semantic Cluster Graph                    ██
-// ══════════════════════════════════════════════════════════════
-
-interface GraphNode {
-  name: string;
-  archiveDir: string;
-  displayName: string;
-  provider: string;
-  keywords: string[];
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  r: number;
-}
-
-const GRAPH_COLORS: Record<string, string> = {
-  local: "#888888",
-  openrouter: "#6c90c6",
-  deepgram: "#79b88a",
-  unknown: "#777777",
-  toi: "#a888cc",
-};
-const GRAPH_PROVIDER_LABELS: Record<string, string> = {
-  local: "Local", openrouter: "OpenRouter", deepgram: "Deepgram", unknown: "Unknown", toi: "TOI",
-};
-
-const G_ZOOM_FACTOR = 1.1;
-const G_ZOOM_MIN = 0.02;
-const G_ZOOM_MAX = 12;
-const G_DRAG_THRESHOLD = 4;
-
-let gNodes: GraphNode[] = [];
-let gEdges: [number, number][] = [];
-let gZoom = 1;
-let gPanX = 0;
-let gPanY = 0;
-let gDragging = false;
-let gDragStartX = 0;
-let gDragStartY = 0;
-let gDragPanStartX = 0;
-let gDragPanStartY = 0;
-let gDragDist = 0;
-let gHovered: GraphNode | null = null;
-let gCssW = 0;
-let gCssH = 0;
-
-function gHex(hex: string, a: number): string {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `rgba(${r},${g},${b},${a})`;
-}
-function gColor(p: string): string { return GRAPH_COLORS[p] || GRAPH_COLORS.unknown; }
-
-function gKeywordSimilarity(a: string[], b: string[]): number {
-  if (!a.length || !b.length) return 0;
-  const setB = new Set(b);
-  let shared = 0;
-  for (const w of a) { if (setB.has(w)) shared++; }
-  return shared / Math.max(a.length, b.length);
-}
-
-/**
- * Keyword-cluster layout using a deterministic Fibonacci-spiral
- * (Vogel / sunflower) placement.
- *
- * Previously the layout used an Archimedean spiral with
- * ``spiralR += spacing / (2π)`` which meant each cluster sat only
- * ~13 px further out than the previous one, causing heavy cluster
- * overlap on the canvas. This version:
- *
- *   1. Computes a bounding radius per cluster (proportional to node
- *      count so dense clusters get more room).
- *   2. Places each cluster on a Fibonacci spiral at a distance
- *      proportional to ``sqrt(k)``, which is the correct spacing for
- *      equal-area placement and guarantees non-overlap when combined
- *      with a pad term.
- *   3. Within each cluster, positions nodes deterministically on a
- *      concentric ring (no ``Math.random()`` so the layout is stable
- *      across re-renders).
- */
-function gClusterLayout(): void {
-  const clusters: Map<string, number[]> = new Map();
-  gNodes.forEach((n, i) => {
-    const key = n.keywords.length > 0 ? n.keywords[0] : "__none__";
-    let arr = clusters.get(key);
-    if (!arr) { arr = []; clusters.set(key, arr); }
-    arr.push(i);
-  });
-
-  const clusterList = [...clusters.entries()].sort((a, b) => b[1].length - a[1].length);
-
-  // Average node radius feeds the per-cluster size computation so the
-  // spacing scales with actual node visual footprint.
-  const avgNodeR =
-    gNodes.reduce((acc, n) => acc + n.r, 0) / Math.max(1, gNodes.length);
-
-  const clusterRadii = clusterList.map(([, indices]) => {
-    // A cluster of N nodes needs radius ~ sqrt(N) × node footprint
-    // with a minimum of 24 px so single-node clusters still reserve
-    // space.
-    return Math.max(24, Math.sqrt(indices.length) * (avgNodeR * 2.6 + 6));
-  });
-
-  // Fibonacci / Vogel spiral: golden-angle placement of successive
-  // clusters. ``c`` is the linear distance per step — we size it so
-  // the maximum-radius cluster never overlaps a neighbour.
-  const maxClusterR = clusterRadii.reduce((a, b) => Math.max(a, b), 0);
-  const step = Math.max(80, maxClusterR * 2 + 24);
-  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-
-  clusterList.forEach(([, indices], ci) => {
-    let cx: number;
-    let cy: number;
-    if (ci === 0) {
-      cx = 0;
-      cy = 0;
-    } else {
-      const angle = ci * goldenAngle;
-      const radius = step * Math.sqrt(ci) * 0.55;
-      cx = Math.cos(angle) * radius;
-      cy = Math.sin(angle) * radius;
-    }
-
-    const n = indices.length;
-    const clusterR = clusterRadii[ci];
-    if (n === 1) {
-      gNodes[indices[0]].x = cx;
-      gNodes[indices[0]].y = cy;
-      return;
-    }
-    // Place nodes on a single ring. The ring radius is slightly
-    // smaller than the cluster radius so the nodes don't touch the
-    // bounding circle and neighbouring clusters stay visually
-    // separated.
-    const ringR = clusterR * 0.62;
-    indices.forEach((nodeIdx, j) => {
-      const a2 = (2 * Math.PI * j) / n - Math.PI / 2;
-      gNodes[nodeIdx].x = cx + Math.cos(a2) * ringR;
-      gNodes[nodeIdx].y = cy + Math.sin(a2) * ringR;
-    });
-  });
-}
-
-/** Pre-compute edges, capped at 400 strongest */
-function gComputeEdges(): void {
-  const N = gNodes.length;
-  const MAX_EDGES = 400;
-  const candidates: { i: number; j: number; sim: number }[] = [];
-
-  if (N > 300) {
-    const kwMap: Map<string, number[]> = new Map();
-    gNodes.forEach((nd, i) => {
-      for (const kw of nd.keywords) {
-        let arr = kwMap.get(kw);
-        if (!arr) { arr = []; kwMap.set(kw, arr); }
-        arr.push(i);
-      }
-    });
-    const seen = new Set<string>();
-    kwMap.forEach((indices) => {
-      for (let a = 0; a < Math.min(indices.length, 40); a++) {
-        for (let b = a + 1; b < Math.min(indices.length, 40); b++) {
-          const ii = indices[a], jj = indices[b];
-          const key = ii < jj ? `${ii}_${jj}` : `${jj}_${ii}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const sim = gKeywordSimilarity(gNodes[ii].keywords, gNodes[jj].keywords);
-          if (sim >= 0.3) candidates.push({ i: ii, j: jj, sim });
-        }
-      }
-    });
-  } else {
-    for (let i = 0; i < N; i++) {
-      for (let j = i + 1; j < N; j++) {
-        const sim = gKeywordSimilarity(gNodes[i].keywords, gNodes[j].keywords);
-        if (sim >= 0.2) candidates.push({ i, j, sim });
-      }
-    }
-  }
-
-  candidates.sort((a, b) => b.sim - a.sim);
-  gEdges = candidates.slice(0, MAX_EDGES).map((cc) => [cc.i, cc.j]);
-}
-
-/**
- * Post-layout relaxation pass — nudges overlapping nodes apart.
- *
- * Even with the deterministic Fibonacci cluster layout, nodes from
- * adjacent clusters (or from same-keyword clusters with many members)
- * can end up within each other's radius. Rather than grow the
- * cluster spacing (which leaves big gaps), we run ~12 iterations of
- * simple pairwise repulsion using a spatial hash to keep the pass
- * O(N) on average instead of O(N²). Two circles overlap iff the
- * distance between their centres is less than the sum of their
- * radii — we split the overlap 50/50 and push them apart along the
- * separating axis.
- */
-function gRelaxCollisions(iterations = 12, padding = 4): void {
-  if (gNodes.length < 2) return;
-  const cellSize = 64;
-  for (let iter = 0; iter < iterations; iter++) {
-    const grid: Map<string, number[]> = new Map();
-    for (let i = 0; i < gNodes.length; i++) {
-      const n = gNodes[i];
-      const gx = Math.floor(n.x / cellSize);
-      const gy = Math.floor(n.y / cellSize);
-      const key = `${gx},${gy}`;
-      let bucket = grid.get(key);
-      if (!bucket) {
-        bucket = [];
-        grid.set(key, bucket);
-      }
-      bucket.push(i);
-    }
-    let anyMove = false;
-    for (let i = 0; i < gNodes.length; i++) {
-      const a = gNodes[i];
-      const gx = Math.floor(a.x / cellSize);
-      const gy = Math.floor(a.y / cellSize);
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          const bucket = grid.get(`${gx + dx},${gy + dy}`);
-          if (!bucket) continue;
-          for (const j of bucket) {
-            if (j <= i) continue;
-            const b = gNodes[j];
-            const ddx = b.x - a.x;
-            const ddy = b.y - a.y;
-            const minDist = a.r + b.r + padding;
-            const distSq = ddx * ddx + ddy * ddy;
-            if (distSq >= minDist * minDist) continue;
-            const dist = Math.sqrt(distSq) || 0.0001;
-            const overlap = (minDist - dist) / 2;
-            const ux = ddx / dist;
-            const uy = ddy / dist;
-            a.x -= ux * overlap;
-            a.y -= uy * overlap;
-            b.x += ux * overlap;
-            b.y += uy * overlap;
-            anyMove = true;
-          }
-        }
-      }
-    }
-    if (!anyMove) break;
-  }
-}
-
-function gCenterView(): void {
-  if (gNodes.length === 0) return;
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  gNodes.forEach((n) => { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x); minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y); });
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-  const spanX = maxX - minX + 100, spanY = maxY - minY + 100;
-  const cw = gCssW || 800, ch = gCssH || 600;
-  gZoom = Math.min(cw / spanX, ch / spanY, 2);
-  gZoom = Math.max(G_ZOOM_MIN, Math.min(G_ZOOM_MAX, gZoom));
-  gPanX = cw / 2 - cx * gZoom;
-  gPanY = ch / 2 - cy * gZoom;
-}
-
-function gExtractKeywordsFromTitle(title: string): string[] {
-  const words = (title || "").toLowerCase().replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 2);
-  return words.slice(0, 8);
-}
-
-async function loadGraphData(): Promise<void> {
-  try {
-    $("graphContainer").setAttribute("aria-busy", "true");
-    let items: Array<{ name: string; archive_dir?: string; display_name: string; source_file?: string; provider: string; keywords: string[] }> = [];
-    try {
-      const r = await apiGet<{ nodes: Array<{ name: string; archive_dir?: string; display_name: string; source_file?: string; provider: string; keywords: string[]; size_bytes: number }> }>("/api/recordings/graph");
-      items = (r.nodes || []).map((it) => ({
-        name: it.name, archive_dir: it.archive_dir || "", display_name: it.display_name,
-        source_file: it.source_file || "",
-        provider: it.provider || "unknown", keywords: it.keywords || [],
-      }));
-    } catch {
-      const r = await apiGet<{ items: RecordingItem[] }>("/api/recordings");
-      items = (r.items || []).map((it) => ({
-        name: it.name, archive_dir: it.archive_dir || "", display_name: it.display_name,
-        source_file: it.source_file || "",
-        provider: it.provider || "unknown",
-        keywords: gExtractKeywordsFromTitle(it.display_name),
-      }));
-    }
-
-    gNodes = items.map((it) => ({
-      name: it.name, archiveDir: String(it.archive_dir || "").trim(), displayName: it.display_name,
-      provider: it.provider || "unknown", keywords: it.keywords || [],
-      x: 0, y: 0, vx: 0, vy: 0,
-      // Larger baseline radius so clusters feel substantial. The
-      // log scale lets a "3-keyword" node and a "12-keyword" node
-      // differ visibly without the big one blotting out neighbours.
-      r: Math.max(5, Math.min(14, 5 + Math.log2(Math.max((it.keywords || []).length, 1) + 1) * 3)),
-    }));
-    $("graphInfoText").textContent = `${gNodes.length} recording${gNodes.length === 1 ? "" : "s"}`;
-    if (gNodes.length === 0) { gRender(); return; }
-
-    gClusterLayout();
-    gRelaxCollisions();
-    gComputeEdges();
-    gCenterView();
-    gRender();
-  } catch (e) {
-    $("graphInfoText").textContent = "Error: " + (e as Error).message;
-    gNodes = [];
-  } finally {
-    $("graphContainer").setAttribute("aria-busy", "false");
-  }
-}
-
-function gRender(): void {
-  const gc = $("graphCanvas") as HTMLCanvasElement;
-  const container = $("graphContainer");
-  const rect = container.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  gCssW = rect.width; gCssH = rect.height;
-  gc.width = rect.width * dpr; gc.height = rect.height * dpr;
-  gc.style.width = rect.width + "px"; gc.style.height = rect.height + "px";
-  const c = gc.getContext("2d")!;
-  c.scale(dpr, dpr);
-  const W = rect.width, H = rect.height;
-
-  c.fillStyle = "#121212";
-  c.fillRect(0, 0, W, H);
-
-  if (gNodes.length === 0) {
-    c.fillStyle = "#8f8f8f"; c.font = "13px 'SF Pro Text', -apple-system, sans-serif";
-    c.textAlign = "center"; c.textBaseline = "middle";
-    c.fillText("No recordings to display", W / 2, H / 2);
-    c.font = "10px 'SF Pro Text', -apple-system, sans-serif"; c.fillStyle = "#666";
-    c.fillText("Create recordings to see them visualized here", W / 2, H / 2 + 22);
-    return;
-  }
-
-  // Viewport in graph coords
-  const vl = -gPanX / gZoom, vt = -gPanY / gZoom;
-  const vr = (W - gPanX) / gZoom, vb = (H - gPanY) / gZoom;
-  const pad = 20 / gZoom;
-
-  c.save();
-  c.translate(gPanX, gPanY);
-  c.scale(gZoom, gZoom);
-
-  // Edges — single batched path
-  if (gEdges.length > 0) {
-    c.beginPath();
-    c.strokeStyle = "rgba(255,255,255,0.04)";
-    c.lineWidth = 0.4;
-    for (const [ai, bi] of gEdges) {
-      const ax = gNodes[ai].x, ay = gNodes[ai].y;
-      const bx = gNodes[bi].x, by = gNodes[bi].y;
-      if (Math.max(ax, bx) < vl || Math.min(ax, bx) > vr || Math.max(ay, by) < vt || Math.min(ay, by) > vb) continue;
-      c.moveTo(ax, ay);
-      c.lineTo(bx, by);
-    }
-    c.stroke();
-  }
-
-  // Nodes — batched per color
-  const byColor: Map<string, GraphNode[]> = new Map();
-  for (const n of gNodes) {
-    if (n.x + n.r + pad < vl || n.x - n.r - pad > vr || n.y + n.r + pad < vt || n.y - n.r - pad > vb) continue;
-    const col = gColor(n.provider);
-    let arr = byColor.get(col);
-    if (!arr) { arr = []; byColor.set(col, arr); }
-    arr.push(n);
-  }
-
-  byColor.forEach((nodes, col) => {
-    c.beginPath();
-    c.fillStyle = gHex(col, 0.7);
-    for (const n of nodes) {
-      if (n === gHovered) continue;
-      c.moveTo(n.x + n.r, n.y);
-      c.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-    }
-    c.fill();
-  });
-
-  // Hovered node
-  if (gHovered) {
-    const n = gHovered;
-    const col = gColor(n.provider);
-    const grd = c.createRadialGradient(n.x, n.y, n.r, n.x, n.y, n.r + 16);
-    grd.addColorStop(0, gHex(col, 0.3)); grd.addColorStop(1, gHex(col, 0));
-    c.beginPath(); c.arc(n.x, n.y, n.r + 16, 0, Math.PI * 2); c.fillStyle = grd; c.fill();
-    c.beginPath(); c.arc(n.x, n.y, n.r, 0, Math.PI * 2); c.fillStyle = col; c.fill();
-    c.strokeStyle = "#fff"; c.lineWidth = 1.5; c.stroke();
-    c.fillStyle = "#fff";
-    c.font = `${Math.max(10, 11 / gZoom)}px 'SF Pro Text', -apple-system, sans-serif`;
-    c.textAlign = "center"; c.textBaseline = "bottom";
-    c.fillText(n.displayName, n.x, n.y - n.r - 6);
-  }
-
-  c.restore();
-
-  // Legend
-  //
-  // The legend is drawn in the OUTER (un-panned, un-zoomed) coordinate
-  // space so it stays pinned to the top-right corner. Previously the
-  // coloured dots and text rendered directly on top of whatever nodes
-  // happened to land in that corner of the viewport — the user's
-  // "в графе все друг на друга наезжает" report. We paint a rounded
-  // backdrop rectangle first so the legend becomes a visually-isolated
-  // island instead of an invisible overlay.
-  const providers = [...new Set(gNodes.map((n) => n.provider))];
-  if (providers.length > 0) {
-    const legendLineH = 16;
-    const legendPadX = 10;
-    const legendPadY = 8;
-    const legendW = 90;
-    const legendH = providers.length * legendLineH + legendPadY * 2 - 4;
-    const legendX = W - legendW - 10;
-    const legendY = 10;
-    // Rounded-rect backdrop. ``roundRect`` is a Canvas 2D method that
-    // shipped in Chromium 99+ — Electron (which we target) always
-    // has a newer rendering core, so this path is safe. A manual
-    // arc fallback exists below for paranoia.
-    c.beginPath();
-    if (typeof (c as CanvasRenderingContext2D & { roundRect?: (x: number, y: number, w: number, h: number, r: number) => void }).roundRect === "function") {
-      (c as CanvasRenderingContext2D & { roundRect: (x: number, y: number, w: number, h: number, r: number) => void }).roundRect(legendX, legendY, legendW, legendH, 8);
-    } else {
-      const r = 8;
-      c.moveTo(legendX + r, legendY);
-      c.arcTo(legendX + legendW, legendY, legendX + legendW, legendY + legendH, r);
-      c.arcTo(legendX + legendW, legendY + legendH, legendX, legendY + legendH, r);
-      c.arcTo(legendX, legendY + legendH, legendX, legendY, r);
-      c.arcTo(legendX, legendY, legendX + legendW, legendY, r);
-    }
-    c.fillStyle = "rgba(18, 18, 18, 0.82)";
-    c.fill();
-    c.strokeStyle = "rgba(255, 255, 255, 0.08)";
-    c.lineWidth = 1;
-    c.stroke();
-
-    // Legend items
-    c.textAlign = "left";
-    c.textBaseline = "middle";
-    c.font = "9px 'SF Pro Text', -apple-system, sans-serif";
-    let ly = legendY + legendPadY + 4;
-    for (const p of providers) {
-      const col = gColor(p);
-      const dotX = legendX + legendPadX;
-      c.beginPath();
-      c.arc(dotX, ly, 4, 0, Math.PI * 2);
-      c.fillStyle = col;
-      c.fill();
-      c.fillStyle = "#c0c0c0";
-      c.fillText(GRAPH_PROVIDER_LABELS[p] || p, dotX + 10, ly);
-      ly += legendLineH;
-    }
-  }
-}
-
-function gHitTest(mx: number, my: number): GraphNode | null {
-  const gx = (mx - gPanX) / gZoom, gy = (my - gPanY) / gZoom;
-  let best: GraphNode | null = null;
-  let bestD = Infinity;
-  for (const n of gNodes) {
-    const dx = n.x - gx, dy = n.y - gy;
-    const d = dx * dx + dy * dy;
-    const rr = (n.r + 6) * (n.r + 6);
-    if (d <= rr && d < bestD) { best = n; bestD = d; }
-  }
-  return best;
-}
-
-function gShowTooltip(node: GraphNode, mx: number, my: number): void {
-  const tt = $("graphTooltip");
-  $("graphTooltipTitle").textContent = node.displayName;
-  $("graphTooltipMeta").textContent = node.provider + (node.keywords.length ? " · " + node.keywords.slice(0, 5).join(", ") : "");
-  $("graphTooltipPreview").textContent = "";
-  // Measure the tooltip's real size after it is visible. The old
-  // code assumed fixed 280×80 dimensions, which broke whenever CSS
-  // changed the tooltip padding, font, or line wrapping — the
-  // tooltip either clipped off-canvas or left a gap near the edge.
-  // Measuring gives us an exact clamp envelope regardless of styling.
-  tt.hidden = false;
-  const rect = $("graphContainer").getBoundingClientRect();
-  const ttRect = tt.getBoundingClientRect();
-  const ttW = Math.max(1, Math.round(ttRect.width));
-  const ttH = Math.max(1, Math.round(ttRect.height));
-  const margin = 6;
-
-  // Prefer right-of-cursor; fall back to left-of-cursor if the
-  // right side would overflow. Final clamp guarantees the tooltip
-  // stays inside [margin, containerSize - ttSize - margin].
-  let left = mx + 16;
-  if (left + ttW + margin > rect.width) {
-    left = mx - ttW - 16;
-  }
-  if (left + ttW + margin > rect.width) {
-    left = rect.width - ttW - margin;
-  }
-  if (left < margin) left = margin;
-
-  let top = my - 10;
-  if (top + ttH + margin > rect.height) {
-    top = rect.height - ttH - margin;
-  }
-  if (top < margin) top = margin;
-
-  tt.style.left = left + "px";
-  tt.style.top = top + "px";
-}
-
-function gHideTooltip(): void {
-  $("graphTooltip").hidden = true;
-  gHovered = null;
-}
-
-function gNavToRecording(node: GraphNode): void {
-  recordingsSearchQuery = "";
-  ($("recordingsSearchInput") as HTMLInputElement).value = "";
-  selectedRecordingName = node.name;
-  selectedRecordingArchiveDir = String(node.archiveDir || "").trim();
-  switchView("recordings");
-  // switchView only refreshes the list when it was empty; without an
-  // explicit openRecording call, the detail pane keeps showing whatever
-  // was open before, so the click "navigates" but shows the wrong content.
-  void openRecording(node.name, node.archiveDir);
-}
+// Graph is intentionally dormant. The sidebar/markup is commented out in
+// index.html, and the implementation block is kept out of the active bundle
+// so it cannot allocate canvas state, register listeners, or call graph APIs.
 
 async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = false;
@@ -9595,107 +9113,8 @@ async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = !!currentArchiveDirSnapshot();
 }
 
-function initGraphInteractions(): void {
-  const gc = $("graphCanvas") as HTMLCanvasElement;
-  const ct = $("graphContainer");
-
-  ct.addEventListener("wheel", (e: WheelEvent) => {
-    e.preventDefault();
-    const rect = ct.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const dir = e.deltaY < 0 ? G_ZOOM_FACTOR : 1 / G_ZOOM_FACTOR;
-    const nz = Math.max(G_ZOOM_MIN, Math.min(G_ZOOM_MAX, gZoom * dir));
-    gPanX = mx - (mx - gPanX) * (nz / gZoom);
-    gPanY = my - (my - gPanY) * (nz / gZoom);
-    gZoom = nz;
-    gRender();
-  }, { passive: false });
-
-  ct.addEventListener("mousedown", (e: MouseEvent) => {
-    if (e.button !== 0) return;
-    gDragging = true; gDragDist = 0;
-    gDragStartX = e.clientX; gDragStartY = e.clientY;
-    gDragPanStartX = gPanX; gDragPanStartY = gPanY;
-    // Install drag-continuation handlers ONLY for the duration of
-    // this drag. Previously they lived on `window` permanently and
-    // fired `if (!gDragging) return;` on EVERY mouse move anywhere
-    // in the app for the lifetime of the page — wasted hit-test
-    // cost that accrues linearly with session length (100+ Hz on a
-    // modern pointer × 6h = ~2M wasted no-op calls). Scope-binding
-    // to the drag means zero overhead outside an active drag.
-    const onDragMove = (ev: MouseEvent) => {
-      const dx = ev.clientX - gDragStartX, dy = ev.clientY - gDragStartY;
-      gDragDist = Math.sqrt(dx * dx + dy * dy);
-      gPanX = gDragPanStartX + dx; gPanY = gDragPanStartY + dy;
-      gRender();
-    };
-    const onDragEnd = () => {
-      gDragging = false;
-      window.removeEventListener("mousemove", onDragMove);
-      window.removeEventListener("mouseup", onDragEnd);
-      // Defensive safety net: if some OS-level focus loss or
-      // fullscreen transition swallows the mouseup event, a final
-      // blur tear-down prevents the drag state from sticking.
-      window.removeEventListener("blur", onDragEnd);
-    };
-    window.addEventListener("mousemove", onDragMove);
-    window.addEventListener("mouseup", onDragEnd);
-    window.addEventListener("blur", onDragEnd);
-  });
-
-  // Graph-local hover mousemove. Stays container-scoped (not window)
-  // so hit-test evaluation only runs when the cursor is genuinely
-  // over the graph. Early-returns on active drag so the drag handler
-  // owns the render path unambiguously.
-  ct.addEventListener("mousemove", (e: MouseEvent) => {
-    if (gDragging) return;
-    const rect = ct.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    if (mx < 0 || my < 0 || mx > rect.width || my > rect.height) {
-      if (gHovered) { gHideTooltip(); gRender(); }
-      return;
-    }
-    const hit = gHitTest(mx, my);
-    if (hit !== gHovered) {
-      gHovered = hit;
-      if (hit) gShowTooltip(hit, mx, my); else gHideTooltip();
-      gRender();
-    } else if (hit) {
-      gShowTooltip(hit, mx, my);
-    }
-  });
-
-  gc.addEventListener("click", (e: MouseEvent) => {
-    if (gDragDist > G_DRAG_THRESHOLD) return;
-    const rect = ct.getBoundingClientRect();
-    const hit = gHitTest(e.clientX - rect.left, e.clientY - rect.top);
-    if (hit) gNavToRecording(hit);
-  });
-
-  $("graphZoomIn").addEventListener("click", () => {
-    const nz = Math.min(G_ZOOM_MAX, gZoom * G_ZOOM_FACTOR);
-    gPanX = gCssW / 2 - (gCssW / 2 - gPanX) * (nz / gZoom);
-    gPanY = gCssH / 2 - (gCssH / 2 - gPanY) * (nz / gZoom);
-    gZoom = nz; gRender();
-  });
-  $("graphZoomOut").addEventListener("click", () => {
-    const nz = Math.max(G_ZOOM_MIN, gZoom / G_ZOOM_FACTOR);
-    gPanX = gCssW / 2 - (gCssW / 2 - gPanX) * (nz / gZoom);
-    gPanY = gCssH / 2 - (gCssH / 2 - gPanY) * (nz / gZoom);
-    gZoom = nz; gRender();
-  });
-  $("graphZoomReset").addEventListener("click", () => { gCenterView(); gRender(); });
-  $("graphRefreshBtn").addEventListener("click", () => void loadGraphData());
-  $("graphOpenRecordingsBtn").addEventListener("click", () => switchView("recordings"));
-
-  new ResizeObserver(() => {
-    if (!ct.closest("[hidden]")) gRender();
-  }).observe(ct);
-}
-
-if (GRAPH_VIEW_ENABLED) {
-  initGraphInteractions();
-}
+// Graph interactions are disabled with the Graph view. Restore together with
+// the commented markup in index.html and the graph styles in styles.css.
 
 // Stamp the version badge on boot. The HTML at #appVersionNumber
 // holds a build-time placeholder that vite/index.html templating
@@ -10675,20 +10094,16 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         : await remoteJobQueued(sourceFile as File, remoteOpts);
       text = String(out.text || "").trim();
     }
-    item.text = text;
-    item.status = "done";
-    item.stage = "done";
     item.model = modelLabel;
     item.language = language;
-    item.endedAt = performance.now();
-    item.completedAt = Date.now();
     // Persist to the History tab's archive. We pass the original
     // file so the audio is saved alongside the transcript and is
     // playable from the History row. `refreshList: true` triggers a
     // single archive reload at the end of each successful save.
+    const sourceName = sourceFile?.name || uploadPathBasename(sourcePath) || uploadItemName(item);
+    let saveOut: SavedRecordingRef;
     try {
-      const sourceName = sourceFile?.name || uploadPathBasename(sourcePath) || uploadItemName(item);
-      const saveOut = await saveRecordingText({
+      saveOut = await saveRecordingText({
         title: (sourceName.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
         sourceText: text,
         transcriptText: text,
@@ -10700,25 +10115,26 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         audioSourcePath: useSourcePath ? sourcePath : "",
         refreshList: true,
       });
-      if (saveOut && typeof saveOut === "object") {
-        item.savedName = String((saveOut as { name?: string }).name || "");
-        // ``saveRecordingText`` returns ``SavedRecordingRef`` whose
-        // shape is ``{ name, archiveDir }`` (camelCase — see
-        // SavedRecordingRef interface). The previous read used
-        // ``archive_dir`` (snake_case) which is always undefined →
-        // savedArchiveDir was always "" and the Upload-pane Reveal-
-        // in-Finder button silently sent an empty archiveDir IPC
-        // payload. The main process logged "archive_dir empty" and
-        // the user saw nothing happen.
-        item.savedArchiveDir = String(
-          (saveOut as { archiveDir?: string }).archiveDir || "",
-        );
-      }
     } catch (saveErr) {
-      // Persist failure is non-fatal — the transcript is still
-      // shown to the user; only the History entry is missing.
       console.warn("Upload: saveRecordingText failed", saveErr);
+      item.text = text;
+      item.status = "error";
+      item.stage = undefined;
+      item.error = `Transcript finished, but History save failed: ${sanitizeUiErrorMessage(
+        saveErr,
+        "Could not save this upload to History.",
+      )}`;
+      item.endedAt = performance.now();
+      item.completedAt = Date.now();
+      return;
     }
+    item.text = text;
+    item.status = "done";
+    item.stage = "done";
+    item.endedAt = performance.now();
+    item.completedAt = Date.now();
+    item.savedName = String(saveOut.name || "");
+    item.savedArchiveDir = String(saveOut.archiveDir || "");
     // Auto-select the just-completed item in the result pane unless
     // the user has already clicked another item — gives a clear
     // visual confirmation of "this is your transcript" without

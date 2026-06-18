@@ -4,6 +4,7 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -225,7 +226,7 @@ class RecordingNameTests(unittest.TestCase):
         self.assertNotEqual(first_key, second_key)
         self.assertNotEqual(second_key, third_key)
 
-    def test_uppercase_txt_recording_is_visible_in_history_graph_and_stats(self):
+    def test_uppercase_txt_recording_is_visible_in_history_and_stats(self):
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
         recording = root / "Existing.TXT"
@@ -240,12 +241,40 @@ class RecordingNameTests(unittest.TestCase):
         )
 
         list_payload = self.main._build_recordings_list_payload(root)
-        graph_payload = self.main._build_recordings_graph_payload(root)
         stats_payload = self.main._build_recordings_stats_payload(root)
 
         self.assertEqual([item["name"] for item in list_payload["items"]], ["Existing.TXT"])
-        self.assertEqual([node["name"] for node in graph_payload["nodes"]], ["Existing.TXT"])
         self.assertEqual(stats_payload["total_recordings"], 1)
+
+    def test_delete_all_removes_uppercase_txt_recordings(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        recording = root / "Existing.TXT"
+        audio = root / "Existing.webm"
+        recording.write_text("Title: Existing\nTranscription:\none\n", encoding="utf-8")
+        audio.write_bytes(b"audio")
+
+        result = self.main._delete_all_recordings_sync()
+
+        self.assertEqual(result["deleted"], 1)
+        self.assertFalse(recording.exists())
+        self.assertFalse(audio.exists())
+
+    def test_audio_retention_matches_uppercase_txt_siblings(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        (root / "Keep.TXT").write_text("keep", encoding="utf-8")
+        keep_audio = root / "Keep.webm"
+        keep_audio.write_bytes(b"keep")
+        (root / "Old.TXT").write_text("old", encoding="utf-8")
+        old_audio = root / "Old.webm"
+        old_audio.write_bytes(b"old")
+
+        pruned = self.main._prune_old_recording_audio(root, "Keep")
+
+        self.assertEqual(pruned, 1)
+        self.assertTrue(keep_audio.exists())
+        self.assertFalse(old_audio.exists())
 
     def test_save_with_audio_upload_collection_writes_uploaded_media_folder(self):
         upload_file = self.main.UploadFile(
@@ -311,6 +340,102 @@ class RecordingNameTests(unittest.TestCase):
             1,
         )
         self.assertIn("updated", existing.read_text(encoding="utf-8"))
+
+    def test_save_with_audio_restores_existing_audio_when_new_upload_fails(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.txt"
+        existing.write_text("old", encoding="utf-8")
+        old_audio = target / "Existing.wav"
+        old_audio.write_bytes(b"old audio")
+
+        async def failing_writer(_tmp_audio: Path) -> None:
+            raise OSError("simulated write failure")
+
+        with self.assertRaises(OSError):
+            asyncio.run(self.main._save_recording_audio_source(
+                orig_name="replacement.wav",
+                write_tmp_audio=failing_writer,
+                name="Existing.txt",
+                archive_dir=str(target),
+                require_existing=True,
+                title="Existing",
+                source_text="source",
+                transcript_text="updated",
+                provider="local",
+                model="small",
+                language="ru",
+                recording_collection="",
+                live_session_id="",
+            ))
+
+        self.assertEqual(old_audio.read_bytes(), b"old audio")
+        self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+
+    def test_claim_recording_text_path_is_atomic_for_parallel_new_saves(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+        errors: list[BaseException] = []
+
+        def claim() -> None:
+            try:
+                barrier.wait(timeout=2)
+                _stem, out = self.main._claim_recording_text_path(
+                    target,
+                    self.main._recording_stem_candidates_from_base("lecture", collision_suffix="timestamp"),
+                )
+                results.append(out.name)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(set(results)), 2)
+        self.assertEqual(len(list(target.glob("*.txt"))), 2)
+
+    def test_failed_upload_validation_does_not_leave_queued_jobs(self):
+        before = set(self.main.jobs._jobs)
+        bad_file = self.main.UploadFile(
+            io.BytesIO(b"not audio"),
+            filename="bad.exe",
+            size=len(b"not audio"),
+        )
+
+        with self.assertRaises(self.main.HTTPException):
+            asyncio.run(self.main.create_job(file=bad_file))
+
+        bad_remote = self.main.UploadFile(
+            io.BytesIO(b"not audio"),
+            filename="bad.exe",
+            size=len(b"not audio"),
+        )
+        with self.assertRaises(self.main.HTTPException):
+            asyncio.run(self.main.create_remote_job(file=bad_remote))
+
+        self.assertEqual(set(self.main.jobs._jobs), before)
+
+    def test_delete_all_recordings_removes_uppercase_txt_and_audio(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        recording = root / "Existing.TXT"
+        recording.write_text("old", encoding="utf-8")
+        audio = root / "Existing.wav"
+        audio.write_bytes(b"old audio")
+
+        result = self.main._delete_all_recordings_sync()
+
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["deleted"], 1)
+        self.assertFalse(recording.exists())
+        self.assertFalse(audio.exists())
 
     def test_save_from_path_upload_collection_copies_source_without_deleting_it(self):
         source = Path(self._tmp.name) / "lecture source.mp3"

@@ -1,12 +1,12 @@
 # Voice Transcriptor — Verified Audit, 18 June 2026
 
-Итог: подтверждено 34 реальных бага/SSOT-рассинхрона. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
+Итог: подтверждено 45 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
 
 Статус:
-- Исправлено: 33
+- Исправлено: 44
 - Оставлено с явным стопом: 1
 - P0: 0 найдено
-- P1: 13 найдено, 13 исправлено (100%)
+- P1: 20 найдено, 20 исправлено (100%)
 
 ## 1. P1 FIXED — keyfile race could overwrite Fernet key
 
@@ -696,7 +696,7 @@ ditto "$APP_DIR" "$PRIMARY_APP"
 
 Суть: recordings list cache key учитывал directory mtime и количество lowercase `.txt`, но не mtime/size transcript/audio файлов.
 
-Последствие: изменение текста существующей записи или audio-sidecar могло не инвалидировать History/Stats/Graph cache, если число файлов не менялось.
+Последствие: изменение текста существующей записи или audio-sidecar могло не инвалидировать History/Stats cache, если число файлов не менялось.
 
 Было:
 ```python
@@ -745,13 +745,13 @@ out_text = target_dir / text_name
 
 Объяснение: выбранный пользователем filename теперь остается SSOT для существующей записи; stem используется только для связанного audio filename.
 
-## 34. P2 FIXED — uppercase `.TXT` recordings disappeared from History/Graph/Stats
+## 34. P2 FIXED — uppercase `.TXT` recordings disappeared from History/Stats
 
-Файл и строка: `backend/main.py:4481`, `backend/main.py:4598`, `backend/main.py:4779`
+Файл и строка: `backend/main.py:4481`, `backend/main.py:4598`
 
 Суть: builders использовали `glob("*.txt")`, хотя save/get endpoints уже принимают `.TXT`.
 
-Последствие: на case-sensitive filesystem запись `Existing.TXT` можно было сохранить и открыть напрямую, но она пропадала из History list, Graph payload и Stats summary.
+Последствие: на case-sensitive filesystem запись `Existing.TXT` можно было сохранить и открыть напрямую, но она пропадала из History list и Stats summary.
 
 Было:
 ```python
@@ -768,6 +768,266 @@ files.extend(_iter_recording_text_files(archive_dir))
 ```
 
 Объяснение: `_iter_recording_text_files()` делает case-insensitive suffix check (`entry.suffix.lower() == ".txt"`) и стал единым SSOT для всех transcript scans.
+
+## 35. P1 FIXED — release runtime build had no transitive wheel lock
+
+Файл и строка: `desktop/scripts/prepare-runtime.sh:27`, `requirements.runtime-lock.txt:1`
+
+Суть: `prepare-runtime.sh` устанавливал broad transitive wheel graph только из `requirements.txt`, без constraints lock.
+
+Последствие: full app rebuild уходил в долгий `pip` backtracking по `numpy`, `huggingface-hub`, `filelock`, `fsspec`, `onnxruntime` и мог практически зависать до packaging stage.
+
+Было:
+```bash
+pip_args+=(-r "${REQS}")
+```
+
+Стало:
+```bash
+REQS_LOCK="${ROOT_DIR}/requirements.runtime-lock.txt"
+[ -f "${REQS_LOCK}" ] || die "missing runtime constraints lock: ${REQS_LOCK}"
+pip_args+=(-c "${REQS_LOCK}")
+pip_args+=(-r "${REQS}")
+```
+
+Объяснение: `requirements.txt` остается SSOT прямых backend dependencies, а `requirements.runtime-lock.txt` фиксирует уже существующий working bundled-runtime graph из установленного app. Release runtime build теперь fail-fast падает без constraints lock, чтобы не возвращаться к broad resolver path. Новые packages не добавлены; зафиксированы версии уже используемых transitive wheels.
+
+## 36. P1 FIXED — dormant Graph still had an active backend/resource surface
+
+Файл и строка: `backend/main.py:4669`, `frontend/src/main.tsx:9092`, `frontend/src/styles.css:2808`
+
+Суть: Graph был скрыт в sidebar, но backend route/cache/builder и frontend graph implementation оставались активным кодом.
+
+Последствие: прямой HTTP вызов или случайный restore view мог запускать полный graph scan, держать canvas/listeners и расходовать CPU/RAM для функции, которую мы пока не используем.
+
+Было:
+```python
+@app.get("/api/recordings/graph")
+def recordings_graph():
+    return _build_recordings_graph_payload()
+```
+
+Стало:
+```python
+# Graph is intentionally dormant. The frontend sidebar/view and TS/CSS
+# implementation are commented out, and the backend route is not registered
+# so no graph scan can be triggered by OpenAPI or direct HTTP calls.
+```
+
+Объяснение: Graph теперь действительно dormant на всех boundary: HTML markup закомментирован, TS/CSS implementation снят с active bundle, backend route не регистрируется.
+
+## 37. P1 FIXED — API token file had a permission race window
+
+Файл и строка: `backend/main.py:481`, `backend/main.py:539`
+
+Суть: auto-generated API token записывался обычным atomic writer, а `chmod 0600` выполнялся уже после rename.
+
+Последствие: на системах с permissive umask token мог коротко появиться с более широкими permissions.
+
+Было:
+```python
+atomic_write_text(API_TOKEN_PATH, token)
+try:
+    os.chmod(API_TOKEN_PATH, 0o600)
+except Exception:
+    pass
+```
+
+Стало:
+```python
+fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+...
+os.replace(str(tmp), str(path))
+os.chmod(path, 0o600)
+```
+
+Объяснение: `_secure_atomic_write_text()` создает временный token file сразу с `0600`, fsync-ит и только потом atomically replaces final path.
+
+## 38. P2 FIXED — Deepgram `num_speakers` setting was ignored
+
+Файл и строка: `backend/main.py:3656`, `backend/remote_deepgram.py:106`
+
+Суть: API принимал `num_speakers`, но provider call не передавал параметр в Deepgram request.
+
+Последствие: пользователь выбирал speaker count, а diarization работал в auto mode.
+
+Было:
+```python
+out = deepgram_transcribe(api_key, input_path, language=language)
+```
+
+Стало:
+```python
+out = deepgram_transcribe(
+    api_key,
+    input_path,
+    language=language,
+    diarize=diarize,
+    num_speakers=num_speakers,
+)
+```
+
+Объяснение: provider boundary теперь валидирует `num_speakers` как integer 1..10 и добавляет его в Deepgram params только при включенной diarization.
+
+## 39. P2 FIXED — Delete All missed uppercase `.TXT` recordings
+
+Файл и строка: `backend/main.py:4674`
+
+Суть: delete-all cleanup использовал lowercase-only scan в части старого recordings path.
+
+Последствие: на case-sensitive filesystem `Existing.TXT` мог остаться после "Delete all", вместе с audio sidecar.
+
+Было:
+```python
+for p in d.glob("*.txt"):
+    ...
+```
+
+Стало:
+```python
+for p in _iter_recording_text_files(d):
+    ...
+```
+
+Объяснение: destructive recording actions теперь используют тот же case-insensitive transcript iterator, что и list/stats/read paths.
+
+## 40. P2 FIXED — audio retention missed uppercase `.TXT` sidecars
+
+Файл и строка: `backend/main.py:2146`, `backend/main.py:2155`
+
+Суть: audio pruning проверял наличие transcript через `entry.with_suffix(".txt")`.
+
+Последствие: `Old.TXT` считался отсутствующим transcript, поэтому связанный `Old.webm` мог пережить retention cleanup или быть обработан неверно.
+
+Было:
+```python
+if entry.stem != keep_stem and not entry.with_suffix(".txt").exists():
+    entry.unlink()
+```
+
+Стало:
+```python
+if entry.stem != keep_stem and not _recording_text_sibling_exists(target_dir, entry.stem):
+    entry.unlink()
+```
+
+Объяснение: sibling lookup теперь идет через `_iter_recording_text_files()` и не зависит от casing расширения.
+
+## 41. P1 FIXED — log rotation deleted log files
+
+Файл и строка: `desktop/main.js:304`, `desktop/main.js:314`
+
+Суть: rotation удалял stale `main.log.rotating` и мог unlink-нуть pending archive при ошибках.
+
+Последствие: диагностические logs терялись без явного запроса пользователя.
+
+Было:
+```js
+if (fs.existsSync(pending)) fs.unlinkSync(pending);
+fs.renameSync(MAIN_LOG_FILE, pending);
+...
+if (fs.existsSync(pending)) fs.unlinkSync(pending);
+```
+
+Стало:
+```js
+const pending = mainLogArchivePath("rotating");
+const archived = mainLogArchivePath("archive");
+fs.renameSync(MAIN_LOG_FILE, pending);
+fs.renameSync(pending, archived);
+```
+
+Объяснение: rotation теперь всегда moves old logs into timestamped archive/recovered files and never deletes logs.
+
+## 42. P1 FIXED — macOS install could merge a new app over stale bundle files
+
+Файл и строка: `BUILD.command:47`
+
+Суть: installed `.app` обновлялся прямым `ditto "$APP_DIR" "$target_app"`.
+
+Последствие: файлы, удаленные из новой сборки, могли остаться в installed app bundle и влиять на runtime.
+
+Было:
+```bash
+mkdir -p "$target_root"
+ditto "$APP_DIR" "$target_app"
+```
+
+Стало:
+```bash
+tmp_app="$target_root/.${target_name}.installing.$$"
+backup_app="$target_app.backup-$(date -u +%Y%m%dT%H%M%SZ)"
+ditto "$APP_DIR" "$tmp_app"
+codesign --verify --deep --strict "$tmp_app"
+mv "$target_app" "$backup_app"
+mv "$tmp_app" "$target_app"
+```
+
+Объяснение: install now stages a clean bundle, verifies it, then swaps it into place. Old bundle is preserved as a timestamped backup, not merged.
+
+## 43. P1 FIXED — Linux source build bypassed packaged runtime SSOT
+
+Файл и строка: `INSTALL.command:21`, `desktop/package.json:15`, `desktop/package.json:121`
+
+Суть: Linux source entrypoint ran electron-builder directly instead of the desktop package script, while runtime preparation and resources lived in package config.
+
+Последствие: AppImage could be built without the bundled Python/ffmpeg runtime even though docs and package config claimed packaged runtime support.
+
+Было:
+```bash
+npm --prefix frontend run build
+cd "$SCRIPT_DIR/desktop"
+node ./unlockDist.js
+npx electron-builder --linux AppImage --x64 "$@"
+```
+
+Стало:
+```bash
+npm --prefix desktop run dist:linux -- "$@"
+```
+
+Объяснение: `dist:linux` is now the single Linux package pipeline: prepare `runtime/linux-x64`, build frontend, unlock dist, and package AppImage with Linux `extraResources`.
+
+## 44. P1 FIXED — frontend release build skipped TypeScript checking
+
+Файл и строка: `frontend/package.json:8`
+
+Суть: `npm --prefix frontend run build` executed only `vite build`.
+
+Последствие: TypeScript regressions could ship because Vite transpiles without enforcing `tsc --noEmit`.
+
+Было:
+```json
+"build": "vite build"
+```
+
+Стало:
+```json
+"typecheck": "tsc --noEmit",
+"build": "tsc --noEmit && vite build"
+```
+
+Объяснение: release frontend build now fails on renderer TypeScript errors instead of relying on Vite's transpile-only build path.
+
+## 45. P3 FIXED — frontend package-lock version drifted
+
+Файл и строка: `frontend/package-lock.json:3`
+
+Суть: `frontend/package.json` was `1.1.25`, lockfile root metadata was still `1.0.0`.
+
+Последствие: scripts/tooling reading lock metadata could report the wrong frontend/app version.
+
+Было:
+```json
+"version": "1.0.0"
+```
+
+Стало:
+```json
+"version": "1.1.25"
+```
+
+Объяснение: frontend lock metadata now matches the package version SSOT.
 
 ## Verification
 

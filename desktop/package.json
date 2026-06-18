@@ -9,10 +9,10 @@
     "start": "electron .",
     "dev": "NODE_ENV=development electron .",
     "build:frontend": "npm --prefix ../frontend run build",
-    "dist": "node ./unlockDist.js && npm run build:frontend && electron-builder --mac dmg --arm64",
-    "dist:dir": "node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
-    "dist:win": "node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
-    "dist:linux": "node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
+    "dist": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=${TRANSCRIPTOR_ALLOW_ADHOC_SIGN:-1} electron-builder --mac dmg --arm64",
+    "dist:dir": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=${TRANSCRIPTOR_ALLOW_ADHOC_SIGN:-1} electron-builder --mac --dir --arm64",
+    "dist:win": "bash ./scripts/prepare-runtime.sh win-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
+    "dist:linux": "bash ./scripts/prepare-runtime.sh linux-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
   },
   "devDependencies": {
     "electron": "30.5.1",
@@ -65,7 +65,11 @@
         {
           "from": "runtime/mac-${arch}",
           "to": "runtime",
-          "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+          "filter": [
+            "**/*",
+            "!**/__pycache__/**",
+            "!**/*.pyc"
+          ]
         }
       ],
       "target": [
@@ -102,7 +106,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "icon.ico",
@@ -113,15 +119,32 @@
         {
           "from": "runtime/win-x64",
           "to": "runtime",
-          "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+          "filter": [
+            "**/*",
+            "!**/__pycache__/**",
+            "!**/*.pyc"
+          ]
         }
       ]
     },
     "linux": {
+      "extraResources": [
+        {
+          "from": "runtime/linux-x64",
+          "to": "runtime",
+          "filter": [
+            "**/*",
+            "!**/__pycache__/**",
+            "!**/*.pyc"
+          ]
+        }
+      ],
       "target": [
         {
           "target": "AppImage",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "icon.png",

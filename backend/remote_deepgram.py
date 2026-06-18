@@ -103,6 +103,7 @@ def deepgram_transcribe(
     model: str = "nova-3",
     language: Optional[str] = None,
     diarize: bool = False,
+    num_speakers: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Transcribe audio using Deepgram's pre-recorded API.
 
@@ -131,6 +132,15 @@ def deepgram_transcribe(
         # ``words[...].speaker`` and the user-facing text below renders
         # speaker-labelled paragraphs from that canonical word list.
         params["diarize"] = "true"
+        speakers_raw = str(num_speakers or "").strip()
+        if speakers_raw:
+            try:
+                speakers = int(speakers_raw)
+            except ValueError as exc:
+                raise RemoteError("Deepgram num_speakers must be an integer") from exc
+            if speakers < 1 or speakers > 10:
+                raise RemoteError("Deepgram num_speakers must be between 1 and 10")
+            params["num_speakers"] = str(speakers)
     if language and language.lower() not in ("auto", ""):
         params["language"] = language
     else:

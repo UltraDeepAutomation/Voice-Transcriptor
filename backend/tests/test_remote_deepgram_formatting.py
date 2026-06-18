@@ -1,6 +1,7 @@
 import unittest
+from unittest import mock
 
-from backend.remote_deepgram import _format_deepgram_speaker_words
+from backend.remote_deepgram import DeepgramRemoteError, _format_deepgram_speaker_words, deepgram_transcribe
 
 
 class DeepgramFormattingTests(unittest.TestCase):
@@ -22,6 +23,49 @@ class DeepgramFormattingTests(unittest.TestCase):
             ]),
             "",
         )
+
+    def test_num_speakers_is_sent_when_diarization_is_enabled(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "results": {
+                        "channels": [
+                            {"alternatives": [{"transcript": "ok", "words": []}]}
+                        ]
+                    }
+                }
+
+        calls = []
+
+        def fake_request(*args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeResponse()
+
+        with mock.patch("backend.remote_deepgram.request_with_retry", side_effect=fake_request):
+            deepgram_transcribe(
+                api_key="dg",
+                audio_bytes=b"wav",
+                filename="audio.wav",
+                diarize=True,
+                num_speakers="2",
+            )
+
+        self.assertEqual(calls[0][1]["params"]["diarize"], "true")
+        self.assertEqual(calls[0][1]["params"]["num_speakers"], "2")
+
+    def test_invalid_num_speakers_fails_before_provider_request(self):
+        with mock.patch("backend.remote_deepgram.request_with_retry") as request:
+            with self.assertRaises(DeepgramRemoteError):
+                deepgram_transcribe(
+                    api_key="dg",
+                    audio_bytes=b"wav",
+                    filename="audio.wav",
+                    diarize=True,
+                    num_speakers="many",
+                )
+        request.assert_not_called()
 
 
 if __name__ == "__main__":

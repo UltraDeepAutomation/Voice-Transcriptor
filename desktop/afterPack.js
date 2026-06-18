@@ -172,6 +172,12 @@ exports.default = async function afterPack(context) {
   }
 
   const useStableIdentity = hasPreferredIdentity();
+  if (!useStableIdentity && process.env.TRANSCRIPTOR_ALLOW_ADHOC_SIGN !== "1") {
+    throw new Error(
+      `afterPack: missing signing identity "${PREFERRED_SIGNING_IDENTITY}". ` +
+        "Set TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 only for explicit local ad-hoc builds.",
+    );
+  }
   const identity = useStableIdentity ? PREFERRED_SIGNING_IDENTITY : "-";
 
   if (useStableIdentity) {

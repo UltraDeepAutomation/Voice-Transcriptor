@@ -33,7 +33,7 @@ npm --prefix frontend run build
 
 cd "$SCRIPT_DIR/desktop"
 node ./unlockDist.js
-npx electron-builder --mac dmg "--${BUILDER_ARCH}" "$@"
+TRANSCRIPTOR_ALLOW_ADHOC_SIGN="${TRANSCRIPTOR_ALLOW_ADHOC_SIGN:-1}" npx electron-builder --mac dmg "--${BUILDER_ARCH}" "$@"
 
 APP_DIR="$SCRIPT_DIR/desktop/dist/mac-${BUILDER_ARCH}/Transcriptor.app"
 if [ "$BUILDER_ARCH" = "x64" ] && [ ! -d "$APP_DIR" ]; then
@@ -47,14 +47,39 @@ fi
 install_app_bundle() {
   local target_app="$1"
   local target_root
+  local target_name
+  local tmp_app
+  local backup_app
   target_root="$(dirname "$target_app")"
+  target_name="$(basename "$target_app")"
+  tmp_app="$target_root/.${target_name}.installing.$$"
+  backup_app="$target_app.backup-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$target_root"
-  ditto "$APP_DIR" "$target_app"
+  ditto "$APP_DIR" "$tmp_app"
+  codesign --verify --deep --strict "$tmp_app"
+  if [ -e "$target_app" ]; then
+    mv "$target_app" "$backup_app"
+  fi
+  if ! mv "$tmp_app" "$target_app"; then
+    if [ -e "$backup_app" ] && [ ! -e "$target_app" ]; then
+      mv "$backup_app" "$target_app"
+    fi
+    exit 1
+  fi
   echo "Installed $target_app"
 }
 
 INSTALL_ROOT="${TRANSCRIPTOR_INSTALL_DIR:-/Applications}"
 if [ ! -d "$INSTALL_ROOT" ] || [ ! -w "$INSTALL_ROOT" ]; then
+  if [ -n "${TRANSCRIPTOR_INSTALL_DIR:-}" ]; then
+    echo "Install directory is not writable: $INSTALL_ROOT" >&2
+    exit 1
+  fi
+  if [ -d "/Applications/Transcriptor.app" ]; then
+    echo "Existing /Applications/Transcriptor.app cannot be updated without write access." >&2
+    echo "Set TRANSCRIPTOR_INSTALL_DIR explicitly or rerun with permissions." >&2
+    exit 1
+  fi
   INSTALL_ROOT="$HOME/Applications"
 fi
 PRIMARY_APP="$INSTALL_ROOT/Transcriptor.app"

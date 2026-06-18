@@ -1,21 +1,22 @@
-fastapi==0.115.6
+fastapi==0.128.8
 # uvicorn without [standard] extras — the `standard` extra pulls
 # uvloop (non-Windows only) which breaks cross-platform `pip install
 # --platform=win_amd64` from a Mac build host. We pin websockets +
 # httptools directly below so the WS upgrade path still works.
 uvicorn==0.30.6
 httptools>=0.5.0
-python-multipart==0.0.12
+python-multipart==0.0.20
 faster-whisper==1.0.3
 soundfile==0.12.1
-# numpy <3 to accept 2.x (which has Python 3.13+ wheels); 1.26.4 floor
-# is the version validated with faster-whisper 1.0.3.
+# Runtime release builds pin the exact resolved wheel in
+# requirements.runtime-lock.txt; this direct range keeps local installs
+# compatible with the faster-whisper 1.0.3 validation floor.
 numpy>=1.26.4,<3
-requests==2.32.3
+requests==2.32.5
 # urllib3 1.x reached EoL 2023-10-01 (CVE-2023-45803, CVE-2024-37891
 # unfixed); requests 2.32+ is compatible with urllib3 2.x so upgrade.
-urllib3>=2.2.0,<3
-cryptography>=42.0.0
+urllib3>=2.6.3,<3
+cryptography>=49.0.0
 # Used by backend.remote_deepgram_live for proxying PCM to Deepgram's live
 # streaming endpoint. uvicorn[standard] brings a compatible version in
 # transitively, but we pin it directly so production installs cannot

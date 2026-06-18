@@ -1,0 +1,57 @@
+# Transitive runtime constraints for desktop/scripts/prepare-runtime.sh.
+# Baseline: /Applications/Transcriptor.app bundled Python runtime that is
+# already shipping and working locally. Keep requirements.txt as the direct
+# dependency SSOT; this file pins the resolved release wheel graph.
+PyYAML==6.0.3
+Pygments==2.20.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.12.1
+av==12.3.0
+certifi==2026.4.22
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.1.8
+coloredlogs==15.0.1
+cryptography==49.0.0
+ctranslate2==4.7.1
+exceptiongroup==1.3.1
+fastapi==0.128.8
+faster-whisper==1.0.3
+filelock==3.19.1
+flatbuffers==25.12.19
+fsspec==2025.10.0
+h11==0.16.0
+hf-xet==1.4.3
+httpcore==1.0.9
+httptools==0.7.1
+httpx==0.28.1
+huggingface_hub==1.8.0
+humanfriendly==10.0
+idna==3.18
+markdown-it-py==3.0.0
+mdurl==0.1.2
+mpmath==1.3.0
+numpy==2.0.2
+onnxruntime==1.20.1
+packaging==26.1
+protobuf==6.33.6
+pycparser==2.23
+pydantic==2.13.3
+pydantic_core==2.46.3
+python-multipart==0.0.20
+requests==2.32.5
+rich==15.0.0
+setuptools==82.0.1
+shellingham==1.5.4
+soundfile==0.12.1
+starlette==0.49.3
+sympy==1.14.0
+tokenizers==0.22.2
+tqdm==4.67.3
+typer==0.23.2
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+urllib3==2.6.3
+uvicorn==0.30.6
+websockets==15.0.1

@@ -23,6 +23,7 @@ cd "$(dirname "$0")/.."
 SCRIPT_DIR="$(pwd)"
 ROOT_DIR="$(cd .. && pwd)"
 REQS="${ROOT_DIR}/requirements.txt"
+REQS_LOCK="${ROOT_DIR}/requirements.runtime-lock.txt"
 RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 CACHE_DIR="${SCRIPT_DIR}/runtime/.cache"
 mkdir -p "${RUNTIME_DIR}" "${CACHE_DIR}"
@@ -50,13 +51,16 @@ die()  { printf '\033[1;31m[prep]\033[0m %s\n' "$*" >&2; exit 1; }
 # -----------------------------------------------------------------------------
 fetch() {
   local url="$1" dest="$2"
-  if [ -f "${dest}" ] && [ -s "${dest}" ]; then
+  local meta="${dest}.url"
+  if [ -f "${dest}" ] && [ -s "${dest}" ] && [ -f "${meta}" ] && [ "$(cat "${meta}")" = "${url}" ]; then
     log "cached  ${dest##*/}"
     return 0
   fi
   log "fetching ${url}"
   curl -fSL --retry 3 --retry-delay 2 -o "${dest}.part" "${url}"
+  printf '%s\n' "${url}" > "${meta}.part"
   mv "${dest}.part" "${dest}"
+  mv "${meta}.part" "${meta}"
 }
 
 # -----------------------------------------------------------------------------
@@ -117,6 +121,8 @@ install_wheels() {
     --timeout 180
     --retries 5
   )
+  [ -f "${REQS_LOCK}" ] || die "missing runtime constraints lock: ${REQS_LOCK}"
+  pip_args+=(-c "${REQS_LOCK}")
   for p in "$@"; do
     pip_args+=(--platform "${p}")
   done

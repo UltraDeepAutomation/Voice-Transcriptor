@@ -55,6 +55,7 @@ class RemoteChunkingTests(unittest.TestCase):
                     "bytes": kwargs["audio_bytes"],
                     "language": kwargs["language"],
                     "diarize": kwargs["diarize"],
+                    "num_speakers": kwargs["num_speakers"],
                 }
             )
             return {
@@ -78,7 +79,7 @@ class RemoteChunkingTests(unittest.TestCase):
                 orig_name="long.mp4",
                 language="ru",
                 diarize=True,
-                num_speakers="",
+                num_speakers="2",
                 openrouter_model="nova-3",
                 cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
                 progress_cb=progress.append,
@@ -91,6 +92,7 @@ class RemoteChunkingTests(unittest.TestCase):
         self.assertEqual([c["bytes"] for c in calls], [b"one", b"two", b"three"])
         self.assertTrue(all(c["language"] == "ru" for c in calls))
         self.assertTrue(all(c["diarize"] for c in calls))
+        self.assertTrue(all(c["num_speakers"] == "2" for c in calls))
         self.assertEqual(result["provider"], "deepgram")
         self.assertEqual(result["model"], "nova-3")
         self.assertEqual(

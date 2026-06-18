@@ -478,6 +478,35 @@ _live_promote_cache: dict[str, tuple[float, dict]] = {}
 _LIVE_PROMOTE_CACHE_TTL_SEC = 60.0
 
 
+def _secure_atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
+    fd: Optional[int] = None
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            if os.name != "nt":
+                raise
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _load_or_create_api_token() -> str:
     env_token = os.environ.get("TRANSCRIPTOR_API_TOKEN", "").strip()
     if env_token:
@@ -507,7 +536,7 @@ def _load_or_create_api_token() -> str:
         # A zero-length token file would pass the `API_TOKEN_PATH.exists()`
         # probe on next boot, read as empty, and the auth guard would
         # lock the user out until the file is manually deleted.
-        atomic_write_text(API_TOKEN_PATH, token)
+        _secure_atomic_write_text(API_TOKEN_PATH, token)
     except OSError as e:
         logger.error(
             "api token persist failed at %s: %s — using in-memory token "
@@ -515,12 +544,6 @@ def _load_or_create_api_token() -> str:
             API_TOKEN_PATH, e,
         )
         return token
-    try:
-        os.chmod(API_TOKEN_PATH, 0o600)
-    except OSError as e:
-        # Non-POSIX filesystems (Windows) or read-only mounts: the token
-        # file will still exist with default permissions.
-        logger.debug("api token chmod skipped: %s", e)
     return token
 
 
@@ -1076,6 +1099,7 @@ async def transcribe_warmup(
     _auth: None = Depends(_require_api_auth),
     model: str = Form("small"),
 ):
+    model = _form_text(model, "small")
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
     loop = asyncio.get_running_loop()
@@ -1327,6 +1351,34 @@ def _payload_bool(payload: Optional[dict], key: str, default: bool = False) -> b
     raise HTTPException(status_code=400, detail=f"{key} must be a boolean")
 
 
+def _form_default_value(value: Any, default: Any) -> Any:
+    """Return FastAPI Form defaults when endpoint helpers are called directly.
+
+    HTTP requests arrive here as parsed Python values. Unit tests and internal
+    callers can omit optional form params, in which case Python passes the
+    FastAPI ``Form(...)`` object itself as the default value.
+    """
+    if value is None:
+        return default
+    if value.__class__.__module__ == "fastapi.params" and hasattr(value, "default"):
+        return getattr(value, "default")
+    return value
+
+
+def _form_text(value: Any, default: str = "") -> str:
+    raw = _form_default_value(value, default)
+    if raw is None:
+        return default
+    return str(raw)
+
+
+def _form_bool(value: Any, default: bool = False) -> bool:
+    raw = _form_default_value(value, default)
+    if isinstance(raw, bool):
+        return raw
+    return _payload_bool({"value": raw}, "value", default)
+
+
 def _is_broken_pipe_error(exc: Exception) -> bool:
     """Return True if the exception is a harmless broken-pipe or WebSocket shutdown race.
 
@@ -1536,7 +1588,7 @@ def _validate_config_payload(payload: dict) -> None:
 _rec_dir_cache: Optional[Path] = None
 _rec_dir_cache_at = 0.0
 _REC_DIR_CACHE_TTL = 10.0
-# Guard the (cache, timestamp) pair atomically. The list/graph/stats
+# Guard the (cache, timestamp) pair atomically. The list/stats
 # caches at line 1248 already use a shared lock for the same reason —
 # concurrent readers can otherwise see fresh cache + stale timestamp 0.0
 # (defeats the cache) or fresh timestamp + None cache (crash on
@@ -1545,7 +1597,7 @@ _rec_dir_cache_lock = threading.Lock()
 
 
 # Single lock guards all three (result, timestamp, key) triples for the
-# list/graph/stats caches below. The GIL makes each individual assignment
+# list/stats caches below. The GIL makes each individual assignment
 # atomic, but the three-write mutation sequence can interleave across
 # concurrent FastAPI workers, leaving cache globals in an inconsistent
 # state (new data + old key → persistent cache miss until TTL). Each
@@ -1556,15 +1608,11 @@ _recordings_caches_lock = threading.Lock()
 
 def _invalidate_recordings_cache() -> None:
     global _list_cache, _list_cache_at, _list_cache_key
-    global _graph_cache, _graph_cache_at, _graph_cache_key
     global _stats_cache, _stats_cache_at, _stats_cache_key
     with _recordings_caches_lock:
         _list_cache = None
         _list_cache_at = 0.0
         _list_cache_key = None
-        _graph_cache = None
-        _graph_cache_at = 0.0
-        _graph_cache_key = None
         _stats_cache = None
         _stats_cache_at = 0.0
         _stats_cache_key = None
@@ -1619,7 +1667,7 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
         if volatile_app_path:
             try:
                 if p.exists() and p.is_dir():
-                    for txt in p.glob("*.txt"):
+                    for txt in _iter_recording_text_files(p):
                         dst = default_dir / txt.name
                         if not dst.exists():
                             # SSOT atomic copy: bare `write_bytes`
@@ -1692,29 +1740,51 @@ def _recording_stem_available(target_dir: Path, stem: str) -> bool:
 
 
 def _unique_stem_from_base(target_dir: Path, base: str, *, collision_suffix: str = "timestamp") -> str:
-    safe_base = _sanitize_name(base)
-    if _recording_stem_available(target_dir, safe_base):
-        return safe_base
-    if collision_suffix == "timestamp":
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-        candidate = f"{safe_base}__{ts}"
-        if _recording_stem_available(target_dir, candidate):
-            return candidate
-    for _ in range(128):
-        candidate = f"{safe_base}-{uuid.uuid4().hex[:8]}"
+    for candidate in _recording_stem_candidates_from_base(base, collision_suffix=collision_suffix):
         if _recording_stem_available(target_dir, candidate):
             return candidate
     raise HTTPException(status_code=500, detail="could not allocate unique recording name")
 
 
-def _unique_recording_stem(target_dir: Path, title: str) -> str:
-    base = _recording_stem(title)
-    if _recording_stem_available(target_dir, base):
-        return base
+def _recording_stem_candidates_from_base(base: str, *, collision_suffix: str = "timestamp") -> Iterable[str]:
+    safe_base = _sanitize_name(base)
+    yield safe_base
+    if collision_suffix == "timestamp":
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        yield f"{safe_base}__{ts}"
     for _ in range(128):
-        candidate = f"{base}-{uuid.uuid4().hex[:8]}"
+        yield f"{safe_base}-{uuid.uuid4().hex[:8]}"
+
+
+def _unique_recording_stem(target_dir: Path, title: str) -> str:
+    for candidate in _recording_stem_candidates(title):
         if _recording_stem_available(target_dir, candidate):
             return candidate
+    raise HTTPException(status_code=500, detail="could not allocate unique recording name")
+
+
+def _recording_stem_candidates(title: str) -> Iterable[str]:
+    base = _recording_stem(title)
+    yield base
+    for _ in range(128):
+        yield f"{base}-{uuid.uuid4().hex[:8]}"
+
+
+def _claim_recording_text_path(target_dir: Path, candidates: Iterable[str]) -> tuple[str, Path]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for stem in candidates:
+        if not _recording_stem_available(target_dir, stem):
+            continue
+        out = target_dir / f"{stem}.txt"
+        try:
+            fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return stem, out
     raise HTTPException(status_code=500, detail="could not allocate unique recording name")
 
 
@@ -1737,6 +1807,13 @@ def _unique_recording_stem_for_source_file(target_dir: Path, filename: str, fall
     if source_name:
         return _unique_stem_from_base(target_dir, Path(source_name).stem, collision_suffix="timestamp")
     return _unique_recording_stem(target_dir, fallback_title)
+
+
+def _recording_stem_candidates_for_source_file(filename: str, fallback_title: str) -> Iterable[str]:
+    source_name = _source_recording_display_name(filename)
+    if source_name:
+        return _recording_stem_candidates_from_base(Path(source_name).stem, collision_suffix="timestamp")
+    return _recording_stem_candidates(fallback_title)
 
 
 def _atomic_temp_path(final_path: Path) -> Path:
@@ -2066,6 +2143,10 @@ def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optio
     return None
 
 
+def _recording_text_sibling_exists(target_dir: Path, stem: str) -> bool:
+    return any(p.stem == stem for p in _iter_recording_text_files(target_dir))
+
+
 # Backward-compat alias for any caller that imports this name. New
 # code should use ``_RECORDING_AUDIO_EXTS`` directly.
 _AUDIO_EXTS_FOR_RETENTION: tuple[str, ...] = _RECORDING_AUDIO_EXTS
@@ -2102,11 +2183,11 @@ def _prune_old_recording_audio(
                 continue
             if entry.stem == keep_stem:
                 continue
-            # Only delete if there's a sibling .txt — this guards
+            # Only delete if there's a sibling transcript — this guards
             # against nuking an orphan audio file that might belong to
-            # an in-progress save from another process.
-            txt_sibling = entry.with_suffix(".txt")
-            if not txt_sibling.exists():
+            # an in-progress save from another process. The helper uses
+            # the same case-insensitive .txt/.TXT scan as History.
+            if not _recording_text_sibling_exists(target_dir, entry.stem):
                 continue
             try:
                 entry.unlink()
@@ -2452,7 +2533,7 @@ def _extract_meta_field(content: str, field: str) -> str:
     # file. If a transcript contained a line starting with "Provider:"
     # / "Language:" (entirely possible in spoken text), the user content
     # was returned as the recording's metadata — corrupting the stats
-    # endpoint's provider histogram, the graph endpoint, and the filter
+    # endpoint's provider histogram and the filter
     # UI. Header lines live BEFORE the first blank line in the on-disk
     # format produced by ``_render_recording_content``; restrict the
     # regex search to that prefix so transcript content cannot match a
@@ -3391,17 +3472,20 @@ async def create_job(
     word_timestamps: bool = Form(False),
 ):
     _cleanup_expired_files()
+    language = _form_text(language, "auto")
+    model = _form_text(model, "small")
+    split_stereo = _form_bool(split_stereo, True)
+    word_timestamps = _form_bool(word_timestamps, False)
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
 
-    job_id = str(uuid.uuid4())
-    jobs.create(job_id)
-
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
+    job_id = str(uuid.uuid4())
     upload_path = UPLOADS_DIR / f"{job_id}.{orig_name}"
     await _save_upload_file(file, upload_path)
 
+    jobs.create(job_id)
     lang_opt = _normalize_language(language)
     _submit_local_transcription_job(
         job_id=job_id,
@@ -3453,6 +3537,10 @@ async def transcribe_sync(
     split_stereo: bool = Form(True),
     word_timestamps: bool = Form(False),
 ):
+    language = _form_text(language, "auto")
+    model = _form_text(model, "small")
+    split_stereo = _form_bool(split_stereo, True)
+    word_timestamps = _form_bool(word_timestamps, False)
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
 
@@ -3565,6 +3653,7 @@ def _run_remote_transcribe_once(
                 model=model,
                 language=language,
                 diarize=bool(diarize),
+                num_speakers=num_speakers,
             )
             return {
                 "provider": "deepgram",
@@ -3806,28 +3895,27 @@ async def create_remote_job(
     openrouter_model: str = Form(""),
 ):
     _cleanup_expired_files()
-    provider_norm = (provider or "").strip()
+    provider_norm = _form_text(provider, "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
         raise HTTPException(status_code=400, detail="unsupported provider")
 
-    job_id = str(uuid.uuid4())
-    jobs.create(job_id)
-
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
+    job_id = str(uuid.uuid4())
     upload_path = UPLOADS_DIR / f"{job_id}.{orig_name}"
     await _save_upload_file(file, upload_path)
 
-    lang_opt = _normalize_language(language)
+    jobs.create(job_id)
+    lang_opt = _normalize_language(_form_text(language, "auto"))
     _submit_remote_transcription_job(
         job_id=job_id,
         provider_norm=provider_norm,
         upload_path=upload_path,
         orig_name=orig_name,
         language=lang_opt,
-        diarize=diarize,
-        num_speakers=num_speakers,
-        openrouter_model=openrouter_model,
+        diarize=_form_bool(diarize, False),
+        num_speakers=_form_text(num_speakers, ""),
+        openrouter_model=_form_text(openrouter_model, ""),
         cleanup_upload_path=True,
     )
     return {"job_id": job_id}
@@ -3873,7 +3961,7 @@ async def remote_transcribe_sync(
     num_speakers: str = Form(""),
     openrouter_model: str = Form(""),
 ):
-    provider_norm = (provider or "").strip()
+    provider_norm = _form_text(provider, "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
         raise HTTPException(status_code=400, detail="unsupported provider")
 
@@ -3883,7 +3971,7 @@ async def remote_transcribe_sync(
     upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
     await _save_upload_file(file, upload_path)
 
-    lang_opt = _normalize_language(language)
+    lang_opt = _normalize_language(_form_text(language, "auto"))
     cfg = load_config()
     loop = asyncio.get_running_loop()
     try:
@@ -3897,9 +3985,9 @@ async def remote_transcribe_sync(
                 upload_path=upload_path,
                 orig_name=orig_name,
                 language=lang_opt,
-                diarize=diarize,
-                num_speakers=num_speakers,
-                openrouter_model=openrouter_model,
+                diarize=_form_bool(diarize, False),
+                num_speakers=_form_text(num_speakers, ""),
+                openrouter_model=_form_text(openrouter_model, ""),
                 cfg=cfg,
             ),
         )
@@ -4578,96 +4666,9 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
         return result
 
 
-_graph_cache: Optional[dict] = None
-_graph_cache_at = 0.0
-_graph_cache_key: Optional[tuple] = None
-_GRAPH_CACHE_TTL = 30.0
-# Same lazy-init + double-checked pattern as `_list_cache_rebuild_lock`
-# (line ~3326). N concurrent cache misses cost ONE scan instead of N.
-_graph_cache_rebuild_lock: Optional[asyncio.Lock] = None
-
-
-def _build_recordings_graph_payload(d: "Path") -> dict:
-    """Heavy sync scan extracted so the async route can offload it
-    via `asyncio.to_thread`. Glob+stat+read+tokenise on every txt
-    file — this is the workload the previous sync `def` was pinning
-    an executor thread for."""
-    nodes = []
-    for archive_dir in _recordings_scan_dirs(d):
-        collection = _recording_collection_for_dir(archive_dir)
-        for p in _iter_recording_text_files(archive_dir):
-            try:
-                st = p.stat()
-                raw = p.read_text(encoding="utf-8", errors="replace")
-                source_file = _recording_source_file(raw)
-                display = _recording_display_name_from_content(raw, p.stem)
-                provider = _extract_meta_field(raw, "Provider").lower() or "unknown"
-                text = _extract_stats_text(raw)
-                keywords = _tokenize_words(text)
-                freq: dict[str, int] = {}
-                for w in keywords:
-                    freq[w] = freq.get(w, 0) + 1
-                top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:10]
-                nodes.append(
-                    {
-                        "name": p.name,
-                        "display_name": display,
-                        "source_file": source_file,
-                        "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                        "size_bytes": st.st_size,
-                        "provider": provider,
-                        "keywords": [w for w, _ in top],
-                        "archive_dir": str(archive_dir),
-                        "recording_collection": collection,
-                    }
-                )
-            except Exception:
-                continue
-    return {"nodes": nodes}
-
-
-@app.get("/api/recordings/graph")
-async def recordings_graph(_auth: None = Depends(_require_api_auth)):
-    """Return recordings with extracted keywords for semantic graph viz.
-
-    Now ``async`` to prevent the per-file glob+stat+read+regex scan
-    from pinning an executor thread on cold cache. Mirrors the
-    list_recordings pattern (lock + double-checked rebuild + offload
-    via `asyncio.to_thread`).
-    """
-    global _graph_cache, _graph_cache_at, _graph_cache_key, _graph_cache_rebuild_lock
-    d = _resolve_recordings_dir()
-    now = time.monotonic()
-
-    cache_key = _recordings_scan_cache_key(d)
-
-    with _recordings_caches_lock:
-        if (
-            _graph_cache is not None
-            and _graph_cache_key == cache_key
-            and (now - _graph_cache_at) < _GRAPH_CACHE_TTL
-        ):
-            return _graph_cache
-
-    if _graph_cache_rebuild_lock is None:
-        _graph_cache_rebuild_lock = asyncio.Lock()
-
-    async with _graph_cache_rebuild_lock:
-        # Double-checked.
-        now = time.monotonic()
-        with _recordings_caches_lock:
-            if (
-                _graph_cache is not None
-                and _graph_cache_key == cache_key
-                and (now - _graph_cache_at) < _GRAPH_CACHE_TTL
-            ):
-                return _graph_cache
-        result = await asyncio.to_thread(_build_recordings_graph_payload, d)
-        with _recordings_caches_lock:
-            _graph_cache = result
-            _graph_cache_at = time.monotonic()
-            _graph_cache_key = cache_key
-        return result
+# Graph is intentionally dormant. The frontend sidebar/view and TS/CSS
+# implementation are commented out, and the backend route is not registered
+# so no graph scan can be triggered by OpenAPI or direct HTTP calls.
 
 
 def _delete_all_recordings_sync() -> dict:
@@ -4678,7 +4679,7 @@ def _delete_all_recordings_sync() -> dict:
     deleted = 0
     failed = 0
     for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
-        for p in list(d.glob("*.txt")):
+        for p in _iter_recording_text_files(d):
             try:
                 p.unlink()
                 audio_path = _recording_audio_path(p.name, target_dir=d)
@@ -4696,7 +4697,7 @@ async def delete_all_recordings(_auth: None = Depends(_require_api_auth)):
     # recordings saved to custom directories are fully removed. Without
     # this, only the TXT files in the default dir were deleted while
     # audio files and TXT files in custom dirs were left on disk.
-    # Invalidate the list/graph/stats caches BEFORE the delete loop AND
+    # Invalidate the list/stats caches BEFORE the delete loop AND
     # after — a concurrent GET /api/recordings landing mid-delete would
     # otherwise repopulate the cache with stale entries that survive
     # until the next invalidation. Double-invalidate is cheap and
@@ -4831,7 +4832,7 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
 async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
     """Return aggregate transcript statistics; cached for 30 s.
 
-    Async + offload pattern matches list_recordings + recordings_graph.
+    Async + offload pattern matches list_recordings.
     On cold cache the scan is offloaded to a worker thread; concurrent
     misses serialise on a per-cache asyncio.Lock so the heaviest
     workload (full archive read + tokenise) runs ONCE per invalidation.
@@ -4900,6 +4901,7 @@ def save_recording(
     # `_register_archive_dir`; a text-only save into a brand-new
     # custom folder left the dir invisible to retention sweeps.
     _register_archive_dir(target_dir)
+    claimed_new_text = False
     if existing_name:
         if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
@@ -4909,17 +4911,25 @@ def save_recording(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem = _unique_recording_stem(target_dir, title)
-        out = target_dir / f"{stem}.txt"
-    _write_recording_text_file(
-        out=out,
-        title=title,
-        source_text=source_text,
-        transcript_text=transcript_text,
-        provider=provider,
-        model=model,
-        language=language,
-    )
+        _stem, out = _claim_recording_text_path(target_dir, _recording_stem_candidates(title))
+        claimed_new_text = True
+    try:
+        _write_recording_text_file(
+            out=out,
+            title=title,
+            source_text=source_text,
+            transcript_text=transcript_text,
+            provider=provider,
+            model=model,
+            language=language,
+        )
+    except Exception:
+        if claimed_new_text:
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     _invalidate_recordings_cache()
     return {"ok": True, "name": out.name, "archive_dir": str(target_dir)}
 
@@ -4963,6 +4973,7 @@ async def _save_recording_audio_source(
     # Persist this dir so startup retroactive retention covers it even if
     # the user changes their default recordings_dir between app launches.
     _register_archive_dir(target_dir)
+    claimed_new_text = False
     if existing_name:
         if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
             raise HTTPException(status_code=400, detail="invalid recording name")
@@ -4973,10 +4984,15 @@ async def _save_recording_audio_source(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem = _unique_recording_stem_for_source_file(target_dir, safe_orig_name, safe_title)
-        text_name = f"{stem}.txt"
+        stem, out_text = _claim_recording_text_path(
+            target_dir,
+            _recording_stem_candidates_for_source_file(safe_orig_name, safe_title),
+        )
+        text_name = out_text.name
+        claimed_new_text = True
 
-    out_text = target_dir / text_name
+    if existing_name:
+        out_text = target_dir / text_name
     out_audio = target_dir / f"{stem}{ext}"
     tmp_audio = _atomic_temp_path(out_audio)
     existing_audio = _recording_audio_path(f"{stem}.txt", target_dir=target_dir)
@@ -4998,43 +5014,49 @@ async def _save_recording_audio_source(
             os.replace(out_audio, audio_backup)
         except OSError:
             audio_backup = None  # Couldn't backup — rollback will only be safe for new-recording path
+    new_audio_placed = False
+    save_completed = False
     try:
         await write_tmp_audio(tmp_audio)
         os.replace(tmp_audio, out_audio)
-        try:
-            _write_recording_text_file(
-                out=out_text,
-                title=safe_title,
-                source_file=source_file_name,
-                source_text=safe_source_text,
-                transcript_text=safe_transcript_text,
-                provider=safe_provider,
-                model=safe_model,
-                language=safe_language,
-            )
-        except Exception:
-            # Text-write failed AFTER the audio reached its final path.
-            # _prune_old_recording_audio requires a sibling .txt to keep
-            # an audio file, so without a rollback the .wav/.m4a would
-            # sit on disk forever as an orphan that no retention rule
-            # ever cleans. Delete the failed-write audio, then restore
-            # the pre-existing one from backup if we have it.
+        new_audio_placed = True
+        _write_recording_text_file(
+            out=out_text,
+            title=safe_title,
+            source_file=source_file_name,
+            source_text=safe_source_text,
+            transcript_text=safe_transcript_text,
+            provider=safe_provider,
+            model=safe_model,
+            language=safe_language,
+        )
+        save_completed = True
+    except BaseException:
+        # Any failure after the prior audio backup was moved aside must
+        # restore it. This covers write_tmp_audio/os.replace failures as
+        # well as text-write failures.
+        if new_audio_placed:
             try:
                 out_audio.unlink(missing_ok=True)
             except OSError:
                 pass
-            if audio_backup is not None and audio_backup.exists():
-                try:
-                    os.replace(audio_backup, out_audio)
-                    audio_backup = None  # Restored, don't clean up below.
-                except OSError:
-                    pass
-            raise
+        if audio_backup is not None and audio_backup.exists():
+            try:
+                os.replace(audio_backup, out_audio)
+                audio_backup = None
+            except OSError as restore_err:
+                logger.warning("audio rollback restore failed; backup left at %s: %s", audio_backup, restore_err)
+        if claimed_new_text:
+            try:
+                out_text.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     finally:
         tmp_audio.unlink(missing_ok=True)
         # Remove any orphaned backup after a successful save. The
         # backup only survives here on the happy path (no rollback).
-        if audio_backup is not None and audio_backup.exists():
+        if save_completed and audio_backup is not None and audio_backup.exists():
             try:
                 audio_backup.unlink(missing_ok=True)
             except OSError:
@@ -5090,17 +5112,17 @@ async def save_recording_with_audio(
     return await _save_recording_audio_source(
         orig_name=orig_name,
         write_tmp_audio=lambda tmp_audio: _save_upload_file(file, tmp_audio),
-        name=name,
-        archive_dir=archive_dir,
-        recording_collection=recording_collection,
-        require_existing=require_existing,
-        title=title,
-        source_text=source_text,
-        transcript_text=transcript_text,
-        provider=provider,
-        model=model,
-        language=language,
-        live_session_id=live_session_id,
+        name=_form_text(name, ""),
+        archive_dir=_form_text(archive_dir, ""),
+        recording_collection=_form_text(recording_collection, ""),
+        require_existing=_form_bool(require_existing, False),
+        title=_form_text(title, "recording"),
+        source_text=_form_text(source_text, ""),
+        transcript_text=_form_text(transcript_text, ""),
+        provider=_form_text(provider, ""),
+        model=_form_text(model, ""),
+        language=_form_text(language, ""),
+        live_session_id=_form_text(live_session_id, ""),
     )
 
 

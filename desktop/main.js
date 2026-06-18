@@ -301,29 +301,32 @@ const MAIN_LOG_MAX_BYTES = 5 * 1024 * 1024;
 let mainLogSizeCached = -1;
 let mainLogCheckCounter = 0;
 
+function mainLogArchivePath(kind) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const base = `${mainLogFilePath}.${kind}-${stamp}`;
+  let candidate = base;
+  for (let i = 1; fs.existsSync(candidate); i += 1) {
+    candidate = `${base}-${i}`;
+  }
+  return candidate;
+}
+
 function rotateMainLogIfNeeded() {
   if (!mainLogFilePath) return;
   try {
     const st = fs.statSync(mainLogFilePath);
     mainLogSizeCached = st.size;
     if (st.size < MAIN_LOG_MAX_BYTES) return;
-    const archived = mainLogFilePath + ".1";
-    const pending = mainLogFilePath + ".rotating";
-    // Defensive: clean up any orphaned .rotating from a prior crashed
-    // rotation BEFORE attempting this one. On Windows, renameSync
-    // throws EEXIST when the target exists — a stale .rotating would
-    // permanently block every subsequent rotation attempt until
-    // someone manually cleared it, defeating the whole mechanism.
-    try { fs.unlinkSync(pending); } catch { /* normal: no orphan */ }
-    // Rename-first, unlink-after. Previous order (unlink archive →
-    // rename current → archive) destroyed the previous archive
-    // PERMANENTLY if the rename failed (Windows: file handle held by
-    // Notepad / Event Viewer / antivirus scan). Correct order is:
-    //   1. Move current log to a side tmp name (fails gracefully
-    //      if locked — leaves main.log intact for next attempt).
-    //   2. Only AFTER step 1 succeeded, unlink the old archive.
-    //   3. Promote tmp → archive.
-    // On step-3 failure, restore tmp → main.log so we don't orphan.
+    const legacyPending = mainLogFilePath + ".rotating";
+    if (fs.existsSync(legacyPending)) {
+      try { fs.renameSync(legacyPending, mainLogArchivePath("recovered")); } catch { /* keep orphan in place */ }
+    }
+    const pending = mainLogArchivePath("rotating");
+    const archived = mainLogArchivePath("archive");
+    // Never delete support logs during rotation. Move current log to a
+    // unique pending name, then promote that pending file to a unique
+    // timestamped archive. If any step fails, preserve the best available
+    // file instead of unlinking it.
     try {
       fs.renameSync(mainLogFilePath, pending);
     } catch {
@@ -332,17 +335,15 @@ function rotateMainLogIfNeeded() {
       // past 5 MB until the lock is released.
       return;
     }
-    try { fs.unlinkSync(archived); } catch { /* archive missing is fine */ }
     try {
       fs.renameSync(pending, archived);
       mainLogSizeCached = 0;
     } catch {
       // Promotion failed. Restore the log to its original name so
-      // appendFile keeps working. If THAT also fails, drop the
-      // .rotating blob — we've already lost this cycle's data and
-      // don't want to leak a permanent orphan.
+      // appendFile keeps working. If THAT also fails, preserve the
+      // pending file as a recovered archive.
       try { fs.renameSync(pending, mainLogFilePath); } catch {
-        try { fs.unlinkSync(pending); } catch { /* give up */ }
+        try { fs.renameSync(pending, mainLogArchivePath("recovered")); } catch { /* keep pending in place */ }
       }
     }
   } catch { /* stat failed — nothing to rotate */ }
@@ -5816,7 +5817,7 @@ async function startBackend() {
         true
       ).catch(() => { });
     }
-    return;
+    throw new Error(backendBootError);
   }
 
   const runtime = await ensureBackendRuntime(python, repoRoot);
@@ -5829,7 +5830,7 @@ async function startBackend() {
         true
       ).catch(() => { });
     }
-    return;
+    throw new Error(backendBootError);
   }
 
   setBackendBootStatus("Starting backend…");
@@ -6667,24 +6668,43 @@ async function createWindow(options = {}) {
           <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333;margin-bottom:20px">${escapeHtml(details)}</pre>
           <div id="status" style="padding:10px 14px;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:16px;color:#7defa0;font-size:13px">⏳ Checking if backend is starting...</div>
           ${recoveryHtml}
-          <script>
-            let attempt = 0;
-            const expectedBootNonce = ${JSON.stringify(BACKEND_BOOT_NONCE)};
-            function checkHealth() {
-              attempt++;
-              const s = document.getElementById('status');
-              s.textContent = '⏳ Waiting for backend... (attempt ' + attempt + ')';
-              fetch('${BASE_URL}/api/health', { signal: AbortSignal.timeout(3000) })
-                .then(r => r.ok ? r.json() : Promise.reject(new Error('health not ready')))
-                .then(body => { if (body && body.boot_nonce === expectedBootNonce) { s.textContent = '✅ Backend is up! Loading app...'; s.style.background='#1a3a1a'; s.style.borderColor='#2a6a2a'; setTimeout(() => { window.location.href = '${BASE_URL}/'; }, 500); } else { setTimeout(checkHealth, 3000); } })
-                .catch(() => setTimeout(checkHealth, 3000));
-            }
-            checkHealth();
-          </script>
         </body>
       </html>
     `)}`
     );
+    let recoveryAttempt = 0;
+    const updateRecoveryStatus = async (text, healthy = false) => {
+      if (!win || win.isDestroyed()) return;
+      const js = `
+        (() => {
+          const s = document.getElementById('status');
+          if (!s) return;
+          s.textContent = ${JSON.stringify(text)};
+          if (${healthy ? "true" : "false"}) {
+            s.style.background = '#1a3a1a';
+            s.style.borderColor = '#2a6a2a';
+          }
+        })();
+      `;
+      try { await win.webContents.executeJavaScript(js, true); } catch { /* page may have navigated */ }
+    };
+    const pollRecovery = async () => {
+      while (win && !win.isDestroyed()) {
+        recoveryAttempt += 1;
+        await updateRecoveryStatus(`⏳ Waiting for backend... (attempt ${recoveryAttempt})`);
+        try {
+          await waitForBackendHealth(`${BASE_URL}/api/health`, 3000);
+          await updateRecoveryStatus("✅ Backend is up! Loading app...", true);
+          if (win && !win.isDestroyed()) {
+            await win.loadURL(`${BASE_URL}/`);
+          }
+          return;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+      }
+    };
+    void pollRecovery();
   }
 }
 
