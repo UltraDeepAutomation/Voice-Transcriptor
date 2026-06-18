@@ -33,7 +33,10 @@ PBS_TAG="20260414"
 PBS_PYVER="3.12.13"
 
 # ffmpeg sources.
-FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+FFMPEG_WIN_RELEASE="autobuild-2026-06-18-14-21"
+FFMPEG_WIN_ASSET="ffmpeg-N-125093-gd2d371d10d-win64-gpl.zip"
+FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_WIN_RELEASE}/${FFMPEG_WIN_ASSET}"
+FFMPEG_WIN_SHA256="90582d696445953f154beac0f73180961fe8c079db1c50238f9f28b5f84dfc1c"
 # evermeet.cx only publishes x86_64 Mac ffmpeg — running it on Apple
 # Silicon requires Rosetta 2 (not installed by default on clean macOS
 # installs). osxexperts.net publishes an arm64-native ffmpeg 7.1
@@ -51,16 +54,59 @@ die()  { printf '\033[1;31m[prep]\033[0m %s\n' "$*" >&2; exit 1; }
 # -----------------------------------------------------------------------------
 fetch() {
   local url="$1" dest="$2"
+  local sha256="${3:-}"
   local meta="${dest}.url"
+  local sha_meta="${dest}.sha256"
   if [ -f "${dest}" ] && [ -s "${dest}" ] && [ -f "${meta}" ] && [ "$(cat "${meta}")" = "${url}" ]; then
-    log "cached  ${dest##*/}"
-    return 0
+    if [ -z "${sha256}" ]; then
+      log "cached  ${dest##*/}"
+      return 0
+    fi
+    if [ -f "${sha_meta}" ] && [ "$(cat "${sha_meta}")" = "${sha256}" ] && [ "$(sha256_file "${dest}")" = "${sha256}" ]; then
+      log "cached  ${dest##*/}"
+      return 0
+    fi
+    warn "cached ${dest##*/} failed checksum or metadata validation; refetching"
+    rm -f "${dest}" "${meta}" "${sha_meta}"
   fi
   log "fetching ${url}"
   curl -fSL --retry 3 --retry-delay 2 -o "${dest}.part" "${url}"
+  if [ -n "${sha256}" ]; then
+    verify_sha256 "${dest}.part" "${sha256}"
+  fi
   printf '%s\n' "${url}" > "${meta}.part"
+  if [ -n "${sha256}" ]; then
+    printf '%s\n' "${sha256}" > "${sha_meta}.part"
+  else
+    rm -f "${sha_meta}.part" "${sha_meta}"
+  fi
   mv "${dest}.part" "${dest}"
   mv "${meta}.part" "${meta}"
+  if [ -n "${sha256}" ]; then
+    mv "${sha_meta}.part" "${sha_meta}"
+  fi
+}
+
+sha256_file() {
+  local file="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+    return
+  fi
+  die "missing sha256 tool: install shasum or sha256sum"
+}
+
+verify_sha256() {
+  local file="$1" expected="$2" actual
+  actual="$(sha256_file "${file}")"
+  if [ "${actual}" != "${expected}" ]; then
+    rm -f "${file}"
+    die "checksum mismatch for ${file##*/}: expected ${expected}, got ${actual}"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -137,7 +183,7 @@ install_wheels() {
 install_ffmpeg_win() {
   local out_dir="$1"
   local zip="${CACHE_DIR}/ffmpeg-win64.zip"
-  fetch "${FFMPEG_WIN_URL}" "${zip}"
+  fetch "${FFMPEG_WIN_URL}" "${zip}" "${FFMPEG_WIN_SHA256}"
   rm -rf "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
   # Extract only ffmpeg.exe from the archive.

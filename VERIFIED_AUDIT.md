@@ -3,8 +3,8 @@
 Итог: подтверждено 45 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
 
 Статус:
-- Исправлено: 44
-- Оставлено с явным стопом: 1
+- Исправлено: 45
+- Оставлено с явным стопом: 0
 - P0: 0 найдено
 - P1: 20 найдено, 20 исправлено (100%)
 
@@ -625,28 +625,29 @@ TRANSCRIPTOR_LIVE_RECOVERY_RETENTION_SEC | ... | 86400 (24ч)
 
 Объяснение: lock metadata now matches desktop package SSOT.
 
-## 29. P2 OPEN — ffmpeg release asset uses `latest` without checksum
+## 29. P2 FIXED — ffmpeg release asset used `latest` without checksum
 
 Файл и строка: `desktop/scripts/prepare-runtime.sh:35`
 
-Суть: Windows ffmpeg URL points to GitHub `latest` and no SHA256 verification is enforced.
+Суть: Windows ffmpeg URL pointed to GitHub `latest` and no SHA256 verification was enforced.
 
 Последствие: release builds are not fully reproducible; upstream asset changes can break or alter builds.
 
-Текущий код:
+Было:
 ```bash
 FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
 curl -fSL --retry 3 --retry-delay 2 -o "${dest}.part" "${url}"
 ```
 
-Предлагаемый код:
+Стало:
 ```bash
-FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/<pinned-release>/<asset>.zip"
-FFMPEG_WIN_SHA256="<sha256>"
-printf '%s  %s\n' "$FFMPEG_WIN_SHA256" "${dest}.part" | shasum -a 256 -c -
+FFMPEG_WIN_RELEASE="autobuild-2026-06-18-14-21"
+FFMPEG_WIN_ASSET="ffmpeg-N-125093-gd2d371d10d-win64-gpl.zip"
+FFMPEG_WIN_SHA256="90582d696445953f154beac0f73180961fe8c079db1c50238f9f28b5f84dfc1c"
+fetch "${FFMPEG_WIN_URL}" "${zip}" "${FFMPEG_WIN_SHA256}"
 ```
 
-Объяснение: фикс требует выбрать конкретный upstream release artifact и checksum. Я не стал выдумывать external supply-chain pin без подтверждения.
+Объяснение: Windows ffmpeg теперь pinned к конкретному BtbN release asset. `fetch()` валидирует cached/downloaded file по SHA256 и refetches cache, если URL/checksum metadata расходятся.
 
 ## 30. P1 FIXED — full release build could hang on Electron postinstall
 
