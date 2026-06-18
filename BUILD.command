@@ -10,6 +10,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+cleanup_path() {
+  local target="$1"
+  if [ -e "$target" ]; then
+    chmod -R u+w "$target" 2>/dev/null || true
+    rm -rf "$target"
+  fi
+}
+
+cleanup_release_output() {
+  cleanup_path "$SCRIPT_DIR/desktop/dist"
+}
+
+cleanup_stale_install_backups() {
+  local target_root="$1"
+  local backup
+  [ -d "$target_root" ] || return 0
+  [ -w "$target_root" ] || return 0
+  for backup in "$target_root"/Transcriptor.app.backup-*; do
+    [ -e "$backup" ] || continue
+    cleanup_path "$backup"
+  done
+}
+
 ARCH="$(uname -m)"
 case "$ARCH" in
   arm64)
@@ -25,6 +48,10 @@ case "$ARCH" in
     exit 1
     ;;
 esac
+
+cleanup_release_output
+cleanup_stale_install_backups "/Applications"
+cleanup_stale_install_backups "$HOME/Applications"
 
 npm --prefix frontend ci
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix desktop ci
@@ -49,16 +76,10 @@ install_app_bundle() {
   tmp_app="$target_root/.${target_name}.installing.$$"
   backup_app="$target_app.backup-$(date -u +%Y%m%dT%H%M%SZ)"
   cleanup_tmp_app() {
-    if [ -e "$tmp_app" ]; then
-      chmod -R u+w "$tmp_app" 2>/dev/null || true
-      rm -rf "$tmp_app"
-    fi
+    cleanup_path "$tmp_app"
   }
   cleanup_backup_app() {
-    if [ -e "$backup_app" ]; then
-      chmod -R u+w "$backup_app" 2>/dev/null || true
-      rm -rf "$backup_app"
-    fi
+    cleanup_path "$backup_app"
   }
   mkdir -p "$target_root"
   cleanup_tmp_app
