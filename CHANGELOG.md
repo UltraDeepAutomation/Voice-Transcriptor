@@ -3,6 +3,33 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-06-25
+
+### Fixed
+
+- **Settings shortcuts UI** — each key in a shortcut is rendered as an
+  individual outlined keycap instead of a plain text phrase.
+- **Deepgram small-audio REST timeout** — live recovery and short
+  re-transcribe payloads no longer inherit the large-upload timeout budget.
+  Tiny payloads fail fast on provider/network stalls while large uploads keep
+  their long upload window.
+- **Deepgram live connect budget** — live WebSocket connection attempts are
+  bounded to an 8 s first attempt plus one 4 s retry.
+- **Remote offline guard** — remote transcription calls fail fast when the
+  app's network probe already reports offline, avoiding long cloud waits.
+- **Redacted API-key roundtrip** — saving the Settings payload returned by
+  `/api/config` preserves the real provider secret instead of persisting the
+  masked display value.
+- **Dormant legacy waveform** — the hidden legacy waveform sink no longer
+  creates a canvas context, resize observer, or rAF render loop while disabled.
+- **Recordings stats scan** — the expensive summary scan is now lazy and runs
+  only when the Stats panel is explicitly opened.
+
+### Build
+
+- Added README guidance for internal ad-hoc macOS arm64 transfer artifacts
+  versus production Developer ID + notarized distribution.
+
 ## [1.1.25] — 2026-05-10
 
 Historical release-audit batch across 24K LOC. This changelog keeps the

@@ -1,7 +1,12 @@
 import unittest
 from unittest import mock
 
-from backend.remote_deepgram import DeepgramRemoteError, _format_deepgram_speaker_words, deepgram_transcribe
+from backend.remote_deepgram import (
+    DeepgramRemoteError,
+    _deepgram_http_policy,
+    _format_deepgram_speaker_words,
+    deepgram_transcribe,
+)
 
 
 class DeepgramFormattingTests(unittest.TestCase):
@@ -66,6 +71,12 @@ class DeepgramFormattingTests(unittest.TestCase):
                     num_speakers="many",
                 )
         request.assert_not_called()
+
+    def test_small_live_recovery_payload_fails_fast(self):
+        self.assertEqual(_deepgram_http_policy(40_379), ((10, 12), 1))
+
+    def test_large_upload_preserves_long_upload_budget(self):
+        self.assertEqual(_deepgram_http_policy(26 * 1024 * 1024), ((10, 208), 2))
 
 
 if __name__ == "__main__":

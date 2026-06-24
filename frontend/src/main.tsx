@@ -953,6 +953,68 @@ function providerLabel(provider: string): string {
   return provider;
 }
 
+const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
+const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = 13_000;
+const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = 8_000;
+const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = 20_000;
+
+function isRemoteProvider(provider: Provider): provider is RemoteProvider {
+  return provider === "openrouter" || provider === "deepgram";
+}
+
+function remoteProviderOfflineMessage(provider: Provider): string {
+  return `${providerLabel(provider)} is unavailable because the internet probe is offline.`;
+}
+
+function inferRemoteJobTimeoutMs(file: File, provider: Provider): number | null {
+  if (provider === "deepgram" && file.size > 0 && file.size <= REMOTE_SMALL_AUDIO_BYTES) {
+    return DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS;
+  }
+  return null;
+}
+
+function createLinkedAbortSignal(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number | null,
+): { signal: AbortSignal | undefined; cleanup: () => void; didTimeout: () => boolean } {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return {
+      signal: parentSignal,
+      cleanup: () => { },
+      didTimeout: () => false,
+    };
+  }
+  const controller = new AbortController();
+  let timeoutId: number | null = null;
+  let timedOut = false;
+  const cleanup = () => {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    parentSignal?.removeEventListener("abort", onParentAbort);
+  };
+  const onParentAbort = () => {
+    cleanup();
+    controller.abort();
+  };
+  timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  if (parentSignal?.aborted) {
+    cleanup();
+    controller.abort();
+  } else {
+    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup,
+    didTimeout: () => timedOut,
+  };
+}
+
 function countWords(text: string): number {
   const value = String(text || "").trim();
   if (!value) return 0;
@@ -2462,8 +2524,14 @@ async function remoteJobSync(
     diarize: boolean;
     openrouterModel?: string;
     signal?: AbortSignal;
+    timeoutMs?: number;
   }
 ): Promise<{ text: string; provider: string; model?: string }> {
+  if (isRemoteProvider(opts.provider) && !isNetworkOnline) {
+    throw new Error(remoteProviderOfflineMessage(opts.provider));
+  }
+  const timeoutMs = opts.timeoutMs ?? inferRemoteJobTimeoutMs(file, opts.provider);
+  const abortSignal = createLinkedAbortSignal(opts.signal, timeoutMs);
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("provider", opts.provider || "openrouter");
@@ -2472,19 +2540,28 @@ async function remoteJobSync(
   if (opts.provider === "openrouter" || opts.provider === "deepgram") {
     fd.set("openrouter_model", (opts.openrouterModel || "").trim());
   }
-  const r = await fetch("/api/remote/transcribe-sync", {
-    method: "POST",
-    body: fd,
-    headers: authHeaders(),
-    signal: opts.signal,
-  });
-  if (!r.ok) throw new Error(await parseError(r));
-  const js = (await r.json()) as { ok?: boolean; result?: { text?: string; provider?: string; model?: string } };
-  return {
-    text: String(js?.result?.text || "").trim(),
-    provider: String(js?.result?.provider || opts.provider || ""),
-    model: String(js?.result?.model || "").trim() || undefined,
-  };
+  try {
+    const r = await fetch("/api/remote/transcribe-sync", {
+      method: "POST",
+      body: fd,
+      headers: authHeaders(),
+      signal: abortSignal.signal,
+    });
+    if (!r.ok) throw new Error(await parseError(r));
+    const js = (await r.json()) as { ok?: boolean; result?: { text?: string; provider?: string; model?: string } };
+    return {
+      text: String(js?.result?.text || "").trim(),
+      provider: String(js?.result?.provider || opts.provider || ""),
+      model: String(js?.result?.model || "").trim() || undefined,
+    };
+  } catch (e) {
+    if (abortSignal.didTimeout()) {
+      throw new Error(`${providerLabel(opts.provider)} request timed out after ${Math.round((timeoutMs || 0) / 1000)}s.`);
+    }
+    throw e;
+  } finally {
+    abortSignal.cleanup();
+  }
 }
 
 function isProviderKeyConfigured(provider: Provider): boolean {
@@ -2983,8 +3060,9 @@ async function loadMics(forceReload = false): Promise<void> {
 
 ($("refreshMicsBtn") as HTMLButtonElement).addEventListener("click", () => void loadMics(true));
 
+const LEGACY_WAVEFORM_ENABLED = false;
 const canvas = $("waveCanvas") as HTMLCanvasElement;
-const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
+const ctx = LEGACY_WAVEFORM_ENABLED ? canvas.getContext("2d") : null;
 
 // --- Ring buffer for waveform bars (avoids GC-heavy Array.slice) ---
 const WAVE_BUF_CAP = 512;
@@ -3006,6 +3084,7 @@ function waveBarAt(reverseIdx: number): number {
 }
 
 function wavePush(v: number): void {
+  if (!LEGACY_WAVEFORM_ENABLED) return;
   waveBuf[waveBufHead] = v;
   waveBufHead = (waveBufHead + 1) % WAVE_BUF_CAP;
   if (waveBufLen < WAVE_BUF_CAP) waveBufLen++;
@@ -3013,21 +3092,26 @@ function wavePush(v: number): void {
 }
 
 function waveClear(): void {
+  if (!LEGACY_WAVEFORM_ENABLED) return;
   waveBufHead = 0;
   waveBufLen = 0;
 }
 
 function resize(): void {
+  if (!ctx) return;
   const r = (canvas.parentElement as HTMLElement).getBoundingClientRect();
   canvas.width = r.width;
   canvas.height = r.height;
   maxBars = Math.max(32, Math.floor(r.width / (BAR_W + BAR_GAP)) + 4);
   draw();
 }
-new ResizeObserver(resize).observe(canvas.parentElement as Element);
-resize();
+if (LEGACY_WAVEFORM_ENABLED) {
+  new ResizeObserver(resize).observe(canvas.parentElement as Element);
+  resize();
+}
 
 function draw(): void {
+  if (!ctx) return;
   const W = canvas.width;
   const H = canvas.height;
   ctx.clearRect(0, 0, W, H);
@@ -3062,17 +3146,26 @@ function draw(): void {
 // --- rAF-driven render loop (decoupled from data collection) ---
 let waveLoopRunning = false;
 function waveLoop(): void {
-  if (!waveLoopRunning) return;
+  if (!waveLoopRunning) {
+    waveAnimId = 0;
+    return;
+  }
   if (waveDirty && document.visibilityState === "visible") draw();
-  requestAnimationFrame(waveLoop);
+  waveAnimId = requestAnimationFrame(waveLoop);
 }
 function startWaveLoop(): void {
+  if (!LEGACY_WAVEFORM_ENABLED) return;
   if (waveLoopRunning) return;
   waveLoopRunning = true;
-  requestAnimationFrame(waveLoop);
+  if (waveAnimId) cancelAnimationFrame(waveAnimId);
+  waveAnimId = requestAnimationFrame(waveLoop);
 }
 function stopWaveLoop(): void {
   waveLoopRunning = false;
+  if (waveAnimId) {
+    cancelAnimationFrame(waveAnimId);
+    waveAnimId = 0;
+  }
 }
 
 let vu = 0;
@@ -3303,9 +3396,9 @@ const DEFAULT_SHORTCUTS = _isMacRenderer ? _platformDefaultShortcuts.darwin : _p
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 
-/** Convert Electron accelerator string to text labels for Settings. */
-function acceleratorToDisplay(acc: string): string {
-  if (!acc) return "—";
+/** Convert Electron accelerator string to Settings keycap labels. */
+function acceleratorToDisplayTokens(acc: string): string[] {
+  if (!acc) return ["—"];
   const parts = acc.split("+");
   const labels: string[] = [];
   for (const p of parts) {
@@ -3316,10 +3409,10 @@ function acceleratorToDisplay(acc: string): string {
     if (lc === "alt" || lc === "option") { labels.push(_isMacRenderer ? "Option" : "Alt"); continue; }
     if (lc === "shift") { labels.push("Shift"); continue; }
     // Arrow keys
-    if (lc === "left" || lc === "arrowleft") { labels.push("Left"); continue; }
-    if (lc === "right" || lc === "arrowright") { labels.push("Right"); continue; }
-    if (lc === "up" || lc === "arrowup") { labels.push("Up"); continue; }
-    if (lc === "down" || lc === "arrowdown") { labels.push("Down"); continue; }
+    if (lc === "left" || lc === "arrowleft") { labels.push("←"); continue; }
+    if (lc === "right" || lc === "arrowright") { labels.push("→"); continue; }
+    if (lc === "up" || lc === "arrowup") { labels.push("↑"); continue; }
+    if (lc === "down" || lc === "arrowdown") { labels.push("↓"); continue; }
     if (lc === "space") { labels.push("Space"); continue; }
     if (lc === "enter" || lc === "return") { labels.push("Enter"); continue; }
     if (lc === "backspace") { labels.push("Backspace"); continue; }
@@ -3328,7 +3421,26 @@ function acceleratorToDisplay(acc: string): string {
     if (lc === "escape" || lc === "esc") { labels.push("Escape"); continue; }
     labels.push(p.trim().toUpperCase());
   }
-  return labels.join(" ");
+  return labels;
+}
+
+function renderShortcutKeys(container: Element, accelerator: string): void {
+  const tokens = acceleratorToDisplayTokens(accelerator);
+  container.replaceChildren(...tokens.map((token) => {
+    const keycap = document.createElement("span");
+    keycap.className = "shortcut-key";
+    keycap.textContent = token;
+    return keycap;
+  }));
+  container.setAttribute("aria-label", tokens.join(" "));
+}
+
+function renderShortcutCapturePrompt(container: Element): void {
+  const keycap = document.createElement("span");
+  keycap.className = "shortcut-key shortcut-key-prompt";
+  keycap.textContent = "Press keys...";
+  container.replaceChildren(keycap);
+  container.setAttribute("aria-label", "Press keys");
 }
 
 /** Convert KeyboardEvent → Electron accelerator string */
@@ -3425,7 +3537,7 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
   const btn = document.getElementById(btnId) as HTMLButtonElement | null;
   if (!btn) return;
   const keysSpan = btn.querySelector(".shortcut-keys");
-  if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
+  if (keysSpan) renderShortcutKeys(keysSpan, accelerator);
 }
 
 /**
@@ -3503,7 +3615,7 @@ function startShortcutRecording(btn: HTMLButtonElement): void {
   activeShortcutBtn = btn;
   btn.classList.add("recording");
   const keysSpan = btn.querySelector(".shortcut-keys");
-  if (keysSpan) keysSpan.textContent = "Press keys...";
+  if (keysSpan) renderShortcutCapturePrompt(keysSpan);
   // Add global keydown listener
   document.addEventListener("keydown", handleShortcutKeydown, true);
   // Outside-click cancel: without this, clicking ANYWHERE other than
@@ -3524,7 +3636,7 @@ function stopShortcutRecording(restoreDisplay: boolean): void {
     const id = activeShortcutBtn.dataset.shortcutId;
     const acc = id === "record" ? currentShortcuts.record : currentShortcuts.paste;
     const keysSpan = activeShortcutBtn.querySelector(".shortcut-keys");
-    if (keysSpan) keysSpan.textContent = acceleratorToDisplay(acc);
+    if (keysSpan) renderShortcutKeys(keysSpan, acc);
   }
   document.removeEventListener("keydown", handleShortcutKeydown, true);
   document.removeEventListener("mousedown", handleShortcutOutsideMousedown, true);
@@ -3589,7 +3701,7 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
 
   // Update display
   const keysSpan = activeShortcutBtn.querySelector(".shortcut-keys");
-  if (keysSpan) keysSpan.textContent = acceleratorToDisplay(accelerator);
+  if (keysSpan) renderShortcutKeys(keysSpan, accelerator);
 
   stopShortcutRecording(false);
 
@@ -4100,6 +4212,7 @@ function queueUiPreferencesSave(): void {
 
 async function loadCfg(): Promise<void> {
   suppressUiPrefAutosave = true;
+  let shouldPersistShortcutMigration = false;
   try {
     const cfg = await apiGet<AppConfig>("/api/config");
     const orK = ((cfg.providers || {}).openrouter || {}).key;
@@ -4202,6 +4315,7 @@ async function loadCfg(): Promise<void> {
         uploadProviderEl.value = next;
       }
     }
+    updateUploadProviderHint();
     const uploadLanguageEl = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
     if (uploadLanguageEl && ui.upload_language) {
       const wanted = String(ui.upload_language).trim();
@@ -4257,7 +4371,7 @@ async function loadCfg(): Promise<void> {
         record: currentShortcuts.record,
         paste: currentShortcuts.paste,
       };
-      queueUiPreferencesSave();
+      shouldPersistShortcutMigration = true;
     }
   } catch (configError) {
     console.warn("Initial config load failed, retrying with built-in preset", configError);
@@ -4268,6 +4382,7 @@ async function loadCfg(): Promise<void> {
     }
   } finally {
     suppressUiPrefAutosave = false;
+    if (shouldPersistShortcutMigration) queueUiPreferencesSave();
   }
 }
 
@@ -4616,6 +4731,14 @@ function syncRecordingsStatsVisibility(): void {
     btn.setAttribute("aria-label", "Show stats");
     btn.setAttribute("aria-pressed", "false");
   }
+}
+
+async function refreshRecordingsStatsIfVisible(): Promise<void> {
+  if (!recordingsStatsOpen) {
+    recordingsStatsRequestSeq += 1;
+    return;
+  }
+  await loadRecordingsStats();
 }
 
 function updateRecordingCopyState(): void {
@@ -4991,7 +5114,7 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
       setSelectedRecording(filteredItems[0] || null);
     }
     renderRecordingsList();
-    await loadRecordingsStats();
+    await refreshRecordingsStatsIfVisible();
     if (selectedRecordingName) {
       await openRecording(selectedRecordingName, selectedRecordingArchiveDir);
     } else {
@@ -5031,14 +5154,14 @@ async function loadRecordingsStats(): Promise<void> {
     empty.className = "hint";
     empty.textContent = "No word stats yet.";
     top.appendChild(empty);
-    return;
+  } else {
+    s.top_words.forEach((w) => {
+      const chip = document.createElement("span");
+      chip.className = "word-chip";
+      chip.textContent = `${w.word} (${w.count})`;
+      top.appendChild(chip);
+    });
   }
-  s.top_words.forEach((w) => {
-    const chip = document.createElement("span");
-    chip.className = "word-chip";
-    chip.textContent = `${w.word} (${w.count})`;
-    top.appendChild(chip);
-  });
 
   const providers = $("statsProviders");
   providers.innerHTML = "";
@@ -5380,6 +5503,7 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
 $("recordingsStatsBtn").addEventListener("click", () => {
   recordingsStatsOpen = !recordingsStatsOpen;
   syncRecordingsStatsVisibility();
+  void refreshRecordingsStatsIfVisible();
 });
 $("recordingCopyBtn").addEventListener("click", () => void copyRecordingText());
 $("resultCopyBtn").addEventListener("click", () => void copyTextContent($("finalOutput").textContent || "", "resultCopyBtn"));
@@ -7448,10 +7572,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     draftSaveTimer = null;
   }
   persistLiveDraft(false);
-  if (waveAnimId) {
-    cancelAnimationFrame(waveAnimId);
-    waveAnimId = 0;
-  }
+  stopWaveLoop();
   if (fallbackCaptureTimer) {
     clearTimeout(fallbackCaptureTimer);
     fallbackCaptureTimer = null;
@@ -7985,15 +8106,18 @@ async function stopLive(enhance: boolean): Promise<void> {
       const data = await resp.json();
       return String(data?.result?.text || "").trim();
     };
-    // Hard time-bound on recovery so a stalled provider doesn't
-    // block the entire stopLive flow indefinitely. 20 s is generous
-    // for the typical chain (on-disk REST 1-2 s + local Whisper
-    // fallback 5-15 s on a 30 s recording) and still bounds the
-    // user-visible "stop button is hung" experience.
-    const RECOVERY_HARD_TIMEOUT_MS = 20000;
+    // Hard time-bound on recovery so a stalled provider doesn't block
+    // stopLive indefinitely. Short live captures get a much tighter
+    // budget: if a 12 s recording has no live text and Deepgram is
+    // degraded/offline, waiting 20+ s is network stall, not useful
+    // transcription work.
+    const RECOVERY_HARD_TIMEOUT_MS =
+      provider === "deepgram" && recordedSec > 0 && recordedSec <= 30
+        ? LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS
+        : LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS;
     const recoverFromEmptyTranscriptInner = async (reason: string): Promise<string> => {
       console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
-      if (isProviderKeyConfigured("deepgram")) {
+      if (isProviderKeyConfigured("deepgram") && isNetworkOnline) {
         if (isCurrentUiSession(sessionUiToken)) {
           patchCurrentRecordingSummary({
             title: provisionalTitle,
@@ -8038,7 +8162,11 @@ async function stopLive(enhance: boolean): Promise<void> {
           }
         }
       } else {
-        console.log(`[trace recover] deepgram skipped — no API key configured`);
+        console.log(
+          isProviderKeyConfigured("deepgram")
+            ? `[trace recover] deepgram skipped — ${remoteProviderOfflineMessage("deepgram")}`
+            : `[trace recover] deepgram skipped — no API key configured`,
+        );
       }
       // Local Whisper — last resort. Always uses the in-memory /
       // backend-fetched file path (no in-place equivalent because
@@ -8399,7 +8527,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           const wordCount = wordCountOf(transcriptRaw);
           const expectedWords = recordedSec * 2.5;
           const isSuspiciouslyShort = recordedSec > 5 && wordCount < expectedWords * 0.3;
-          if (isSuspiciouslyShort && isProviderKeyConfigured("deepgram")) {
+          if (isSuspiciouslyShort && isProviderKeyConfigured("deepgram") && isNetworkOnline) {
             patchCurrentRecordingSummary({
               title: provisionalTitle,
               status: `Streaming captured only ${wordCount} words for ${Math.round(recordedSec)}s. Re-transcribing via REST...`,
@@ -9815,18 +9943,15 @@ function setupUploadView(): void {
     Array.from(dt.files).forEach(enqueueUploadFile);
   });
   // Block the entire window from navigating away if a file is
-  // dropped OUTSIDE the drop zone — without this, dropping a file
-  // anywhere else opens it in the renderer (replacing the app).
-  // Scoped to the upload view via `closest('.view[data-view="upload"]')`
-  // so dropping on Record/Settings/etc. retains default browser
-  // behaviour (none, since those views don't accept drops anyway).
+  // dropped OUTSIDE the drop zone. Browsers navigate to dropped
+  // files by default, including when the user is on Live/History/
+  // Settings. Enqueue remains owned solely by `#uploadLargeDrop`.
   ["dragover", "drop"].forEach((ev) => {
     window.addEventListener(ev, (e) => {
-      const view = (document.querySelector('.view[data-view="upload"]') as HTMLElement | null);
-      if (!view || view.hidden) return;
       // Inside the drop zone the per-element listeners already handle it.
       if ((e.target as HTMLElement)?.closest("#uploadLargeDrop")) return;
       e.preventDefault();
+      e.stopPropagation();
     });
   });
   const clearBtn = document.getElementById("uploadQueueClearBtn") as HTMLButtonElement | null;

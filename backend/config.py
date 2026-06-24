@@ -307,6 +307,34 @@ def _decrypt_provider_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _redact_provider_key_value(key: str) -> str:
+    return "" if not key else (key[:3] + "..." + key[-2:])
+
+
+def _preserve_redacted_provider_keys(update: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Treat redacted provider keys posted back by the UI as unchanged."""
+    providers = update.get("providers")
+    current_providers = current.get("providers")
+    if not isinstance(providers, dict) or not isinstance(current_providers, dict):
+        return update
+
+    for name, prov in providers.items():
+        if not isinstance(prov, dict) or "key" not in prov:
+            continue
+        incoming_key = prov.get("key")
+        if not isinstance(incoming_key, str):
+            continue
+        current_provider = current_providers.get(name)
+        if not isinstance(current_provider, dict):
+            continue
+        current_key = current_provider.get("key")
+        if not isinstance(current_key, str) or not current_key:
+            continue
+        if incoming_key == _redact_provider_key_value(current_key):
+            prov.pop("key", None)
+    return update
+
+
 def _migrate_legacy_data() -> None:
     # Packaged app previously stored data inside app resources; migrate once
     # to a stable user directory.
@@ -734,7 +762,8 @@ def save_config(cfg: Dict[str, Any]) -> None:
     """
     with _CONFIG_IO_LOCK:
         current = _load_config_unlocked()
-        merged_current = _deep_merge(current, cfg or {})
+        update = _preserve_redacted_provider_keys(json.loads(json.dumps(cfg or {})), current)
+        merged_current = _deep_merge(current, update)
         merged = _deep_merge(DEFAULT_CONFIG, merged_current)
         # Always stamp the current schema version on write — callers may
         # POST partial configs without it; _deep_merge already inserted
@@ -774,5 +803,5 @@ def redact_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(prov, dict) or "key" not in prov:
             continue
         k = prov.get("key") or ""
-        prov["key"] = "" if not k else (k[:3] + "..." + k[-2:])
+        prov["key"] = _redact_provider_key_value(k)
     return cfg

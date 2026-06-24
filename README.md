@@ -23,6 +23,17 @@ Use release artifacts when available.
 
 Public macOS release/build output is arm64-only. Intel macOS packaged runtime builds are intentionally unsupported in the current release line.
 
+#### Internal ad-hoc builds
+
+`desktop/dist/Transcriptor-<version>-arm64.dmg` and the matching ZIP are suitable for internal transfer between trusted Macs when no Developer ID certificate is available on the build machine. These builds are ad-hoc signed, not notarized. A receiving Mac may require removing quarantine before first launch:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Transcriptor.app
+open /Applications/Transcriptor.app
+```
+
+Public distribution must use a Developer ID Application identity plus Apple notarization and stapling. Without that identity, macOS Gatekeeper cannot treat the app as a fully trusted external download.
+
 ### Windows x64
 
 1. Download `Transcriptor Setup <version>.exe`.

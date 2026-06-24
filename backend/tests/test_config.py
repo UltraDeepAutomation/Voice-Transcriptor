@@ -68,6 +68,22 @@ class TestConfigLifecycle(unittest.TestCase):
         )
         self.assertEqual(cfg["preferences"]["remote_provider"], "deepgram")
 
+    def test_redacted_provider_key_roundtrip_preserves_real_secret(self):
+        """GET /api/config returns masked keys; posting that payload back
+        must not persist the mask as the real provider key."""
+        real_key = "sk-or-v1-real-secret-1234567890"
+        self.config_mod.save_config({
+            "providers": {"openrouter": {"key": real_key}},
+            "preferences": {"remote_provider": "openrouter"},
+        })
+        redacted_payload = self.config_mod.redact_config(self.config_mod.load_config())
+        self.assertEqual(redacted_payload["providers"]["openrouter"]["key"], "sk-...90")
+
+        self.config_mod.save_config(redacted_payload)
+
+        cfg = self.config_mod.load_config()
+        self.assertEqual(cfg["providers"]["openrouter"]["key"], real_key)
+
     def test_first_save_writes_no_backup(self):
         """Nothing to rotate if the file is new — .bak should only
         appear starting from the second save onward."""

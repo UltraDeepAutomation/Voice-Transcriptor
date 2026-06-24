@@ -47,6 +47,28 @@ RemoteError = DeepgramRemoteError  # type: ignore[misc]
 from backend.deepgram_endpoints import DEEPGRAM_REST_BASE as DEEPGRAM_API_BASE  # noqa: E402,F401
 
 
+_DEEPGRAM_CONNECT_TIMEOUT_SEC = 10
+_DEEPGRAM_SMALL_AUDIO_BYTES = 1 * 1024 * 1024
+_DEEPGRAM_LARGE_AUDIO_BYTES = 5 * 1024 * 1024
+
+
+def _deepgram_http_policy(audio_size_bytes: int) -> tuple[tuple[int, int], int]:
+    """Return (timeout, attempts) for Deepgram REST by body size.
+
+    Short live-capture recoveries are usually tiny compressed payloads.
+    They should fail fast on provider stalls instead of inheriting the
+    long upload budget required by multi-megabyte files.
+    """
+    size = max(0, int(audio_size_bytes or 0))
+    body_mb = max(1.0, size / (1024 * 1024))
+
+    if size <= _DEEPGRAM_SMALL_AUDIO_BYTES:
+        return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, 12), 1
+    if size < _DEEPGRAM_LARGE_AUDIO_BYTES:
+        return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, max(45, int(body_mb * 10))), 2
+    return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, max(180, int(body_mb * 8))), 2
+
+
 def _format_deepgram_speaker_words(words: object) -> str:
     """Return a speaker-labelled transcript from Deepgram word objects."""
     if not isinstance(words, list) or not words:
@@ -181,8 +203,15 @@ def deepgram_transcribe(
         "Content-Type": content_type,
     }
 
-    logger.info("deepgram_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
-    # Adaptive timeout for large-file uploads.
+    timeout, upload_retries = _deepgram_http_policy(len(audio_bytes))
+    logger.info(
+        "deepgram_transcribe: model=%s, audio=%d bytes timeout=%s attempts=%d",
+        model,
+        len(audio_bytes),
+        timeout,
+        upload_retries,
+    )
+    # Adaptive timeout for Deepgram REST uploads.
     #
     # User report (1 May 2026): a 26.6 MB m4a from a slow / cross-region
     # link (RU → us-east Deepgram) failed with
@@ -195,26 +224,17 @@ def deepgram_transcribe(
     # just bled bandwidth — the bottleneck is upload speed, not transient
     # provider hiccups.
     #
-    # Formula: ``read = max(180, body_mb * 8)`` seconds.
-    #   * 180 s floor covers small files even on a tarpit-slow link.
-    #   * 8 s/MB ceiling covers ~1 Mbit/s sustained upload (typical
-    #     mobile-tethered minimum) plus headroom for Deepgram's own
-    #     processing time after the body is fully received.
-    # Connect stays at 10 s — DNS + TLS handshake is independent of body size.
-    body_mb = max(1.0, len(audio_bytes) / (1024 * 1024))
-    read_timeout = max(180, int(body_mb * 8))
-    # Retries scaled inversely to body size: small files keep the 3-attempt
-    # transient-recovery behaviour, large uploads attempt twice. Three full
-    # retries of a 50 MB body waste 150 MB on a network that's already
-    # struggling — the second attempt is the diagnostic value, beyond that
-    # is bandwidth waste.
-    upload_retries = 3 if body_mb < 5 else 2
+    # Large files keep the old generous budget: ``read = max(180,
+    # body_mb * 8)`` seconds, with two attempts. Short live recordings
+    # use one 12 s attempt, because the body is already only a few
+    # dozen KB after compaction; waiting 20-35 s there is provider or
+    # network stall, not meaningful transcription work.
     r = request_with_retry(
         "POST", url,
         headers=headers,
         params=params,
         data=audio_bytes,
-        timeout=(10, read_timeout),
+        timeout=timeout,
         retries=upload_retries,
     )
 

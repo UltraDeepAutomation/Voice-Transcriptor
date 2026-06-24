@@ -58,6 +58,10 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 logger = logging.getLogger(__name__)
 
 
+DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC = 8.0
+DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
+
+
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
 # centralised host as the REST module so a regional override sets
 # both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
@@ -240,27 +244,25 @@ class DeepgramLiveSession:
 
     # ----- Lifecycle --------------------------------------------------------
 
-    async def connect(self, open_timeout: float = 15.0) -> None:
+    async def connect(self, open_timeout: float = DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC) -> None:
         """Open the upstream Deepgram WebSocket and start the receive loop.
 
         Raises ``DeepgramLiveError`` on authentication / network failure.
         The session is unusable after a failed connect; construct a new
         one to retry.
 
-        Default ``open_timeout`` is 15s (was 10s) — enough for a
-        worst-case DNS-cold + TLS-handshake + WSS-upgrade on
-        tethered/mobile networks. The old 10s default produced false-
-        positive ``Deepgram connect timed out after 10.0s`` on
-        perfectly healthy connections that hit a cold DNS cache or a
-        transient TLS slowdown.
+        Default ``open_timeout`` is 8s with one 4s retry. Live capture
+        cannot benefit from a 20+ second handshake: if Deepgram is not
+        reachable quickly, the recording is still saved locally and the
+        stop-time recovery path can decide what to do with the durable
+        audio.
 
-        On ``asyncio.TimeoutError`` we perform ONE silent retry with
-        a shorter 6s budget:
+        On ``asyncio.TimeoutError`` we perform ONE silent retry:
           - DNS miss on attempt 1 → attempt 2 hits a warm cache.
           - Momentary TCP stall → new connection bypasses the stuck
             half-open socket.
           - Permanently dead network → attempt 2 also fails quickly,
-            worst-case total 21s not 30s.
+            worst-case total 12s.
           - ``InvalidStatus`` (4xx) is NEVER retried: 401 = bad key,
             403 = no streaming entitlement, 429 = rate-limit, all
             permanent within the retry window.
@@ -294,7 +296,7 @@ class DeepgramLiveSession:
                 ping_timeout=None,
             )
 
-        retry_budget = 6.0
+        retry_budget = DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC
         try:
             try:
                 self._ws = await _attempt(open_timeout)
