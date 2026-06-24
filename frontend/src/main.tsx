@@ -3303,30 +3303,32 @@ const DEFAULT_SHORTCUTS = _isMacRenderer ? _platformDefaultShortcuts.darwin : _p
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 
-/** Convert Electron accelerator string → human-readable macOS symbols */
+/** Convert Electron accelerator string to text labels for Settings. */
 function acceleratorToDisplay(acc: string): string {
   if (!acc) return "—";
   const parts = acc.split("+");
-  const symbols: string[] = [];
+  const labels: string[] = [];
   for (const p of parts) {
     const lc = p.trim().toLowerCase();
-    if (lc === "command" || lc === "cmd" || lc === "meta" || lc === "super") { symbols.push("⌘"); continue; }
-    if (lc === "control" || lc === "ctrl" || lc === "commandorcontrol" || lc === "cmdorctrl") { symbols.push("⌃"); continue; }
-    if (lc === "alt" || lc === "option") { symbols.push("⌥"); continue; }
-    if (lc === "shift") { symbols.push("⇧"); continue; }
+    if (lc === "command" || lc === "cmd" || lc === "meta" || lc === "super") { labels.push("Command"); continue; }
+    if (lc === "control" || lc === "ctrl") { labels.push("Control"); continue; }
+    if (lc === "commandorcontrol" || lc === "cmdorctrl") { labels.push("Command or Control"); continue; }
+    if (lc === "alt" || lc === "option") { labels.push(_isMacRenderer ? "Option" : "Alt"); continue; }
+    if (lc === "shift") { labels.push("Shift"); continue; }
     // Arrow keys
-    if (lc === "left" || lc === "arrowleft") { symbols.push("←"); continue; }
-    if (lc === "right" || lc === "arrowright") { symbols.push("→"); continue; }
-    if (lc === "up" || lc === "arrowup") { symbols.push("↑"); continue; }
-    if (lc === "down" || lc === "arrowdown") { symbols.push("↓"); continue; }
-    if (lc === "space") { symbols.push("␣"); continue; }
-    if (lc === "enter" || lc === "return") { symbols.push("↩"); continue; }
-    if (lc === "backspace" || lc === "delete") { symbols.push("⌫"); continue; }
-    if (lc === "tab") { symbols.push("⇥"); continue; }
-    if (lc === "escape" || lc === "esc") { symbols.push("⎋"); continue; }
-    symbols.push(p.trim().toUpperCase());
+    if (lc === "left" || lc === "arrowleft") { labels.push("Left"); continue; }
+    if (lc === "right" || lc === "arrowright") { labels.push("Right"); continue; }
+    if (lc === "up" || lc === "arrowup") { labels.push("Up"); continue; }
+    if (lc === "down" || lc === "arrowdown") { labels.push("Down"); continue; }
+    if (lc === "space") { labels.push("Space"); continue; }
+    if (lc === "enter" || lc === "return") { labels.push("Enter"); continue; }
+    if (lc === "backspace") { labels.push("Backspace"); continue; }
+    if (lc === "delete") { labels.push("Delete"); continue; }
+    if (lc === "tab") { labels.push("Tab"); continue; }
+    if (lc === "escape" || lc === "esc") { labels.push("Escape"); continue; }
+    labels.push(p.trim().toUpperCase());
   }
-  return symbols.join(" ");
+  return labels.join(" ");
 }
 
 /** Convert KeyboardEvent → Electron accelerator string */

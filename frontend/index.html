@@ -115,8 +115,8 @@
   <div class="shell">
     <nav class="sidebar">
       <div class="sb-nav">
-        <button class="sb-item active" data-view="upload">Upload</button>
-        <button class="sb-item" data-view="record">Live</button>
+        <button class="sb-item active" data-view="record">Live</button>
+        <button class="sb-item" data-view="upload">Upload</button>
         <button class="sb-item" data-view="recordings">History</button>
         <button class="sb-item" data-view="settings">Settings</button>
       </div>
@@ -128,7 +128,7 @@
           <div class="window-heading">
             <span class="window-title">Transcriptor</span>
             <div class="window-view-stack">
-              <span class="window-view" id="windowViewLabel">Upload</span>
+              <span class="window-view" id="windowViewLabel">Live</span>
             </div>
           </div>
           <span class="net-pill" id="netPill" title="Internet connection status">
@@ -138,7 +138,7 @@
         </div>
       </div>
 
-      <section class="view" data-view="upload">
+      <section class="view" data-view="upload" hidden>
         <div class="topbar">
           <div class="topbar-row">
             <label class="top-item top-item-mic">
@@ -242,7 +242,7 @@
         </div>
       </section>
 
-      <section class="view" data-view="record" hidden>
+      <section class="view" data-view="record">
         <div class="topbar">
           <select id="mode" hidden>
             <option value="live" selected>Live</option>
@@ -670,13 +670,13 @@
               <label class="field">
                 <span class="lbl">Record (click to change)</span>
                 <button class="shortcut-btn" id="shortcutRecord" type="button" data-shortcut-id="record">
-                  <span class="shortcut-keys">⌥ ←</span>
+                  <span class="shortcut-keys">Option Left</span>
                 </button>
               </label>
               <label class="field">
                 <span class="lbl">Paste (click to change)</span>
                 <button class="shortcut-btn" id="shortcutPaste" type="button" data-shortcut-id="paste">
-                  <span class="shortcut-keys">⌥ ⇧ 7</span>
+                  <span class="shortcut-keys">Option Shift V</span>
                 </button>
               </label>
               <div class="btn-row">

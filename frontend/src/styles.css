@@ -2525,9 +2525,9 @@ textarea:focus-visible,
 }
 
 .shortcut-keys {
-  font-family: "SF Mono", "Menlo", "Monaco", monospace;
-  font-size: 12.5px;
-  letter-spacing: 1px;
+  font-family: inherit;
+  font-size: 13px;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 
