@@ -2,31 +2,43 @@
 
 This package is for Apple Silicon Macs.
 
-## Internal Ad-Hoc Build
+## Sonoma / Internal Install
 
-Use this flow for a trusted internal transfer when the build machine has no
-Developer ID Application certificate.
+Use the terminal installer for this internal build. It mounts the DMG, quits any
+running Transcriptor, copies the app to `/Applications`, removes quarantine,
+verifies the bundle, and opens the app.
 
-1. Copy `Transcriptor-1.1.25-arm64.dmg` to the target Mac.
-2. Open the DMG and drag `Transcriptor.app` to `/Applications`.
-3. Remove quarantine if macOS blocks the first launch:
+1. Copy these files to the same folder on the target Mac:
+   - `Transcriptor-1.1.25-arm64.dmg`
+   - `INSTALL_ON_OTHER_MAC.command`
+2. Open Terminal in that folder.
+3. Run:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Transcriptor.app
-open /Applications/Transcriptor.app
+bash INSTALL_ON_OTHER_MAC.command
 ```
 
 4. Grant Microphone, Accessibility, and Automation permissions when prompted.
 
-If the DMG cannot be used in the transfer channel, copy
-`Transcriptor-1.1.25-arm64-internal.zip`, unzip it, and move
-`Transcriptor.app` to `/Applications` manually.
+If the app was already dragged into `/Applications` manually and Sonoma shows
+"Cannot open Transcriptor", run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Transcriptor.app
+codesign --verify --deep --strict --verbose=2 /Applications/Transcriptor.app
+open /Applications/Transcriptor.app
+```
+
+If the DMG cannot be used in the transfer channel, put
+`Transcriptor-1.1.25-arm64-internal.zip` next to `INSTALL_ON_OTHER_MAC.command`
+and run the same command.
 
 ## Production Distribution
 
 For public or customer distribution, build with a valid Developer ID
 Application identity, notarize with Apple, and staple the ticket. Ad-hoc
-signing is not enough for Gatekeeper-trusted external downloads.
+signing is not enough for Gatekeeper-trusted drag-and-drop installs on a clean
+Sonoma Mac.
 
 ## Verification
 
