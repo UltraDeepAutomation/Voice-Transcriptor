@@ -78,6 +78,32 @@ class DeepgramFormattingTests(unittest.TestCase):
     def test_large_upload_preserves_long_upload_budget(self):
         self.assertEqual(_deepgram_http_policy(26 * 1024 * 1024), ((10, 208), 2))
 
+    def test_deepgram_uses_shared_audio_mime_ssot(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "results": {
+                        "channels": [
+                            {"alternatives": [{"transcript": "ok", "words": []}]}
+                        ]
+                    }
+                }
+
+        calls = []
+
+        def fake_request(*args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeResponse()
+
+        with mock.patch("backend.remote_deepgram.request_with_retry", side_effect=fake_request):
+            deepgram_transcribe(api_key="dg", audio_bytes=b"opus", filename="clip.opus")
+            deepgram_transcribe(api_key="dg", audio_bytes=b"webm", filename="clip.webm")
+
+        self.assertEqual(calls[0][1]["headers"]["Content-Type"], "audio/opus")
+        self.assertEqual(calls[1][1]["headers"]["Content-Type"], "audio/webm")
+
 
 if __name__ == "__main__":
     unittest.main()

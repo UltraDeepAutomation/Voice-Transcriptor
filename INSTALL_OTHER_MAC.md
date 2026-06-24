@@ -2,14 +2,14 @@
 
 This package is for Apple Silicon Macs.
 
-## Sonoma / Internal Install
+## macOS / Internal Install
 
 Use the terminal installer for this internal build. It mounts the DMG, quits any
 running Transcriptor, copies the app to `/Applications`, removes quarantine,
 verifies the bundle, and opens the app.
 
 1. Copy these files to the same folder on the target Mac:
-   - `Transcriptor-1.1.25-arm64.dmg`
+   - `Transcriptor-<version>-arm64.dmg`
    - `INSTALL_ON_OTHER_MAC.command`
 2. Open Terminal in that folder.
 3. Run:
@@ -29,9 +29,14 @@ codesign --verify --deep --strict --verbose=2 /Applications/Transcriptor.app
 open /Applications/Transcriptor.app
 ```
 
-If the DMG cannot be used in the transfer channel, put
-`Transcriptor-1.1.25-arm64-internal.zip` next to `INSTALL_ON_OTHER_MAC.command`
-and run the same command.
+If the DMG cannot be used in the transfer channel, put the matching
+`Transcriptor-<version>-arm64-internal.zip` created by `BUILD.command` next to
+`INSTALL_ON_OTHER_MAC.command` and run the same command.
+
+`BUILD.command` also writes a ready-to-send archive:
+`desktop/dist/release/Transcriptor-<version>-arm64-macos-install.zip`. That
+archive contains the DMG, this document, `INSTALL_ON_OTHER_MAC.command`, and
+`TRANSCRIPTOR_RELEASE_MANIFEST.txt`.
 
 ## Production Distribution
 
@@ -46,7 +51,9 @@ On the target Mac, verify the app bundle before first launch:
 
 ```bash
 codesign --verify --deep --strict --verbose=2 /Applications/Transcriptor.app
-/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 - <<'PY'
+APP=/Applications/Transcriptor.app
+RES="$APP/Contents/Resources"
+PYTHONPATH="$RES" PYTHONDONTWRITEBYTECODE=1 "$RES/runtime/python/bin/python3" - <<'PY'
 import backend.remote_deepgram as rest
 import backend.remote_deepgram_live as live
 print(rest._deepgram_http_policy(40379))

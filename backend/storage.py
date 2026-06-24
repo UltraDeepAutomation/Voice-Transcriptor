@@ -175,6 +175,37 @@ def atomic_write_json(path: Path, data: JSONData, *, indent: int = 2) -> None:
     atomic_write_text(path, payload)
 
 
+def atomic_copy_file(src: Path, path: Path, *, preserve_stat: bool = True) -> None:
+    """Copy *src* to *path* atomically and durably.
+
+    Used for migration paths where the bytes already exist on disk but the
+    destination must still obey the same tmp/fsync/rename contract as fresh
+    writes.
+    """
+    src = Path(src)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path_for(path)
+    try:
+        with open(src, "rb") as src_f, open(tmp, "wb") as dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+            dst_f.flush()
+            os.fsync(dst_f.fileno())
+        if preserve_stat:
+            try:
+                shutil.copystat(src, tmp)
+            except OSError as stat_error:
+                logger.warning("copy metadata skipped for %s -> %s: %s", src, path, stat_error)
+        os.replace(tmp, path)
+        _fsync_parent_dir(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def rotate_backup(path: Path, backup: Path) -> None:
     """Copy *path* → *backup* before an overwrite.
 

@@ -17,19 +17,27 @@ Use release artifacts when available.
 
 ### macOS Apple Silicon
 
-1. Download `Transcriptor-<version>-arm64.dmg`.
-2. Open the DMG and move `Transcriptor.app` to Applications.
+1. Download `Transcriptor-<version>-arm64-macos-install.zip` from
+   `desktop/dist/release`.
+2. Unzip it and run `bash INSTALL_ON_OTHER_MAC.command` from the extracted
+   folder.
 3. On first launch, allow Microphone, Accessibility, and Automation permissions.
 
 Public macOS release/build output is arm64-only. Intel macOS packaged runtime builds are intentionally unsupported in the current release line.
 
 #### Internal ad-hoc builds
 
-`desktop/dist/Transcriptor-<version>-arm64.dmg` and the matching ZIP are suitable for internal transfer between trusted Macs when no Developer ID certificate is available on the build machine. These builds are ad-hoc signed, not notarized. A receiving Mac may require removing quarantine before first launch:
+`desktop/dist/release/Transcriptor-<version>-arm64-macos-install.zip` is the
+preferred transfer artifact between trusted Macs when no Developer ID
+certificate is available on the build machine. The terminal installer mounts
+the DMG, installs into `/Applications`, removes quarantine, verifies the bundle,
+checks the release manifest, and opens the app. These builds are
+self-signed/internal or ad-hoc signed, not notarized.
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Transcriptor.app
-open /Applications/Transcriptor.app
+unzip Transcriptor-<version>-arm64-macos-install.zip
+cd Transcriptor-<version>-arm64-macos-install
+bash INSTALL_ON_OTHER_MAC.command
 ```
 
 Public distribution must use a Developer ID Application identity plus Apple notarization and stapling. Without that identity, macOS Gatekeeper cannot treat the app as a fully trusted external download.
@@ -59,7 +67,7 @@ Prerequisites:
 - Node.js `>=22.12.0`; `.node-version` and `.nvmrc` are the local SSOT.
 - npm `>=10` from the same Node distribution.
 - Runtime preparation requires `python3` with `pip`, `curl`, `tar`, and `unzip` for macOS/Windows archives.
-- macOS arm64 release builds require `bash`, Xcode Command Line Tools, `codesign`, and a configured signing identity. Use `npm --prefix desktop run dist:adhoc` only for explicit local ad-hoc builds.
+- macOS arm64 internal release builds require `bash`, Xcode Command Line Tools, `codesign`, and the internal signing identity. `TRANSCRIPTOR_SIGNING_IDENTITY="Developer ID Application: ..."` only signs with a production identity; public distribution still requires a separate notarization and stapling gate before shipment. Use `npm --prefix desktop run dist:adhoc` only for explicit local ad-hoc builds.
 - Windows release packaging requires a Bash-capable shell because `desktop/scripts/prepare-runtime.sh` prepares the bundled runtime.
 - Linux desktop integration still depends on distro packages such as `xdotool`, `wmctrl`, and `zenity`.
 

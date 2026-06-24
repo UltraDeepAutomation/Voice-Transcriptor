@@ -962,6 +962,10 @@ function isRemoteProvider(provider: Provider): provider is RemoteProvider {
   return provider === "openrouter" || provider === "deepgram";
 }
 
+function isRemoteProviderReachable(provider: Provider, providerReachabilityHint = false): boolean {
+  return isRemoteProvider(provider) && (providerReachabilityHint || isNetworkOnline);
+}
+
 function remoteProviderOfflineMessage(provider: Provider): string {
   return `${providerLabel(provider)} is unavailable because the internet probe is offline.`;
 }
@@ -2525,9 +2529,10 @@ async function remoteJobSync(
     openrouterModel?: string;
     signal?: AbortSignal;
     timeoutMs?: number;
+    providerReachabilityHint?: boolean;
   }
 ): Promise<{ text: string; provider: string; model?: string }> {
-  if (isRemoteProvider(opts.provider) && !isNetworkOnline) {
+  if (isRemoteProvider(opts.provider) && !isRemoteProviderReachable(opts.provider, opts.providerReachabilityHint)) {
     throw new Error(remoteProviderOfflineMessage(opts.provider));
   }
   const timeoutMs = opts.timeoutMs ?? inferRemoteJobTimeoutMs(file, opts.provider);
@@ -2649,12 +2654,18 @@ async function localJobSync(
   return normalizeLocalTranscriptionResult(js?.result);
 }
 
-async function transcribeCanonicalAudioLocally(file: File, language: string, model: string): Promise<LocalTranscriptionResult> {
+async function transcribeCanonicalAudioLocally(
+  file: File,
+  language: string,
+  model: string,
+  signal?: AbortSignal
+): Promise<LocalTranscriptionResult> {
   return localJobSync(file, {
     language: resolveFastLocalLanguage(language),
     model: (model || "").trim() || "small",
     splitStereo: false,
     wordTimestamps: false,
+    signal,
   });
 }
 
@@ -2900,7 +2911,7 @@ function switchView(requestedView: RequestedViewName): void {
 
 function resolveEffectiveProvider(preferred: Provider): Provider {
   if (preferred === "local") return "local";
-  if (isNetworkOnline) return preferred;
+  if (isRemoteProviderReachable(preferred)) return preferred;
   return "local";
 }
 
@@ -7335,6 +7346,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   const providerValue = liveSnapshot.provider;
   const languageValue = liveSnapshot.language;
   const effectiveProvider = liveSnapshot.effectiveProvider;
+  const deepgramReachabilityHint = effectiveProvider === "deepgram";
   const modelValue = liveSnapshot.model;
   const sourceLiveText = getSessionCanonicalLiveSourceText(sessionUiToken);
   // The stop entry snapshot is intentionally not the SSOT: final/interim
@@ -8085,12 +8097,13 @@ async function stopLive(enhance: boolean): Promise<void> {
     // ``transcribe-on-disk`` endpoint added in 1.1.18. Saves
     // 500 ms-1 s of loopback overhead on every recovery call when
     // the recording was successfully persisted (the common case).
-    const deepgramRestOnDisk = async (): Promise<string | null> => {
+    const deepgramRestOnDisk = async (signal?: AbortSignal): Promise<string | null> => {
       if (!persistedRecordingName) return null;
       const url = `/api/recordings/${encodeURIComponent(persistedRecordingName)}/transcribe-on-disk`;
       const resp = await fetch(url, {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
+        signal,
         body: JSON.stringify({
           provider: "deepgram",
           language: languageValue,
@@ -8115,9 +8128,9 @@ async function stopLive(enhance: boolean): Promise<void> {
       provider === "deepgram" && recordedSec > 0 && recordedSec <= 30
         ? LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS
         : LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS;
-    const recoverFromEmptyTranscriptInner = async (reason: string): Promise<string> => {
+    const recoverFromEmptyTranscriptInner = async (reason: string, signal?: AbortSignal): Promise<string> => {
       console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
-      if (isProviderKeyConfigured("deepgram") && isNetworkOnline) {
+      if (isProviderKeyConfigured("deepgram") && isRemoteProviderReachable("deepgram", deepgramReachabilityHint)) {
         if (isCurrentUiSession(sessionUiToken)) {
           patchCurrentRecordingSummary({
             title: provisionalTitle,
@@ -8131,7 +8144,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         // the recording wasn't persisted (extremely rare — stopLive's
         // two-attempt save handles every common failure).
         try {
-          const onDisk = await deepgramRestOnDisk();
+          const onDisk = await deepgramRestOnDisk(signal);
           if (onDisk !== null) {
             console.log(`[trace recover] deepgram REST on-disk durMs=${(performance.now() - tDg).toFixed(0)} textLen=${onDisk.length} wordCount=${onDisk.split(/\s+/).filter(Boolean).length}`);
             if (onDisk) return onDisk;
@@ -8153,6 +8166,8 @@ async function stopLive(enhance: boolean): Promise<void> {
               language: languageValue,
               diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
               openrouterModel: getRemoteModelValue("deepgram"),
+              providerReachabilityHint: deepgramReachabilityHint,
+              signal,
             });
             const text = String(result.text || "").trim();
             console.log(`[trace recover] deepgram REST upload durMs=${(performance.now() - tDg2).toFixed(0)} textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
@@ -8190,6 +8205,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           audioFile,
           languageValue,
           liveSnapshot.finalLocalModel,
+          signal,
         );
         const text = String(local.text || "").trim();
         console.log(`[trace recover] local whisper OK durMs=${(performance.now() - tLocal).toFixed(0)} model="${liveSnapshot.finalLocalModel}" textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
@@ -8206,14 +8222,17 @@ async function stopLive(enhance: boolean): Promise<void> {
     // (its promises don't get cancelled — the caller just stops
     // waiting), so a delayed result still gets logged; we just don't
     // block the UI on it.
+    let emptyRecoveryAttempted = false;
     const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
+      emptyRecoveryAttempted = true;
       const tStart = performance.now();
+      const abortController = new AbortController();
       // ``timeoutHandle`` is captured so the inner-resolves-first path
       // can clearTimeout and avoid the misleading "HARD TIMEOUT" log
       // that would otherwise fire 20 s after the function already
       // returned (cosmetic noise the user noticed in main.log).
       let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-      const innerPromise = recoverFromEmptyTranscriptInner(reason).finally(() => {
+      const innerPromise = recoverFromEmptyTranscriptInner(reason, abortController.signal).finally(() => {
         if (timeoutHandle !== null) {
           clearTimeout(timeoutHandle);
           timeoutHandle = null;
@@ -8222,6 +8241,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       const timeoutPromise = new Promise<string>((resolve) => {
         timeoutHandle = setTimeout(() => {
           console.log(`[trace recover] HARD TIMEOUT after ${RECOVERY_HARD_TIMEOUT_MS}ms — abandoning recovery`);
+          abortController.abort();
           resolve("");
         }, RECOVERY_HARD_TIMEOUT_MS);
       });
@@ -8527,7 +8547,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           const wordCount = wordCountOf(transcriptRaw);
           const expectedWords = recordedSec * 2.5;
           const isSuspiciouslyShort = recordedSec > 5 && wordCount < expectedWords * 0.3;
-          if (isSuspiciouslyShort && isProviderKeyConfigured("deepgram") && isNetworkOnline) {
+          if (isSuspiciouslyShort && isProviderKeyConfigured("deepgram") && isRemoteProviderReachable("deepgram", deepgramReachabilityHint)) {
             patchCurrentRecordingSummary({
               title: provisionalTitle,
               status: `Streaming captured only ${wordCount} words for ${Math.round(recordedSec)}s. Re-transcribing via REST...`,
@@ -8541,6 +8561,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                   language: languageValue,
                   diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
                   openrouterModel: getRemoteModelValue("deepgram"),
+                  providerReachabilityHint: deepgramReachabilityHint,
                 });
                 const restText = String(restResult.text || "").trim();
                 if (restText && wordCountOf(restText) > wordCount) {
@@ -8557,44 +8578,81 @@ async function stopLive(enhance: boolean): Promise<void> {
             }
           }
         } else {
-          // No committed segments at all (very short recording, or
-          // Deepgram hadn't returned any is_final yet). Fall back to
-          // the envelope await.
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: "Sealing Deepgram stream…",
-            tone: "info",
-          }, sessionUiToken);
-          const envelope = liveFinalPromise ? await liveFinalPromise : null;
-          const envelopeError = envelope?.error || getLiveStreamError(sessionUiToken) || "";
-          const envelopeText = textFromLiveFinalEnvelope(envelope);
-          if (envelopeText && !envelopeError) {
-            transcriptRaw = envelopeText;
-          } else if (envelopeError) {
-            // Migrated to ``recoverFromEmptyTranscript`` in 1.1.17:
-            // the previous bespoke chain at this branch read
-            // ``transcribeInputFile`` directly, which is the OPFS-
-            // dangling lazy ``Blob([header, spool])`` after
-            // ``deferredSinkDestroy.destroy()`` runs upstream.
-            // ``recoverFromEmptyTranscript`` resolves audio through
-            // ``fetchRecoveryAudioFile`` (durable backend re-fetch
-            // first, in-memory only as last resort) and runs the
-            // exact same Deepgram-REST → local-Whisper chain — same
-            // behaviour, no dangling-blob class of bug.
+          // No committed/interim text at stop. Do not serialize the
+          // 4s Deepgram final-envelope wait and the saved-audio
+          // recovery pass: on regional WS stalls this was exactly how a
+          // 12s clip displayed "TRANSCRIBE 24s". Start both arms now
+          // and accept the first useful transcript.
+          type NoFinalCandidate = {
+            label: "envelope" | "recovery";
+            text: string;
+            error: string;
+            words: number;
+          };
+          const noStreamingActivity = !hasStreamingActivity(instantBuffer);
+          const noFinalSilence = captureSilenceSnapshot(getSessionCanonicalLiveSourceText(sessionUiToken));
+          const definitelySilent = noStreamingActivity && (
+            noFinalSilence.hardSilence ||
+            noFinalSilence.likelySilenceWithoutPreview
+          );
+          if (definitelySilent) {
+            console.log(`[trace no-final] silent recording — skipping envelope/recovery wait`);
             patchCurrentRecordingSummary({
               title: provisionalTitle,
-              status: `Live stream issue (${envelopeError}). Recovering from saved audio…`,
-              tone: "warning",
+              status: "Recording completed, no speech detected.",
+              tone: "info",
             }, sessionUiToken);
-            transcriptRaw = await recoverFromEmptyTranscript(
-              `Live stream errored (${envelopeError}).`,
-            );
+          } else {
+            const reason = noStreamingActivity
+              ? "Live stream returned no text, but microphone audio was captured."
+              : "Live stream returned no text.";
+            patchCurrentRecordingSummary({
+              title: provisionalTitle,
+              status: noStreamingActivity
+                ? "Live stream returned no text. Recovering from saved audio…"
+                : "Sealing stream while recovering from saved audio…",
+              tone: noStreamingActivity ? "warning" : "info",
+            }, sessionUiToken);
+            const tNoFinal = performance.now();
+            const envelopeCand: Promise<NoFinalCandidate> = (liveFinalPromise || Promise.resolve(null))
+              .then((envelope) => {
+                const error = envelope?.error || getLiveStreamError(sessionUiToken) || "";
+                const text = error ? "" : textFromLiveFinalEnvelope(envelope);
+                return {
+                  label: "envelope" as const,
+                  text,
+                  error,
+                  words: countWords(text),
+                };
+              });
+            const recoveryCand: Promise<NoFinalCandidate> = recoverFromEmptyTranscript(reason)
+              .then((text) => ({
+                label: "recovery" as const,
+                text,
+                error: "",
+                words: countWords(text),
+              }));
+            const first = await Promise.race([envelopeCand, recoveryCand]);
+            console.log(`[trace no-final] first=${first.label} ms=${(performance.now() - tNoFinal).toFixed(0)} words=${first.words} error="${first.error}"`);
+            if (first.text) {
+              transcriptRaw = first.text;
+            } else {
+              const other = await (first.label === "envelope" ? recoveryCand : envelopeCand);
+              console.log(`[trace no-final] second=${other.label} ms=${(performance.now() - tNoFinal).toFixed(0)} words=${other.words} error="${other.error}"`);
+              if (other.text) {
+                transcriptRaw = other.text;
+              } else if (first.error || other.error) {
+                console.log(`[trace no-final] no transcript recovered; envelopeError="${first.error || other.error}"`);
+              }
+            }
           }
         } // close ``else`` (no instantTranscript — envelope fallback)
       }
 
       // Very last resort: whatever the live source text captured.
-      if (!transcriptRaw) {
+      if (!transcriptRaw && emptyRecoveryAttempted) {
+        console.log(`[trace stopLive] empty transcript remains after recovery; not retrying recovery chain`);
+      } else if (!transcriptRaw) {
         const committed = getSessionCanonicalLiveSourceText(sessionUiToken);
         if (committed) transcriptRaw = committed;
       }
@@ -8708,6 +8766,15 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
 
     console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)}`);
+    const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
+    patchCurrentRecordingSummary({
+      title: transcriptRaw ? _smartTitle(transcriptRaw) : provisionalTitle,
+      status: transcriptRaw
+        ? "Final transcript is ready. Saving audio and transcript."
+        : "Recording completed, no speech detected.",
+      tone: transcriptRaw ? "success" : "info",
+      transcribeLatencyMs: transcriptReadyLatencyMs,
+    }, sessionUiToken);
 
     publishRecordingFinalSignal({
       recordingId,
@@ -8763,7 +8830,6 @@ async function stopLive(enhance: boolean): Promise<void> {
         }, sessionUiToken);
       }
     }
-    const latencyMs = performance.now() - transcribeStartedAt;
     patchCurrentRecordingSummary({
       title,
       status: finalSaveConflict
@@ -8772,7 +8838,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           ? "Final transcript is ready. Audio and transcript are both available."
           : "Recording completed, no speech detected.",
       tone: finalSaveConflict ? "warning" : "success",
-      transcribeLatencyMs: latencyMs,
+      transcribeLatencyMs: transcriptReadyLatencyMs,
       ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
     }, sessionUiToken);
   } catch (e) {

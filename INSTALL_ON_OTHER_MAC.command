@@ -3,8 +3,8 @@
 #  Transcriptor - installer for another Apple Silicon Mac
 #
 #  Put this file next to either:
-#    - Transcriptor-1.1.25-arm64.dmg
-#    - Transcriptor-1.1.25-arm64-internal.zip
+#    - Transcriptor-<version>-arm64.dmg
+#    - Transcriptor-<version>-arm64-internal.zip
 #    - Transcriptor.app
 #
 #  Then run:
@@ -14,8 +14,10 @@ set -euo pipefail
 
 PRODUCT_NAME="Transcriptor"
 APP_NAME="Transcriptor.app"
-DMG_NAME="Transcriptor-1.1.25-arm64.dmg"
-ZIP_NAME="Transcriptor-1.1.25-arm64-internal.zip"
+DMG_PATTERN="Transcriptor-*-arm64.dmg"
+ZIP_PATTERN="Transcriptor-*-arm64-internal.zip"
+RELEASE_MANIFEST_NAME="TRANSCRIPTOR_RELEASE_MANIFEST.txt"
+DEFAULT_EXPECTED_BUNDLE_ID="local.transcriptor.app"
 TARGET_ROOT="${TRANSCRIPTOR_INSTALL_DIR:-/Applications}"
 TARGET_APP="${TARGET_ROOT}/${APP_NAME}"
 
@@ -23,6 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP_DIR=""
 MOUNT_DIR=""
 SOURCE_APP=""
+EXPECTED_BUNDLE_ID="${TRANSCRIPTOR_EXPECTED_BUNDLE_ID:-$DEFAULT_EXPECTED_BUNDLE_ID}"
+MANIFEST_DMG_NAME=""
+MANIFEST_ZIP_NAME=""
 
 log() {
   printf '[Transcriptor installer] %s\n' "$*"
@@ -72,33 +77,111 @@ verify_app() {
   fi
   local bundle_id
   bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist" 2>/dev/null || true)"
-  [ "$bundle_id" = "local.transcriptor.app" ] || die "Unexpected bundle id: ${bundle_id:-unknown}"
+  [ "$bundle_id" = "$EXPECTED_BUNDLE_ID" ] || die "Unexpected bundle id: ${bundle_id:-unknown}; expected ${EXPECTED_BUNDLE_ID}"
+}
+
+read_manifest_value() {
+  local key="$1"
+  local manifest_path="${SCRIPT_DIR}/${RELEASE_MANIFEST_NAME}"
+  [ -f "$manifest_path" ] || return 0
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$manifest_path"
+}
+
+validate_manifest_basename() {
+  local label="$1"
+  local value="$2"
+  [ -n "$value" ] || return 0
+  case "$value" in
+    */*|*..*)
+      die "Invalid ${label} in ${RELEASE_MANIFEST_NAME}: ${value}"
+      ;;
+  esac
+}
+
+load_release_manifest() {
+  local manifest_path="${SCRIPT_DIR}/${RELEASE_MANIFEST_NAME}"
+  local manifest_app_id
+  [ -f "$manifest_path" ] || return 0
+  manifest_app_id="$(read_manifest_value "app_id")"
+  if [ -n "$manifest_app_id" ]; then
+    EXPECTED_BUNDLE_ID="$manifest_app_id"
+  fi
+  MANIFEST_DMG_NAME="$(read_manifest_value "dmg")"
+  MANIFEST_ZIP_NAME="$(read_manifest_value "internal_zip")"
+  validate_manifest_basename "DMG name" "$MANIFEST_DMG_NAME"
+  validate_manifest_basename "internal ZIP name" "$MANIFEST_ZIP_NAME"
+  log "Using release manifest ${RELEASE_MANIFEST_NAME}"
+}
+
+artifact_from_manifest_or_pattern() {
+  local manifest_name="$1"
+  local pattern="$2"
+  local label="$3"
+  if [ -n "$manifest_name" ]; then
+    local manifest_path="${SCRIPT_DIR}/${manifest_name}"
+    [ -f "$manifest_path" ] || die "${RELEASE_MANIFEST_NAME} expects missing ${label}: ${manifest_name}"
+    printf '%s\n' "$manifest_path"
+    return 0
+  fi
+  find_single_artifact "$pattern" "$label"
+}
+
+find_single_artifact() {
+  local pattern="$1"
+  local label="$2"
+  local old_nullglob
+  local -a matches=()
+  old_nullglob="$(shopt -p nullglob || true)"
+  shopt -s nullglob
+  matches=("${SCRIPT_DIR}"/${pattern})
+  if [ -n "$old_nullglob" ]; then
+    eval "$old_nullglob"
+  else
+    shopt -u nullglob
+  fi
+  if [ "${#matches[@]}" -gt 1 ]; then
+    printf '[Transcriptor installer] ERROR: multiple %s artifacts found:\n' "$label" >&2
+    printf '  %s\n' "${matches[@]}" >&2
+    exit 1
+  fi
+  if [ "${#matches[@]}" -eq 1 ]; then
+    printf '%s\n' "${matches[0]}"
+  fi
+  return 0
 }
 
 prepare_source_app() {
+  TMP_DIR="$(mktemp -d)"
+
+  local dmg_path
+  dmg_path="$(artifact_from_manifest_or_pattern "$MANIFEST_DMG_NAME" "$DMG_PATTERN" "DMG")"
+  if [ -n "$dmg_path" ]; then
+    MOUNT_DIR="$(mktemp -d)"
+    log "Mounting $(basename "$dmg_path")"
+    xattr -dr com.apple.quarantine "$dmg_path" 2>/dev/null || true
+    if ! hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$MOUNT_DIR" -quiet; then
+      die "Failed to mount $(basename "$dmg_path"). Run: xattr -dr com.apple.quarantine \"$dmg_path\"; or install from the matching internal ZIP."
+    fi
+    SOURCE_APP="${MOUNT_DIR}/${APP_NAME}"
+    return
+  fi
+
+  local zip_path
+  zip_path="$(artifact_from_manifest_or_pattern "$MANIFEST_ZIP_NAME" "$ZIP_PATTERN" "internal ZIP")"
+  if [ -n "$zip_path" ]; then
+    log "Unpacking $(basename "$zip_path")"
+    xattr -dr com.apple.quarantine "$zip_path" 2>/dev/null || true
+    unzip -q "$zip_path" -d "$TMP_DIR"
+    SOURCE_APP="${TMP_DIR}/${APP_NAME}"
+    return
+  fi
+
   if [ -d "${SCRIPT_DIR}/${APP_NAME}" ]; then
     SOURCE_APP="${SCRIPT_DIR}/${APP_NAME}"
     return
   fi
 
-  TMP_DIR="$(mktemp -d)"
-
-  if [ -f "${SCRIPT_DIR}/${DMG_NAME}" ]; then
-    MOUNT_DIR="$(mktemp -d)"
-    log "Mounting ${DMG_NAME}"
-    hdiutil attach "${SCRIPT_DIR}/${DMG_NAME}" -readonly -nobrowse -mountpoint "$MOUNT_DIR" -quiet
-    SOURCE_APP="${MOUNT_DIR}/${APP_NAME}"
-    return
-  fi
-
-  if [ -f "${SCRIPT_DIR}/${ZIP_NAME}" ]; then
-    log "Unpacking ${ZIP_NAME}"
-    unzip -q "${SCRIPT_DIR}/${ZIP_NAME}" -d "$TMP_DIR"
-    SOURCE_APP="${TMP_DIR}/${APP_NAME}"
-    return
-  fi
-
-  die "Put ${DMG_NAME}, ${ZIP_NAME}, or ${APP_NAME} next to this installer."
+  die "Put ${DMG_PATTERN}, ${ZIP_PATTERN}, or ${APP_NAME} next to this installer."
 }
 
 quit_existing_app() {
@@ -167,6 +250,7 @@ main() {
   require_cmd osascript
   require_cmd pgrep
 
+  load_release_manifest
   prepare_source_app
   verify_app "$SOURCE_APP"
 

@@ -28,6 +28,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from backend.storage import (
+    atomic_copy_file,
     atomic_promote_file,
     atomic_write_bytes,
     atomic_write_json,
@@ -106,6 +107,32 @@ class TestAtomicPromoteFile(unittest.TestCase):
 
             self.assertFalse(target.exists())
             self.assertFalse(tmp.exists())
+
+
+class TestAtomicCopyFile(unittest.TestCase):
+    def test_copies_source_to_nested_target_atomically(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "legacy.json"
+            target = root / "new" / "config.json"
+            src.write_bytes(b'{"v":1}')
+
+            atomic_copy_file(src, target)
+
+            self.assertEqual(target.read_bytes(), b'{"v":1}')
+            self.assertEqual(list(target.parent.glob("*.tmp-*")), [])
+
+    def test_cleanup_on_missing_source_failure(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "missing.json"
+            target = root / "target.json"
+
+            with self.assertRaises(OSError):
+                atomic_copy_file(src, target)
+
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.glob("*.tmp-*")), [])
 
 
 class TestAtomicWriteText(unittest.TestCase):

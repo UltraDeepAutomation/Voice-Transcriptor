@@ -11,6 +11,9 @@ from pathlib import Path
 from unittest import mock
 
 
+TEST_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _fresh_main_module(data_dir: str):
     os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
     os.environ["TRANSCRIPTOR_DATA_DIR"] = data_dir
@@ -21,7 +24,7 @@ def _fresh_main_module(data_dir: str):
 
 class RecordingNameTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(dir=str(Path.home()))
+        self._tmp = tempfile.TemporaryDirectory(dir=str(TEST_WORKSPACE_ROOT))
         self.main = _fresh_main_module(self._tmp.name)
 
     def tearDown(self):
@@ -399,6 +402,21 @@ class RecordingNameTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(len(results), 2)
         self.assertEqual(len(set(results)), 2)
+        self.assertEqual(len(list(target.glob("*.tmp-*.claim"))), 2)
+        self.assertEqual(len(list(target.glob("*.txt"))), 0)
+
+        for name in results:
+            self.main._write_recording_text_file(
+                out=target / name,
+                title=Path(name).stem,
+                source_text="source",
+                transcript_text="transcript",
+                provider="local",
+                model="small",
+                language="ru",
+            )
+
+        self.assertEqual(list(target.glob("*.tmp-*.claim")), [])
         self.assertEqual(len(list(target.glob("*.txt"))), 2)
 
     def test_failed_upload_validation_does_not_leave_queued_jobs(self):
@@ -493,6 +511,14 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(job.status, "done")
         self.assertTrue(source.exists())
         run_once.assert_called_once()
+
+    def test_safe_delete_live_recovery_swallow_cleanup_error(self):
+        with mock.patch.object(
+            self.main,
+            "_delete_live_recovery",
+            side_effect=OSError("locked recovery sidecar"),
+        ):
+            self.assertFalse(self.main._safe_delete_live_recovery("session-1"))
 
 
 if __name__ == "__main__":

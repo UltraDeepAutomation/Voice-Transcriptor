@@ -8,6 +8,7 @@
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DIST_DIR="$SCRIPT_DIR/desktop/dist"
 cd "$SCRIPT_DIR"
 
 cleanup_path() {
@@ -19,7 +20,7 @@ cleanup_path() {
 }
 
 cleanup_release_output() {
-  cleanup_path "$SCRIPT_DIR/desktop/dist"
+  cleanup_path "$DIST_DIR"
 }
 
 cleanup_stale_install_backups() {
@@ -59,11 +60,120 @@ ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix desktop ci
 cd "$SCRIPT_DIR/desktop"
 npm run dist -- "$@"
 
-APP_DIR="$SCRIPT_DIR/desktop/dist/mac-${BUILDER_ARCH}/Transcriptor.app"
+APP_DIR="$DIST_DIR/mac-${BUILDER_ARCH}/Transcriptor.app"
 if [ ! -d "$APP_DIR" ]; then
   echo "Built app bundle not found: $APP_DIR" >&2
   exit 1
 fi
+APP_VERSION="$(node -p "require('./package.json').version")"
+APP_ID="$(node -p "require('./package.json').build.appId")"
+APP_ARTIFACT_PREFIX="Transcriptor-${APP_VERSION}-${BUILDER_ARCH}"
+DMG_PATH="$DIST_DIR/${APP_ARTIFACT_PREFIX}.dmg"
+INTERNAL_ZIP="$DIST_DIR/${APP_ARTIFACT_PREFIX}-internal.zip"
+RELEASE_DIR="$DIST_DIR/release"
+RELEASE_MANIFEST_NAME="TRANSCRIPTOR_RELEASE_MANIFEST.txt"
+INSTALL_KIT_NAME="${APP_ARTIFACT_PREFIX}-macos-install"
+INSTALL_KIT_DIR="$RELEASE_DIR/$INSTALL_KIT_NAME"
+INSTALL_KIT_ZIP="$RELEASE_DIR/${INSTALL_KIT_NAME}.zip"
+
+create_internal_zip() {
+  local zip_path="$1"
+  cleanup_path "$zip_path"
+  (
+    cd "$(dirname "$APP_DIR")"
+    ditto -c -k --sequesterRsrc --keepParent "$(basename "$APP_DIR")" "$zip_path"
+  )
+  echo "Created $zip_path"
+}
+
+create_internal_zip "$INTERNAL_ZIP"
+
+write_release_manifest() {
+  local out="$1"
+  cat > "$out" <<EOF
+product=Transcriptor
+version=$APP_VERSION
+arch=$BUILDER_ARCH
+app_id=$APP_ID
+dmg=$(basename "$DMG_PATH")
+internal_zip=$(basename "$INTERNAL_ZIP")
+install_zip=$(basename "$INSTALL_KIT_ZIP")
+EOF
+}
+
+create_release_package() {
+  local dmg_base
+  local internal_zip_base
+  local install_zip_base
+
+  [ -f "$DMG_PATH" ] || {
+    echo "Built DMG not found: $DMG_PATH" >&2
+    exit 1
+  }
+  [ -f "$INTERNAL_ZIP" ] || {
+    echo "Internal ZIP not found: $INTERNAL_ZIP" >&2
+    exit 1
+  }
+  [ -f "$SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" ] || {
+    echo "Installer script not found: $SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" >&2
+    exit 1
+  }
+  [ -f "$SCRIPT_DIR/INSTALL_OTHER_MAC.md" ] || {
+    echo "Install docs not found: $SCRIPT_DIR/INSTALL_OTHER_MAC.md" >&2
+    exit 1
+  }
+  command -v zip >/dev/null 2>&1 || {
+    echo "Missing required command: zip" >&2
+    exit 1
+  }
+  command -v shasum >/dev/null 2>&1 || {
+    echo "Missing required command: shasum" >&2
+    exit 1
+  }
+
+  cleanup_path "$RELEASE_DIR"
+  mkdir -p "$RELEASE_DIR"
+  write_release_manifest "$RELEASE_DIR/$RELEASE_MANIFEST_NAME"
+
+  cp "$DMG_PATH" "$RELEASE_DIR/"
+  cp "$INTERNAL_ZIP" "$RELEASE_DIR/"
+  cp "$SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" "$RELEASE_DIR/"
+  cp "$SCRIPT_DIR/INSTALL_OTHER_MAC.md" "$RELEASE_DIR/"
+  chmod +x "$RELEASE_DIR/INSTALL_ON_OTHER_MAC.command"
+
+  cleanup_path "$INSTALL_KIT_DIR"
+  mkdir -p "$INSTALL_KIT_DIR"
+  cp "$DMG_PATH" "$INSTALL_KIT_DIR/"
+  cp "$SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" "$INSTALL_KIT_DIR/"
+  cp "$SCRIPT_DIR/INSTALL_OTHER_MAC.md" "$INSTALL_KIT_DIR/"
+  cp "$RELEASE_DIR/$RELEASE_MANIFEST_NAME" "$INSTALL_KIT_DIR/"
+  chmod +x "$INSTALL_KIT_DIR/INSTALL_ON_OTHER_MAC.command"
+
+  cleanup_path "$INSTALL_KIT_ZIP"
+  (
+    cd "$RELEASE_DIR"
+    zip -qry -X "$(basename "$INSTALL_KIT_ZIP")" "$(basename "$INSTALL_KIT_DIR")"
+  )
+  cleanup_path "$INSTALL_KIT_DIR"
+
+  dmg_base="$(basename "$DMG_PATH")"
+  internal_zip_base="$(basename "$INTERNAL_ZIP")"
+  install_zip_base="$(basename "$INSTALL_KIT_ZIP")"
+  (
+    cd "$RELEASE_DIR"
+    shasum -a 256 \
+      "$dmg_base" \
+      "$internal_zip_base" \
+      "$install_zip_base" \
+      "INSTALL_ON_OTHER_MAC.command" \
+      "INSTALL_OTHER_MAC.md" \
+      "$RELEASE_MANIFEST_NAME" \
+      > SHA256SUMS.txt
+  )
+  echo "Created release package in $RELEASE_DIR"
+}
+
+create_release_package
 
 install_app_bundle() {
   local target_app="$1"

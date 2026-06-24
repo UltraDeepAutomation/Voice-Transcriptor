@@ -42,12 +42,12 @@
 //
 // Identity selection
 // ------------------
-// Probes the local keychain for ``AntigravityTelegramDev`` (the
-// user's self-signed 10-year code-signing certificate). When found,
-// uses it as the ``identity`` option. When absent (fresh machine,
-// CI runner), drops to ad-hoc via ``-`` and logs a warning — the
-// build fails on a missing certificate unless TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1
-// is set explicitly for local ad-hoc builds.
+// Uses TRANSCRIPTOR_SIGNING_IDENTITY when set; otherwise falls back to
+// the internal development identity. Production builds can point this
+// at a real "Developer ID Application: ..." certificate without editing
+// source. TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 is the only path to ad-hoc
+// signing and intentionally forces identity "-" for local/internal
+// throwaway builds.
 //
 // TCC persistence
 // ---------------
@@ -63,7 +63,7 @@ const {
 } = require("node:fs");
 const path = require("node:path");
 
-const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
+const DEFAULT_INTERNAL_SIGNING_IDENTITY = "AntigravityTelegramDev";
 const PYTHON_IMPORT_TREES = Object.freeze([
   path.join("Contents", "Resources", "runtime", "python"),
   path.join("Contents", "Resources", "backend"),
@@ -194,16 +194,17 @@ function makeBundledPythonImportsReadOnly(appPath) {
 }
 
 /**
- * Return ``true`` if the preferred signing identity is currently
- * available in the local keychain. Probes via ``security find-
- * identity -v -p codesigning``.
+ * Return ``true`` if *identity* is currently available in the local
+ * keychain. Probes via ``security find-identity -v -p codesigning``.
  */
-function hasPreferredIdentity() {
+function hasSigningIdentity(identity) {
+  const wanted = String(identity || "").trim();
+  if (!wanted) return false;
   try {
     const out = execSync("/usr/bin/security find-identity -v -p codesigning", {
       encoding: "utf8",
     });
-    return out.includes(`"${PREFERRED_SIGNING_IDENTITY}"`);
+    return out.includes(`"${wanted}"`);
   } catch {
     return false;
   }
@@ -234,25 +235,37 @@ exports.default = async function afterPack(context) {
     throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
   }
 
-  const useStableIdentity = hasPreferredIdentity();
-  if (!useStableIdentity && process.env.TRANSCRIPTOR_ALLOW_ADHOC_SIGN !== "1") {
+  const requestedIdentity = String(
+    process.env.TRANSCRIPTOR_SIGNING_IDENTITY || DEFAULT_INTERNAL_SIGNING_IDENTITY,
+  ).trim();
+  const useAdhocIdentity = process.env.TRANSCRIPTOR_ALLOW_ADHOC_SIGN === "1";
+  const hasRequestedIdentity = !useAdhocIdentity && hasSigningIdentity(requestedIdentity);
+  const isDeveloperIdIdentity = !useAdhocIdentity && /^Developer ID Application:/i.test(requestedIdentity);
+  if (!useAdhocIdentity && !hasRequestedIdentity) {
     throw new Error(
-      `afterPack: missing signing identity "${PREFERRED_SIGNING_IDENTITY}". ` +
-        "Set TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 only for explicit local ad-hoc builds.",
+      `afterPack: missing signing identity "${requestedIdentity}". ` +
+        "Set TRANSCRIPTOR_SIGNING_IDENTITY to a valid keychain identity, " +
+        "or set TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 only for explicit local ad-hoc builds.",
     );
   }
-  const identity = useStableIdentity ? PREFERRED_SIGNING_IDENTITY : "-";
+  const identity = useAdhocIdentity ? "-" : requestedIdentity;
+  const runtimeTimestampArg = isDeveloperIdIdentity ? "--timestamp" : "--timestamp=none";
 
-  if (useStableIdentity) {
+  if (!useAdhocIdentity) {
     console.log(
-      `[afterPack] Signing ${appPath} with stable identity "${PREFERRED_SIGNING_IDENTITY}" via @electron/osx-sign`,
+      `[afterPack] Signing ${appPath} with identity "${requestedIdentity}" via @electron/osx-sign`,
+    );
+    console.log(
+      isDeveloperIdIdentity
+        ? "[afterPack] Developer ID identity detected; secure timestamps are enabled for notarization."
+        : "[afterPack] Internal identity detected; timestamp service is disabled for offline internal builds.",
     );
     console.log(
       "[afterPack] TCC permissions (microphone, accessibility, Apple Events) will persist across rebuilds.",
     );
   } else {
     console.log(
-      `[afterPack] Preferred identity "${PREFERRED_SIGNING_IDENTITY}" not in keychain — using ad-hoc signing`,
+      "[afterPack] TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 — using ad-hoc signing identity \"-\"",
     );
     console.log(
       "[afterPack] NOTE: ad-hoc rebuilds invalidate TCC grants; the user will see permission prompts every build.",
@@ -335,7 +348,7 @@ exports.default = async function afterPack(context) {
       // Executables get hardened-runtime + entitlements.
       // Dylibs / bundles get a bare signature (entitlements aren't valid
       // on shared libraries and codesign errors out when passed here).
-      const args = ["--force", "--sign", identity, "--timestamp=none"];
+      const args = ["--force", "--sign", identity, runtimeTimestampArg];
       if (kind === "executable") {
         args.push("--options", "runtime", "--entitlements", inheritEntitlements);
         execCount += 1;
@@ -388,24 +401,18 @@ exports.default = async function afterPack(context) {
 
   // STEP 2 — main @electron/osx-sign pass (bundle walk + envelope).
   //
-  // Disable Apple's RFC3161 timestamp service. The default
-  // @electron/osx-sign behaviour is ``--timestamp`` (no URL), which
-  // queries ``timestamp.apple.com``. When that service is
-  // unreachable (intermittent Apple outages, corporate firewalls,
-  // offline builds) codesign hard-fails with "The timestamp service
-  // is not available" and the whole build aborts. For a self-signed
-  // certificate like ``AntigravityTelegramDev`` — used exclusively
-  // for local TCC-grant persistence, not for distribution that
-  // Gatekeeper will validate — the timestamp is not meaningful
-  // (Gatekeeper skips it for non-Developer-ID identities anyway).
-  // Passing ``"none"`` in the per-file options sends
-  // ``--timestamp=none`` to codesign, making every build robust
-  // against Apple TS outages. osx-sign@1.0.5 only consumes
-  // ``timestamp`` from the per-file options returned by
-  // ``optionsForFile``; passing it at the top level is silently
-  // ignored (see node_modules/@electron/osx-sign/dist/esm/sign.js
-  // line 163 — top-level opts are merged against the tool's built-in
-  // defaultOptionsForFile, NOT our custom hook's return value).
+  // Timestamp policy:
+  //   - Developer ID builds keep @electron/osx-sign's default
+  //     ``--timestamp`` behaviour because notarization expects secure
+  //     timestamps.
+  //   - Internal/self-signed/ad-hoc builds force ``--timestamp=none``
+  //     so offline internal builds do not fail on Apple timestamp
+  //     service/network outages. These builds are not Gatekeeper-trusted
+  //     public artifacts.
+  const osxSignTimestamp = isDeveloperIdIdentity ? undefined : "none";
+  const perFileTimestamp = () => (
+    osxSignTimestamp === undefined ? {} : { timestamp: osxSignTimestamp }
+  );
   await signApp({
     app: appPath,
     identity,
@@ -443,13 +450,13 @@ exports.default = async function afterPack(context) {
         return {
           entitlements,
           hardenedRuntime: true,
-          timestamp: "none",
+          ...perFileTimestamp(),
         };
       }
       return {
         entitlements: inheritEntitlements,
         hardenedRuntime: true,
-        timestamp: "none",
+        ...perFileTimestamp(),
       };
     },
   });

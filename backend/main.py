@@ -11,7 +11,6 @@ import secrets
 import threading
 import time
 import subprocess
-import mimetypes
 import tempfile
 import unicodedata
 from collections import defaultdict, deque
@@ -43,6 +42,7 @@ from backend.audio_constants import (
     LIVE_RECOVERY_MIN_BYTES,
     LIVE_SAMPLE_RATE_HZ,
 )
+from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
@@ -795,6 +795,14 @@ def _delete_live_recovery(session_id: str) -> bool:
     return True
 
 
+def _safe_delete_live_recovery(session_id: str) -> bool:
+    try:
+        return _delete_live_recovery(session_id)
+    except OSError as exc:
+        logger.warning("live recovery delete failed for %s: %s", session_id, exc)
+        return False
+
+
 def _list_live_recoveries() -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for pcm_path in sorted(LIVE_RECOVERY_DIR.glob("*.pcm16"), reverse=True):
@@ -1015,12 +1023,12 @@ def _promote_live_recovery(
             # get pruned.
             _prune_old_recording_audio(target_dir, stem)
             _invalidate_recordings_cache()
-            _delete_live_recovery(session_id)
             result = {
                 "name": text_out.name,
                 "audio_name": audio_out.name,
                 "archive_dir": str(target_dir),
             }
+            _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)
     finally:
         # Always release the per-session lock entry so the dict does not
@@ -1786,14 +1794,22 @@ def _recording_stem_candidates(title: str) -> Iterable[str]:
         yield f"{base}-{uuid.uuid4().hex[:8]}"
 
 
+def _recording_text_claim_path(out: Path) -> Path:
+    # Deterministic per-stem marker: O_EXCL reserves the name without creating
+    # a visible empty .txt. The suffix matches _TMP_ORPHAN_RE, so a process
+    # crash before _write_recording_text_file is swept on next startup.
+    return out.with_name(f"{out.name}.tmp-000000.claim")
+
+
 def _claim_recording_text_path(target_dir: Path, candidates: Iterable[str]) -> tuple[str, Path]:
     target_dir.mkdir(parents=True, exist_ok=True)
     for stem in candidates:
         if not _recording_stem_available(target_dir, stem):
             continue
         out = target_dir / f"{stem}.txt"
+        claim = _recording_text_claim_path(out)
         try:
-            fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             continue
         try:
@@ -2069,66 +2085,18 @@ def _recordings_storage_dirs_for_roots(roots: Iterable[Path]) -> list[Path]:
 _RECORDING_AUDIO_EXTS: tuple[str, ...] = tuple(sorted(ALLOWED_AUDIO_EXTS))
 
 
-# ── Explicit extension → Content-Type map ──────────────────────────────
-#
-# Python's stdlib ``mimetypes.guess_type`` returns *wrong* MIMEs for
-# extensions we actually use:
-#   .webm  → "video/webm"           (we use it as an audio container)
-#   .opus  → "audio/ogg"            (loses opus distinction)
-#   .m4a   → "audio/mp4a-latm"      (legacy; modern is audio/mp4)
-#   .wma   → "audio/x-ms-wma"       (Windows-Media legacy form)
-#
-# When we serve a recording over HTTP and the frontend or Deepgram REST
-# routes by Content-Type header, those wrong MIMEs cause:
-#   • Frontend Re-transcribe receiving ``video/webm`` for an Opus file
-#     and synthesizing a ``.bin`` filename.
-#   • Deepgram REST receiving ``video/webm`` and deciding it's video,
-#     either rejecting it or attempting unnecessary demux.
-# Both are silent failures — the upload "succeeds" but the transcript
-# comes back empty, exactly the user-reported "Re-transcribe failed
-# both providers" symptom.
-#
-# This map is the single source of truth for HOW we describe each
-# extension on the wire. It overrides ``mimetypes.guess_type`` for
-# every entry; falls through to guess_type only for extensions we
-# don't list (which would be unusual — they should be in
-# ``ALLOWED_AUDIO_EXTS``).
-_AUDIO_EXT_TO_MIME: dict[str, str] = {
-    ".wav": "audio/wav",
-    ".mp3": "audio/mpeg",
-    ".m4a": "audio/mp4",
-    ".flac": "audio/flac",
-    ".ogg": "audio/ogg",
-    ".oga": "audio/ogg",
-    ".opus": "audio/opus",
-    ".aac": "audio/aac",
-    ".webm": "audio/webm",
-    ".wma": "audio/x-ms-wma",
-    # Video containers we accept and demux server-side — frontend
-    # treats them as opaque payloads, so we stamp them as the
-    # canonical video MIME so downstream tools dispatch correctly.
-    ".mp4": "video/mp4",
-    ".m4v": "video/mp4",
-    ".mov": "video/quicktime",
-    ".mkv": "video/x-matroska",
-    ".avi": "video/x-msvideo",
-    ".mpg": "video/mpeg",
-    ".mpeg": "video/mpeg",
-    ".3gp": "video/3gpp",
-}
-
 # 1.1.25 SSOT invariant: every accepted extension MUST have an
 # explicit MIME mapping. Falling back to ``mimetypes.guess_type``
 # for an unmapped extension produces wrong MIMEs for our actual
-# formats (the whole reason ``_AUDIO_EXT_TO_MIME`` exists). An
+# formats (the whole reason ``AUDIO_EXT_TO_MIME`` exists). An
 # import-time assert prevents drift from compiling at all: adding
 # a new ext to ``ALLOWED_AUDIO_EXTS`` without adding the matching
 # MIME entry now fails on backend startup instead of silently
 # falling through to ``application/octet-stream``.
-_missing_mime_exts = ALLOWED_AUDIO_EXTS - _AUDIO_EXT_TO_MIME.keys()
+_missing_mime_exts = ALLOWED_AUDIO_EXTS - AUDIO_EXT_TO_MIME.keys()
 if _missing_mime_exts:
     raise RuntimeError(
-        f"ALLOWED_AUDIO_EXTS / _AUDIO_EXT_TO_MIME drift: missing MIME "
+        f"ALLOWED_AUDIO_EXTS / AUDIO_EXT_TO_MIME drift: missing MIME "
         f"mapping for {sorted(_missing_mime_exts)}"
     )
 
@@ -2136,15 +2104,12 @@ if _missing_mime_exts:
 def _audio_content_type(filename: str) -> str:
     """Return the canonical Content-Type for an audio/video filename.
 
-    Always prefer the explicit ``_AUDIO_EXT_TO_MIME`` map over Python's
+    Always prefer the explicit ``AUDIO_EXT_TO_MIME`` map over Python's
     ``mimetypes.guess_type`` (which returns ``video/webm`` for an Opus
     audio container, ``audio/ogg`` for ``.opus``, ``audio/mp4a-latm``
     for ``.m4a``, etc. — all of which break wire-level routing).
     """
-    ext = Path(filename or "").suffix.lower()
-    if ext in _AUDIO_EXT_TO_MIME:
-        return _AUDIO_EXT_TO_MIME[ext]
-    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return audio_content_type(filename)
 
 
 def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optional[Path]:
@@ -2452,18 +2417,22 @@ def _write_recording_text_file(
     model: str,
     language: str,
 ) -> None:
-    _atomic_write_text(
-        out,
-        _render_recording_content(
-            title=title,
-            source_file=source_file,
-            source_text=source_text,
-            transcript_text=transcript_text,
-            provider=provider,
-            model=model,
-            language=language,
-        ),
-    )
+    claim = _recording_text_claim_path(out)
+    try:
+        _atomic_write_text(
+            out,
+            _render_recording_content(
+                title=title,
+                source_file=source_file,
+                source_text=source_text,
+                transcript_text=transcript_text,
+                provider=provider,
+                model=model,
+                language=language,
+            ),
+        )
+    finally:
+        claim.unlink(missing_ok=True)
 
 
 def _extract_stats_text(content: str) -> str:
@@ -5098,7 +5067,7 @@ async def _save_recording_audio_source(
     # fresh uuid collides with a concurrent live recovery and nukes it.
     raw_sid = str(live_session_id or "").strip()
     if raw_sid and LIVE_SESSION_ID_RE.fullmatch(raw_sid):
-        _delete_live_recovery(raw_sid)
+        _safe_delete_live_recovery(raw_sid)
     return {
         "ok": True,
         "name": out_text.name,

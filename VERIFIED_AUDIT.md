@@ -1,12 +1,12 @@
-# Voice Transcriptor — Verified Audit, 18-19 June 2026
+# Voice Transcriptor — Verified Audit, 18-25 June 2026
 
-Итог: подтверждено 60 реальных багов/SSOT-рассинхронов. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
+Итог: подтверждено 73 реальных бага/SSOT-рассинхрона. До 100 не добивал: старый список из 100 содержал много неподтвержденных candidate-пунктов и был заменен.
 
 Статус:
-- Исправлено: 60
+- Исправлено: 73
 - Оставлено с явным стопом: 0
 - P0: 0 найдено
-- P1: 33 найдено, 33 исправлено (100%)
+- P1: 36 найдено, 36 исправлено (100%)
 
 ## 1. P1 FIXED — keyfile race could overwrite Fernet key
 
@@ -1483,6 +1483,374 @@ atomic_write_text(API_TOKEN_PATH, token, mode=0o600)
 
 Объяснение: secure file mode is now a feature of the shared storage primitive. The token path keeps `0600` permissions, but no longer carries a second atomic-write implementation in `main.py`.
 
+## 61. P1 FIXED — production macOS signing identity was hard-coded to an internal certificate
+
+Файл и строка: `desktop/afterPack.js:238`
+
+Суть: release signing always searched for `AntigravityTelegramDev`, so a real Developer ID certificate could not be used without editing source.
+
+Последствие: production macOS build failed on machines that had only `Developer ID Application: ...`, and source had to be patched per build environment.
+
+Было:
+```js
+const PREFERRED_SIGNING_IDENTITY = "AntigravityTelegramDev";
+const useStableIdentity = hasPreferredIdentity();
+const identity = useStableIdentity ? PREFERRED_SIGNING_IDENTITY : "-";
+```
+
+Стало:
+```js
+const requestedIdentity = String(
+  process.env.TRANSCRIPTOR_SIGNING_IDENTITY || DEFAULT_INTERNAL_SIGNING_IDENTITY,
+).trim();
+const useAdhocIdentity = process.env.TRANSCRIPTOR_ALLOW_ADHOC_SIGN === "1";
+const identity = useAdhocIdentity ? "-" : requestedIdentity;
+```
+
+Объяснение: signing identity is now configuration, not source code. Ad-hoc signing remains explicit via `TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1`.
+
+## 62. P1 FIXED — root build did not produce the transfer package documented for macOS installs
+
+Файл и строка: `BUILD.command:68`, `BUILD.command:89`, `README.md:20`
+
+Суть: docs and installer expected a matching internal ZIP / macOS transfer kit, but the root build only relied on electron-builder artifacts.
+
+Последствие: after a successful build the target Mac install flow could be missing the exact ZIP/package named by docs, making the app look "not rebuilt" or not transferable.
+
+Было:
+```bash
+APP_DIR="$SCRIPT_DIR/desktop/dist/mac-${BUILDER_ARCH}/Transcriptor.app"
+```
+
+Стало:
+```bash
+APP_VERSION="$(node -p "require('./package.json').version")"
+APP_ARTIFACT_PREFIX="Transcriptor-${APP_VERSION}-${BUILDER_ARCH}"
+INTERNAL_ZIP="$DIST_DIR/${APP_ARTIFACT_PREFIX}-internal.zip"
+INSTALL_KIT_ZIP="$RELEASE_DIR/${APP_ARTIFACT_PREFIX}-macos-install.zip"
+create_internal_zip "$INTERNAL_ZIP"
+create_release_package
+```
+
+Объяснение: artifact names now come from `desktop/package.json`, and `BUILD.command` writes the installable release folder, checksums, internal ZIP, release manifest, and macOS install ZIP from one version SSOT.
+
+## 63. P2 FIXED — installer selected stale loose app before fresh versioned artifacts
+
+Файл и строка: `INSTALL_ON_OTHER_MAC.command:17`, `INSTALL_ON_OTHER_MAC.command:78`
+
+Суть: installer hard-coded `1.1.25` artifact names and preferred a loose `Transcriptor.app` before the freshly built DMG/ZIP.
+
+Последствие: copying a new DMG next to an old loose app could install the stale app bundle; next version would also require editing the installer script.
+
+Было:
+```bash
+DMG_NAME="Transcriptor-1.1.25-arm64.dmg"
+ZIP_NAME="Transcriptor-1.1.25-arm64-internal.zip"
+if [ -d "${SCRIPT_DIR}/${APP_NAME}" ]; then
+  SOURCE_APP="${SCRIPT_DIR}/${APP_NAME}"
+fi
+```
+
+Стало:
+```bash
+DMG_PATTERN="Transcriptor-*-arm64.dmg"
+ZIP_PATTERN="Transcriptor-*-arm64-internal.zip"
+dmg_path="$(find_single_artifact "$DMG_PATTERN" "DMG")"
+zip_path="$(find_single_artifact "$ZIP_PATTERN" "internal ZIP")"
+```
+
+Объяснение: version-specific filenames are discovered, multiple matching artifacts fail loudly, and the priority is DMG -> internal ZIP -> loose app.
+
+## 64. P2 FIXED — target-Mac verification imported bundled backend without `PYTHONPATH`
+
+Файл и строка: `INSTALL_OTHER_MAC.md:51`
+
+Суть: verification ran the bundled Python executable but did not add `Contents/Resources` to `PYTHONPATH`.
+
+Последствие: `import backend.remote_deepgram` could fail on the target Mac even when the app bundle itself was valid.
+
+Было:
+```bash
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 - <<'PY'
+import backend.remote_deepgram as rest
+```
+
+Стало:
+```bash
+APP=/Applications/Transcriptor.app
+RES="$APP/Contents/Resources"
+PYTHONPATH="$RES" PYTHONDONTWRITEBYTECODE=1 "$RES/runtime/python/bin/python3" - <<'PY'
+import backend.remote_deepgram as rest
+```
+
+Объяснение: the verification command now mirrors runtime import paths instead of depending on the shell's current directory.
+
+## 65. P2 FIXED — live recovery cleanup could turn a successful save into a 500
+
+Файл и строка: `backend/main.py:798`, `backend/main.py:1031`, `backend/main.py:5109`
+
+Суть: after successfully saving audio/text, `_delete_live_recovery()` was called directly and could raise `OSError`.
+
+Последствие: a locked or already-changing recovery sidecar could make the API report failure after the durable recording had already been saved.
+
+Было:
+```python
+_delete_live_recovery(raw_sid)
+```
+
+Стало:
+```python
+def _safe_delete_live_recovery(session_id: str) -> bool:
+    try:
+        return _delete_live_recovery(session_id)
+    except OSError as exc:
+        logger.warning("live recovery delete failed for %s: %s", session_id, exc)
+        return False
+
+_safe_delete_live_recovery(raw_sid)
+```
+
+Объяснение: cleanup failure is now logged as cleanup failure; it no longer changes the outcome of a completed save.
+
+## 66. P2 FIXED — legacy data migration bypassed storage durability SSOT
+
+Файл и строка: `backend/config.py:348`, `backend/storage.py:178`
+
+Суть: migration copied config, transcripts, and audio with raw `shutil.copy2()` instead of the storage layer.
+
+Последствие: migration could leave partially copied files or miss parent-directory fsync guarantees that the rest of the app relies on.
+
+Было:
+```python
+shutil.copy2(legacy_cfg, CONFIG_PATH)
+shutil.copy2(p, dst)
+shutil.copy2(audio_src, audio_dst)
+```
+
+Стало:
+```python
+def atomic_copy_file(src: Path, path: Path, *, preserve_stat: bool = True) -> None:
+    with open(src, "rb") as src_f, open(tmp, "wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f)
+        dst_f.flush()
+        os.fsync(dst_f.fileno())
+    os.replace(tmp, path)
+    _fsync_parent_dir(path)
+
+atomic_copy_file(legacy_cfg, CONFIG_PATH)
+atomic_copy_file(p, dst)
+atomic_copy_file(audio_src, audio_dst)
+```
+
+Объяснение: migration now shares the same tmp/rename/fsync contract as fresh writes.
+
+## 67. P2 FIXED — Deepgram recovery used generic network probe as provider SSOT
+
+Файл и строка: `frontend/src/main.tsx:965`, `frontend/src/main.tsx:8126`, `frontend/src/main.tsx:8537`
+
+Суть: REST recovery was skipped whenever the app-wide health probe said offline, even if the active live session was already using Deepgram.
+
+Последствие: a stale localhost/network probe could prevent Deepgram REST recovery and leave an empty or suspiciously short transcript.
+
+Было:
+```ts
+if (isProviderKeyConfigured("deepgram") && isNetworkOnline) {
+  const result = await remoteJobSync(audioFile, { provider: "deepgram", ... });
+}
+```
+
+Стало:
+```ts
+function isRemoteProviderReachable(provider: Provider, providerReachabilityHint = false): boolean {
+  return isRemoteProvider(provider) && (providerReachabilityHint || isNetworkOnline);
+}
+
+const deepgramReachabilityHint = effectiveProvider === "deepgram";
+if (isProviderKeyConfigured("deepgram") && isRemoteProviderReachable("deepgram", deepgramReachabilityHint)) {
+  const result = await remoteJobSync(audioFile, {
+    provider: "deepgram",
+    providerReachabilityHint: deepgramReachabilityHint,
+  });
+}
+```
+
+Объяснение: provider reachability and app-wide online state are separated; an active Deepgram session can authorize Deepgram recovery without changing the normal offline fallback behavior.
+
+## 68. P3 FIXED — backend recording tests wrote temp data into the real home directory
+
+Файл и строка: `backend/tests/test_recording_names.py:14`, `backend/tests/test_recording_names.py:27`
+
+Суть: tests used `TemporaryDirectory(dir=str(Path.home()))`.
+
+Последствие: tests failed in sandboxed/workspace-only environments and polluted the user's home on interrupted runs.
+
+Было:
+```python
+self._tmp = tempfile.TemporaryDirectory(dir=str(Path.home()))
+```
+
+Стало:
+```python
+TEST_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+self._tmp = tempfile.TemporaryDirectory(dir=str(TEST_WORKSPACE_ROOT))
+```
+
+Объяснение: test data is still inside the app's allowed home subtree for archive-dir validation, but now stays inside the workspace sandbox.
+
+## 69. P2 FIXED — Deepgram REST MIME map drifted from backend MIME SSOT
+
+Файл и строка: `backend/audio_mime.py:16`, `backend/remote_deepgram.py:171`, `backend/main.py:2088`
+
+Суть: Deepgram REST had its own MIME table; `.opus` was sent as `audio/ogg`, and accepted video extensions were not covered by the same invariant as `main.py`.
+
+Последствие: provider uploads and recording serving could disagree on Content-Type for the same file, producing provider-specific empty transcripts or wrong downstream routing.
+
+Было:
+```python
+mime_map = {
+    "opus": "audio/ogg",
+    "webm": "audio/webm",
+    "mp4": "audio/mp4",
+}
+content_type = mime_map.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+```
+
+Стало:
+```python
+AUDIO_EXT_TO_MIME = {
+    ".opus": "audio/opus",
+    ".webm": "audio/webm",
+    ".mp4": "video/mp4",
+}
+
+content_type = audio_content_type(filename)
+```
+
+Объяснение: MIME mapping now lives in `backend/audio_mime.py`; `main.py` still enforces the allowed-extension invariant, and Deepgram REST imports the same helper.
+
+## 70. P2 FIXED — recording name claim created visible zero-byte transcripts
+
+Файл и строка: `backend/main.py:1797`, `backend/main.py:2420`, `backend/tests/test_recording_names.py:405`
+
+Суть: `_claim_recording_text_path()` reserved a name by creating the final `.txt` file before content was rendered.
+
+Последствие: a process crash between claim and write left a visible empty transcript in History and blocked reuse of the natural recording name.
+
+Было:
+```python
+fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+return stem, out
+```
+
+Стало:
+```python
+def _recording_text_claim_path(out: Path) -> Path:
+    return out.with_name(f"{out.name}.tmp-000000.claim")
+
+fd = os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+return stem, out
+
+finally:
+    claim.unlink(missing_ok=True)
+```
+
+Объяснение: name reservation now uses an orphan-sweep-compatible tmp marker. The final `.txt` appears only after atomic content write succeeds.
+
+## 71. P2 FIXED — installer ignored the release manifest generated by the build
+
+Файл и строка: `INSTALL_ON_OTHER_MAC.command:19`, `INSTALL_ON_OTHER_MAC.command:102`, `INSTALL_ON_OTHER_MAC.command:154`
+
+Суть: `BUILD.command` generated `TRANSCRIPTOR_RELEASE_MANIFEST.txt`, but the target-Mac installer still discovered artifacts by broad glob patterns.
+
+Последствие: a folder containing the manifest plus extra old DMG/ZIP files could install the wrong artifact, or fail with a multiple-artifact error despite the build already declaring the exact release files.
+
+Было:
+```bash
+dmg_path="$(find_single_artifact "$DMG_PATTERN" "DMG")"
+zip_path="$(find_single_artifact "$ZIP_PATTERN" "internal ZIP")"
+[ "$bundle_id" = "local.transcriptor.app" ] || die "Unexpected bundle id"
+```
+
+Стало:
+```bash
+load_release_manifest
+dmg_path="$(artifact_from_manifest_or_pattern "$MANIFEST_DMG_NAME" "$DMG_PATTERN" "DMG")"
+zip_path="$(artifact_from_manifest_or_pattern "$MANIFEST_ZIP_NAME" "$ZIP_PATTERN" "internal ZIP")"
+[ "$bundle_id" = "$EXPECTED_BUNDLE_ID" ] || die "Unexpected bundle id"
+```
+
+Объяснение: the manifest is now the installer SSOT when present; fallback glob discovery remains for manual folders. Bundle-id validation stays mandatory with `local.transcriptor.app` as the default and manifest/env override only when explicitly provided.
+
+## 72. P1 FIXED — Developer ID signing disabled secure timestamps
+
+Файл и строка: `desktop/afterPack.js:243`, `desktop/afterPack.js:251`, `desktop/afterPack.js:405`
+
+Суть: the signing hook disabled Apple timestamping for every identity, including real `Developer ID Application:` certificates.
+
+Последствие: internal self-signed builds became offline-friendly, but production Developer ID artifacts lost the timestamp policy expected by notarization and long-term Gatekeeper validation.
+
+Было:
+```js
+const args = ["--force", "--sign", identity, "--timestamp=none"];
+
+return {
+  entitlements,
+  hardenedRuntime: true,
+  timestamp: "none",
+};
+```
+
+Стало:
+```js
+const isDeveloperIdIdentity = !useAdhocIdentity && /^Developer ID Application:/i.test(requestedIdentity);
+const runtimeTimestampArg = isDeveloperIdIdentity ? "--timestamp" : "--timestamp=none";
+const osxSignTimestamp = isDeveloperIdIdentity ? undefined : "none";
+
+const args = ["--force", "--sign", identity, runtimeTimestampArg];
+
+return {
+  entitlements,
+  hardenedRuntime: true,
+  ...perFileTimestamp(),
+};
+```
+
+Объяснение: timestamp policy now follows the signing identity. Internal/ad-hoc builds stay robust offline; Developer ID builds keep secure timestamps for the production notarization path.
+
+## 73. P2 FIXED — no-final Deepgram stop path serialized envelope wait and recovery
+
+Файл и строка: `frontend/src/main.tsx:8225`, `frontend/src/main.tsx:8581`, `frontend/src/main.tsx:8635`
+
+Суть: when a Deepgram live session had no committed/interim text at Stop, the UI waited for the final envelope first and only then started saved-audio recovery.
+
+Последствие: regional WebSocket stalls could produce user-visible stop latency like `TRANSCRIBE 24s` for short recordings because two bounded waits were serialized instead of raced.
+
+Было:
+```ts
+const envelope = liveFinalPromise ? await liveFinalPromise : null;
+const envelopeText = textFromLiveFinalEnvelope(envelope);
+if (envelopeText) {
+  transcriptRaw = envelopeText;
+} else if (envelopeError) {
+  transcriptRaw = await recoverFromEmptyTranscript(...);
+}
+```
+
+Стало:
+```ts
+const envelopeCand = (liveFinalPromise || Promise.resolve(null)).then(...);
+const recoveryCand = recoverFromEmptyTranscript(reason).then(...);
+const first = await Promise.race([envelopeCand, recoveryCand]);
+if (first.text) {
+  transcriptRaw = first.text;
+} else {
+  const other = await (first.label === "envelope" ? recoveryCand : envelopeCand);
+  if (other.text) transcriptRaw = other.text;
+}
+```
+
+Объяснение: the no-final branch now starts envelope finalization and saved-audio recovery together, uses the first useful transcript, and avoids retrying the same recovery chain again after it has already been attempted.
+
 ## Verification
 
 Пройдено:
@@ -1504,6 +1872,16 @@ hdiutil verify desktop/dist/Transcriptor-1.1.25-arm64.dmg
 codesign --verify --deep --strict /Applications/Transcriptor.app
 codesign --verify --deep --strict ~/Applications/Transcriptor.app
 git diff --check
+```
+
+Дополнительно пройдено 2026-06-25:
+```text
+python3 -m unittest discover backend/tests -q
+PYTHONPYCACHEPREFIX=/private/tmp/transcriptor-pycache python3 -m compileall -q backend
+npm --prefix frontend run typecheck
+npm --prefix frontend run build
+node --check desktop/afterPack.js && node --check desktop/preload.js && node --check desktop/main.js && node --check desktop/unlockDist.js && node --check desktop/scripts/require-bash.js
+bash -n BUILD.command INSTALL.command INSTALL_ON_OTHER_MAC.command desktop/scripts/prepare-runtime.sh
 ```
 
 Примечание 2026-06-19: повторный `./BUILD.command` дошел до валидного signed `Transcriptor.app`, но дважды падал на этапе `hdiutil` с `No space left on device` из-за почти полного диска. После очистки сгенерированных build/runtime/cache артефактов DMG был собран из уже подписанного prepackaged app и установлен в `/Applications` и `~/Applications`.

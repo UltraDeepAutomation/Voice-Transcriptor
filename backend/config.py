@@ -42,13 +42,12 @@ import copy
 import json
 import logging
 import os
-import shutil
 import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict
 
-from backend.storage import atomic_write_bytes, atomic_write_json, rotate_backup
+from backend.storage import atomic_copy_file, atomic_write_bytes, atomic_write_json, rotate_backup
 
 logger = logging.getLogger(__name__)
 
@@ -346,8 +345,7 @@ def _migrate_legacy_data() -> None:
         # Copy config if new config is missing.
         legacy_cfg = LEGACY_DATA_DIR / "config.json"
         if legacy_cfg.exists() and not CONFIG_PATH.exists():
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(legacy_cfg, CONFIG_PATH)
+            atomic_copy_file(legacy_cfg, CONFIG_PATH)
 
         # Copy recordings if destination is empty.
         legacy_rec = LEGACY_DATA_DIR / "recordings"
@@ -359,13 +357,13 @@ def _migrate_legacy_data() -> None:
                 for p in legacy_rec.glob("*.txt"):
                     dst = new_rec / p.name
                     if not dst.exists():
-                        shutil.copy2(p, dst)
+                        atomic_copy_file(p, dst)
                     stem = p.stem
                     for ext in (".wav", ".m4a", ".mp3", ".flac", ".ogg", ".aac", ".mp4", ".webm"):
                         audio_src = legacy_rec / f"{stem}{ext}"
                         audio_dst = new_rec / audio_src.name
                         if audio_src.exists() and not audio_dst.exists():
-                            shutil.copy2(audio_src, audio_dst)
+                            atomic_copy_file(audio_src, audio_dst)
     except OSError as e:
         # Non-fatal: app should continue even if migration fails, but the
         # user deserves a breadcrumb in the logs so they can recover data
