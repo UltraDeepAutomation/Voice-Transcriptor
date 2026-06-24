@@ -24,7 +24,8 @@ def _fresh_main_module(data_dir: str):
 
 class RecordingNameTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(dir=str(TEST_WORKSPACE_ROOT))
+        Path.home().mkdir(parents=True, exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=str(Path.home()))
         self.main = _fresh_main_module(self._tmp.name)
 
     def tearDown(self):

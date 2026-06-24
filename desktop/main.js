@@ -6,6 +6,10 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 
+const MIRROR_RENDERER_TRACE_LOGS =
+  process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
+  process.env.NODE_ENV === "development";
+
 const BACKEND_RUNTIME_IMPORTS = Object.freeze([
   "fastapi",
   "uvicorn",
@@ -6182,16 +6186,18 @@ async function createWindow(options = {}) {
     }
     return allow;
   });
-  // Mirror renderer-side trace logs to main.log so we can debug
-  // tail-cut and other live-pipeline issues from a packaged build
-  // without the user opening DevTools. Only lines that start with
-  // ``[trace]`` are mirrored — keeps the log focused. The renderer
-  // emits these via plain ``console.log("[trace] ...")``; no IPC
-  // bridge or preload script needed.
+  // Mirror renderer-side trace logs to main.log only when explicitly
+  // enabled. The renderer emits high-volume ``[trace ...]`` lines on
+  // live stop/recovery paths; mirroring them synchronously in release
+  // builds creates avoidable I/O during the exact latency-sensitive
+  // path users are timing. Keep crash/backend/permission logs always
+  // on, and enable renderer trace capture with
+  // TRANSCRIPTOR_RENDERER_TRACE_LOGS=1 when diagnosing a packaged app.
   //
   // Args: (event, level, message, line, sourceId)
   //   level: 0=verbose, 1=info, 2=warning, 3=error
   win.webContents.on("console-message", (_event, level, message) => {
+    if (!MIRROR_RENDERER_TRACE_LOGS) return;
     const text = String(message || "");
     if (!text.startsWith("[trace")) return;
     const levelTag = level === 3 ? "ERROR" : level === 2 ? "WARN" : "INFO";

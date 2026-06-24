@@ -1114,6 +1114,7 @@ def health():
     return {
         "ok": True,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "accepted_audio_exts": sorted(ext.lstrip(".") for ext in ALLOWED_AUDIO_EXTS),
         "boot_nonce": BOOT_NONCE,
     }
 

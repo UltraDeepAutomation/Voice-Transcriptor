@@ -6,9 +6,9 @@ and standard text completions for upscale/post-processing.
 
 import base64
 import logging
-import mimetypes
 from typing import Any, Dict
 
+from backend.audio_mime import audio_content_type
 from backend.http_retry import RemoteError, request_with_retry
 
 logger = logging.getLogger(__name__)
@@ -61,8 +61,7 @@ def openrouter_transcribe(
     if not key:
         raise RemoteError("OpenRouter key is not configured")
 
-    mt, _ = mimetypes.guess_type(filename or "")
-    fmt = (mt or "audio/wav").split("/")[-1]
+    fmt = audio_content_type(filename or "audio.wav").split("/")[-1]
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -91,21 +90,22 @@ def openrouter_transcribe(
     }
 
     logger.info("openrouter_transcribe: model=%s, audio=%d bytes", model, len(audio_bytes))
-    # Adaptive timeout matching remote_deepgram.py — the OpenRouter audio
-    # path base64-encodes the audio bytes inline in the JSON body, so the
-    # uploaded payload is ~1.33× the raw audio size. ``requests`` applies
-    # the read-timeout to the whole socket including the write/upload
-    # phase, so a large audio body on a slow link trips the timeout
-    # mid-upload. Same formula as the Deepgram path: 180 s floor + 8 s
-    # per encoded MB (rounded up to account for base64 inflation).
+    # Adaptive timeout for OpenRouter audio. The request body embeds base64
+    # audio in JSON, so large files still need a generous upload/read window.
+    # Short live recordings must not inherit the old 180 s floor: when a
+    # provider stalls, the UI should fall back promptly instead of looking
+    # stuck on "Transcribe" for minutes.
     encoded_mb = max(1.0, (len(audio_bytes) * 1.34) / (1024 * 1024))
-    read_timeout = max(180, int(encoded_mb * 8))
-    # Scale retries inversely to body size — same logic the Deepgram
-    # path applies. Three full retries of a 50 MB encoded body waste
-    # 150 MB of bandwidth on a network that's already struggling; the
-    # 2nd attempt is the diagnostic value, beyond that is bandwidth
-    # waste. Small files keep the 3-attempt transient-recovery path.
-    upload_retries = 3 if encoded_mb < 5 else 2
+    if encoded_mb <= 2:
+        read_timeout = 45
+    elif encoded_mb <= 5:
+        read_timeout = max(75, int(encoded_mb * 15))
+    else:
+        read_timeout = max(180, int(encoded_mb * 8))
+    # Keep retry count bounded for interactive live-final use. The 2nd
+    # attempt catches transient edge failures; a 3rd stalled attempt is
+    # usually just extra UI latency before local fallback.
+    upload_retries = 2
     r = request_with_retry(
         "POST", url, headers=headers, json=payload,
         timeout=(10, read_timeout),

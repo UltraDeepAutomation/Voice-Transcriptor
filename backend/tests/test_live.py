@@ -113,6 +113,14 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
         request.url = type("FakeURL", (), {"path": "/api/health"})()
         asyncio.run(self.main._require_api_auth(request))
 
+    def test_health_exposes_upload_extension_ssot(self):
+        payload = self.main.health()
+        self.assertIn("accepted_audio_exts", payload)
+        self.assertIn("wav", payload["accepted_audio_exts"])
+        self.assertIn("opus", payload["accepted_audio_exts"])
+        self.assertIn("mp4", payload["accepted_audio_exts"])
+        self.assertNotIn(".wav", payload["accepted_audio_exts"])
+
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):
     async def test_force_transcribe_bypasses_min_step_for_stop_tail(self):

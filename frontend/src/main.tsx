@@ -4,7 +4,6 @@ type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type KeyProvider = "openrouter" | "deepgram";
 type ViewName = "upload" | "record" | "recordings" | "settings";
-type RequestedViewName = ViewName | "graph";
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
 
 interface NetworkStatusResponse {
@@ -411,18 +410,9 @@ const ALLOWED_AUDIO_MIME = new Set([
   "audio/webm",
   "audio/aac",
 ]);
-// SSOT for the file extensions BOTH the Live-tab file-picker
-// validator and the Upload-tab drag-drop validator accept. Mirrors
-// backend/main.py:ALLOWED_AUDIO_EXTS: every extension the backend's
-// ffmpeg path can demux (audio + video + Opus/Ogg-Audio variants).
-//
-// Previously the file held TWO divergent sets: ``ALLOWED_AUDIO_EXT``
-// (8 audio-only entries) used for setSelectedFile, and
-// ``UPLOAD_ALLOWED_EXTS`` (17 audio+video entries) used for
-// enqueueUploadFile. The Upload set itself was missing ``oga`` that
-// the backend WOULD accept — silent rejection at the client for a
-// file the server would have transcribed. Consolidated here so a
-// future ext addition (.flv, .ts, .wmv, ...) is a one-line change.
+// Fallback accepted extensions used before the first /api/health response.
+// Backend/main.py:ALLOWED_AUDIO_EXTS is the runtime SSOT; refreshNetworkState()
+// mutates this set from health.accepted_audio_exts after boot.
 const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
   // Audio containers — natively understood by Deepgram REST and the
   // OpenRouter audio-input pipeline. Mirrors backend/main.py:296.
@@ -2876,8 +2866,13 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
 }
 
-function switchView(requestedView: RequestedViewName): void {
-  const view: ViewName = requestedView === "graph" ? "recordings" : requestedView;
+function parseViewName(value: string): ViewName {
+  return value === "upload" || value === "recordings" || value === "settings" || value === "record"
+    ? value
+    : "record";
+}
+
+function switchView(view: ViewName): void {
   document.querySelectorAll(".view").forEach((el) => {
     const node = el as HTMLElement;
     node.hidden = node.dataset.view !== view;
@@ -2927,10 +2922,22 @@ async function refreshNetworkState(): Promise<void> {
     // already waited for it). Defensive Number/Finite check tolerates
     // an old backend without the field — falls back to current value.
     try {
-      const healthJson = (await health.clone().json()) as { max_upload_bytes?: unknown };
+      const healthJson = (await health.clone().json()) as {
+        max_upload_bytes?: unknown;
+        accepted_audio_exts?: unknown;
+      };
       const candidate = Number(healthJson?.max_upload_bytes);
       if (Number.isFinite(candidate) && candidate > 0) {
         MAX_FILE_BYTES = Math.trunc(candidate);
+      }
+      if (Array.isArray(healthJson?.accepted_audio_exts)) {
+        const nextExts = healthJson.accepted_audio_exts
+          .map((value) => String(value || "").trim().toLowerCase().replace(/^\./, ""))
+          .filter((value) => /^[a-z0-9]+$/.test(value));
+        if (nextExts.length > 0) {
+          ACCEPTED_AUDIO_VIDEO_EXTS.clear();
+          for (const ext of nextExts) ACCEPTED_AUDIO_VIDEO_EXTS.add(ext);
+        }
       }
     } catch (e) {
       // Non-JSON or shape mismatch — keep prior MAX_FILE_BYTES.
@@ -2985,7 +2992,7 @@ function hideBootOverlayOnce(): void {
 
 document.querySelectorAll(".sb-item").forEach((e) => {
   e.addEventListener("click", () => {
-    const v = ((e as HTMLElement).dataset.view || "record") as RequestedViewName;
+    const v = parseViewName((e as HTMLElement).dataset.view || "record");
     switchView(v);
   });
 });
@@ -6647,6 +6654,9 @@ const CAPTURE_TAIL_ACTIVITY_PEAK = 0.045;
 function pushCapturedFrame(input: Float32Array): void {
   if (!(input instanceof Float32Array) || !input.length) return;
   workletLastFrameAt = Date.now();
+  if (startAt <= 0) {
+    startAt = workletLastFrameAt;
+  }
   window.__transcriptorLastFrameAt = workletLastFrameAt;
   let sum = 0;
   let peak = 0;
@@ -6884,7 +6894,7 @@ async function startLive(): Promise<void> {
   window.__transcriptorRmsLevel = 0;
   window.__transcriptorLastFrameAt = 0;
 
-  startAt = Date.now();
+  startAt = 0;
   persistLiveDraft(true);
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
@@ -6892,7 +6902,7 @@ async function startLive(): Promise<void> {
   }
   draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
   timer = window.setInterval(() => {
-    const durationSec = (Date.now() - startAt) / 1000;
+    const durationSec = startAt > 0 ? (Date.now() - startAt) / 1000 : 0;
     if (isCurrentUiSession(sessionUiToken)) {
       $("timer").textContent = fmtTime(durationSec);
     }
@@ -7552,23 +7562,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     transcribeInputFile = canonicalCapture.file;
   }
 
-  // Only OpenRouter needs a stop-time REST re-upload — it has no streaming
-  // API. Deepgram's final envelope is authoritative and already contains
-  // the complete transcript by the time it arrives. For Deepgram we only
-  // fall back to REST if the live stream failed outright (see below).
-  if (
-    provider === "openrouter" &&
-    enhance &&
-    transcribeInputFile &&
-    isProviderKeyConfigured(provider)
-  ) {
-    remoteApiPromise = remoteJobSync(transcribeInputFile, {
-      provider,
-      language: languageValue,
-      diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-      openrouterModel: modelValue,
-    });
-  }
+  // OpenRouter has no streaming API, so it still needs a full-audio REST pass.
+  // Start it only after the durable save path below has created/fetched the
+  // canonical audio. Starting here with the OPFS-backed File can race with
+  // deferredSinkDestroy and upload an empty/truncated body.
 
   // ── Cleanup (runs while provider is finalizing) ─────────────────────────
   if (timer) {
@@ -8719,8 +8716,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         }
       }
     } else {
-      // OpenRouter (or any future non-streaming remote): the REST promise
-      // started during the cleanup phase is the authoritative path.
+      // OpenRouter (or any future non-streaming remote): transcribe from the
+      // durably saved recording first. This avoids the OPFS-spool lifetime bug
+      // where a lazy in-memory File outlived its backing store.
       if (isCurrentUiSession(sessionUiToken)) {
         $("progressFill").style.width = "50%";
         $("progressText").textContent = "50%";
@@ -8735,6 +8733,17 @@ async function stopLive(enhance: boolean): Promise<void> {
           status: "Live preview stays visible while the full-audio transcript is being finalized.",
           tone: "info",
         }, sessionUiToken);
+      }
+      if (!remoteApiPromise && isProviderKeyConfigured(provider)) {
+        const finalAudioFile = await fetchRecoveryAudioFile();
+        if (finalAudioFile) {
+          remoteApiPromise = remoteJobSync(finalAudioFile, {
+            provider,
+            language: languageValue,
+            diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+            openrouterModel: modelValue,
+          });
+        }
       }
       if (remoteApiPromise) {
         try {
