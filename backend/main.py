@@ -1326,6 +1326,14 @@ def _best_effort_unlink(path: Path, *, context: str) -> bool:
         return False
 
 
+def _is_backend_owned_upload_path(path: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(UPLOADS_DIR.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def _validate_audio_filename(name: str) -> None:
     # 1.1.25: previous form was ``if ext and ext not in ALLOWED_...``
     # which silently passed when the filename had NO extension. A POST
@@ -5291,7 +5299,8 @@ async def save_recording_from_path(
     async def write_tmp_audio(tmp_audio: Path) -> None:
         await asyncio.to_thread(_copy_source_media_file, source_path, tmp_audio)
 
-    return await _save_recording_audio_source(
+    consume_source_path = _payload_bool(payload, "consume_source_path", False)
+    result = await _save_recording_audio_source(
         orig_name=_normalize_filename(source_path.name),
         write_tmp_audio=write_tmp_audio,
         name=str((payload or {}).get("name") or ""),
@@ -5306,3 +5315,6 @@ async def save_recording_from_path(
         language=str((payload or {}).get("language") or ""),
         live_session_id="",
     )
+    if consume_source_path and _is_backend_owned_upload_path(source_path):
+        _best_effort_unlink(source_path, context="recording consumed upload source cleanup")
+    return result

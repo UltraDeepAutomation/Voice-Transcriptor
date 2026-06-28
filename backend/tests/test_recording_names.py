@@ -866,6 +866,50 @@ class RecordingNameTests(unittest.TestCase):
         raw = (target_dir / result["name"]).read_text(encoding="utf-8")
         self.assertIn("Source file: lecture source.mp3", raw)
 
+    def test_save_from_path_consumes_backend_owned_upload_snapshot_after_success(self):
+        source = self.main.UPLOADS_DIR / "job.lecture.mp3"
+        payload = b"tiny mp3 payload"
+        source.write_bytes(payload)
+
+        result = asyncio.run(self.main.save_recording_from_path({
+            "source_path": str(source),
+            "title": "Lecture",
+            "source_text": "source",
+            "transcript_text": "transcript",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+            "recording_collection": "uploads",
+            "consume_source_path": True,
+        }))
+
+        target_dir = Path(result["archive_dir"])
+        self.assertFalse(source.exists())
+        self.assertEqual((target_dir / result["audio_name"]).read_bytes(), payload)
+        self.assertIn("transcript", (target_dir / result["name"]).read_text(encoding="utf-8"))
+
+    def test_save_from_path_does_not_consume_user_source_path(self):
+        source = Path(self._tmp.name) / "lecture source.mp3"
+        payload = b"tiny mp3 payload"
+        source.write_bytes(payload)
+
+        result = asyncio.run(self.main.save_recording_from_path({
+            "source_path": str(source),
+            "title": "Lecture",
+            "source_text": "source",
+            "transcript_text": "transcript",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+            "recording_collection": "uploads",
+            "consume_source_path": True,
+        }))
+
+        target_dir = Path(result["archive_dir"])
+        self.assertTrue(source.exists())
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual((target_dir / result["audio_name"]).read_bytes(), payload)
+
     def test_local_job_from_path_does_not_delete_source_file(self):
         source = Path(self._tmp.name) / "source.mp3"
         source.write_bytes(b"tiny mp3 payload")

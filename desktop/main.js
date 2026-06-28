@@ -6193,8 +6193,12 @@ async function createWindow(options = {}) {
         if (fs.existsSync(cfgPath)) {
           const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
           const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
-          if (configuredRoot && path.isAbsolute(configuredRoot)) {
-            allowedRecordingRoots.push(path.resolve(configuredRoot));
+          if (configuredRoot) {
+            allowedRecordingRoots.push(
+              path.isAbsolute(configuredRoot)
+                ? path.resolve(configuredRoot)
+                : path.resolve(dataDir, configuredRoot)
+            );
           }
         }
       } catch (e) {

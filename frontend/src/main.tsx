@@ -5387,6 +5387,7 @@ async function saveRecordingText(opts: {
   recordingCollection?: RecordingCollection;
   audioFile?: File | null;
   audioSourcePath?: string;
+  consumeAudioSourcePath?: boolean;
   /** When set, the backend atomically discards the live-recovery spool
    *  for this session ID immediately after the audio is persisted —
    *  closing the race window between a successful save and the
@@ -5442,6 +5443,7 @@ async function saveRecordingText(opts: {
       provider: opts.provider,
       model: opts.model,
       language: opts.language,
+      consume_source_path: !!opts.consumeAudioSourcePath,
     };
     if (archiveDir) payload.archive_dir = archiveDir;
     const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save-from-path", {
@@ -10429,6 +10431,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     let text = "";
     let modelLabel = "";
     let saveAudioSourcePath = useSourcePath ? sourcePath : "";
+    let consumeSaveAudioSourcePath = false;
     if (provider === "local") {
       modelLabel = "small";
       const localOpts = {
@@ -10443,7 +10446,10 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         : await localJobQueued(sourceFile as File, localOpts);
       text = String(out.text || "").trim();
       item.audioDurationSec = Math.max(0, Number(out.durationSec || 0) || 0);
-      if (useSourcePath && out.audioSourcePath) saveAudioSourcePath = out.audioSourcePath;
+      if (useSourcePath && out.audioSourcePath) {
+        saveAudioSourcePath = out.audioSourcePath;
+        consumeSaveAudioSourcePath = true;
+      }
     } else {
       modelLabel = getRemoteModelValue(provider) || "";
       const remoteOpts = {
@@ -10468,7 +10474,10 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         : await remoteJobQueued(sourceFile as File, remoteOpts);
       text = String(out.text || "").trim();
       item.audioDurationSec = Math.max(0, Number(out.durationSec || 0) || 0);
-      if (useSourcePath && out.audioSourcePath) saveAudioSourcePath = out.audioSourcePath;
+      if (useSourcePath && out.audioSourcePath) {
+        saveAudioSourcePath = out.audioSourcePath;
+        consumeSaveAudioSourcePath = true;
+      }
     }
     item.model = modelLabel;
     item.language = language;
@@ -10489,6 +10498,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         recordingCollection: RECORDING_COLLECTIONS.uploads,
         audioFile: useSourcePath ? null : sourceFile,
         audioSourcePath: useSourcePath ? saveAudioSourcePath : "",
+        consumeAudioSourcePath: useSourcePath ? consumeSaveAudioSourcePath : false,
         refreshList: true,
       });
     } catch (saveErr) {
