@@ -4855,13 +4855,27 @@ def _delete_all_recordings_sync() -> dict:
     failed = 0
     for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
         for p in _iter_recording_text_files(d):
+            audio_path = _recording_audio_path(p.name, target_dir=d)
+            audio_backup: Optional[Path] = None
             try:
-                audio_path = _recording_audio_path(p.name, target_dir=d)
                 if audio_path is not None:
-                    audio_path.unlink(missing_ok=True)
+                    audio_backup = audio_path.with_name(f"{audio_path.name}.tmp-{uuid.uuid4().hex}")
+                    os.replace(audio_path, audio_backup)
                 p.unlink()
+                if audio_backup is not None:
+                    _best_effort_unlink(audio_backup, context="delete-all audio cleanup")
                 deleted += 1
-            except Exception:
+            except Exception as exc:
+                if audio_backup is not None and audio_backup.exists():
+                    try:
+                        os.replace(audio_backup, audio_path)
+                    except OSError as restore_err:
+                        logger.warning(
+                            "delete-all audio rollback failed for %s: %s",
+                            audio_path,
+                            restore_err,
+                        )
+                logger.warning("delete-all recording failed for %s: %s", p, exc)
                 failed += 1
     return {"deleted": deleted, "failed": failed}
 

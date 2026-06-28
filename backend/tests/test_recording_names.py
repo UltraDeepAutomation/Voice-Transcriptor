@@ -514,6 +514,30 @@ class RecordingNameTests(unittest.TestCase):
         self.assertFalse(recording.exists())
         self.assertFalse(audio.exists())
 
+    def test_delete_all_restores_audio_when_transcript_delete_fails(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        root.mkdir(parents=True)
+        recording = root / "Locked.TXT"
+        audio = root / "Locked.webm"
+        recording.write_text("Title: Locked\nTranscription:\none\n", encoding="utf-8")
+        audio.write_bytes(b"audio")
+        original_unlink = Path.unlink
+
+        def locked_transcript_unlink(path_self, *args, **kwargs):
+            if path_self == recording:
+                raise PermissionError("locked transcript")
+            return original_unlink(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", locked_transcript_unlink):
+            result = self.main._delete_all_recordings_sync()
+
+        self.assertEqual(result["deleted"], 0)
+        self.assertEqual(result["failed"], 1)
+        self.assertTrue(recording.exists())
+        self.assertTrue(audio.exists())
+        self.assertEqual(audio.read_bytes(), b"audio")
+        self.assertFalse(list(root.glob("Locked.webm.tmp-*")))
+
     def test_audio_retention_matches_uppercase_txt_siblings(self):
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
