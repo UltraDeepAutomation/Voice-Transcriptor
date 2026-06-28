@@ -306,6 +306,87 @@ def _decrypt_provider_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _encrypted_provider_keys_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
+    """Return provider keys that are still encrypted in a raw config tree."""
+    out: Dict[str, str] = {}
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return out
+    for name, prov in providers.items():
+        if not isinstance(prov, dict):
+            continue
+        key = str(prov.get("key") or "").strip()
+        if key.startswith(_ENC_PREFIX):
+            out[str(name)] = key
+    return out
+
+
+def _load_raw_encrypted_provider_keys_unlocked() -> Dict[str, str]:
+    """Read encrypted provider keys from the persisted SSOT without decrypting.
+
+    This is used by ``save_config`` to avoid destructive partial saves when a
+    Fernet key is missing/rotated/corrupt. In that state ``load_config`` must
+    expose an empty runtime key because the secret is unusable, but unrelated
+    preference saves must still preserve the encrypted disk value.
+    """
+    for path in (CONFIG_PATH, _CONFIG_BACKUP_PATH):
+        if not path.exists():
+            continue
+        try:
+            raw = _read_json_file(path)
+            raw = _migrate_schema(raw)
+            raw = _validate_config_shape(raw)
+            merged = _deep_merge(DEFAULT_CONFIG, raw)
+            return _encrypted_provider_keys_from_config(merged)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("could not inspect raw provider keys at %s: %s", path, e)
+    return {}
+
+
+def _update_has_provider_key(update: Dict[str, Any], provider_name: str) -> bool:
+    providers = update.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    provider = providers.get(provider_name)
+    return isinstance(provider, dict) and "key" in provider
+
+
+def _preserve_undecryptable_provider_keys(
+    merged: Dict[str, Any],
+    current: Dict[str, Any],
+    update: Dict[str, Any],
+    raw_encrypted_keys: Dict[str, str],
+) -> Dict[str, Any]:
+    """Keep raw encrypted keys when this process cannot decrypt them.
+
+    A partial config save should not turn an unreadable encrypted secret into
+    an empty string. Non-empty incoming keys still replace the old encrypted
+    value; empty/missing keys preserve the disk SSOT until decryption works or
+    the user provides a new key.
+    """
+    if not raw_encrypted_keys:
+        return merged
+
+    providers = merged.get("providers")
+    current_providers = current.get("providers")
+    if not isinstance(providers, dict) or not isinstance(current_providers, dict):
+        return merged
+
+    for name, raw_key in raw_encrypted_keys.items():
+        provider = providers.get(name)
+        current_provider = current_providers.get(name)
+        if not isinstance(provider, dict) or not isinstance(current_provider, dict):
+            continue
+        if str(current_provider.get("key") or "").strip():
+            continue
+        incoming_key_present = _update_has_provider_key(update, name)
+        incoming_key = str(provider.get("key") or "").strip()
+        if incoming_key_present and incoming_key and not incoming_key.startswith(_ENC_PREFIX):
+            continue
+        provider["key"] = raw_key
+    return merged
+
+
 def _redact_provider_key_value(key: str) -> str:
     return "" if not key else (key[:3] + "..." + key[-2:])
 
@@ -759,10 +840,12 @@ def save_config(cfg: Dict[str, Any]) -> None:
         surface a meaningful 500.
     """
     with _CONFIG_IO_LOCK:
+        raw_encrypted_keys = _load_raw_encrypted_provider_keys_unlocked()
         current = _load_config_unlocked()
         update = _preserve_redacted_provider_keys(json.loads(json.dumps(cfg or {})), current)
         merged_current = _deep_merge(current, update)
         merged = _deep_merge(DEFAULT_CONFIG, merged_current)
+        merged = _preserve_undecryptable_provider_keys(merged, current, update, raw_encrypted_keys)
         # Always stamp the current schema version on write — callers may
         # POST partial configs without it; _deep_merge already inserted
         # DEFAULT_CONFIG['schema_version'], but explicit is safer.

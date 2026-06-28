@@ -163,12 +163,21 @@ interface LocalTranscriptionResult {
   text: string;
   segments: TranscriptSegment[];
   durationSec: number;
+  audioSourcePath?: string;
 }
 
 interface RemoteTranscriptionResult {
   text: string;
   provider: string;
   model?: string;
+  durationSec?: number;
+  audioSourcePath?: string;
+}
+
+interface BackendJobCreated {
+  job_id: string;
+  audio_source_path?: string;
+  audioSourcePath?: string;
 }
 
 interface BackendJobState<T> {
@@ -532,6 +541,26 @@ function base64UrlEncodeUtf8(value: string): string {
     binary += String.fromCharCode(byte);
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function cssEscape(value: string): string {
+  const nativeEscape = globalThis.CSS?.escape;
+  if (typeof nativeEscape === "function") {
+    return nativeEscape(value);
+  }
+  return String(value).replace(/[\0-\x1f\x7f]|^-?\d|^-$|[^\w-]/g, (char, offset) => {
+    if (char === "\0") return "\uFFFD";
+    const code = char.charCodeAt(0);
+    const needsCodePointEscape =
+      code < 0x20 ||
+      code === 0x7f ||
+      (offset === 0 && /[0-9]/.test(char)) ||
+      (offset === 1 && value.charAt(0) === "-" && /[0-9]/.test(char));
+    if (needsCodePointEscape) {
+      return `\\${code.toString(16)} `;
+    }
+    return `\\${char}`;
+  });
 }
 
 function websocketAuthProtocols(): string[] {
@@ -1858,9 +1887,10 @@ class OpfsPcmSink implements PcmSink {
   static async create(sessionId: string): Promise<OpfsPcmSink | null> {
     const dir = await getPcmSpoolDir(true);
     if (!dir) return null;
+    let name = "";
     try {
       const safeId = sessionId.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 96) || `s${Date.now()}`;
-      const name = `${safeId}.pcm16`;
+      name = `${safeId}.pcm16`;
       // Register BEFORE creating the file handle so the cleanup scan
       // never races with the file's existence on disk.
       _activePcmSpoolNames.add(name);
@@ -1868,18 +1898,28 @@ class OpfsPcmSink implements PcmSink {
       const writable = await handle.createWritable({ keepExistingData: false });
       return new OpfsPcmSink(dir, handle, writable);
     } catch (e) {
+      if (name) {
+        _activePcmSpoolNames.delete(name);
+        try {
+          await dir.removeEntry(name);
+        } catch {
+          // Best effort: a failed create may not have left an entry behind,
+          // and OPFS implementations differ on when the file becomes visible.
+        }
+      }
       console.warn("OpfsPcmSink: create failed, falling back to memory sink", e);
       return null;
     }
   }
 
   append(samples: Float32Array): void {
-    if (this.destroyed || this.lastWriteError) return;
+    if (this.destroyed) return;
     if (!samples.length) return;
     const int16 = floatSamplesToInt16LE(samples);
     this.pendingChunks.push(int16);
     this.pendingBytes += int16.byteLength;
     this.totalSamples += int16.length;
+    if (this.lastWriteError) return;
     this.scheduleFlush();
   }
 
@@ -2262,7 +2302,7 @@ function syncRemoteModelOptions(): void {
 async function remoteJob(
   file: File,
   opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
-): Promise<{ job_id: string }> {
+): Promise<BackendJobCreated> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("provider", opts.provider || "openrouter");
@@ -2278,13 +2318,13 @@ async function remoteJob(
     signal: opts.signal,
   });
   if (!r.ok) throw new Error(await parseError(r));
-  return (await r.json()) as { job_id: string };
+  return (await r.json()) as BackendJobCreated;
 }
 
 async function localJob(
   file: File,
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
-): Promise<{ job_id: string }> {
+): Promise<BackendJobCreated> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("language", opts.language || "auto");
@@ -2298,13 +2338,13 @@ async function localJob(
     signal: opts.signal,
   });
   if (!r.ok) throw new Error(await parseError(r));
-  return (await r.json()) as { job_id: string };
+  return (await r.json()) as BackendJobCreated;
 }
 
 async function remoteJobFromPath(
   sourcePath: string,
   opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal },
-): Promise<{ job_id: string }> {
+): Promise<BackendJobCreated> {
   const r = await fetch("/api/remote/jobs/from-path", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -2318,13 +2358,13 @@ async function remoteJobFromPath(
     }),
   });
   if (!r.ok) throw new Error(await parseError(r));
-  return (await r.json()) as { job_id: string };
+  return (await r.json()) as BackendJobCreated;
 }
 
 async function localJobFromPath(
   sourcePath: string,
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
-): Promise<{ job_id: string }> {
+): Promise<BackendJobCreated> {
   const r = await fetch("/api/jobs/from-path", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -2338,7 +2378,7 @@ async function localJobFromPath(
     }),
   });
   if (!r.ok) throw new Error(await parseError(r));
-  return (await r.json()) as { job_id: string };
+  return (await r.json()) as BackendJobCreated;
 }
 
 async function cancelBackendJob(jobId: string): Promise<void> {
@@ -2403,7 +2443,7 @@ async function waitForBackendJob<T>(
 }
 
 async function waitForQueuedRemoteJob(
-  created: { job_id: string },
+  created: BackendJobCreated,
   opts: {
     provider: Provider;
     language: string;
@@ -2434,6 +2474,8 @@ async function waitForQueuedRemoteJob(
     text: String(result?.text || "").trim(),
     provider: String(result?.provider || opts.provider || ""),
     model: String(result?.model || "").trim() || undefined,
+    durationSec: Math.max(0, Number((result as { duration?: unknown; durationSec?: unknown })?.durationSec ?? (result as { duration?: unknown })?.duration ?? 0) || 0),
+    audioSourcePath: String(created.audio_source_path || created.audioSourcePath || "").trim() || undefined,
   };
 }
 
@@ -2478,7 +2520,7 @@ function normalizeLocalTranscriptionResult(raw: { text?: string; duration?: numb
 }
 
 async function waitForQueuedLocalJob(
-  created: { job_id: string },
+  created: BackendJobCreated,
   opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
 ): Promise<LocalTranscriptionResult> {
   const onAbort = () => { void cancelBackendJob(created.job_id); };
@@ -2493,7 +2535,10 @@ async function waitForQueuedLocalJob(
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
   }
-  return normalizeLocalTranscriptionResult(result);
+  return {
+    ...normalizeLocalTranscriptionResult(result),
+    audioSourcePath: String(created.audio_source_path || created.audioSourcePath || "").trim() || undefined,
+  };
 }
 
 async function localJobQueued(
@@ -2562,12 +2607,10 @@ async function remoteJobSync(
 function isProviderKeyConfigured(provider: Provider): boolean {
   if (provider === "local" || !provider) return true;
   if (provider === "openrouter") {
-    const typed = (($("orKey") as HTMLInputElement).value || "").trim();
-    return hasOpenrouterKey || !!typed;
+    return hasOpenrouterKey;
   }
   if (provider === "deepgram") {
-    const typed = (($("deepgramKey") as HTMLInputElement).value || "").trim();
-    return hasDeepgramKey || !!typed;
+    return hasDeepgramKey;
   }
   return true;
 }
@@ -2999,22 +3042,22 @@ document.querySelectorAll(".sb-item").forEach((e) => {
 
 async function loadMics(forceReload = false): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia || !navigator.mediaDevices?.enumerateDevices) {
-    ($("micSelect") as HTMLSelectElement).innerHTML = '<option value="">Microphone API unavailable</option>';
+    ($("micSelect") as HTMLSelectElement).replaceChildren(new Option("Microphone API unavailable", ""));
     return;
   }
   try {
     const sel = $("micSelect") as HTMLSelectElement;
     if (forceReload) {
-      sel.innerHTML = '<option value="">Loading...</option>';
+      sel.replaceChildren(new Option("Loading...", ""));
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
     }
     const devs = await navigator.mediaDevices.enumerateDevices();
     const curVal = sel.value;
-    sel.innerHTML = '<option value="">Default</option>';
+    sel.replaceChildren(new Option("Default", ""));
     const mics = devs.filter((d) => d.kind === "audioinput");
     if (mics.length === 0) {
-      sel.innerHTML = '<option value="">No microphones</option>';
+      sel.replaceChildren(new Option("No microphones", ""));
     } else {
       mics.forEach((d, i) => {
         const o = document.createElement("option");
@@ -3069,7 +3112,7 @@ async function loadMics(forceReload = false): Promise<void> {
     // Always rewrite — the prior condition guarded behind a dead
     // `/loading/i.test(sel.value)` regex (`sel.value` is an attribute
     // value, never the display text, so the check never fired).
-    sel.innerHTML = `<option value="">${label}</option>`;
+    sel.replaceChildren(new Option(label, ""));
     // Tooltip carries the technical name for bug reports without
     // polluting the select's rendered text.
     sel.title = name ? `${label} (${name})` : label;
@@ -5114,7 +5157,7 @@ async function moveRecordingSelection(step: number): Promise<void> {
   setSelectedRecording(next);
   renderRecordingsList();
   await openRecording(next.name, recordingArchiveDir(next));
-  const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${CSS.escape(recordingDomKey(next))}"]`);
+  const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${cssEscape(recordingDomKey(next))}"]`);
   target?.focus();
 }
 
@@ -5351,7 +5394,8 @@ async function saveRecordingText(opts: {
   liveSessionId?: string;
   refreshList?: boolean;
 }): Promise<SavedRecordingRef> {
-  if (!opts.archiveDir && !recordingsBootstrapReady) {
+  const hasArchiveDirOption = Object.prototype.hasOwnProperty.call(opts, "archiveDir");
+  if (!hasArchiveDirOption && !recordingsBootstrapReady) {
     await ensureRecordingsArchiveReady();
   }
   const sourceText = (opts.sourceText || "").trim();
@@ -5359,7 +5403,7 @@ async function saveRecordingText(opts: {
   const audioFile = opts.audioFile || null;
   const audioSourcePath = normalizeUploadSourcePath(opts.audioSourcePath || "");
   const existingName = (opts.name || "").trim();
-  const archiveDir = (opts.archiveDir || currentArchiveDirSnapshot()).trim();
+  const archiveDir = (hasArchiveDirOption ? String(opts.archiveDir || "") : currentArchiveDirSnapshot()).trim();
   const recordingCollection = String(opts.recordingCollection || "").trim();
   const requireExisting = !!opts.requireExisting;
   if (!sourceText && !transcriptText && !audioFile && !audioSourcePath) {
@@ -5387,10 +5431,9 @@ async function saveRecordingText(opts: {
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
   } else if (audioSourcePath) {
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save-from-path", {
+    const payload: Record<string, unknown> = {
       source_path: audioSourcePath,
       name: existingName,
-      archive_dir: archiveDir,
       recording_collection: recordingCollection,
       require_existing: requireExisting,
       title: opts.title,
@@ -5399,13 +5442,16 @@ async function saveRecordingText(opts: {
       provider: opts.provider,
       model: opts.model,
       language: opts.language,
+    };
+    if (archiveDir) payload.archive_dir = archiveDir;
+    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save-from-path", {
+      ...payload,
     });
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
   } else {
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
+    const payload: Record<string, unknown> = {
       name: existingName,
-      archive_dir: archiveDir,
       recording_collection: recordingCollection,
       require_existing: requireExisting,
       title: opts.title,
@@ -5414,6 +5460,10 @@ async function saveRecordingText(opts: {
       provider: opts.provider,
       model: opts.model,
       language: opts.language,
+    };
+    if (archiveDir) payload.archive_dir = archiveDir;
+    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
+      ...payload,
     });
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
@@ -5479,7 +5529,7 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
     setSelectedRecording(first);
     renderRecordingsList();
     void openRecording(first.name, recordingArchiveDir(first)).then(() => {
-      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${CSS.escape(recordingDomKey(first))}"]`);
+      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${cssEscape(recordingDomKey(first))}"]`);
       target?.focus();
     });
     return;
@@ -5492,7 +5542,7 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
     setSelectedRecording(last);
     renderRecordingsList();
     void openRecording(last.name, recordingArchiveDir(last)).then(() => {
-      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${CSS.escape(recordingDomKey(last))}"]`);
+      const target = $("recordingsList").querySelector<HTMLElement>(`[data-recording-key="${cssEscape(recordingDomKey(last))}"]`);
       target?.focus();
     });
   }
@@ -6020,9 +6070,115 @@ let stopTransitionOwnerToken = "";
 // allocate two PcmSinks / WebSockets / MediaRecorders and the second's
 // globals would silently leak the first.
 let startLiveInFlight = false;
+let liveStartAttemptSeq = 0;
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
 let liveWsMode: LiveWsMode = "local-assist";
+
+function resolvePendingWorkletFlushes(): void {
+  for (const finish of Array.from(pendingWorkletFlushes.values())) {
+    finish();
+  }
+  pendingWorkletFlushes.clear();
+}
+
+function detachWorkletCapture(reason: string): void {
+  const node = workletNode;
+  if (!node) {
+    resolvePendingWorkletFlushes();
+    return;
+  }
+  try {
+    node.disconnect();
+  } catch (e) {
+    console.debug(`AudioWorklet disconnect failed during ${reason}`, e);
+  }
+  node.port.onmessage = null;
+  workletNode = null;
+  resolvePendingWorkletFlushes();
+}
+
+function startScriptProcessorCapture(
+  localAc: AudioContext,
+  localSrc: MediaStreamAudioSourceNode,
+  reason: string,
+): boolean {
+  if (scriptNode) return true;
+  try {
+    scriptNode = localAc.createScriptProcessor(4096, 1, 1);
+    scriptSinkGain = localAc.createGain();
+    scriptSinkGain.gain.value = 0;
+    scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
+      const ch = ev.inputBuffer.getChannelData(0);
+      if (!ch || !ch.length) return;
+      pushCapturedFrame(new Float32Array(ch));
+    };
+    localSrc.connect(scriptNode);
+    scriptNode.connect(scriptSinkGain);
+    scriptSinkGain.connect(localAc.destination);
+    if (shouldLivePreview()) {
+      const cur = liveDraftDisplayText || "";
+      if (!cur.includes("[Mic fallback engaged]")) {
+        setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
+      }
+    }
+    console.warn(`ScriptProcessor fallback engaged: ${reason}`);
+    return true;
+  } catch (e) {
+    console.warn("ScriptProcessor fallback init failed", e);
+    try {
+      if (scriptNode) localSrc.disconnect(scriptNode);
+    } catch { /* best effort */ }
+    try { scriptNode?.disconnect(); } catch { /* best effort */ }
+    try { scriptSinkGain?.disconnect(); } catch { /* best effort */ }
+    if (scriptNode) scriptNode.onaudioprocess = null;
+    scriptNode = null;
+    scriptSinkGain = null;
+    return false;
+  }
+}
+
+async function cleanupCancelledStartCaptureResources(): Promise<void> {
+  if (fallbackCaptureTimer) {
+    clearTimeout(fallbackCaptureTimer);
+    fallbackCaptureTimer = null;
+  }
+  if (vuIntervalId) {
+    clearInterval(vuIntervalId);
+    vuIntervalId = null;
+  }
+  stopWaveLoop();
+  detachWorkletCapture("cancelled live start");
+  try {
+    if (src && scriptNode) src.disconnect(scriptNode);
+  } catch { /* best effort */ }
+  try { scriptNode?.disconnect(); } catch { /* best effort */ }
+  try { scriptSinkGain?.disconnect(); } catch { /* best effort */ }
+  if (scriptNode) scriptNode.onaudioprocess = null;
+  scriptNode = null;
+  scriptSinkGain = null;
+  try { analyser?.disconnect(); } catch { /* best effort */ }
+  analyser = null;
+  try { src?.disconnect(); } catch { /* best effort */ }
+  src = null;
+  if (mediaRecorder) {
+    try { mediaRecorder.ondataavailable = null; } catch { /* best effort */ }
+    try {
+      if (mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    } catch { /* best effort */ }
+    mediaRecorder = null;
+    recordedWebmChunks = [];
+  }
+  if (stream) {
+    try { stream.getTracks().forEach((track) => track.stop()); } catch { /* best effort */ }
+    stream = null;
+  }
+  if (ac) {
+    const closing = ac;
+    ac = null;
+    try { await closing.close(); } catch { /* best effort */ }
+  }
+}
 /**
  * Finalize barrier for the live WebSocket.
  *
@@ -6803,6 +6959,7 @@ async function startLive(): Promise<void> {
   // Set the in-flight flag synchronously BEFORE any await.
   if (isBusy || stopTransitionInFlight || startLiveInFlight) return;
   startLiveInFlight = true;
+  const startAttemptSeq = ++liveStartAttemptSeq;
   try {
   let sessionArchiveDir = "";
   try {
@@ -6819,6 +6976,10 @@ async function startLive(): Promise<void> {
     return;
   }
   liveStartAbortReason = "";
+  const throwIfStartCancelled = (): void => {
+    if (startAttemptSeq === liveStartAttemptSeq) return;
+    throw new DOMException("Recording start was cancelled.", "AbortError");
+  };
   const sessionUiToken = createClientSessionId();
   activeUiSessionToken = sessionUiToken;
   activeLiveSessionId = sessionUiToken;
@@ -7045,6 +7206,7 @@ async function startLive(): Promise<void> {
       throw new Error("This browser does not support microphone capture.");
     }
     await loadMics(true);
+    throwIfStartCancelled();
     const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
     try {
       stream = await navigator.mediaDevices.getUserMedia(devId ? { audio: { deviceId: { exact: devId } } } : { audio: true });
@@ -7059,6 +7221,7 @@ async function startLive(): Promise<void> {
       // Selected mic could disappear after reconnect/sleep. Use system default fallback.
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     }
+    throwIfStartCancelled();
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");
     }
@@ -7090,6 +7253,7 @@ async function startLive(): Promise<void> {
         console.debug("AudioContext resume rejected (non-fatal)", e);
       }
     }
+    throwIfStartCancelled();
     recordedWebmChunks = [];
     try {
       mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
@@ -7139,13 +7303,6 @@ async function startLive(): Promise<void> {
     analyser = ac.createAnalyser();
     analyser.fftSize = 2048;
     src.connect(analyser);
-    await ac.audioWorklet.addModule(new URL("./pcm-worklet.js", import.meta.url).href);
-    workletNode = new AudioWorkletNode(ac, "pcm-capture-processor", {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      channelCount: 1,
-    });
-
     const buf = new Float32Array(analyser.fftSize);
     // Use setInterval instead of requestAnimationFrame.
     // rAF throttles to ~0 fps when the Electron window is hidden (which it
@@ -7180,68 +7337,87 @@ async function startLive(): Promise<void> {
     vuIntervalId = setInterval(tick, WAVE_METER_INTERVAL_MS);
     startWaveLoop();
 
-    workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-      const msg = ev.data as unknown;
-      if (msg instanceof Float32Array) {
-        pushCapturedFrame(msg);
-        return;
-      }
-      if (msg && typeof msg === "object" && "type" in msg) {
-        const data = msg as { type?: unknown; token?: unknown };
-        if (data.type === "flush-ack") {
-          const token = String(data.token || "");
-          const resolve = pendingWorkletFlushes.get(token);
-          if (resolve) resolve();
-        }
-      }
-    };
-
-    src.connect(workletNode);
-
-    // Enterprise fallback: if AudioWorklet path is silent/stalled on this host,
-    // switch to ScriptProcessor capture so recording still works.
-    if (fallbackCaptureTimer) {
-      clearTimeout(fallbackCaptureTimer);
-      fallbackCaptureTimer = null;
-    }
-    fallbackCaptureTimer = window.setTimeout(() => {
-      // Capture mutable globals into locals so the compiler (and the
-      // reader) can be sure nothing reassigns them between the null
-      // guard and the dereference. Previously this callback read ``ac``
-      // and ``src`` directly; they are module-level ``let`` variables
-      // that stopLive() nulls out during cleanup, so in principle a
-      // race could crash with a null-dereference. In practice it was
-      // safe because everything below runs synchronously, but making
-      // the snapshot explicit eliminates the class of bug entirely.
-      const localAc = ac;
-      const localSrc = src;
-      if (!localAc || !localSrc || !isRecording) return;
-      const noFrames = captureFrameCount < 3;
-      if (!noFrames) return;
+    let workletCaptureStarted = false;
+    if (ac.audioWorklet && typeof AudioWorkletNode === "function") {
       try {
-        scriptNode = localAc.createScriptProcessor(4096, 1, 1);
-        scriptSinkGain = localAc.createGain();
-        scriptSinkGain.gain.value = 0;
-        scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
-          const ch = ev.inputBuffer.getChannelData(0);
-          if (!ch || !ch.length) return;
-          pushCapturedFrame(new Float32Array(ch));
-        };
-        localSrc.connect(scriptNode);
-        scriptNode.connect(scriptSinkGain);
-        scriptSinkGain.connect(localAc.destination);
-        if (shouldLivePreview()) {
-          const cur = liveDraftDisplayText || "";
-          if (!cur.includes("[Mic fallback engaged]")) {
-            setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
+        await ac.audioWorklet.addModule(new URL("./pcm-worklet.js", import.meta.url).href);
+        throwIfStartCancelled();
+        workletNode = new AudioWorkletNode(ac, "pcm-capture-processor", {
+          numberOfInputs: 1,
+          numberOfOutputs: 0,
+          channelCount: 1,
+        });
+
+        workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
+          const msg = ev.data as unknown;
+          if (msg instanceof Float32Array) {
+            pushCapturedFrame(msg);
+            return;
           }
-        }
+          if (msg && typeof msg === "object" && "type" in msg) {
+            const data = msg as { type?: unknown; token?: unknown };
+            if (data.type === "flush-ack") {
+              const token = String(data.token || "");
+              const resolve = pendingWorkletFlushes.get(token);
+              if (resolve) resolve();
+            }
+          }
+        };
+
+        src.connect(workletNode);
+        workletCaptureStarted = true;
       } catch (e) {
-        console.warn("ScriptProcessor fallback init failed", e);
+        console.warn("AudioWorklet capture init failed; falling back to ScriptProcessor", e);
+        detachWorkletCapture("AudioWorklet init failure");
       }
-    }, UI_TOKENS.capture.fallbackInitDelayMs);
+    }
+
+    if (!workletCaptureStarted) {
+      const fallbackStarted = startScriptProcessorCapture(
+        ac,
+        src,
+        ac.audioWorklet ? "AudioWorklet init failed" : "AudioWorklet API unavailable",
+      );
+      if (!fallbackStarted) {
+        throw new Error("Microphone capture is unavailable in this browser runtime.");
+      }
+    } else {
+      // Enterprise fallback: if AudioWorklet path is silent/stalled on this host,
+      // switch to ScriptProcessor capture so recording still works.
+      if (fallbackCaptureTimer) {
+        clearTimeout(fallbackCaptureTimer);
+        fallbackCaptureTimer = null;
+      }
+      fallbackCaptureTimer = window.setTimeout(() => {
+        // Capture mutable globals into locals so the compiler (and the
+        // reader) can be sure nothing reassigns them between the null
+        // guard and the dereference. Previously this callback read ``ac``
+        // and ``src`` directly; they are module-level ``let`` variables
+        // that stopLive() nulls out during cleanup, so in principle a
+        // race could crash with a null-dereference. In practice it was
+        // safe because everything below runs synchronously, but making
+        // the snapshot explicit eliminates the class of bug entirely.
+        const localAc = ac;
+        const localSrc = src;
+        if (!localAc || !localSrc || !isRecording) return;
+        const noFrames = captureFrameCount < 3;
+        if (!noFrames) return;
+        const fallbackStarted = startScriptProcessorCapture(
+          localAc,
+          localSrc,
+          "AudioWorklet produced no initial frames",
+        );
+        if (fallbackStarted) {
+          detachWorkletCapture("AudioWorklet no-frame fallback");
+        }
+      }, UI_TOKENS.capture.fallbackInitDelayMs);
+    }
 
   } catch (e) {
+    if (startAttemptSeq !== liveStartAttemptSeq) {
+      await cleanupCancelledStartCaptureResources();
+      return;
+    }
     liveStartAbortReason = micErrorTag(e) || (e as Error).message || "Unable to start recording.";
     if (shouldLivePreview()) {
       setLiveDraftState("", liveStartAbortReason);
@@ -7272,6 +7448,7 @@ async function waitForWorkletDrain(
 async function stopLive(enhance: boolean): Promise<void> {
   if (stopTransitionInFlight) return;
   if (!isRecording) return;
+  liveStartAttemptSeq += 1;
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
   stopTransitionOwnerToken = stopTransitionToken;
@@ -7600,10 +7777,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
   };
   tearDown("workletNode.disconnect", () => {
-    if (workletNode) {
-      workletNode.disconnect();
-      workletNode.port.onmessage = null;
-    }
+    detachWorkletCapture("live teardown");
+  });
+  tearDown("scriptNode.input.disconnect", () => {
+    if (src && scriptNode) src.disconnect(scriptNode);
   });
   tearDown("scriptNode.disconnect", () => {
     if (scriptNode) {
@@ -9540,6 +9717,10 @@ interface UploadQueueSnapshotItem {
   provider?: Provider;
   model?: string;
   language?: string;
+  audioDurationSec?: number;
+  requestedProvider?: Provider;
+  requestedLanguage?: string;
+  requestedDiarize?: boolean;
   savedName?: string;
   savedArchiveDir?: string;
 }
@@ -9580,6 +9761,10 @@ interface UploadQueueItem {
   provider?: Provider;
   model?: string;
   language?: string;
+  audioDurationSec?: number;
+  requestedProvider?: Provider;
+  requestedLanguage?: string;
+  requestedDiarize?: boolean;
   savedName?: string;
   savedArchiveDir?: string;
   abortController?: AbortController;
@@ -9691,6 +9876,27 @@ function uploadItemName(item: UploadQueueItem): string {
 function uploadItemSize(item: UploadQueueItem): number {
   const size = Number(item.sizeBytes || item.file?.size || 0);
   return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+function normalizeUploadProvider(value: unknown): Provider {
+  const provider = String(value || "").trim();
+  return provider === "local" || provider === "openrouter" || provider === "deepgram"
+    ? provider
+    : "deepgram";
+}
+
+function currentUploadTranscriptionOptions(): {
+  provider: Provider;
+  language: string;
+  diarize: boolean;
+} {
+  const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
+  const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
+  return {
+    provider: normalizeUploadProvider(providerSel?.value || "deepgram"),
+    language: (languageSel?.value || "auto").trim() || "auto",
+    diarize: !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked,
+  };
 }
 
 function uploadItemResultText(item: UploadQueueItem): string {
@@ -9875,6 +10081,10 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
     provider: item.provider || "",
     model: item.model || "",
     language: item.language || "",
+    audioDurationSec: Math.max(0, Number(item.audioDurationSec || 0) || 0),
+    requestedProvider: item.requestedProvider || "",
+    requestedLanguage: item.requestedLanguage || "",
+    requestedDiarize: item.requestedDiarize === true,
     savedName: item.savedName || "",
     savedArchiveDir: item.savedArchiveDir || "",
   };
@@ -9934,6 +10144,10 @@ function restoreUploadQueueSnapshot(): void {
         provider: (src.provider || "") as Provider,
         model: String(src.model || ""),
         language: String(src.language || ""),
+        audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),
+        requestedProvider: normalizeUploadProvider(src.requestedProvider || src.provider || "deepgram"),
+        requestedLanguage: String(src.requestedLanguage || src.language || "auto"),
+        requestedDiarize: src.requestedDiarize === true,
         savedName: String(src.savedName || ""),
         savedArchiveDir: String(src.savedArchiveDir || ""),
       });
@@ -10064,11 +10278,10 @@ function setupUploadView(): void {
   // line ~8237. A duplicate listener here was attaching ANOTHER hint
   // refresh on every change, which leaked one stale-DOM-read closure
   // into the listener list per renderer reload. Removed.)
-  // Initial provider default: prefer Deepgram if the user has a key,
-  // else fall back to local Whisper (offline-capable). Honors per-tab
-  // independence — the Record tab's selection is unaffected.
-  const initialProvider: Provider = isProviderKeyConfigured("deepgram") ? "deepgram" : "local";
-  provider.value = initialProvider;
+  // Provider is restored from /api/config in loadCfg(), after provider-key
+  // state is known. Do not pick a "smart" startup default here: doing so
+  // races the config fetch and can route the first upload through Local
+  // even when the user's saved/default provider is Deepgram.
   // Mirror language preference from the global #language so users who
   // already pinned RU/EN don't have to re-pick it on every tab.
   try {
@@ -10102,6 +10315,7 @@ function enqueueUploadFile(file: File): void {
   // uploading. Retry uses the same helper so it cannot bypass the
   // first-enqueue gate.
   const sourcePath = uploadSourcePathFromFile(file);
+  const uploadOptions = currentUploadTranscriptionOptions();
   const validationError = uploadFileValidationError(file);
   if (validationError) {
     addUploadQueueItem({
@@ -10121,9 +10335,12 @@ function enqueueUploadFile(file: File): void {
     file,
     displayName: file.name,
     sizeBytes: file.size,
-    sourcePath,
-    status: "queued",
-  });
+      sourcePath,
+      status: "queued",
+      requestedProvider: uploadOptions.provider,
+      requestedLanguage: uploadOptions.language,
+      requestedDiarize: uploadOptions.diarize,
+    });
   renderUploadQueue();
   void runUploadProcessor();
 }
@@ -10198,14 +10415,12 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       }
     }, _stageCrossoverDelay)
     : 0;
-  const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
-  const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
-  const diarize = !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked;
-  const selectedProvider = (providerSel?.value || "deepgram") as Provider;
+  const selectedProvider = normalizeUploadProvider(item.requestedProvider || item.provider || "deepgram");
   // Honor offline mode the same way the Record tab does — fall back
   // to local when the chosen remote provider isn't available right now.
   const provider = resolveEffectiveProvider(selectedProvider);
-  const language = (languageSel?.value || "auto").trim();
+  const language = String(item.requestedLanguage || item.language || "auto").trim() || "auto";
+  const diarize = item.requestedDiarize === true;
   item.provider = provider;
   try {
     if (provider !== "local" && !isProviderKeyConfigured(provider)) {
@@ -10213,6 +10428,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     }
     let text = "";
     let modelLabel = "";
+    let saveAudioSourcePath = useSourcePath ? sourcePath : "";
     if (provider === "local") {
       modelLabel = "small";
       const localOpts = {
@@ -10226,6 +10442,8 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         ? await localJobQueuedFromPath(sourcePath, localOpts)
         : await localJobQueued(sourceFile as File, localOpts);
       text = String(out.text || "").trim();
+      item.audioDurationSec = Math.max(0, Number(out.durationSec || 0) || 0);
+      if (useSourcePath && out.audioSourcePath) saveAudioSourcePath = out.audioSourcePath;
     } else {
       modelLabel = getRemoteModelValue(provider) || "";
       const remoteOpts = {
@@ -10249,6 +10467,8 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         ? await remoteJobQueuedFromPath(sourcePath, remoteOpts)
         : await remoteJobQueued(sourceFile as File, remoteOpts);
       text = String(out.text || "").trim();
+      item.audioDurationSec = Math.max(0, Number(out.durationSec || 0) || 0);
+      if (useSourcePath && out.audioSourcePath) saveAudioSourcePath = out.audioSourcePath;
     }
     item.model = modelLabel;
     item.language = language;
@@ -10268,7 +10488,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         language,
         recordingCollection: RECORDING_COLLECTIONS.uploads,
         audioFile: useSourcePath ? null : sourceFile,
-        audioSourcePath: useSourcePath ? sourcePath : "",
+        audioSourcePath: useSourcePath ? saveAudioSourcePath : "",
         refreshList: true,
       });
     } catch (saveErr) {
@@ -10457,6 +10677,7 @@ async function retryUploadItem(id: string): Promise<void> {
     renderUploadQueue();
     return;
   }
+  const uploadOptions = currentUploadTranscriptionOptions();
   item.status = "queued";
   item.stage = "queued";
   item.uploadProgress = undefined;
@@ -10468,6 +10689,10 @@ async function retryUploadItem(id: string): Promise<void> {
   item.provider = undefined;
   item.model = "";
   item.language = "";
+  item.audioDurationSec = 0;
+  item.requestedProvider = uploadOptions.provider;
+  item.requestedLanguage = uploadOptions.language;
+  item.requestedDiarize = uploadOptions.diarize;
   item.savedName = "";
   item.savedArchiveDir = "";
   try { item.abortController?.abort(); } catch { /* idempotent */ }
@@ -10729,14 +10954,20 @@ function renderUploadResultPane(): void {
     const append = (k: string, v: string) => {
       if (!v) return;
       const span = document.createElement("span");
-      span.innerHTML = `<span class="upload-result-meta-key">${k}</span>${v.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c] || c)}`;
+      const key = document.createElement("span");
+      key.className = "upload-result-meta-key";
+      key.textContent = k;
+      span.appendChild(key);
+      span.appendChild(document.createTextNode(v));
       metaEl.appendChild(span);
     };
     append("provider", item.provider || "");
     append("model", item.model || "");
     append("language", item.language || "");
-    const dur = item.endedAt && item.startedAt ? `${((item.endedAt - item.startedAt) / 1000).toFixed(1)}s` : "";
-    append("duration", dur);
+    const audioDuration = Math.max(0, Number(item.audioDurationSec || 0) || 0);
+    append("audio", audioDuration > 0 ? fmtDur(audioDuration) : "");
+    const elapsed = item.endedAt && item.startedAt ? `${((item.endedAt - item.startedAt) / 1000).toFixed(1)}s` : "";
+    append("elapsed", elapsed);
     append("size", formatUploadFileSize(uploadItemSize(item)));
     append("words", String(((item.text || "").match(/\S+/g) || []).length));
     if (copyBtn) {

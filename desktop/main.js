@@ -22,6 +22,12 @@ const BACKEND_RUNTIME_IMPORTS = Object.freeze([
   "websockets",
 ]);
 const BACKEND_RUNTIME_IMPORT_CHECK = `import ${BACKEND_RUNTIME_IMPORTS.join(", ")}`;
+const PYTHON_ENV_SCRUB_KEYS = Object.freeze([
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "VIRTUAL_ENV",
+  "PYTHONUSERBASE",
+]);
 
 // Register process-level crash handlers IMMEDIATELY — the previous
 // registration happened inside app.whenReady().then(...), meaning any
@@ -29,6 +35,25 @@ const BACKEND_RUNTIME_IMPORT_CHECK = `import ${BACKEND_RUNTIME_IMPORTS.join(", "
 // top-level fs/path calls) terminated the process with no log trace
 // because appendMainLog requires app.getPath('userData') which isn't
 // ready yet. Fall back to console.error for the pre-ready window.
+let fatalMainExitScheduled = false;
+function exitAfterFatalMainProcessError(reason) {
+  if (fatalMainExitScheduled) return;
+  fatalMainExitScheduled = true;
+  try { isQuitting = true; } catch { }
+  try {
+    if (typeof killBackendHard === "function") {
+      killBackendHard(reason || "fatal main-process exception");
+    }
+  } catch { }
+  const exitNow = () => {
+    try { app.exit(1); } catch { process.exit(1); }
+  };
+  try { setImmediate(exitNow); } catch { exitNow(); }
+  try {
+    const timer = setTimeout(() => process.exit(1), 1500);
+    timer.unref?.();
+  } catch { }
+}
 process.on("uncaughtException", (err) => {
   try {
     if (typeof appendMainLog === "function") {
@@ -36,6 +61,7 @@ process.on("uncaughtException", (err) => {
     }
   } catch { /* appendMainLog may not be defined yet during early boot */ }
   try { console.error("[uncaughtException]", err); } catch { }
+  exitAfterFatalMainProcessError("uncaughtException");
 });
 process.on("unhandledRejection", (reason) => {
   try {
@@ -144,6 +170,7 @@ _relocateUserDataOffOneDrive();
 
 let backend = null;
 let win = null;
+let mainWindowInitialLoadPromise = null;
 let overlayWin = null;
 let overlayWaveMonitor = null;
 let overlayLoaded = false;
@@ -306,7 +333,7 @@ if (!singleInstanceLock) {
 }
 
 app.on("second-instance", () => {
-  ensureWindowVisible({ manual: true });
+  ensureWindowVisible({ manual: true, force: true });
 });
 
 // Rotate main.log when it exceeds this size. Prior code appended
@@ -510,6 +537,9 @@ function traceEnd(ctx, status = "done", details = {}) {
 async function ensureWindowVisible(options = {}) {
   const force = !!options.force;
   if (!force && overlayStopInFlight) return;
+  if (process.platform === "darwin" && app.dock) {
+    try { app.dock.show(); } catch { }
+  }
   if (!win || win.isDestroyed()) {
     await createWindow();
     return;
@@ -521,6 +551,25 @@ async function ensureWindowVisible(options = {}) {
   if (win.isMinimized()) win.restore();
   if (!win.isVisible()) win.show();
   win.focus();
+}
+
+function isCursorInsideVisibleOverlayInteractiveRegion() {
+  if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return false;
+  try {
+    const cursor = screen.getCursorScreenPoint();
+    const wb = overlayWin.getBounds();
+    const visibleH = overlayQuickSettingsOpen
+      ? wb.height
+      : (OVERLAY_TOKENS.window.height || 47);
+    return (
+      cursor.x >= wb.x &&
+      cursor.x <= wb.x + wb.width &&
+      cursor.y >= (wb.y + wb.height - visibleH) &&
+      cursor.y <= wb.y + wb.height
+    );
+  } catch {
+    return false;
+  }
 }
 
 function getRepoRoot() {
@@ -2713,9 +2762,11 @@ async function waitForRendererUiReady(timeoutMs = 8000) {
   while (Date.now() - started < timeoutMs) {
     if (!win || win.isDestroyed() || !win.webContents) return false;
     try {
-      const ready = await win.webContents.executeJavaScript(
+      const remainingMs = Math.max(100, timeoutMs - (Date.now() - started));
+      const ready = await execRendererJsWithTimeout(
         `(() => !!(document.getElementById('btnStart') && document.getElementById('btnStop')) )();`,
-        true
+        false,
+        Math.min(500, remainingMs)
       );
       if (ready) return true;
     } catch { }
@@ -2972,6 +3023,17 @@ async function queryRendererState() {
       const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
       const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
       const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
+      const finishedRecords = Array.isArray(window.__transcriptorFinishedRecords)
+        ? window.__transcriptorFinishedRecords
+          .map((x) => ({
+            recordingId: Number((x && x.recordingId) || 0),
+            finishedAt: Number((x && x.finishedAt) || 0),
+            text: String((x && x.text) || '').trim(),
+          }))
+          .filter((x) => x.recordingId > 0 && x.finishedAt > 0 && x.text.length > 0)
+          .slice(-30)
+        : [];
+      const isRec = !!(window.__transcriptorIsRecording);
       const status = (document.getElementById('statusText')?.textContent || '').trim();
       const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
       const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
@@ -2985,6 +3047,8 @@ async function queryRendererState() {
         uiFinalRecordingId,
         uiFinalText,
         uiFinalKind,
+        finishedRecords,
+        isRec,
         status,
         finalText,
         liveText,
@@ -3011,6 +3075,17 @@ async function queryRendererState() {
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+async function queryRendererRecordingState() {
+  const state = await execRendererJsWithTimeout(
+    `(() => ({ recording: !!window.__transcriptorIsRecording, recordingId: Number(window.__transcriptorCurrentRecordingId || 0) }))();`,
+    { recording: false, recordingId: 0 },
+    1000,
+  );
+  return state && typeof state === "object"
+    ? state
+    : { recording: false, recordingId: 0 };
 }
 
 function sleep(ms) {
@@ -4739,12 +4814,7 @@ async function runPostStopQueue() {
       // clean up — treat as not-recording and hide the overlay.
       let rendererState = { recording: false, recordingId: 0 };
       try {
-        if (win && !win.isDestroyed() && win.webContents) {
-          rendererState = await win.webContents.executeJavaScript(
-            `(() => ({ recording: !!window.__transcriptorIsRecording, recordingId: Number(window.__transcriptorCurrentRecordingId || 0) }))();`,
-            true
-          );
-        }
+        rendererState = await queryRendererRecordingState();
       } catch (e) {
         appendMainLog(`[post-stop-queue] isRec-error err="${compactLogText(e?.message || e)}"`);
       }
@@ -4835,61 +4905,9 @@ async function processPostStopTask(task) {
       await sleep(70);
       continue;
     }
-    let state = null;
-    try {
-      state = await win.webContents.executeJavaScript(
-        `
-        (() => {
-          const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
-          const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
-          const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
-          const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
-          const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
-          const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
-          const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
-          const finishedRecords = Array.isArray(window.__transcriptorFinishedRecords)
-            ? window.__transcriptorFinishedRecords
-              .map((x) => ({
-                recordingId: Number((x && x.recordingId) || 0),
-                finishedAt: Number((x && x.finishedAt) || 0),
-                text: String((x && x.text) || '').trim(),
-              }))
-              .filter((x) => x.recordingId > 0 && x.finishedAt > 0 && x.text.length > 0)
-              .slice(-30)
-            : [];
-          const isRec = !!(window.__transcriptorIsRecording);
-          const status = (document.getElementById('statusText')?.textContent || '').trim();
-          const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
-          const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
-          const busy = !!document.getElementById('btnStart')?.disabled;
-          const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-          return {
-            finishedAt,
-            finishedRecordingId,
-            finishedText,
-            uiFinalAt,
-            uiFinalRecordingId,
-            uiFinalText,
-            uiFinalKind,
-            finishedRecords,
-            isRec,
-            status,
-            finalText,
-            liveText,
-            busy,
-            progressVisible,
-          };
-        })();
-        `,
-        true
-      );
-    } catch {
-      traceStep(trace, "poll_js_error", { pollCount });
-      await sleep(70);
-      continue;
-    }
+    const state = await queryRendererState();
     if (!state) {
-      traceStep(trace, "poll_empty_state", { pollCount });
+      traceStep(trace, "poll_js_error", { pollCount });
       await sleep(70);
       continue;
     }
@@ -5258,6 +5276,25 @@ function runCommand(cmd, args, options = {}) {
   });
 }
 
+function isBundledPythonRuntime(python) {
+  const bundled = getBundledPythonPath();
+  return !!bundled && path.resolve(python) === path.resolve(bundled);
+}
+
+function buildPythonEnv(python, overrides = {}) {
+  const env = { ...process.env };
+  if (isBundledPythonRuntime(python)) {
+    for (const key of PYTHON_ENV_SCRUB_KEYS) {
+      delete env[key];
+    }
+    env.PYTHONNOUSERSITE = "1";
+  }
+  return {
+    ...env,
+    ...overrides,
+  };
+}
+
 function canBindPort(host, port) {
   return new Promise((resolve) => {
     const srv = net.createServer();
@@ -5479,7 +5516,7 @@ async function resolvePython(repoRoot) {
   const bundled = getBundledPythonPath();
   if (bundled) {
     const check = await runCommand(bundled, ["-c", "import sys; print(sys.executable)"], {
-      cwd: repoRoot, timeoutMs: 8000
+      cwd: repoRoot, timeoutMs: 8000, env: buildPythonEnv(bundled)
     });
     if (check.ok) {
       appendMainLog(`[resolvePython] using bundled runtime: ${bundled}`);
@@ -5535,11 +5572,21 @@ function setBackendBootStatus(msg) {
   }
 }
 
+function broadcastBackendBootError() {
+  if (!backendBootError || !win || win.isDestroyed() || !win.webContents) return;
+  win.webContents.executeJavaScript(
+    `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+    true
+  ).catch((e) => {
+    appendMainLog(`[backend-boot-error-broadcast] failed: ${e?.message || e}`);
+  });
+}
+
 async function ensureBackendRuntime(python, repoRoot) {
   const importCheck = await runCommand(
     python,
     ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-    { cwd: repoRoot, timeoutMs: 12000 }
+    { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
   );
 
   if (importCheck.ok) return { ok: true };
@@ -5637,7 +5684,7 @@ async function ensureBackendRuntime(python, repoRoot) {
   const recheck = await runCommand(
     python,
     ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-    { cwd: repoRoot, timeoutMs: 12000 }
+    { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
   );
 
   if (!recheck.ok) {
@@ -5681,13 +5728,7 @@ async function startBackend() {
   if (!python) {
     backendBootError = "Python 3 interpreter was not found. Please install Python 3 from python.org.";
     setBackendBootStatus("");
-    // Broadcast error to renderer
-    if (win && !win.isDestroyed() && win.webContents) {
-      win.webContents.executeJavaScript(
-        `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
-        true
-      ).catch(() => { });
-    }
+    broadcastBackendBootError();
     throw new Error(backendBootError);
   }
 
@@ -5695,12 +5736,7 @@ async function startBackend() {
   if (!runtime.ok) {
     backendBootError = runtime.details || "Backend runtime is unavailable.";
     setBackendBootStatus("");
-    if (win && !win.isDestroyed() && win.webContents) {
-      win.webContents.executeJavaScript(
-        `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
-        true
-      ).catch(() => { });
-    }
+    broadcastBackendBootError();
     throw new Error(backendBootError);
   }
 
@@ -5768,11 +5804,9 @@ async function startBackend() {
   // repoRoot into sys.path for uvicorn's module resolution, so
   // exporting PYTHONPATH=repoRoot would double-inject the same dir
   // AND expose every sibling top-level dir (runtime/, frontend/) as
-  // importable. We deliberately do NOT export PYTHONPATH here;
-  // the caller's own PYTHONPATH (if set) is passed through via
-  // ...process.env spread above.
-  const childEnv = {
-    ...process.env,
+  // importable. buildPythonEnv scrubs Python-specific parent env when
+  // using the bundled runtime so packaged launches stay hermetic.
+  const childEnv = buildPythonEnv(python, {
     PATH: envPath,
     PYTHONUNBUFFERED: "1",
     // CRITICAL on macOS: prevent Python from writing .pyc bytecode
@@ -5792,7 +5826,8 @@ async function startBackend() {
     PYTHONPYCACHEPREFIX: pythonCacheDir,
     TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
     TRANSCRIPTOR_BOOT_NONCE: BACKEND_BOOT_NONCE,
-  };
+    TRANSCRIPTOR_PARENT_WATCHDOG: "1",
+  });
   backend = spawn(python, args, {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
@@ -5846,6 +5881,7 @@ async function startBackend() {
         backendBootError = `Backend exited with code ${code} after ${attempt - 1} restart attempts — giving up.`;
         setBackendBootStatus("");
         appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
+        broadcastBackendBootError();
         return;
       }
       const delay = Math.min(800 * attempt, 5000);
@@ -5933,6 +5969,38 @@ function waitForBackendHealth(url, timeoutMs) {
   });
 }
 
+function trackMainWindowInitialLoad(browserWindow) {
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    mainWindowInitialLoadPromise = null;
+    return null;
+  }
+  let timeoutHandle = null;
+  let resolvePromise = null;
+  const promise = new Promise((resolve) => {
+    resolvePromise = resolve;
+  });
+  const settle = () => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+    try { browserWindow.webContents.off("did-finish-load", settle); } catch { }
+    try { browserWindow.webContents.off("did-fail-load", settle); } catch { }
+    try { browserWindow.off("closed", settle); } catch { }
+    if (mainWindowInitialLoadPromise === promise) {
+      mainWindowInitialLoadPromise = null;
+    }
+    resolvePromise?.();
+  };
+  browserWindow.webContents.once("did-finish-load", settle);
+  browserWindow.webContents.once("did-fail-load", settle);
+  browserWindow.once("closed", settle);
+  timeoutHandle = setTimeout(settle, 15000);
+  timeoutHandle.unref?.();
+  mainWindowInitialLoadPromise = promise;
+  return promise;
+}
+
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
 
@@ -5944,6 +6012,9 @@ async function createWindow(options = {}) {
   // ``win && !win.isDestroyed()`` — this is a defense-in-depth guard
   // so a future caller cannot silently trip the leak.
   if (win && !win.isDestroyed()) {
+    if (mainWindowInitialLoadPromise) {
+      try { await mainWindowInitialLoadPromise; } catch { }
+    }
     if (showWindow && !win.isVisible()) {
       win.show();
       win.focus();
@@ -6004,6 +6075,7 @@ async function createWindow(options = {}) {
       backgroundThrottling: false,
     }
   });
+  trackMainWindowInitialLoad(win);
 
   // Refuse navigation to any origin other than the backend. A
   // transcript containing an <a href="https://evil..."> that's clicked
@@ -6073,8 +6145,25 @@ async function createWindow(options = {}) {
       // sanitises it via _resolve_recordings_target_dir on the backend
       // side, but defence-in-depth: only accept absolute paths under
       // the userData root or under TRANSCRIPTOR_DATA_DIR / recordings.
+      const pathContains = (root, candidate) => {
+        const rel = path.relative(root, candidate);
+        return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+      };
       const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
       const recordingsRoot = path.resolve(dataDir, "recordings");
+      const allowedRecordingRoots = [recordingsRoot];
+      try {
+        const cfgPath = path.join(dataDir, "config.json");
+        if (fs.existsSync(cfgPath)) {
+          const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+          const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
+          if (configuredRoot && path.isAbsolute(configuredRoot)) {
+            allowedRecordingRoots.push(path.resolve(configuredRoot));
+          }
+        }
+      } catch (e) {
+        appendMainLog(`[reveal-recording] config allowlist read failed: ${e?.message || e}`);
+      }
       const archiveDir = archiveDirRaw && path.isAbsolute(archiveDirRaw)
         ? path.resolve(archiveDirRaw)
         : recordingsRoot;
@@ -6101,7 +6190,14 @@ async function createWindow(options = {}) {
       // already have dedicated playback, and selecting the media file
       // made the user think the transcription had been saved under the
       // wrong name.
-      const target = path.join(archiveDir, safeName);
+      const target = path.resolve(archiveDir, safeName);
+      const isAllowedRecordingPath = allowedRecordingRoots.some((root) =>
+        pathContains(root, archiveDir) && pathContains(root, target)
+      );
+      if (!isAllowedRecordingPath) {
+        appendMainLog(`[reveal-recording] archive_dir outside recording roots: ${archiveDir}`);
+        return;
+      }
       try {
         shell.showItemInFolder(target);
       } catch (e) {
@@ -6160,29 +6256,50 @@ async function createWindow(options = {}) {
       perm === "videoCapture";
     return { perm, known, allowedCapability };
   };
+  const permissionOriginCandidates = (wc, details = {}, requestingOrigin = "") => {
+    const values = [
+      details?.securityOrigin,
+      details?.requestingOrigin,
+      details?.requestingUrl,
+      requestingOrigin,
+      details?.embeddingOrigin,
+      details?.frameOrigin,
+      wc?.getURL?.(),
+    ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+    return Array.from(new Set(values));
+  };
+  const permissionFromBackendOrigin = (wc, details = {}, requestingOrigin = "") => {
+    const origins = permissionOriginCandidates(wc, details, requestingOrigin);
+    return origins.length > 0 && origins.every((origin) => _isBackendOrigin(origin));
+  };
+  const permissionOriginsLog = (wc, details = {}, requestingOrigin = "") =>
+    permissionOriginCandidates(wc, details, requestingOrigin)
+      .map(permissionLogUrl)
+      .filter(Boolean)
+      .join(" | ");
   win.webContents.session.setPermissionRequestHandler((wc, permission, cb, details = {}) => {
     const { perm, known, allowedCapability } = permissionDecision(permission, details);
-    const url = wc?.getURL?.() || "";
-    const fromBackend = _isBackendOrigin(url);
+    const fromBackend = permissionFromBackendOrigin(wc, details);
     const allow = allowedCapability && fromBackend;
-    const logUrl = permissionLogUrl(url);
+    const logUrl = permissionOriginsLog(wc, details);
     if (known && !fromBackend) {
-      appendMainLog(`[perm-request] DENY non-backend origin: perm=${perm} url=${logUrl}`);
+      appendMainLog(`[perm-request] DENY non-backend origin: perm=${perm} origins=${logUrl}`);
     } else {
-      appendMainLog(`[perm-request] perm=${perm} allow=${allow} url=${logUrl}`);
+      appendMainLog(`[perm-request] perm=${perm} allow=${allow} origins=${logUrl}`);
     }
     cb(allow);
   });
-  win.webContents.session.setPermissionCheckHandler((wc, permission, _requestingOrigin, details = {}) => {
+  win.webContents.session.setPermissionCheckHandler((wc, permission, requestingOrigin, details = {}) => {
     const { perm, known, allowedCapability } = permissionDecision(permission, details);
-    const url = wc?.getURL?.() || "";
-    const fromBackend = _isBackendOrigin(url);
+    const fromBackend = permissionFromBackendOrigin(wc, details, requestingOrigin);
     const allow = allowedCapability && fromBackend;
-    const logUrl = permissionLogUrl(url);
+    const logUrl = permissionOriginsLog(wc, details, requestingOrigin);
     if (known && !fromBackend) {
-      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} url=${logUrl}`);
+      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} origins=${logUrl}`);
     } else {
-      appendMainLog(`[perm-check] perm=${perm} allow=${allow} url=${logUrl}`);
+      appendMainLog(`[perm-check] perm=${perm} allow=${allow} origins=${logUrl}`);
     }
     return allow;
   });
@@ -6407,7 +6524,6 @@ async function createWindow(options = {}) {
     if (process.platform === "darwin" && !isQuitting) {
       event.preventDefault();
       win.hide();
-      if (app.dock) app.dock.hide();
       return;
     }
   });
@@ -6555,6 +6671,10 @@ async function createWindow(options = {}) {
       </html>
     `)}`
     );
+    if (showWindow && win && !win.isDestroyed()) {
+      if (!win.isVisible()) win.show();
+      win.focus();
+    }
     let recoveryAttempt = 0;
     const updateRecoveryStatus = async (text, healthy = false) => {
       if (!win || win.isDestroyed()) return;
@@ -6598,17 +6718,14 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", () => {
-  // In menu bar mode (dock hidden), ignore all activation events.
-  if (process.platform === "darwin" && app.dock && !app.dock.isVisible()) {
-    return;
-  }
   // When the recording overlay is visible, clicking its buttons triggers
   // macOS app activation (even though the window is focusable:false).
-  // Don't show the main window — the user is interacting with the overlay.
-  if (overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()) {
+  // Suppress only that concrete overlay-click case. A Dock click happens
+  // with the cursor outside the overlay, so it must always reopen/focus
+  // the main window even while recording/transcribing continues.
+  if (isCursorInsideVisibleOverlayInteractiveRegion()) {
     return;
   }
-  if (overlayStopInFlight) return;
   ensureWindowVisible({ manual: true, force: true });
 });
 
@@ -6811,13 +6928,25 @@ process.on("exit", () => {
   isQuitting = true;
   killBackendHard("process-exit");
 });
+const SIGNAL_EXIT_CODES = Object.freeze({
+  SIGHUP: 129,
+  SIGINT: 130,
+  SIGTERM: 143,
+});
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(sig, () => {
     appendMainLog(`[signal] ${sig}`);
     isQuitting = true;
     killBackendHard(`signal-${sig}`);
-    // Let Electron's own handler run; don't call app.exit() ourselves
-    // because that would skip before-quit cleanup.
+    try {
+      app.quit();
+    } catch {
+      try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
+    }
+    const exitTimer = setTimeout(() => {
+      try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
+    }, 1500);
+    if (typeof exitTimer.unref === "function") exitTimer.unref();
   });
 }
 

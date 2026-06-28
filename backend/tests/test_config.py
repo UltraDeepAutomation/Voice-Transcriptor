@@ -84,6 +84,26 @@ class TestConfigLifecycle(unittest.TestCase):
         cfg = self.config_mod.load_config()
         self.assertEqual(cfg["providers"]["openrouter"]["key"], real_key)
 
+    def test_undecryptable_encrypted_key_survives_unrelated_save(self):
+        real_key = "sk-or-v1-survive-fernet-outage-1234567890"
+        self.config_mod.save_config({
+            "providers": {"openrouter": {"key": real_key}},
+            "preferences": {"remote_provider": "openrouter"},
+        })
+        raw_before = json.loads(self.config_mod.CONFIG_PATH.read_text(encoding="utf-8"))
+        encrypted_key = raw_before["providers"]["openrouter"]["key"]
+        self.assertTrue(encrypted_key.startswith("enc:"))
+
+        self.config_mod._FERNET = None
+        unreadable = self.config_mod.load_config()
+        self.assertEqual(unreadable["providers"]["openrouter"]["key"], "")
+
+        self.config_mod.save_config({"preferences": {"remote_provider": "deepgram"}})
+
+        raw_after = json.loads(self.config_mod.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(raw_after["providers"]["openrouter"]["key"], encrypted_key)
+        self.assertEqual(raw_after["preferences"]["remote_provider"], "deepgram")
+
     def test_first_save_writes_no_backup(self):
         """Nothing to rotate if the file is new — .bak should only
         appear starting from the second save onward."""

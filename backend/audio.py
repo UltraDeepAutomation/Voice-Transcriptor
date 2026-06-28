@@ -37,10 +37,24 @@ logger = logging.getLogger(__name__)
 # upload could OOM the backend.
 _FFMPEG_STDERR_CAP_BYTES = 64 * 1024
 _REMOTE_COMPACT_TIMEOUT_SEC = 1800
+_FFMPEG_DECODE_ERROR_PATTERNS = (
+    "partial file",
+    "input buffer exhausted",
+    "invalid data found when processing input",
+    "error submitting packet to decoder",
+    "error while decoding",
+    "corrupt",
+    "truncated",
+)
 
 
 class AudioError(RuntimeError):
     pass
+
+
+def _ffmpeg_stderr_has_decode_error(stderr_text: str) -> bool:
+    low = str(stderr_text or "").lower()
+    return any(pattern in low for pattern in _FFMPEG_DECODE_ERROR_PATTERNS)
 
 
 def _bounded_stderr_reader(pipe, cap: int) -> list[str]:
@@ -84,6 +98,7 @@ def _run_ffmpeg(
     cmd: list[str],
     timeout_sec: int,
     cancel_event: Optional[threading.Event] = None,
+    fail_on_decode_error: bool = False,
 ) -> None:
     """Run ffmpeg with bounded stderr + hard timeout.
 
@@ -141,10 +156,17 @@ def _run_ffmpeg(
                 proc.stderr.close()
         except Exception:
             pass
+    msg = "".join(collected).strip()
     if proc.returncode != 0:
-        msg = "".join(collected).strip() or f"ffmpeg exited with code {proc.returncode}"
+        msg = msg or f"ffmpeg exited with code {proc.returncode}"
         logger.warning("ffmpeg failed (rc=%d): %s", proc.returncode, msg)
         raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
+    if fail_on_decode_error and _ffmpeg_stderr_has_decode_error(msg):
+        logger.warning("ffmpeg reported decode errors despite rc=0: %s", msg)
+        raise AudioError(
+            "ffmpeg decoded only part of the input; the source media appears "
+            f"truncated or corrupt: {msg[:4000]}"
+        )
 
 
 def _compact_audio_for_remote_cmd(path_in: str, path_out: str) -> list[str]:
@@ -264,6 +286,7 @@ def compact_audio_for_remote(
             cmd,
             timeout_sec=_REMOTE_COMPACT_TIMEOUT_SEC,
             cancel_event=cancel_event,
+            fail_on_decode_error=True,
         )
     except AudioError:
         try:
@@ -304,6 +327,7 @@ def compact_audio_chunks_for_remote(
             cmd,
             timeout_sec=_REMOTE_COMPACT_TIMEOUT_SEC,
             cancel_event=cancel_event,
+            fail_on_decode_error=True,
         )
     except AudioError:
         for p in glob.glob(os.path.join(output_dir, "chunk_*.webm")):
@@ -376,66 +400,14 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             "pcm_s16le",
             path_out,
         ]
-        # Bounded-memory ffmpeg call: stderr routed through a helper
-        # thread that caps the retained prefix at _FFMPEG_STDERR_CAP_BYTES
-        # while continuing to drain the OS pipe so ffmpeg is never blocked
-        # on a full pipe buffer. The previous `subprocess.run(...
-        # capture_output=True)` implementation buffered unbounded stderr
-        # into a Python string; a crash-loop ffmpeg (malformed container,
-        # missing codec) could fill gigabytes of RAM before the 5-minute
-        # timeout fired.
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        collected: list[str] = []
-        reader = threading.Thread(
-            target=lambda: collected.extend(
-                _bounded_stderr_reader(proc.stderr, _FFMPEG_STDERR_CAP_BYTES)
-            ),
-            name="ffmpeg-stderr-reader",
-            daemon=True,
-        )
-        reader.start()
         try:
-            try:
-                proc.wait(timeout=300)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                # Give the kill a moment to propagate before giving up;
-                # the reader thread will exit when the pipe closes.
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                raise AudioError("ffmpeg conversion timed out")
-            reader.join(timeout=5)
-        finally:
-            # Defensive close in case the reader thread already drained
-            # the pipe — Popen's stderr remains open until explicitly closed.
-            try:
-                if proc.stderr is not None and not proc.stderr.closed:
-                    proc.stderr.close()
-            except Exception:
-                pass
-        if proc.returncode != 0:
-            msg = "".join(collected).strip() or f"ffmpeg exited with code {proc.returncode}"
-            # Log the full (capped) stderr locally for operator
-            # debugging; surface only a compact prefix in the
-            # exception that callers may echo back over HTTP.
-            logger.warning("ffmpeg failed (rc=%d): %s", proc.returncode, msg)
-            # 1.1.25: clean up partial output. ffmpeg's ``-y`` flag
-            # truncates the output up front, so a non-zero exit
-            # leaves a 0-byte (or torn) WAV at ``path_out`` that
-            # downstream transcribe calls would otherwise consume
-            # as if it were a real recording.
+            _run_ffmpeg(cmd, timeout_sec=300, fail_on_decode_error=True)
+        except AudioError:
             try:
                 os.unlink(path_out)
             except OSError:
                 pass
-            raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
+            raise
         return path_out
 
     if ext != ".wav":
@@ -498,7 +470,7 @@ def ensure_wav_16k_preserve_channels(path_in: str, path_out: str) -> str:
             path_out,
         ]
         try:
-            _run_ffmpeg(cmd, timeout_sec=300)
+            _run_ffmpeg(cmd, timeout_sec=300, fail_on_decode_error=True)
         except AudioError:
             try:
                 os.unlink(path_out)

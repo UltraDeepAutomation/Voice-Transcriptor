@@ -116,6 +116,13 @@ verify_sha256() {
   fi
 }
 
+remove_tree() {
+  local target="$1"
+  [ -e "${target}" ] || return 0
+  chmod -R u+w "${target}" 2>/dev/null || true
+  rm -rf "${target}"
+}
+
 python_sha256_for_triple() {
   local triple="$1"
   case "${triple}" in
@@ -145,7 +152,7 @@ install_python() {
   local url="https://github.com/indygreg/python-build-standalone/releases/download/${PBS_TAG}/${tarball}"
   local cached="${CACHE_DIR}/${tarball}"
   fetch "${url}" "${cached}" "$(python_sha256_for_triple "${triple}")"
-  rm -rf "${out_dir}"
+  remove_tree "${out_dir}"
   mkdir -p "${out_dir}"
   log "extracting python for ${triple}"
   # The tarball already contains a top-level "python/" directory with the
@@ -209,14 +216,14 @@ install_ffmpeg_win() {
   local out_dir="$1"
   local zip="${CACHE_DIR}/ffmpeg-win64.zip"
   fetch "${FFMPEG_WIN_URL}" "${zip}" "${FFMPEG_WIN_SHA256}"
-  rm -rf "${out_dir}/ffmpeg"
+  remove_tree "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
   # Extract only ffmpeg.exe from the archive.
   local tmp
   tmp="$(mktemp -d)"
   unzip -q "${zip}" -d "${tmp}"
   find "${tmp}" -name "ffmpeg.exe" -exec cp {} "${out_dir}/ffmpeg/bin/ffmpeg.exe" \;
-  rm -rf "${tmp}"
+  remove_tree "${tmp}"
   [ -f "${out_dir}/ffmpeg/bin/ffmpeg.exe" ] || die "ffmpeg.exe not found in archive"
   log "ffmpeg.exe installed"
 }
@@ -233,7 +240,7 @@ install_ffmpeg_mac() {
   fi
   local zip="${CACHE_DIR}/${cache_name}"
   fetch "${url}" "${zip}" "${sha256}"
-  rm -rf "${out_dir}/ffmpeg"
+  remove_tree "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
   # osxexperts arm zip contains __MACOSX/ metadata junk; extract only
   # the actual ffmpeg binary and discard the rest.
@@ -252,7 +259,7 @@ install_ffmpeg_mac() {
     [ -n "${found}" ] || die "ffmpeg binary not found in archive"
     cp "${found}" "${out_dir}/ffmpeg/bin/ffmpeg"
   fi
-  rm -rf "${tmp}"
+  remove_tree "${tmp}"
   chmod +x "${out_dir}/ffmpeg/bin/ffmpeg"
   [ -x "${out_dir}/ffmpeg/bin/ffmpeg" ] || die "ffmpeg binary not executable"
   # Verify arch matches target to catch future URL regressions early.
@@ -268,7 +275,7 @@ install_ffmpeg_linux() {
   local out_dir="$1"
   local tar="${CACHE_DIR}/ffmpeg-linux.tar.xz"
   fetch "${FFMPEG_LINUX_URL}" "${tar}" "${FFMPEG_LINUX_SHA256}"
-  rm -rf "${out_dir}/ffmpeg"
+  remove_tree "${out_dir}/ffmpeg"
   mkdir -p "${out_dir}/ffmpeg/bin"
   local tmp
   tmp="$(mktemp -d)"
@@ -288,7 +295,7 @@ install_ffmpeg_linux() {
   done < <(find "${tmp}" -name "ffmpeg" -type f -perm -u+x -print0)
   [ -n "$best" ] || die "ffmpeg binary not found in linux archive"
   cp "$best" "${out_dir}/ffmpeg/bin/ffmpeg"
-  rm -rf "${tmp}"
+  remove_tree "${tmp}"
   chmod +x "${out_dir}/ffmpeg/bin/ffmpeg"
   log "ffmpeg (linux) installed"
 }

@@ -5,6 +5,7 @@ import sys
 import asyncio
 import base64
 import binascii
+import hashlib
 import uuid
 import re
 import secrets
@@ -141,12 +142,16 @@ _backend_logger.propagate = False
 # GUARANTEE the orphan is reaped, which is the whole point of this
 # watchdog.
 #
-# ``TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG=1`` opts out for users who run
-# the backend standalone (``python -m uvicorn backend.main:app`` in a
-# dev shell without Electron parent), since reading stdin in a dev
-# shell would block on the terminal.
+# Electron sets ``TRANSCRIPTOR_PARENT_WATCHDOG=1`` when it owns the
+# backend stdin pipe. Standalone and CI runs often have a non-tty stdin
+# too (pytest capture, shell pipelines, launchd), so stdin shape alone is
+# not proof that EOF means "Electron parent died".
+#
+# ``TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG=1`` remains an emergency opt-out.
 def _start_parent_death_watchdog() -> None:
     if os.environ.get("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG") == "1":
+        return
+    if os.environ.get("TRANSCRIPTOR_PARENT_WATCHDOG") != "1":
         return
     if not os.isatty(0):
         # Only install the watchdog when stdin is a pipe (parent-spawned).
@@ -261,18 +266,29 @@ jobs = JobStore(max_workers=2)
 # persisted job errors. The redact happens BEFORE the string is handed
 # to anything external; full exceptions are still written to main.log
 # via `logger.exception` for operator debugging.
+_ERROR_POSIX_PATH_ROOTS_RE = r"(?:Users|home|root|var|tmp|private|opt|Applications|System)"
+_ERROR_WINDOWS_PATH_ROOTS_RE = r"(?:Users|Windows|Temp|ProgramData|Program Files)"
+_ERROR_LOCAL_PATH_START_RE = (
+    rf"(?:/{_ERROR_POSIX_PATH_ROOTS_RE}/|[A-Za-z]:[\\/]{_ERROR_WINDOWS_PATH_ROOTS_RE}[\\/])"
+)
 _ERROR_PATH_REDACT_RE = re.compile(
-    r"(?:"
+    rf"(?:"
     # POSIX user/system paths. `(?<![A-Za-z0-9:/])` look-behind prevents
     # over-redacting URL paths like ``https://example.com/home/stream`` —
     # we only strip when the slash is preceded by whitespace, quote,
     # start-of-string, or a non-URL punctuation character, so a real
     # local path gets caught while a URL path survives the redact.
-    r"(?<![A-Za-z0-9:/])/(?:Users|home|root|var|tmp|private|opt|Applications|System)/[^\s\"'`]*"
-    r"|"
+    rf"(?<![A-Za-z0-9:/])/{_ERROR_POSIX_PATH_ROOTS_RE}/[^\s\"'`]*"
+    rf"|"
     # Windows user/system paths — both `\` and forward-slashed variants.
-    r"[A-Za-z]:\\(?:Users|Windows|Temp|ProgramData|Program Files)\\[^\s\"'`]*"
-    r")",
+    rf"[A-Za-z]:[\\/]{_ERROR_WINDOWS_PATH_ROOTS_RE}[\\/][^\s\"'`]*"
+    rf")",
+    re.IGNORECASE,
+)
+_ERROR_QUOTED_PATH_REDACT_RE = re.compile(
+    rf"\"{_ERROR_LOCAL_PATH_START_RE}[^\"\r\n]*\""
+    rf"|'{_ERROR_LOCAL_PATH_START_RE}[^'\r\n]*'"
+    rf"|`{_ERROR_LOCAL_PATH_START_RE}[^`\r\n]*`",
     re.IGNORECASE,
 )
 # Crude API-key shapes that should never end up in an error body. We
@@ -295,6 +311,10 @@ def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
     text = str(exc) if not isinstance(exc, str) else exc
     if not text:
         return exc.__class__.__name__ if isinstance(exc, BaseException) else "error"
+    text = _ERROR_QUOTED_PATH_REDACT_RE.sub(
+        lambda match: f"{match.group(0)[0]}<path>{match.group(0)[0]}",
+        text,
+    )
     text = _ERROR_PATH_REDACT_RE.sub("<path>", text)
     text = _ERROR_TOKEN_REDACT_RE.sub("<token>", text)
     if len(text) > max_len:
@@ -392,6 +412,10 @@ REMOTE_TRANSCRIBE_CHUNK_SEC = max(
 REMOTE_RAW_FALLBACK_MAX_BYTES = max(
     1 * 1024 * 1024,
     _env_int("TRANSCRIPTOR_REMOTE_RAW_FALLBACK_MAX_BYTES", 8 * 1024 * 1024),
+)
+SOURCE_MEDIA_STABILITY_PROBE_SEC = max(
+    0.05,
+    min(2.0, _env_int("TRANSCRIPTOR_SOURCE_MEDIA_STABILITY_PROBE_MS", 450) / 1000.0),
 )
 BOOT_NONCE = (os.environ.get("TRANSCRIPTOR_BOOT_NONCE") or "").strip()
 ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
@@ -635,18 +659,21 @@ def _warm_default_local_model() -> None:
 
 
 def _origin_allowed(origin: str, request: Request) -> bool:
-    parsed = urlparse(origin)
-    if parsed.scheme not in {"http", "https"}:
+    try:
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if parsed.hostname not in {"127.0.0.1", "localhost"}:
+            return False
+        req_port = request.url.port
+        if req_port is None:
+            req_port = 443 if request.url.scheme == "https" else 80
+        origin_port = parsed.port
+        if origin_port is None:
+            origin_port = 443 if parsed.scheme == "https" else 80
+        return origin_port == req_port
+    except ValueError:
         return False
-    if parsed.hostname not in {"127.0.0.1", "localhost"}:
-        return False
-    req_port = request.url.port
-    if req_port is None:
-        req_port = 443 if request.url.scheme == "https" else 80
-    origin_port = parsed.port
-    if origin_port is None:
-        origin_port = 443 if parsed.scheme == "https" else 80
-    return origin_port == req_port
 
 
 _RATE_BUCKET_MAX_KEYS = 2048
@@ -882,10 +909,15 @@ def _lookup_live_promote_cache(session_id: str) -> Optional[dict]:
         # 404. Treat a missing file as a cache miss so the promoter
         # re-runs and recreates the entry.
         name = str(payload.get("name") or "")
+        audio_name = str(payload.get("audio_name") or "")
         archive_dir_str = str(payload.get("archive_dir") or "")
         if name and archive_dir_str:
             try:
-                if not (Path(archive_dir_str) / name).exists():
+                archive_dir = Path(archive_dir_str)
+                if not (archive_dir / name).exists():
+                    _live_promote_cache.pop(session_id, None)
+                    return None
+                if audio_name and not (archive_dir / audio_name).exists():
                     _live_promote_cache.pop(session_id, None)
                     return None
             except OSError:
@@ -947,7 +979,14 @@ def _promote_live_recovery(
             # np.frombuffer + astype(float32) materialises 3× the raw PCM
             # size in RAM simultaneously.
             pcm_size = pcm_path.stat().st_size
-            if pcm_size < LIVE_RECOVERY_MIN_BYTES:
+            readable_pcm_size = pcm_size - (pcm_size % 2)
+            if pcm_size != readable_pcm_size:
+                logger.warning(
+                    "live recovery %s has odd byte length (%d); ignoring trailing byte",
+                    session_id,
+                    pcm_size,
+                )
+            if readable_pcm_size < LIVE_RECOVERY_MIN_BYTES:
                 raise HTTPException(status_code=400, detail="live recovery too short")
             if pcm_size > MAX_RECOVERY_PROMOTE_BYTES:
                 # Do NOT interpolate `pcm_path` into the response body —
@@ -967,7 +1006,8 @@ def _promote_live_recovery(
                         f"{MAX_RECOVERY_PROMOTE_BYTES // (1024 * 1024)} MB)"
                     ),
                 )
-            audio_bytes = pcm_path.read_bytes()
+            with pcm_path.open("rb") as pcm_file:
+                audio_bytes = pcm_file.read(readable_pcm_size)
 
             pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             started_at = str(meta.get("started_at") or "").strip()
@@ -1243,7 +1283,8 @@ def _safe_user_filename_part(value: str, *, fallback: str = "recording", max_len
     cleaned = cleaned[:max_len].strip(" ._-")
     if not cleaned:
         cleaned = fallback
-    if cleaned.lower() in _WINDOWS_RESERVED_BASENAMES:
+    reserved_probe = cleaned.split(".", 1)[0].lower()
+    if reserved_probe in _WINDOWS_RESERVED_BASENAMES:
         cleaned = f"_{cleaned}"
     return cleaned
 
@@ -1266,6 +1307,14 @@ def _normalize_filename(name: str) -> str:
     # treat it as an unknown format. Always ensure a fallback ``.wav``
     # extension when the user-supplied name didn't produce one.
     return cleaned
+
+
+def _recording_text_name_leaf(name: str) -> str:
+    raw = unicodedata.normalize("NFC", str(name or "")).replace("\\", "/")
+    leaf = os.path.basename(raw).strip()
+    if "\x00" in raw or leaf in {"", ".", ".."} or not leaf.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="invalid recording name")
+    return leaf
 
 
 def _validate_audio_filename(name: str) -> None:
@@ -1316,11 +1365,30 @@ def _resolve_source_media_path(source_path: object) -> Path:
             status_code=413,
             detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
         )
+    suffixes = {suffix.lower() for suffix in resolved.suffixes}
+    if suffixes & {".crdownload", ".download", ".part", ".tmp"}:
+        raise HTTPException(status_code=409, detail="source file is still downloading")
+    try:
+        stat_before = resolved.stat()
+        time.sleep(SOURCE_MEDIA_STABILITY_PROBE_SEC)
+        stat_after = resolved.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="source file is not accessible") from exc
+    if (
+        stat_before.st_size != stat_after.st_size
+        or int(stat_before.st_mtime_ns) != int(stat_after.st_mtime_ns)
+    ):
+        raise HTTPException(status_code=409, detail="source file is still being written; wait for it to finish and retry")
     return resolved
 
 
 def _copy_source_media_file(source_path: Path, target: Path) -> int:
     total = 0
+    digest = hashlib.sha256()
+    try:
+        stat_before = source_path.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="source file is not accessible") from exc
     try:
         with source_path.open("rb") as src, target.open("wb") as dst:
             while True:
@@ -1333,7 +1401,35 @@ def _copy_source_media_file(source_path: Path, target: Path) -> int:
                         status_code=413,
                         detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
                     )
+                digest.update(chunk)
                 dst.write(chunk)
+        try:
+            stat_after = source_path.stat()
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail="source file changed during copy") from exc
+        if (
+            stat_before.st_dev != stat_after.st_dev
+            or stat_before.st_ino != stat_after.st_ino
+            or total != stat_before.st_size
+            or stat_after.st_size != stat_before.st_size
+        ):
+            raise HTTPException(status_code=409, detail="source file changed during copy; wait for it to finish and retry")
+        source_total = 0
+        source_digest = hashlib.sha256()
+        with source_path.open("rb") as verify:
+            while True:
+                chunk = verify.read(1024 * 1024)
+                if not chunk:
+                    break
+                source_total += len(chunk)
+                if source_total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+                    )
+                source_digest.update(chunk)
+        if source_total != total or source_digest.digest() != digest.digest():
+            raise HTTPException(status_code=409, detail="source file changed during copy; wait for it to finish and retry")
         return total
     except BaseException:
         try:
@@ -1345,6 +1441,13 @@ def _copy_source_media_file(source_path: Path, target: Path) -> int:
                 cleanup_err,
             )
         raise
+
+
+def _snapshot_source_media_for_job(source_path: Path, job_id: str) -> Path:
+    orig_name = _normalize_filename(source_path.name)
+    target = UPLOADS_DIR / f"{job_id}.{orig_name}"
+    _copy_source_media_file(source_path, target)
+    return target
 
 
 def _normalize_language(value: str) -> Optional[str]:
@@ -1753,9 +1856,9 @@ def _sanitize_name(value: str) -> str:
 
 
 def _recording_stem(name_or_title: str) -> str:
-    raw = os.path.basename(name_or_title or "").strip()
-    if raw.endswith(".txt"):
-        return Path(raw).stem
+    raw = os.path.basename(str(name_or_title or "").replace("\\", "/")).strip()
+    if raw.lower().endswith(".txt"):
+        return _sanitize_name(Path(raw).stem)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     return f"{ts}__{_sanitize_name(raw or 'recording')}"
 
@@ -1856,15 +1959,9 @@ def _atomic_temp_path(final_path: Path) -> Path:
 
 
 def _recording_path_or_404(name: str, target_dir: Optional[Path] = None) -> Path:
-    safe = os.path.basename(name or "")
-    # Case-insensitive ``.txt`` check — on macOS HFS+/APFS and Windows
-    # NTFS the filesystem itself is case-insensitive, so a recording
-    # written as ``foo.txt`` is the same file as ``foo.TXT``. The old
-    # ``safe.endswith(".txt")`` rejected the .TXT spelling at the
-    # validator before we even touched the disk, returning 400 for a
-    # file the OS would have happily found.
-    if not safe.lower().endswith(".txt") or safe in {"", ".", ".."}:
-        raise HTTPException(status_code=400, detail="invalid recording name")
+    # Canonical leaf extraction is shared with save/update/audio lookup
+    # so Windows-style names behave the same on POSIX and Windows hosts.
+    safe = _recording_text_name_leaf(name)
     p = (target_dir or _resolve_recordings_dir()) / safe
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="recording not found")
@@ -1976,7 +2073,13 @@ def _resolve_recordings_collection_target_dir(
         collection_dir.mkdir(parents=True, exist_ok=True)
     elif not collection_dir.exists() or not collection_dir.is_dir():
         raise HTTPException(status_code=409, detail="archive directory is no longer available")
-    return collection_dir.resolve()
+    resolved_collection_dir = collection_dir.resolve()
+    home_dir = Path.home().resolve()
+    try:
+        resolved_collection_dir.relative_to(home_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="archive_dir is outside allowed directories") from exc
+    return resolved_collection_dir
 
 
 def _recordings_scan_dirs(root: Path) -> list[Path]:
@@ -2114,7 +2217,10 @@ def _audio_content_type(filename: str) -> str:
 
 
 def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optional[Path]:
-    stem = Path(os.path.basename(name or "")).stem
+    try:
+        stem = Path(_recording_text_name_leaf(name)).stem
+    except HTTPException:
+        return None
     if not stem:
         return None
     root_dir = target_dir or _resolve_recordings_dir()
@@ -2865,7 +2971,7 @@ def _open_live_recovery(
     # the PCM itself is intact.
     atomic_write_json(meta_path, meta_payload)
 
-    pcm_file = pcm_path.open("wb")
+    pcm_file = pcm_path.open("wb", buffering=0)
     try:
         return {
             "session_id": session_id,
@@ -2898,6 +3004,17 @@ def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
         return
     if recovery.get("write_failed"):
         return
+    if not data:
+        return
+    chunk = bytes(data)
+    if len(chunk) % 2:
+        logger.warning(
+            "live recovery received odd PCM16 chunk (%d B); dropping trailing byte",
+            len(chunk),
+        )
+        chunk = chunk[:-1]
+        if not chunk:
+            return
     # Hard cap on the per-session recovery spool. Without this a user
     # who leaves a tab streaming overnight (or a runaway reconnect loop)
     # can fill a small SSD. We stop writing silently once the ceiling is
@@ -2912,6 +3029,11 @@ def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
                 recovery["bytes"], MAX_LIVE_RECOVERY_BYTES,
             )
         return
+    remaining = MAX_LIVE_RECOVERY_BYTES - int(recovery["bytes"])
+    if len(chunk) > remaining:
+        chunk = chunk[: remaining - (remaining % 2)]
+        if not chunk:
+            return
     # Counter increment MUST follow a successful write — otherwise an
     # OSError on the very chunk that wins (full disk, EBADF, EIO) still
     # bumps ``bytes`` and ``chunks``. Subsequent comparisons against
@@ -2920,7 +3042,7 @@ def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
     # and downstream duration math (``bytes / 32000.0``) reports a
     # longer recording than truly recoverable.
     try:
-        recovery["pcm_file"].write(data)
+        written = recovery["pcm_file"].write(chunk)
     except OSError as e:
         recovery["write_failed"] = True
         recovery["had_error"] = True
@@ -2933,8 +3055,20 @@ def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
             e,
         )
         return
+    if written is None:
+        written = len(chunk)
+    if written <= 0:
+        return
+    if written != len(chunk):
+        recovery["had_error"] = True
+        recovery["partial_write"] = True
+        logger.warning(
+            "live recovery partial write (%d/%d B); marking recovery degraded",
+            written,
+            len(chunk),
+        )
     recovery["chunks"] += 1
-    recovery["bytes"] += len(data)
+    recovery["bytes"] += int(written)
 
 
 def _finalize_live_recovery(recovery: dict) -> None:
@@ -3464,6 +3598,7 @@ async def create_job(
     word_timestamps = _form_bool(word_timestamps, False)
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
+    lang_opt = _normalize_language(language)
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
@@ -3472,7 +3607,6 @@ async def create_job(
     await _save_upload_file(file, upload_path)
 
     jobs.create(job_id)
-    lang_opt = _normalize_language(language)
     _submit_local_transcription_job(
         job_id=job_id,
         upload_path=upload_path,
@@ -3495,23 +3629,27 @@ async def create_job_from_path(
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
 
-    source_path = _resolve_source_media_path((payload or {}).get("source_path") or (payload or {}).get("path"))
+    source_path = await asyncio.to_thread(
+        _resolve_source_media_path,
+        (payload or {}).get("source_path") or (payload or {}).get("path"),
+    )
     lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
     split_stereo = _payload_bool(payload, "split_stereo", True)
     word_timestamps = _payload_bool(payload, "word_timestamps", False)
 
     job_id = str(uuid.uuid4())
+    upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
     _submit_local_transcription_job(
         job_id=job_id,
-        upload_path=source_path,
+        upload_path=upload_path,
         model=model,
         language=lang_opt,
         split_stereo=split_stereo,
         word_timestamps=word_timestamps,
         cleanup_upload_path=False,
     )
-    return {"job_id": job_id}
+    return {"job_id": job_id, "audio_source_path": str(upload_path)}
 
 
 @app.post("/api/transcribe-sync")
@@ -3529,13 +3667,13 @@ async def transcribe_sync(
     word_timestamps = _form_bool(word_timestamps, False)
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
+    lang_opt = _normalize_language(language)
 
     request_id = str(uuid.uuid4())
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
     upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
     await _save_upload_file(file, upload_path)
-    lang_opt = _normalize_language(language)
     loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(
@@ -3578,6 +3716,17 @@ def _run_remote_transcribe_once(
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> dict[str, Any]:
+    def _remote_result_duration_sec(result: dict[str, Any]) -> float:
+        raw = result.get("raw")
+        if isinstance(raw, dict):
+            metadata = raw.get("metadata")
+            if isinstance(metadata, dict):
+                try:
+                    return max(0.0, float(metadata.get("duration") or 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
     def _raise_if_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise JobCancelledError("job cancelled")
@@ -3624,6 +3773,7 @@ def _run_remote_transcribe_once(
                 "provider": "openrouter",
                 "model": model,
                 "text": (out.get("text") or "").strip(),
+                "duration": _remote_result_duration_sec(out),
                 "raw": out.get("raw"),
             }
 
@@ -3645,6 +3795,7 @@ def _run_remote_transcribe_once(
                 "provider": "deepgram",
                 "model": model,
                 "text": (out.get("text") or "").strip(),
+                "duration": _remote_result_duration_sec(out),
                 "raw": out.get("raw"),
             }
 
@@ -3740,6 +3891,7 @@ def _run_remote_transcribe_once(
 
         text_parts: list[str] = []
         raw_chunks: list[dict[str, Any]] = []
+        total_duration_sec = 0.0
         for idx, chunk_path in enumerate(chunk_paths):
             _raise_if_cancelled()
             payload = Path(chunk_path).read_bytes()
@@ -3756,11 +3908,14 @@ def _run_remote_transcribe_once(
             text = (result.get("text") or "").strip()
             if text:
                 text_parts.append(text)
+            chunk_duration_sec = max(0.0, float(result.get("duration") or 0.0))
+            total_duration_sec += chunk_duration_sec
             raw_chunks.append(
                 {
                     "index": idx,
                     "filename": chunk_name,
                     "bytes": len(payload),
+                    "duration": chunk_duration_sec,
                     "raw": result.get("raw"),
                 }
             )
@@ -3770,6 +3925,7 @@ def _run_remote_transcribe_once(
             "provider": prov,
             "model": model,
             "text": "\n\n".join(text_parts).strip(),
+            "duration": total_duration_sec,
             "raw": {
                 "chunked": True,
                 "chunk_seconds": REMOTE_TRANSCRIBE_CHUNK_SEC,
@@ -3884,6 +4040,7 @@ async def create_remote_job(
     provider_norm = _form_text(provider, "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
         raise HTTPException(status_code=400, detail="unsupported provider")
+    lang_opt = _normalize_language(_form_text(language, "auto"))
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
@@ -3892,7 +4049,6 @@ async def create_remote_job(
     await _save_upload_file(file, upload_path)
 
     jobs.create(job_id)
-    lang_opt = _normalize_language(_form_text(language, "auto"))
     _submit_remote_transcription_job(
         job_id=job_id,
         provider_norm=provider_norm,
@@ -3917,16 +4073,20 @@ async def create_remote_job_from_path(
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
         raise HTTPException(status_code=400, detail="unsupported provider")
 
-    source_path = _resolve_source_media_path((payload or {}).get("source_path") or (payload or {}).get("path"))
+    source_path = await asyncio.to_thread(
+        _resolve_source_media_path,
+        (payload or {}).get("source_path") or (payload or {}).get("path"),
+    )
     orig_name = _normalize_filename(source_path.name)
     lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
 
     job_id = str(uuid.uuid4())
+    upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
     _submit_remote_transcription_job(
         job_id=job_id,
         provider_norm=provider_norm,
-        upload_path=source_path,
+        upload_path=upload_path,
         orig_name=orig_name,
         language=lang_opt,
         diarize=_payload_bool(payload, "diarize", False),
@@ -3934,7 +4094,7 @@ async def create_remote_job_from_path(
         openrouter_model=str((payload or {}).get("openrouter_model") or ""),
         cleanup_upload_path=False,
     )
-    return {"job_id": job_id}
+    return {"job_id": job_id, "audio_source_path": str(upload_path)}
 
 
 @app.post("/api/remote/transcribe-sync")
@@ -3950,6 +4110,7 @@ async def remote_transcribe_sync(
     provider_norm = _form_text(provider, "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
         raise HTTPException(status_code=400, detail="unsupported provider")
+    lang_opt = _normalize_language(_form_text(language, "auto"))
 
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
@@ -3957,7 +4118,6 @@ async def remote_transcribe_sync(
     upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
     await _save_upload_file(file, upload_path)
 
-    lang_opt = _normalize_language(_form_text(language, "auto"))
     cfg = load_config()
     loop = asyncio.get_running_loop()
     try:
@@ -4135,6 +4295,9 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
                 if ("HTTP 404" in msg) or ("not found" in msg.lower()):
                     continue
                 raise
+            except RemoteError as e:
+                last_err = e
+                raise
         if out is None:
             if last_err is not None:
                 raise last_err
@@ -4142,7 +4305,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
             # escaped the OpenRouterError handler below and surfaced
             # as a generic FastAPI 500 with no actionable message.
             raise HTTPException(status_code=502, detail="upscale failed: no candidate model succeeded")
-    except OpenRouterError as e:
+    except RemoteError as e:
         # 1.1.25: route through ``_safe_error_text`` so the 502 body
         # never leaks raw upstream URL fragments / response bodies
         # into the renderer.
@@ -4862,7 +5025,8 @@ def save_recording(
     payload: dict = Body(...),
     _auth: None = Depends(_require_api_auth),
 ):
-    existing_name = os.path.basename(str(payload.get("name") or "").strip())
+    raw_existing_name = str(payload.get("name") or "").strip()
+    existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
     archive_dir = str(payload.get("archive_dir") or "").strip()
     recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
     require_existing = _payload_bool(payload, "require_existing", False)
@@ -4889,8 +5053,6 @@ def save_recording(
     _register_archive_dir(target_dir)
     claimed_new_text = False
     if existing_name:
-        if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
-            raise HTTPException(status_code=400, detail="invalid recording name")
         out = target_dir / existing_name
         if require_existing and not out.exists():
             raise HTTPException(status_code=409, detail="recording no longer exists in the target archive")
@@ -4936,7 +5098,8 @@ async def _save_recording_audio_source(
     language: str = "",
     live_session_id: str = "",
 ) -> dict[str, Any]:
-    existing_name = os.path.basename(str(name or "").strip())
+    raw_existing_name = str(name or "").strip()
+    existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
     safe_title = _sanitize_name(str(title or "recording"))
     safe_source_text = str(source_text or "").strip()
     safe_transcript_text = str(transcript_text or "").strip()
@@ -4961,8 +5124,6 @@ async def _save_recording_audio_source(
     _register_archive_dir(target_dir)
     claimed_new_text = False
     if existing_name:
-        if existing_name in {"", ".", ".."} or not existing_name.lower().endswith(".txt"):
-            raise HTTPException(status_code=400, detail="invalid recording name")
         stem = Path(existing_name).stem
         text_name = existing_name
         if require_existing and not (target_dir / existing_name).exists():
@@ -5117,7 +5278,10 @@ async def save_recording_from_path(
     payload: dict = Body(...),
     _auth: None = Depends(_require_api_auth),
 ):
-    source_path = _resolve_source_media_path((payload or {}).get("source_path") or (payload or {}).get("path"))
+    source_path = await asyncio.to_thread(
+        _resolve_source_media_path,
+        (payload or {}).get("source_path") or (payload or {}).get("path"),
+    )
 
     async def write_tmp_audio(tmp_audio: Path) -> None:
         await asyncio.to_thread(_copy_source_media_file, source_path, tmp_audio)

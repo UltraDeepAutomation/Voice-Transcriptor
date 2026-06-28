@@ -128,7 +128,7 @@ class RemoteChunkingTests(unittest.TestCase):
         }
 
         with mock.patch.object(self.main.logger, "warning") as warn:
-            self.main._record_recovery_chunk(recovery, b"first")
+            self.main._record_recovery_chunk(recovery, b"first!")
             self.main._record_recovery_chunk(recovery, b"second")
 
         self.assertEqual(pcm.write_calls, 1)

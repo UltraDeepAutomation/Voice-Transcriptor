@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -24,8 +25,12 @@ def _fresh_main_module(data_dir: str):
 
 class RecordingNameTests(unittest.TestCase):
     def setUp(self):
-        Path.home().mkdir(parents=True, exist_ok=True)
-        self._tmp = tempfile.TemporaryDirectory(dir=str(Path.home()))
+        self._old_home = os.environ.get("HOME")
+        self._old_userprofile = os.environ.get("USERPROFILE")
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        self._tmp = tempfile.TemporaryDirectory(dir=self._home.name)
         self.main = _fresh_main_module(self._tmp.name)
 
     def tearDown(self):
@@ -38,6 +43,15 @@ class RecordingNameTests(unittest.TestCase):
         os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
         os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
         self._tmp.cleanup()
+        self._home.cleanup()
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        if self._old_userprofile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = self._old_userprofile
 
     def test_upload_source_filename_is_unicode_safe_display_ssot(self):
         target = Path(self._tmp.name) / "recordings"
@@ -96,6 +110,156 @@ class RecordingNameTests(unittest.TestCase):
         )
 
         self.assertRegex(stem, r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}__spoken title$")
+
+    def test_txt_recording_stem_cannot_bypass_windows_reserved_names(self):
+        self.assertEqual(self.main._safe_user_filename_part("con.txt"), "_con.txt")
+        self.assertEqual(self.main._recording_stem("con.txt"), "_con")
+        self.assertEqual(self.main._recording_stem(r"C:\notes\aux.txt"), "_aux")
+
+    def test_safe_error_text_redacts_quoted_paths_with_spaces(self):
+        text = (
+            "failed to open '/Users/alice/Library/Application Support/Voice Transcriptor/config.json' "
+            "with token sk-abcdefghijklmnopqrstuvwxyz123456"
+        )
+
+        redacted = self.main._safe_error_text(text, max_len=500)
+
+        self.assertIn("'<path>'", redacted)
+        self.assertIn("<token>", redacted)
+        self.assertNotIn("Application Support", redacted)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz123456", redacted)
+
+    def test_origin_allowed_rejects_malformed_origin_without_500(self):
+        request = SimpleNamespace(url=SimpleNamespace(port=8765, scheme="http"))
+
+        self.assertFalse(self.main._origin_allowed("http://localhost:not-a-port", request))
+
+    def test_recording_collection_rejects_symlink_escape_after_resolve(self):
+        root = Path(self._tmp.name) / "recordings"
+        root.mkdir()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        live_name = self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE]
+        (root / live_name).symlink_to(outside.name, target_is_directory=True)
+
+        with self.assertRaises(self.main.HTTPException) as cm:
+            self.main._resolve_recordings_collection_target_dir(
+                str(root),
+                collection=self.main.RECORDING_COLLECTION_LIVE,
+                create=True,
+            )
+
+        self.assertEqual(cm.exception.status_code, 403)
+
+    def test_live_promote_cache_misses_when_cached_audio_is_missing(self):
+        archive_dir = Path(self._tmp.name) / "recordings"
+        archive_dir.mkdir()
+        (archive_dir / "Recovered.txt").write_text("ok", encoding="utf-8")
+
+        self.main._store_live_promote_cache(
+            "session-with-missing-audio",
+            {
+                "name": "Recovered.txt",
+                "audio_name": "Recovered.wav",
+                "archive_dir": str(archive_dir),
+            },
+        )
+
+        self.assertIsNone(self.main._lookup_live_promote_cache("session-with-missing-audio"))
+
+    def test_create_job_invalid_language_does_not_save_upload_or_create_job(self):
+        fake_file = SimpleNamespace(filename="audio.wav")
+
+        with mock.patch.object(self.main, "_save_upload_file", new=mock.AsyncMock()) as save_upload:
+            with mock.patch.object(self.main.jobs, "create") as create_job:
+                with self.assertRaises(self.main.HTTPException) as cm:
+                    asyncio.run(self.main.create_job(file=fake_file, language="not a language", _auth=None))
+
+        self.assertEqual(cm.exception.status_code, 400)
+        save_upload.assert_not_awaited()
+        create_job.assert_not_called()
+
+    def test_source_media_path_rejects_file_that_changes_during_probe(self):
+        source = Path(self._tmp.name) / "growing.wav"
+        source.write_bytes(b"RIFF")
+
+        def mutate_during_probe(_seconds):
+            source.write_bytes(b"RIFF-growing")
+
+        with mock.patch.object(self.main.time, "sleep", side_effect=mutate_during_probe):
+            with self.assertRaises(self.main.HTTPException) as cm:
+                self.main._resolve_source_media_path(str(source))
+
+        self.assertEqual(cm.exception.status_code, 409)
+
+    def test_local_from_path_uses_backend_owned_snapshot(self):
+        source = Path(self._tmp.name) / "clip.wav"
+        source.write_bytes(b"RIFF")
+        snapshot = self.main.UPLOADS_DIR / "snapshot.clip.wav"
+        snapshot.write_bytes(b"RIFF")
+
+        with mock.patch.object(self.main, "_snapshot_source_media_for_job", return_value=snapshot) as make_snapshot, \
+             mock.patch.object(self.main.jobs, "create") as create_job, \
+             mock.patch.object(self.main, "_submit_local_transcription_job") as submit_job:
+            out = asyncio.run(
+                self.main.create_job_from_path(
+                    payload={"source_path": str(source), "model": "small"},
+                    _auth=None,
+                )
+            )
+
+        make_snapshot.assert_called_once()
+        create_job.assert_called_once_with(out["job_id"])
+        submit_job.assert_called_once()
+        self.assertEqual(submit_job.call_args.kwargs["upload_path"], snapshot)
+        self.assertFalse(submit_job.call_args.kwargs["cleanup_upload_path"])
+        self.assertEqual(out["audio_source_path"], str(snapshot))
+
+    def test_remote_from_path_uses_backend_owned_snapshot(self):
+        source = Path(self._tmp.name) / "clip.wav"
+        source.write_bytes(b"RIFF")
+        snapshot = self.main.UPLOADS_DIR / "snapshot.clip.wav"
+        snapshot.write_bytes(b"RIFF")
+
+        with mock.patch.object(self.main, "_snapshot_source_media_for_job", return_value=snapshot) as make_snapshot, \
+             mock.patch.object(self.main.jobs, "create") as create_job, \
+             mock.patch.object(self.main, "_submit_remote_transcription_job") as submit_job:
+            out = asyncio.run(
+                self.main.create_remote_job_from_path(
+                    payload={"source_path": str(source), "provider": "deepgram"},
+                    _auth=None,
+                )
+            )
+
+        make_snapshot.assert_called_once()
+        create_job.assert_called_once_with(out["job_id"])
+        submit_job.assert_called_once()
+        self.assertEqual(submit_job.call_args.kwargs["upload_path"], snapshot)
+        self.assertFalse(submit_job.call_args.kwargs["cleanup_upload_path"])
+        self.assertEqual(out["audio_source_path"], str(snapshot))
+
+    def test_live_recovery_drops_odd_pcm16_trailing_byte(self):
+        recovery = self.main._open_live_recovery(
+            session_id="oddpcm",
+            started_at=self.main.datetime.now(),
+            provider="local",
+            model="small",
+            language="auto",
+            archive_dir="",
+            recording_collection=self.main.RECORDING_COLLECTION_LIVE,
+        )
+        try:
+            self.main._record_recovery_chunk(recovery, b"\x01\x02\x03")
+
+            self.assertEqual(recovery["bytes"], 2)
+            self.assertEqual(Path(recovery["pcm_path"]).read_bytes(), b"\x01\x02")
+        finally:
+            try:
+                recovery["pcm_file"].close()
+            except OSError:
+                pass
+            Path(recovery["pcm_path"]).unlink(missing_ok=True)
+            Path(recovery["meta_path"]).unlink(missing_ok=True)
 
     def test_recording_collections_save_into_source_specific_folders(self):
         live = self.main.save_recording({
@@ -160,6 +324,40 @@ class RecordingNameTests(unittest.TestCase):
 
         self.assertEqual(result["name"], "Existing.TXT")
         self.assertIn("updated", (target / "Existing.TXT").read_text(encoding="utf-8"))
+
+    def test_recording_text_lookup_normalizes_windows_path_leaf(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.TXT"
+        existing.write_text("old", encoding="utf-8")
+        audio = target / "Existing.wav"
+        audio.write_bytes(b"audio")
+
+        path = self.main._recording_path_or_404(r"C:\archive\Existing.TXT", target_dir=target)
+        audio_path = self.main._recording_audio_path(r"C:\archive\Existing.TXT", target_dir=target)
+
+        self.assertEqual(path, existing)
+        self.assertEqual(audio_path, audio)
+
+    def test_save_recording_existing_name_normalizes_windows_path_leaf(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.TXT"
+        existing.write_text("old", encoding="utf-8")
+
+        result = self.main.save_recording({
+            "name": r"C:\archive\Existing.TXT",
+            "archive_dir": str(target),
+            "require_existing": "true",
+            "title": "Existing",
+            "source_text": "source",
+            "transcript_text": "updated",
+        })
+
+        self.assertEqual(result["name"], "Existing.TXT")
+        self.assertTrue(existing.exists())
+        self.assertFalse((target / r"C:\archive\Existing.TXT").exists())
+        self.assertIn("updated", existing.read_text(encoding="utf-8"))
 
     def test_get_recording_uses_archive_dir_for_duplicate_names(self):
         root = (Path(self._tmp.name) / "recordings").resolve()
@@ -343,6 +541,38 @@ class RecordingNameTests(unittest.TestCase):
             sum(1 for p in target.iterdir() if p.name.lower() == "existing.txt"),
             1,
         )
+        self.assertIn("updated", existing.read_text(encoding="utf-8"))
+
+    def test_save_with_audio_existing_name_normalizes_windows_path_leaf(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.TXT"
+        existing.write_text("old", encoding="utf-8")
+        upload_file = self.main.UploadFile(
+            io.BytesIO(b"tiny wav payload"),
+            filename="replacement.wav",
+            size=len(b"tiny wav payload"),
+        )
+
+        result = asyncio.run(self.main.save_recording_with_audio(
+            file=upload_file,
+            name=r"C:\archive\Existing.TXT",
+            archive_dir=str(target),
+            require_existing=True,
+            title="Existing",
+            source_text="source",
+            transcript_text="updated",
+            provider="local",
+            model="small",
+            language="ru",
+            recording_collection="",
+            live_session_id="",
+        ))
+
+        self.assertEqual(result["name"], "Existing.TXT")
+        self.assertTrue(existing.exists())
+        self.assertTrue((target / "Existing.wav").exists())
+        self.assertFalse((target / r"C:\archive\Existing.TXT").exists())
         self.assertIn("updated", existing.read_text(encoding="utf-8"))
 
     def test_save_with_audio_restores_existing_audio_when_new_upload_fails(self):

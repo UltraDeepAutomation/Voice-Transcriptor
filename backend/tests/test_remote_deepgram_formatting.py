@@ -72,6 +72,17 @@ class DeepgramFormattingTests(unittest.TestCase):
                 )
         request.assert_not_called()
 
+    def test_malformed_provider_response_is_not_saved_as_empty_success(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"metadata": {"request_id": "dg-123"}}
+
+        with mock.patch("backend.remote_deepgram.request_with_retry", return_value=FakeResponse()):
+            with self.assertRaises(DeepgramRemoteError):
+                deepgram_transcribe(api_key="dg", audio_bytes=b"wav", filename="audio.wav")
+
     def test_small_live_recovery_payload_fails_fast(self):
         self.assertEqual(_deepgram_http_policy(40_379), ((10, 12), 1))
 
