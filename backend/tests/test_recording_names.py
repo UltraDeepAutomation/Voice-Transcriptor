@@ -630,6 +630,46 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(old_audio.read_bytes(), b"old audio")
         self.assertEqual(existing.read_text(encoding="utf-8"), "old")
 
+    def test_save_with_audio_aborts_if_existing_audio_backup_fails(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.txt"
+        existing.write_text("old", encoding="utf-8")
+        old_audio = target / "Existing.wav"
+        old_audio.write_bytes(b"old audio")
+
+        async def writer(tmp_audio: Path) -> None:
+            tmp_audio.write_bytes(b"new audio")
+
+        real_replace = os.replace
+
+        def fail_backup_replace(src, dst):
+            if Path(src).resolve() == old_audio.resolve():
+                raise OSError("locked old audio")
+            return real_replace(src, dst)
+
+        with mock.patch.object(self.main.os, "replace", side_effect=fail_backup_replace):
+            with self.assertRaises(self.main.HTTPException) as cm:
+                asyncio.run(self.main._save_recording_audio_source(
+                    orig_name="replacement.wav",
+                    write_tmp_audio=writer,
+                    name="Existing.txt",
+                    archive_dir=str(target),
+                    require_existing=True,
+                    title="Existing",
+                    source_text="source",
+                    transcript_text="updated",
+                    provider="local",
+                    model="small",
+                    language="ru",
+                    recording_collection="",
+                    live_session_id="",
+                ))
+
+        self.assertEqual(cm.exception.status_code, 500)
+        self.assertEqual(old_audio.read_bytes(), b"old audio")
+        self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+
     def test_save_with_audio_does_not_fail_when_old_sidecar_cleanup_fails(self):
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()

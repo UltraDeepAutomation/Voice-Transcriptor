@@ -238,6 +238,35 @@ class TestConfigLifecycle(unittest.TestCase):
         self.assertTrue(kf.exists())
         self.assertGreater(len(kf.read_bytes()), 0)
 
+    def test_legacy_recording_migration_copies_every_canonical_audio_ext(self):
+        legacy_root = tempfile.TemporaryDirectory()
+        self.addCleanup(legacy_root.cleanup)
+        legacy_data = os.path.join(legacy_root.name, "legacy-data")
+        legacy_recordings = os.path.join(legacy_data, "recordings")
+        os.makedirs(legacy_recordings)
+
+        transcript = os.path.join(legacy_recordings, "Clip.txt")
+        with open(transcript, "w", encoding="utf-8") as f:
+            f.write("legacy transcript")
+        for ext in self.config_mod.AUDIO_EXT_TO_MIME.keys():
+            with open(os.path.join(legacy_recordings, f"Clip{ext}"), "wb") as f:
+                f.write(ext.encode("ascii"))
+
+        self.config_mod.LEGACY_DATA_DIR = self.config_mod.Path(legacy_data)
+        self.config_mod._migrate_legacy_data()
+
+        migrated_recordings = self.config_mod.DATA_DIR / "recordings"
+        self.assertEqual(
+            (migrated_recordings / "Clip.txt").read_text(encoding="utf-8"),
+            "legacy transcript",
+        )
+        for ext in self.config_mod.AUDIO_EXT_TO_MIME.keys():
+            with self.subTest(ext=ext):
+                self.assertEqual(
+                    (migrated_recordings / f"Clip{ext}").read_bytes(),
+                    ext.encode("ascii"),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

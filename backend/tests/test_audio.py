@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import io
+import numpy as np
+import soundfile as sf
 from pathlib import Path
 from unittest import mock
 
@@ -128,6 +130,40 @@ class AudioCommandTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(call.get("fail_on_decode_error") for call in calls))
+
+    def test_no_ffmpeg_fallback_rejects_non_pcm16_wav_instead_of_copying(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "float.wav"
+            dst = Path(td) / "out.wav"
+            sf.write(
+                src,
+                np.zeros((LIVE_SAMPLE_RATE_HZ, 1), dtype=np.float32),
+                LIVE_SAMPLE_RATE_HZ,
+                subtype="FLOAT",
+            )
+
+            with mock.patch("backend.audio._has_ffmpeg", return_value=False):
+                with self.assertRaisesRegex(AudioError, "PCM_16"):
+                    ensure_wav_16k(str(src), str(dst), channels=1)
+
+            self.assertFalse(dst.exists())
+
+    def test_no_ffmpeg_preserve_channels_rejects_non_pcm16_wav(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "float-stereo.wav"
+            dst = Path(td) / "out.wav"
+            sf.write(
+                src,
+                np.zeros((LIVE_SAMPLE_RATE_HZ, 2), dtype=np.float32),
+                LIVE_SAMPLE_RATE_HZ,
+                subtype="FLOAT",
+            )
+
+            with mock.patch("backend.audio._has_ffmpeg", return_value=False):
+                with self.assertRaisesRegex(AudioError, "PCM_16"):
+                    ensure_wav_16k_preserve_channels(str(src), str(dst))
+
+            self.assertFalse(dst.exists())
 
 
 if __name__ == "__main__":

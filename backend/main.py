@@ -5162,8 +5162,16 @@ async def _save_recording_audio_source(
             # permanent backup of the prior audio on disk forever.
             audio_backup = out_audio.with_name(f"{out_audio.name}.tmp-{uuid.uuid4().hex}")
             os.replace(out_audio, audio_backup)
-        except OSError:
-            audio_backup = None  # Couldn't backup — rollback will only be safe for new-recording path
+        except OSError as backup_err:
+            logger.warning(
+                "recording audio backup failed for %s: %s",
+                out_audio,
+                backup_err,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="could not preserve existing recording audio before replacement",
+            ) from backup_err
     new_audio_placed = False
     save_completed = False
     try:

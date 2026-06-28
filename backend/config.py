@@ -47,6 +47,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict
 
+from backend.audio_mime import AUDIO_EXT_TO_MIME
 from backend.storage import atomic_copy_file, atomic_write_bytes, atomic_write_json, rotate_backup
 
 logger = logging.getLogger(__name__)
@@ -440,7 +441,7 @@ def _migrate_legacy_data() -> None:
                     if not dst.exists():
                         atomic_copy_file(p, dst)
                     stem = p.stem
-                    for ext in (".wav", ".m4a", ".mp3", ".flac", ".ogg", ".aac", ".mp4", ".webm"):
+                    for ext in sorted(AUDIO_EXT_TO_MIME.keys()):
                         audio_src = legacy_rec / f"{stem}{ext}"
                         audio_dst = new_rec / audio_src.name
                         if audio_src.exists() and not audio_dst.exists():

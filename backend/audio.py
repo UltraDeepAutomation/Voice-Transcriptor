@@ -415,15 +415,22 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg`) or upload a WAV file."
         )
 
-    data, sr = sf.read(path_in, always_2d=True)
-    if sr != LIVE_SAMPLE_RATE_HZ:
+    try:
+        info = sf.info(path_in)
+    except Exception as exc:
+        raise AudioError("Unable to inspect WAV file without ffmpeg") from exc
+    if int(info.samplerate) != LIVE_SAMPLE_RATE_HZ:
         raise AudioError(
             f"ffmpeg is not installed. Please upload a {LIVE_SAMPLE_RATE_HZ} Hz WAV "
             "(or install ffmpeg for auto-convert)."
         )
-    if data.shape[1] != channels:
+    if int(info.channels) != int(channels):
         raise AudioError(
-            f"Audio has {data.shape[1]} channel(s), but {channels} required (install ffmpeg to convert)."
+            f"Audio has {info.channels} channel(s), but {channels} required (install ffmpeg to convert)."
+        )
+    if str(info.subtype or "").upper() != "PCM_16":
+        raise AudioError(
+            "Audio WAV subtype is not PCM_16; install ffmpeg to normalize it."
         )
     # Copy atomically: write to tmp then rename. A raw copyfile()
     # leaves the destination truncated on ENOSPC, and a subsequent
@@ -484,14 +491,21 @@ def ensure_wav_16k_preserve_channels(path_in: str, path_out: str) -> str:
             "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg`) or upload a WAV file."
         )
 
-    data, sr = sf.read(path_in, always_2d=True)
-    if sr != LIVE_SAMPLE_RATE_HZ:
+    try:
+        info = sf.info(path_in)
+    except Exception as exc:
+        raise AudioError("Unable to inspect WAV file without ffmpeg") from exc
+    if int(info.samplerate) != LIVE_SAMPLE_RATE_HZ:
         raise AudioError(
             f"ffmpeg is not installed. Please upload a {LIVE_SAMPLE_RATE_HZ} Hz WAV "
             "(or install ffmpeg for auto-convert)."
         )
-    if data.shape[1] < 1:
+    if int(info.channels) < 1:
         raise AudioError("Audio has no readable channels")
+    if str(info.subtype or "").upper() != "PCM_16":
+        raise AudioError(
+            "Audio WAV subtype is not PCM_16; install ffmpeg to normalize it."
+        )
     _copy_file_atomic(path_in, path_out)
     return path_out
 

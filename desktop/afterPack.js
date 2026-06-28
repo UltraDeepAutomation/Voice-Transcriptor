@@ -120,9 +120,13 @@ function classifyMacho(filePath) {
     // Fat Mach-O: magic is BE (cafebabe / cafebabf). Read one
     // nested arch's thin header to determine the real filetype.
     if (magicBE === 0xcafebabe || magicBE === 0xcafebabf) {
-      const fatHdr = Buffer.alloc(24); // magic(4)+nfat(4)+first fat_arch(16)
+      // Enough for FAT32's 32-bit offset and FAT64's high+low 64-bit offset.
+      const fatHdr = Buffer.alloc(24);
       if (readSync(fd, fatHdr, 0, 24, 0) < 24) return "macho-other";
-      const firstOff = fatHdr.readUInt32BE(16);
+      const firstOff = magicBE === 0xcafebabf
+        ? Number(fatHdr.readBigUInt64BE(16))
+        : fatHdr.readUInt32BE(16);
+      if (!Number.isSafeInteger(firstOff) || firstOff <= 0) return "macho-other";
       const thinHdr = Buffer.alloc(16);
       if (readSync(fd, thinHdr, 0, 16, firstOff) < 16) return "macho-other";
       const thinMagic = thinHdr.readUInt32LE(0);
