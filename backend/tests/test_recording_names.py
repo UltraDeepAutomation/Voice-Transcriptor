@@ -116,6 +116,13 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(self.main._recording_stem("con.txt"), "_con")
         self.assertEqual(self.main._recording_stem(r"C:\notes\aux.txt"), "_aux")
 
+    def test_existing_recording_leaf_rejects_windows_reserved_names(self):
+        for raw_name in ("CON.txt", "aux.TXT", r"C:\notes\nul.txt"):
+            with self.subTest(raw_name=raw_name):
+                with self.assertRaises(self.main.HTTPException) as cm:
+                    self.main._recording_text_name_leaf(raw_name)
+                self.assertEqual(cm.exception.status_code, 400)
+
     def test_safe_error_text_redacts_quoted_paths_with_spaces(self):
         text = (
             "failed to open '/Users/alice/Library/Application Support/Voice Transcriptor/config.json' "
@@ -358,6 +365,23 @@ class RecordingNameTests(unittest.TestCase):
         self.assertTrue(existing.exists())
         self.assertFalse((target / r"C:\archive\Existing.TXT").exists())
         self.assertIn("updated", existing.read_text(encoding="utf-8"))
+
+    def test_failed_text_save_does_not_register_archive_dir(self):
+        target = Path(self._tmp.name) / "custom-recordings"
+        target.mkdir()
+
+        with mock.patch.object(self.main, "_atomic_write_text", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.main.save_recording({
+                    "archive_dir": str(target),
+                    "title": "Will fail",
+                    "source_text": "source",
+                    "transcript_text": "transcript",
+                })
+
+        registry = self.main._ARCHIVE_DIR_REGISTRY_PATH
+        registered = registry.read_text(encoding="utf-8") if registry.exists() else ""
+        self.assertNotIn(str(target.resolve()), registered)
 
     def test_get_recording_uses_archive_dir_for_duplicate_names(self):
         root = (Path(self._tmp.name) / "recordings").resolve()
@@ -606,6 +630,74 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(old_audio.read_bytes(), b"old audio")
         self.assertEqual(existing.read_text(encoding="utf-8"), "old")
 
+    def test_save_with_audio_does_not_fail_when_old_sidecar_cleanup_fails(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        existing = target / "Existing.txt"
+        existing.write_text("old", encoding="utf-8")
+        old_audio = target / "Existing.webm"
+        old_audio.write_bytes(b"old audio")
+
+        async def writer(tmp_audio: Path) -> None:
+            tmp_audio.write_bytes(b"new audio")
+
+        real_unlink = Path.unlink
+
+        def flaky_unlink(path_obj: Path, *args, **kwargs):
+            if path_obj.resolve() == old_audio.resolve():
+                raise OSError("locked old audio")
+            return real_unlink(path_obj, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", flaky_unlink):
+            result = asyncio.run(self.main._save_recording_audio_source(
+                orig_name="replacement.wav",
+                write_tmp_audio=writer,
+                name="Existing.txt",
+                archive_dir=str(target),
+                require_existing=True,
+                title="Existing",
+                source_text="source",
+                transcript_text="updated",
+                provider="local",
+                model="small",
+                language="ru",
+                recording_collection="",
+                live_session_id="",
+            ))
+
+        self.assertEqual(result["name"], "Existing.txt")
+        self.assertTrue((target / "Existing.wav").exists())
+        self.assertTrue(old_audio.exists())
+        self.assertIn("updated", existing.read_text(encoding="utf-8"))
+
+    def test_failed_audio_save_does_not_register_archive_dir(self):
+        target = Path(self._tmp.name) / "custom-audio-recordings"
+        target.mkdir()
+
+        async def failing_writer(_tmp_audio: Path) -> None:
+            raise OSError("disk full")
+
+        with self.assertRaises(OSError):
+            asyncio.run(self.main._save_recording_audio_source(
+                orig_name="replacement.wav",
+                write_tmp_audio=failing_writer,
+                name="",
+                archive_dir=str(target),
+                require_existing=False,
+                title="Will fail",
+                source_text="source",
+                transcript_text="transcript",
+                provider="local",
+                model="small",
+                language="ru",
+                recording_collection="",
+                live_session_id="",
+            ))
+
+        registry = self.main._ARCHIVE_DIR_REGISTRY_PATH
+        registered = registry.read_text(encoding="utf-8") if registry.exists() else ""
+        self.assertNotIn(str(target.resolve()), registered)
+
     def test_claim_recording_text_path_is_atomic_for_parallel_new_saves(self):
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
@@ -649,6 +741,27 @@ class RecordingNameTests(unittest.TestCase):
 
         self.assertEqual(list(target.glob("*.tmp-*.claim")), [])
         self.assertEqual(len(list(target.glob("*.txt"))), 2)
+
+    def test_claim_cleanup_failure_does_not_mask_successful_text_write(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        out = target / "note.txt"
+        claim = self.main._recording_text_claim_path(out)
+        claim.mkdir()
+
+        self.main._write_recording_text_file(
+            out=out,
+            title="note",
+            source_text="source",
+            transcript_text="transcript",
+            provider="local",
+            model="small",
+            language="ru",
+        )
+
+        self.assertTrue(out.exists())
+        self.assertTrue(claim.exists())
+        self.assertIn("transcript", out.read_text(encoding="utf-8"))
 
     def test_failed_upload_validation_does_not_leave_queued_jobs(self):
         before = set(self.main.jobs._jobs)
@@ -750,6 +863,42 @@ class RecordingNameTests(unittest.TestCase):
             side_effect=OSError("locked recovery sidecar"),
         ):
             self.assertFalse(self.main._safe_delete_live_recovery("session-1"))
+
+    def test_discard_live_recovery_uses_safe_delete_path(self):
+        with mock.patch.object(
+            self.main,
+            "_delete_live_recovery",
+            side_effect=OSError("locked recovery sidecar"),
+        ):
+            self.assertEqual(
+                self.main.discard_live_recovery("session-1", _auth=None),
+                {"ok": True, "deleted": False},
+            )
+
+    def test_delete_upscale_preset_reports_controlled_error_on_unlink_failure(self):
+        preset_path = self.main._upscale_preset_path("custom_delete")
+        self.main._write_upscale_preset(
+            preset_path,
+            {
+                "id": "custom_delete",
+                "name": "Custom",
+                "instruction": "Clean this transcript.",
+                "builtin": False,
+            },
+        )
+        real_unlink = Path.unlink
+
+        def flaky_unlink(path_obj: Path, *args, **kwargs):
+            if path_obj.resolve() == preset_path.resolve():
+                raise OSError("locked preset")
+            return real_unlink(path_obj, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", flaky_unlink):
+            with self.assertRaises(self.main.HTTPException) as cm:
+                self.main.delete_upscale_preset("custom_delete", _auth=None)
+
+        self.assertEqual(cm.exception.status_code, 500)
+        self.assertEqual(cm.exception.detail, "could not delete preset")
 
 
 if __name__ == "__main__":

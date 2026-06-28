@@ -28,6 +28,7 @@ const PYTHON_ENV_SCRUB_KEYS = Object.freeze([
   "VIRTUAL_ENV",
   "PYTHONUSERBASE",
 ]);
+const RUN_COMMAND_OUTPUT_MAX_CHARS = 1024 * 1024;
 
 // Register process-level crash handlers IMMEDIATELY — the previous
 // registration happened inside app.whenReady().then(...), meaning any
@@ -5225,6 +5226,25 @@ function runCommand(cmd, args, options = {}) {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    const appendBoundedOutput = (current, chunk, streamName) => {
+      const next = current + String(chunk || "");
+      if (next.length <= RUN_COMMAND_OUTPUT_MAX_CHARS) return next;
+      if (streamName === "stdout") stdoutTruncated = true;
+      if (streamName === "stderr") stderrTruncated = true;
+      return next.slice(-RUN_COMMAND_OUTPUT_MAX_CHARS);
+    };
+    const finalStdout = () => (
+      stdoutTruncated
+        ? `[stdout truncated to last ${RUN_COMMAND_OUTPUT_MAX_CHARS} chars]\n${stdout}`
+        : stdout
+    );
+    const finalStderr = () => (
+      stderrTruncated
+        ? `[stderr truncated to last ${RUN_COMMAND_OUTPUT_MAX_CHARS} chars]\n${stderr}`
+        : stderr
+    );
     // Three independent code paths (timeout, child error, child close)
     // can all reach ``resolve``; the first wins, the rest are no-ops.
     // Without this guard, an error fired BETWEEN the timeout's
@@ -5253,25 +5273,25 @@ function runCommand(cmd, args, options = {}) {
       try {
         child.kill("SIGKILL");
       } catch { }
-      settleOnce({ ok: false, code: -1, stdout, stderr: `${stderr}\nTimed out` });
+      settleOnce({ ok: false, code: -1, stdout: finalStdout(), stderr: `${finalStderr()}\nTimed out` });
     }, timeoutMs);
 
     child.stdout.on("data", (d) => {
-      stdout += d.toString();
+      stdout = appendBoundedOutput(stdout, d.toString(), "stdout");
     });
 
     child.stderr.on("data", (d) => {
-      stderr += d.toString();
+      stderr = appendBoundedOutput(stderr, d.toString(), "stderr");
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
-      settleOnce({ ok: false, code: -1, stdout, stderr: `${stderr}\n${err.message}` });
+      settleOnce({ ok: false, code: -1, stdout: finalStdout(), stderr: `${finalStderr()}\n${err.message}` });
     });
 
     child.on("close", (code) => {
       clearTimeout(timer);
-      settleOnce({ ok: code === 0, code: code ?? -1, stdout, stderr });
+      settleOnce({ ok: code === 0, code: code ?? -1, stdout: finalStdout(), stderr: finalStderr() });
     });
   });
 }
@@ -5926,9 +5946,25 @@ async function startBackend() {
 function waitForBackendHealth(url, timeoutMs) {
   const started = Date.now();
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const settleOk = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const settleErr = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    const scheduleRetry = () => {
+      if (settled) return;
+      setTimeout(tick, 250);
+    };
     const tick = () => {
+      if (settled) return;
       if (Date.now() - started > timeoutMs) {
-        reject(new Error("Backend did not start in time"));
+        settleErr(new Error("Backend did not start in time"));
         return;
       }
       const req = http.get(url, (res) => {
@@ -5947,9 +5983,9 @@ function waitForBackendHealth(url, timeoutMs) {
             if (payload?.boot_nonce !== BACKEND_BOOT_NONCE) {
               throw new Error("backend boot nonce mismatch");
             }
-            resolve();
+            settleOk();
           } catch {
-            setTimeout(tick, 250);
+            scheduleRetry();
           }
         });
       });
@@ -5963,7 +5999,7 @@ function waitForBackendHealth(url, timeoutMs) {
       req.setTimeout(2000, () => {
         try { req.destroy(); } catch { }
       });
-      req.on("error", () => setTimeout(tick, 250));
+      req.on("error", scheduleRetry);
     };
     tick();
   });

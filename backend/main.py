@@ -1051,13 +1051,10 @@ def _promote_live_recovery(
                 # Roll back: if the text write failed after the audio was
                 # already placed at its final path, delete the orphaned
                 # audio so it doesn't leak on disk with no .txt sibling.
-                try:
-                    audio_out.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                _best_effort_unlink(audio_out, context="live recovery promotion rollback")
                 raise
             finally:
-                tmp_audio.unlink(missing_ok=True)
+                _best_effort_unlink(tmp_audio, context="live recovery tmp cleanup")
             # Same retention policy as ``save_recording_with_audio``: recovered
             # sessions are the new "latest", so older audio files in the archive
             # get pruned.
@@ -1314,7 +1311,19 @@ def _recording_text_name_leaf(name: str) -> str:
     leaf = os.path.basename(raw).strip()
     if "\x00" in raw or leaf in {"", ".", ".."} or not leaf.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="invalid recording name")
+    reserved_probe = Path(leaf).stem.lower()
+    if reserved_probe in _WINDOWS_RESERVED_BASENAMES:
+        raise HTTPException(status_code=400, detail="invalid recording name")
     return leaf
+
+
+def _best_effort_unlink(path: Path, *, context: str) -> bool:
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        logger.warning("%s: failed to remove %s: %s", context, path, exc)
+        return False
 
 
 def _validate_audio_filename(name: str) -> None:
@@ -2539,7 +2548,7 @@ def _write_recording_text_file(
             ),
         )
     finally:
-        claim.unlink(missing_ok=True)
+        _best_effort_unlink(claim, context="recording text claim cleanup")
 
 
 def _extract_stats_text(content: str) -> str:
@@ -3555,7 +3564,7 @@ def list_live_recoveries(_auth: None = Depends(_require_api_auth)):
 
 @app.post("/api/live/recoveries/{session_id}/discard")
 def discard_live_recovery(session_id: str, _auth: None = Depends(_require_api_auth)):
-    deleted = _delete_live_recovery(session_id)
+    deleted = _safe_delete_live_recovery(session_id)
     return {"ok": True, "deleted": deleted}
 
 
@@ -4425,7 +4434,11 @@ def delete_upscale_preset(preset_id: str, _auth: None = Depends(_require_api_aut
     if bool(item.get("builtin")):
         raise HTTPException(status_code=400, detail="built-in presets cannot be deleted")
     p = _upscale_preset_path(preset_id)
-    p.unlink(missing_ok=True)
+    try:
+        p.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("upscale preset delete failed for %s: %s", preset_id, exc)
+        raise HTTPException(status_code=500, detail="could not delete preset") from exc
     return {"ok": True}
 
 
@@ -5044,13 +5057,6 @@ def save_recording(
         collection=recording_collection,
         create=not require_existing,
     )
-    # SSOT consistency with save_recording_with_audio (line 3799): every
-    # save into a custom archive dir must register that dir so
-    # `_retroactive_audio_retention` and `_get_known_archive_dirs`
-    # know about it. Previously only the audio-bearing save called
-    # `_register_archive_dir`; a text-only save into a brand-new
-    # custom folder left the dir invisible to retention sweeps.
-    _register_archive_dir(target_dir)
     claimed_new_text = False
     if existing_name:
         out = target_dir / existing_name
@@ -5073,11 +5079,11 @@ def save_recording(
         )
     except Exception:
         if claimed_new_text:
-            try:
-                out.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _best_effort_unlink(out, context="recording save rollback")
         raise
+    # Register only after durable user data exists. A failed save should
+    # not pollute the archive registry with an empty or invalid target dir.
+    _register_archive_dir(target_dir)
     _invalidate_recordings_cache()
     return {"ok": True, "name": out.name, "archive_dir": str(target_dir)}
 
@@ -5119,9 +5125,6 @@ async def _save_recording_audio_source(
         collection=recording_collection,
         create=not bool(require_existing),
     )
-    # Persist this dir so startup retroactive retention covers it even if
-    # the user changes their default recordings_dir between app launches.
-    _register_archive_dir(target_dir)
     claimed_new_text = False
     if existing_name:
         stem = Path(existing_name).stem
@@ -5183,10 +5186,7 @@ async def _save_recording_audio_source(
         # restore it. This covers write_tmp_audio/os.replace failures as
         # well as text-write failures.
         if new_audio_placed:
-            try:
-                out_audio.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _best_effort_unlink(out_audio, context="recording audio save rollback")
         if audio_backup is not None and audio_backup.exists():
             try:
                 os.replace(audio_backup, out_audio)
@@ -5194,22 +5194,19 @@ async def _save_recording_audio_source(
             except OSError as restore_err:
                 logger.warning("audio rollback restore failed; backup left at %s: %s", audio_backup, restore_err)
         if claimed_new_text:
-            try:
-                out_text.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _best_effort_unlink(out_text, context="recording text save rollback")
         raise
     finally:
-        tmp_audio.unlink(missing_ok=True)
+        _best_effort_unlink(tmp_audio, context="recording tmp audio cleanup")
         # Remove any orphaned backup after a successful save. The
         # backup only survives here on the happy path (no rollback).
         if save_completed and audio_backup is not None and audio_backup.exists():
-            try:
-                audio_backup.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _best_effort_unlink(audio_backup, context="recording audio backup cleanup")
     if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
-        existing_audio.unlink(missing_ok=True)
+        _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
+    # Persist this dir only after transcript + audio are durable so startup
+    # retroactive retention does not learn failed/empty archive targets.
+    _register_archive_dir(target_dir)
     # Audio retention: only the NEWEST recording keeps its audio file.
     # Delete audio from every older recording in the same archive so
     # the user never ends up with gigabytes of old takes piling up.
