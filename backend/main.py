@@ -816,9 +816,9 @@ def _delete_live_recovery(session_id: str) -> bool:
     pcm_path, meta_path = _live_recovery_paths(session_id)
     if pcm_path is None:
         return False
-    pcm_path.unlink(missing_ok=True)
     if meta_path is not None:
         meta_path.unlink(missing_ok=True)
+    pcm_path.unlink(missing_ok=True)
     return True
 
 

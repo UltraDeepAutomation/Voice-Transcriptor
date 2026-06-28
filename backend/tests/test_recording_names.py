@@ -976,6 +976,26 @@ class RecordingNameTests(unittest.TestCase):
         ):
             self.assertFalse(self.main._safe_delete_live_recovery("session-1"))
 
+    def test_delete_live_recovery_preserves_pcm_when_metadata_delete_fails(self):
+        session_id = "preservepcm"
+        pcm_path = self.main.LIVE_RECOVERY_DIR / f"20260101_000000_{session_id}.pcm16"
+        meta_path = pcm_path.with_suffix(".json")
+        pcm_path.write_bytes(b"\x00\x00" * self.main.LIVE_SAMPLE_RATE_HZ)
+        meta_path.write_text('{"session_id":"preservepcm"}', encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def fail_meta_unlink(path_obj: Path, *args, **kwargs):
+            if path_obj.resolve() == meta_path.resolve():
+                raise OSError("locked metadata")
+            return real_unlink(path_obj, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", fail_meta_unlink):
+            with self.assertRaises(OSError):
+                self.main._delete_live_recovery(session_id)
+
+        self.assertTrue(pcm_path.exists())
+        self.assertTrue(meta_path.exists())
+
     def test_discard_live_recovery_uses_safe_delete_path(self):
         with mock.patch.object(
             self.main,
