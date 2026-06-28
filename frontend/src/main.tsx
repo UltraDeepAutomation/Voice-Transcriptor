@@ -432,6 +432,7 @@ const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
 ]);
 const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
 const UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
+const UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200;
 const UPLOAD_QUEUE_MAX_PARALLEL = 2;
 const OPENROUTER_AUDIO_MODELS = [
@@ -10158,6 +10159,20 @@ function restoreUploadQueueSnapshot(): void {
     saveUploadQueueSnapshot();
   } catch (e) {
     console.warn("Upload queue snapshot parse failed", e);
+    try {
+      localStorage.setItem(`${UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
+    } catch (backupErr) {
+      console.warn("Upload queue corrupt snapshot backup failed", backupErr);
+    }
+    try {
+      localStorage.setItem(UPLOAD_QUEUE_STORAGE_KEY, JSON.stringify({
+        version: 1,
+        hideFinished: uploadHideFinished,
+        items: [],
+      } satisfies UploadQueueStoragePayload));
+    } catch (repairErr) {
+      console.warn("Upload queue snapshot repair failed", repairErr);
+    }
   }
 }
 
