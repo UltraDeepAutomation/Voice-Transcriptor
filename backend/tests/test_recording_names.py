@@ -268,6 +268,34 @@ class RecordingNameTests(unittest.TestCase):
             Path(recovery["pcm_path"]).unlink(missing_ok=True)
             Path(recovery["meta_path"]).unlink(missing_ok=True)
 
+    def test_live_recovery_open_failure_rolls_back_metadata(self):
+        started_at = self.main.datetime.now()
+        session_id = "openfail"
+        stem = f"{started_at.strftime('%Y%m%d_%H%M%S')}_{session_id}"
+        pcm_path = self.main.LIVE_RECOVERY_DIR / f"{stem}.pcm16"
+        meta_path = self.main.LIVE_RECOVERY_DIR / f"{stem}.json"
+        real_open = Path.open
+
+        def fail_pcm_open(path_obj: Path, *args, **kwargs):
+            if path_obj.resolve() == pcm_path.resolve():
+                raise OSError("pcm open failed")
+            return real_open(path_obj, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", fail_pcm_open):
+            with self.assertRaises(OSError):
+                self.main._open_live_recovery(
+                    session_id=session_id,
+                    started_at=started_at,
+                    provider="local",
+                    model="small",
+                    language="auto",
+                    archive_dir="",
+                    recording_collection=self.main.RECORDING_COLLECTION_LIVE,
+                )
+
+        self.assertFalse(pcm_path.exists())
+        self.assertFalse(meta_path.exists())
+
     def test_recording_collections_save_into_source_specific_folders(self):
         live = self.main.save_recording({
             "title": "Live note",

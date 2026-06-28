@@ -2988,7 +2988,12 @@ def _open_live_recovery(
     # the PCM itself is intact.
     atomic_write_json(meta_path, meta_payload)
 
-    pcm_file = pcm_path.open("wb", buffering=0)
+    try:
+        pcm_file = pcm_path.open("wb", buffering=0)
+    except BaseException:
+        _best_effort_unlink(pcm_path, context="live recovery open rollback")
+        _best_effort_unlink(meta_path, context="live recovery open rollback")
+        raise
     try:
         return {
             "session_id": session_id,
