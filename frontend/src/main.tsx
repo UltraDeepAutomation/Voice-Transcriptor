@@ -9770,6 +9770,7 @@ interface UploadQueueItem {
   savedName?: string;
   savedArchiveDir?: string;
   abortController?: AbortController;
+  cancelRequested?: boolean;
 }
 
 // The currently-selected queue item id — drives which transcript is
@@ -10391,6 +10392,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   }
   item.status = "transcribing";
   item.stage = useSourcePath ? "processing" : "uploading";
+  item.cancelRequested = false;
   item.startedAt = performance.now();
   // Per-item AbortController. Threaded through every fetch so
   // the user's Stop button can yank the in-flight request even
@@ -10481,6 +10483,13 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     }
     item.model = modelLabel;
     item.language = language;
+    if (item.cancelRequested) {
+      item.status = "cancelled";
+      item.stage = undefined;
+      item.endedAt = performance.now();
+      item.completedAt = Date.now();
+      return;
+    }
     // Persist to the History tab's archive. We pass the original
     // file so the audio is saved alongside the transcript and is
     // playable from the History row. `refreshList: true` triggers a
@@ -10534,7 +10543,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     // doesn't have to read a "AbortError: ..." message that's
     // basically meaningless to them.
     const isAbort = e instanceof DOMException && e.name === "AbortError";
-    if (isAbort) {
+    if (isAbort || item.cancelRequested) {
       item.status = "cancelled";
       item.stage = undefined;
     } else {
@@ -10547,6 +10556,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   } finally {
     clearTimeout(_stageTimer);
     item.abortController = undefined;
+    item.cancelRequested = false;
     renderUploadQueue();
   }
 }
@@ -10556,6 +10566,7 @@ function uploadStatusLabel(item: UploadQueueItem): string {
     case "queued":
       return "Queued";
     case "transcribing":
+      if (item.cancelRequested) return "Cancelling…";
       // Three labelled phases inside the outer "transcribing" status:
       //   uploading  → request body is being handed to the backend.
       //                fetch does not expose browser upload progress,
@@ -10618,14 +10629,14 @@ function cancelUploadItem(id: string): void {
     return;
   }
   if (item.status === "transcribing") {
+    if (item.cancelRequested) return;
+    item.cancelRequested = true;
     // Abort the in-flight fetch. The processor's catch will
     // see DOMException name === "AbortError" and mark it
     // cancelled (NOT error) so the queue UI distinguishes
     // user-cancelled from transcription failures.
     try { item.abortController?.abort(); } catch { /* idempotent */ }
-    // Status flip happens inside processUploadItem's finally;
-    // no need to set it here. Re-render just to disable the
-    // Stop button immediately for visual feedback.
+    saveUploadQueueSnapshot();
     renderUploadQueue();
   }
 }
@@ -10816,7 +10827,8 @@ function renderUploadQueue(): void {
       stopBtn.className = "upload-queue-item-stop";
       stopBtn.setAttribute("aria-label", "Stop transcription");
       stopBtn.title = "Stop transcription";
-      stopBtn.textContent = "Stop";
+      stopBtn.disabled = item.cancelRequested === true;
+      stopBtn.textContent = item.cancelRequested ? "Stopping" : "Stop";
       stopBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         cancelUploadItem(item.id);
