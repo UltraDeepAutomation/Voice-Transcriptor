@@ -111,6 +111,16 @@ class RecordingNameTests(unittest.TestCase):
 
         self.assertRegex(stem, r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}__spoken title$")
 
+    def test_recording_stem_availability_is_case_insensitive(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        (target / "meeting.TXT").write_text("existing", encoding="utf-8")
+        (target / "audio.WEBM").write_bytes(b"existing audio")
+
+        self.assertFalse(self.main._recording_stem_available(target, "Meeting"))
+        self.assertFalse(self.main._recording_stem_available(target, "AUDIO"))
+        self.assertTrue(self.main._recording_stem_available(target, "Another"))
+
     def test_txt_recording_stem_cannot_bypass_windows_reserved_names(self):
         self.assertEqual(self.main._safe_user_filename_part("con.txt"), "_con.txt")
         self.assertEqual(self.main._recording_stem("con.txt"), "_con")

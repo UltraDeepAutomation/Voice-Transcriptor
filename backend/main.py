@@ -1881,7 +1881,15 @@ def _recording_stem(name_or_title: str) -> str:
 
 
 def _recording_stem_available(target_dir: Path, stem: str) -> bool:
-    return not (target_dir / f"{stem}.txt").exists() and not any(target_dir.glob(f"{stem}.*"))
+    stem_key = str(stem or "").casefold()
+    try:
+        for entry in target_dir.iterdir():
+            if entry.stem.casefold() == stem_key:
+                return False
+    except OSError as exc:
+        logger.warning("recording stem availability scan failed for %s: %s", target_dir, exc)
+        return False
+    return True
 
 
 def _unique_stem_from_base(target_dir: Path, base: str, *, collision_suffix: str = "timestamp") -> str:
