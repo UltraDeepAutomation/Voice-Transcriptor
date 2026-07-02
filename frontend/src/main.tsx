@@ -3459,6 +3459,7 @@ interface PersistedLiveDraft {
   source_text?: string;
   transcript_text?: string;
   provider?: string;
+  provider_present?: boolean;
   model?: string;
   language?: string;
   archive_dir?: string;
@@ -3498,6 +3499,7 @@ function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
     source_text: pickString("source_text"),
     transcript_text: pickString("transcript_text"),
     provider: pickString("provider"),
+    provider_present: Object.prototype.hasOwnProperty.call(obj, "provider"),
     model: pickString("model"),
     language: pickString("language"),
     archive_dir: pickString("archive_dir"),
@@ -3533,7 +3535,9 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       title: String(draft.title || "Recovered recording") + " (Recovered)",
       sourceText,
       transcriptText,
-      provider: String(draft.provider || "local"),
+      provider: draft.provider_present
+        ? (String(draft.provider || "").trim() || "none")
+        : "local",
       model: String(draft.model || "-"),
       language: String(draft.language || "auto"),
       recordingCollection: RECORDING_COLLECTIONS.live,

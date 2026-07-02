@@ -794,7 +794,10 @@ async function execRendererJsWithTimeout(code, fallback, timeoutMs = 2000) {
 
 async function getRendererProviderChoice() {
   const v = await execRendererJsWithTimeout(
-    `(() => String((document.getElementById('providerSelect')?.value || 'local')).trim())();`,
+    `(() => {
+      const el = document.getElementById('providerSelect');
+      return String(el ? el.value : 'local').trim();
+    })();`,
     "local",
   );
   return normalizeProviderChoice(v);
