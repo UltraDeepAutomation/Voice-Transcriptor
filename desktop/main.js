@@ -599,16 +599,10 @@ function getOverlayWindowSize() {
   return getOverlayMeasuredWindowSize() || getOverlayFallbackWindowSize();
 }
 
-function applyOverlayGeometryPayload(rawPayload) {
-  let payload = null;
-  try {
-    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
-  } catch {
-    return;
-  }
+function applyOverlayGeometrySnapshot(payload) {
   const width = Number(payload?.width);
   const height = Number(payload?.height);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
   const next = {
     width: clampOverlayDimension(width, 1, OVERLAY_TOKENS.window.maxWidth),
     height: clampOverlayDimension(height, 1, OVERLAY_TOKENS.window.maxHeight),
@@ -623,10 +617,45 @@ function applyOverlayGeometryPayload(rawPayload) {
     prev.quickOpen === next.quickOpen &&
     prev.menuOpen === next.menuOpen
   ) {
-    return;
+    return false;
   }
   overlayContentGeometry = next;
   applyOverlayWindowSize();
+  return true;
+}
+
+function applyOverlayGeometryPayload(rawPayload) {
+  let payload = null;
+  try {
+    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
+  } catch {
+    return;
+  }
+  applyOverlayGeometrySnapshot(payload);
+}
+
+async function refreshOverlayGeometryFromRenderer(timeoutMs = 250) {
+  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return false;
+  let timer = null;
+  try {
+    const snapshot = await Promise.race([
+      overlayWin.webContents.executeJavaScript(
+        `(() => typeof window.__transcriptorOverlayGeometrySnapshot === 'function'
+          ? window.__transcriptorOverlayGeometrySnapshot()
+          : null)();`,
+        true,
+      ),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`overlay geometry timeout after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+    return applyOverlayGeometrySnapshot(snapshot);
+  } catch (e) {
+    appendMainLog(`[overlay-geometry] refresh skipped: ${compactLogText(e?.message || e)}`);
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function getOverlayInteractiveBounds() {
@@ -1631,8 +1660,7 @@ function createOverlayHtml() {
         cv.style.height = waveH + 'px';
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-        const emitGeometry = () => {
-          geometryEmitScheduled = false;
+        const readGeometrySnapshot = () => {
           const stackRect = stackEl.getBoundingClientRect();
           let left = stackRect.left;
           let top = stackRect.top;
@@ -1648,12 +1676,17 @@ function createOverlayHtml() {
           }
           const width = Math.max(1, Math.ceil(right - left));
           const height = Math.max(1, Math.ceil(bottom - top));
-          const payload = {
+          return {
             width,
             height,
             quickOpen: settingsSlot.classList.contains('on'),
             menuOpen
           };
+        };
+        window.__transcriptorOverlayGeometrySnapshot = readGeometrySnapshot;
+        const emitGeometry = () => {
+          geometryEmitScheduled = false;
+          const payload = readGeometrySnapshot();
           document.title = '__overlay_geometry__' + encodeURIComponent(JSON.stringify(payload));
         };
         const scheduleGeometryEmit = () => {
@@ -2494,9 +2527,8 @@ async function showRecordingOverlay() {
       true
     );
   } catch { }
-  try {
-    applyOverlayWindowSize();
-  } catch { }
+  await refreshOverlayGeometryFromRenderer();
+  applyOverlayWindowSize();
   ow.showInactive();
   await playOverlayCue("start");
   if (overlayWaveMonitor) {
@@ -2631,7 +2663,6 @@ async function ensureOverlayVisible(options = {}) {
       true
     );
   });
-  applyOverlayWindowSize();
   const jsParts = [];
   if (resetTimer) jsParts.push("window.resetTimer && window.resetTimer();");
   if (startTimer) jsParts.push("window.startTimer && window.startTimer();");
@@ -2641,6 +2672,8 @@ async function ensureOverlayVisible(options = {}) {
       ow.webContents.executeJavaScript(jsParts.join(" "), true)
     );
   }
+  await refreshOverlayGeometryFromRenderer();
+  applyOverlayWindowSize();
   ow.showInactive();
 }
 
