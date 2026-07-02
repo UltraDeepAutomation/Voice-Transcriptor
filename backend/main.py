@@ -43,6 +43,16 @@ from backend.audio_constants import (
     LIVE_RECOVERY_MIN_BYTES,
     LIVE_SAMPLE_RATE_HZ,
 )
+from backend.model_catalog import (
+    DEFAULT_DEEPGRAM_AUDIO_MODEL,
+    DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
+    DEFAULT_OPENROUTER_AUDIO_MODEL,
+    DEFAULT_OPENROUTER_UPSCALE_MODEL,
+    LOCAL_TRANSCRIPTION_MODELS,
+    OPENROUTER_UPSCALE_FALLBACK_MODELS,
+    REMOTE_TRANSCRIPTION_PROVIDERS,
+    health_model_catalog,
+)
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.audio import (
     AudioError,
@@ -418,8 +428,8 @@ SOURCE_MEDIA_STABILITY_PROBE_SEC = max(
     min(2.0, _env_int("TRANSCRIPTOR_SOURCE_MEDIA_STABILITY_PROBE_MS", 450) / 1000.0),
 )
 BOOT_NONCE = (os.environ.get("TRANSCRIPTOR_BOOT_NONCE") or "").strip()
-ALLOWED_LOCAL_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
-ALLOWED_REMOTE_PROVIDERS = {"openrouter", "deepgram"}
+ALLOWED_LOCAL_MODELS = set(LOCAL_TRANSCRIPTION_MODELS)
+ALLOWED_REMOTE_PROVIDERS = set(REMOTE_TRANSCRIPTION_PROVIDERS)
 ALLOWED_AUDIO_EXTS = {
     # Audio containers — natively understood by Deepgram REST and the
     # OpenRouter audio-input pipeline.
@@ -647,9 +657,10 @@ def _sweep_orphan_tmp_files() -> None:
 def _warm_default_local_model() -> None:
     try:
         started = time.perf_counter()
-        state = warm_model("small", probe=True)
+        state = warm_model(DEFAULT_LOCAL_TRANSCRIPTION_MODEL, probe=True)
         logger.info(
-            "default local model warmed: model=small load_ms=%d probe_ms=%d total_ms=%d",
+            "default local model warmed: model=%s load_ms=%d probe_ms=%d total_ms=%d",
+            DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
             int(state.get("loaded_ms", 0)),
             int(state.get("probe_ms", 0)),
             int((time.perf_counter() - started) * 1000),
@@ -849,7 +860,7 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                     "finished_at": str(raw.get("finished_at") or ""),
                     "sample_rate": int(raw.get("sample_rate") or LIVE_SAMPLE_RATE_HZ),
                     "bytes": bytes_count,
-                    "model": str(raw.get("model") or "small"),
+                    "model": str(raw.get("model") or DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
                     "language": str(raw.get("language") or "auto"),
                     "duration_sec": round(bytes_count / float(LIVE_PCM_BYTES_PER_SEC), 2),
                 }
@@ -1011,7 +1022,7 @@ def _promote_live_recovery(
 
             pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             started_at = str(meta.get("started_at") or "").strip()
-            model = str(meta.get("model") or "small").strip() or "small"
+            model = str(meta.get("model") or DEFAULT_LOCAL_TRANSCRIPTION_MODEL).strip() or DEFAULT_LOCAL_TRANSCRIPTION_MODEL
             language = str(meta.get("language") or "auto").strip() or "auto"
             pinned_archive_dir = str(meta.get("archive_dir") or "").strip()
             collection = _normalize_recording_collection(
@@ -1153,6 +1164,7 @@ def health():
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "accepted_audio_exts": sorted(ext.lstrip(".") for ext in ALLOWED_AUDIO_EXTS),
         "live_sample_rate_hz": LIVE_SAMPLE_RATE_HZ,
+        "model_catalog": health_model_catalog(),
         "boot_nonce": BOOT_NONCE,
     }
 
@@ -1160,9 +1172,9 @@ def health():
 @app.post("/api/transcribe/warmup")
 async def transcribe_warmup(
     _auth: None = Depends(_require_api_auth),
-    model: str = Form("small"),
+    model: str = Form(DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
 ):
-    model = _form_text(model, "small")
+    model = _form_text(model, DEFAULT_LOCAL_TRANSCRIPTION_MODEL)
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
     loop = asyncio.get_running_loop()
@@ -2861,7 +2873,7 @@ async def ws_transcribe(websocket: WebSocket):
                 session_id=session_id,
                 started_at=started_at,
                 provider=provider,
-                model=model or ("nova-3" if provider == "deepgram" else "small"),
+                model=model or (DEFAULT_DEEPGRAM_AUDIO_MODEL if provider == "deepgram" else DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
                 language=lang_opt or "auto",
                 archive_dir=archive_dir,
                 recording_collection=recording_collection,
@@ -2902,7 +2914,7 @@ async def ws_transcribe(websocket: WebSocket):
             await _run_deepgram_live_session(
                 websocket=websocket,
                 api_key=dg_key,
-                model=model or "nova-3",
+                model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
                 language=language,
                 diarize=diarize,
                 recovery=recovery_ctx,
@@ -2910,7 +2922,7 @@ async def ws_transcribe(websocket: WebSocket):
         else:
             await _run_local_live_session(
                 websocket=websocket,
-                model=model or "small",
+                model=model or DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
                 language=lang_opt,
                 recovery=recovery_ctx,
             )
@@ -3243,7 +3255,7 @@ async def _run_local_live_session(
 ) -> None:
     """Drive the local faster-whisper assist pipeline for a live session."""
     if model not in ALLOWED_LOCAL_MODELS:
-        model = "small"
+        model = DEFAULT_LOCAL_TRANSCRIPTION_MODEL
     session = LiveSession(model_name=model, language=language)
     stop = asyncio.Event()
 
@@ -3366,7 +3378,7 @@ async def _run_deepgram_live_session(
     the server state machine to either one.
     """
     dg_cfg = DeepgramLiveConfig(
-        model=model or "nova-3",
+        model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
         language=language or "auto",
         sample_rate=LIVE_SAMPLE_RATE_HZ,
         interim_results=True,
@@ -3618,13 +3630,13 @@ async def create_job(
     _auth: None = Depends(_require_api_auth),
     file: UploadFile = File(...),
     language: str = Form("auto"),
-    model: str = Form("small"),
+    model: str = Form(DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
     split_stereo: bool = Form(True),
     word_timestamps: bool = Form(False),
 ):
     _cleanup_expired_files()
     language = _form_text(language, "auto")
-    model = _form_text(model, "small")
+    model = _form_text(model, DEFAULT_LOCAL_TRANSCRIPTION_MODEL)
     split_stereo = _form_bool(split_stereo, True)
     word_timestamps = _form_bool(word_timestamps, False)
     if model not in ALLOWED_LOCAL_MODELS:
@@ -3656,7 +3668,7 @@ async def create_job_from_path(
     _auth: None = Depends(_require_api_auth),
 ):
     _cleanup_expired_files()
-    model = str((payload or {}).get("model") or "small").strip()
+    model = str((payload or {}).get("model") or DEFAULT_LOCAL_TRANSCRIPTION_MODEL).strip()
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
 
@@ -3688,12 +3700,12 @@ async def transcribe_sync(
     _auth: None = Depends(_require_api_auth),
     file: UploadFile = File(...),
     language: str = Form("auto"),
-    model: str = Form("small"),
+    model: str = Form(DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
     split_stereo: bool = Form(True),
     word_timestamps: bool = Form(False),
 ):
     language = _form_text(language, "auto")
-    model = _form_text(model, "small")
+    model = _form_text(model, DEFAULT_LOCAL_TRANSCRIPTION_MODEL)
     split_stereo = _form_bool(split_stereo, True)
     word_timestamps = _form_bool(word_timestamps, False)
     if model not in ALLOWED_LOCAL_MODELS:
@@ -3790,7 +3802,7 @@ def _run_remote_transcribe_once(
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("openrouter") or {}
         model = (
-            openrouter_model or pref.get("model") or "google/gemini-2.5-flash"
+            openrouter_model or pref.get("model") or DEFAULT_OPENROUTER_AUDIO_MODEL
         ).strip()
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
@@ -3810,7 +3822,7 @@ def _run_remote_transcribe_once(
 
     elif prov == "deepgram":
         dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
-        model = (openrouter_model or "nova-3").strip()
+        model = (openrouter_model or DEFAULT_DEEPGRAM_AUDIO_MODEL).strip()
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
             out = deepgram_transcribe(
@@ -4287,7 +4299,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
     providers = cfg.get("providers") or {}
     prefs = cfg.get("preferences") or {}
     key = ((providers.get("openrouter") or {}).get("key") or "").strip()
-    model = str((payload.get("model") or (prefs.get("openrouter") or {}).get("model") or "google/gemini-2.5-flash")).strip()
+    model = str((payload.get("model") or (prefs.get("openrouter") or {}).get("model") or DEFAULT_OPENROUTER_UPSCALE_MODEL)).strip()
     if not key:
         raise HTTPException(status_code=400, detail="OpenRouter key is not configured")
     instruction = str(preset.get("instruction") or "").strip()
@@ -4295,8 +4307,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
     for m in [
         model,
         str((prefs.get("openrouter") or {}).get("model") or "").strip(),
-        "google/gemini-2.5-flash",
-        "openai/gpt-4o-mini",
+        *OPENROUTER_UPSCALE_FALLBACK_MODELS,
     ]:
         mm = str(m or "").strip()
         if mm and mm not in candidates:

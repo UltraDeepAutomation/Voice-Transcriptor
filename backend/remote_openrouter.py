@@ -10,6 +10,11 @@ from typing import Any, Dict
 
 from backend.audio_mime import audio_content_type
 from backend.http_retry import RemoteError, request_with_retry
+from backend.model_catalog import (
+    DEFAULT_OPENROUTER_AUDIO_MODEL,
+    DEFAULT_OPENROUTER_UPSCALE_MODEL,
+    OPENROUTER_AUDIO_MODELS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +74,7 @@ def openrouter_transcribe(
         "Content-Type": "application/json",
     }
     payload: Dict[str, Any] = {
-        "model": model or "google/gemini-2.5-flash",
+        "model": model or DEFAULT_OPENROUTER_AUDIO_MODEL,
         "messages": [
             {
                 "role": "user",
@@ -117,7 +122,7 @@ def openrouter_transcribe(
         if "input_audio" in error_text.lower() or "image" in error_text.lower():
             raise RemoteError(
                 f"Model '{model}' does not support audio input. Please use a model that supports audio, "
-                f"such as: google/gemini-2.5-flash, openai/gpt-4o-audio-preview"
+                f"such as: {', '.join(OPENROUTER_AUDIO_MODELS)}"
             )
         raise RemoteError(f"openrouter failed: HTTP {r.status_code} {error_text}")
 
@@ -160,7 +165,7 @@ def openrouter_upscale_text(
         "Content-Type": "application/json",
     }
     payload: Dict[str, Any] = {
-        "model": model or "google/gemini-2.5-flash",
+        "model": model or DEFAULT_OPENROUTER_UPSCALE_MODEL,
         "messages": [
             {
                 "role": "system",

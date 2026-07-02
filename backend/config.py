@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from backend.audio_mime import AUDIO_EXT_TO_MIME
+from backend.model_catalog import DEFAULT_OPENROUTER_AUDIO_MODEL
 from backend.storage import atomic_copy_file, atomic_write_bytes, atomic_write_json, rotate_backup
 
 logger = logging.getLogger(__name__)
@@ -468,7 +469,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "remote_provider": "openrouter",
         "recordings_dir": "",
         "openrouter": {
-            "model": "google/gemini-2.5-flash",
+            "model": DEFAULT_OPENROUTER_AUDIO_MODEL,
         },
     },
 }

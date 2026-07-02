@@ -67,6 +67,7 @@ DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
 # both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL  # noqa: E402,F401
+from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
 
 
 @dataclass
@@ -81,7 +82,7 @@ class DeepgramLiveConfig:
     multilingual model) covers number formatting at live time.
     """
 
-    model: str = "nova-3"
+    model: str = DEFAULT_DEEPGRAM_AUDIO_MODEL
     language: str = "auto"
     # Constrained to ``LIVE_SAMPLE_RATE_HZ`` — the WS announces this
     # rate to Deepgram and the frontend downsampler targets it; any
@@ -127,7 +128,7 @@ class DeepgramLiveConfig:
 
     def to_query_string(self) -> str:
         params: dict[str, str] = {
-            "model": self.model or "nova-3",
+            "model": self.model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
             "encoding": "linear16",
             "sample_rate": str(int(self.sample_rate)),
             "channels": str(int(self.channels)),

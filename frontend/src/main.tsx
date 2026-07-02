@@ -436,7 +436,9 @@ const UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
 const UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200;
 const UPLOAD_QUEUE_MAX_PARALLEL = 2;
-const OPENROUTER_AUDIO_MODELS = [
+let LOCAL_TRANSCRIPTION_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
+let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small";
+let OPENROUTER_AUDIO_MODELS = [
   "google/gemini-2.5-flash",
   "google/gemini-2.0-flash-lite",
   "openai/gpt-4o-audio-preview",
@@ -447,9 +449,9 @@ const OPENROUTER_AUDIO_MODELS = [
 // new default required hunting all sites; missing one produced
 // drift between the cold-boot model and what the user actually
 // saw selected. Single named constant eliminates the hazard.
-const DEFAULT_OPENROUTER_AUDIO_MODEL = OPENROUTER_AUDIO_MODELS[0];
-const DEEPGRAM_AUDIO_MODELS = ["nova-3"];
-const DEFAULT_DEEPGRAM_AUDIO_MODEL = DEEPGRAM_AUDIO_MODELS[0];
+let DEFAULT_OPENROUTER_AUDIO_MODEL = OPENROUTER_AUDIO_MODELS[0];
+let DEEPGRAM_AUDIO_MODELS = ["nova-3"];
+let DEFAULT_DEEPGRAM_AUDIO_MODEL = DEEPGRAM_AUDIO_MODELS[0];
 
 /**
  * Text-generation models suitable for upscaling a raw transcript into
@@ -467,7 +469,7 @@ interface UpscaleModelOption {
   id: string;
   label: string;
 }
-const OPENROUTER_UPSCALE_MODELS: UpscaleModelOption[] = [
+let OPENROUTER_UPSCALE_MODELS: UpscaleModelOption[] = [
   { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
   { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   { id: "openai/gpt-4o-mini", label: "GPT-4o mini" },
@@ -475,7 +477,7 @@ const OPENROUTER_UPSCALE_MODELS: UpscaleModelOption[] = [
   { id: "anthropic/claude-3.5-sonnet", label: "Claude 3.5 Sonnet" },
   { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5" },
 ];
-const DEFAULT_UPSCALE_MODEL = OPENROUTER_UPSCALE_MODELS[0].id;
+let DEFAULT_UPSCALE_MODEL = OPENROUTER_UPSCALE_MODELS[0].id;
 
 function labelForUpscaleModel(id: string): string {
   const known = OPENROUTER_UPSCALE_MODELS.find((m) => m.id === id);
@@ -485,6 +487,112 @@ function labelForUpscaleModel(id: string): string {
   // blow out the dropdown width.
   const short = id.split("/").pop() || id;
   return short.replace(/-preview$/, "").trim() || id;
+}
+
+function normalizeModelList(value: unknown, fallback: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const source = Array.isArray(value) ? value : fallback;
+  for (const raw of source) {
+    const model = String(raw || "").trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    out.push(model);
+  }
+  return out.length ? out : fallback.slice();
+}
+
+function normalizeDefaultModel(value: unknown, models: string[], fallback: string): string {
+  const model = String(value || "").trim();
+  if (model && models.includes(model)) return model;
+  return models.includes(fallback) ? fallback : models[0] || fallback;
+}
+
+function normalizeUpscaleModelOptions(value: unknown, fallback: UpscaleModelOption[]): UpscaleModelOption[] {
+  const seen = new Set<string>();
+  const out: UpscaleModelOption[] = [];
+  const source = Array.isArray(value) ? value : fallback;
+  for (const raw of source) {
+    const item = raw && typeof raw === "object" ? raw as { id?: unknown; label?: unknown } : null;
+    const id = String(item?.id || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, label: String(item?.label || labelForUpscaleModel(id)).trim() || id });
+  }
+  return out.length ? out : fallback.slice();
+}
+
+function syncLocalModelOptions(): void {
+  const sel = document.getElementById("model") as HTMLSelectElement | null;
+  if (!sel) return;
+  const preferred = (sel.value || "").trim();
+  const nextValue = LOCAL_TRANSCRIPTION_MODELS.includes(preferred)
+    ? preferred
+    : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+  sel.innerHTML = "";
+  for (const model of LOCAL_TRANSCRIPTION_MODELS) {
+    const opt = document.createElement("option");
+    opt.value = model;
+    opt.textContent = model;
+    sel.appendChild(opt);
+  }
+  sel.value = LOCAL_TRANSCRIPTION_MODELS.includes(nextValue)
+    ? nextValue
+    : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+}
+
+function applyHealthModelCatalog(catalog: unknown): void {
+  if (!catalog || typeof catalog !== "object") return;
+  const root = catalog as {
+    local?: { models?: unknown; default_model?: unknown };
+    remote?: {
+      openrouter?: { audio_models?: unknown; default_audio_model?: unknown };
+      deepgram?: { audio_models?: unknown; default_audio_model?: unknown };
+    };
+    upscale?: { openrouter_models?: unknown; default_model?: unknown };
+  };
+  LOCAL_TRANSCRIPTION_MODELS = normalizeModelList(root.local?.models, LOCAL_TRANSCRIPTION_MODELS);
+  DEFAULT_LOCAL_TRANSCRIPTION_MODEL = normalizeDefaultModel(
+    root.local?.default_model,
+    LOCAL_TRANSCRIPTION_MODELS,
+    DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
+  );
+
+  OPENROUTER_AUDIO_MODELS = normalizeModelList(root.remote?.openrouter?.audio_models, OPENROUTER_AUDIO_MODELS);
+  const previousOpenrouterDefault = DEFAULT_OPENROUTER_AUDIO_MODEL;
+  DEFAULT_OPENROUTER_AUDIO_MODEL = normalizeDefaultModel(
+    root.remote?.openrouter?.default_audio_model,
+    OPENROUTER_AUDIO_MODELS,
+    DEFAULT_OPENROUTER_AUDIO_MODEL,
+  );
+  if (!remoteModelByProvider.openrouter || remoteModelByProvider.openrouter === previousOpenrouterDefault) {
+    remoteModelByProvider.openrouter = DEFAULT_OPENROUTER_AUDIO_MODEL;
+  }
+
+  DEEPGRAM_AUDIO_MODELS = normalizeModelList(root.remote?.deepgram?.audio_models, DEEPGRAM_AUDIO_MODELS);
+  const previousDeepgramDefault = DEFAULT_DEEPGRAM_AUDIO_MODEL;
+  DEFAULT_DEEPGRAM_AUDIO_MODEL = normalizeDefaultModel(
+    root.remote?.deepgram?.default_audio_model,
+    DEEPGRAM_AUDIO_MODELS,
+    DEFAULT_DEEPGRAM_AUDIO_MODEL,
+  );
+  if (!remoteModelByProvider.deepgram || remoteModelByProvider.deepgram === previousDeepgramDefault) {
+    remoteModelByProvider.deepgram = DEFAULT_DEEPGRAM_AUDIO_MODEL;
+  }
+
+  OPENROUTER_UPSCALE_MODELS = normalizeUpscaleModelOptions(
+    root.upscale?.openrouter_models,
+    OPENROUTER_UPSCALE_MODELS,
+  );
+  DEFAULT_UPSCALE_MODEL = normalizeDefaultModel(
+    root.upscale?.default_model,
+    OPENROUTER_UPSCALE_MODELS.map((m) => m.id),
+    DEFAULT_UPSCALE_MODEL,
+  );
+
+  syncLocalModelOptions();
+  syncRemoteModelOptions();
+  populateUpscaleModelOptions();
 }
 
 let isBusy = false;
@@ -2255,7 +2363,7 @@ function getRemoteModelValue(provider: Provider): string {
     const v = (remoteModelByProvider.deepgram || "").trim();
     return v || DEFAULT_DEEPGRAM_AUDIO_MODEL;
   }
-  return ($("model") as HTMLSelectElement).value || "small";
+  return ($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
 }
 
 function syncLiveLocalModelVisibility(): void {
@@ -2339,7 +2447,7 @@ async function localJob(
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("language", opts.language || "auto");
-  fd.set("model", opts.model || "small");
+  fd.set("model", opts.model || DEFAULT_LOCAL_TRANSCRIPTION_MODEL);
   fd.set("split_stereo", String(!!opts.splitStereo));
   fd.set("word_timestamps", String(!!opts.wordTimestamps));
   const r = await fetch("/api/jobs", {
@@ -2383,7 +2491,7 @@ async function localJobFromPath(
     body: JSON.stringify({
       source_path: sourcePath,
       language: opts.language || "auto",
-      model: opts.model || "small",
+      model: opts.model || DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
       split_stereo: !!opts.splitStereo,
       word_timestamps: !!opts.wordTimestamps,
     }),
@@ -2677,7 +2785,7 @@ async function localJobSync(
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("language", opts.language || "auto");
-  fd.set("model", opts.model || "small");
+  fd.set("model", opts.model || DEFAULT_LOCAL_TRANSCRIPTION_MODEL);
   fd.set("split_stereo", String(!!opts.splitStereo));
   fd.set("word_timestamps", String(!!opts.wordTimestamps));
   const r = await fetch("/api/transcribe-sync", {
@@ -2706,7 +2814,7 @@ async function transcribeCanonicalAudioLocally(
 ): Promise<LocalTranscriptionResult> {
   return localJobSync(file, {
     language: resolveFastLocalLanguage(language),
-    model: (model || "").trim() || "small",
+    model: (model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
     splitStereo: false,
     wordTimestamps: false,
     signal,
@@ -2714,7 +2822,7 @@ async function transcribeCanonicalAudioLocally(
 }
 
 async function warmLocalModel(model: string): Promise<void> {
-  const resolvedModel = (model || "").trim() || "small";
+  const resolvedModel = (model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   const fd = new FormData();
   fd.set("model", resolvedModel);
   const r = await fetch("/api/transcribe/warmup", { method: "POST", body: fd, headers: authHeaders() });
@@ -2796,20 +2904,20 @@ function resolveFastLocalLanguage(language: string): string {
 }
 
 function resolveFastLiveLocalModel(model: string): string {
-  const raw = String(model || "").trim() || "small";
-  if (raw === "medium" || raw === "large-v3") return "small";
+  const raw = String(model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+  if (raw === "medium" || raw === "large-v3") return DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   return raw;
 }
 
 function resolveLivePreviewLocalModel(model: string): string {
-  const raw = String(model || "").trim() || "small";
+  const raw = String(model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   if (raw === "tiny" || raw === "base") return raw;
   return "tiny";
 }
 
 function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalModel: string; finalLocalModel: string } {
-  const configuredLocalModel = (($("model") as HTMLSelectElement).value || "small").trim();
-  const finalLocalModel = configuredLocalModel || "small";
+  const configuredLocalModel = (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim();
+  const finalLocalModel = configuredLocalModel || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   const effectiveProvider = resolveEffectiveProvider(selectedProvider);
   return {
     assistLocalModel: effectiveProvider === "local" ? resolveFastLiveLocalModel(configuredLocalModel) : resolveLivePreviewLocalModel(configuredLocalModel),
@@ -2879,7 +2987,7 @@ function scheduleLocalWarmup(): void {
       modelsToWarm.add(sessionModels.finalLocalModel);
     }
   } else {
-    modelsToWarm.add((($("model") as HTMLSelectElement).value || "small").trim() || "small");
+    modelsToWarm.add((($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL);
   }
   modelsToWarm.forEach((model) => {
     warmLocalModel(model).catch((e) => {
@@ -2980,6 +3088,7 @@ async function refreshNetworkState(): Promise<void> {
         max_upload_bytes?: unknown;
         accepted_audio_exts?: unknown;
         live_sample_rate_hz?: unknown;
+        model_catalog?: unknown;
       };
       const candidate = Number(healthJson?.max_upload_bytes);
       if (Number.isFinite(candidate) && candidate > 0) {
@@ -2998,6 +3107,7 @@ async function refreshNetworkState(): Promise<void> {
           for (const ext of nextExts) ACCEPTED_AUDIO_VIDEO_EXTS.add(ext);
         }
       }
+      applyHealthModelCatalog(healthJson?.model_catalog);
     } catch (e) {
       // Non-JSON or shape mismatch — keep prior MAX_FILE_BYTES.
       console.debug("health body parse skipped", e);
@@ -3419,7 +3529,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     mode: "live",
     provider: (($("providerSelect") as HTMLSelectElement).value || "local").trim(),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
-    local_model: (($("model") as HTMLSelectElement).value || "small").trim(),
+    local_model: (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim(),
     mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
     auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
@@ -5761,7 +5871,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
 
     // 2. Local Whisper fallback — always available, no API key required.
     if (!text) {
-      const model = ($("model") as HTMLSelectElement).value || "small";
+      const model = ($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
       triedProviders.push(`local Whisper ${model}`);
       // Two-line message captures both the fallback context AND the
       // current step: the user sees Deepgram-failed reason without
@@ -5797,7 +5907,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
           provider: usedProvider,
           model: usedProvider === "deepgram"
             ? getRemoteModelValue("deepgram")
-            : (($("model") as HTMLSelectElement).value || "small"),
+            : (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
           language: lang,
         });
       } catch { }
@@ -9265,7 +9375,7 @@ async function transcribeSelectedFile(): Promise<void> {
   setBusy(true, sessionUiToken);
   const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
   const provider = resolveEffectiveProvider(selectedProvider);
-  const modelValue = provider === "local" ? (($("model") as HTMLSelectElement).value || "small") : getRemoteModelValue(provider);
+  const modelValue = provider === "local" ? (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL) : getRemoteModelValue(provider);
   setCurrentRecordingSummary({
     title: selectedFile.name || "Selected audio file",
     status: "Preparing file transcription.",
@@ -10499,7 +10609,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     let saveAudioSourcePath = useSourcePath ? sourcePath : "";
     let consumeSaveAudioSourcePath = false;
     if (provider === "local") {
-      modelLabel = "small";
+      modelLabel = DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
       const localOpts = {
         language: resolveFastLocalLanguage(language),
         model: modelLabel,

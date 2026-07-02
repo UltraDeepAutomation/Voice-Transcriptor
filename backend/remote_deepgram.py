@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 
 from backend.audio_mime import audio_content_type
 from backend.http_retry import RemoteError, request_with_retry
+from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ def deepgram_transcribe(
     api_key: str,
     audio_bytes: bytes,
     filename: str,
-    model: str = "nova-3",
+    model: str = DEFAULT_DEEPGRAM_AUDIO_MODEL,
     language: Optional[str] = None,
     diarize: bool = False,
     num_speakers: Optional[str] = None,
@@ -143,7 +144,7 @@ def deepgram_transcribe(
     url = f"{DEEPGRAM_API_BASE}/listen"
 
     params: Dict[str, str] = {
-        "model": model or "nova-3",
+        "model": model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
         "punctuate": "true",
         "paragraphs": "true",
         "numerals": "true",

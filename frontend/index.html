@@ -346,11 +346,11 @@
                       <option value="openrouter">OpenRouter</option>
                       <option value="">None</option>
                     </select>
-                    <!-- Options below are placeholders: ``populateRemote
-                         ModelOptions`` (frontend/src/main.tsx) overwrites
-                         this select's children from the canonical
-                         OPENROUTER_AUDIO_MODELS / DEEPGRAM_AUDIO_MODELS
-                         arrays before the user can interact. The first
+                    <!-- Options below are placeholders: ``syncRemoteModelOptions``
+                         (frontend/src/main.tsx) overwrites this select from
+                         backend /api/health model_catalog after boot, with
+                         frontend fallbacks only for the cold-start window.
+                         The first
                          ``<option>`` was previously
                          ``google/gemini-3.1-flash-lite-preview`` which is
                          NOT a valid OpenRouter slug — surfaced by the
@@ -358,10 +358,9 @@
                          the SSOT-driven repopulate ran. Replaced with the
                          canonical SSOT default so the cold-boot flash
                          never shows a stale model id. -->
-                    <!-- 1.1.25: empty placeholder. populateRemoteModelOptions
-                         (see frontend/src/main.tsx) rebuilds this select from
-                         OPENROUTER_AUDIO_MODELS / DEEPGRAM_AUDIO_MODELS at
-                         boot — the only SSOT for the remote-model list.
+                    <!-- 1.1.25+: empty placeholder. syncRemoteModelOptions
+                         rebuilds this select from the current runtime model
+                         catalog. /api/health is the SSOT after boot.
                          Previously this placeholder hardcoded a stale list
                          that mixed nova-3 (Deepgram) under what should have
                          been an OpenRouter-only fallback, producing a
@@ -621,10 +620,9 @@
                 </span>
               </label>
               <!-- Hidden input bridges legacy callers; the live value is
-                   set by ``loadCfg`` from the SSOT OPENROUTER_AUDIO_MODELS
-                   array. Default below mirrors that SSOT's first entry
-                   (``google/gemini-2.5-flash``) so the brief cold-boot
-                   window before loadCfg runs reads a real model slug. -->
+                   set by ``loadCfg`` and then refreshed from /api/health
+                   model_catalog. Default below is only the cold-boot
+                   fallback before backend health arrives. -->
               <input id="orModel" type="hidden" value="google/gemini-2.5-flash" />
             </div>
           </div>

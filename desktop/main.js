@@ -284,7 +284,6 @@ let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
 let BACKEND_BOOT_NONCE = "";
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
-const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
     collapsedWidth: 184,
@@ -753,8 +752,7 @@ function normalizeProviderChoice(value) {
 
 function normalizeLocalModelChoice(value) {
   const v = String(value || "").trim();
-  const allowed = new Set(LOCAL_MODELS);
-  return allowed.has(v) ? v : "small";
+  return v || "small";
 }
 
 /**
