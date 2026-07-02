@@ -5669,7 +5669,11 @@ async function saveRecordingText(opts: {
   }
   // Fire-and-forget: don't block critical path for recordings list reload.
   if (opts.refreshList !== false) {
-    loadRecordings(true).catch(() => { });
+    loadRecordings(true).catch((e) => {
+      console.warn("Recordings reload after save failed", e);
+      const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
+      setStatus(`Saved. History refresh failed: ${msg}`, "warning");
+    });
   }
   return {
     name: savedName,
