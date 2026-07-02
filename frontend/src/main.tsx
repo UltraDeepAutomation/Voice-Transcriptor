@@ -1495,6 +1495,15 @@ function setStatus(st: string, kind?: StatusKind): void {
   dot.className = "status-dot" + statusKindToDotClass(resolvedKind);
 }
 
+function setSettingsArchiveStatus(message: string, tone: UiTone = "neutral"): void {
+  const el = document.getElementById("settingsArchiveStatus");
+  if (!el) return;
+  const text = String(message || "").trim();
+  el.textContent = text;
+  el.hidden = !text;
+  el.className = `settings-save-status settings-save-status-${tone}`;
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -4251,10 +4260,13 @@ function queueUiPreferencesSave(): void {
           await apiPost<{ ok: boolean }>("/api/config", payload);
           configuredRecordingsDir = nextRecordingsDir;
           if (!shouldRefreshRecordingsArchive) return;
+          setSettingsArchiveStatus("Archive folder saved.", "success");
           activeResolvedRecordingsDir = "";
           recordingsBootstrapReady = false;
           const reloadTask = loadRecordings(false).catch((e) => {
             console.warn("Recordings archive reload failed", e);
+            const msg = sanitizeUiErrorMessage(e, "Recordings archive reload failed.");
+            setSettingsArchiveStatus(`Archive reload failed: ${msg}`, "warning");
           });
           const trackedReloadPromise = reloadTask.finally(() => {
             if (recordingsBootstrapPromise === trackedReloadPromise) {
@@ -4266,6 +4278,9 @@ function queueUiPreferencesSave(): void {
         } catch (e) {
           const msg = sanitizeUiErrorMessage(e, "Settings were not saved.");
           setStatus(`Settings save failed: ${msg}`, "error");
+          if (shouldRefreshRecordingsArchive) {
+            setSettingsArchiveStatus(`Archive settings save failed: ${msg}`, "error");
+          }
           showRecordSessionNotice(`Settings were not saved: ${msg}`, "error", 7000);
         }
       });
@@ -4723,24 +4738,46 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
   syncRemoteModelOptions();
   queueUiPreferencesSave();
 });
-$("pickRecordingsDirBtn").addEventListener("click", () =>
+($("pickRecordingsDirBtn") as HTMLButtonElement).addEventListener("click", () => {
+  const btn = $("pickRecordingsDirBtn") as HTMLButtonElement;
+  btn.disabled = true;
+  setSettingsArchiveStatus("Choosing archive folder...", "info");
   void apiPost<{ path: string }>("/api/recordings/pick-folder", {})
     .then((r) => {
       ($("recordingsDirInput") as HTMLInputElement).value = r.path || "";
+      setSettingsArchiveStatus("Archive folder selected. Saving settings...", "success");
       queueUiPreferencesSave();
     })
     .catch((e: Error) => {
+      const msg = sanitizeUiErrorMessage(e, "Could not choose archive folder.");
       console.error(e.message);
+      setSettingsArchiveStatus(`Choose folder failed: ${msg}`, "error");
+      setStatus(`Choose folder failed: ${msg}`, "error");
     })
-);
-$("openRecordingsDirBtn").addEventListener("click", () =>
+    .finally(() => {
+      btn.disabled = false;
+    });
+});
+($("openRecordingsDirBtn") as HTMLButtonElement).addEventListener("click", () => {
+  const btn = $("openRecordingsDirBtn") as HTMLButtonElement;
+  btn.disabled = true;
+  setSettingsArchiveStatus("Opening archive folder...", "info");
   void apiPost<{ ok: boolean; path: string }>("/api/recordings/open-folder", {
     path: ($("recordingsDirInput") as HTMLInputElement).value.trim(),
   })
-    .catch((e: Error) => {
-      console.error(e.message);
+    .then(() => {
+      setSettingsArchiveStatus("Archive folder opened.", "success");
     })
-);
+    .catch((e: Error) => {
+      const msg = sanitizeUiErrorMessage(e, "Could not open archive folder.");
+      console.error(e.message);
+      setSettingsArchiveStatus(`Open folder failed: ${msg}`, "error");
+      setStatus(`Open folder failed: ${msg}`, "error");
+    })
+    .finally(() => {
+      btn.disabled = false;
+    });
+});
 
 // ── Shortcut picker click listeners ─────────────────────────────────────────
 $("shortcutRecord").addEventListener("click", (e) => {

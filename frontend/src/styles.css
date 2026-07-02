@@ -2426,8 +2426,7 @@ textarea:focus-visible,
   display: none;
 }
 
-.settings-save-status-warning,
-.settings-save-status-error {
+.settings-save-status:not([hidden]) {
   display: block;
 }
 
