@@ -213,7 +213,7 @@ let recordingAutoStopConfigRefreshAt = 0;
 // Generation counter for recordingAutoStopConfig async refreshes. Each
 // scheduled refresh captures this value; when the Promise resolves it
 // checks that the generation still matches before writing — so a
-// resolve from a PREVIOUS session (after the recording surface was reset and a
+// resolve from a PREVIOUS session (after the recording status state was reset and a
 // new recording started) cannot clobber the new session's config.
 let recordingAutoStopConfigGen = 0;
 let recordingStartedAt = 0;
@@ -811,7 +811,7 @@ function startRecordingStateMonitor() {
             // Drop the result if a new recording session bumped the
             // generation while we were awaiting — the old config would
             // otherwise overwrite freshly set values from the new
-            // session's recording surface.
+            // session's recording status state.
             if (gen === recordingAutoStopConfigGen) {
               recordingAutoStopConfig = nextCfg;
             }

@@ -6,7 +6,7 @@ product
 
 ## Users
 
-People who need a reliable desktop transcription workstation: live microphone transcription, uploaded audio transcription, AI cleanup, local history, and fast reuse through hotkeys, overlay controls, and auto-paste.
+People who need a reliable desktop transcription workstation: live microphone transcription, uploaded audio transcription, AI cleanup, local history, and fast reuse through global hotkeys, a single recording status capsule, and auto-paste.
 
 ## Product Purpose
 
