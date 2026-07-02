@@ -309,6 +309,7 @@ declare global {
     __transcriptorLastUiFinalAt?: number;
     __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
+    __transcriptorGetQuickSettingsOpen?: () => boolean;
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
@@ -606,6 +607,7 @@ let selectedFile: File | null = null;
 let pollAbortController: AbortController | null = null;
 let uiPrefSaveTimer: number | null = null;
 let suppressUiPrefAutosave = false;
+let quickSettingsOpen = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
@@ -3533,7 +3535,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
     auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
-    quick_settings_open: !$("quickSettingsPanel").hidden,
+    quick_settings_open: quickSettingsOpen,
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
     upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
     upscale_model: getUpscaleModelValue(),
@@ -6130,19 +6132,23 @@ function shouldLivePreview(): boolean {
   }
 });
 
+function getQuickSettingsOpen(): boolean {
+  return quickSettingsOpen;
+}
+
 function syncQuickSettingsVisibility(open: boolean): void {
   const panel = $("quickSettingsPanel");
   const btn = $("quickSettingsToggle") as HTMLButtonElement;
-  panel.hidden = !open;
-  btn.classList.toggle("active", open);
-  btn.setAttribute("aria-pressed", open ? "true" : "false");
+  quickSettingsOpen = !!open;
+  panel.hidden = !quickSettingsOpen;
+  panel.dataset.open = quickSettingsOpen ? "true" : "false";
+  btn.classList.toggle("active", quickSettingsOpen);
+  btn.setAttribute("aria-pressed", quickSettingsOpen ? "true" : "false");
 }
 
 function applyQuickSettingsFromMain(open: boolean): boolean {
-  const panel = $("quickSettingsPanel");
   const nextOpen = !!open;
-  const currentOpen = !panel.hidden;
-  const changed = currentOpen !== nextOpen;
+  const changed = quickSettingsOpen !== nextOpen;
   syncQuickSettingsVisibility(nextOpen);
   if (changed) queueUiPreferencesSave();
   return changed;
@@ -6155,10 +6161,11 @@ function initQuickControls(): void {
   syncRemoteModelOptions();
 
   ($("quickSettingsToggle") as HTMLButtonElement).addEventListener("click", () => {
-    const next = $("quickSettingsPanel").hidden !== false;
+    const next = !quickSettingsOpen;
     syncQuickSettingsVisibility(next);
     queueUiPreferencesSave();
   });
+  window.__transcriptorGetQuickSettingsOpen = getQuickSettingsOpen;
   window.__transcriptorSetQuickSettingsOpen = applyQuickSettingsFromMain;
 }
 

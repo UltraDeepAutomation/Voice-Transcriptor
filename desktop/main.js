@@ -809,12 +809,22 @@ async function getRendererLocalModelChoice() {
 }
 
 async function getRendererQuickSettingsOpen() {
-  // Use getComputedStyle instead of .hidden: the panel is hidden via
-  // CSS display:none (not via the HTML hidden attribute), so p.hidden
-  // is always false even when the element is invisible, causing the
-  // overlay to always think quick-settings is open.
+  // Frontend keeps quick settings as explicit renderer state. The DOM
+  // nodes are legacy bridge sinks and are intentionally display:none,
+  // so layout/computed style is not a valid source of truth.
   return await execRendererJsWithTimeout(
-    `(() => { const p = document.getElementById('quickSettingsPanel'); if (!p) return false; return getComputedStyle(p).display !== 'none'; })();`,
+    `(() => {
+      if (typeof window.__transcriptorGetQuickSettingsOpen === 'function') {
+        return !!window.__transcriptorGetQuickSettingsOpen();
+      }
+      const btn = document.getElementById('quickSettingsToggle');
+      if (btn && btn.getAttribute('aria-pressed') != null) {
+        return btn.getAttribute('aria-pressed') === 'true';
+      }
+      const p = document.getElementById('quickSettingsPanel');
+      if (!p) return false;
+      return p.dataset.open === 'true' || p.hidden === false;
+    })();`,
     null,
   );
 }
