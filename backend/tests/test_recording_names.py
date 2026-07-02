@@ -161,6 +161,16 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(cm.exception.status_code, 409)
         self.assertEqual(cm.exception.detail, "folder path exists but is not a directory")
 
+    def test_open_recordings_folder_does_not_create_missing_requested_path(self):
+        missing_dir = Path(self._home.name) / "missing-open-target"
+
+        with self.assertRaises(self.main.HTTPException) as cm:
+            asyncio.run(self.main.open_recordings_folder({"path": str(missing_dir)}, _auth=None))
+
+        self.assertEqual(cm.exception.status_code, 404)
+        self.assertEqual(cm.exception.detail, "folder path does not exist")
+        self.assertFalse(missing_dir.exists())
+
     def test_recording_collection_rejects_symlink_escape_after_resolve(self):
         root = Path(self._tmp.name) / "recordings"
         root.mkdir()

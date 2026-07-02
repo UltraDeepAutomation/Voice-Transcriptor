@@ -4609,6 +4609,18 @@ def _ensure_directory_for_user_path(path: Path, action: str) -> None:
         raise HTTPException(status_code=500, detail=f"{action} failed: {_safe_error_text(e)}")
 
 
+def _require_existing_directory_for_user_path(path: Path, action: str) -> None:
+    try:
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="folder path does not exist")
+        if not path.is_dir():
+            raise HTTPException(status_code=409, detail="folder path exists but is not a directory")
+    except HTTPException:
+        raise
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"{action} failed: {_safe_error_text(e)}")
+
+
 @app.post("/api/recordings/pick-folder")
 async def pick_recordings_folder(_auth: None = Depends(_require_api_auth)):
     cmd, kind = _resolve_picker_command()
@@ -4706,7 +4718,7 @@ async def open_recordings_folder(payload: dict = Body(default_factory=dict), _au
                 d.relative_to(home_dir)
             except ValueError:
                 raise HTTPException(status_code=403, detail="path outside allowed directories")
-        _ensure_directory_for_user_path(d, "open folder")
+        _require_existing_directory_for_user_path(d, "open folder")
     else:
         d = _resolve_recordings_dir()
     # Pick the right open-folder command per platform.
