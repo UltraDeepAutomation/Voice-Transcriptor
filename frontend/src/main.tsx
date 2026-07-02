@@ -1084,6 +1084,18 @@ function providerLabel(provider: string): string {
   return provider;
 }
 
+function normalizeProviderSelection(value: unknown, fallback: Provider = "local"): Provider {
+  const provider = String(value ?? "").trim();
+  if (provider === "" || provider === "local" || provider === "openrouter" || provider === "deepgram") {
+    return provider as Provider;
+  }
+  return fallback;
+}
+
+function readProviderSelection(): Provider {
+  return normalizeProviderSelection(($("providerSelect") as HTMLSelectElement).value, "local");
+}
+
 const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
 const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = 13_000;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = 8_000;
@@ -2369,7 +2381,7 @@ function getRemoteModelValue(provider: Provider): string {
 }
 
 function syncLiveLocalModelVisibility(): void {
-  const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const provider = readProviderSelection();
   const effective = resolveEffectiveProvider(provider);
   const group = document.getElementById("liveLocalModelGroup");
   const toolbarRow = document.getElementById("livePaneToolbarRow");
@@ -2384,7 +2396,7 @@ function syncLiveLocalModelVisibility(): void {
 }
 
 function syncRemoteModelOptions(): void {
-  const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const provider = readProviderSelection();
   const sel = $("remoteModelSelect") as HTMLSelectElement;
   syncLiveLocalModelVisibility();
   if (provider === "local" || !provider) {
@@ -2935,8 +2947,9 @@ function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalMod
  *   - any other provider → local faster-whisper assist pipeline
  */
 function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
-  const provider = snapshot?.effectiveProvider
-    || resolveEffectiveProvider((($("providerSelect") as HTMLSelectElement).value || "local") as Provider);
+  const provider = snapshot
+    ? snapshot.effectiveProvider
+    : resolveEffectiveProvider(readProviderSelection());
   if (provider === "deepgram" && isProviderKeyConfigured("deepgram")) {
     return "deepgram-stream";
   }
@@ -2980,7 +2993,8 @@ function getVisibleLivePreviewText(): string {
 }
 
 function scheduleLocalWarmup(): void {
-  const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const selectedProvider = readProviderSelection();
+  if (!selectedProvider) return;
   const sessionModels = resolveSessionLocalModels(selectedProvider);
   const modelsToWarm = new Set<string>();
   if ($("uploadPanel").hidden) {
@@ -3069,9 +3083,23 @@ function switchView(view: ViewName): void {
 }
 
 function resolveEffectiveProvider(preferred: Provider): Provider {
+  if (!preferred) return "";
   if (preferred === "local") return "local";
+  if (!isRemoteProvider(preferred)) return "local";
+  if (!isProviderKeyConfigured(preferred)) return "local";
   if (isRemoteProviderReachable(preferred)) return preferred;
   return "local";
+}
+
+function localFallbackReason(preferred: Provider): string {
+  if (!isRemoteProvider(preferred)) return "Transcribing locally.";
+  if (!isProviderKeyConfigured(preferred)) {
+    return `${providerLabel(preferred)} key is not configured. Transcribing locally.`;
+  }
+  if (!isRemoteProviderReachable(preferred)) {
+    return "Internet is unavailable. Transcribing locally.";
+  }
+  return "Transcribing locally.";
 }
 
 async function refreshNetworkState(): Promise<void> {
@@ -3389,10 +3417,10 @@ function persistLiveDraft(recording: boolean): void {
       title,
       source_text: liveText,
       transcript_text: finalText,
-      provider: activeLiveSessionSnapshot?.provider || (($("providerSelect") as HTMLSelectElement).value || "local"),
+      provider: activeLiveSessionSnapshot?.provider ?? readProviderSelection(),
       model:
         activeLiveSessionSnapshot?.model ||
-        getRemoteModelValue((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
+        getRemoteModelValue(readProviderSelection()),
       language: activeLiveSessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
       archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
       recording_collection: RECORDING_COLLECTIONS.live,
@@ -3529,7 +3557,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
   const silence = getAutoStopSilenceConfig();
   return {
     mode: "live",
-    provider: (($("providerSelect") as HTMLSelectElement).value || "local").trim(),
+    provider: readProviderSelection(),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
     local_model: (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim(),
     mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
@@ -4350,7 +4378,7 @@ function queueUiPreferencesSave(): void {
   }
   uiPrefSaveTimer = window.setTimeout(() => {
     uiPrefSaveTimer = null;
-    const provider = (($("providerSelect") as HTMLSelectElement).value || "local").trim();
+    const provider = readProviderSelection();
     const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
     const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
@@ -6113,7 +6141,7 @@ function shouldLivePreview(): boolean {
 });
 ($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
   const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
-  const provider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const provider = readProviderSelection();
   if (v && provider === "openrouter") {
     remoteModelByProvider.openrouter = v;
     ($("orModel") as HTMLInputElement).value = v;
@@ -7148,7 +7176,7 @@ async function startLive(): Promise<void> {
   activeLiveSessionId = sessionUiToken;
   activeLiveArchiveDir = sessionArchiveDir;
   resetOutputs();
-  const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const selectedProvider = readProviderSelection();
   const selectedEffectiveProvider = resolveEffectiveProvider(selectedProvider);
   const sessionLocalModels = resolveSessionLocalModels(selectedProvider);
   const selectedModel =
@@ -7684,13 +7712,15 @@ async function stopLive(enhance: boolean): Promise<void> {
     const preview = words.slice(0, 8).join(" ");
     return preview.length > 80 ? preview.slice(0, 77) + "..." : preview;
   };
+  const currentProviderSelection = readProviderSelection();
+  const currentSessionModels = resolveSessionLocalModels(currentProviderSelection);
   const liveSnapshot = activeLiveSessionSnapshot || {
-    provider: (($("providerSelect") as HTMLSelectElement).value || "local") as Provider,
-    effectiveProvider: resolveEffectiveProvider((($("providerSelect") as HTMLSelectElement).value || "local") as Provider),
-    model: resolveSessionLocalModels((($("providerSelect") as HTMLSelectElement).value || "local") as Provider).finalLocalModel,
+    provider: currentProviderSelection,
+    effectiveProvider: resolveEffectiveProvider(currentProviderSelection),
+    model: currentSessionModels.finalLocalModel,
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
-    assistLocalModel: resolveSessionLocalModels((($("providerSelect") as HTMLSelectElement).value || "local") as Provider).assistLocalModel,
-    finalLocalModel: resolveSessionLocalModels((($("providerSelect") as HTMLSelectElement).value || "local") as Provider).finalLocalModel,
+    assistLocalModel: currentSessionModels.assistLocalModel,
+    finalLocalModel: currentSessionModels.finalLocalModel,
   };
   const providerValue = liveSnapshot.provider;
   const languageValue = liveSnapshot.language;
@@ -7734,6 +7764,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     };
   };
   const provider = effectiveProvider;
+  const metadataProvider = provider || providerValue || "local";
   let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
   let savedAudioFile: File | null = null;
   let transcribeInputFile: File | null = null;
@@ -8065,7 +8096,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           title: provisionalTitle,
           sourceText: latestSourceForSave(),
           transcriptText: "",
-          provider: providerValue || "local",
+          provider: metadataProvider,
           model: modelValue,
           language: languageValue,
           recordingCollection: RECORDING_COLLECTIONS.live,
@@ -8173,7 +8204,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         title: latestSourceTitle(),
         sourceText: latestSourceForSave(),
         transcriptText: "[ Silence ]",
-        provider: providerValue,
+        provider: metadataProvider,
         model: modelValue,
         language: languageValue,
         recordingCollection: RECORDING_COLLECTIONS.live,
@@ -8221,7 +8252,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         title: latestSourceTitle(),
         sourceText: latestSourceForSave(),
         transcriptText: "",
-        provider: providerValue,
+        provider: metadataProvider,
         model: modelValue,
         language: languageValue,
         recordingCollection: RECORDING_COLLECTIONS.live,
@@ -8297,7 +8328,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
 
   if (providerValue !== effectiveProvider) {
-    setStatusScoped(sessionUiToken, "Processing (Offline Local)");
+    setStatusScoped(sessionUiToken, "Processing (Local Fallback)");
   } else {
     setStatusScoped(sessionUiToken, "Processing");
   }
@@ -8356,7 +8387,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     title: provisionalTitle,
     status:
       providerValue !== effectiveProvider
-        ? "Internet is unavailable. Transcribing locally from the saved audio."
+        ? localFallbackReason(providerValue)
         : `Transcribing with ${providerLabel(provider)}.`,
     tone: "info",
   }, sessionUiToken);
@@ -9380,7 +9411,7 @@ async function transcribeSelectedFile(): Promise<void> {
   activeUiSessionToken = sessionUiToken;
   resetOutputs();
   setBusy(true, sessionUiToken);
-  const selectedProvider = (($("providerSelect") as HTMLSelectElement).value || "local") as Provider;
+  const selectedProvider = readProviderSelection();
   const provider = resolveEffectiveProvider(selectedProvider);
   const modelValue = provider === "local" ? (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL) : getRemoteModelValue(provider);
   setCurrentRecordingSummary({
@@ -9389,7 +9420,7 @@ async function transcribeSelectedFile(): Promise<void> {
     tone: "info",
   }, sessionUiToken);
   if (selectedProvider !== provider) {
-    setStatusScoped(sessionUiToken, "Processing (Offline Local)");
+    setStatusScoped(sessionUiToken, "Processing (Local Fallback)");
   } else {
     setStatusScoped(sessionUiToken, "Processing");
   }
@@ -9419,7 +9450,7 @@ async function transcribeSelectedFile(): Promise<void> {
   patchCurrentRecordingSummary({
     status:
       selectedProvider !== provider
-        ? "Internet is unavailable. Transcribing the selected file locally."
+        ? localFallbackReason(selectedProvider)
         : `Transcribing file with ${providerLabel(provider)}.`,
     tone: "info",
   }, sessionUiToken);
