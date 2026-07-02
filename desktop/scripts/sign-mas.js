@@ -12,10 +12,21 @@ const {
   shouldIgnoreOsxSignPath,
 } = require("./macos-signing-utils");
 
-function requiredEnv(name) {
-  const value = String(process.env[name] || "").trim();
-  if (!value) throw new Error(`Missing required environment variable: ${name}`);
-  return value;
+function requiredEnvSet(names) {
+  const values = {};
+  const missing = [];
+  for (const name of names) {
+    const value = String(process.env[name] || "").trim();
+    if (!value) {
+      missing.push(name);
+    } else {
+      values[name] = value;
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+  }
+  return values;
 }
 
 function run(command, args, options = {}) {
@@ -86,10 +97,16 @@ async function main() {
   const preflightOnly = process.argv.includes("--preflight");
   const projectDir = path.resolve(__dirname, "..");
   const packageJson = readJson(path.join(projectDir, "package.json"));
-  const appId = requiredEnv("TRANSCRIPTOR_MAS_APP_ID");
-  const appIdentity = requiredEnv("TRANSCRIPTOR_MAS_SIGNING_IDENTITY");
-  const installerIdentity = requiredEnv("TRANSCRIPTOR_MAS_INSTALLER_IDENTITY");
-  const provisioningProfile = path.resolve(requiredEnv("TRANSCRIPTOR_MAS_PROVISIONING_PROFILE"));
+  const releaseEnv = requiredEnvSet([
+    "TRANSCRIPTOR_MAS_APP_ID",
+    "TRANSCRIPTOR_MAS_SIGNING_IDENTITY",
+    "TRANSCRIPTOR_MAS_INSTALLER_IDENTITY",
+    "TRANSCRIPTOR_MAS_PROVISIONING_PROFILE",
+  ]);
+  const appId = releaseEnv.TRANSCRIPTOR_MAS_APP_ID;
+  const appIdentity = releaseEnv.TRANSCRIPTOR_MAS_SIGNING_IDENTITY;
+  const installerIdentity = releaseEnv.TRANSCRIPTOR_MAS_INSTALLER_IDENTITY;
+  const provisioningProfile = path.resolve(releaseEnv.TRANSCRIPTOR_MAS_PROVISIONING_PROFILE);
   assertBundleId(appId);
   if (!fs.existsSync(provisioningProfile)) {
     throw new Error(`Provisioning profile not found: ${provisioningProfile}`);

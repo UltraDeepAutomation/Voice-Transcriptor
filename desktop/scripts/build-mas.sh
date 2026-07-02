@@ -15,15 +15,22 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
-require_env() {
-  local name="$1"
-  [ -n "${!name:-}" ] || die "Missing required environment variable: $name"
+require_envs() {
+  local missing=()
+  local name
+  for name in "$@"; do
+    [ -n "${!name:-}" ] || missing+=("$name")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    die "Missing required environment variables: ${missing[*]}"
+  fi
 }
 
-require_env TRANSCRIPTOR_MAS_APP_ID
-require_env TRANSCRIPTOR_MAS_SIGNING_IDENTITY
-require_env TRANSCRIPTOR_MAS_INSTALLER_IDENTITY
-require_env TRANSCRIPTOR_MAS_PROVISIONING_PROFILE
+require_envs \
+  TRANSCRIPTOR_MAS_APP_ID \
+  TRANSCRIPTOR_MAS_SIGNING_IDENTITY \
+  TRANSCRIPTOR_MAS_INSTALLER_IDENTITY \
+  TRANSCRIPTOR_MAS_PROVISIONING_PROFILE
 
 case "$TRANSCRIPTOR_MAS_APP_ID" in
   local.*)
