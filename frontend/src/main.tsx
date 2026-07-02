@@ -1716,8 +1716,8 @@ function syncKeyActionButton(provider: KeyProvider): void {
   btn.setAttribute("aria-label", canDelete ? "Delete key" : "Save key");
 }
 
-// Auto-stop silence detection is handled exclusively by the overlay main process
-// (desktop/main.js showRecordingOverlay waveMonitor). No frontend-side auto-stop.
+// Auto-stop silence detection is handled exclusively by the Electron main
+// process recording-state monitor. The frontend only publishes VU/RMS samples.
 
 /**
  * Translate a raw fetch/network error into a user-actionable message.

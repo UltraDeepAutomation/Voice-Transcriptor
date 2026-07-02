@@ -272,6 +272,10 @@ let backendStartInFlight = null;
 let micPermissionChecked = false;
 let loadedFrontendBuildSignature = "";
 let pasteTarget = emptyCapturedPasteTarget();
+// The product now has one recording surface: the renderer capsule.
+// The legacy always-on-top Electron overlay was a second UI source of
+// truth and produced the duplicated top capsule reported by the user.
+const SEPARATE_RECORDING_OVERLAY_ENABLED = false;
 
 const HOST = "127.0.0.1";
 // Backend port default. pickBackendPort iterates up if occupied, so
@@ -2479,6 +2483,117 @@ function cancelScheduledOverlayHide(reason = "") {
   }
 }
 
+function stopRecordingStateMonitor() {
+  if (overlayWaveMonitor) {
+    clearInterval(overlayWaveMonitor);
+    overlayWaveMonitor = null;
+  }
+}
+
+function startRecordingStateMonitor({ mirrorLevelToOverlay = false } = {}) {
+  stopRecordingStateMonitor();
+  overlayWaveMonitor = setInterval(() => {
+    if (!win || win.isDestroyed() || !win.webContents) return;
+    if (
+      mirrorLevelToOverlay &&
+      (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible())
+    ) {
+      return;
+    }
+    win.webContents
+      .executeJavaScript(
+        `(() => {
+          const vu = Number(window.__transcriptorVuLevel || 0);
+          const rms = Number(window.__transcriptorRmsLevel || 0);
+          const lastFrameAt = Number(window.__transcriptorLastFrameAt || 0);
+          const isRec = !!window.__transcriptorIsRecording;
+          return {
+            vu: Number.isFinite(vu) ? vu : 0,
+            rms: Number.isFinite(rms) ? rms : 0,
+            lastFrameAt: Number.isFinite(lastFrameAt) ? lastFrameAt : 0,
+            isRec
+          };
+        })();`,
+        true
+      )
+      .then((state) => {
+        if (mirrorLevelToOverlay && (!overlayWin || overlayWin.isDestroyed())) return;
+        const safeLevel = Math.max(0, Math.min(1, Number(state?.vu) || 0));
+        const safeRms = Math.max(0, Number(state?.rms) || 0);
+        const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
+        const isRec = !!state?.isRec;
+        const cfg = overlayAutoStopConfig || { enabled: false, seconds: 2, thresholdDb: -42 };
+        const now = Date.now();
+        if (safeLastFrameAt > 0) overlaySeenAudioFrames = true;
+        if (now - overlayAutoStopConfigRefreshAt > 1200) {
+          overlayAutoStopConfigRefreshAt = now;
+          const gen = ++overlayAutoStopConfigGen;
+          getRendererAutoStopSilenceConfig().then((nextCfg) => {
+            // Drop the result if a new recording session bumped the
+            // generation while we were awaiting — the old config would
+            // otherwise overwrite freshly set values from the new
+            // session's recording surface.
+            if (gen === overlayAutoStopConfigGen) {
+              overlayAutoStopConfig = nextCfg;
+            }
+          }).catch(() => { });
+        }
+        if (!isRec || !cfg.enabled || overlayStopInFlight) {
+          overlaySilenceStartedAt = 0;
+        } else {
+          const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
+          const warmupMs = 1500;
+          if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
+            overlaySilenceStartedAt = 0;
+            if (mirrorLevelToOverlay) {
+              overlayWin.webContents.executeJavaScript(
+                `window.setLevel(${safeLevel});`,
+                true
+              ).catch(() => { });
+            }
+            return;
+          }
+          // Only use dB-based silence detection — no staleAudioFrames shortcut.
+          // staleAudioFrames was causing false stops during active speech when
+          // the audio pipeline had minor hiccups.
+          const consideredSilent = safeRms <= thresholdRms;
+          if (consideredSilent) {
+            if (!overlaySilenceStartedAt) {
+              overlaySilenceStartedAt = now;
+            }
+            const silentElapsed = now - overlaySilenceStartedAt;
+            if (silentElapsed >= Number(cfg.seconds) * 1000) {
+              overlaySilenceStartedAt = 0;
+              overlayStopInFlight = true;
+              stopRecordingStateMonitor();
+              appendMainLog(`[recording-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
+              guardedStopFromOverlay("autostop");
+            }
+          } else {
+            overlaySilenceStartedAt = 0;
+          }
+          // Separate fail-safe: if audio pipeline is truly dead (no frames for 8 seconds),
+          // force stop to avoid infinite hang. This is NOT silence detection.
+          const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 8000;
+          if (staleAudioFrames && !overlayStopInFlight) {
+            overlayStopInFlight = true;
+            stopRecordingStateMonitor();
+            appendMainLog(`[recording-autostop-stale] audio pipeline dead for 8s, forcing stop`);
+            guardedStopFromOverlay("autostop-stale");
+          }
+        }
+        if (mirrorLevelToOverlay) {
+          overlayWin.webContents.executeJavaScript(
+            `window.setLevel(${safeLevel});`,
+            true
+          ).catch(() => { });
+        }
+      })
+      .catch(() => { });
+  }, 120);
+  try { overlayWaveMonitor.unref?.(); } catch { }
+}
+
 async function showRecordingOverlay() {
   cancelScheduledOverlayHide("show-recording");
   // Preserve user's last quick-settings open/closed choice across runs.
@@ -2493,6 +2608,11 @@ async function showRecordingOverlay() {
   if (overlayTranscribingStatusTimer) {
     clearTimeout(overlayTranscribingStatusTimer);
     overlayTranscribingStatusTimer = null;
+  }
+  if (!SEPARATE_RECORDING_OVERLAY_ENABLED) {
+    overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
+    startRecordingStateMonitor({ mirrorLevelToOverlay: false });
+    return;
   }
   clearCapturedPasteTarget();
   const front = await getFrontmostAppInfo();
@@ -2531,113 +2651,13 @@ async function showRecordingOverlay() {
   applyOverlayWindowSize();
   ow.showInactive();
   await playOverlayCue("start");
-  if (overlayWaveMonitor) {
-    clearInterval(overlayWaveMonitor);
-    overlayWaveMonitor = null;
-  }
-  overlayWaveMonitor = setInterval(() => {
-    if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
-    if (!win || win.isDestroyed() || !win.webContents) return;
-    win.webContents
-      .executeJavaScript(
-        `(() => {
-          const vu = Number(window.__transcriptorVuLevel || 0);
-          const rms = Number(window.__transcriptorRmsLevel || 0);
-          const lastFrameAt = Number(window.__transcriptorLastFrameAt || 0);
-          const isRec = !!window.__transcriptorIsRecording;
-          return {
-            vu: Number.isFinite(vu) ? vu : 0,
-            rms: Number.isFinite(rms) ? rms : 0,
-            lastFrameAt: Number.isFinite(lastFrameAt) ? lastFrameAt : 0,
-            isRec
-          };
-        })();`,
-        true
-      )
-      .then((state) => {
-        if (!overlayWin || overlayWin.isDestroyed()) return;
-        const safeLevel = Math.max(0, Math.min(1, Number(state?.vu) || 0));
-        const safeRms = Math.max(0, Number(state?.rms) || 0);
-        const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
-        const isRec = !!state?.isRec;
-        const cfg = overlayAutoStopConfig || { enabled: false, seconds: 2, thresholdDb: -42 };
-        const now = Date.now();
-        if (safeLastFrameAt > 0) overlaySeenAudioFrames = true;
-        if (now - overlayAutoStopConfigRefreshAt > 1200) {
-          overlayAutoStopConfigRefreshAt = now;
-          const gen = ++overlayAutoStopConfigGen;
-          getRendererAutoStopSilenceConfig().then((nextCfg) => {
-            // Drop the result if a new recording session bumped the
-            // generation while we were awaiting — the old config would
-            // otherwise overwrite freshly set values from the new
-            // session's showRecordingOverlay.
-            if (gen === overlayAutoStopConfigGen) {
-              overlayAutoStopConfig = nextCfg;
-            }
-          }).catch(() => { });
-        }
-        if (!isRec || !cfg.enabled || overlayStopInFlight) {
-          overlaySilenceStartedAt = 0;
-        } else {
-          const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
-          const warmupMs = 1500;
-          if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
-            overlaySilenceStartedAt = 0;
-            overlayWin.webContents.executeJavaScript(
-              `window.setLevel(${safeLevel});`,
-              true
-            ).catch(() => { });
-            return;
-          }
-          // Only use dB-based silence detection — no staleAudioFrames shortcut.
-          // staleAudioFrames was causing false stops during active speech when
-          // the audio pipeline had minor hiccups.
-          const consideredSilent = safeRms <= thresholdRms;
-          if (consideredSilent) {
-            if (!overlaySilenceStartedAt) {
-              overlaySilenceStartedAt = now;
-            }
-            const silentElapsed = now - overlaySilenceStartedAt;
-            if (silentElapsed >= Number(cfg.seconds) * 1000) {
-              overlaySilenceStartedAt = 0;
-              overlayStopInFlight = true;
-              // Immediately kill the wave monitor so no more VU levels
-              // are pumped into the overlay (prevents yellow/red flicker)
-              if (overlayWaveMonitor) {
-                clearInterval(overlayWaveMonitor);
-                overlayWaveMonitor = null;
-              }
-              appendMainLog(`[overlay-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
-              guardedStopFromOverlay("autostop");
-            }
-          } else {
-            overlaySilenceStartedAt = 0;
-          }
-          // Separate fail-safe: if audio pipeline is truly dead (no frames for 8 seconds),
-          // force stop to avoid infinite hang. This is NOT silence detection.
-          const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 8000;
-          if (staleAudioFrames && !overlayStopInFlight) {
-            overlayStopInFlight = true;
-            if (overlayWaveMonitor) {
-              clearInterval(overlayWaveMonitor);
-              overlayWaveMonitor = null;
-            }
-            appendMainLog(`[overlay-autostop-stale] audio pipeline dead for 8s, forcing stop`);
-            guardedStopFromOverlay("autostop-stale");
-          }
-        }
-        overlayWin.webContents.executeJavaScript(
-          `window.setLevel(${safeLevel});`,
-          true
-        ).catch(() => { });
-      })
-      .catch(() => { });
-  }, 120);
+  startRecordingStateMonitor({ mirrorLevelToOverlay: true });
 }
 
 async function ensureOverlayVisible(options = {}) {
   const { resetTimer = false, startTimer = false, status = null } = options;
   cancelScheduledOverlayHide("ensure-visible");
+  if (!SEPARATE_RECORDING_OVERLAY_ENABLED) return;
   const ow = ensureOverlayWindow();
   armOverlayMouseInterception();
   positionOverlayWindow();
@@ -2698,6 +2718,10 @@ async function setOverlayTimer(text) {
  * new recording session.
  */
 function scheduleOverlayHide(ms) {
+  if (!SEPARATE_RECORDING_OVERLAY_ENABLED) {
+    hideRecordingOverlay();
+    return;
+  }
   cancelScheduledOverlayHide();
   overlayHideTimer = setTimeout(() => {
     overlayHideTimer = null;
@@ -2707,8 +2731,9 @@ function scheduleOverlayHide(ms) {
 
 function hideRecordingOverlay() {
   cancelScheduledOverlayHide();
-  if (!overlayWin || overlayWin.isDestroyed()) return;
-  overlayWin.hide();
+  if (overlayWin && !overlayWin.isDestroyed()) {
+    overlayWin.hide();
+  }
   overlayStopInFlight = false;
   overlaySilenceStartedAt = 0;
   overlayAutoStopConfigRefreshAt = 0;
@@ -2725,10 +2750,7 @@ function hideRecordingOverlay() {
     clearTimeout(overlayTranscribingStatusTimer);
     overlayTranscribingStatusTimer = null;
   }
-  if (overlayWaveMonitor) {
-    clearInterval(overlayWaveMonitor);
-    overlayWaveMonitor = null;
-  }
+  stopRecordingStateMonitor();
   // Stop the Win/Linux cursor poll while hidden; the visible-overlay
   // paths re-arm it even when the same BrowserWindow is reused.
   stopOverlayMouseInterception();
@@ -2755,10 +2777,7 @@ async function setOverlayStatus(text) {
 
 async function showPostStopYellowThenTranscribing(delayMs = 500) {
   // Kill wave monitor so no more VU levels leak in during yellow/blue phase
-  if (overlayWaveMonitor) {
-    clearInterval(overlayWaveMonitor);
-    overlayWaveMonitor = null;
-  }
+  stopRecordingStateMonitor();
   await setOverlayStatus("Auto stop");
   if (overlayTranscribingStatusTimer) {
     clearTimeout(overlayTranscribingStatusTimer);
@@ -2844,7 +2863,7 @@ async function toggleRecordingFromShortcut() {
       windowTitle: compactLogText(front.windowTitle || "", 80),
     });
     await ensureOverlayVisible({ status: hasActivePostStopWork() ? null : "Starting", resetTimer: false, startTimer: false });
-    traceStep(trace, "overlay_visible", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
+    traceStep(trace, "recording_surface_ready", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
@@ -2965,10 +2984,7 @@ async function toggleRecordingFromShortcut() {
     } else {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       // Kill wave monitor immediately — recording is done
-      if (overlayWaveMonitor) {
-        clearInterval(overlayWaveMonitor);
-        overlayWaveMonitor = null;
-      }
+      stopRecordingStateMonitor();
       await playOverlayCue("stop");
       await setOverlayStatus("Saved To App");
       scheduleOverlayHide(1400);
@@ -6995,10 +7011,7 @@ app.on("before-quit", () => {
     clearInterval(accessibilityPollTimer);
     accessibilityPollTimer = null;
   }
-  if (overlayWaveMonitor) {
-    clearInterval(overlayWaveMonitor);
-    overlayWaveMonitor = null;
-  }
+  stopRecordingStateMonitor();
   stopOverlayMouseInterception();
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
@@ -7455,14 +7468,16 @@ app.whenReady().then(async () => {
   // is contextual rather than blocking the launch.
   try { await macPermPromise; } catch { /* best-effort permission */ }
 
-  // Preload overlay once to avoid first-use delay after hotkey.
-  try {
-    ensureOverlayWindow();
-    // Routed through ensureOverlayLoaded so this preload shares its
-    // loadURL with any concurrent shortcut-driven ensureOverlayVisible
-    // call (rare during startup, but a race-free path costs nothing).
-    await ensureOverlayLoaded();
-  } catch { }
+  if (SEPARATE_RECORDING_OVERLAY_ENABLED) {
+    // Preload overlay once to avoid first-use delay after hotkey.
+    try {
+      ensureOverlayWindow();
+      // Routed through ensureOverlayLoaded so this preload shares its
+      // loadURL with any concurrent shortcut-driven ensureOverlayVisible
+      // call (rare during startup, but a race-free path costs nothing).
+      await ensureOverlayLoaded();
+    } catch { }
+  }
 }).catch((err) => {
   // The whenReady chain has many awaits — startBackend, permission
   // probes, accessibility checks, overlay preload — and any one of
