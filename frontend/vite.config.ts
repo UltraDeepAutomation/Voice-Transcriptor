@@ -33,6 +33,10 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // Electron ships Chromium; keep CSS output aligned with that runtime
+    // so production builds preserve unprefixed properties like backdrop-filter.
+    cssTarget: "chrome142",
+    cssMinify: false,
   },
   define: {
     __APP_VERSION__: JSON.stringify(PKG_VERSION),
