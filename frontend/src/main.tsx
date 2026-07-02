@@ -10055,6 +10055,14 @@ function normalizeUploadProvider(value: unknown): Provider {
     : "deepgram";
 }
 
+function resolveEffectiveUploadProvider(preferred: Provider): Provider {
+  if (preferred === "local") return "local";
+  if (!isRemoteProvider(preferred)) return "local";
+  if (!isProviderKeyConfigured(preferred)) return "local";
+  if (!isRemoteProviderReachable(preferred)) return "local";
+  return preferred;
+}
+
 function currentUploadTranscriptionOptions(): {
   provider: Provider;
   language: string;
@@ -10601,9 +10609,10 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     }, _stageCrossoverDelay)
     : 0;
   const selectedProvider = normalizeUploadProvider(item.requestedProvider || item.provider || "deepgram");
-  // Honor offline mode the same way the Record tab does — fall back
-  // to local when the chosen remote provider isn't available right now.
-  const provider = resolveEffectiveProvider(selectedProvider);
+  // Upload is a batch workflow: if the selected remote provider is
+  // unavailable or has no key, keep the file moving through Local
+  // Whisper instead of failing every queued item.
+  const provider = resolveEffectiveUploadProvider(selectedProvider);
   const language = String(item.requestedLanguage || item.language || "auto").trim() || "auto";
   const diarize = item.requestedDiarize === true;
   item.provider = provider;
