@@ -120,6 +120,7 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
         self.assertIn("opus", payload["accepted_audio_exts"])
         self.assertIn("mp4", payload["accepted_audio_exts"])
         self.assertNotIn(".wav", payload["accepted_audio_exts"])
+        self.assertEqual(payload["live_sample_rate_hz"], LIVE_SAMPLE_RATE_HZ)
 
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):

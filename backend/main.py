@@ -1152,6 +1152,7 @@ def health():
         "ok": True,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "accepted_audio_exts": sorted(ext.lstrip(".") for ext in ALLOWED_AUDIO_EXTS),
+        "live_sample_rate_hz": LIVE_SAMPLE_RATE_HZ,
         "boot_nonce": BOOT_NONCE,
     }
 

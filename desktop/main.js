@@ -2856,22 +2856,38 @@ async function stopRecordingFromOverlay() {
   if (win.isVisible()) win.hide();
 
   try {
-    const result = await win.webContents.executeJavaScript(
-      `
-      (() => {
-        const isRec = !!(window.__transcriptorIsRecording);
-        const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
-        const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-        const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
-        const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
-        if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
-        // Use dedicated stop event — avoids dual-path race with btnStop.click().
-        window.dispatchEvent(new Event('transcriptor-hotkey-stop'));
-        return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
-      })();
-      `,
-      true
-    );
+    const snapshot = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    const expectedRecordingId = Number(snapshot?.recordingId || 0);
+    const result = snapshot?.recording
+      ? await execRendererJsWithTimeout(
+        `
+        (() => {
+          const expectedRecordingId = ${JSON.stringify(expectedRecordingId)};
+          const isRec = !!(window.__transcriptorIsRecording);
+          const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
+          const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
+          const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
+          const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
+          if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
+          if (expectedRecordingId > 0 && recordingId !== expectedRecordingId) {
+            return { ok: false, recording: true, stale: true, timerText, recordingId, expectedRecordingId, auto, autoSendEnter };
+          }
+          // Use dedicated stop event — avoids dual-path race with btnStop.click().
+          window.dispatchEvent(new CustomEvent('transcriptor-hotkey-stop', { detail: { recordingId } }));
+          return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
+        })();
+        `,
+        null,
+        2000,
+      )
+      : {
+        ok: false,
+        recording: false,
+        timerText: "",
+        recordingId: expectedRecordingId,
+        auto: false,
+        autoSendEnter: false,
+      };
 
     await ensureOverlayVisible({ startTimer: false, resetTimer: false });
     if (result?.timerText) {
@@ -2879,7 +2895,16 @@ async function stopRecordingFromOverlay() {
     }
     await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
 
-    if (result?.ok) {
+    if (!result) {
+      appendMainLog("[overlay-stop] renderer stop request timed out");
+      await setOverlayStatus("App Loading");
+      scheduleOverlayHide(1300);
+    } else if (result?.stale) {
+      appendMainLog(
+        `[overlay-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
+      );
+      await setOverlayStatus("Recording");
+    } else if (result?.ok) {
       await playOverlayCue("stop");
       if (result.auto) {
         enqueuePostStopTask({

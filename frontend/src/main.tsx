@@ -369,9 +369,10 @@ const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "
 // value from every successful health probe so the cap can never drift
 // from what the backend will actually accept on POST.
 let MAX_FILE_BYTES = 500 * 1024 * 1024;
-const AUDIO_TOKENS = {
-  liveSampleRateHz: 16_000,
-} as const;
+// SSOT: backend/main.py exposes backend.audio_constants.LIVE_SAMPLE_RATE_HZ
+// through /api/health.live_sample_rate_hz. This fallback only applies before
+// the first health response lands.
+let LIVE_SAMPLE_RATE_HZ = 16_000;
 const UI_TOKENS = {
   polling: {
     remoteChunkSettleTimeoutMs: 3_000,
@@ -2978,10 +2979,15 @@ async function refreshNetworkState(): Promise<void> {
       const healthJson = (await health.clone().json()) as {
         max_upload_bytes?: unknown;
         accepted_audio_exts?: unknown;
+        live_sample_rate_hz?: unknown;
       };
       const candidate = Number(healthJson?.max_upload_bytes);
       if (Number.isFinite(candidate) && candidate > 0) {
         MAX_FILE_BYTES = Math.trunc(candidate);
+      }
+      const sampleRateCandidate = Number(healthJson?.live_sample_rate_hz);
+      if (Number.isFinite(sampleRateCandidate) && sampleRateCandidate >= 8_000 && sampleRateCandidate <= 96_000) {
+        LIVE_SAMPLE_RATE_HZ = Math.trunc(sampleRateCandidate);
       }
       if (Array.isArray(healthJson?.accepted_audio_exts)) {
         const nextExts = healthJson.accepted_audio_exts
@@ -6877,7 +6883,7 @@ function pushCapturedFrame(input: Float32Array): void {
   window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(captureRmsEma) ? captureRmsEma : 0);
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
-  const ds = downsample(input, ac.sampleRate, AUDIO_TOKENS.liveSampleRateHz);
+  const ds = downsample(input, ac.sampleRate, LIVE_SAMPLE_RATE_HZ);
   const frameStartSample = capturePcmSampleCount;
   capturePcmSampleCount += ds.length;
   if (rms >= CAPTURE_TAIL_ACTIVITY_RMS || peak >= CAPTURE_TAIL_ACTIVITY_PEAK) {
@@ -7759,7 +7765,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (pcmSink) {
     try {
       pcmCanonicalSampleCount = pcmSink.totalSamples;
-      pcmCanonicalFile = await pcmSink.finalize(AUDIO_TOKENS.liveSampleRateHz);
+      pcmCanonicalFile = await pcmSink.finalize(LIVE_SAMPLE_RATE_HZ);
     } catch (e) {
       console.warn("pcmSink.finalize failed; canonical audio will come from WebM fallback", e);
     }
@@ -7768,7 +7774,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   const canonicalCapture = await selectCanonicalCapturedAudio({
     pcmFile: pcmCanonicalFile,
     pcmSampleCount: pcmCanonicalSampleCount,
-    pcmSampleRate: AUDIO_TOKENS.liveSampleRateHz,
+    pcmSampleRate: LIVE_SAMPLE_RATE_HZ,
     recordedChunks: recordedWebmChunks,
     expectedDurationSec: recordedSec,
   });
@@ -8582,7 +8588,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           // path ran even when the visible live preview already had the
           // full utterance tail.
           const lastSpeechEnd = maxLiveBufferSpeechEnd(instantBuffer);
-          const lastCapturedActivitySec = captureLastActivePcmSample / AUDIO_TOKENS.liveSampleRateHz;
+          const lastCapturedActivitySec = captureLastActivePcmSample / LIVE_SAMPLE_RATE_HZ;
           const tailGapSec = recordedSec - lastSpeechEnd;
           const tailActivityGapSec = lastCapturedActivitySec - lastSpeechEnd;
           const hasTimestampedLiveCoverage = lastSpeechEnd > 0;
@@ -9463,7 +9469,9 @@ window.addEventListener("transcriptor-hotkey-toggle", () => {
 });
 
 // Dedicated stop event for overlay stop — avoids dual-path race.
-window.addEventListener("transcriptor-hotkey-stop", () => {
+window.addEventListener("transcriptor-hotkey-stop", (ev) => {
+  const requestedRecordingId = Number((ev as CustomEvent<{ recordingId?: number }>).detail?.recordingId || 0);
+  if (requestedRecordingId > 0 && currentRecordingId !== requestedRecordingId) return;
   if (isRecording) {
     void stopLive(shouldAutoTranscribe());
   }
