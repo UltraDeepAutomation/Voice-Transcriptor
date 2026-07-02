@@ -80,7 +80,7 @@ class RemoteChunkingTests(unittest.TestCase):
                 language="ru",
                 diarize=True,
                 num_speakers="2",
-                openrouter_model="nova-3",
+                remote_model="nova-3",
                 cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
                 progress_cb=progress.append,
             )
@@ -105,6 +105,52 @@ class RemoteChunkingTests(unittest.TestCase):
         self.assertEqual(len(result["raw"]["chunks"]), 3)
         self.assertGreaterEqual(progress[0], 0.18)
         self.assertGreaterEqual(progress[-1], 0.9)
+
+    def test_remote_model_uses_canonical_field_and_legacy_alias(self):
+        source = Path(self._tmp.name) / "source.wav"
+        source.write_bytes(b"source-audio-bytes")
+        chunk = Path(self._tmp.name) / "chunk.webm"
+        chunk.write_bytes(b"chunk")
+
+        models = []
+
+        def fake_deepgram_transcribe(**kwargs):
+            models.append(kwargs["model"])
+            return {"text": "ok", "raw": {}}
+
+        with mock.patch.object(
+            self.main,
+            "compact_audio_chunks_for_remote",
+            return_value=[str(chunk)],
+        ), mock.patch.object(
+            self.main,
+            "deepgram_transcribe",
+            side_effect=fake_deepgram_transcribe,
+        ):
+            canonical = self.main._run_remote_transcribe_once(
+                provider_norm="deepgram",
+                upload_path=source,
+                orig_name="source.wav",
+                language="en",
+                diarize=False,
+                num_speakers="",
+                remote_model="nova-3",
+                cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
+            )
+            legacy = self.main._run_remote_transcribe_once(
+                provider_norm="deepgram",
+                upload_path=source,
+                orig_name="source.wav",
+                language="en",
+                diarize=False,
+                num_speakers="",
+                openrouter_model="legacy-nova",
+                cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
+            )
+
+        self.assertEqual(canonical["model"], "nova-3")
+        self.assertEqual(legacy["model"], "legacy-nova")
+        self.assertEqual(models, ["nova-3", "legacy-nova"])
 
     def test_live_recovery_helpers_are_optional(self):
         self.main._record_recovery_chunk(None, b"pcm")

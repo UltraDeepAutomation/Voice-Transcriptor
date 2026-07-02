@@ -1530,6 +1530,23 @@ def _form_text(value: Any, default: str = "") -> str:
     return str(raw)
 
 
+def _first_nonempty_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _remote_model_from_payload(payload: Optional[dict]) -> str:
+    data = payload or {}
+    return _first_nonempty_text(
+        data.get("model"),
+        data.get("remote_model"),
+        data.get("openrouter_model"),  # legacy alias kept for older clients
+    )
+
+
 def _form_bool(value: Any, default: bool = False) -> bool:
     raw = _form_default_value(value, default)
     if isinstance(raw, bool):
@@ -3754,7 +3771,8 @@ def _run_remote_transcribe_once(
     language: Optional[str],
     diarize: bool,
     num_speakers: str,
-    openrouter_model: str,
+    remote_model: str = "",
+    openrouter_model: str = "",
     cfg: Optional[dict] = None,
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
@@ -3796,13 +3814,14 @@ def _run_remote_transcribe_once(
         or ((cfg.get("preferences") or {}).get("remote_provider"))
         or "openrouter"
     ).strip()
+    explicit_model = _first_nonempty_text(remote_model, openrouter_model)
 
     _raise_if_cancelled()
     if prov == "openrouter":
         or_key = ((cfg.get("providers") or {}).get("openrouter") or {}).get("key") or ""
         pref = (cfg.get("preferences") or {}).get("openrouter") or {}
         model = (
-            openrouter_model or pref.get("model") or DEFAULT_OPENROUTER_AUDIO_MODEL
+            explicit_model or pref.get("model") or DEFAULT_OPENROUTER_AUDIO_MODEL
         ).strip()
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
@@ -3822,7 +3841,7 @@ def _run_remote_transcribe_once(
 
     elif prov == "deepgram":
         dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
-        model = (openrouter_model or DEFAULT_DEEPGRAM_AUDIO_MODEL).strip()
+        model = (explicit_model or DEFAULT_DEEPGRAM_AUDIO_MODEL).strip()
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
             out = deepgram_transcribe(
@@ -3988,7 +4007,7 @@ def _submit_remote_transcription_job(
     language: Optional[str],
     diarize: bool,
     num_speakers: str,
-    openrouter_model: str,
+    remote_model: str,
     cleanup_upload_path: bool,
 ) -> None:
     cancel_event = jobs.cancel_event(job_id)
@@ -4011,7 +4030,7 @@ def _submit_remote_transcription_job(
                 language=language,
                 diarize=diarize,
                 num_speakers=num_speakers,
-                openrouter_model=openrouter_model,
+                remote_model=remote_model,
                 cancel_event=cancel_event,
                 progress_cb=lambda value: (
                     jobs.raise_if_cancelled(job_id),
@@ -4077,6 +4096,8 @@ async def create_remote_job(
     language: str = Form("auto"),
     diarize: bool = Form(False),
     num_speakers: str = Form(""),
+    model: str = Form(""),
+    remote_model: str = Form(""),
     openrouter_model: str = Form(""),
 ):
     _cleanup_expired_files()
@@ -4100,7 +4121,11 @@ async def create_remote_job(
         language=lang_opt,
         diarize=_form_bool(diarize, False),
         num_speakers=_form_text(num_speakers, ""),
-        openrouter_model=_form_text(openrouter_model, ""),
+        remote_model=_first_nonempty_text(
+            _form_text(model, ""),
+            _form_text(remote_model, ""),
+            _form_text(openrouter_model, ""),
+        ),
         cleanup_upload_path=True,
     )
     return {"job_id": job_id}
@@ -4134,7 +4159,7 @@ async def create_remote_job_from_path(
         language=lang_opt,
         diarize=_payload_bool(payload, "diarize", False),
         num_speakers=str((payload or {}).get("num_speakers") or ""),
-        openrouter_model=str((payload or {}).get("openrouter_model") or ""),
+        remote_model=_remote_model_from_payload(payload),
         cleanup_upload_path=False,
     )
     return {"job_id": job_id, "audio_source_path": str(upload_path)}
@@ -4148,6 +4173,8 @@ async def remote_transcribe_sync(
     language: str = Form("auto"),
     diarize: bool = Form(False),
     num_speakers: str = Form(""),
+    model: str = Form(""),
+    remote_model: str = Form(""),
     openrouter_model: str = Form(""),
 ):
     provider_norm = _form_text(provider, "").strip()
@@ -4176,7 +4203,11 @@ async def remote_transcribe_sync(
                 language=lang_opt,
                 diarize=_form_bool(diarize, False),
                 num_speakers=_form_text(num_speakers, ""),
-                openrouter_model=_form_text(openrouter_model, ""),
+                remote_model=_first_nonempty_text(
+                    _form_text(model, ""),
+                    _form_text(remote_model, ""),
+                    _form_text(openrouter_model, ""),
+                ),
                 cfg=cfg,
             ),
         )
@@ -4223,7 +4254,7 @@ async def transcribe_recording_on_disk(
         language:        ISO-639-1 / "auto" (default: auto)
         diarize:         bool (default: false)
         num_speakers:    str (deepgram only)
-        openrouter_model: str
+        model/remote_model: str (legacy alias: openrouter_model)
         archive_dir:     str — same as the GET endpoint
 
     Returns same shape as ``/api/remote/transcribe-sync``.
@@ -4265,7 +4296,7 @@ async def transcribe_recording_on_disk(
                 language=lang_opt,
                 diarize=_payload_bool(payload, "diarize", False),
                 num_speakers=str(payload.get("num_speakers") or ""),
-                openrouter_model=str(payload.get("openrouter_model") or ""),
+                remote_model=_remote_model_from_payload(payload),
                 cfg=cfg,
             ),
         )

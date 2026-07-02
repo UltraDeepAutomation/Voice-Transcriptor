@@ -2403,6 +2403,25 @@ function getRemoteModelValue(provider: Provider): string {
   return ($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
 }
 
+function appendRemoteModelFormFields(fd: FormData, provider: Provider, model: string | undefined): void {
+  if (!isRemoteProvider(provider)) return;
+  const value = String(model || "").trim();
+  fd.set("model", value);
+  fd.set("remote_model", value);
+  // Legacy backend alias. Keep it derived here so there is still one caller-side SSOT.
+  fd.set("openrouter_model", value);
+}
+
+function remoteModelJsonFields(provider: Provider, model: string | undefined): Record<string, string> {
+  if (!isRemoteProvider(provider)) return {};
+  const value = String(model || "").trim();
+  return {
+    model: value,
+    remote_model: value,
+    openrouter_model: value,
+  };
+}
+
 function syncLiveLocalModelVisibility(): void {
   const provider = readProviderSelection();
   const effective = resolveEffectiveProvider(provider);
@@ -2457,16 +2476,14 @@ function syncRemoteModelOptions(): void {
 
 async function remoteJob(
   file: File,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal }
+  opts: { provider: Provider; language: string; diarize: boolean; remoteModel?: string; signal?: AbortSignal }
 ): Promise<BackendJobCreated> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
   fd.set("provider", opts.provider || "openrouter");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
-  if (opts.provider === "openrouter" || opts.provider === "deepgram") {
-    fd.set("openrouter_model", (opts.openrouterModel || "").trim());
-  }
+  appendRemoteModelFormFields(fd, opts.provider, opts.remoteModel);
   const r = await fetch("/api/remote/jobs", {
     method: "POST",
     body: fd,
@@ -2499,7 +2516,7 @@ async function localJob(
 
 async function remoteJobFromPath(
   sourcePath: string,
-  opts: { provider: Provider; language: string; diarize: boolean; openrouterModel?: string; signal?: AbortSignal },
+  opts: { provider: Provider; language: string; diarize: boolean; remoteModel?: string; signal?: AbortSignal },
 ): Promise<BackendJobCreated> {
   const r = await fetch("/api/remote/jobs/from-path", {
     method: "POST",
@@ -2510,7 +2527,7 @@ async function remoteJobFromPath(
       provider: opts.provider || "openrouter",
       language: opts.language || "auto",
       diarize: !!opts.diarize,
-      openrouter_model: (opts.openrouterModel || "").trim(),
+      ...remoteModelJsonFields(opts.provider, opts.remoteModel),
     }),
   });
   if (!r.ok) throw new Error(await parseError(r));
@@ -2604,7 +2621,7 @@ async function waitForQueuedRemoteJob(
     provider: Provider;
     language: string;
     diarize: boolean;
-    openrouterModel?: string;
+    remoteModel?: string;
     signal?: AbortSignal;
     onProcessingProgress?: (fraction: number) => void;
   },
@@ -2641,7 +2658,7 @@ async function remoteJobQueued(
     provider: Provider;
     language: string;
     diarize: boolean;
-    openrouterModel?: string;
+    remoteModel?: string;
     signal?: AbortSignal;
     onProcessingProgress?: (fraction: number) => void;
   },
@@ -2655,7 +2672,7 @@ async function remoteJobQueuedFromPath(
     provider: Provider;
     language: string;
     diarize: boolean;
-    openrouterModel?: string;
+    remoteModel?: string;
     signal?: AbortSignal;
     onProcessingProgress?: (fraction: number) => void;
   },
@@ -2717,7 +2734,7 @@ async function remoteJobSync(
     provider: Provider;
     language: string;
     diarize: boolean;
-    openrouterModel?: string;
+    remoteModel?: string;
     signal?: AbortSignal;
     timeoutMs?: number;
     providerReachabilityHint?: boolean;
@@ -2733,9 +2750,7 @@ async function remoteJobSync(
   fd.set("provider", opts.provider || "openrouter");
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
-  if (opts.provider === "openrouter" || opts.provider === "deepgram") {
-    fd.set("openrouter_model", (opts.openrouterModel || "").trim());
-  }
+  appendRemoteModelFormFields(fd, opts.provider, opts.remoteModel);
   try {
     const r = await fetch("/api/remote/transcribe-sync", {
       method: "POST",
@@ -5818,7 +5833,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
           provider: "deepgram",
           language: lang,
           diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-          openrouterModel: dgModel,
+          remoteModel: dgModel,
         });
         text = String(result.text || "").trim();
         usedProvider = "deepgram";
@@ -8406,7 +8421,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           provider: "deepgram",
           language: languageValue,
           diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-          openrouter_model: getRemoteModelValue("deepgram"),
+          ...remoteModelJsonFields("deepgram", getRemoteModelValue("deepgram")),
           archive_dir: persistedRecordingArchiveDir || "",
         }),
       });
@@ -8463,7 +8478,7 @@ async function stopLive(enhance: boolean): Promise<void> {
               provider: "deepgram",
               language: languageValue,
               diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-              openrouterModel: getRemoteModelValue("deepgram"),
+              remoteModel: getRemoteModelValue("deepgram"),
               providerReachabilityHint: deepgramReachabilityHint,
               signal,
             });
@@ -8858,7 +8873,7 @@ async function stopLive(enhance: boolean): Promise<void> {
                   provider: "deepgram",
                   language: languageValue,
                   diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-                  openrouterModel: getRemoteModelValue("deepgram"),
+                  remoteModel: getRemoteModelValue("deepgram"),
                   providerReachabilityHint: deepgramReachabilityHint,
                 });
                 const restText = String(restResult.text || "").trim();
@@ -9042,7 +9057,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             provider,
             language: languageValue,
             diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-            openrouterModel: modelValue,
+            remoteModel: modelValue,
           });
         }
       }
@@ -9443,7 +9458,7 @@ async function transcribeSelectedFile(): Promise<void> {
         provider,
         language: ($("language") as HTMLSelectElement).value,
         diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-        openrouterModel: modelValue,
+        remoteModel: modelValue,
         signal: pollAbortController.signal,
       });
       const transcriptRaw = String(syncOut.text || "").trim();
@@ -10609,7 +10624,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         provider,
         language,
         diarize,
-        openrouterModel: modelLabel,
+        remoteModel: modelLabel,
         signal: item.abortController.signal,
         // Upload-tab remote jobs must not hold one browser XHR open
         // for upload + ffmpeg + provider processing. Large videos can
