@@ -151,6 +151,16 @@ class RecordingNameTests(unittest.TestCase):
 
         self.assertFalse(self.main._origin_allowed("http://localhost:not-a-port", request))
 
+    def test_open_recordings_folder_rejects_existing_file_path(self):
+        existing_file = Path(self._home.name) / "not-a-folder"
+        existing_file.write_text("file, not directory", encoding="utf-8")
+
+        with self.assertRaises(self.main.HTTPException) as cm:
+            asyncio.run(self.main.open_recordings_folder({"path": str(existing_file)}, _auth=None))
+
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.detail, "folder path exists but is not a directory")
+
     def test_recording_collection_rejects_symlink_escape_after_resolve(self):
         root = Path(self._tmp.name) / "recordings"
         root.mkdir()
