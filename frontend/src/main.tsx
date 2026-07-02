@@ -197,7 +197,7 @@ interface LiveSessionSnapshot {
   finalLocalModel: string;
 }
 
-type LiveWsMode = "local-assist" | "deepgram-stream";
+type LiveWsMode = "none" | "local-assist" | "deepgram-stream";
 
 interface LiveFinalEnvelope {
   text: string;
@@ -1078,6 +1078,7 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
 function providerLabel(provider: string): string {
   const value = String(provider || "").trim().toLowerCase();
   if (!value || value === "unknown") return "Unknown";
+  if (value === "none") return "None";
   if (value === "local") return "Local";
   if (value === "openrouter") return "OpenRouter";
   if (value === "deepgram") return "Deepgram";
@@ -2369,6 +2370,7 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
 }
 
 function getRemoteModelValue(provider: Provider): string {
+  if (!provider) return "";
   if (provider === "openrouter") {
     const v = (remoteModelByProvider.openrouter || "").trim();
     return v || DEFAULT_OPENROUTER_AUDIO_MODEL;
@@ -2944,12 +2946,16 @@ function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalMod
  *
  * SSOT routing rules:
  *   - deepgram (online)  → dedicated Deepgram streaming WebSocket
- *   - any other provider → local faster-whisper assist pipeline
+ *   - local / remote fallback → local faster-whisper assist pipeline
+ *   - no provider        → no live transcription transport
  */
 function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
   const provider = snapshot
     ? snapshot.effectiveProvider
     : resolveEffectiveProvider(readProviderSelection());
+  if (!provider) {
+    return "none";
+  }
   if (provider === "deepgram" && isProviderKeyConfigured("deepgram")) {
     return "deepgram-stream";
   }
@@ -6264,7 +6270,7 @@ let startLiveInFlight = false;
 let liveStartAttemptSeq = 0;
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
-let liveWsMode: LiveWsMode = "local-assist";
+let liveWsMode: LiveWsMode = "none";
 
 function resolvePendingWorkletFlushes(): void {
   for (const finish of Array.from(pendingWorkletFlushes.values())) {
@@ -7050,8 +7056,8 @@ function pushCapturedFrame(input: Float32Array): void {
 
   // ── Live WebSocket path ───────────────────────────────────────────
   // Independent of the canonical sink: the PCM16 bytes are streamed
-  // to the backend /ws/transcribe in real time regardless of whether
-  // the sink succeeded or not.
+  // to the backend /ws/transcribe in real time when a transcription
+  // transport exists for this session.
   //
   // IMPORTANT: if the WS is still CONNECTING (not yet OPEN), buffer
   // the frame and flush the buffer once the socket opens. This fixes
@@ -7180,9 +7186,11 @@ async function startLive(): Promise<void> {
   const selectedEffectiveProvider = resolveEffectiveProvider(selectedProvider);
   const sessionLocalModels = resolveSessionLocalModels(selectedProvider);
   const selectedModel =
-    selectedEffectiveProvider === "local"
-      ? sessionLocalModels.finalLocalModel
-      : getRemoteModelValue(selectedEffectiveProvider);
+    !selectedEffectiveProvider
+      ? ""
+      : selectedEffectiveProvider === "local"
+        ? sessionLocalModels.finalLocalModel
+        : getRemoteModelValue(selectedEffectiveProvider);
   const selectedLanguage = (($("language") as HTMLSelectElement).value || "auto").trim();
   const sessionTitle = "Recording " + new Date().toLocaleString();
   activeLiveSessionSnapshot = {
@@ -7260,137 +7268,144 @@ async function startLive(): Promise<void> {
     }
   }, UI_TOKENS.timer.tickMs);
 
-  const enableVisibleLivePreview = shouldLivePreview();
-  const wsQuery = new URLSearchParams({
-    provider: sessionWsMode === "deepgram-stream" ? "deepgram" : "local",
-    language: activeLiveSessionSnapshot.language,
-    session_id: activeLiveSessionId,
-    archive_dir: activeLiveArchiveDir,
-    recording_collection: RECORDING_COLLECTIONS.live,
-    diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
-  });
-  if (sessionWsMode === "deepgram-stream") {
-    wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
+  const enableVisibleLivePreview = sessionWsMode !== "none" && shouldLivePreview();
+  if (sessionWsMode === "none") {
+    patchCurrentRecordingSummary({
+      status: "Recording audio only. No transcription provider is selected.",
+      tone: "info",
+    }, sessionUiToken);
   } else {
-    wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
-  }
-  ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => {
-    const statusMsg =
-      sessionWsMode === "deepgram-stream"
-        ? enableVisibleLivePreview
-          ? "Recording. Deepgram live streaming is active."
-          : "Recording. Deepgram live stream is committing segments in the background."
-        : enableVisibleLivePreview
-          ? selectedEffectiveProvider === "local"
-            ? "Recording with live preview enabled."
-            : "Recording with live preview enabled. Local assist is canonical for fast stop."
-          : "Recording. Background local assist is active for fast stop finalization.";
-    patchCurrentRecordingSummary({ status: statusMsg, tone: "info" }, sessionUiToken);
-  };
-  ws.onerror = (ev) => {
-    // Scope the log to this session token so a stale socket from a
-    // prior recording can't confuse the developer into thinking the
-    // current session is broken. No state mutation — actual error
-    // surfacing happens through the higher-level 'error' message
-    // path from the backend or the onclose handler below.
-    console.warn(`live ws transport error [session=${sessionUiToken.slice(0, 8)}]`, ev);
-  };
-  ws.onclose = (ev) => {
-    // A clean close (1000/1005) after finalize is expected. An unclean
-    // close before finalize means the stream died; release any pending
-    // waiters for THIS session with a synthetic error envelope so
-    // stopLive doesn't hang on waitForLiveFinalEnvelope.
-    const slot = liveFinalSlots.get(sessionUiToken);
-    if (!slot) return;
-    if (slot.envelope) return;
-    if (slot.waiters.length === 0) return;
-    console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot.envelope} waiters=${slot.waiters.length}`);
-    if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
-    console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
-    resolveLiveFinal(sessionUiToken, {
-      text: "",
-      segments: [],
-      durationSec: 0,
-      source: sessionWsMode,
-      error: `live stream closed unexpectedly (code=${ev.code})`,
+    const wsQuery = new URLSearchParams({
+      provider: sessionWsMode === "deepgram-stream" ? "deepgram" : "local",
+      language: activeLiveSessionSnapshot.language,
+      session_id: activeLiveSessionId,
+      archive_dir: activeLiveArchiveDir,
+      recording_collection: RECORDING_COLLECTIONS.live,
+      diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
     });
-  };
-  ws.onmessage = (ev: MessageEvent<string>) => {
-    const msg = parseLiveWsMessage(ev.data);
-    if (!msg) return;
-    const isActiveSession = activeUiSessionToken === sessionUiToken;
-    const sessionBuffer = ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
-    switch (msg.type) {
-      case "error": {
-        setLiveStreamError(sessionUiToken, msg.error);
-        console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
-        // Only surface truly fatal errors to the user. Non-fatal
-        // stream drops (when we already have committed segments) are
-        // logged to the console but invisible in the pill — the
-        // recording keeps going, just not streaming to Deepgram
-        // anymore. stopLive picks up the committed text as the
-        // transcript so the user experience is seamless.
-        if (isActiveSession && msg.fatal) {
-          patchCurrentRecordingSummary(
-            {
-              status: `Live stream error: ${explainNetworkError(new Error(msg.error))}`,
-              tone: "error",
-            },
-            sessionUiToken
-          );
-          // DO NOT pipe the error message through setLiveInterimText:
-          // that path feeds into `sourceLiveText` at stopLive time,
-          // which then becomes the saved transcript + the clipboard-
-          // paste content. A user in a region that blocks Deepgram
-          // would otherwise see a raw "[Deepgram connect failed: did
-          // not receive a valid HTTP response]" pasted into Slack /
-          // Telegram / wherever. The status pill carries the error;
-          // transcript stays empty so the paste code path treats it
-          // as "nothing to paste".
-        }
-        return;
-      }
-      case "segments": {
-        const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-        console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
-        appendSegmentsToBuffer(sessionBuffer, msg.segments);
-        if (isActiveSession) {
-          projectLiveTranscriptBufferToActiveState(sessionBuffer);
-          if (liveDraftText) {
-            persistLiveDraft(true);
-          }
-        }
-        return;
-      }
-      case "interim": {
-        sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
-        sessionBuffer.interimSegment = msg.segment;
-        if (isActiveSession) {
-          projectLiveTranscriptBufferToActiveState(sessionBuffer);
-        }
-        return;
-      }
-      case "final": {
-        const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-        console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
-        appendSegmentsToBuffer(sessionBuffer, msg.segments);
-        if (isActiveSession) {
-          projectLiveTranscriptBufferToActiveState(sessionBuffer);
-        }
-        const envelope: LiveFinalEnvelope = {
-          text: normalizeTranscriptWhitespace(msg.text),
-          segments: msg.segments,
-          durationSec: msg.durationSec,
-          source: msg.source || sessionWsMode,
-        };
-        if (msg.error) envelope.error = msg.error;
-        resolveLiveFinal(sessionUiToken, envelope);
-        return;
-      }
+    if (sessionWsMode === "deepgram-stream") {
+      wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
+    } else {
+      wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
     }
-  };
+    ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      const statusMsg =
+        sessionWsMode === "deepgram-stream"
+          ? enableVisibleLivePreview
+            ? "Recording. Deepgram live streaming is active."
+            : "Recording. Deepgram live stream is committing segments in the background."
+          : enableVisibleLivePreview
+            ? selectedEffectiveProvider === "local"
+              ? "Recording with live preview enabled."
+              : "Recording with live preview enabled. Local assist is canonical for fast stop."
+            : "Recording. Background local assist is active for fast stop finalization.";
+      patchCurrentRecordingSummary({ status: statusMsg, tone: "info" }, sessionUiToken);
+    };
+    ws.onerror = (ev) => {
+      // Scope the log to this session token so a stale socket from a
+      // prior recording can't confuse the developer into thinking the
+      // current session is broken. No state mutation — actual error
+      // surfacing happens through the higher-level 'error' message
+      // path from the backend or the onclose handler below.
+      console.warn(`live ws transport error [session=${sessionUiToken.slice(0, 8)}]`, ev);
+    };
+    ws.onclose = (ev) => {
+      // A clean close (1000/1005) after finalize is expected. An unclean
+      // close before finalize means the stream died; release any pending
+      // waiters for THIS session with a synthetic error envelope so
+      // stopLive doesn't hang on waitForLiveFinalEnvelope.
+      const slot = liveFinalSlots.get(sessionUiToken);
+      if (!slot) return;
+      if (slot.envelope) return;
+      if (slot.waiters.length === 0) return;
+      console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot.envelope} waiters=${slot.waiters.length}`);
+      if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
+      console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
+      resolveLiveFinal(sessionUiToken, {
+        text: "",
+        segments: [],
+        durationSec: 0,
+        source: sessionWsMode,
+        error: `live stream closed unexpectedly (code=${ev.code})`,
+      });
+    };
+    ws.onmessage = (ev: MessageEvent<string>) => {
+      const msg = parseLiveWsMessage(ev.data);
+      if (!msg) return;
+      const isActiveSession = activeUiSessionToken === sessionUiToken;
+      const sessionBuffer = ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
+      switch (msg.type) {
+        case "error": {
+          setLiveStreamError(sessionUiToken, msg.error);
+          console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
+          // Only surface truly fatal errors to the user. Non-fatal
+          // stream drops (when we already have committed segments) are
+          // logged to the console but invisible in the pill — the
+          // recording keeps going, just not streaming to Deepgram
+          // anymore. stopLive picks up the committed text as the
+          // transcript so the user experience is seamless.
+          if (isActiveSession && msg.fatal) {
+            patchCurrentRecordingSummary(
+              {
+                status: `Live stream error: ${explainNetworkError(new Error(msg.error))}`,
+                tone: "error",
+              },
+              sessionUiToken
+            );
+            // DO NOT pipe the error message through setLiveInterimText:
+            // that path feeds into `sourceLiveText` at stopLive time,
+            // which then becomes the saved transcript + the clipboard-
+            // paste content. A user in a region that blocks Deepgram
+            // would otherwise see a raw "[Deepgram connect failed: did
+            // not receive a valid HTTP response]" pasted into Slack /
+            // Telegram / wherever. The status pill carries the error;
+            // transcript stays empty so the paste code path treats it
+            // as "nothing to paste".
+          }
+          return;
+        }
+        case "segments": {
+          const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
+          console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
+          appendSegmentsToBuffer(sessionBuffer, msg.segments);
+          if (isActiveSession) {
+            projectLiveTranscriptBufferToActiveState(sessionBuffer);
+            if (liveDraftText) {
+              persistLiveDraft(true);
+            }
+          }
+          return;
+        }
+        case "interim": {
+          sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
+          sessionBuffer.interimSegment = msg.segment;
+          if (isActiveSession) {
+            projectLiveTranscriptBufferToActiveState(sessionBuffer);
+          }
+          return;
+        }
+        case "final": {
+          const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
+          console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
+          appendSegmentsToBuffer(sessionBuffer, msg.segments);
+          if (isActiveSession) {
+            projectLiveTranscriptBufferToActiveState(sessionBuffer);
+          }
+          const envelope: LiveFinalEnvelope = {
+            text: normalizeTranscriptWhitespace(msg.text),
+            segments: msg.segments,
+            durationSec: msg.durationSec,
+            source: msg.source || sessionWsMode,
+          };
+          if (msg.error) envelope.error = msg.error;
+          resolveLiveFinal(sessionUiToken, envelope);
+          return;
+        }
+      }
+    };
+  }
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -7714,10 +7729,15 @@ async function stopLive(enhance: boolean): Promise<void> {
   };
   const currentProviderSelection = readProviderSelection();
   const currentSessionModels = resolveSessionLocalModels(currentProviderSelection);
+  const currentEffectiveProvider = resolveEffectiveProvider(currentProviderSelection);
   const liveSnapshot = activeLiveSessionSnapshot || {
     provider: currentProviderSelection,
-    effectiveProvider: resolveEffectiveProvider(currentProviderSelection),
-    model: currentSessionModels.finalLocalModel,
+    effectiveProvider: currentEffectiveProvider,
+    model: !currentEffectiveProvider
+      ? ""
+      : currentEffectiveProvider === "local"
+        ? currentSessionModels.finalLocalModel
+        : getRemoteModelValue(currentEffectiveProvider),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
     assistLocalModel: currentSessionModels.assistLocalModel,
     finalLocalModel: currentSessionModels.finalLocalModel,
@@ -7764,7 +7784,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     };
   };
   const provider = effectiveProvider;
-  const metadataProvider = provider || providerValue || "local";
+  const metadataProvider = provider || (providerValue ? providerValue : "none");
   let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
   let savedAudioFile: File | null = null;
   let transcribeInputFile: File | null = null;
@@ -8186,8 +8206,8 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
 
   const drainedSourceLiveText = latestSourceForSave();
-  const drainedSilence = captureSilenceSnapshot(drainedSourceLiveText);
-  if (drainedSilence.silentCapture) {
+  const drainedSilence = provider ? captureSilenceSnapshot(drainedSourceLiveText) : null;
+  if (drainedSilence?.silentCapture) {
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
@@ -8300,7 +8320,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         title: latestSourceTitle(),
         sourceText: latestSourceForSave(),
         transcriptText: "",
-        provider: "local",
+        provider: metadataProvider,
         model: modelValue,
         language: languageValue,
         recordingCollection: RECORDING_COLLECTIONS.live,

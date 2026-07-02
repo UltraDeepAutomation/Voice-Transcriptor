@@ -614,6 +614,35 @@ class RecordingNameTests(unittest.TestCase):
         self.assertTrue((target_dir / result["name"]).exists())
         self.assertTrue((target_dir / result["audio_name"]).exists())
 
+    def test_save_with_audio_provider_none_keeps_audio_only_metadata(self):
+        upload_file = self.main.UploadFile(
+            io.BytesIO(b"tiny wav payload"),
+            filename="audio-only.wav",
+            size=len(b"tiny wav payload"),
+        )
+
+        result = asyncio.run(self.main.save_recording_with_audio(
+            file=upload_file,
+            name="",
+            archive_dir="",
+            require_existing=False,
+            title="Audio Only",
+            source_text="",
+            transcript_text="",
+            provider="none",
+            model="",
+            language="auto",
+            recording_collection="live",
+            live_session_id="",
+        ))
+
+        target_dir = Path(result["archive_dir"])
+        content = (target_dir / result["name"]).read_text(encoding="utf-8")
+        self.assertIn("Provider: none", content)
+        self.assertNotIn("[No speech captured]", content)
+        self.assertNotIn("Original:", content)
+        self.assertTrue((target_dir / result["audio_name"]).exists())
+
     def test_save_with_audio_preserves_existing_txt_extension_casing(self):
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()

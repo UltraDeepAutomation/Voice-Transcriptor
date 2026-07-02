@@ -5185,7 +5185,7 @@ async def _save_recording_audio_source(
     safe_provider = str(provider or "").strip()
     safe_model = str(model or "").strip()
     safe_language = str(language or "").strip()
-    if not safe_source_text and not safe_transcript_text:
+    if not safe_source_text and not safe_transcript_text and safe_provider.lower() != "none":
         safe_source_text = "[No speech captured]"
 
     safe_orig_name = _normalize_filename(orig_name or "recording.wav")
