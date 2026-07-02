@@ -172,7 +172,7 @@ _relocateUserDataOffOneDrive();
 let backend = null;
 let win = null;
 let mainWindowInitialLoadPromise = null;
-let overlayWaveMonitor = null;
+let recordingStateMonitor = null;
 let tray = null;
 let backendBootError = "";
 // Cache the last shortcut-registration status so we can replay it to
@@ -201,22 +201,23 @@ let backendStderrTail = "";
 const BACKEND_STDERR_TAIL_MAX = 4096;
 let isQuitting = false;
 let shortcutToggleInFlight = false;
-let overlayStopInFlight = false;
+let recordingStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
-let overlaySilenceStartedAt = 0;
-let overlayAutoStopConfig = { enabled: false, seconds: 2, thresholdDb: -42 };
-let overlayAutoStopConfigRefreshAt = 0;
-// Generation counter for overlayAutoStopConfig async refreshes. Each
+const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
+let recordingSilenceStartedAt = 0;
+let recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
+let recordingAutoStopConfigRefreshAt = 0;
+// Generation counter for recordingAutoStopConfig async refreshes. Each
 // scheduled refresh captures this value; when the Promise resolves it
 // checks that the generation still matches before writing — so a
 // resolve from a PREVIOUS session (after the recording surface was reset and a
 // new recording started) cannot clobber the new session's config.
-let overlayAutoStopConfigGen = 0;
-let overlayRecordingStartedAt = 0;
-let overlaySeenAudioFrames = false;
+let recordingAutoStopConfigGen = 0;
+let recordingStartedAt = 0;
+let recordingSeenAudioFrames = false;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
@@ -465,7 +466,7 @@ function traceEnd(ctx, status = "done", details = {}) {
 
 async function ensureWindowVisible(options = {}) {
   const force = !!options.force;
-  if (!force && overlayStopInFlight) return;
+  if (!force && recordingStopInFlight) return;
   if (process.platform === "darwin" && app.dock) {
     try { app.dock.show(); } catch { }
   }
@@ -646,28 +647,29 @@ async function getRendererAutoSendEnterEnabled() {
 }
 
 async function getRendererAutoStopSilenceConfig() {
-  const DEFAULT_CONFIG = { enabled: false, seconds: 2, thresholdDb: -42 };
+  const fallback = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   const out = await execRendererJsWithTimeout(
     `
     (() => {
+      const fallback = ${JSON.stringify(fallback)};
       const enabledEl = document.getElementById('autoStopSilenceEnabled');
       const secEl = document.getElementById('autoStopSilenceSeconds');
       const dbEl = document.getElementById('autoStopSilenceDb');
       const enabled = !!(enabledEl && enabledEl.checked);
-      const secRaw = Number(secEl ? secEl.value : 2);
-      const dbRaw = Number(dbEl ? dbEl.value : -42);
-      const seconds = Math.min(120, Math.max(1, Number.isFinite(secRaw) ? Math.round(secRaw) : 2));
-      const thresholdDb = Math.min(-10, Math.max(-80, Number.isFinite(dbRaw) ? Math.round(dbRaw) : -42));
+      const secRaw = Number(secEl ? secEl.value : fallback.seconds);
+      const dbRaw = Number(dbEl ? dbEl.value : fallback.thresholdDb);
+      const seconds = Math.min(120, Math.max(1, Number.isFinite(secRaw) ? Math.round(secRaw) : fallback.seconds));
+      const thresholdDb = Math.min(-10, Math.max(-80, Number.isFinite(dbRaw) ? Math.round(dbRaw) : fallback.thresholdDb));
       return { enabled, seconds, thresholdDb };
     })();
     `,
     null,
   );
-  if (!out) return DEFAULT_CONFIG;
+  if (!out) return fallback;
   return {
     enabled: !!out.enabled,
-    seconds: Number.isFinite(Number(out.seconds)) ? Number(out.seconds) : 2,
-    thresholdDb: Number.isFinite(Number(out.thresholdDb)) ? Number(out.thresholdDb) : -42,
+    seconds: Number.isFinite(Number(out.seconds)) ? Number(out.seconds) : fallback.seconds,
+    thresholdDb: Number.isFinite(Number(out.thresholdDb)) ? Number(out.thresholdDb) : fallback.thresholdDb,
   };
 }
 
@@ -768,15 +770,15 @@ function hasActivePostStopWork() {
 }
 
 function stopRecordingStateMonitor() {
-  if (overlayWaveMonitor) {
-    clearInterval(overlayWaveMonitor);
-    overlayWaveMonitor = null;
+  if (recordingStateMonitor) {
+    clearInterval(recordingStateMonitor);
+    recordingStateMonitor = null;
   }
 }
 
 function startRecordingStateMonitor() {
   stopRecordingStateMonitor();
-  overlayWaveMonitor = setInterval(() => {
+  recordingStateMonitor = setInterval(() => {
     if (!win || win.isDestroyed() || !win.webContents) return;
     win.webContents
       .executeJavaScript(
@@ -799,29 +801,29 @@ function startRecordingStateMonitor() {
         const safeRms = Math.max(0, Number(state?.rms) || 0);
         const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
         const isRec = !!state?.isRec;
-        const cfg = overlayAutoStopConfig || { enabled: false, seconds: 2, thresholdDb: -42 };
+        const cfg = recordingAutoStopConfig || DEFAULT_RECORDING_AUTO_STOP_CONFIG;
         const now = Date.now();
-        if (safeLastFrameAt > 0) overlaySeenAudioFrames = true;
-        if (now - overlayAutoStopConfigRefreshAt > 1200) {
-          overlayAutoStopConfigRefreshAt = now;
-          const gen = ++overlayAutoStopConfigGen;
+        if (safeLastFrameAt > 0) recordingSeenAudioFrames = true;
+        if (now - recordingAutoStopConfigRefreshAt > 1200) {
+          recordingAutoStopConfigRefreshAt = now;
+          const gen = ++recordingAutoStopConfigGen;
           getRendererAutoStopSilenceConfig().then((nextCfg) => {
             // Drop the result if a new recording session bumped the
             // generation while we were awaiting — the old config would
             // otherwise overwrite freshly set values from the new
             // session's recording surface.
-            if (gen === overlayAutoStopConfigGen) {
-              overlayAutoStopConfig = nextCfg;
+            if (gen === recordingAutoStopConfigGen) {
+              recordingAutoStopConfig = nextCfg;
             }
           }).catch(() => { });
         }
-        if (!isRec || !cfg.enabled || overlayStopInFlight) {
-          overlaySilenceStartedAt = 0;
+        if (!isRec || !cfg.enabled || recordingStopInFlight) {
+          recordingSilenceStartedAt = 0;
         } else {
           const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
           const warmupMs = 1500;
-          if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
-            overlaySilenceStartedAt = 0;
+          if (recordingStartedAt && (now - recordingStartedAt) < warmupMs) {
+            recordingSilenceStartedAt = 0;
             return;
           }
           // Only use dB-based silence detection — no staleAudioFrames shortcut.
@@ -829,60 +831,64 @@ function startRecordingStateMonitor() {
           // the audio pipeline had minor hiccups.
           const consideredSilent = safeRms <= thresholdRms;
           if (consideredSilent) {
-            if (!overlaySilenceStartedAt) {
-              overlaySilenceStartedAt = now;
+            if (!recordingSilenceStartedAt) {
+              recordingSilenceStartedAt = now;
             }
-            const silentElapsed = now - overlaySilenceStartedAt;
+            const silentElapsed = now - recordingSilenceStartedAt;
             if (silentElapsed >= Number(cfg.seconds) * 1000) {
-              overlaySilenceStartedAt = 0;
-              overlayStopInFlight = true;
+              recordingSilenceStartedAt = 0;
+              recordingStopInFlight = true;
               stopRecordingStateMonitor();
               appendMainLog(`[recording-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
-              guardedStopFromOverlay("autostop");
+              guardedStopFromRecordingSurface("autostop");
             }
           } else {
-            overlaySilenceStartedAt = 0;
+            recordingSilenceStartedAt = 0;
           }
           // Separate fail-safe: if audio pipeline is truly dead (no frames for 8 seconds),
           // force stop to avoid infinite hang. This is NOT silence detection.
-          const staleAudioFrames = overlaySeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 8000;
-          if (staleAudioFrames && !overlayStopInFlight) {
-            overlayStopInFlight = true;
+          const staleAudioFrames = recordingSeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 8000;
+          if (staleAudioFrames && !recordingStopInFlight) {
+            recordingStopInFlight = true;
             stopRecordingStateMonitor();
             appendMainLog(`[recording-autostop-stale] audio pipeline dead for 8s, forcing stop`);
-            guardedStopFromOverlay("autostop-stale");
+            guardedStopFromRecordingSurface("autostop-stale");
           }
         }
       })
       .catch(() => { });
   }, 120);
-  try { overlayWaveMonitor.unref?.(); } catch { }
+  try { recordingStateMonitor.unref?.(); } catch { }
 }
 
-async function showRecordingOverlay() {
-  overlaySilenceStartedAt = 0;
-  overlayAutoStopConfigRefreshAt = 0;
-  overlayRecordingStartedAt = Date.now();
-  overlaySeenAudioFrames = false;
-  overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
+async function beginRecordingSurfaceSession() {
+  recordingSilenceStartedAt = 0;
+  recordingAutoStopConfigRefreshAt = 0;
+  recordingStartedAt = Date.now();
+  recordingSeenAudioFrames = false;
+  recordingAutoStopConfig = await getRendererAutoStopSilenceConfig();
   startRecordingStateMonitor();
 }
 
-async function ensureOverlayVisible(_options = {}) {}
-
-async function setOverlayTimer(_text) {}
-
-function scheduleOverlayHide(_ms) {
-  hideRecordingOverlay();
+async function ensureRecordingSurfaceVisible(options = {}) {
+  if (typeof options.status === "string" && options.status.trim()) {
+    await setRecordingSurfaceStatus(options.status);
+  }
 }
 
-function hideRecordingOverlay() {
-  overlayStopInFlight = false;
-  overlaySilenceStartedAt = 0;
-  overlayAutoStopConfigRefreshAt = 0;
-  overlayAutoStopConfigGen++;
-  overlayRecordingStartedAt = 0;
-  overlaySeenAudioFrames = false;
+async function setRecordingSurfaceTimer(_text) {}
+
+function scheduleRecordingSurfaceHide(_ms) {
+  hideRecordingSurface();
+}
+
+function hideRecordingSurface() {
+  recordingStopInFlight = false;
+  recordingSilenceStartedAt = 0;
+  recordingAutoStopConfigRefreshAt = 0;
+  recordingAutoStopConfigGen++;
+  recordingStartedAt = 0;
+  recordingSeenAudioFrames = false;
   stopRecordingStateMonitor();
   if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
     appendMainLog(`[recording-surface] reset-stale-pending=${pendingTranscriptionCount}`);
@@ -890,7 +896,7 @@ function hideRecordingOverlay() {
   }
 }
 
-async function setOverlayStatus(text) {
+async function setRecordingSurfaceStatus(text) {
   const status = String(text || "").trim();
   if (!status) return;
   await execRendererJsWithTimeout(
@@ -908,7 +914,7 @@ async function showPostStopYellowThenTranscribing(_delayMs = 500) {
   stopRecordingStateMonitor();
 }
 
-async function playOverlayCue(_kind = "start") {}
+async function playRecordingSurfaceCue(_kind = "start") {}
 
 async function isRendererRecording() {
   if (!win || win.isDestroyed() || !win.webContents) return false;
@@ -956,13 +962,13 @@ async function toggleRecordingFromShortcut() {
       pid: front.pid || 0,
       windowTitle: compactLogText(front.windowTitle || "", 80),
     });
-    await ensureOverlayVisible({ status: hasActivePostStopWork() ? null : "Starting", resetTimer: false, startTimer: false });
+    await ensureRecordingSurfaceVisible({ status: hasActivePostStopWork() ? null : "Starting", resetTimer: false, startTimer: false });
     traceStep(trace, "recording_surface_ready", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
-      await setOverlayStatus("App Not Ready");
-      scheduleOverlayHide(1200);
+      await setRecordingSurfaceStatus("App Not Ready");
+      scheduleRecordingSurfaceHide(1200);
       traceEnd(trace, "failed", { reason: "window-not-ready" });
       return;
     }
@@ -970,8 +976,8 @@ async function toggleRecordingFromShortcut() {
     const ready = await waitForRendererUiReady();
     traceStep(trace, "renderer_ready_check", { ready: !!ready });
     if (!ready) {
-      await setOverlayStatus("App Loading");
-      scheduleOverlayHide(1300);
+      await setRecordingSurfaceStatus("App Loading");
+      scheduleRecordingSurfaceHide(1300);
       traceEnd(trace, "failed", { reason: "renderer-not-ready" });
       return;
     }
@@ -982,7 +988,7 @@ async function toggleRecordingFromShortcut() {
         `[shortcut] start blocked by single-capsule post-stop work ` +
         `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
       );
-      await ensureOverlayVisible({ status: "Transcribing", resetTimer: false, startTimer: false });
+      await ensureRecordingSurfaceVisible({ status: "Transcribing", resetTimer: false, startTimer: false });
       traceStep(trace, "single_capsule_busy", {
         pending: pendingTranscriptionCount,
         queue: postStopQueue.length,
@@ -995,8 +1001,8 @@ async function toggleRecordingFromShortcut() {
     const micGranted = await requestMacMicrophonePermissionOnce();
     if (!micGranted) {
       traceStep(trace, "mic_permission_denied", {});
-      await setOverlayStatus("Grant Access");
-      scheduleOverlayHide(1200);
+      await setRecordingSurfaceStatus("Grant Access");
+      scheduleRecordingSurfaceHide(1200);
       traceEnd(trace, "failed", { reason: "mic-permission-denied" });
       return;
     }
@@ -1033,15 +1039,15 @@ async function toggleRecordingFromShortcut() {
       // inflight guard via the outer finally, and let the user retry.
       appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
       shortcutToggleInFlight = false;
-      scheduleOverlayHide(1300);
+      scheduleRecordingSurfaceHide(1300);
       traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
       return;
     }
 
     if (!result?.ok) {
       traceStep(trace, "renderer_toggle_failed", { result: result || null });
-      await setOverlayStatus("App Loading");
-      scheduleOverlayHide(1300);
+      await setRecordingSurfaceStatus("App Loading");
+      scheduleRecordingSurfaceHide(1300);
       traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
       return;
     }
@@ -1053,18 +1059,18 @@ async function toggleRecordingFromShortcut() {
         target: pasteTargetSummary(pasteTarget),
       });
       traceStep(trace, "recording_started", { auto: !!result.auto, timerText: result.timerText || "" });
-      await showRecordingOverlay();
+      await beginRecordingSurfaceSession();
       traceEnd(trace, "recording-started", {});
       return;
     }
 
-    await ensureOverlayVisible({ startTimer: false, resetTimer: false });
+    await ensureRecordingSurfaceVisible({ startTimer: false, resetTimer: false });
     if (result.timerText) {
-      await setOverlayTimer(result.timerText);
+      await setRecordingSurfaceTimer(result.timerText);
     }
     if (result.auto) {
       traceStep(trace, "recording_stopped", { autoTranscribe: true, timerText: result.timerText || "" });
-      await playOverlayCue("stop");
+      await playRecordingSurfaceCue("stop");
       enqueuePostStopTask({
         autoTranscribe: true,
         autoSendEnter: !!result.autoSendEnter,
@@ -1077,9 +1083,9 @@ async function toggleRecordingFromShortcut() {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       // Kill wave monitor immediately — recording is done
       stopRecordingStateMonitor();
-      await playOverlayCue("stop");
-      await setOverlayStatus("Saved To App");
-      scheduleOverlayHide(1400);
+      await playRecordingSurfaceCue("stop");
+      await setRecordingSurfaceStatus("Saved To App");
+      scheduleRecordingSurfaceHide(1400);
     }
     traceEnd(trace, "done", {});
   } finally {
@@ -1091,32 +1097,32 @@ async function toggleRecordingFromShortcut() {
 }
 
 /**
- * Fire-and-forget wrapper for ``stopRecordingFromOverlay`` with a
+ * Fire-and-forget wrapper for ``stopRecordingFromMainProcess`` with a
  * hard deadline. If the stop call hangs (e.g., renderer is
  * unresponsive), the recording state machine would be stuck with
- * ``overlayStopInFlight = true`` forever, permanently blocking new
+ * ``recordingStopInFlight = true`` forever, permanently blocking new
  * recordings. This wrapper clears the flag on EVERY exit path —
  * resolve, reject, OR timeout — and resets recording-surface state if the stop
  * never completed.
  */
-function guardedStopFromOverlay(reason) {
+function guardedStopFromRecordingSurface(reason) {
   const deadlineMs = 12000;
   let settled = false;
   const finish = (why, err) => {
     if (settled) return;
     settled = true;
-    overlayStopInFlight = false;
+    recordingStopInFlight = false;
     if (err) {
-      appendMainLog(`[overlay-${reason}-error] ${compactLogText(err?.message || err)}`);
+      appendMainLog(`[recording-${reason}-error] ${compactLogText(err?.message || err)}`);
     } else if (why === "timeout") {
-      appendMainLog(`[overlay-${reason}-timeout] stopRecordingFromOverlay exceeded ${deadlineMs}ms deadline`);
+      appendMainLog(`[recording-${reason}-timeout] stopRecordingFromMainProcess exceeded ${deadlineMs}ms deadline`);
     }
     if (why !== "resolve") {
-      hideRecordingOverlay();
+      hideRecordingSurface();
     }
   };
   const timer = setTimeout(() => finish("timeout"), deadlineMs);
-  stopRecordingFromOverlay().then(
+  stopRecordingFromMainProcess().then(
     () => {
       clearTimeout(timer);
       finish("resolve");
@@ -1128,7 +1134,7 @@ function guardedStopFromOverlay(reason) {
   );
 }
 
-async function stopRecordingFromOverlay() {
+async function stopRecordingFromMainProcess() {
   await ensureBackgroundWindow();
   if (!win || win.isDestroyed() || !win.webContents) return;
   if (win.isVisible()) win.hide();
@@ -1170,22 +1176,22 @@ async function stopRecordingFromOverlay() {
         autoSendEnter: false,
       };
 
-    await ensureOverlayVisible({ startTimer: false, resetTimer: false });
+    await ensureRecordingSurfaceVisible({ startTimer: false, resetTimer: false });
     if (result?.timerText) {
-      await setOverlayTimer(result.timerText);
+      await setRecordingSurfaceTimer(result.timerText);
     }
 
     if (!result) {
-      appendMainLog("[overlay-stop] renderer stop request timed out");
-      await setOverlayStatus("App Loading");
-      scheduleOverlayHide(1300);
+      appendMainLog("[recording-stop] renderer stop request timed out");
+      await setRecordingSurfaceStatus("App Loading");
+      scheduleRecordingSurfaceHide(1300);
     } else if (result?.stale) {
       appendMainLog(
-        `[overlay-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
+        `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
       );
-      await setOverlayStatus("Recording");
+      await setRecordingSurfaceStatus("Recording");
     } else if (result?.ok) {
-      await playOverlayCue("stop");
+      await playRecordingSurfaceCue("stop");
       if (result.auto) {
         enqueuePostStopTask({
           autoTranscribe: true,
@@ -1196,12 +1202,12 @@ async function stopRecordingFromOverlay() {
         });
         await showPostStopYellowThenTranscribing(700);
       } else {
-        await setOverlayStatus("Saved To App");
-        scheduleOverlayHide(1400);
+        await setRecordingSurfaceStatus("Saved To App");
+        scheduleRecordingSurfaceHide(1400);
       }
     } else {
-      await setOverlayStatus("Saved To App");
-      scheduleOverlayHide(1400);
+      await setRecordingSurfaceStatus("Saved To App");
+      scheduleRecordingSurfaceHide(1400);
     }
   } finally {
     clearCapturedPasteTarget();
@@ -1211,7 +1217,7 @@ async function stopRecordingFromOverlay() {
 // Maximum time we wait on the renderer for a state snapshot. If the
 // renderer is stuck (infinite loop, ongoing synchronous work, blocked
 // on a pending IPC), ``executeJavaScript`` never resolves — and the
-// overlay stop path sits forever waiting for getLatestTranscriptText.
+// recording stop path sits forever waiting for getLatestTranscriptText.
 // 2 s is long enough for a healthy renderer under load but short
 // enough that a stuck renderer still lets the user stop cleanly.
 const RENDERER_STATE_QUERY_TIMEOUT_MS = 2000;
@@ -1526,7 +1532,7 @@ function looksLikeAutomationPermissionError(reason) {
   );
 }
 
-function overlayStatusForPasteFailure(reason) {
+function recordingSurfaceStatusForPasteFailure(reason) {
   const r = String(reason || "").toLowerCase();
   // The transcript is ALWAYS written to the system clipboard before
   // the paste attempt (see ``clipboard.writeText(transcript)`` in
@@ -2398,7 +2404,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
       
       -- Fast path: bring target to front and send physical Cmd+V keycode.
       -- Avoid AXFocusedUIElement probing here because some apps block this call
-      -- for several seconds and it makes the overlay look "stuck on transcribing".
+      -- for several seconds and makes the recording status look stuck on transcribing.
       set frontmost of p to true
       delay 0.08
       if targetWindowTitle is not "" then
@@ -2507,7 +2513,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
         // A Russian user targeting a window titled "Телеграм" would
         // otherwise see UTF-8 bytes interpreted as CP-1251 gibberish,
         // AppActivate fails silently, and SendKeys hits whichever
-        // process is foreground — usually the overlay itself.
+        // process is foreground — usually Transcriptor itself.
         const vbsSource = vbsLines.join("\r\n");
         const vbsBuf = Buffer.concat([
           Buffer.from([0xFF, 0xFE]),           // UTF-16 LE BOM
@@ -2538,7 +2544,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
       // Fallback: lightweight PowerShell (no C# compilation).
       // Activate the captured target PID FIRST via SetForegroundWindow
       // — otherwise SendKeys fires at whatever has focus when the
-      // hotkey was pressed (typically the overlay itself), and the
+      // hotkey was pressed (often Transcriptor itself), and the
       // text lands in the wrong window.
       if (attempt === 2) {
         const pidNum = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
@@ -2940,10 +2946,10 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
 // classic two-paste-of-same-recording symptom. Two entry points feed
 // enqueuePostStopTask:
 //   * toggleRecordingFromShortcut() — fired by Alt+Left hotkey
-//   * stopRecordingFromOverlay()    — fired by main-process auto-stop,
-//                                     wrapped in guardedStopFromOverlay
+//   * stopRecordingFromMainProcess()    — fired by main-process auto-stop,
+//                                     wrapped in guardedStopFromRecordingSurface
 // They use SEPARATE in-flight flags (shortcutToggleInFlight vs
-// overlayStopInFlight). A press-and-click sequence within ~50 ms can
+// recordingStopInFlight). A press-and-click sequence within ~50 ms can
 // invoke both before either flag has been observed, producing TWO
 // enqueuePostStopTask calls for the SAME recordingId — two
 // transcript polls, two clipboard writes, two AppleScript Cmd+V's.
@@ -3005,15 +3011,15 @@ async function runPostStopQueue() {
           await processPostStopTask(task);
         } catch (e) {
           appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
-          await setOverlayStatus("Saved To App").catch(() => { });
+          await setRecordingSurfaceStatus("Saved To App").catch(() => { });
         }
       } finally {
         pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       }
       if (pendingTranscriptionCount > 0) {
-        await setOverlayStatus("Transcribing").catch(() => { });
+        await setRecordingSurfaceStatus("Transcribing").catch(() => { });
       } else {
-        scheduleOverlayHide(1400);
+        scheduleRecordingSurfaceHide(1400);
       }
     }
   } finally {
@@ -3075,7 +3081,7 @@ async function processPostStopTask(task) {
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let overlayPhase = "";
+  let recordingSurfacePhase = "";
   let doneStatusTranscriptSince = 0;
 
   while (Date.now() < deadline) {
@@ -3093,12 +3099,12 @@ async function processPostStopTask(task) {
     }
     const statusLower = String(state.status || "").trim().toLowerCase();
     if (!state.isRec) {
-      if (statusLower === "upscaling" && overlayPhase !== "upscaling") {
-        await setOverlayStatus("Upscaling");
-        overlayPhase = "upscaling";
-      } else if ((statusLower === "processing" || statusLower === "transcribing") && overlayPhase !== "transcribing") {
-        await setOverlayStatus("Transcribing");
-        overlayPhase = "transcribing";
+      if (statusLower === "upscaling" && recordingSurfacePhase !== "upscaling") {
+        await setRecordingSurfaceStatus("Upscaling");
+        recordingSurfacePhase = "upscaling";
+      } else if ((statusLower === "processing" || statusLower === "transcribing") && recordingSurfacePhase !== "transcribing") {
+        await setRecordingSurfaceStatus("Transcribing");
+        recordingSurfacePhase = "transcribing";
       }
     }
     const finishedRecords = Array.isArray(state.finishedRecords) ? state.finishedRecords : [];
@@ -3185,7 +3191,7 @@ async function processPostStopTask(task) {
     await sleep(30);
   }
 
-  let overlayStatus = "Saved To App";
+  let recordingSurfaceStatus = "Saved To App";
   if (transcript) {
     traceStep(trace, "transcript_ready", {
       len: transcript.length,
@@ -3243,7 +3249,7 @@ async function processPostStopTask(task) {
       // guard at the top of processPostStopTask.
       _markRecordingPasted(task.recordingId);
       // Show success immediately once the paste actually happened.
-      await setOverlayStatus("Pasted");
+      await setRecordingSurfaceStatus("Pasted");
     }
     if (pasted.ok && task.autoSendEnter) {
       await sleep(220);
@@ -3256,7 +3262,7 @@ async function processPostStopTask(task) {
         `[cmd-enter] ${pasteTargetSummary(effectiveTarget)} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
       );
       if (sent.ok) {
-        await setOverlayStatus("Sent");
+        await setRecordingSurfaceStatus("Sent");
       }
       if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
         openPrivacyAccessibilitySettings();
@@ -3265,14 +3271,14 @@ async function processPostStopTask(task) {
     if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
       openPrivacyAccessibilitySettings();
     }
-    overlayStatus = pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason);
+    recordingSurfaceStatus = pasted.ok ? "Paste Sent" : recordingSurfaceStatusForPasteFailure(pasted.reason);
   } else {
     traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
   }
 
   const isRecNow = await isRendererRecording();
   if (!isRecNow) {
-    await setOverlayStatus(overlayStatus);
+    await setRecordingSurfaceStatus(recordingSurfaceStatus);
   }
   traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
 }
@@ -3314,13 +3320,13 @@ async function pasteLatestTranscriptFromShortcut() {
       windowTitle: compactLogText(front.windowTitle || "", 80),
     });
     setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
-    await ensureOverlayVisible({ status: "Pasting", resetTimer: false, startTimer: false });
+    await ensureRecordingSurfaceVisible({ status: "Pasting", resetTimer: false, startTimer: false });
 
     const text = await getLatestTranscriptText();
     if (!text) {
       traceStep(trace, "no_text_available", {});
-      await setOverlayStatus("No Text");
-      scheduleOverlayHide(1200);
+      await setRecordingSurfaceStatus("No Text");
+      scheduleRecordingSurfaceHide(1200);
       clearCapturedPasteTarget();
       return;
     }
@@ -3343,7 +3349,7 @@ async function pasteLatestTranscriptFromShortcut() {
     appendMainLog(
       `[paste-last] ${pasteTargetSummary(pasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
-    await setOverlayStatus(pasted.ok ? "Paste Sent" : overlayStatusForPasteFailure(pasted.reason));
+    await setRecordingSurfaceStatus(pasted.ok ? "Paste Sent" : recordingSurfaceStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
       if (String(pasted.reason || "").includes("no-accessibility")) {
         openPrivacyAccessibilitySettings();
@@ -3351,7 +3357,7 @@ async function pasteLatestTranscriptFromShortcut() {
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
     clearCapturedPasteTarget();
-    scheduleOverlayHide(1300);
+    scheduleRecordingSurfaceHide(1300);
   } finally {
     clearCapturedPasteTarget();
     pasteShortcutInFlight = false;
@@ -4546,13 +4552,13 @@ async function createWindow(options = {}) {
     // require recovery. Every other reason (crashed, killed,
     // oom, etc.) leaves the Electron main process holding stale
     // references — the recording state machine, any in-flight
-    // ``overlayStopInFlight`` flag, the ``pendingTranscriptionCount``
+    // ``recordingStopInFlight`` flag, the ``pendingTranscriptionCount``
     // counter, and the ``shortcutToggleInFlight`` guard — that
     // would otherwise block every future hotkey press.
     if (reason === "clean-exit") return;
     // Reset the state machine so the NEXT hotkey press starts
     // cleanly instead of short-circuiting on a stale flag.
-    overlayStopInFlight = false;
+    recordingStopInFlight = false;
     shortcutToggleInFlight = false;
     pasteShortcutInFlight = false;
     if (pendingTranscriptionCount > 0) {
@@ -4586,9 +4592,9 @@ async function createWindow(options = {}) {
     // Tear down recording-surface state: it may be waiting on a transcript
     // that will never arrive.
     try {
-      hideRecordingOverlay();
+      hideRecordingSurface();
     } catch (e) {
-      appendMainLog(`[render-process-gone] hideRecordingOverlay failed: ${e?.message || e}`);
+      appendMainLog(`[render-process-gone] hideRecordingSurface failed: ${e?.message || e}`);
     }
     // The renderer is dead; ``reload()`` on a crashed webContents
     // throws. Schedule a fresh load so the user sees a working UI
@@ -5387,7 +5393,7 @@ app.whenReady().then(async () => {
     const recordResult = safeRegisterShortcut(shortcuts.record, () => {
       toggleRecordingFromShortcut().catch((e) => {
         appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
-        hideRecordingOverlay();
+        hideRecordingSurface();
       });
     });
     if (recordResult.ok) {
@@ -5401,7 +5407,7 @@ app.whenReady().then(async () => {
     const pasteResult = safeRegisterShortcut(shortcuts.paste, () => {
       pasteLatestTranscriptFromShortcut().catch((e) => {
         appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
-        hideRecordingOverlay();
+        hideRecordingSurface();
       });
     });
     if (pasteResult.ok) {

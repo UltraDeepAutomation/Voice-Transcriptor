@@ -3062,8 +3062,8 @@ function scheduleLocalWarmup(): void {
 
 // Formerly toggled between "live recording" and "file upload" modes
 // based on a switch that no longer exists — live mode is the only
-// supported surface. Recording controls now live in the overlay; state
-// consumed by Electron main is published through liveStatusSnapshot().
+// supported surface. Recording controls now live in the renderer;
+// Electron main consumes recording state through liveStatusSnapshot().
 function syncMode(): void {
   $("livePane").hidden = false;
   $("splitGap").hidden = false;
@@ -3755,9 +3755,7 @@ function refreshShortcutConflictState(): void {
 // 2s polling for the conflict-state badge on Settings → Shortcuts.
 // Capture the handle so a future code path (e.g. shutdown hook,
 // pre-quit IPC) can clear it. Gate the body on document visibility
-// so the poll doesn't waste CPU when the renderer window is hidden
-// (e.g. user dragged the recording overlay to focus while the
-// Settings tab is invisible behind it).
+// so the poll doesn't waste CPU when the renderer window is hidden.
 const _shortcutConflictPollHandle = window.setInterval(() => {
   if (document.visibilityState === "hidden") return;
   refreshShortcutConflictState();
@@ -6713,11 +6711,11 @@ function logger_warn_client(message: string): void {
  *
  *   1. ``pasteReady`` — consumed by the Electron main process through
  *      ``window.__transcriptorLastFinished*`` and
- *      ``window.__transcriptorFinishedRecords``. This tells the overlay
+ *      ``window.__transcriptorFinishedRecords``. This tells Electron main
  *      "a transcript is ready to paste NOW".
  *
  *   2. ``uiFinal`` — consumed by the Electron main process through
- *      ``window.__transcriptorLastUiFinal*`` for overlay state machines
+ *      ``window.__transcriptorLastUiFinal*`` for recording state machines
  *      that need to know what the UI is currently showing. This is also
  *      what drives the ``$finalOutput`` DOM element.
  *
@@ -6733,7 +6731,7 @@ interface RecordingOutputSignal {
   /** The text to render in the ``$finalOutput`` DOM element. Defaults to
    *  ``pasteText`` when omitted. Pass explicit ``""`` to clear the DOM. */
   domText?: string;
-  /** Classification of this event for the overlay state machine. */
+  /** Classification of this event for the recording state machine. */
   kind?: RecordingFinalSignalKind;
   sessionToken?: string;
 }
@@ -6775,7 +6773,7 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     }
   }
 
-  // Channel 2: UI-final signal (always updated so the overlay can track
+  // Channel 2: UI-final signal (always updated so Electron main can track
   // both transcript and error/status states).
   window.__transcriptorLastUiFinalText = hasUiFinal ? uiFinalText : "";
   window.__transcriptorLastUiFinalAt = hasUiFinal ? now : 0;
@@ -6804,21 +6802,21 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
 }
 
 /**
- * Atomic reset of EVERY window.__transcriptor* scalar the overlay
+ * Atomic reset of EVERY window.__transcriptor* scalar Electron main
  * reads. Called when a new recording begins or when an explicit
  * ``resetOutputs()`` fires.
  *
  * The ``__transcriptorFinishedRecords`` history array is intentionally
  * NOT cleared here — it's keyed by recordingId and bounded at 30
- * entries, and the overlay uses it as a lookup table to recover the
+ * entries, and Electron main uses it as a lookup table to recover the
  * text for a specific finished recordingId even after newer sessions
  * have overwritten the scalar pointers.
  *
  * Previously this function only reset Channel 2 (ui-final), leaving
  * Channel 1 (paste-ready: LastFinishedText/At/RecordingId) pointing at
  * the PREVIOUS session's transcript. During the startup window of a
- * new recording, the overlay could observe stale paste-ready state
- * and trigger an overlay transition keyed on it.
+ * new recording, Electron main could observe stale paste-ready state
+ * and trigger a recording transition keyed on it.
  */
 function clearRecordingOutput(): void {
   // Channel 1 — paste-ready scalars.
@@ -6907,7 +6905,7 @@ function setLiveDraftState(text: string, displayText = text): void {
 
 // The authoritative committed/interim state lives in LiveTranscriptBuffer
 // per session. These globals are only the currently active UI projection
-// kept for the existing renderer/overlay read paths.
+// kept for the existing renderer/main-process read paths.
 // Snapshot of ``liveInterimText`` taken JUST BEFORE it is cleared by
 // an incoming ``is_final`` event. When the user presses Stop while
 // Deepgram is mid-utterance, the live interim may contain words that
@@ -6947,9 +6945,9 @@ function resetOutputs(): void {
 }
 
 // EMA (exponential moving average) smoothing factor for
-// ``__transcriptorRmsLevel``. The overlay's silence detector polls
+// ``__transcriptorRmsLevel``. The main-process silence detector polls
 // this value every 120 ms, but the worklet posts a frame every
-// ~2.67 ms (128 samples @ 48 kHz). Without smoothing, the overlay
+// ~2.67 ms (128 samples @ 48 kHz). Without smoothing, the monitor
 // samples ONE instantaneous 2.67 ms window and can catch a micro-
 // pause between syllables (natural in conversational speech) as
 // "silence", accumulate 2 s of intermittent dips, and trigger a
@@ -6982,12 +6980,12 @@ function pushCapturedFrame(input: Float32Array): void {
   captureRmsAccum += rms;
   captureRmsSqAccum += rms * rms;
   if (peak > capturePeakMax) capturePeakMax = peak;
-  // Smooth RMS via EMA so the overlay's silence detector sees the
+  // Smooth RMS via EMA so the main-process silence detector sees the
   // energy trend over ~120 ms, not a single 2.67 ms micro-window
   // that might happen to land on an inter-syllable gap.
   captureRmsEma = CAPTURE_RMS_EMA_ALPHA * rms + (1 - CAPTURE_RMS_EMA_ALPHA) * captureRmsEma;
   // CRITICAL: set __transcriptorRmsLevel here too, not just in setVU.
-  // The overlay main process reads this for silence detection.
+  // Electron main reads this for silence detection.
   // setVU runs in rAF which stalls when the window is hidden.
   window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(captureRmsEma) ? captureRmsEma : 0);
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
@@ -7196,8 +7194,8 @@ async function startLive(): Promise<void> {
   // Recording started — transcription happens on stop via single sync call.
   window.__transcriptorIsRecording = true;
   window.__transcriptorLastFrameAt = Date.now();
-  // Atomically clear every overlay-observable global BEFORE setting
-  // the new currentRecordingId, so the overlay can never observe
+  // Atomically clear every main-process-observable global BEFORE setting
+  // the new currentRecordingId, so Electron main can never observe
   // "new currentRecordingId + old paste-ready text" in a transient
   // race during startLive.
   clearRecordingFinalSignal();
@@ -7465,8 +7463,8 @@ async function startLive(): Promise<void> {
     src.connect(analyser);
     const buf = new Float32Array(analyser.fftSize);
     // Use setInterval instead of requestAnimationFrame.
-    // rAF throttles to ~0 fps when the Electron window is hidden (which it
-    // always is during overlay recording). setInterval keeps firing reliably.
+    // rAF throttles to ~0 fps when the Electron window is hidden. setInterval
+    // keeps firing reliably for the main-process recording monitor.
     // Promoted to module scope so stopLive can clear it deterministically.
     // Previously local → leaked after stopLive because analyser null-check
     // self-cleanup was best-effort and delayed by up to one tick.
@@ -8344,7 +8342,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     tone: "info",
   }, sessionUiToken);
   // Single-capsule invariant: keep the app busy until this stop/transcribe
-  // pipeline reaches the outer finally. That keeps hotkeys, overlay clicks,
+  // pipeline reaches the outer finally. That keeps hotkeys, main-process stops,
   // and in-app recording controls behind the same source of truth.
   try {
     // ── Recovery-audio resolver ────────────────────────────────────
@@ -8768,7 +8766,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             //   3. If the first candidate is already within 90% of
             //      instant, keep instant immediately. Waiting for REST
             //      after an equal envelope is pure latency and caused
-            //      the overlay paste task to time out.
+            //      the post-stop paste task to time out.
             //   4. Only if the first candidate is clearly worse/empty,
             //      await the OTHER (it might yet recover a real stream
             //      dropout).
@@ -9248,7 +9246,7 @@ async function stopLive(enhance: boolean): Promise<void> {
       stopTransitionOwnerToken = "";
     }
     // Guarantee id is 0 even if an uncaught throw happened before the
-    // in-body reset above — a stale id would confuse the overlay's
+    // in-body reset above — a stale id would confuse the post-stop
     // post-stop task guard on the next recording start.
     if (stoppedRecordingId > 0 && currentRecordingId === stoppedRecordingId) {
       currentRecordingId = 0;
@@ -9559,7 +9557,7 @@ drop.addEventListener("drop", (e: DragEvent) => {
 });
 
 $("btnTranscribeFile").addEventListener("click", () => void transcribeSelectedFile());
-// User-facing recording is controlled by the overlay and global hotkey events.
+// User-facing recording is controlled by renderer buttons and global hotkey events.
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
   if (isRecording) {
@@ -9569,7 +9567,7 @@ window.addEventListener("transcriptor-hotkey-toggle", () => {
   }
 });
 
-// Dedicated stop event for overlay stop — avoids dual-path race.
+// Dedicated stop event for main-process stops — avoids dual-path race.
 window.addEventListener("transcriptor-hotkey-stop", (ev) => {
   const requestedRecordingId = Number((ev as CustomEvent<{ recordingId?: number }>).detail?.recordingId || 0);
   if (requestedRecordingId > 0 && currentRecordingId !== requestedRecordingId) return;

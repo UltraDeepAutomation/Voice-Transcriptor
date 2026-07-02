@@ -83,7 +83,7 @@ Frontend owns:
 
 ```text
 desktop/
-├── main.js                         # Electron main process, backend lifecycle, overlay, hotkeys
+├── main.js                         # Electron main process, backend lifecycle, recording monitor, hotkeys
 ├── preload.js                      # safe renderer bridge
 ├── package.json                    # electron-builder config and desktop scripts
 ├── afterPack.js                    # macOS bundle signing/runtime fixups
@@ -108,7 +108,7 @@ Desktop owns:
 - backend process spawn and port selection.
 - boot nonce verification.
 - global hotkeys.
-- overlay window.
+- headless recording state monitor and global hotkey coordination.
 - auto-paste platform integrations.
 - log writing and non-destructive rotation.
 - bundled runtime packaging for macOS, Windows, and Linux.

@@ -1,6 +1,6 @@
 # Transcriptor
 
-Desktop voice transcription app with live recording, file upload transcription, AI text cleanup, local history, global hotkeys, overlay controls, and auto-paste.
+Desktop voice transcription app with live recording, file upload transcription, AI text cleanup, local history, global hotkeys, in-app recording controls, and auto-paste.
 
 ## Current Scope
 
