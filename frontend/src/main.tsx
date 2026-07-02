@@ -4375,7 +4375,6 @@ function queueUiPreferencesSave(): void {
     const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
     const shouldRefreshRecordingsArchive = nextRecordingsDir !== configuredRecordingsDir;
-    ($("orModel") as HTMLInputElement).value = openrouterModel;
     const payload = {
       preferences: {
         recordings_dir: nextRecordingsDir,
@@ -4443,7 +4442,6 @@ async function loadCfg(): Promise<void> {
     // SSOT default mirrors DEFAULT_OPENROUTER_AUDIO_MODEL. Same SSOT
     // rationale as the autosave path above.
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || DEFAULT_OPENROUTER_AUDIO_MODEL;
-    ($("orModel") as HTMLInputElement).value = cfgOpenrouterModel;
     configuredRecordingsDir = (cfg.preferences || {}).recordings_dir || "";
     ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;
     const ui = (cfg.preferences || {}).ui || {};
@@ -4873,11 +4871,6 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
     .catch((e: Error) => {
       $("upscaleOutput").textContent = `Preset delete failed: ${e.message}`;
     });
-});
-($("orModel") as HTMLInputElement).addEventListener("change", () => {
-  remoteModelByProvider.openrouter = (($("orModel") as HTMLInputElement).value || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
-  syncRemoteModelOptions();
-  queueUiPreferencesSave();
 });
 ($("pickRecordingsDirBtn") as HTMLButtonElement).addEventListener("click", () => {
   const btn = $("pickRecordingsDirBtn") as HTMLButtonElement;
@@ -6143,7 +6136,6 @@ function shouldLivePreview(): boolean {
   const provider = readProviderSelection();
   if (v && provider === "openrouter") {
     remoteModelByProvider.openrouter = v;
-    ($("orModel") as HTMLInputElement).value = v;
   }
   if (v && provider === "deepgram") {
     remoteModelByProvider.deepgram = v;
