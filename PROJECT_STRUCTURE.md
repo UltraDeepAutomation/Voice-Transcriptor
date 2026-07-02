@@ -90,6 +90,7 @@ desktop/
 ├── preload.js                      # safe renderer bridge
 ├── package.json                    # electron-builder config and desktop scripts
 ├── afterPack.js                    # macOS bundle signing/runtime fixups
+├── afterAllArtifactBuild.js        # macOS DMG artifact signing hook
 ├── unlockDist.js                   # build artifact lock cleanup
 ├── entitlements.mac.plist          # macOS app entitlements
 ├── entitlements.mac.inherit.plist  # macOS helper entitlements
@@ -115,6 +116,7 @@ Desktop owns:
 - auto-paste platform integrations.
 - log writing and non-destructive rotation.
 - bundled runtime packaging for macOS, Windows, and Linux.
+- Developer ID app/DMG signing handoff for notarization.
 - Mac App Store packaging, provisioning preflight, and TestFlight upload handoff.
 
 ## Build SSOT
