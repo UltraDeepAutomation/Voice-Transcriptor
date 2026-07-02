@@ -166,6 +166,21 @@ class TestConfigLifecycle(unittest.TestCase):
         # providers reset to defaults
         self.assertIn("openrouter", cfg["providers"])
 
+    def test_invalid_remote_provider_resets_to_default(self):
+        bad = {
+            "schema_version": 2,
+            "providers": {"openrouter": {"key": ""}},
+            "preferences": {"remote_provider": "not-a-provider"},
+        }
+        self.config_mod.CONFIG_PATH.write_text(json.dumps(bad), encoding="utf-8")
+
+        cfg = self.config_mod.load_config()
+
+        self.assertEqual(
+            cfg["preferences"]["remote_provider"],
+            self.config_mod.DEFAULT_CONFIG["preferences"]["remote_provider"],
+        )
+
     def test_forward_compat_preserves_newer_version(self):
         """A config written by a newer Transcriptor should NOT be
         downgraded. Unknown fields are preserved so no data is lost

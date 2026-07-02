@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from backend.audio_mime import AUDIO_EXT_TO_MIME
-from backend.model_catalog import DEFAULT_OPENROUTER_AUDIO_MODEL
+from backend.model_catalog import DEFAULT_OPENROUTER_AUDIO_MODEL, REMOTE_TRANSCRIPTION_PROVIDERS
 from backend.storage import atomic_copy_file, atomic_write_bytes, atomic_write_json, rotate_backup
 
 logger = logging.getLogger(__name__)
@@ -563,6 +563,15 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
         remote_provider = preferences.get("remote_provider")
         if remote_provider is not None and not isinstance(remote_provider, str):
             logger.warning("config.preferences.remote_provider must be string; resetting")
+            preferences = dict(preferences)
+            preferences["remote_provider"] = DEFAULT_CONFIG["preferences"]["remote_provider"]
+            out["preferences"] = preferences
+        elif (
+            isinstance(remote_provider, str)
+            and remote_provider
+            and remote_provider not in REMOTE_TRANSCRIPTION_PROVIDERS
+        ):
+            logger.warning("config.preferences.remote_provider=%r is unsupported; resetting", remote_provider)
             preferences = dict(preferences)
             preferences["remote_provider"] = DEFAULT_CONFIG["preferences"]["remote_provider"]
             out["preferences"] = preferences
