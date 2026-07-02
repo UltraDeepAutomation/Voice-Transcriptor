@@ -209,6 +209,55 @@ function hardenAppTransportSecurity(appPath, { log = console.log } = {}) {
   log(`[macos-signing] Hardened App Transport Security in ${infoPlist}`);
 }
 
+function plistSetString(plistPath, key, value) {
+  runPlistBuddy(plistPath, `Delete :${key}`, { optional: true });
+  runPlistBuddy(plistPath, `Add :${key} string ${value}`);
+}
+
+function normalizeMacPrivacyUsageDescriptions(appPath, { log = console.log } = {}) {
+  const infoPlist = path.join(appPath, "Contents", "Info.plist");
+  if (!existsSync(infoPlist)) {
+    throw new Error(`Info.plist not found: ${infoPlist}`);
+  }
+
+  const microphoneUsage = "Transcriptor records microphone audio when you start a live transcription.";
+  plistSetString(infoPlist, "NSMicrophoneUsageDescription", microphoneUsage);
+  plistSetString(infoPlist, "NSAudioCaptureUsageDescription", microphoneUsage);
+  plistSetString(
+    infoPlist,
+    "NSAppleEventsUsageDescription",
+    "Transcriptor uses Apple Events to paste transcripts into the app you are working in.",
+  );
+
+  // Electron injects generic Camera/Bluetooth prompts by default, but
+  // Transcriptor only captures microphone audio. Shipping unused usage
+  // descriptions makes App Store privacy review noisier and implies
+  // capabilities that are not part of the product contract.
+  for (const key of [
+    "NSCameraUsageDescription",
+    "NSBluetoothAlwaysUsageDescription",
+    "NSBluetoothPeripheralUsageDescription",
+  ]) {
+    runPlistBuddy(infoPlist, `Delete :${key}`, { optional: true });
+  }
+
+  const camera = runPlistBuddy(infoPlist, "Print :NSCameraUsageDescription", { optional: true });
+  const bluetoothAlways = runPlistBuddy(
+    infoPlist,
+    "Print :NSBluetoothAlwaysUsageDescription",
+    { optional: true },
+  );
+  const bluetoothPeripheral = runPlistBuddy(
+    infoPlist,
+    "Print :NSBluetoothPeripheralUsageDescription",
+    { optional: true },
+  );
+  if (camera || bluetoothAlways || bluetoothPeripheral) {
+    throw new Error(`Privacy usage description normalization failed for ${infoPlist}`);
+  }
+  log(`[macos-signing] Normalized macOS privacy usage descriptions in ${infoPlist}`);
+}
+
 function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg = "--timestamp", log = console.log }) {
   const runtimeRoot = path.join(appPath, "Contents", "Resources", "runtime");
   if (!existsSync(runtimeRoot)) {
@@ -255,6 +304,7 @@ module.exports = {
   hasCertificateIdentity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
+  normalizeMacPrivacyUsageDescriptions,
   pathIsInside,
   preSignRuntimeBinaries,
   shouldIgnoreOsxSignPath,

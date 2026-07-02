@@ -9,6 +9,7 @@ const {
   hasCertificateIdentity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
+  normalizeMacPrivacyUsageDescriptions,
   preSignRuntimeBinaries,
   shouldIgnoreOsxSignPath,
 } = require("./macos-signing-utils");
@@ -143,6 +144,9 @@ async function main() {
   }
 
   hardenAppTransportSecurity(appPath, {
+    log: (message) => console.log(message.replace("[macos-signing]", "[mas-sign]")),
+  });
+  normalizeMacPrivacyUsageDescriptions(appPath, {
     log: (message) => console.log(message.replace("[macos-signing]", "[mas-sign]")),
   });
   assertNoBundledBytecode(appPath);

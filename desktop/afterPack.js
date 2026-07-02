@@ -65,6 +65,7 @@ const {
   hardenAppTransportSecurity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
+  normalizeMacPrivacyUsageDescriptions,
   preSignRuntimeBinaries,
   shouldIgnoreOsxSignPath,
 } = require("./scripts/macos-signing-utils");
@@ -100,6 +101,9 @@ exports.default = async function afterPack(context) {
     throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
   }
   hardenAppTransportSecurity(appPath, {
+    log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
+  });
+  normalizeMacPrivacyUsageDescriptions(appPath, {
     log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
   });
   if (isMas) {
