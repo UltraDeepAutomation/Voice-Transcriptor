@@ -4475,8 +4475,11 @@ async function loadCfg(): Promise<void> {
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
     }
-    const providerCandidate = String(ui.provider || "").trim();
-    if (providerCandidate && Array.from(providerSel.options).some((o) => o.value === providerCandidate)) {
+    const hasStoredProvider = Object.prototype.hasOwnProperty.call(ui, "provider");
+    const providerCandidate = hasStoredProvider
+      ? normalizeProviderSelection(ui.provider, providerSel.value as Provider)
+      : null;
+    if (providerCandidate !== null && Array.from(providerSel.options).some((o) => o.value === providerCandidate)) {
       providerSel.value = providerCandidate;
     }
     quickProviderSel.value = providerSel.value;
