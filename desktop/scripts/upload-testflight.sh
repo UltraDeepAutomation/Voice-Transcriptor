@@ -38,6 +38,10 @@ if [ "$has_api_key" -ne 1 ] && [ "$has_apple_id" -ne 1 ]; then
   fi
 fi
 
+if [ "$has_api_key" -eq 1 ] && [ -n "${ASC_API_KEY_PATH:-}" ] && [ ! -f "$ASC_API_KEY_PATH" ]; then
+  preflight_errors+=("ASC_API_KEY_PATH does not exist: $ASC_API_KEY_PATH")
+fi
+
 if [ "${#preflight_errors[@]}" -gt 0 ]; then
   echo "[testflight-upload] Preflight failed:" >&2
   for err in "${preflight_errors[@]}"; do
@@ -48,20 +52,25 @@ fi
 
 if [ "$has_api_key" -eq 1 ]; then
   echo "[testflight-upload] Uploading with App Store Connect API key"
-  xcrun altool --upload-app \
-    -f "$PKG_PATH" \
-    -t osx \
-    --apiKey "$ASC_API_KEY" \
-    --apiIssuer "$ASC_API_ISSUER" \
+  args=(
+    --upload-package "$PKG_PATH"
+    --api-key "$ASC_API_KEY"
+    --api-issuer "$ASC_API_ISSUER"
     --output-format xml
+  )
+  [ -z "${ASC_API_KEY_PATH:-}" ] || args+=(--p8-file-path "$ASC_API_KEY_PATH")
+  [ -z "${ASC_PROVIDER_PUBLIC_ID:-}" ] || args+=(--provider-public-id "$ASC_PROVIDER_PUBLIC_ID")
+  xcrun altool "${args[@]}"
 elif [ "$has_apple_id" -eq 1 ]; then
   echo "[testflight-upload] Uploading with Apple ID app-specific password"
-  xcrun altool --upload-app \
-    -f "$PKG_PATH" \
-    -t osx \
-    -u "$ASC_USERNAME" \
-    -p "$ASC_APP_SPECIFIC_PASSWORD" \
+  args=(
+    --upload-package "$PKG_PATH"
+    -u "$ASC_USERNAME"
+    -p "$ASC_APP_SPECIFIC_PASSWORD"
     --output-format xml
+  )
+  [ -z "${ASC_PROVIDER_PUBLIC_ID:-}" ] || args+=(--provider-public-id "$ASC_PROVIDER_PUBLIC_ID")
+  xcrun altool "${args[@]}"
 fi
 
 echo "[testflight-upload] Uploaded. App Store Connect must process the build before it appears in TestFlight."

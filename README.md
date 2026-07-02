@@ -62,10 +62,13 @@ Upload the generated `desktop/dist/Transcriptor-<version>-mas-arm64.pkg` after A
 ```bash
 export ASC_API_KEY="KEYID"
 export ASC_API_ISSUER="ISSUER-UUID"
+export ASC_API_KEY_PATH="/absolute/path/AuthKey_KEYID.p8"
 npm --prefix desktop run testflight:upload
 ```
 
 Apple ID upload also works with `ASC_USERNAME` and `ASC_APP_SPECIFIC_PASSWORD`.
+For Apple accounts attached to multiple providers, also export
+`ASC_PROVIDER_PUBLIC_ID`.
 
 ### Windows x64
 
