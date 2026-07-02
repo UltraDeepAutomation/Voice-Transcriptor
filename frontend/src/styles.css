@@ -3107,19 +3107,20 @@ canvas {
    Restore together with Graph markup in index.html and Graph code in main.tsx. */
 
 /* ──────────────────────────────────────────────────────────────────────
- * Boot overlay — enterprise-grade first-launch UX.
+ * Boot overlay — enterprise-grade backend failure UX.
  *
- * The app shell plus all panes are rendered by main.tsx on import, so
- * they fire DOMContentLoaded before the Python backend's /api/health
- * responds (cold-start can be 2-10s while Whisper models warm up and
- * venv dependencies verify). Without this overlay the user sees fully-
- * rendered UI that silently fails on any interaction until the backend
- * wakes up.
+ * Electron waits for /api/health before loading the renderer, so the
+ * overlay is hidden by default and only appears for startup/runtime
+ * backend errors. The hidden state must be a real `display:none`; keeping
+ * a transparent fixed overlay in the render tree leaves its spinner
+ * animation running behind the app and creates a second invisible UI
+ * surface.
  *
- * Pattern: fullscreen fixed overlay starts visible (data-state="loading"),
- * transitions to "error" on boot failure, "success" when hidden. Card
- * uses the same surface tokens as the main app so it feels native, not
- * bolted-on. Spinner is a pure-CSS conic gradient — no asset load.
+ * Pattern: JS removes `[hidden]` for loading/error states, then switches
+ * to `data-state="success"` for the fade-out before applying `[hidden]`
+ * again. Card uses the same surface tokens as the main app so it feels
+ * native, not bolted-on. Spinner is a pure-CSS conic gradient — no asset
+ * load.
  * ────────────────────────────────────────────────────────────────── */
 
 .boot-overlay {
@@ -3136,9 +3137,12 @@ canvas {
 }
 
 .boot-overlay[hidden] {
+  display: none;
+}
+
+.boot-overlay[data-state="success"] {
   opacity: 0;
   pointer-events: none;
-  display: flex; /* keep flex during fade — display:none jumps; use visibility transition instead */
 }
 
 .boot-overlay-card {

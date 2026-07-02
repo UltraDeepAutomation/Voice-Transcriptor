@@ -3269,6 +3269,7 @@ function hideBootOverlayOnce(): void {
   _bootOverlayHidden = true;
   const overlay = document.getElementById("bootOverlay");
   if (!overlay) return;
+  if (overlay.hidden) return;
   overlay.dataset.state = "success";
   const statusEl = document.getElementById("bootOverlayStatus");
   if (statusEl) statusEl.textContent = "Ready";
@@ -3278,7 +3279,9 @@ function hideBootOverlayOnce(): void {
   // "fade out then fully hide" but the code did a hard cut. Now the
   // dataset.state="success" change drives the CSS opacity transition
   // (~300 ms in styles.css), and we wait for it to finish before
-  // marking ``hidden`` so pointer-events stop intercepting clicks.
+  // marking ``hidden``. When the overlay starts hidden (normal app
+  // path), return above so we do not keep an invisible fixed surface
+  // and spinner in the render tree.
   window.setTimeout(() => { overlay.hidden = true; }, 320);
 }
 
@@ -9408,12 +9411,11 @@ updateRecordingCopyState();
 
 // ── Backend boot status / error display ──
 //
-// The boot overlay (``#bootOverlay``) starts visible (HTML default) and
-// is hidden by ``hideBootOverlayOnce`` on the first successful
-// /api/health response inside ``refreshNetworkState``. During cold
-// start (2-10 s while the Python backend spawns + Whisper models warm),
-// the overlay dominates the viewport instead of leaving the user
-// staring at a silently-unresponsive UI.
+// The boot overlay (``#bootOverlay``) starts hidden because Electron
+// waits for /api/health before loading the renderer. It is still the
+// canonical surface for backend startup/runtime errors: main process
+// replays ``__setBackendBootError`` after a failed boot, which unhides
+// the overlay with a user-actionable diagnosis.
 
 window.__setBackendBootStatus = (msg: string) => {
   if (!msg) return;
