@@ -58,6 +58,7 @@ body {
   --glass-bg-strong: rgba(28, 29, 32, 0.86);
   --glass-bg-opaque: var(--bg-3);
   --glass-control-bg: rgba(42, 44, 48, 0.72);
+  --glass-control-bg-subtle: rgba(255, 255, 255, 0.018);
   --glass-control-bg-hover: rgba(52, 54, 60, 0.82);
   --glass-control-bg-active: rgba(62, 64, 70, 0.9);
   --glass-chip-bg: rgba(41, 43, 47, 0.68);
@@ -167,6 +168,7 @@ body {
     --glass-bg: var(--bg-3);
     --glass-bg-strong: var(--bg-4);
     --glass-control-bg: var(--bg-3);
+    --glass-control-bg-subtle: var(--bg-3);
     --glass-control-bg-hover: var(--bg-8);
     --glass-control-bg-active: var(--bg-9);
     --glass-chip-bg: var(--bg-8);
@@ -240,14 +242,16 @@ body.platform-darwin .sidebar {
 
 .sb-item:hover {
   color: var(--text-2);
-  border-color: var(--line);
-  background: rgba(255, 255, 255, 0.02);
+  border-color: var(--glass-border);
+  background: var(--glass-control-bg-subtle);
+  box-shadow: var(--glass-surface-outline);
 }
 
 .sb-item.active {
   color: var(--text);
-  border-color: var(--line-2);
-  background: var(--bg-8);
+  border-color: var(--glass-border-strong);
+  background: var(--glass-control-bg-active);
+  box-shadow: var(--glass-surface-outline);
 }
 
 /* Left accent stripe removed by UX request — selected state is
@@ -335,7 +339,7 @@ body.platform-darwin .sidebar {
   color: var(--text-2);
   font-size: 11px;
   font-weight: 600;
-  box-shadow: none;
+  box-shadow: var(--glass-surface-outline);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -794,7 +798,7 @@ textarea:focus-visible,
 }
 
 .btn-ghost {
-  background: rgba(255, 255, 255, 0.018);
+  background: var(--glass-control-bg-subtle);
   border-color: var(--glass-border);
 }
 
@@ -1135,7 +1139,7 @@ textarea:focus-visible,
   gap: 8px;
   margin-top: 6px;
   padding-top: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  border-top: 1px solid var(--glass-border);
   justify-content: flex-end;
 }
 
@@ -1225,7 +1229,7 @@ textarea:focus-visible,
 }
 
 .popup-check:hover {
-  background: var(--bg-9);
+  background: var(--glass-control-bg-hover);
 }
 
 .popup-check input {
@@ -1501,6 +1505,8 @@ textarea:focus-visible,
 .pane-footer {
   padding: 10px 14px;
   border-top: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  box-shadow: var(--glass-surface-outline);
   display: flex;
   gap: 8px;
   align-items: center;
@@ -1598,7 +1604,7 @@ textarea:focus-visible,
 }
 
 .resource-row {
-  background: var(--surface-bg);
+  background: var(--glass-bg);
 }
 
 .pane-footer-label {
@@ -2333,10 +2339,10 @@ textarea:focus-visible,
   height: var(--h-control);
   min-height: var(--h-control);
   padding: 0 4px 0 8px;
-  border: 1px solid var(--surface-border);
+  border: 1px solid var(--glass-border);
   border-radius: var(--control-radius);
-  background: var(--surface-bg-muted);
-  box-shadow: none;
+  background: var(--glass-control-bg);
+  box-shadow: var(--glass-surface-outline);
   transition: border-color var(--dur-base), box-shadow var(--dur-base), background var(--dur-base);
 }
 
@@ -2473,9 +2479,10 @@ textarea:focus-visible,
   height: var(--h-control);
   min-height: var(--h-control);
   padding: 0 12px;
-  border: 1px solid var(--surface-border);
+  border: 1px solid var(--glass-border);
   border-radius: var(--control-radius);
-  background: var(--surface-bg-muted);
+  background: var(--glass-control-bg);
+  box-shadow: var(--glass-surface-outline);
 }
 
 /* ── Shortcut picker button ─────────────────────────────────────────── */
@@ -2500,11 +2507,12 @@ textarea:focus-visible,
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
   user-select: none;
+  box-shadow: var(--glass-surface-outline);
 }
 
 .shortcut-btn:hover {
   background: var(--control-bg-hover);
-  border-color: var(--surface-border-strong);
+  border-color: var(--glass-border-strong);
 }
 
 .shortcut-btn:focus-visible {
@@ -2568,13 +2576,13 @@ textarea:focus-visible,
   min-width: 32px;
   height: 28px;
   padding: 0 10px;
-  border: 1px solid var(--line-4);
+  border: 1px solid var(--glass-border-strong);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.015)),
-    var(--surface-bg-muted);
+    linear-gradient(180deg, var(--glass-highlight), rgba(255, 255, 255, 0.015)),
+    var(--glass-chip-bg);
   color: var(--text);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  box-shadow: var(--glass-surface-outline);
   font-weight: 600;
   line-height: 1;
 }
@@ -2596,22 +2604,25 @@ canvas,
   -webkit-app-region: no-drag;
 }
 
-@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+@supports (backdrop-filter: blur(1px)) {
   .screen-header,
   .recordings-head,
   .window-topbar,
   .topbar,
   .pane-header,
+  .pane-footer,
   .recordings-list-toolbar,
   .recordings-stats,
   .recordings-viewer-header,
   .current-audio-row,
+  .session-notice,
   .modal-card,
   .boot-overlay-card {
     backdrop-filter: var(--glass-filter);
-    -webkit-backdrop-filter: var(--glass-filter);
   }
 
+  .sb-item:hover,
+  .sb-item.active,
   .window-view,
   .window-status-pill,
   .net-pill,
@@ -2626,14 +2637,57 @@ canvas,
   .transcribe-settings-popup,
   .recording-audio-actions,
   .key-row,
+  .settings-toggle,
   .shortcut-btn,
   .shortcut-key {
     backdrop-filter: var(--glass-filter-soft);
-    -webkit-backdrop-filter: var(--glass-filter-soft);
   }
 
   .boot-overlay {
     backdrop-filter: var(--glass-filter);
+  }
+}
+
+@supports (-webkit-backdrop-filter: blur(1px)) {
+  .screen-header,
+  .recordings-head,
+  .window-topbar,
+  .topbar,
+  .pane-header,
+  .pane-footer,
+  .recordings-list-toolbar,
+  .recordings-stats,
+  .recordings-viewer-header,
+  .current-audio-row,
+  .session-notice,
+  .modal-card,
+  .boot-overlay-card {
+    -webkit-backdrop-filter: var(--glass-filter);
+  }
+
+  .sb-item:hover,
+  .sb-item.active,
+  .window-view,
+  .window-status-pill,
+  .net-pill,
+  .context-chip,
+  .section-chip,
+  select,
+  input,
+  textarea,
+  .btn,
+  .icon-btn,
+  .link-btn,
+  .transcribe-settings-popup,
+  .recording-audio-actions,
+  .key-row,
+  .settings-toggle,
+  .shortcut-btn,
+  .shortcut-key {
+    -webkit-backdrop-filter: var(--glass-filter-soft);
+  }
+
+  .boot-overlay {
     -webkit-backdrop-filter: var(--glass-filter);
   }
 }
@@ -2642,8 +2696,10 @@ canvas,
   *,
   *::before,
   *::after {
-    transition-duration: 1ms !important;
+    transition: none !important;
     transition-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
   }
 
@@ -2665,12 +2721,16 @@ canvas,
   .window-topbar,
   .topbar,
   .pane-header,
+  .pane-footer,
   .recordings-list-toolbar,
   .recordings-stats,
   .recordings-viewer-header,
   .current-audio-row,
+  .session-notice,
   .modal-card,
   .boot-overlay-card,
+  .sb-item:hover,
+  .sb-item.active,
   .window-view,
   .window-status-pill,
   .net-pill,
@@ -2685,6 +2745,7 @@ canvas,
   .transcribe-settings-popup,
   .recording-audio-actions,
   .key-row,
+  .settings-toggle,
   .shortcut-btn,
   .shortcut-key {
     backdrop-filter: none;
@@ -2708,6 +2769,25 @@ canvas,
     --control-border: ButtonBorder;
     --chip-bg: ButtonFace;
     --chip-border: ButtonBorder;
+    --glass-bg: Canvas;
+    --glass-bg-strong: Canvas;
+    --glass-bg-opaque: Canvas;
+    --glass-control-bg: ButtonFace;
+    --glass-control-bg-subtle: ButtonFace;
+    --glass-control-bg-hover: ButtonFace;
+    --glass-control-bg-active: ButtonFace;
+    --glass-chip-bg: ButtonFace;
+    --glass-border: ButtonBorder;
+    --glass-border-strong: ButtonText;
+    --glass-highlight: transparent;
+    --glass-highlight-strong: transparent;
+    --glass-filter: none;
+    --glass-filter-soft: none;
+    --glass-popover-bg: Canvas;
+    --glass-modal-bg: Canvas;
+    --glass-shadow-popover: none;
+    --glass-shadow-modal: none;
+    --glass-surface-outline: none;
     --text: CanvasText;
     --text-2: CanvasText;
     --text-3: GrayText;
@@ -2720,12 +2800,15 @@ canvas,
   .window-topbar,
   .topbar,
   .pane-header,
+  .pane-footer,
   .recordings-list-toolbar,
   .recordings-stats,
   .recordings-viewer-header,
   .current-audio-row,
+  .session-notice,
   .modal-card,
   .boot-overlay-card,
+  .sb-item,
   .window-view,
   .window-status-pill,
   .net-pill,
@@ -2740,6 +2823,7 @@ canvas,
   .transcribe-settings-popup,
   .recording-audio-actions,
   .key-row,
+  .settings-toggle,
   .shortcut-btn,
   .shortcut-key {
     background: Canvas;
