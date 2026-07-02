@@ -31,7 +31,6 @@ interface AppConfig {
       mic_id?: string;
       auto_transcribe?: boolean;
       live_preview?: boolean;
-      quick_settings_open?: boolean;
       upscale_enabled?: boolean;
       upscale_preset?: string;
       upscale_model?: string;
@@ -317,8 +316,6 @@ declare global {
     __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
-    __transcriptorGetQuickSettingsOpen?: () => boolean;
-    __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
@@ -697,7 +694,6 @@ let hasOpenrouterKey = false;
 let hasDeepgramKey = false;
 let uiPrefSaveTimer: number | null = null;
 let suppressUiPrefAutosave = false;
-let quickSettingsOpen = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
@@ -1641,7 +1637,7 @@ function setBusy(nextBusy: boolean, scopeToken = ""): void {
     busyScopeToken = "";
   }
   isBusy = !!nextBusy;
-  ["providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
+  ["providerSelect", "remoteModelSelect", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
@@ -3557,7 +3553,6 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
     auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
-    quick_settings_open: quickSettingsOpen,
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
     upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
     upscale_model: getUpscaleModelValue(),
@@ -4449,7 +4444,6 @@ async function loadCfg(): Promise<void> {
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEFAULT_DEEPGRAM_AUDIO_MODEL || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
     const languageSel = $("language") as HTMLSelectElement;
     const providerSel = $("providerSelect") as HTMLSelectElement;
-    const quickProviderSel = $("quickProviderSelect") as HTMLSelectElement;
     const modelSel = $("model") as HTMLSelectElement;
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
@@ -4461,7 +4455,6 @@ async function loadCfg(): Promise<void> {
     if (providerCandidate !== null && Array.from(providerSel.options).some((o) => o.value === providerCandidate)) {
       providerSel.value = providerCandidate;
     }
-    quickProviderSel.value = providerSel.value;
     if (ui.local_model && Array.from(modelSel.options).some((o) => o.value === ui.local_model)) {
       modelSel.value = ui.local_model;
     }
@@ -4516,7 +4509,6 @@ async function loadCfg(): Promise<void> {
       remoteSel.value = getRemoteModelValue("deepgram");
     }
     await loadUpscalePresets(pendingUpscalePresetId);
-    syncQuickSettingsVisibility(ui.quick_settings_open === true);
 
     // Upload tab — restore persisted provider/language/diarize. Each
     // input is guarded so a config carried over from a build without
@@ -6124,9 +6116,6 @@ function shouldLivePreview(): boolean {
 }
 
 ($("providerSelect") as HTMLSelectElement).addEventListener("change", () => {
-  const main = $("providerSelect") as HTMLSelectElement;
-  const quick = $("quickProviderSelect") as HTMLSelectElement;
-  if (quick.value !== main.value) quick.value = main.value;
   syncRemoteModelOptions();
   queueUiPreferencesSave();
   scheduleLocalWarmup();
@@ -6142,51 +6131,6 @@ function shouldLivePreview(): boolean {
   }
   queueUiPreferencesSave();
 });
-($("quickProviderSelect") as HTMLSelectElement).addEventListener("change", () => {
-  const quick = $("quickProviderSelect") as HTMLSelectElement;
-  const main = $("providerSelect") as HTMLSelectElement;
-  if (main.value !== quick.value) {
-    main.value = quick.value;
-    main.dispatchEvent(new Event("change"));
-  }
-});
-
-function getQuickSettingsOpen(): boolean {
-  return quickSettingsOpen;
-}
-
-function syncQuickSettingsVisibility(open: boolean): void {
-  const panel = $("quickSettingsPanel");
-  const btn = $("quickSettingsToggle") as HTMLButtonElement;
-  quickSettingsOpen = !!open;
-  panel.hidden = !quickSettingsOpen;
-  panel.dataset.open = quickSettingsOpen ? "true" : "false";
-  btn.classList.toggle("active", quickSettingsOpen);
-  btn.setAttribute("aria-pressed", quickSettingsOpen ? "true" : "false");
-}
-
-function applyQuickSettingsFromMain(open: boolean): boolean {
-  const nextOpen = !!open;
-  const changed = quickSettingsOpen !== nextOpen;
-  syncQuickSettingsVisibility(nextOpen);
-  if (changed) queueUiPreferencesSave();
-  return changed;
-}
-
-function initQuickControls(): void {
-  const main = $("providerSelect") as HTMLSelectElement;
-  const quick = $("quickProviderSelect") as HTMLSelectElement;
-  quick.value = main.value;
-  syncRemoteModelOptions();
-
-  ($("quickSettingsToggle") as HTMLButtonElement).addEventListener("click", () => {
-    const next = !quickSettingsOpen;
-    syncQuickSettingsVisibility(next);
-    queueUiPreferencesSave();
-  });
-  window.__transcriptorGetQuickSettingsOpen = getQuickSettingsOpen;
-  window.__transcriptorSetQuickSettingsOpen = applyQuickSettingsFromMain;
-}
 
 ($("language") as HTMLSelectElement).addEventListener("change", () => {
   queueUiPreferencesSave();
@@ -9402,7 +9346,6 @@ void loadCfg()
     scheduleLocalWarmup();
   })
   .catch(() => { });
-initQuickControls();
 syncRemoteModelOptions();
 populateUpscaleModelOptions();
 // Seed the preset dropdown synchronously with the 4 built-in presets
