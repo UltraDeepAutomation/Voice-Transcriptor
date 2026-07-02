@@ -320,6 +320,7 @@ declare global {
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorGetQuickSettingsOpen?: () => boolean;
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
+    __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
     /**
@@ -1639,6 +1640,11 @@ function setStatus(st: string, kind?: StatusKind): void {
     label.textContent = liveStatusText;
   }
 }
+
+window.__transcriptorSetMainStatus = (status: string, kind?: StatusKind): boolean => {
+  setStatus(status, kind);
+  return true;
+};
 
 function setSettingsArchiveStatus(message: string, tone: UiTone = "neutral"): void {
   const el = document.getElementById("settingsArchiveStatus");

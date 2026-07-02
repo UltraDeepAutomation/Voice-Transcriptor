@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, screen, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell } = require("electron");
+const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -32,7 +32,7 @@ const RUN_COMMAND_OUTPUT_MAX_CHARS = 1024 * 1024;
 
 // Register process-level crash handlers IMMEDIATELY — the previous
 // registration happened inside app.whenReady().then(...), meaning any
-// module-load-time crash (in requestSingleInstanceLock, createOverlayHtml,
+// module-load-time crash (in requestSingleInstanceLock or other
 // top-level fs/path calls) terminated the process with no log trace
 // because appendMainLog requires app.getPath('userData') which isn't
 // ready yet. Fall back to console.error for the pre-ready window.
@@ -172,22 +172,7 @@ _relocateUserDataOffOneDrive();
 let backend = null;
 let win = null;
 let mainWindowInitialLoadPromise = null;
-let overlayWin = null;
 let overlayWaveMonitor = null;
-let overlayLoaded = false;
-// In-flight loadURL Promise. Three call sites (ensureOverlayVisible,
-// showRecordingOverlay, the startup preload) all guard their loadURL
-// with `if (!overlayLoaded)` and set `overlayLoaded = true` after the
-// await resolves. Concurrent callers (e.g. user presses Alt+Left then
-// Alt+Shift+V before the first overlay finishes loading) all see
-// `overlayLoaded = false`, all call `ow.loadURL`, and Electron aborts
-// every prior loadURL when a new one starts on the same webContents —
-// so the FIRST caller's await rejects with ERR_ABORTED, its catch
-// hides the overlay, and the user sees a flash-and-vanish with no
-// recording started. The shared promise gates all three sites onto
-// the SAME loadURL call: subsequent callers await the same Promise
-// instead of issuing a competing load.
-let _overlayLoadPromise = null;
 let tray = null;
 let backendBootError = "";
 // Cache the last shortcut-registration status so we can replay it to
@@ -221,34 +206,17 @@ let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
-let overlayQuickSettingsOpen = false;
-let overlayContentGeometry = null;
-// Win/Linux click-through fix: poll cursor against pill bounds and
-// toggle ignoreMouseEvents from the main process. See the comment
-// inside armOverlayMouseInterception for the full rationale.
-let overlayMouseTrackTimer = null;
-let overlayMouseInPill = false;
-let overlayQuickProvider = "local";
-let overlayQuickModel = "small";
-let overlayQuickUpscalePreset = "builtin_clean";
-let overlayQuickUpscaleEnabled = false;
-let overlayQuickAutoSend = false;
-let overlayQuickAutoSendInitialized = false;
-let overlayQuickSettingsInitialized = false;
 let overlaySilenceStartedAt = 0;
 let overlayAutoStopConfig = { enabled: false, seconds: 2, thresholdDb: -42 };
 let overlayAutoStopConfigRefreshAt = 0;
 // Generation counter for overlayAutoStopConfig async refreshes. Each
 // scheduled refresh captures this value; when the Promise resolves it
 // checks that the generation still matches before writing — so a
-// resolve from a PREVIOUS session (after the overlay was hidden and a
+// resolve from a PREVIOUS session (after the recording surface was reset and a
 // new recording started) cannot clobber the new session's config.
 let overlayAutoStopConfigGen = 0;
 let overlayRecordingStartedAt = 0;
 let overlaySeenAudioFrames = false;
-let overlayAutoStopTriggerTimer = null;
-let overlayTranscribingStatusTimer = null;
-let overlayHideTimer = null;
 let postStopQueue = [];
 let postStopWorkerRunning = false;
 let pendingTranscriptionCount = 0;
@@ -272,11 +240,6 @@ let backendStartInFlight = null;
 let micPermissionChecked = false;
 let loadedFrontendBuildSignature = "";
 let pasteTarget = emptyCapturedPasteTarget();
-// The product now has one recording surface: the renderer capsule.
-// The legacy always-on-top Electron overlay was a second UI source of
-// truth and produced the duplicated top capsule reported by the user.
-const SEPARATE_RECORDING_OVERLAY_ENABLED = false;
-
 const HOST = "127.0.0.1";
 // Backend port default. pickBackendPort iterates up if occupied, so
 // collisions with other local services on 8321 are non-fatal — the
@@ -288,50 +251,6 @@ let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
 let BACKEND_BOOT_NONCE = "";
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
-const OVERLAY_TOKENS = Object.freeze({
-  window: Object.freeze({
-    collapsedWidth: 172,
-    expandedWidth: 172,
-    expandedHeight: 96,
-    height: 42,
-    geometryPadding: 2,
-    minWidth: 112,
-    minHeight: 30,
-    maxWidth: 260,
-    maxHeight: 260,
-    bottomOffset: 10,
-  }),
-  pill: Object.freeze({
-    marginTop: 6,
-    gap: 9,
-    padY: 7,
-    padX: 6,
-    borderRadius: 999,
-    border: "1px solid rgba(255,255,255,.18)",
-    background: "linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97))",
-    backdrop: "blur(8px) saturate(100%)",
-  }),
-  wave: Object.freeze({
-    width: 54,
-    height: 16,
-    barWidth: 1.4,
-    barGap: 1.0,
-    idleTickMs: 120,
-    activeStaleMs: 220,
-  }),
-  timer: Object.freeze({
-    tickMs: 200,
-  }),
-  sounds: Object.freeze({
-    start: Object.freeze({ durationSec: 0.075, baseHz: 760, endHz: 980, gainPeak: 0.04 }),
-    stop: Object.freeze({ durationSec: 0.09, baseHz: 560, endHz: 420, gainPeak: 0.055 }),
-  }),
-  stateIcon: Object.freeze({
-    size: 14,
-    dotSize: 8,
-  }),
-});
-
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
   // app.quit() is async and allows module-level code to keep running
@@ -563,136 +482,6 @@ async function ensureWindowVisible(options = {}) {
   win.focus();
 }
 
-function clampOverlayDimension(value, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return min;
-  return Math.max(min, Math.min(max, Math.ceil(n)));
-}
-
-function getOverlayFallbackWindowSize() {
-  return overlayQuickSettingsOpen
-    ? {
-      width: OVERLAY_TOKENS.window.expandedWidth,
-      height: OVERLAY_TOKENS.window.expandedHeight,
-    }
-    : {
-      width: OVERLAY_TOKENS.window.collapsedWidth,
-      height: OVERLAY_TOKENS.window.height,
-    };
-}
-
-function getOverlayMeasuredWindowSize() {
-  const geometry = overlayContentGeometry;
-  if (!geometry || geometry.quickOpen !== overlayQuickSettingsOpen) return null;
-  const pad = Math.max(0, Number(OVERLAY_TOKENS.window.geometryPadding) || 0);
-  return {
-    width: clampOverlayDimension(
-      geometry.width + pad,
-      OVERLAY_TOKENS.window.minWidth,
-      OVERLAY_TOKENS.window.maxWidth,
-    ),
-    height: clampOverlayDimension(
-      geometry.height + pad,
-      OVERLAY_TOKENS.window.minHeight,
-      OVERLAY_TOKENS.window.maxHeight,
-    ),
-  };
-}
-
-function getOverlayWindowSize() {
-  return getOverlayMeasuredWindowSize() || getOverlayFallbackWindowSize();
-}
-
-function applyOverlayGeometrySnapshot(payload) {
-  const width = Number(payload?.width);
-  const height = Number(payload?.height);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
-  const next = {
-    width: clampOverlayDimension(width, 1, OVERLAY_TOKENS.window.maxWidth),
-    height: clampOverlayDimension(height, 1, OVERLAY_TOKENS.window.maxHeight),
-    quickOpen: !!payload?.quickOpen,
-    menuOpen: !!payload?.menuOpen,
-  };
-  const prev = overlayContentGeometry;
-  if (
-    prev &&
-    prev.width === next.width &&
-    prev.height === next.height &&
-    prev.quickOpen === next.quickOpen &&
-    prev.menuOpen === next.menuOpen
-  ) {
-    return false;
-  }
-  overlayContentGeometry = next;
-  applyOverlayWindowSize();
-  return true;
-}
-
-function applyOverlayGeometryPayload(rawPayload) {
-  let payload = null;
-  try {
-    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
-  } catch {
-    return;
-  }
-  applyOverlayGeometrySnapshot(payload);
-}
-
-async function refreshOverlayGeometryFromRenderer(timeoutMs = 250) {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return false;
-  let timer = null;
-  try {
-    const snapshot = await Promise.race([
-      overlayWin.webContents.executeJavaScript(
-        `(() => typeof window.__transcriptorOverlayGeometrySnapshot === 'function'
-          ? window.__transcriptorOverlayGeometrySnapshot()
-          : null)();`,
-        true,
-      ),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`overlay geometry timeout after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]);
-    return applyOverlayGeometrySnapshot(snapshot);
-  } catch (e) {
-    appendMainLog(`[overlay-geometry] refresh skipped: ${compactLogText(e?.message || e)}`);
-    return false;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-function getOverlayInteractiveBounds() {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return null;
-  const wb = overlayWin.getBounds();
-  const size = getOverlayWindowSize();
-  const visibleW = Math.min(wb.width, size.width || wb.width);
-  const visibleH = Math.min(wb.height, size.height || wb.height);
-  return {
-    x: Math.round(wb.x + (wb.width - visibleW) / 2),
-    y: Math.round(wb.y + wb.height - visibleH),
-    width: visibleW,
-    height: visibleH,
-  };
-}
-
-function isCursorInsideVisibleOverlayInteractiveRegion() {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return false;
-  try {
-    const cursor = screen.getCursorScreenPoint();
-    const bounds = getOverlayInteractiveBounds();
-    if (!bounds) return false;
-    return (
-      cursor.x >= bounds.x &&
-      cursor.x <= bounds.x + bounds.width &&
-      cursor.y >= bounds.y &&
-      cursor.y <= bounds.y + bounds.height
-    );
-  } catch {
-    return false;
-  }
-}
-
 function getRepoRoot() {
   if (app.isPackaged) return process.resourcesPath;
   return path.join(__dirname, "..");
@@ -791,12 +580,11 @@ function normalizeLocalModelChoice(value) {
 /**
  * Race win.webContents.executeJavaScript(code) against a timeout.
  *
- * Every overlay-lifecycle renderer probe (`getRendererProviderChoice`,
- * `getRendererLocalModelChoice`, `getRendererQuickSettingsOpen`,
- * `getRendererUpscalePresetContext`, etc.) previously awaited the
+ * Every hotkey-lifecycle renderer probe (`getRendererProviderChoice`,
+ * `getRendererLocalModelChoice`, auto-stop config reads, etc.) previously awaited the
  * executeJavaScript Promise unconditionally. If the renderer was
  * stuck (long synchronous work, layout lock, extension interaction),
- * the main process would hang in `showRecordingOverlay` forever —
+ * the main process would hang in the recording startup path forever —
  * `shortcutToggleInFlight` stayed true and the user could not re-fire
  * the hotkey until process restart. This wrapper guarantees a
  * bounded wait per probe.
@@ -844,52 +632,6 @@ async function getRendererLocalModelChoice() {
   return normalizeLocalModelChoice(v);
 }
 
-async function getRendererQuickSettingsOpen() {
-  // Frontend keeps quick settings as explicit renderer state. The DOM
-  // nodes are legacy bridge sinks and are intentionally display:none,
-  // so layout/computed style is not a valid source of truth.
-  return await execRendererJsWithTimeout(
-    `(() => {
-      if (typeof window.__transcriptorGetQuickSettingsOpen === 'function') {
-        return !!window.__transcriptorGetQuickSettingsOpen();
-      }
-      const btn = document.getElementById('quickSettingsToggle');
-      if (btn && btn.getAttribute('aria-pressed') != null) {
-        return btn.getAttribute('aria-pressed') === 'true';
-      }
-      const p = document.getElementById('quickSettingsPanel');
-      if (!p) return false;
-      return p.dataset.open === 'true' || p.hidden === false;
-    })();`,
-    null,
-  );
-}
-
-async function getRendererUpscalePresetContext() {
-  const DEFAULT_CONTEXT = { selected: "builtin_clean", enabled: false, presets: [{ id: "builtin_clean", name: "Clean" }] };
-  const out = await execRendererJsWithTimeout(
-    `
-    (() => {
-      const sel = document.getElementById('upscalePresetSelect');
-      const en = document.getElementById('upscaleToggle');
-      const selected = String(sel?.value || 'builtin_clean').trim();
-      const enabled = !!(en && en.checked);
-      const presets = Array.from(sel?.options || []).map((o) => ({
-        id: String(o.value || '').trim(),
-        name: String(o.textContent || o.value || '').trim(),
-      })).filter((x) => x.id);
-      return { selected, enabled, presets };
-    })();
-    `,
-    null,
-  );
-  if (!out) return DEFAULT_CONTEXT;
-  const presets = Array.isArray(out.presets) ? out.presets : [];
-  const selected = String(out.selected || "builtin_clean").trim() || "builtin_clean";
-  const enabled = !!out.enabled;
-  return { selected, enabled, presets: presets.length ? presets : [{ id: "builtin_clean", name: "Clean" }] };
-}
-
 async function getRendererAutoSendEnterEnabled() {
   const out = await execRendererJsWithTimeout(
     `
@@ -927,95 +669,6 @@ async function getRendererAutoStopSilenceConfig() {
     seconds: Number.isFinite(Number(out.seconds)) ? Number(out.seconds) : 2,
     thresholdDb: Number.isFinite(Number(out.thresholdDb)) ? Number(out.thresholdDb) : -42,
   };
-}
-
-async function setRendererUpscalePresetChoice(presetId) {
-  if (!win || win.isDestroyed() || !win.webContents) return;
-  const target = String(presetId || "").trim();
-  if (!target) return;
-  await safeExec("setRendererUpscalePresetChoice", () =>
-    win.webContents.executeJavaScript(
-      `
-      (() => {
-        const target = ${JSON.stringify(target)};
-        const sel = document.getElementById('upscalePresetSelect');
-        if (!sel) return false;
-        if (!Array.from(sel.options || []).some((o) => String(o.value || '') === target)) return false;
-        if (sel.value !== target) {
-          sel.value = target;
-          sel.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        return true;
-      })();
-      `,
-      true
-    )
-  );
-}
-
-async function setRendererUpscaleEnabledChoice(enabled) {
-  if (!win || win.isDestroyed() || !win.webContents) return;
-  const target = !!enabled;
-  await safeExec("setRendererUpscaleEnabledChoice", () =>
-    win.webContents.executeJavaScript(
-      `
-      (() => {
-        const target = ${target ? "true" : "false"};
-        const el = document.getElementById('upscaleToggle');
-        if (!el) return false;
-        if (!!el.checked !== target) {
-          el.checked = target;
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        return true;
-      })();
-      `,
-      true
-    )
-  );
-}
-
-async function setRendererQuickSettingsOpenChoice(open) {
-  if (!win || win.isDestroyed() || !win.webContents) return;
-  const target = !!open;
-  await safeExec("setRendererQuickSettingsOpenChoice", () =>
-    win.webContents.executeJavaScript(
-      `
-      (() => {
-        const target = ${target ? "true" : "false"};
-        if (typeof window.__transcriptorSetQuickSettingsOpen === 'function') {
-          return !!window.__transcriptorSetQuickSettingsOpen(target);
-        }
-        const panel = document.getElementById('quickSettingsPanel');
-        const btn = document.getElementById('quickSettingsToggle');
-        if (!panel || !btn) return false;
-        const isOpen = !panel.hidden;
-        if (isOpen !== target) btn.click();
-        return true;
-      })();
-      `,
-      true
-    )
-  );
-}
-
-async function setRendererAutoSendEnterChoice(enabled) {
-  if (!win || win.isDestroyed() || !win.webContents) return;
-  const target = !!enabled;
-  await safeExec("setRendererAutoSendEnterChoice", () =>
-    win.webContents.executeJavaScript(
-      `
-      (() => {
-        const btn = document.getElementById('autoSendEnterToggle');
-        if (!btn) return false;
-        const isOn = btn.classList.contains('active');
-        if (isOn !== ${target ? "true" : "false"}) btn.click();
-        return true;
-      })();
-      `,
-      true
-    )
-  );
 }
 
 async function setRendererProviderChoice(provider) {
@@ -1110,1377 +763,8 @@ async function setRendererModelChoice(provider, model) {
   );
 }
 
-function createOverlayHtml() {
-  const t = OVERLAY_TOKENS;
-  return `
-  <html>
-    <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;display:flex;justify-content:center;align-items:flex-end;height:100vh;">
-      <div id="stack">
-      <div id="settingsSlot">
-        <div id="settingsPill">
-          <div id="quickPanel">
-            <div id="quickAutoStopCapsule" title="Auto stop on silence">
-              <input id="quickAutoStopToggle" type="checkbox" />
-              <span class="capsuleLabel">Stop</span>
-              <div id="quickAutoStopSecsLabel">
-                <button id="quickAutoStopSecsMinus" type="button" aria-label="Decrease seconds">&minus;</button>
-                <span id="quickAutoStopSecs" aria-live="polite">2</span>
-                <button id="quickAutoStopSecsPlus" type="button" aria-label="Increase seconds">+</button>
-              </div>
-            </div>
-            <div id="quickUpscaleCapsule" title="Upscale settings">
-              <input id="quickUpscaleToggle" type="checkbox" />
-              <span id="quickUpscaleOffLabel">Upscale</span>
-              <div id="quickUpscaleDrop">
-                <button id="quickUpscaleBtn" type="button" aria-label="Upscale preset">
-                  <span id="quickUpscaleBtnText">Clean</span>
-                </button>
-                <div id="quickUpscaleMenu"></div>
-              </div>
-            </div>
-            <div id="quickAutoSendCapsule" title="Auto send after paste">
-              <input id="quickAutoSendToggle" type="checkbox" />
-              <span class="capsuleLabel">Send</span>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div id="pill">
-        <div id="core">
-          <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
-          <canvas id="wave" width="${t.wave.width}" height="${t.wave.height}"></canvas>
-          <span id="timer">00:00</span>
-          <span id="stateIcon" aria-hidden="true"></span>
-        </div>
-      </div>
-      </div>
-      <style>
-        #stack{
-          display:flex;
-          flex-direction:column;
-          align-items:center;
-          gap:4px;
-          margin:0 auto;
-        }
-        #pill{
-          width: fit-content;
-          margin: 0;
-          display:flex;
-          align-items:center;
-          justify-content:flex-start;
-          gap:6px;
-          padding:${t.pill.padY}px ${t.pill.padX}px;
-          border-radius:${t.pill.borderRadius}px;
-          border:1px solid #333;
-          background:#161616;
-          box-shadow:none;
-          overflow:hidden;
-          isolation:isolate;
-        }
-        #core{
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          gap:${t.pill.gap}px;
-        }
-        #settingsSlot{
-          width:100%;
-          height:0;
-          min-height:0;
-          display:flex;
-          align-items:flex-end;
-          justify-content:center;
-          margin-bottom:0;
-          overflow:visible;
-        }
-        #settingsSlot.on{
-          height:auto;
-          min-height:34px;
-          margin-bottom:8px;
-        }
-        #settingsPill{
-          width:fit-content;
-          min-height:22px;
-          padding:8px;
-          border-radius:14px;
-          border:1px solid #333;
-          background:#161616;
-          opacity:0;
-          pointer-events:none;
-          transform:translateY(-5px) scale(.985);
-          transition:opacity .12s ease, transform .12s ease;
-        }
-        #settingsSlot.on #settingsPill{
-          opacity:1;
-          pointer-events:auto;
-          transform:translateY(-2px) scale(1);
-        }
-        #wave{
-          display:block;
-          opacity:.95;
-          width:${t.wave.width}px;
-          height:${t.wave.height}px;
-          flex:0 0 ${t.wave.width}px;
-        }
-        #quickPanel{
-          display:flex;
-          flex-direction:column;
-          align-items:stretch;
-          gap:4px;
-          min-width:0;
-          overflow:visible;
-          flex:0 0 auto;
-        }
-        /* ── Shared capsule base ── */
-        #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule{
-          display:flex;
-          align-items:center;
-          gap:5px;
-          padding:0 6px 0 2px;
-          height:22px;
-          border-radius:999px;
-          white-space:nowrap;
-          min-width:0;
-        }
-        .capsuleLabel{
-          font-size:10px;
-          font-weight:650;
-          letter-spacing:.01em;
-          opacity:.92;
-        }
-        /* ── Shared toggle base ── */
-        #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle{
-          appearance:none;
-          width:28px;
-          height:16px;
-          border-radius:999px;
-          border:1px solid #444;
-          background:#2a2a2a;
-          position:relative;
-          outline:none;
-          cursor:pointer;
-          flex:0 0 28px;
-          transition:background .14s ease, border-color .14s ease;
-        }
-        #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before{
-          content:"";
-          position:absolute;
-          left:2px;
-          top:2px;
-          width:10px;
-          height:10px;
-          border-radius:999px;
-          background:#d2d2d2;
-          transition:transform .14s ease, background .14s ease;
-        }
-        /* ── Upscale: PURPLE accent ── */
-        #quickUpscaleCapsule{
-          border:1px solid #3d2e52;
-          background:#2a2234;
-          color:#e0e0e0;
-        }
-        #quickUpscaleToggle:checked{
-          background:#5a36a0;
-          border-color:#7a50c8;
-        }
-        #quickUpscaleToggle:checked::before{
-          transform:translateX(12px);
-          background:#fff;
-        }
-        #quickUpscaleOffLabel{
-          font-size:10px;
-          font-weight:650;
-          letter-spacing:.01em;
-          opacity:.92;
-        }
-        /* ── AutoSend: GREEN accent ── */
-        #quickAutoSendCapsule{
-          border:1px solid #2e4a35;
-          background:#1e2e22;
-          color:#d0e8d4;
-        }
-        #quickAutoSendToggle:checked{
-          background:#2e5c3a;
-          border-color:#4a8a5a;
-        }
-        #quickAutoSendToggle:checked::before{
-          transform:translateX(12px);
-          background:#90e0a0;
-        }
-        /* ── AutoStop: YELLOW/AMBER accent ── */
-        #quickAutoStopCapsule{
-          border:1px solid #4a4428;
-          background:#2a2818;
-          color:#e0dcc0;
-        }
-        #quickAutoStopToggle:checked{
-          background:#5c5020;
-          border-color:#8a7a3a;
-        }
-        #quickAutoStopToggle:checked::before{
-          transform:translateX(12px);
-          background:#e8d860;
-        }
-        #quickAutoStopSecsLabel{
-          display:inline-flex;
-          align-items:center;
-          gap:2px;
-          margin-left:2px;
-          background:#2a2818;
-          border:1px solid #4a4428;
-          border-radius:8px;
-          padding:1px 3px;
-          height:18px;
-        }
-        #quickAutoStopSecs{
-          display:inline-block;
-          min-width:18px;
-          text-align:center;
-          color:#e0dcc0;
-          font-size:10px;
-          font-weight:700;
-          font-family:Menlo,ui-monospace,monospace;
-          line-height:1;
-          padding:0 2px;
-        }
-        #quickAutoStopSecsMinus, #quickAutoStopSecsPlus{
-          all:unset;
-          display:inline-flex;
-          align-items:center;
-          justify-content:center;
-          width:16px;
-          height:16px;
-          border-radius:4px;
-          color:#d4c888;
-          font-size:12px;
-          font-weight:700;
-          cursor:pointer;
-          user-select:none;
-          transition:background 80ms ease;
-        }
-        #quickAutoStopSecsMinus:hover, #quickAutoStopSecsPlus:hover{
-          background:#4a4428;
-        }
-        #quickAutoStopSecsMinus:active, #quickAutoStopSecsPlus:active{
-          background:#5a5438;
-        }
-        .secsUnit{
-          font-size:9px;
-          font-weight:600;
-          color:#8a8a60;
-        }
-        /* ── Upscale dropdown ── */
-        #quickUpscaleDrop{
-          position:relative;
-        }
-        #quickUpscaleBtn{
-          appearance:none;
-          border:1px solid #3d2e52;
-          border-radius:999px;
-          background:#2a2234;
-          color:#eaeaea;
-          height:18px;
-          padding:0 18px 0 8px;
-          font-size:10px;
-          font-weight:600;
-          max-width:96px;
-          min-width:96px;
-          text-align:left;
-          cursor:pointer;
-          position:relative;
-        }
-        #quickUpscaleBtn::after{
-          content:"";
-          position:absolute;
-          right:6px;
-          top:50%;
-          width:8px;
-          height:5px;
-          transform:translateY(-50%);
-          background-repeat:no-repeat;
-          background-position:center;
-          background-size:8px 5px;
-          background-image:url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-        }
-        #quickUpscaleBtnText{
-          display:block;
-          overflow:hidden;
-          text-overflow:ellipsis;
-          white-space:nowrap;
-        }
-        #quickUpscaleMenu{
-          position:absolute;
-          left:0;
-          top:22px;
-          min-width:100%;
-          border:1px solid #3d2e52;
-          border-radius:10px;
-          background:#1e1a24;
-          display:none;
-          z-index:5;
-          max-height:160px;
-          overflow:auto;
-          padding:4px;
-        }
-        #quickUpscaleMenu.open{
-          display:block;
-        }
-        .quickUpscaleItem{
-          width:100%;
-          appearance:none;
-          border:0;
-          border-radius:8px;
-          height:22px;
-          padding:0 8px;
-          text-align:left;
-          color:#eaeaea;
-          background:transparent;
-          font-size:10px;
-          cursor:pointer;
-        }
-        .quickUpscaleItem:hover{
-          background:#2e2e2e;
-        }
-        .quickUpscaleItem.active{
-          background:#3a2a52;
-        }
-        #quickUpscaleCapsule.up-off #quickUpscaleDrop{
-          display:none;
-        }
-        #quickUpscaleCapsule.up-on #quickUpscaleOffLabel{
-          display:none;
-        }
-        /* quickSendEnterBtn removed — replaced by #quickAutoSendCapsule */
-        #gearBtn{
-          appearance:none;
-          border:1px solid #333;
-          border-radius:999px;
-          background:#2a2a2a;
-          width:22px;
-          height:22px;
-          padding:0;
-          position:relative;
-          flex:0 0 22px;
-          cursor:pointer;
-        }
-        #gearBtn::before{
-          content:"";
-          position:absolute;
-          left:50%;
-          top:50%;
-          width:11px;
-          height:11px;
-          transform:translate(-50%,-50%);
-          background-repeat:no-repeat;
-          background-position:center;
-          background-size:11px 11px;
-          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
-        }
-        #gearBtn.on{
-          border-color:#444;
-          background:#3a3a3a;
-        }
-        #gearBtn.on::before{
-          background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(236,236,236,0.95)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(236,236,236,0.95)' stroke-width='1.4'/%3E%3C/svg%3E");
-        }
-        #stateIcon{
-          width:14px;
-          height:14px;
-          border-radius:50%;
-          position:relative;
-          display:inline-block;
-          flex:0 0 14px;
-          background:transparent;
-          animation:none;
-        }
-        #stateIcon::before{
-          content:"";
-          position:absolute;
-          left:50%;
-          top:50%;
-          width:8px;
-          height:8px;
-          transform:translate(-50%,-50%);
-          border-radius:50%;
-          background:rgba(180,180,180,.92);
-          box-shadow:0 0 0 0 rgba(180,180,180,0);
-        }
-        #stateIcon::after{
-          content:"";
-          position:absolute;
-          left:50%;
-          top:50%;
-          width:14px;
-          height:14px;
-          transform:translate(-50%,-50%);
-          border-radius:50%;
-          border:1px solid rgba(180,180,180,.2);
-          opacity:0;
-        }
-        #stateIcon.rec{
-          animation:none;
-        }
-        #stateIcon.rec::before{
-          background:rgba(255,92,92,.94);
-          border-radius:2px;
-          animation:coreBreathe 1.35s ease-in-out infinite;
-        }
-        #stateIcon.rec::after{
-          opacity:1;
-          border:1px solid rgba(255,92,92,.44);
-          animation:recHalo 1.35s ease-out infinite;
-        }
-        #stateIcon.transcribing::before{
-          background:rgba(114,174,255,.98);
-          box-shadow:0 0 8px rgba(114,174,255,.55);
-        }
-        #stateIcon.transcribing::after{
-          opacity:1;
-          border:1px solid rgba(114,174,255,.75);
-          border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
-          box-shadow:0 0 10px rgba(114,174,255,.36), inset 0 0 6px rgba(114,174,255,.28);
-          animation:transBlob 1.05s ease-in-out infinite;
-        }
-        #stateIcon.ok{
-          animation:none;
-        }
-        #stateIcon.upscaling::before{
-          background:rgba(173,112,255,.98);
-          box-shadow:0 0 8px rgba(173,112,255,.5);
-        }
-        #stateIcon.upscaling::after{
-          opacity:1;
-          border:1px solid rgba(173,112,255,.72);
-          border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
-          box-shadow:0 0 10px rgba(173,112,255,.34), inset 0 0 6px rgba(173,112,255,.26);
-          animation:transBlob 1.05s ease-in-out infinite;
-        }
-        #stateIcon.autostop::before{
-          background:rgba(255,196,74,.98);
-          box-shadow:0 0 8px rgba(255,196,74,.46);
-        }
-        #stateIcon.autostop::after{
-          opacity:1;
-          border:1px solid rgba(255,196,74,.66);
-          animation:okHalo .8s ease-out infinite;
-        }
-        #stateIcon.ok::before{
-          background:rgba(112,210,136,.96);
-          box-shadow:0 0 8px rgba(112,210,136,.4);
-          animation:okBreathe .65s ease-out 1;
-        }
-        #stateIcon.ok::after{
-          opacity:1;
-          border:1px solid rgba(112,210,136,.35);
-          animation:okHalo .7s ease-out 1;
-        }
-        #stateIcon.fail{
-          animation:none;
-        }
-        #stateIcon.fail::before{
-          background:rgba(184,184,184,.95);
-        }
-        #stateIcon.fail::after{
-          opacity:0;
-        }
-        #timer{
-          font-size:10px;
-          font-weight:800;
-          color:rgba(255,255,255,.96);
-          font-family:Menlo,ui-monospace,monospace;
-          min-width:36px;
-          text-align:center;
-          line-height:1;
-          flex:0 0 36px;
-        }
-        @keyframes coreBreathe{
-          0%,100%{transform:translate(-50%,-50%) scale(1)}
-          50%{transform:translate(-50%,-50%) scale(1.1)}
-        }
-        @keyframes recHalo{
-          0%{transform:translate(-50%,-50%) scale(1); opacity:.9}
-          70%{transform:translate(-50%,-50%) scale(1.28); opacity:.16}
-          100%{transform:translate(-50%,-50%) scale(1.36); opacity:0}
-        }
-        @keyframes transBlob{
-          0%{
-            transform:translate(-50%,-50%) rotate(0deg) scale(1);
-            border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
-          }
-          33%{
-            transform:translate(-50%,-50%) rotate(40deg) scale(1.07);
-            border-radius:62% 38% 58% 42% / 40% 62% 38% 60%;
-          }
-          66%{
-            transform:translate(-50%,-50%) rotate(84deg) scale(1.02);
-            border-radius:46% 54% 40% 60% / 62% 36% 64% 38%;
-          }
-          100%{
-            transform:translate(-50%,-50%) rotate(125deg) scale(1);
-            border-radius:38% 62% 44% 56% / 54% 42% 58% 46%;
-          }
-        }
-        @keyframes okBreathe{
-          0%{transform:translate(-50%,-50%) scale(.86)}
-          100%{transform:translate(-50%,-50%) scale(1)}
-        }
-        @keyframes okHalo{
-          0%{transform:translate(-50%,-50%) scale(.92); opacity:.7}
-          100%{transform:translate(-50%,-50%) scale(1.2); opacity:0}
-        }
-      </style>
-      <script>
-        let start = Date.now();
-        const el = document.getElementById('timer');
-        const cv = document.getElementById('wave');
-        const ctx = cv.getContext('2d');
-        const stackEl = document.getElementById('stack');
-        const settingsSlot = document.getElementById('settingsSlot');
-        const pill = document.getElementById('pill');
-        const stateIcon = document.getElementById('stateIcon');
-        const gearBtn = document.getElementById('gearBtn');
-        const quickPanel = document.getElementById('quickPanel');
-        const quickUpscaleCapsule = document.getElementById('quickUpscaleCapsule');
-        const quickUpscaleToggle = document.getElementById('quickUpscaleToggle');
-        const quickUpscaleBtn = document.getElementById('quickUpscaleBtn');
-        const quickUpscaleBtnText = document.getElementById('quickUpscaleBtnText');
-        const quickUpscaleMenu = document.getElementById('quickUpscaleMenu');
-        const quickAutoSendToggle = document.getElementById('quickAutoSendToggle');
-        let quickUpscaleOptions = [];
-        let quickUpscaleSelected = 'builtin_clean';
-        let geometryEmitScheduled = false;
-        let timerId = null;
-        let audioCtx = null;
-        const bars = [];
-        let lastLevelAt = 0;
-        let activeWave = true;
-        let waveMode = 'recording';
-        const dpr = Math.max(1, Math.min(3, Number(window.devicePixelRatio || 1)));
-        const waveW = ${t.wave.width};
-        const waveH = ${t.wave.height};
-        cv.width = Math.round(waveW * dpr);
-        cv.height = Math.round(waveH * dpr);
-        cv.style.width = waveW + 'px';
-        cv.style.height = waveH + 'px';
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-        const readGeometrySnapshot = () => {
-          const stackRect = stackEl.getBoundingClientRect();
-          let left = stackRect.left;
-          let top = stackRect.top;
-          let right = stackRect.right;
-          let bottom = stackRect.bottom;
-          const menuOpen = quickUpscaleMenu.classList.contains('open');
-          if (menuOpen) {
-            const menuRect = quickUpscaleMenu.getBoundingClientRect();
-            left = Math.min(left, menuRect.left);
-            top = Math.min(top, menuRect.top);
-            right = Math.max(right, menuRect.right);
-            bottom = Math.max(bottom, menuRect.bottom);
-          }
-          const width = Math.max(1, Math.ceil(right - left));
-          const height = Math.max(1, Math.ceil(bottom - top));
-          return {
-            width,
-            height,
-            quickOpen: settingsSlot.classList.contains('on'),
-            menuOpen
-          };
-        };
-        window.__transcriptorOverlayGeometrySnapshot = readGeometrySnapshot;
-        const emitGeometry = () => {
-          geometryEmitScheduled = false;
-          const payload = readGeometrySnapshot();
-          document.title = '__overlay_geometry__' + encodeURIComponent(JSON.stringify(payload));
-        };
-        const scheduleGeometryEmit = () => {
-          if (geometryEmitScheduled) return;
-          geometryEmitScheduled = true;
-          requestAnimationFrame(() => {
-            setTimeout(emitGeometry, 0);
-          });
-        };
-        window.addEventListener('resize', scheduleGeometryEmit);
-
-        const bw = ${t.wave.barWidth};
-        const gap = ${t.wave.barGap};
-        const maxBars = Math.floor(waveW / (bw + gap));
-        window.setLevel = (lv) => {
-          if (waveMode !== 'recording') return;
-          const raw = Math.max(0, Math.min(1, Number(lv) || 0));
-          const level = Math.max(0, Math.min(1, Math.pow(raw, 0.72) * 1.45));
-          lastLevelAt = Date.now();
-          bars.push(level);
-          while (bars.length > maxBars) bars.shift();
-          render();
-        };
-        window.resetWave = () => {
-          bars.length = 0;
-          lastLevelAt = 0;
-          render();
-        };
-        window.setStatus = (s) => {
-          const raw = String(s || '').trim().toLowerCase();
-          activeWave = raw === 'starting' || raw === 'recording' || raw === 'auto stop';
-          waveMode = raw === 'transcribing'
-            ? 'transcribing'
-            : (raw === 'upscaling'
-              ? 'upscaling'
-              : (raw === 'auto stop'
-                ? 'autostop'
-                : (activeWave ? 'recording' : 'idle')));
-          stateIcon.className = '';
-          // Strip the composite "In Clipboard · <reason>" suffix before
-          // matching — every clipboard-recovery variant counts as an OK
-          // final state (text is safe in the clipboard), not a failure.
-          const rawKey = raw.startsWith('in clipboard') ? 'in clipboard' : raw;
-          if (rawKey === 'starting' || rawKey === 'recording') {
-            stateIcon.classList.add('rec');
-          } else if (rawKey === 'transcribing' || rawKey === 'pasting') {
-            stateIcon.classList.add('transcribing');
-          } else if (rawKey === 'upscaling') {
-            stateIcon.classList.add('upscaling');
-          } else if (rawKey === 'auto stop') {
-            stateIcon.classList.add('autostop');
-          } else if (
-            rawKey === 'paste sent' || rawKey === 'pasted' || rawKey === 'sent' ||
-            rawKey === 'done' || rawKey === 'saved to app' || rawKey === 'in clipboard'
-          ) {
-            stateIcon.classList.add('ok');
-          } else if (
-            rawKey === 'paste failed' || rawKey === 'grant access' ||
-            rawKey === 'secure field' || rawKey === 'no text focus' ||
-            rawKey === 'clipboard error' || rawKey === 'no text' ||
-            rawKey === 'app not ready' || rawKey === 'app loading'
-          ) {
-            stateIcon.classList.add('fail');
-          } else {
-            // Unknown status — default to transcribing spinner so the
-            // overlay doesn't lie about success/failure.
-            stateIcon.classList.add('transcribing');
-          }
-        };
-        window.setQuickOpen = (open) => {
-          const on = !!open;
-          settingsSlot.classList.toggle('on', on);
-          gearBtn.classList.toggle('on', on);
-          scheduleGeometryEmit();
-        };
-        window.setUpscaleEnabled = (enabled) => {
-          const on = !!enabled;
-          if (quickUpscaleToggle.checked !== on) quickUpscaleToggle.checked = on;
-          quickUpscaleCapsule.classList.toggle('up-on', on);
-          quickUpscaleCapsule.classList.toggle('up-off', !on);
-        };
-        window.setUpscaleOptions = (items, selected) => {
-          const list = Array.isArray(items) ? items : [];
-          quickUpscaleOptions = [];
-          list.forEach((it) => {
-            const id = String((it && it.id) || '').trim();
-            if (!id) return;
-            const name = String((it && it.name) || id).trim();
-            quickUpscaleOptions.push({ id, name });
-          });
-          if (!quickUpscaleOptions.length) {
-            quickUpscaleOptions.push({ id: 'builtin_clean', name: 'Clean' });
-          }
-          const next = String(selected || '').trim();
-          quickUpscaleSelected = next && quickUpscaleOptions.some((o) => o.id === next) ? next : quickUpscaleOptions[0].id;
-          renderUpscaleMenu();
-          scheduleGeometryEmit();
-        };
-        window.setUpscale = (presetId) => {
-          const v = String(presetId || '').trim();
-          if (!v) return;
-          if (!quickUpscaleOptions.some((o) => o.id === v)) return;
-          quickUpscaleSelected = v;
-          renderUpscaleMenu();
-        };
-        window.setAutoSendEnabled = (enabled) => {
-          const on = !!enabled;
-          if (quickAutoSendToggle.checked !== on) quickAutoSendToggle.checked = on;
-        };
-
-        // Make the entire core of the capsule clickable to stop recording
-        document.getElementById('core').addEventListener('click', (e) => {
-          if (waveMode === 'recording') {
-            e.stopPropagation();
-            document.title = '__overlay_stop__';
-          }
-        });
-
-        gearBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const next = !settingsSlot.classList.contains('on');
-          window.setQuickOpen(next);
-          document.title = '__overlay_settings__' + (next ? '1' : '0');
-        });
-        quickUpscaleToggle.addEventListener('change', () => {
-          window.setUpscaleEnabled(quickUpscaleToggle.checked);
-          document.title = '__overlay_upscale_enabled__' + (quickUpscaleToggle.checked ? '1' : '0');
-        });
-        quickUpscaleBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          quickUpscaleMenu.classList.toggle('open');
-          scheduleGeometryEmit();
-        });
-        document.addEventListener('click', () => {
-          if (!quickUpscaleMenu.classList.contains('open')) return;
-          quickUpscaleMenu.classList.remove('open');
-          scheduleGeometryEmit();
-        });
-        quickAutoSendToggle.addEventListener('change', () => {
-          const next = quickAutoSendToggle.checked;
-          document.title = '__overlay_autosend__' + (next ? '1' : '0');
-        });
-        const quickAutoStopToggle = document.getElementById('quickAutoStopToggle');
-        const quickAutoStopSecs = document.getElementById('quickAutoStopSecs');
-        const quickAutoStopMinus = document.getElementById('quickAutoStopSecsMinus');
-        const quickAutoStopPlus = document.getElementById('quickAutoStopSecsPlus');
-        // Replaced the tiny (24x18 px) text input with a span + +/-
-        // buttons. The input had two hard UX problems:
-        //   1. On Apple Silicon macOS the overlay window is created
-        //      with focusable:false; setFocusable(true) runs AFTER
-        //      the click lands, so keystrokes went to the prior
-        //      focused window (Claude / Slack / Cursor), not the
-        //      overlay input.
-        //   2. 24 pixels wide is below the comfortable click target
-        //      minimum; users reliably missed the field.
-        // Buttons sidestep both issues — no keyboard input required,
-        // each button is a 16x16 hit target that doesn't need window
-        // focus to fire its click handler.
-        const secsBounds = { min: 1, max: 120 };
-        const emitSecs = (v) => {
-          // Must NOT use a "|| 2" fallback on the rounded value —
-          // that turns a legitimate Math.round(0) into 2 AFTER the
-          // clamp's floor is supposed to take over. Scenario: user
-          // at value 1 clicks minus → readSecs=1 → 1-1=0 → Math.round(0)=0
-          // → 0||2 → 2. Sign-inverted: the minus button INCREMENTS
-          // the value at the min boundary. Handle NaN explicitly
-          // instead, so the clamp does its own floor.
-          //
-          // CRITICAL: this comment is INSIDE createOverlayHtml's
-          // outer template literal. NEVER write a backtick or a
-          // dollar-curly placeholder marker (the two-character
-          // sequence "dollar then open-brace") inside this template
-          // body — even in a comment. A stray backtick closes the
-          // template and dumps the rest as JS; a stray placeholder
-          // opener tries to evaluate the JS that follows it as an
-          // interpolation expression. Both have crashed shortcuts in
-          // production. Use plain quotes 'X' or "X" only.
-          const raw = Number(v);
-          const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
-          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
-          quickAutoStopSecs.textContent = String(sec);
-          scheduleGeometryEmit();
-          document.title = '__overlay_autostop_secs__' + sec;
-        };
-        const readSecs = () => {
-          const n = Number(quickAutoStopSecs.textContent);
-          return Number.isFinite(n) && n > 0 ? n : 2;
-        };
-        window.setAutoStopConfig = (enabled, seconds) => {
-          const on = !!enabled;
-          if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
-          // Mirror emitSecs: NaN → default, let the clamp's floor
-          // provide the minimum. The previous "|| 2" trick coerced
-          // a legitimate 0 (if ever passed) to 2 BEFORE the clamp
-          // could floor it to 1 — same anti-pattern the sibling
-          // emitSecs fn was fixed for. Keep both consistent.
-          // (No backticks in this comment — see emitSecs's CRITICAL
-          // note above: any backtick inside this template body would
-          // close the outer template literal and crash overlay
-          // rendering with "...is not a function".)
-          const raw = Number(seconds);
-          const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
-          const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
-          if (Number(quickAutoStopSecs.textContent) !== sec) {
-            quickAutoStopSecs.textContent = String(sec);
-            scheduleGeometryEmit();
-          }
-        };
-        quickAutoStopToggle.addEventListener('change', () => {
-          document.title = '__overlay_autostop_enabled__' + (quickAutoStopToggle.checked ? '1' : '0');
-        });
-        // Click-and-hold auto-repeat: first pointerdown fires one
-        // tick immediately, then after a 400 ms dwell the value
-        // ticks every 60 ms. After 20 ticks (~1.2 s of holding)
-        // we accelerate to 20 ms/tick so large adjustments
-        // (2 → 30, 2 → 60) don't require dozens of discrete
-        // clicks. Released on pointerup / pointerleave / pointer
-        // cancel so the user can bail by dragging off the button.
-        const attachHoldRepeat = (btn, delta) => {
-          let holdTimeout = null;
-          let repeatInterval = null;
-          let tickCount = 0;
-          const tick = () => {
-            emitSecs(readSecs() + delta);
-            tickCount += 1;
-            if (tickCount === 20 && repeatInterval !== null) {
-              clearInterval(repeatInterval);
-              repeatInterval = setInterval(tick, 20);
-            }
-          };
-          const stop = () => {
-            if (holdTimeout !== null) { clearTimeout(holdTimeout); holdTimeout = null; }
-            if (repeatInterval !== null) { clearInterval(repeatInterval); repeatInterval = null; }
-            tickCount = 0;
-          };
-          btn.addEventListener('pointerdown', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            stop(); // reset any lingering state from a prior press
-            emitSecs(readSecs() + delta); // immediate first tick
-            holdTimeout = setTimeout(() => {
-              repeatInterval = setInterval(tick, 60);
-            }, 400);
-          });
-          btn.addEventListener('pointerup', stop);
-          btn.addEventListener('pointerleave', stop);
-          btn.addEventListener('pointercancel', stop);
-          // Safety net: if the user drags the pointer off the
-          // overlay while holding, the stack mouseleave handler
-          // flips the overlay into setIgnoreMouseEvents(true,
-          // {forward:true}) and on some Electron builds the button
-          // never receives pointerleave / pointerup, leaving the
-          // interval ticking until the user re-enters the overlay.
-          // Document-level listeners fire regardless of ignore-
-          // mouse state because they're in the renderer's own
-          // event stream, not the compositor's hit-test.
-          document.addEventListener('pointerup', stop);
-          document.addEventListener('pointercancel', stop);
-          window.addEventListener('blur', stop);
-        };
-        attachHoldRepeat(quickAutoStopMinus, -1);
-        attachHoldRepeat(quickAutoStopPlus, +1);
-        window.setTimer = (t) => {
-          const str = String(t || '').trim();
-          if (/^\\d{2,3}:\\d{2}$/.test(str)) {
-            el.textContent = str;
-            scheduleGeometryEmit();
-          }
-        };
-        window.resetTimer = () => {
-          start = Date.now();
-          tick();
-        };
-        window.startTimer = () => {
-          if (timerId) clearInterval(timerId);
-          timerId = setInterval(tick, ${t.timer.tickMs});
-        };
-        window.playCue = (kind) => {
-          try {
-            if (!audioCtx) {
-              const AC = window.AudioContext || window.webkitAudioContext;
-              if (!AC) return;
-              audioCtx = new AC();
-            }
-            if (audioCtx.state === 'suspended') {
-              audioCtx.resume().catch(() => {});
-            }
-            const now = audioCtx.currentTime;
-            const cue = kind === 'stop' ? ${JSON.stringify(t.sounds.stop)} : ${JSON.stringify(t.sounds.start)};
-            const dur = cue.durationSec;
-            const base = cue.baseHz;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            osc.type = 'triangle';
-            osc.frequency.setValueAtTime(base, now);
-            osc.frequency.exponentialRampToValueAtTime(cue.endHz, now + dur);
-            gain.gain.setValueAtTime(0.0001, now);
-            gain.gain.exponentialRampToValueAtTime(cue.gainPeak, now + 0.012);
-            gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-            osc.connect(gain);
-            gain.connect(audioCtx.destination);
-            osc.start(now);
-            osc.stop(now + dur + 0.01);
-          } catch {}
-        };
-        window.stopTimer = () => {
-          if (timerId) {
-            clearInterval(timerId);
-            timerId = null;
-          }
-        };
-        const render = () => {
-          ctx.clearRect(0, 0, waveW, waveH);
-          // 1.1.24 silent-floor for the overlay waveform.
-          // Drop the previous 2 px height floor that produced a
-          // bright-red sliver across the canvas during silence.
-          // New formula h = v * (waveH - 2) renders sub-pixel
-          // bars invisible at ambient-noise level and visible
-          // only on real speech. Tail of the comment is
-          // intentionally short here because the entire
-          // createOverlayHtml body is itself a JS template
-          // literal: a stray backtick or dollar-brace in this
-          // comment block (see 1.1.23 regression that broke
-          // global hotkeys) closes the outer literal and breaks
-          // every interpolation downstream.
-          for (let i = 0; i < bars.length; i++) {
-            const v = bars[bars.length - 1 - i];
-            const x = waveW - (i + 1) * (bw + gap);
-            if (x < 0) break;
-            const h = Math.min(waveH - 2, v * (waveH - 2));
-            if (h <= 0) continue;
-            const y = (waveH - h) / 2;
-            if (waveMode === 'recording') {
-              ctx.fillStyle = 'rgba(255,77,77,.88)';
-            } else if (waveMode === 'autostop') {
-              ctx.fillStyle = 'rgba(255,196,74,.92)';
-            } else if (waveMode === 'transcribing') {
-              ctx.fillStyle = 'rgba(114,174,255,.92)';
-            } else if (waveMode === 'upscaling') {
-              ctx.fillStyle = 'rgba(173,112,255,.92)';
-            } else {
-              ctx.fillStyle = 'rgba(170,170,170,.62)';
-            }
-            ctx.fillRect(x, y, bw, h);
-          }
-        };
-        const renderUpscaleMenu = () => {
-          const selected = quickUpscaleOptions.find((x) => x.id === quickUpscaleSelected) || quickUpscaleOptions[0] || { id: 'builtin_clean', name: 'Clean' };
-          quickUpscaleBtnText.textContent = (selected.name || selected.id || 'Upscale');
-          quickUpscaleMenu.innerHTML = '';
-          quickUpscaleOptions.forEach((x) => {
-            const b = document.createElement('button');
-            b.type = 'button';
-            b.className = 'quickUpscaleItem' + (x.id === quickUpscaleSelected ? ' active' : '');
-            b.textContent = x.name.length > 22 ? (x.name.slice(0, 22) + '…') : x.name;
-            b.title = x.name;
-            b.addEventListener('click', (ev) => {
-              ev.stopPropagation();
-              quickUpscaleSelected = x.id;
-              renderUpscaleMenu();
-              quickUpscaleMenu.classList.remove('open');
-              document.title = '__overlay_upscale__' + encodeURIComponent(x.id);
-            });
-            quickUpscaleMenu.appendChild(b);
-          });
-        };
-        const tick = () => {
-          const s = Math.max(0, Math.floor((Date.now() - start) / 1000));
-          const mm = String(Math.floor(s / 60)).padStart(2, '0');
-          const ss = String(s % 60).padStart(2, '0');
-          el.textContent = mm + ':' + ss;
-        };
-        setInterval(() => {
-          if (activeWave && Date.now() - lastLevelAt < ${t.wave.activeStaleMs}) return;
-          const idle = activeWave
-            ? (0.08 + Math.random() * 0.12)
-            : ((waveMode === 'transcribing' || waveMode === 'upscaling') ? 0.055 : (0.03 + Math.random() * 0.03));
-          bars.push(idle);
-          while (bars.length > maxBars) bars.shift();
-          render();
-        }, ${t.wave.idleTickMs});
-        tick();
-        // Timer ownership lives in the main-process overlay state machine.
-        // Starting it during HTML bootstrap makes non-recording overlays
-        // (Starting/App Loading/Transcribing/Pasting) show a second,
-        // autonomous countdown before the main process can stop it.
-        window.setQuickOpen(false);
-        window.setUpscaleEnabled(false);
-        window.setUpscaleOptions([{ id: 'builtin_clean', name: 'Clean' }], 'builtin_clean');
-        window.setUpscale('builtin_clean');
-        window.setAutoSendEnabled(false);
-        scheduleGeometryEmit();
-
-        // Mouse enter/leave: toggle click interception on the capsule.
-        // When mouse is over the pill, we capture events; otherwise pass through.
-        stackEl.addEventListener('mouseenter', () => {
-          document.title = '__overlay_mouse_enter__';
-        });
-        stackEl.addEventListener('mouseleave', () => {
-          document.title = '__overlay_mouse_leave__';
-        });
-      </script>
-    </body>
-  </html>`;
-}
-
-function stopOverlayMouseInterception() {
-  if (overlayMouseTrackTimer) {
-    clearInterval(overlayMouseTrackTimer);
-    overlayMouseTrackTimer = null;
-  }
-  overlayMouseInPill = false;
-}
-
-function armOverlayMouseInterception() {
-  if (!overlayWin || overlayWin.isDestroyed()) return;
-  // Allow clicks to pass through transparent regions around the capsule pill.
-  // The overlay HTML reports mouse enter/leave on the pill so we toggle this.
-  // The `{ forward: true }` option is macOS-only per Electron docs; passing it
-  // on Windows/Linux is silently ignored in some versions and throws in others.
-  //
-  // CROSS-PLATFORM ASYMMETRY (user report on Windows: "клик идёт сквозь
-  // settings button" / "клик сквозь капсулу"):
-  //
-  //   On macOS, `{ forward: true }` lets MOUSE-MOVE events still reach
-  //   the renderer for hit-testing while clicks pass through. That's
-  //   how the pill's own ``mouseenter``/``mouseleave`` listeners
-  //   detect when the cursor crosses the pill boundary and emit the
-  //   `__overlay_mouse_enter__` / `_leave_` console events that flip
-  //   ignoreMouseEvents off for the pill region.
-  //
-  //   On Windows + Linux, `forward` does NOT exist. With plain
-  //   ``setIgnoreMouseEvents(true)`` the renderer NEVER sees ANY
-  //   mouse events — including the move that should fire mouseenter
-  //   on the pill. So the renderer never sends the "enter" signal,
-  //   we never flip ignoreMouseEvents to false, and clicks pass
-  //   straight through the pill — including on the settings button.
-  //
-  //   FIX: poll the cursor against the pill's screen-space bounds in
-  //   a 50 ms interval and toggle ignoreMouseEvents directly from the
-  //   main process. The pill is centered horizontally in the overlay
-  //   window and pinned to its bottom; we recompute its bounds on
-  //   every tick because the overlay window can move (display change,
-  //   Quick-Settings expand) and the pill height is fixed by
-  //   OVERLAY_TOKENS.window.height.
-  if (process.platform === "darwin") {
-    overlayWin.setIgnoreMouseEvents(true, { forward: true });
-    return;
-  }
-  if (overlayMouseTrackTimer) return;
-  overlayWin.setIgnoreMouseEvents(true);
-  overlayMouseInPill = false;
-  overlayMouseTrackTimer = setInterval(() => {
-    if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
-    try {
-      const cursor = screen.getCursorScreenPoint();
-      const bounds = getOverlayInteractiveBounds();
-      const inPill = !!bounds &&
-        cursor.x >= bounds.x &&
-        cursor.x <= bounds.x + bounds.width &&
-        cursor.y >= bounds.y &&
-        cursor.y <= bounds.y + bounds.height;
-      // Only flip when state actually changes — repeated identical
-      // calls are cheap but the rerender on the renderer side from
-      // an event change is wasteful.
-      if (inPill !== overlayMouseInPill) {
-        overlayMouseInPill = inPill;
-        overlayWin.setIgnoreMouseEvents(!inPill);
-      }
-    } catch (e) {
-      // Window destroyed mid-tick; clear and let the next visible
-      // overlay path re-arm the tracker for the current window.
-      stopOverlayMouseInterception();
-    }
-  }, 50);
-  try { overlayMouseTrackTimer.unref?.(); } catch { /* ignore */ }
-}
-
-function ensureOverlayWindow() {
-  if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
-  const initialOverlaySize = getOverlayWindowSize();
-  overlayWin = new BrowserWindow({
-    width: initialOverlaySize.width,
-    height: initialOverlaySize.height,
-    frame: false,
-    transparent: true,
-    resizable: false,
-    movable: false,
-    focusable: false,
-    skipTaskbar: true,
-    show: false,
-    hasShadow: false,
-    alwaysOnTop: true,
-    backgroundColor: "#00000000",
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      // Same Windows background-throttling fix as the main window.
-      // The overlay shows the recording timer + waveform — both
-      // depend on rAF / setInterval that Chromium clamps to 1 Hz
-      // on a backgrounded renderer. Without this flag the timer
-      // visibly stalls when the user switches focus during a
-      // recording session, even though the underlying mic capture
-      // is in the main window's renderer.
-      backgroundThrottling: false,
-    }
-  });
-  armOverlayMouseInterception();
-  overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  // "screen-saver" level puts the pill above legitimate fullscreen
-  // content (games, video). "floating" still sits above normal windows
-  // — above every app the user cares about paste targeting — but below
-  // true fullscreen apps where the pill overlay is intrusive.
-  overlayWin.setAlwaysOnTop(true, "floating");
-  overlayWin.on("page-title-updated", (event, title) => {
-    const raw = String(title || "");
-    if (!raw.startsWith("__overlay_")) return;
-    event.preventDefault();
-    if (raw.startsWith("__overlay_stop__")) {
-      overlayStopInFlight = true;
-      if (win && !win.isDestroyed() && win.isVisible()) {
-        safeExecSync("overlay_stop:winHide", () => win.hide());
-      }
-      // Route through guardedStopFromOverlay (same as autostop) so a
-      // renderer that hangs never leaves overlayStopInFlight=true
-      // forever. The direct-Promise path only cleared the flag on
-      // rejection; a promise that never settles (IPC hung) would
-      // permanently brick the overlay until app restart.
-      guardedStopFromOverlay("overlay-click");
-      return;
-    }
-    if (raw.startsWith("__overlay_settings__")) {
-      overlayQuickSettingsOpen = raw.endsWith("1");
-      overlayQuickSettingsInitialized = true;
-      applyOverlayWindowSize();
-      if (win && !win.isDestroyed() && win.isVisible()) {
-        safeExecSync("overlay_settings:winHide", () => win.hide());
-      }
-      void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
-      return;
-    }
-    if (raw.startsWith("__overlay_geometry__")) {
-      applyOverlayGeometryPayload(raw.replace("__overlay_geometry__", ""));
-      return;
-    }
-    if (raw.startsWith("__overlay_upscale_enabled__")) {
-      const v = raw.endsWith("1");
-      overlayQuickUpscaleEnabled = !!v;
-      void setRendererUpscaleEnabledChoice(v);
-      return;
-    }
-    if (raw.startsWith("__overlay_upscale__")) {
-      const v = String(decodeURIComponent(raw.replace("__overlay_upscale__", "")) || "").trim();
-      overlayQuickUpscalePreset = v;
-      void setRendererUpscalePresetChoice(v);
-      return;
-    }
-    if (raw.startsWith("__overlay_autosend__")) {
-      const v = raw.endsWith("1");
-      overlayQuickAutoSend = !!v;
-      overlayQuickAutoSendInitialized = true;
-      void setRendererAutoSendEnterChoice(v);
-      return;
-    }
-    if (raw.startsWith("__overlay_autostop_enabled__")) {
-      const v = raw.endsWith("1");
-      overlayAutoStopConfig = { ...overlayAutoStopConfig, enabled: !!v };
-      // Sync to renderer
-      if (win && !win.isDestroyed() && win.webContents) {
-        win.webContents.executeJavaScript(
-          `(() => { const el = document.getElementById('autoStopSilenceEnabled'); if (el) el.checked = ${v}; })();`,
-          true
-        ).catch(() => { });
-      }
-      return;
-    }
-    if (raw.startsWith("__overlay_autostop_secs__")) {
-      const secStr = raw.replace("__overlay_autostop_secs__", "");
-      const sec = Math.min(120, Math.max(1, Math.round(Number(secStr) || 2)));
-      overlayAutoStopConfig = { ...overlayAutoStopConfig, seconds: sec };
-      // Sync to renderer
-      if (win && !win.isDestroyed() && win.webContents) {
-        win.webContents.executeJavaScript(
-          `(() => { const el = document.getElementById('autoStopSilenceSeconds'); if (el) el.value = ${sec}; })();`,
-          true
-        ).catch(() => { });
-      }
-      return;
-    }
-    // NOTE: the prior `__overlay_input_focus__` / `__overlay_input_blur__`
-    // handlers flipped overlayWin.setFocusable(true/false) for the
-    // tiny seconds text-input in the auto-stop capsule. That input
-    // was replaced with +/- buttons (which don't need keyboard
-    // focus), so no current overlay element emits these signals.
-    // If a new text input is ever added to the overlay, restore the
-    // emit-side in createOverlayHtml AND this handler atomically.
-    if (raw === "__overlay_mouse_enter__") {
-      // Mouse entered the pill — capture mouse events.
-      if (overlayWin && !overlayWin.isDestroyed()) {
-        overlayWin.setIgnoreMouseEvents(false);
-      }
-      return;
-    }
-    if (raw === "__overlay_mouse_leave__") {
-      // Mouse left the pill — pass clicks through to desktop.
-      if (overlayWin && !overlayWin.isDestroyed()) {
-        // `forward: true` is macOS-only per Electron docs. The
-        // initial setup at lines ~1938 platform-gates correctly;
-        // this re-invocation on every mouse-leave was previously
-        // unconditional, throwing on some Windows builds and
-        // leaving the overlay stuck in an inconsistent ignore
-        // state. Mirror the platform gate here.
-        if (process.platform === "darwin") {
-          overlayWin.setIgnoreMouseEvents(true, { forward: true });
-        } else {
-          overlayWin.setIgnoreMouseEvents(true);
-        }
-      }
-      return;
-    }
-  });
-  overlayWin.on("closed", () => {
-    overlayWin = null;
-    // CRITICAL: reset overlayLoaded too. ensureOverlayWindow checks
-    // `if (!overlayLoaded)` to decide whether to call loadURL on the
-    // freshly-recreated window. Without this reset, a destroyed +
-    // recreated overlay (display change, dev hot-reload, electron
-    // session crash) was a fresh BrowserWindow with NO HTML loaded,
-    // yet overlayLoaded=true short-circuited every loadURL path —
-    // permanent blank capsule until the entire process restarts.
-    overlayLoaded = false;
-    overlayContentGeometry = null;
-    // 1.1.25: same lifecycle hazard for the quick-settings init
-    // flags. Without reset, a destroyed + recreated overlay window
-    // skipped the one-time renderer-state sync and showed stale
-    // checkbox states until the user manually toggled something.
-    // Initialization flags must track the lifecycle of what they
-    // initialize.
-    overlayQuickSettingsInitialized = false;
-    overlayQuickAutoSendInitialized = false;
-    // Stop the Win/Linux mouse-tracking polling so it doesn't tick
-    // against a destroyed overlayWin reference. The next visible-overlay
-    // path re-arms it for the recreated window.
-    stopOverlayMouseInterception();
-  });
-  return overlayWin;
-}
-
-function positionOverlayWindow() {
-  if (!overlayWin || overlayWin.isDestroyed()) return;
-  // Choose the display that currently CONTAINS the overlay, not
-  // blindly the primary. Without this, users who undock their external
-  // monitor mid-session (or change primary display via System Settings)
-  // get the overlay positioned on a screen that no longer exists,
-  // leaving it invisible forever.
-  const [w, h] = overlayWin.getSize();
-  let wa;
-  try {
-    const bounds = overlayWin.getBounds();
-    // Use the display matching the overlay's current center point;
-    // fall back to the primary when the window has no usable bounds
-    // (e.g. first call before show()).
-    const probe = {
-      x: bounds.x + Math.floor(bounds.width / 2),
-      y: bounds.y + Math.floor(bounds.height / 2),
-    };
-    const display = screen.getDisplayNearestPoint(probe) || screen.getPrimaryDisplay();
-    wa = display.workArea;
-  } catch {
-    wa = screen.getPrimaryDisplay().workArea;
-  }
-  const x = Math.round(wa.x + (wa.width - w) / 2);
-  const y = Math.round(wa.y + wa.height - h - OVERLAY_TOKENS.window.bottomOffset);
-  overlayWin.setPosition(x, y, false);
-}
-
-// React to display topology changes so the overlay doesn't strand
-// itself off-screen. Fires in three scenarios:
-//   1. User unplugs a monitor while the overlay was visible on it.
-//   2. User plugs in a new monitor and macOS/Windows re-arranges the
-//      primary workspace origin.
-//   3. User changes the scale factor / resolution of the current
-//      display (which shifts workArea by a few pixels).
-// In all three cases we re-measure and re-pin the overlay to the
-// bottom-center of the display it currently (or most recently) lived
-// on. Cheap and idempotent — no-op when overlayWin is null.
-// Module-scope reference so before-quit + idempotency guard can both
-// reach it. Without this, every call to registerDisplayTopologyListeners
-// (e.g. dev hot-reload, accidental double-call from a future window-
-// recreate path) accumulates one more listener per topology event,
-// and they're all retained for the app's lifetime since screen has
-// no implicit lifecycle hook.
-let _displayReposition = null;
-function registerDisplayTopologyListeners() {
-  // Idempotent: if we already wired listeners in a previous call,
-  // skip — installing the same handler twice would double-fire on
-  // every topology event.
-  if (_displayReposition) return;
-  _displayReposition = () => {
-    if (!overlayWin || overlayWin.isDestroyed()) return;
-    try {
-      positionOverlayWindow();
-    } catch (e) {
-      appendMainLog(`[display-topology] reposition failed: ${e?.message || e}`);
-    }
-  };
-  try {
-    screen.on("display-metrics-changed", _displayReposition);
-    screen.on("display-added", _displayReposition);
-    screen.on("display-removed", _displayReposition);
-  } catch (e) {
-    appendMainLog(`[display-topology] listener install failed: ${e?.message || e}`);
-    _displayReposition = null;
-  }
-}
-
-function unregisterDisplayTopologyListeners() {
-  if (!_displayReposition) return;
-  try {
-    screen.removeListener("display-metrics-changed", _displayReposition);
-    screen.removeListener("display-added", _displayReposition);
-    screen.removeListener("display-removed", _displayReposition);
-  } catch (e) {
-    appendMainLog(`[display-topology] listener removal failed: ${e?.message || e}`);
-  }
-  _displayReposition = null;
-}
-
-/**
- * Idempotent overlay HTML loader. All three call-sites that previously
- * inlined `if (!overlayLoaded) { await ow.loadURL(...); overlayLoaded = true; }`
- * now route through here so concurrent callers share ONE loadURL —
- * second callers await the first's promise instead of issuing a
- * competing load that aborts the first.
- *
- * Edge cases:
- *   - already loaded → no-op, immediate resolve.
- *   - loadURL in flight → second caller awaits the same promise;
- *     both observe `overlayLoaded = true` after it resolves.
- *   - loadURL rejects (window destroyed mid-load, OOM, etc.) → the
- *     `.catch` clears overlayLoaded and the in-flight pointer so the
- *     next caller can retry with a fresh load. We rethrow so the
- *     caller's existing try/catch around `ensureOverlayVisible` /
- *     `showRecordingOverlay` still surfaces the failure to its
- *     trace + status path.
- *   - overlay window closed (line ~2090 listener resets overlayLoaded
- *     to false) DURING a successful in-flight load → the loadURL
- *     promise rejects when the webContents tears down, the `.catch`
- *     fires and clears state, the next caller starts fresh.
- */
-async function ensureOverlayLoaded() {
-  if (overlayLoaded) return;
-  if (!_overlayLoadPromise) {
-    const ow = ensureOverlayWindow();
-    _overlayLoadPromise = ow
-      .loadURL(`data:text/html,${encodeURIComponent(createOverlayHtml())}`)
-      .then(() => {
-        overlayLoaded = true;
-      })
-      .catch((err) => {
-        overlayLoaded = false;
-        throw err;
-      })
-      .finally(() => {
-        _overlayLoadPromise = null;
-      });
-  }
-  await _overlayLoadPromise;
-}
-
-function applyOverlayWindowSize() {
-  if (!overlayWin || overlayWin.isDestroyed()) return;
-  safeExecSync("applyOverlayWindowSize", () => {
-    const size = getOverlayWindowSize();
-    overlayWin.setSize(size.width, size.height, false);
-    positionOverlayWindow();
-  });
-}
-
 function hasActivePostStopWork() {
   return pendingTranscriptionCount > 0 || postStopWorkerRunning || postStopQueue.length > 0;
-}
-
-function cancelScheduledOverlayHide(reason = "") {
-  if (overlayHideTimer === null) return;
-  clearTimeout(overlayHideTimer);
-  overlayHideTimer = null;
-  if (reason) {
-    appendMainLog(`[overlay-hide] cancelled pending hide: ${reason}`);
-  }
 }
 
 function stopRecordingStateMonitor() {
@@ -2490,16 +774,10 @@ function stopRecordingStateMonitor() {
   }
 }
 
-function startRecordingStateMonitor({ mirrorLevelToOverlay = false } = {}) {
+function startRecordingStateMonitor() {
   stopRecordingStateMonitor();
   overlayWaveMonitor = setInterval(() => {
     if (!win || win.isDestroyed() || !win.webContents) return;
-    if (
-      mirrorLevelToOverlay &&
-      (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible())
-    ) {
-      return;
-    }
     win.webContents
       .executeJavaScript(
         `(() => {
@@ -2517,7 +795,6 @@ function startRecordingStateMonitor({ mirrorLevelToOverlay = false } = {}) {
         true
       )
       .then((state) => {
-        if (mirrorLevelToOverlay && (!overlayWin || overlayWin.isDestroyed())) return;
         const safeLevel = Math.max(0, Math.min(1, Number(state?.vu) || 0));
         const safeRms = Math.max(0, Number(state?.rms) || 0);
         const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
@@ -2545,12 +822,6 @@ function startRecordingStateMonitor({ mirrorLevelToOverlay = false } = {}) {
           const warmupMs = 1500;
           if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
             overlaySilenceStartedAt = 0;
-            if (mirrorLevelToOverlay) {
-              overlayWin.webContents.executeJavaScript(
-                `window.setLevel(${safeLevel});`,
-                true
-              ).catch(() => { });
-            }
             return;
           }
           // Only use dB-based silence detection — no staleAudioFrames shortcut.
@@ -2582,12 +853,6 @@ function startRecordingStateMonitor({ mirrorLevelToOverlay = false } = {}) {
             guardedStopFromOverlay("autostop-stale");
           }
         }
-        if (mirrorLevelToOverlay) {
-          overlayWin.webContents.executeJavaScript(
-            `window.setLevel(${safeLevel});`,
-            true
-          ).catch(() => { });
-        }
       })
       .catch(() => { });
   }, 120);
@@ -2595,226 +860,55 @@ function startRecordingStateMonitor({ mirrorLevelToOverlay = false } = {}) {
 }
 
 async function showRecordingOverlay() {
-  cancelScheduledOverlayHide("show-recording");
-  // Preserve user's last quick-settings open/closed choice across runs.
   overlaySilenceStartedAt = 0;
   overlayAutoStopConfigRefreshAt = 0;
   overlayRecordingStartedAt = Date.now();
   overlaySeenAudioFrames = false;
-  if (overlayAutoStopTriggerTimer) {
-    clearTimeout(overlayAutoStopTriggerTimer);
-    overlayAutoStopTriggerTimer = null;
-  }
-  if (overlayTranscribingStatusTimer) {
-    clearTimeout(overlayTranscribingStatusTimer);
-    overlayTranscribingStatusTimer = null;
-  }
-  if (!SEPARATE_RECORDING_OVERLAY_ENABLED) {
-    overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
-    startRecordingStateMonitor({ mirrorLevelToOverlay: false });
-    return;
-  }
-  clearCapturedPasteTarget();
-  const front = await getFrontmostAppInfo();
-  setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
-  const ow = ensureOverlayWindow();
-  armOverlayMouseInterception();
-  positionOverlayWindow();
-  // Routed through ensureOverlayLoaded so a parallel call from
-  // ensureOverlayVisible (rapid Alt+Left → Alt+Shift+V hotkey
-  // sequence) shares the same in-flight loadURL instead of issuing
-  // a competing load that aborts the first one.
-  await ensureOverlayLoaded();
-  const upscaleCtx = await getRendererUpscalePresetContext();
-  overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
-  overlayQuickUpscalePreset = upscaleCtx.selected;
-  if (!overlayQuickAutoSendInitialized) {
-    overlayQuickAutoSend = await getRendererAutoSendEnterEnabled();
-    overlayQuickAutoSendInitialized = true;
-  }
   overlayAutoStopConfig = await getRendererAutoStopSilenceConfig();
-  if (!overlayQuickSettingsInitialized) {
-    const rendererQuickOpen = await getRendererQuickSettingsOpen();
-    if (rendererQuickOpen !== null) {
-      overlayQuickSettingsOpen = rendererQuickOpen;
-      overlayQuickSettingsInitialized = true;
-    }
-  }
-  try {
-    const asCfg = overlayAutoStopConfig;
-    await ow.webContents.executeJavaScript(
-      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setAutoStopConfig && window.setAutoStopConfig(${!!asCfg.enabled}, ${Number(asCfg.seconds) || 2}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');`,
-      true
-    );
-  } catch { }
-  await refreshOverlayGeometryFromRenderer();
-  applyOverlayWindowSize();
-  ow.showInactive();
-  await playOverlayCue("start");
-  startRecordingStateMonitor({ mirrorLevelToOverlay: true });
+  startRecordingStateMonitor();
 }
 
-async function ensureOverlayVisible(options = {}) {
-  const { resetTimer = false, startTimer = false, status = null } = options;
-  cancelScheduledOverlayHide("ensure-visible");
-  if (!SEPARATE_RECORDING_OVERLAY_ENABLED) return;
-  const ow = ensureOverlayWindow();
-  armOverlayMouseInterception();
-  positionOverlayWindow();
-  // Idempotent / race-safe load: see ensureOverlayLoaded note above.
-  await ensureOverlayLoaded();
-  await safeExec("ensureOverlayVisible:initializeQuickSettings", async () => {
-    const upscaleCtx = await getRendererUpscalePresetContext();
-    overlayQuickUpscaleEnabled = !!upscaleCtx.enabled;
-    overlayQuickUpscalePreset = upscaleCtx.selected;
-    if (!overlayQuickAutoSendInitialized) {
-      overlayQuickAutoSend = await getRendererAutoSendEnterEnabled();
-      overlayQuickAutoSendInitialized = true;
-    }
-    if (!overlayQuickSettingsInitialized) {
-      const rendererQuickOpen = await getRendererQuickSettingsOpen();
-      if (rendererQuickOpen !== null) {
-        overlayQuickSettingsOpen = rendererQuickOpen;
-        overlayQuickSettingsInitialized = true;
-      }
-    }
-    await ow.webContents.executeJavaScript(
-      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"});`,
-      true
-    );
-  });
-  const jsParts = [];
-  if (resetTimer) jsParts.push("window.resetTimer && window.resetTimer();");
-  if (startTimer) jsParts.push("window.startTimer && window.startTimer();");
-  if (typeof status === "string") jsParts.push(`window.setStatus && window.setStatus(${JSON.stringify(status)});`);
-  if (jsParts.length) {
-    await safeExec("ensureOverlayVisible:execJsParts", () =>
-      ow.webContents.executeJavaScript(jsParts.join(" "), true)
-    );
-  }
-  await refreshOverlayGeometryFromRenderer();
-  applyOverlayWindowSize();
-  ow.showInactive();
-}
+async function ensureOverlayVisible(_options = {}) {}
 
-async function setOverlayTimer(text) {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
-  const value = String(text || "").trim();
-  // 1.1.25: accept 2-OR-3-digit minutes so recordings >99:59 don't
-  // freeze the overlay timer. Same regex pattern used inside
-  // ``createOverlayHtml``'s ``window.setTimer`` (see line ~1828)
-  // is updated symmetrically.
-  if (!/^\d{2,3}:\d{2}$/.test(value)) return;
-  await safeExec("setOverlayTimer", () =>
-    overlayWin.webContents.executeJavaScript(`window.setTimer && window.setTimer(${JSON.stringify(value)});`, true)
-  );
-}
+async function setOverlayTimer(_text) {}
 
-/**
- * Schedule a single hideRecordingOverlay() call after `ms` milliseconds.
- * Any previously scheduled call is cancelled first, so multiple in-flight
- * code paths converge on exactly one hide — eliminating the stacked-timer
- * race where a late second fire kills the wave monitor of a freshly started
- * new recording session.
- */
-function scheduleOverlayHide(ms) {
-  if (!SEPARATE_RECORDING_OVERLAY_ENABLED) {
-    hideRecordingOverlay();
-    return;
-  }
-  cancelScheduledOverlayHide();
-  overlayHideTimer = setTimeout(() => {
-    overlayHideTimer = null;
-    hideRecordingOverlay();
-  }, ms);
+function scheduleOverlayHide(_ms) {
+  hideRecordingOverlay();
 }
 
 function hideRecordingOverlay() {
-  cancelScheduledOverlayHide();
-  if (overlayWin && !overlayWin.isDestroyed()) {
-    overlayWin.hide();
-  }
   overlayStopInFlight = false;
   overlaySilenceStartedAt = 0;
   overlayAutoStopConfigRefreshAt = 0;
-  // Bump the generation so any in-flight getRendererAutoStopSilenceConfig
-  // Promise from this session cannot clobber the next session's config.
   overlayAutoStopConfigGen++;
   overlayRecordingStartedAt = 0;
   overlaySeenAudioFrames = false;
-  if (overlayAutoStopTriggerTimer) {
-    clearTimeout(overlayAutoStopTriggerTimer);
-    overlayAutoStopTriggerTimer = null;
-  }
-  if (overlayTranscribingStatusTimer) {
-    clearTimeout(overlayTranscribingStatusTimer);
-    overlayTranscribingStatusTimer = null;
-  }
   stopRecordingStateMonitor();
-  // Stop the Win/Linux cursor poll while hidden; the visible-overlay
-  // paths re-arm it even when the same BrowserWindow is reused.
-  stopOverlayMouseInterception();
-  // Safety net: when the overlay is fully dismissed and no worker is
-  // actively draining the post-stop queue, both the counter and the
-  // queue MUST be zero. If anything has drifted out of sync (e.g. a
-  // crash in the worker left residual state), reset them now so a
-  // future recording does not inherit a phantom "queued" indicator.
   if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
-    appendMainLog(`[hide-overlay] reset-stale-pending=${pendingTranscriptionCount}`);
+    appendMainLog(`[recording-surface] reset-stale-pending=${pendingTranscriptionCount}`);
     pendingTranscriptionCount = 0;
   }
 }
 
 async function setOverlayStatus(text) {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
-  await safeExec("setOverlayStatus", () =>
-    overlayWin.webContents.executeJavaScript(
-      `window.setStatus && window.setStatus(${JSON.stringify(String(text || ""))});`,
-      true
-    )
+  const status = String(text || "").trim();
+  if (!status) return;
+  await execRendererJsWithTimeout(
+    `(() => {
+      const fn = window.__transcriptorSetMainStatus;
+      if (typeof fn !== 'function') return false;
+      return !!fn(${JSON.stringify(status)});
+    })();`,
+    false,
+    500,
   );
 }
 
-async function showPostStopYellowThenTranscribing(delayMs = 500) {
-  // Kill wave monitor so no more VU levels leak in during yellow/blue phase
+async function showPostStopYellowThenTranscribing(_delayMs = 500) {
   stopRecordingStateMonitor();
-  await setOverlayStatus("Auto stop");
-  if (overlayTranscribingStatusTimer) {
-    clearTimeout(overlayTranscribingStatusTimer);
-    overlayTranscribingStatusTimer = null;
-  }
-  overlayTranscribingStatusTimer = setTimeout(() => {
-    overlayTranscribingStatusTimer = null;
-    if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
-    if (pendingTranscriptionCount > 0 || overlayStopInFlight) {
-      void setOverlayStatus("Transcribing");
-    }
-  }, delayMs);
 }
 
-async function playOverlayCue(kind = "start") {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
-  const cue = kind === "stop" ? "stop" : "start";
-  // 1.1.25: hard 500 ms cap on the executeJavaScript call. Audio
-  // cue is best-effort; never block hotkey responsiveness on it.
-  // Without the cap, a stuck overlay webContents (rare but real:
-  // data: URL never resolved, GPU-process restart in flight) would
-  // freeze ``toggleRecordingFromShortcut`` / ``stopRecordingFromOverlay``
-  // / ``showRecordingOverlay`` — all three call playOverlayCue
-  // synchronously under their respective inflight guards.
-  try {
-    await Promise.race([
-      overlayWin.webContents.executeJavaScript(
-        `window.playCue && window.playCue(${JSON.stringify(cue)});`,
-        true,
-      ),
-      new Promise((res) => setTimeout(res, 500)),
-    ]);
-    appendMainLog(`[overlay-cue] kind=${cue}`);
-  } catch (e) {
-    appendMainLog(`[overlay-cue-error] kind=${cue} err=${compactLogText(e?.message || e)}`);
-  }
-}
+async function playOverlayCue(_kind = "start") {}
 
 async function isRendererRecording() {
   if (!win || win.isDestroyed() || !win.webContents) return false;
@@ -2889,7 +983,6 @@ async function toggleRecordingFromShortcut() {
         `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
       );
       await ensureOverlayVisible({ status: "Transcribing", resetTimer: false, startTimer: false });
-      await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
       traceStep(trace, "single_capsule_busy", {
         pending: pendingTranscriptionCount,
         queue: postStopQueue.length,
@@ -2969,7 +1062,6 @@ async function toggleRecordingFromShortcut() {
     if (result.timerText) {
       await setOverlayTimer(result.timerText);
     }
-    await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
     if (result.auto) {
       traceStep(trace, "recording_stopped", { autoTranscribe: true, timerText: result.timerText || "" });
       await playOverlayCue("stop");
@@ -3001,10 +1093,10 @@ async function toggleRecordingFromShortcut() {
 /**
  * Fire-and-forget wrapper for ``stopRecordingFromOverlay`` with a
  * hard deadline. If the stop call hangs (e.g., renderer is
- * unresponsive), the overlay state-machine would be stuck with
+ * unresponsive), the recording state machine would be stuck with
  * ``overlayStopInFlight = true`` forever, permanently blocking new
  * recordings. This wrapper clears the flag on EVERY exit path —
- * resolve, reject, OR timeout — and hides the overlay if the stop
+ * resolve, reject, OR timeout — and resets recording-surface state if the stop
  * never completed.
  */
 function guardedStopFromOverlay(reason) {
@@ -3061,7 +1153,7 @@ async function stopRecordingFromOverlay() {
           if (expectedRecordingId > 0 && recordingId !== expectedRecordingId) {
             return { ok: false, recording: true, stale: true, timerText, recordingId, expectedRecordingId, auto, autoSendEnter };
           }
-          // Use a dedicated stop event so overlay stop has one renderer entrypoint.
+          // Use a dedicated stop event so main-process stops have one renderer entrypoint.
           window.dispatchEvent(new CustomEvent('transcriptor-hotkey-stop', { detail: { recordingId } }));
           return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
         })();
@@ -3082,7 +1174,6 @@ async function stopRecordingFromOverlay() {
     if (result?.timerText) {
       await setOverlayTimer(result.timerText);
     }
-    await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
 
     if (!result) {
       appendMainLog("[overlay-stop] renderer stop request timed out");
@@ -4849,9 +2940,8 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
 // classic two-paste-of-same-recording symptom. Two entry points feed
 // enqueuePostStopTask:
 //   * toggleRecordingFromShortcut() — fired by Alt+Left hotkey
-//   * stopRecordingFromOverlay()    — fired by clicking the overlay
-//                                     stop pill, wrapped in
-//                                     guardedStopFromOverlay
+//   * stopRecordingFromOverlay()    — fired by main-process auto-stop,
+//                                     wrapped in guardedStopFromOverlay
 // They use SEPARATE in-flight flags (shortcutToggleInFlight vs
 // overlayStopInFlight). A press-and-click sequence within ~50 ms can
 // invoke both before either flag has been observed, producing TWO
@@ -4971,7 +3061,7 @@ async function processPostStopTask(task) {
     traceEnd(trace, "skipped", { reason: "already-pasted" });
     return;
   }
-  // Bound overlay wait to the renderer's live-recovery SLA. Fast paths
+  // Bound post-stop wait to the renderer's live-recovery SLA. Fast paths
   // exit immediately on paste-ready; this ceiling only protects the
   // rare "stream dropped, REST/local recovery is still running" case.
   // Mirrors the renderer's slow-path SLA: Deepgram final envelope
@@ -5225,7 +3315,6 @@ async function pasteLatestTranscriptFromShortcut() {
     });
     setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
     await ensureOverlayVisible({ status: "Pasting", resetTimer: false, startTimer: false });
-    await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
 
     const text = await getLatestTranscriptText();
     if (!text) {
@@ -6456,7 +4545,7 @@ async function createWindow(options = {}) {
     // ``clean-exit`` happens on normal window close and does NOT
     // require recovery. Every other reason (crashed, killed,
     // oom, etc.) leaves the Electron main process holding stale
-    // references — the overlay state machine, any in-flight
+    // references — the recording state machine, any in-flight
     // ``overlayStopInFlight`` flag, the ``pendingTranscriptionCount``
     // counter, and the ``shortcutToggleInFlight`` guard — that
     // would otherwise block every future hotkey press.
@@ -6494,8 +4583,8 @@ async function createWindow(options = {}) {
       _enqueuedRecordingIds.clear();
       _pastedRecordingIds.clear();
     }
-    // Tear down the overlay: it may be in "Transcribing" state
-    // pointing at a transcript that will never arrive.
+    // Tear down recording-surface state: it may be waiting on a transcript
+    // that will never arrive.
     try {
       hideRecordingOverlay();
     } catch (e) {
@@ -6847,14 +4936,6 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", () => {
-  // When the recording overlay is visible, clicking its buttons triggers
-  // macOS app activation (even though the window is focusable:false).
-  // Suppress only that concrete overlay-click case. A Dock click happens
-  // with the cursor outside the overlay, so it must always reopen/focus
-  // the main window even while recording/transcribing continues.
-  if (isCursorInsideVisibleOverlayInteractiveRegion()) {
-    return;
-  }
   ensureWindowVisible({ manual: true, force: true });
 });
 
@@ -6986,7 +5067,7 @@ app.on("before-quit", () => {
   // Clear the auto-restart timer FIRST, before any other cleanup.
   // killBackendHard at the bottom of this handler also clears it, but
   // by then we've already spent ~tens of milliseconds tearing down
-  // shortcuts, timers, the overlay, and the tray. If the timer fires
+  // shortcuts, timers, recording monitors, and the tray. If the timer fires
   // during that window it spawns a NEW backend that the now-cleared
   // ``backend`` reference can't kill — a guaranteed orphan. Yanking
   // the timer first closes that race window.
@@ -7012,28 +5093,6 @@ app.on("before-quit", () => {
     accessibilityPollTimer = null;
   }
   stopRecordingStateMonitor();
-  stopOverlayMouseInterception();
-  if (overlayAutoStopTriggerTimer) {
-    clearTimeout(overlayAutoStopTriggerTimer);
-    overlayAutoStopTriggerTimer = null;
-  }
-  if (overlayTranscribingStatusTimer) {
-    clearTimeout(overlayTranscribingStatusTimer);
-    overlayTranscribingStatusTimer = null;
-  }
-  // Symmetric removal of the screen topology listeners installed by
-  // registerDisplayTopologyListeners. Without this, the listeners and
-  // their closure ref to overlayWin retain memory across unusual quit
-  // paths (e.g. dev hot-reload that reinstates app.whenReady).
-  unregisterDisplayTopologyListeners();
-  hideRecordingOverlay();
-  if (overlayWin && !overlayWin.isDestroyed()) {
-    try {
-      overlayWin.close();
-    } catch (e) {
-      appendMainLog(`[before-quit] overlay close failed: ${e?.message || e}`);
-    }
-  }
   if (tray) {
     try {
       tray.destroy();
@@ -7079,7 +5138,6 @@ app.whenReady().then(async () => {
   // captured. No duplicate registration needed here.
   cleanupStaleTranscriptTmpFiles();
   lastTranscriptText = loadLastTranscriptFromDisk();
-  registerDisplayTopologyListeners();
   if (process.platform === "darwin") {
     app.setActivationPolicy("regular");
   }
@@ -7467,20 +5525,9 @@ app.whenReady().then(async () => {
   // the user has the window in front of them, and any modal dialog
   // is contextual rather than blocking the launch.
   try { await macPermPromise; } catch { /* best-effort permission */ }
-
-  if (SEPARATE_RECORDING_OVERLAY_ENABLED) {
-    // Preload overlay once to avoid first-use delay after hotkey.
-    try {
-      ensureOverlayWindow();
-      // Routed through ensureOverlayLoaded so this preload shares its
-      // loadURL with any concurrent shortcut-driven ensureOverlayVisible
-      // call (rare during startup, but a race-free path costs nothing).
-      await ensureOverlayLoaded();
-    } catch { }
-  }
 }).catch((err) => {
   // The whenReady chain has many awaits — startBackend, permission
-  // probes, accessibility checks, overlay preload — and any one of
+  // probes, accessibility checks, and any one of
   // them rejecting becomes an unhandled promise rejection that the
   // top-level ``unhandledRejection`` handler logs but cannot recover
   // from. The app then sits in an inconsistent state (no shortcuts,
