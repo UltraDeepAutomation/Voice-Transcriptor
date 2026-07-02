@@ -585,11 +585,19 @@ function applyHealthModelCatalog(catalog: unknown): void {
     root.upscale?.openrouter_models,
     OPENROUTER_UPSCALE_MODELS,
   );
+  const previousUpscaleDefault = DEFAULT_UPSCALE_MODEL;
   DEFAULT_UPSCALE_MODEL = normalizeDefaultModel(
     root.upscale?.default_model,
     OPENROUTER_UPSCALE_MODELS.map((m) => m.id),
     DEFAULT_UPSCALE_MODEL,
   );
+  const upscaleSel = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
+  if (upscaleSel && !hasStoredUpscaleModelPreference) {
+    const selected = (upscaleSel.value || "").trim();
+    if (!selected || selected === previousUpscaleDefault) {
+      upscaleSel.value = DEFAULT_UPSCALE_MODEL;
+    }
+  }
 
   syncLocalModelOptions();
   syncRemoteModelOptions();
@@ -611,6 +619,7 @@ let quickSettingsOpen = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
+let hasStoredUpscaleModelPreference = false;
 let currentRecordingAudioObjectUrl = "";
 let currentRecordingAudioSourceKey = "";
 let currentRecordingAudioRenderSeq = 0;
@@ -4522,6 +4531,7 @@ async function loadCfg(): Promise<void> {
     // Restore persisted upscale model; populateUpscaleModelOptions
     // merges it into the dropdown if it's not in the built-in list.
     const storedUpscaleModel = String(ui.upscale_model || "").trim();
+    hasStoredUpscaleModelPreference = !!storedUpscaleModel;
     const upscaleModelSelectEl = document.getElementById("upscaleModelSelect") as HTMLSelectElement | null;
     if (upscaleModelSelectEl) {
       upscaleModelSelectEl.value = storedUpscaleModel || DEFAULT_UPSCALE_MODEL;
