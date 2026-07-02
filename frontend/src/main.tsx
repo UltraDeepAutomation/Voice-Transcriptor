@@ -7484,14 +7484,13 @@ async function stopLive(enhance: boolean): Promise<void> {
     const stopBtn = document.getElementById("btnStop") as HTMLButtonElement | null;
     if (stopBtn) stopBtn.disabled = true;
   };
-  const releaseStopTransitionForNextRecording = (): void => {
+  const releaseStopTransitionAfterCaptureDetach = (): void => {
     if (stopTransitionReleased) return;
     stopTransitionReleased = true;
     if (stopTransitionOwnerToken === stopTransitionToken) {
       stopTransitionInFlight = false;
       stopTransitionOwnerToken = "";
     }
-    setBusy(false, sessionUiToken);
     disableStopButtonForSession();
   };
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
@@ -7855,11 +7854,10 @@ async function stopLive(enhance: boolean): Promise<void> {
   wsPendingFrames = [];
   mediaRecorder = null;
   recordedWebmChunks = [];
-  // Release the PCM sink reference so a subsequent startLive can
-  // allocate a new sink concurrently, but DO NOT destroy (delete the
-  // OPFS spool file) yet — the File blob from finalize() may still
-  // reference it. Destruction is deferred to after saveRecordingText
-  // serializes the blob into the FormData upload.
+  // Release the PCM sink reference after capture teardown, but DO NOT
+  // destroy (delete the OPFS spool file) yet — the File blob from
+  // finalize() may still reference it. Destruction is deferred to
+  // after saveRecordingText serializes the blob into the FormData upload.
   const deferredSinkDestroy = pcmSink;
   pcmSink = null;
   activeLiveSessionId = "";
@@ -7884,7 +7882,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (savedAudioFile) {
     setCurrentRecordingAudio(savedAudioFile, "", sessionArchiveDir, sessionUiToken);
   }
-  releaseStopTransitionForNextRecording();
+  releaseStopTransitionAfterCaptureDetach();
 
   let persistedRecordingName = "";
   let persistedRecordingArchiveDir = "";
@@ -8202,8 +8200,9 @@ async function stopLive(enhance: boolean): Promise<void> {
         : `Transcribing with ${providerLabel(provider)}.`,
     tone: "info",
   }, sessionUiToken);
-  // Allow next hotkey/session to start while this recording is transcribing.
-  setBusy(false, sessionUiToken);
+  // Single-capsule invariant: keep the app busy until this stop/transcribe
+  // pipeline reaches the outer finally. That keeps hotkeys, overlay clicks,
+  // and in-app recording controls behind the same source of truth.
   try {
     // ── Recovery-audio resolver ────────────────────────────────────
     //
@@ -9097,10 +9096,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     };
   }
   } finally {
-    // Usually cleared earlier once capture globals have been detached,
-    // so the next recording can start while this session saves/transcribes.
+    // Usually cleared earlier once capture globals have been detached.
     // Keep this final assignment as the crash-proof fallback for exceptions
-    // before that release point.
+    // before that release point; `isBusy` is released only after the full
+    // stop/transcribe pipeline completes.
     if (stopTransitionOwnerToken === stopTransitionToken) {
       stopTransitionInFlight = false;
       stopTransitionOwnerToken = "";
@@ -9143,6 +9142,11 @@ async function stopLive(enhance: boolean): Promise<void> {
       }
       liveStreamErrors.delete(stoppedSessionToken);
       liveTranscriptBuffers.delete(stoppedSessionToken);
+    }
+    if (stoppedSessionToken) {
+      setBusy(false, stoppedSessionToken);
+    } else {
+      setBusy(false);
     }
   }
 }

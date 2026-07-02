@@ -287,8 +287,8 @@ const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const LOCAL_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
-    collapsedWidth: 320,
-    expandedWidth: 320,
+    collapsedWidth: 184,
+    expandedWidth: 196,
     height: 47,
     bottomOffset: 10,
   }),
@@ -554,19 +554,34 @@ async function ensureWindowVisible(options = {}) {
   win.focus();
 }
 
+function getOverlayInteractiveBounds() {
+  if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return null;
+  const wb = overlayWin.getBounds();
+  const visibleH = overlayQuickSettingsOpen
+    ? wb.height
+    : (OVERLAY_TOKENS.window.height || 47);
+  const visibleW = overlayQuickSettingsOpen
+    ? wb.width
+    : Math.min(wb.width, OVERLAY_TOKENS.window.collapsedWidth || wb.width);
+  return {
+    x: Math.round(wb.x + (wb.width - visibleW) / 2),
+    y: Math.round(wb.y + wb.height - visibleH),
+    width: visibleW,
+    height: visibleH,
+  };
+}
+
 function isCursorInsideVisibleOverlayInteractiveRegion() {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return false;
   try {
     const cursor = screen.getCursorScreenPoint();
-    const wb = overlayWin.getBounds();
-    const visibleH = overlayQuickSettingsOpen
-      ? wb.height
-      : (OVERLAY_TOKENS.window.height || 47);
+    const bounds = getOverlayInteractiveBounds();
+    if (!bounds) return false;
     return (
-      cursor.x >= wb.x &&
-      cursor.x <= wb.x + wb.width &&
-      cursor.y >= (wb.y + wb.height - visibleH) &&
-      cursor.y <= wb.y + wb.height
+      cursor.x >= bounds.x &&
+      cursor.x <= bounds.x + bounds.width &&
+      cursor.y >= bounds.y &&
+      cursor.y <= bounds.y + bounds.height
     );
   } catch {
     return false;
@@ -982,12 +997,8 @@ function createOverlayHtml() {
   const t = OVERLAY_TOKENS;
   return `
   <html>
-    <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;display:flex;justify-content:center;">
+    <body style="margin:0;background:transparent;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;display:flex;justify-content:center;align-items:flex-end;height:100vh;">
       <div id="stack">
-      <div id="queuePill">
-        <canvas id="queueWave" width="${t.wave.width}" height="12"></canvas>
-        <span id="queueTimer">00:00</span>
-      </div>
       <div id="settingsSlot">
         <div id="settingsPill">
           <div id="quickPanel">
@@ -1032,7 +1043,7 @@ function createOverlayHtml() {
           flex-direction:column;
           align-items:center;
           gap:4px;
-          margin:2px auto 0;
+          margin:0 auto;
         }
         #pill{
           width: fit-content;
@@ -1055,30 +1066,20 @@ function createOverlayHtml() {
           justify-content:center;
           gap:9px;
         }
-        #queuePill{
-          width:132px;
-          height:18px;
-          padding:2px 8px;
-          border-radius:999px;
-          border:1px solid #2e2e2e;
-          background:#141414;
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          opacity:0;
-          pointer-events:none;
-        }
-        #queuePill.on{
-          opacity:1;
-        }
         #settingsSlot{
           width:100%;
+          height:0;
+          min-height:0;
+          display:flex;
+          align-items:flex-end;
+          justify-content:center;
+          margin-bottom:0;
+          overflow:visible;
+        }
+        #settingsSlot.on{
           height:auto;
           min-height:34px;
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          margin-bottom:16px;
+          margin-bottom:8px;
         }
         #settingsPill{
           width:fit-content;
@@ -1096,23 +1097,6 @@ function createOverlayHtml() {
           opacity:1;
           pointer-events:auto;
           transform:translateY(-2px) scale(1);
-        }
-        #queueWave{
-          width:${t.wave.width}px;
-          height:12px;
-          display:block;
-          opacity:.95;
-          flex:0 0 ${t.wave.width}px;
-        }
-        #queueTimer{
-          font-size:9px;
-          font-weight:700;
-          color:#d0d0d0;
-          font-family:Menlo,ui-monospace,monospace;
-          min-width:30px;
-          text-align:right;
-          line-height:1;
-          flex:0 0 30px;
         }
         #wave{
           display:block;
@@ -1533,10 +1517,6 @@ function createOverlayHtml() {
         const el = document.getElementById('timer');
         const cv = document.getElementById('wave');
         const ctx = cv.getContext('2d');
-        const qPill = document.getElementById('queuePill');
-        const qCv = document.getElementById('queueWave');
-        const qCtx = qCv.getContext('2d');
-        const qTimer = document.getElementById('queueTimer');
         const settingsSlot = document.getElementById('settingsSlot');
         const pill = document.getElementById('pill');
         const stateIcon = document.getElementById('stateIcon');
@@ -1551,38 +1531,23 @@ function createOverlayHtml() {
         let quickUpscaleOptions = [];
         let quickUpscaleSelected = 'builtin_clean';
         let timerId = null;
-        let queueTimerId = null;
         let audioCtx = null;
         const bars = [];
-        const queueBars = [];
         let lastLevelAt = 0;
-        let lastQueueLevelAt = 0;
         let activeWave = true;
-        let queueVisible = false;
-        let queueStart = Date.now();
         let waveMode = 'recording';
         const dpr = Math.max(1, Math.min(3, Number(window.devicePixelRatio || 1)));
         const waveW = ${t.wave.width};
         const waveH = ${t.wave.height};
-        const queueW = ${t.wave.width};
-        const queueH = 12;
         cv.width = Math.round(waveW * dpr);
         cv.height = Math.round(waveH * dpr);
         cv.style.width = waveW + 'px';
         cv.style.height = waveH + 'px';
-        qCv.width = Math.round(queueW * dpr);
-        qCv.height = Math.round(queueH * dpr);
-        qCv.style.width = queueW + 'px';
-        qCv.style.height = queueH + 'px';
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        qCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
         const bw = ${t.wave.barWidth};
         const gap = ${t.wave.barGap};
         const maxBars = Math.floor(waveW / (bw + gap));
-        const qBw = 1.2;
-        const qGap = 0.8;
-        const qMaxBars = Math.floor(queueW / (qBw + qGap));
         window.setLevel = (lv) => {
           if (waveMode !== 'recording') return;
           const raw = Math.max(0, Math.min(1, Number(lv) || 0));
@@ -1591,44 +1556,6 @@ function createOverlayHtml() {
           bars.push(level);
           while (bars.length > maxBars) bars.shift();
           render();
-        };
-        window.setQueueLevel = (lv) => {
-          const raw = Math.max(0, Math.min(1, Number(lv) || 0));
-          const level = Math.max(0, Math.min(1, Math.pow(raw, 0.7) * 1.55));
-          lastQueueLevelAt = Date.now();
-          queueBars.push(level);
-          while (queueBars.length > qMaxBars) queueBars.shift();
-          renderQueue();
-        };
-        window.setQueueVisible = (show) => {
-          const prev = queueVisible;
-          queueVisible = !!show;
-          qPill.classList.toggle('on', queueVisible);
-          if (queueVisible && !prev) {
-            queueStart = Date.now();
-            qTimer.textContent = '00:00';
-            if (queueTimerId) clearInterval(queueTimerId);
-            queueTimerId = setInterval(() => {
-              const s = Math.max(0, Math.floor((Date.now() - queueStart) / 1000));
-              const mm = String(Math.floor(s / 60)).padStart(2, '0');
-              const ss = String(s % 60).padStart(2, '0');
-              qTimer.textContent = mm + ':' + ss;
-            }, ${t.timer.tickMs});
-          }
-          if (!queueVisible) {
-            queueBars.length = 0;
-            renderQueue();
-            qTimer.textContent = '00:00';
-            if (queueTimerId) {
-              clearInterval(queueTimerId);
-              queueTimerId = null;
-            }
-          }
-        };
-        window.resetQueueWave = () => {
-          queueBars.length = 0;
-          lastQueueLevelAt = 0;
-          renderQueue();
         };
         window.resetWave = () => {
           bars.length = 0;
@@ -1943,18 +1870,6 @@ function createOverlayHtml() {
             ctx.fillRect(x, y, bw, h);
           }
         };
-        const renderQueue = () => {
-          qCtx.clearRect(0, 0, queueW, queueH);
-          for (let i = 0; i < queueBars.length; i++) {
-            const v = queueBars[queueBars.length - 1 - i];
-            const x = queueW - (i + 1) * (qBw + qGap);
-            if (x < 0) break;
-            const h = Math.max(2, Math.min(queueH - 1, v * (queueH - 1)));
-            const y = (queueH - h) / 2;
-            qCtx.fillStyle = 'rgba(98,216,132,.94)';
-            qCtx.fillRect(x, y, qBw, h);
-          }
-        };
         const renderUpscaleMenu = () => {
           const selected = quickUpscaleOptions.find((x) => x.id === quickUpscaleSelected) || quickUpscaleOptions[0] || { id: 'builtin_clean', name: 'Clean' };
           quickUpscaleBtnText.textContent = (selected.name || selected.id || 'Upscale');
@@ -1990,13 +1905,6 @@ function createOverlayHtml() {
           while (bars.length > maxBars) bars.shift();
           render();
         }, ${t.wave.idleTickMs});
-        setInterval(() => {
-          if (!queueVisible) return;
-          if (Date.now() - lastQueueLevelAt < ${t.wave.activeStaleMs}) return;
-          queueBars.push(0.05 + Math.random() * 0.06);
-          while (queueBars.length > qMaxBars) queueBars.shift();
-          renderQueue();
-        }, ${t.wave.idleTickMs});
         tick();
         window.startTimer();
         window.setQuickOpen(false);
@@ -2004,7 +1912,6 @@ function createOverlayHtml() {
         window.setUpscaleOptions([{ id: 'builtin_clean', name: 'Clean' }], 'builtin_clean');
         window.setUpscale('builtin_clean');
         window.setAutoSendEnabled(false);
-        window.setQueueVisible(false);
 
         // Mouse enter/leave: toggle click interception on the capsule.
         // When mouse is over the pill, we capture events; otherwise pass through.
@@ -2086,22 +1993,12 @@ function ensureOverlayWindow() {
       if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
       try {
         const cursor = screen.getCursorScreenPoint();
-        const wb = overlayWin.getBounds();
-        // Pill height = OVERLAY_TOKENS.window.height (the visible
-        // capsule height, pinned to the bottom of the BrowserWindow).
-        // When Quick-Settings is OPEN the visible content extends
-        // upward to fill the entire BrowserWindow, so the click-zone
-        // expands to the full window rectangle. When closed, only
-        // the bottom pill is visible — clicks above it should pass
-        // through to apps behind so users can interact with them.
-        const visibleH = overlayQuickSettingsOpen
-          ? wb.height
-          : (OVERLAY_TOKENS.window.height || 47);
-        const inPill =
-          cursor.x >= wb.x &&
-          cursor.x <= wb.x + wb.width &&
-          cursor.y >= (wb.y + wb.height - visibleH) &&
-          cursor.y <= wb.y + wb.height;
+        const bounds = getOverlayInteractiveBounds();
+        const inPill = !!bounds &&
+          cursor.x >= bounds.x &&
+          cursor.x <= bounds.x + bounds.width &&
+          cursor.y >= bounds.y &&
+          cursor.y <= bounds.y + bounds.height;
         // Only flip when state actually changes — repeated identical
         // calls are cheap but the rerender on the renderer side from
         // an event change is wasteful.
@@ -2395,16 +2292,8 @@ function applyOverlayWindowSize() {
   });
 }
 
-async function syncOverlayQueueVisual(recordingHint = null) {
-  if (!overlayWin || overlayWin.isDestroyed() || !overlayLoaded) return;
-  const isRec = typeof recordingHint === "boolean" ? recordingHint : await isRendererRecording();
-  const showQueue = pendingTranscriptionCount > 0 && !!isRec;
-  await safeExec("syncOverlayQueueVisual", () =>
-    overlayWin.webContents.executeJavaScript(
-      `window.setQueueVisible && window.setQueueVisible(${showQueue ? "true" : "false"});`,
-      true
-    )
-  );
+function hasActivePostStopWork() {
+  return pendingTranscriptionCount > 0 || postStopWorkerRunning || postStopQueue.length > 0;
 }
 
 async function showRecordingOverlay() {
@@ -2446,18 +2335,16 @@ async function showRecordingOverlay() {
       overlayQuickSettingsInitialized = true;
     }
   }
-  const hasQueuedTranscriptions = pendingTranscriptionCount > 0;
   try {
     const asCfg = overlayAutoStopConfig;
     await ow.webContents.executeJavaScript(
-      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setAutoStopConfig && window.setAutoStopConfig(${!!asCfg.enabled}, ${Number(asCfg.seconds) || 2}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); ${hasQueuedTranscriptions ? "" : "window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');"}`,
+      `window.setUpscaleEnabled && window.setUpscaleEnabled(${overlayQuickUpscaleEnabled ? "true" : "false"}); window.setUpscaleOptions && window.setUpscaleOptions(${JSON.stringify(upscaleCtx.presets)}, ${JSON.stringify(overlayQuickUpscalePreset)}); window.setUpscale && window.setUpscale(${JSON.stringify(overlayQuickUpscalePreset)}); window.setAutoSendEnabled && window.setAutoSendEnabled(${overlayQuickAutoSend ? "true" : "false"}); window.setAutoStopConfig && window.setAutoStopConfig(${!!asCfg.enabled}, ${Number(asCfg.seconds) || 2}); window.setQuickOpen && window.setQuickOpen(${overlayQuickSettingsOpen ? "true" : "false"}); window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer(); window.setStatus && window.setStatus('Recording');`,
       true
     );
   } catch { }
   try {
     applyOverlayWindowSize();
   } catch { }
-  await syncOverlayQueueVisual(true);
   ow.showInactive();
   await playOverlayCue("start");
   if (overlayWaveMonitor) {
@@ -2513,7 +2400,7 @@ async function showRecordingOverlay() {
           if (overlayRecordingStartedAt && (now - overlayRecordingStartedAt) < warmupMs) {
             overlaySilenceStartedAt = 0;
             overlayWin.webContents.executeJavaScript(
-              `window.setLevel(${safeLevel}); window.setQueueLevel && window.setQueueLevel(${safeLevel});`,
+              `window.setLevel(${safeLevel});`,
               true
             ).catch(() => { });
             return;
@@ -2556,7 +2443,7 @@ async function showRecordingOverlay() {
           }
         }
         overlayWin.webContents.executeJavaScript(
-          `window.setLevel(${safeLevel}); window.setQueueLevel && window.setQueueLevel(${safeLevel});`,
+          `window.setLevel(${safeLevel});`,
           true
         ).catch(() => { });
       })
@@ -2600,7 +2487,6 @@ async function ensureOverlayVisible(options = {}) {
       ow.webContents.executeJavaScript(jsParts.join(" "), true)
     );
   }
-  await syncOverlayQueueVisual();
   ow.showInactive();
 }
 
@@ -2640,9 +2526,6 @@ function hideRecordingOverlay() {
     overlayHideTimer = null;
   }
   if (!overlayWin || overlayWin.isDestroyed()) return;
-  if (overlayLoaded) {
-    overlayWin.webContents.executeJavaScript(`window.setQueueVisible && window.setQueueVisible(false);`, true).catch(() => { });
-  }
   overlayWin.hide();
   overlayStopInFlight = false;
   overlaySilenceStartedAt = 0;
@@ -2788,16 +2671,8 @@ async function toggleRecordingFromShortcut() {
       pid: front.pid || 0,
       windowTitle: compactLogText(front.windowTitle || "", 80),
     });
-    await ensureOverlayVisible({ status: pendingTranscriptionCount > 0 ? null : "Starting", resetTimer: false, startTimer: false });
-    traceStep(trace, "overlay_visible", { status: "Starting" });
-    const micGranted = await requestMacMicrophonePermissionOnce();
-    if (!micGranted) {
-      traceStep(trace, "mic_permission_denied", {});
-      await setOverlayStatus("Grant Access");
-      scheduleOverlayHide(1200);
-      traceEnd(trace, "failed", { reason: "mic-permission-denied" });
-      return;
-    }
+    await ensureOverlayVisible({ status: hasActivePostStopWork() ? null : "Starting", resetTimer: false, startTimer: false });
+    traceStep(trace, "overlay_visible", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
@@ -2813,6 +2688,32 @@ async function toggleRecordingFromShortcut() {
       await setOverlayStatus("App Loading");
       scheduleOverlayHide(1300);
       traceEnd(trace, "failed", { reason: "renderer-not-ready" });
+      return;
+    }
+
+    const beforeToggleState = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    if (!beforeToggleState.recording && hasActivePostStopWork()) {
+      appendMainLog(
+        `[shortcut] start blocked by single-capsule post-stop work ` +
+        `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
+      );
+      await ensureOverlayVisible({ status: "Transcribing", resetTimer: false, startTimer: false });
+      await overlayWin?.webContents.executeJavaScript(`window.stopTimer && window.stopTimer();`, true).catch(() => { });
+      traceStep(trace, "single_capsule_busy", {
+        pending: pendingTranscriptionCount,
+        queue: postStopQueue.length,
+        worker: !!postStopWorkerRunning,
+      });
+      traceEnd(trace, "blocked", { reason: "single-capsule-post-stop-active" });
+      return;
+    }
+
+    const micGranted = await requestMacMicrophonePermissionOnce();
+    if (!micGranted) {
+      traceStep(trace, "mic_permission_denied", {});
+      await setOverlayStatus("Grant Access");
+      scheduleOverlayHide(1200);
+      traceEnd(trace, "failed", { reason: "mic-permission-denied" });
       return;
     }
 
@@ -2885,7 +2786,6 @@ async function toggleRecordingFromShortcut() {
         recordingId: Number(result.recordingId || 0),
         target: pasteTarget,
       });
-      await syncOverlayQueueVisual(false);
       await showPostStopYellowThenTranscribing(700);
     } else {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
@@ -2984,7 +2884,6 @@ async function stopRecordingFromOverlay() {
           recordingId: Number(result.recordingId || 0),
           target: pasteTarget,
         });
-        await syncOverlayQueueVisual(false);
         await showPostStopYellowThenTranscribing(700);
       } else {
         await setOverlayStatus("Saved To App");
@@ -4799,42 +4698,10 @@ async function runPostStopQueue() {
       } finally {
         pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       }
-      // Read BOTH recording state and recordingId in one shot. We cannot
-      // trust ``__transcriptorIsRecording`` alone here: stopLive sets it
-      // to false LATE in its cleanup sequence (~line 5288), while
-      // processPostStopTask can complete much earlier (Deepgram returns
-      // committed segments within ~100 ms). During that window
-      // ``isRec`` reads true even though no recording is actually
-      // happening — the user perceives this as the overlay "auto-
-      // restarting" a new red recording after the blue transcribe.
-      //
-      // The fix: compare recordingId against the task's. A genuinely
-      // NEW recording bumps ``__transcriptorCurrentRecordingId`` via
-      // ``++liveRecordingSeq`` in startLive. If the id matches the
-      // task we just finished, we're still watching the old stopLive
-      // clean up — treat as not-recording and hide the overlay.
-      let rendererState = { recording: false, recordingId: 0 };
-      try {
-        rendererState = await queryRendererRecordingState();
-      } catch (e) {
-        appendMainLog(`[post-stop-queue] isRec-error err="${compactLogText(e?.message || e)}"`);
-      }
-      const taskRecId = Number(task.recordingId || 0);
-      const newRecordingStarted = !!rendererState.recording
-        && Number(rendererState.recordingId || 0) > 0
-        && Number(rendererState.recordingId || 0) !== taskRecId;
-      await syncOverlayQueueVisual(newRecordingStarted).catch(() => { });
-      if (!newRecordingStarted) {
-        if (pendingTranscriptionCount > 0) {
-          await setOverlayStatus("Transcribing").catch(() => { });
-        } else {
-          scheduleOverlayHide(1400);
-        }
-      } else if (pendingTranscriptionCount === 0) {
-        await overlayWin?.webContents.executeJavaScript(
-          `window.setStatus && window.setStatus("Recording"); window.resetWave && window.resetWave(); window.resetTimer && window.resetTimer(); window.startTimer && window.startTimer();`,
-          true
-        ).catch(() => { });
+      if (pendingTranscriptionCount > 0) {
+        await setOverlayStatus("Transcribing").catch(() => { });
+      } else {
+        scheduleOverlayHide(1400);
       }
     }
   } finally {
