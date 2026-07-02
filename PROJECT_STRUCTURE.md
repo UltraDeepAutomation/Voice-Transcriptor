@@ -90,9 +90,16 @@ desktop/
 ├── unlockDist.js                   # build artifact lock cleanup
 ├── entitlements.mac.plist          # macOS app entitlements
 ├── entitlements.mac.inherit.plist  # macOS helper entitlements
+├── entitlements.mas.plist          # Mac App Store app entitlements
+├── entitlements.mas.inherit.plist  # Mac App Store helper entitlements
 ├── icon.png / icon.ico             # package icons
 └── scripts/
-    └── prepare-runtime.sh          # macOS arm64 / Windows x64 / Linux x64 runtime builder
+    ├── prepare-runtime.sh          # macOS arm64 / Windows x64 / Linux x64 runtime builder
+    ├── build-mas.sh                # Mac App Store package build entrypoint
+    ├── sign-mas.js                 # Mac App Store signing and provisioning preflight
+    ├── upload-testflight.sh        # App Store Connect/TestFlight upload entrypoint
+    ├── macos-signing-utils.js      # shared macOS signing/provisioning helpers
+    └── require-bash.js             # release-host shell guard for Windows packaging
 ```
 
 Desktop owns:
@@ -105,6 +112,7 @@ Desktop owns:
 - auto-paste platform integrations.
 - log writing and non-destructive rotation.
 - bundled runtime packaging for macOS, Windows, and Linux.
+- Mac App Store packaging, provisioning preflight, and TestFlight upload handoff.
 
 ## Build SSOT
 
