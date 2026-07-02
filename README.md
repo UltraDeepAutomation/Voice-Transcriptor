@@ -46,11 +46,13 @@ Public distribution must use a Developer ID Application identity plus Apple nota
 
 The App Store/TestFlight artifact is a MAS `.pkg`, not the public DMG. It must use an explicit App Store Connect bundle ID, a matching Mac App Store provisioning profile, an app signing certificate, and an installer signing certificate. The build fails before packaging if any required signing input is missing.
 
+`.env.example` is the environment-variable SSOT. Export the MAS values in your shell, or source a local env file before running the build scripts.
+
 ```bash
 export TRANSCRIPTOR_MAS_APP_ID="com.yourcompany.transcriptor"
 export TRANSCRIPTOR_MAS_PROVISIONING_PROFILE="/absolute/path/Transcriptor_Mac_App_Store.provisionprofile"
 export TRANSCRIPTOR_MAS_SIGNING_IDENTITY="Apple Distribution: Your Team (TEAMID)"
-export TRANSCRIPTOR_MAS_INSTALLER_IDENTITY="Mac Installer Distribution: Your Team (TEAMID)"
+export TRANSCRIPTOR_MAS_INSTALLER_IDENTITY="3rd Party Mac Developer Installer: Your Team (TEAMID)"
 
 npm --prefix desktop run dist:mas
 ```
@@ -143,10 +145,18 @@ For backend-only API work, running `uvicorn backend.main:app` manually is fine, 
 
 ## Configuration
 
-Copy `.env.example` to `.env` when you need overrides:
+Copy `.env.example` to `.env` when you need app/runtime overrides:
 
 ```bash
 cp .env.example .env
+```
+
+Shell-driven build, signing, install, and upload scripts read process environment. Source the file before running those commands when you keep their values in `.env`:
+
+```bash
+set -a
+source .env
+set +a
 ```
 
 `.env.example` is the SSOT for user-facing environment variables. Internal variables such as `TRANSCRIPTOR_BOOT_NONCE` are owned by Electron/backend startup and should not be set by users.
