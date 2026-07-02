@@ -3376,10 +3376,7 @@ let vu = 0;
 function setVU(rms: number): void {
   window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(rms) ? rms : 0);
   vu = vu * 0.7 + rms * 0.3;
-  const pct = Math.min(100, vu * 400);
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, vu * UI_TOKENS.capture.vuAmplify));
-  $("vuFill").style.width = pct + "%";
-  $("vuFill").style.background = pct < 40 ? "#aaa" : pct < 70 ? "#888" : "#666";
 }
 
 function resetVU(): void {
