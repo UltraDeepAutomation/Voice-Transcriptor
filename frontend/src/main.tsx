@@ -503,18 +503,6 @@ const UI_TOKENS = {
     pollStepMs: 30,
   },
 } as const;
-const ALLOWED_AUDIO_MIME = new Set([
-  "audio/wav",
-  "audio/x-wav",
-  "audio/mpeg",
-  "audio/mp4",
-  "audio/x-m4a",
-  "audio/flac",
-  "audio/x-flac",
-  "audio/ogg",
-  "audio/webm",
-  "audio/aac",
-]);
 // Fallback accepted extensions used before the first /api/health response.
 // Backend/main.py:ALLOWED_AUDIO_EXTS is the runtime SSOT; refreshNetworkState()
 // mutates this set from health.accepted_audio_exts after boot.
@@ -708,8 +696,6 @@ let recordedWebmChunks: Blob[] = [];
 let isNetworkOnline = true;
 let hasOpenrouterKey = false;
 let hasDeepgramKey = false;
-let selectedFile: File | null = null;
-let pollAbortController: AbortController | null = null;
 let uiPrefSaveTimer: number | null = null;
 let suppressUiPrefAutosave = false;
 let quickSettingsOpen = false;
@@ -826,8 +812,8 @@ function latestRecordingAudioUrl(savedName = "", archiveDir = ""): string {
 // MIME → canonical extension mapping. Used when the backend's
 // ``Content-Disposition`` header is absent or unparseable and we have
 // to synthesize a filename from the saved-name stem. The backend's
-// ``ALLOWED_AUDIO_MIME`` set is the SSOT for which MIME types we may
-// receive; this map is its inverse for the (rare) header-missing path.
+// audio MIME handling is backend-owned; this map only recovers a useful
+// extension for the rare header-missing playback/download path.
 const MIME_TO_AUDIO_EXT: Record<string, string> = {
   "audio/wav": "wav",
   "audio/x-wav": "wav",
@@ -1656,7 +1642,7 @@ function setBusy(nextBusy: boolean, scopeToken = ""): void {
     busyScopeToken = "";
   }
   isBusy = !!nextBusy;
-  ["btnTranscribeFile", "pickFileBtn", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
+  ["providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
@@ -3131,13 +3117,9 @@ function scheduleLocalWarmup(): void {
   if (!selectedProvider) return;
   const sessionModels = resolveSessionLocalModels(selectedProvider);
   const modelsToWarm = new Set<string>();
-  if ($("uploadPanel").hidden) {
-    modelsToWarm.add(sessionModels.assistLocalModel);
-    if (resolveEffectiveProvider(selectedProvider) === "local") {
-      modelsToWarm.add(sessionModels.finalLocalModel);
-    }
-  } else {
-    modelsToWarm.add((($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL);
+  modelsToWarm.add(sessionModels.assistLocalModel);
+  if (resolveEffectiveProvider(selectedProvider) === "local") {
+    modelsToWarm.add(sessionModels.finalLocalModel);
   }
   modelsToWarm.forEach((model) => {
     warmLocalModel(model).catch((e) => {
@@ -3153,13 +3135,6 @@ function scheduleLocalWarmup(): void {
 function syncMode(): void {
   $("livePane").hidden = false;
   $("splitGap").hidden = false;
-  $("uploadPanel").hidden = true;
-  // Removed: setSelectedFile(null). The Live tab no longer surfaces a
-  // file picker — the Upload tab fully owns batch transcription. The
-  // call here was a vestige of the pre-Upload-tab era; resetting
-  // ``selectedFile`` on every loadCfg / view change clobbered any
-  // value still in flight from the now-removed Live-tab file flow,
-  // and on every config refresh wrote to ``#fileName`` for nothing.
 }
 
 function setNetworkState(online: boolean, latencyMs: number | null = null): void {
@@ -9380,269 +9355,6 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
 }
 
-function reportFileSelectionError(message: string): void {
-  selectedFile = null;
-  $("fileName").textContent = "No file selected";
-  publishRecordingOutput({
-    recordingId: 0,
-    pasteText: "",
-    domText: message,
-    kind: "error",
-  });
-  // 1.1.25 fix: previously called ``patchCurrentRecordingSummary``
-  // with NO sessionToken — that wrote unconditionally and could
-  // clobber the status pill of an active live recording when the
-  // user dropped a bad file in the (non-active) Live tab file
-  // picker mid-recording. File-selection state and live-recording
-  // state are unrelated and must not share the status surface.
-  // Use the non-disruptive notice instead.
-  showRecordSessionNotice(message, "error", 6000);
-}
-
-function setSelectedFile(file: File | null): void {
-  if (file && file.size > MAX_FILE_BYTES) {
-    reportFileSelectionError(
-      `File is too large. Max ${Math.round(MAX_FILE_BYTES / (1024 * 1024))} MB.`
-    );
-    return;
-  }
-  if (file) {
-    const ext = (file.name.split(".").pop() || "").toLowerCase();
-    // 1.1.25 fix: previous gate was ``!file.type || ALLOWED_AUDIO_MIME.has(file.type)``
-    // which treated MISSING MIME as "passes" — combined with also-missing
-    // extension on a file with no dot, both checks were lenient and let
-    // unidentifiable binaries through to the backend. The MIME path now
-    // requires an actual MIME match; the extension path independently
-    // accepts files where the MIME is empty but the extension is known.
-    const mimeOk = !!file.type && ALLOWED_AUDIO_MIME.has(file.type);
-    // Use the SSOT extension set that mirrors backend's
-    // ALLOWED_AUDIO_EXTS. Previously rejected legitimate .opus / .oga
-    // / .wma files the backend would have accepted, plus ALL video
-    // containers — even though the backend's ffmpeg path can demux
-    // audio out of any of them.
-    const extOk = !!ext && ACCEPTED_AUDIO_VIDEO_EXTS.has(ext);
-    if (!mimeOk && !extOk) {
-      reportFileSelectionError(
-        "Unsupported file type. Drop an audio or video file.",
-      );
-      return;
-    }
-  }
-  selectedFile = file;
-  $("fileName").textContent = file ? `${file.name} (${Math.round(file.size / 1024)} KB)` : "No file selected";
-}
-
-async function transcribeSelectedFile(): Promise<void> {
-  if (isBusy) return;
-  if (!selectedFile) {
-    publishRecordingOutput({
-      recordingId: 0,
-      pasteText: "",
-      domText: "Please choose an audio file first.",
-      kind: "error",
-    });
-    patchCurrentRecordingSummary({ status: "Please choose an audio file first.", tone: "error" });
-    return;
-  }
-
-  const sessionUiToken = createClientSessionId();
-  activeUiSessionToken = sessionUiToken;
-  resetOutputs();
-  setBusy(true, sessionUiToken);
-  const selectedProvider = readProviderSelection();
-  const provider = resolveEffectiveProvider(selectedProvider);
-  const modelValue = provider === "local" ? (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL) : getRemoteModelValue(provider);
-  setCurrentRecordingSummary({
-    title: selectedFile.name || "Selected audio file",
-    status: "Preparing file transcription.",
-    tone: "info",
-  }, sessionUiToken);
-  if (selectedProvider !== provider) {
-    setStatusScoped(sessionUiToken, "Processing (Local Fallback)");
-  } else {
-    setStatusScoped(sessionUiToken, "Processing");
-  }
-  if (provider !== "local" && !isProviderKeyConfigured(provider)) {
-    const msg = providerKeyErrorMessage(provider);
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    publishRecordingOutput({
-      recordingId: 0,
-      pasteText: "",
-      domText: msg,
-      kind: "error",
-      sessionToken: sessionUiToken,
-    });
-    patchCurrentRecordingSummary({
-      status: msg,
-      tone: "error",
-    }, sessionUiToken);
-    setBusy(false, sessionUiToken);
-    return;
-  }
-  const transcribeStartedAt = performance.now();
-  if (isCurrentUiSession(sessionUiToken)) {
-    $("progressRow").hidden = false;
-  }
-  patchCurrentRecordingSummary({
-    status:
-      selectedProvider !== provider
-        ? localFallbackReason(selectedProvider)
-        : `Transcribing file with ${providerLabel(provider)}.`,
-    tone: "info",
-  }, sessionUiToken);
-
-  try {
-    pollAbortController?.abort();
-    pollAbortController = new AbortController();
-    if (provider === "local") {
-      if (isCurrentUiSession(sessionUiToken)) {
-        $("progressFill").style.width = "35%";
-        $("progressText").textContent = "35%";
-      }
-      const syncOut = await localJobSync(selectedFile, {
-        language: resolveFastLocalLanguage(($("language") as HTMLSelectElement).value),
-        model: modelValue,
-        splitStereo: ($("splitStereoCheck") as HTMLInputElement).checked,
-        wordTimestamps: ($("wordTsCheck") as HTMLInputElement).checked,
-        signal: pollAbortController.signal,
-      });
-      const transcriptRaw = String(syncOut.text || "").trim();
-      publishRecordingFinalSignal({
-        recordingId: 0,
-        signalText: "",
-        domText: transcriptRaw,
-        kind: "status",
-        sessionToken: sessionUiToken,
-      });
-      if (isCurrentUiSession(sessionUiToken)) {
-        $("progressFill").style.width = "100%";
-        $("progressText").textContent = "100%";
-        $("progressRow").hidden = true;
-      }
-      if (transcriptRaw) {
-        const pasteReadyText = await runUpscaleIfEnabled(
-          transcriptRaw,
-          sessionUiToken,
-          { setDoneStatus: false },
-        );
-        publishRecordingFinalSignal({
-          recordingId: 0,
-          signalText: pasteReadyText || transcriptRaw,
-          domText: transcriptRaw,
-          kind: "transcript",
-          sessionToken: sessionUiToken,
-        });
-      }
-      setStatusScoped(sessionUiToken, "Done");
-      const latencyMs = performance.now() - transcribeStartedAt;
-      patchCurrentRecordingSummary({
-        status: transcriptRaw ? "File transcript is ready." : "Recording completed, no speech detected.",
-        tone: "success",
-        transcribeLatencyMs: latencyMs,
-      }, sessionUiToken);
-      return;
-    } else {
-      const syncOut = await remoteJobSync(selectedFile, {
-        provider,
-        language: ($("language") as HTMLSelectElement).value,
-        diarize: ($("diarizeCheck") as HTMLInputElement).checked,
-        remoteModel: modelValue,
-        signal: pollAbortController.signal,
-      });
-      const transcriptRaw = String(syncOut.text || "").trim();
-      publishRecordingFinalSignal({
-        recordingId: 0,
-        signalText: "",
-        domText: transcriptRaw,
-        kind: "status",
-        sessionToken: sessionUiToken,
-      });
-      if (isCurrentUiSession(sessionUiToken)) {
-        $("progressFill").style.width = "100%";
-        $("progressText").textContent = "100%";
-        $("progressRow").hidden = true;
-      }
-      if (transcriptRaw) {
-        const pasteReadyText = await runUpscaleIfEnabled(
-          transcriptRaw,
-          sessionUiToken,
-          { setDoneStatus: false },
-        );
-        publishRecordingFinalSignal({
-          recordingId: 0,
-          signalText: pasteReadyText || transcriptRaw,
-          domText: transcriptRaw,
-          kind: "transcript",
-          sessionToken: sessionUiToken,
-        });
-      }
-      setStatusScoped(sessionUiToken, "Done");
-      const latencyMs = performance.now() - transcribeStartedAt;
-      patchCurrentRecordingSummary({
-        status: transcriptRaw ? "File transcript is ready." : "Recording completed, no speech detected.",
-        tone: "success",
-        transcribeLatencyMs: latencyMs,
-      }, sessionUiToken);
-      return;
-    }
-  } catch (e) {
-    console.error("File transcription failed", e);
-    const safeMessage = sanitizeUiErrorMessage(e, "File transcription failed.");
-    publishRecordingFinalSignal({
-      recordingId: 0,
-      signalText: "",
-      domText: safeMessage,
-      kind: "error",
-      sessionToken: sessionUiToken,
-    });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    setStatusScoped(sessionUiToken, "Error");
-    patchCurrentRecordingSummary({
-      status: safeMessage,
-      tone: "error",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
-  } finally {
-    pollAbortController = null;
-    setBusy(false, sessionUiToken);
-  }
-}
-
-const drop = $("uploadDrop");
-const fileInput = $("fileInput") as HTMLInputElement;
-
-$("pickFileBtn").addEventListener("click", () => fileInput.click());
-fileInput.onchange = () => {
-  const file = fileInput.files && fileInput.files[0];
-  setSelectedFile(file || null);
-};
-
-drop.addEventListener("click", () => fileInput.click());
-["dragenter", "dragover"].forEach((ev) => {
-  drop.addEventListener(ev, (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    drop.classList.add("drag");
-  });
-});
-["dragleave", "drop"].forEach((ev) => {
-  drop.addEventListener(ev, (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    drop.classList.remove("drag");
-  });
-});
-drop.addEventListener("drop", (e: DragEvent) => {
-  const files = e.dataTransfer?.files;
-  if (!files || !files.length) return;
-  setSelectedFile(files[0]);
-});
-
-$("btnTranscribeFile").addEventListener("click", () => void transcribeSelectedFile());
 // User-facing recording is controlled by global hotkey events that the
 // Electron main process dispatches into this renderer.
 
