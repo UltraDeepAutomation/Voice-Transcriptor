@@ -57,170 +57,27 @@
 // rebuilds keep their Microphone / Accessibility / Apple Events
 // grants even though every rebuild produces a different CDHash.
 
-const { execFileSync, execSync } = require("node:child_process");
-const {
-  existsSync, readdirSync, lstatSync, openSync, readSync, closeSync, chmodSync,
-} = require("node:fs");
+const { execFileSync } = require("node:child_process");
+const { existsSync } = require("node:fs");
 const path = require("node:path");
+const {
+  assertNoBundledBytecode,
+  hasSigningIdentity,
+  makeBundledPythonImportsReadOnly,
+  preSignRuntimeBinaries,
+  shouldIgnoreOsxSignPath,
+} = require("./scripts/macos-signing-utils");
 
 const DEFAULT_INTERNAL_SIGNING_IDENTITY = "AntigravityTelegramDev";
-const PYTHON_IMPORT_TREES = Object.freeze([
-  path.join("Contents", "Resources", "runtime", "python"),
-  path.join("Contents", "Resources", "backend"),
-]);
-
-function walkTree(root, visitor) {
-  const visit = (entryPath) => {
-    let st;
-    try { st = lstatSync(entryPath); } catch { return; }
-    if (st.isSymbolicLink()) return;
-    if (st.isDirectory()) {
-      let entries;
-      try { entries = readdirSync(entryPath); } catch { return; }
-      for (const name of entries) {
-        visit(path.join(entryPath, name));
-      }
-      visitor(entryPath, st);
-      return;
-    }
-    if (st.isFile()) {
-      visitor(entryPath, st);
-    }
-  };
-  visit(root);
-}
-
-function pathIsInside(candidate, root) {
-  const rel = path.relative(root, candidate);
-  return rel === "" || (rel && !rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
-// Read first 16 bytes to detect Mach-O filetype.
-//   magic (u32) + cputype (u32) + cpusubtype (u32) + filetype (u32)
-//   MH_EXECUTE = 2, MH_DYLIB = 6, MH_BUNDLE = 8
-function classifyMacho(filePath) {
-  let fd;
-  try {
-    fd = openSync(filePath, "r");
-  } catch { return "non-macho"; }
-  try {
-    const buf = Buffer.alloc(16);
-    const n = readSync(fd, buf, 0, 16, 0);
-    if (n < 16) return "non-macho";
-    const magicLE = buf.readUInt32LE(0);
-    const magicBE = buf.readUInt32BE(0);
-    // Thin Mach-O: both 64-bit (feedfacf) and 32-bit (feedface).
-    // filetype at offset 12: MH_EXECUTE=2, MH_DYLIB=6, MH_BUNDLE=8
-    if (magicLE === 0xfeedfacf || magicLE === 0xfeedface) {
-      const filetype = buf.readUInt32LE(12);
-      if (filetype === 2) return "executable";
-      if (filetype === 6 || filetype === 8) return "dylib";
-      return "macho-other";
-    }
-    // Fat Mach-O: magic is BE (cafebabe / cafebabf). Read one
-    // nested arch's thin header to determine the real filetype.
-    if (magicBE === 0xcafebabe || magicBE === 0xcafebabf) {
-      // Enough for FAT32's 32-bit offset and FAT64's high+low 64-bit offset.
-      const fatHdr = Buffer.alloc(24);
-      if (readSync(fd, fatHdr, 0, 24, 0) < 24) return "macho-other";
-      const firstOff = magicBE === 0xcafebabf
-        ? Number(fatHdr.readBigUInt64BE(16))
-        : fatHdr.readUInt32BE(16);
-      if (!Number.isSafeInteger(firstOff) || firstOff <= 0) return "macho-other";
-      const thinHdr = Buffer.alloc(16);
-      if (readSync(fd, thinHdr, 0, 16, firstOff) < 16) return "macho-other";
-      const thinMagic = thinHdr.readUInt32LE(0);
-      if (thinMagic !== 0xfeedfacf && thinMagic !== 0xfeedface) {
-        return "macho-other";
-      }
-      const filetype = thinHdr.readUInt32LE(12);
-      if (filetype === 2) return "executable";
-      if (filetype === 6 || filetype === 8) return "dylib";
-      return "macho-other";
-    }
-    return "non-macho";
-  } finally {
-    try { closeSync(fd); } catch { /* ignore */ }
-  }
-}
-
-function shouldIgnoreOsxSignPath(filePath, appPath, runtimeRoot) {
-  if (filePath === appPath) return false;
-  if (pathIsInside(filePath, runtimeRoot)) return true;
-  if (filePath.endsWith(".app") || filePath.endsWith(".framework")) return false;
-  let st;
-  try { st = lstatSync(filePath); } catch { return true; }
-  if (!st.isFile()) return false;
-  const kind = classifyMacho(filePath);
-  return kind === "non-macho" || kind === "macho-other";
-}
-
-function assertNoBundledBytecode(appPath) {
-  const offenders = [];
-  for (const relRoot of PYTHON_IMPORT_TREES) {
-    const root = path.join(appPath, relRoot);
-    if (!existsSync(root)) continue;
-    walkTree(root, (entryPath, st) => {
-      if (
-        (st.isDirectory() && path.basename(entryPath) === "__pycache__") ||
-        (st.isFile() && entryPath.endsWith(".pyc"))
-      ) {
-        offenders.push(entryPath);
-      }
-    });
-  }
-  if (offenders.length > 0) {
-    throw new Error(
-      "afterPack: bundled Python bytecode is forbidden inside the signed app. " +
-        `First offenders:\n${offenders.slice(0, 20).join("\n")}`,
-    );
-  }
-}
-
-function makeBundledPythonImportsReadOnly(appPath) {
-  let fileCount = 0;
-  let dirCount = 0;
-  for (const relRoot of PYTHON_IMPORT_TREES) {
-    const root = path.join(appPath, relRoot);
-    if (!existsSync(root)) continue;
-    walkTree(root, (entryPath, st) => {
-      const executable = (st.mode & 0o111) !== 0;
-      const mode = st.isDirectory() ? 0o555 : (executable ? 0o555 : 0o444);
-      chmodSync(entryPath, mode);
-      if (st.isDirectory()) dirCount += 1;
-      if (st.isFile()) fileCount += 1;
-    });
-  }
-  console.log(
-    `[afterPack] Locked bundled Python import trees read-only ` +
-    `(${fileCount} files + ${dirCount} directories)`,
-  );
-}
-
-/**
- * Return ``true`` if *identity* is currently available in the local
- * keychain. Probes via ``security find-identity -v -p codesigning``.
- */
-function hasSigningIdentity(identity) {
-  const wanted = String(identity || "").trim();
-  if (!wanted) return false;
-  try {
-    const out = execSync("/usr/bin/security find-identity -v -p codesigning", {
-      encoding: "utf8",
-    });
-    return out.includes(`"${wanted}"`);
-  } catch {
-    return false;
-  }
-}
 
 exports.default = async function afterPack(context) {
   // electron-builder invokes afterPack for every platform. Only
-  // touch macOS builds — Windows ignores codesign.
+  // touch macOS builds — Windows/Linux ignore codesign.
   const platform = context.electronPlatformName || context.packager.platform.nodeName;
-  if (platform !== "darwin") {
+  if (platform !== "darwin" && platform !== "mas") {
     return;
   }
+  const isMas = platform === "mas";
 
   const appOutDir = context.appOutDir;
   const appName = context.packager.appInfo.productFilename;
@@ -230,13 +87,32 @@ exports.default = async function afterPack(context) {
   }
 
   const projectDir = context.packager.info.projectDir;
-  const entitlements = path.join(projectDir, "entitlements.mac.plist");
-  const inheritEntitlements = path.join(projectDir, "entitlements.mac.inherit.plist");
+  const entitlements = path.join(projectDir, isMas ? "entitlements.mas.plist" : "entitlements.mac.plist");
+  const inheritEntitlements = path.join(
+    projectDir,
+    isMas ? "entitlements.mas.inherit.plist" : "entitlements.mac.inherit.plist",
+  );
   if (!existsSync(entitlements)) {
     throw new Error(`afterPack: entitlements plist missing at ${entitlements}`);
   }
   if (!existsSync(inheritEntitlements)) {
     throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
+  }
+  if (isMas) {
+    assertNoBundledBytecode(appPath);
+    if (process.env.TRANSCRIPTOR_MAS_EXTERNAL_SIGN !== "1") {
+      throw new Error(
+        "afterPack: MAS builds must use `npm --prefix desktop run dist:mas`. " +
+          "That pipeline builds the MAS-flavored Electron app first, then signs it " +
+          "with the App Store provisioning profile and installer identity in a " +
+          "single audited step.",
+      );
+    }
+    console.log(
+      "[afterPack] TRANSCRIPTOR_MAS_EXTERNAL_SIGN=1 — leaving MAS app unsigned " +
+        "for scripts/sign-mas.js",
+    );
+    return;
   }
 
   const requestedIdentity = String(
@@ -337,71 +213,13 @@ exports.default = async function afterPack(context) {
   // invalidates those hashes → verify --deep --strict fails.
   // Signing first means osx-sign's envelope hashes the final signed
   // bytes of every runtime file.
-  const runtimeRoot = path.join(appPath, "Contents", "Resources", "runtime");
-  if (existsSync(runtimeRoot)) {
-    console.log(`[afterPack] Pre-signing bundled runtime binaries under ${runtimeRoot}`);
-    let signedCount = 0;
-    let execCount = 0;
-    let dylibCount = 0;
-
-    // codesign REJECTS --entitlements / --options runtime on MH_DYLIB /
-    // MH_BUNDLE. Passing them to a plain .so silently fails ("invalid
-    // format for a code signature"), leaving the file unsigned and the
-    // site-packages extension unloadable under hardened runtime.
-    const signOne = (filePath, kind) => {
-      // Executables get hardened-runtime + entitlements.
-      // Dylibs / bundles get a bare signature (entitlements aren't valid
-      // on shared libraries and codesign errors out when passed here).
-      const args = ["--force", "--sign", identity, runtimeTimestampArg];
-      if (kind === "executable") {
-        args.push("--options", "runtime", "--entitlements", inheritEntitlements);
-        execCount += 1;
-      } else {
-        dylibCount += 1;
-      }
-      args.push(filePath);
-      try {
-        execFileSync("/usr/bin/codesign", args,
-          { stdio: ["ignore", "ignore", "pipe"] });
-        signedCount += 1;
-      } catch (e) {
-        const stderr = e && e.stderr ? e.stderr.toString() : "";
-        // HARD FAIL. A silently-unsigned .dylib under hardened runtime
-        // crashes the Python interpreter at first `import` with "code
-        // signature in ... not valid for use in process" — better to
-        // abort the build here than ship a broken DMG.
-        throw new Error(
-          `afterPack: codesign failed for ${filePath}\n${stderr || (e.message || e)}`
-        );
-      }
-    };
-
-    const walk = (dir) => {
-      let entries;
-      try { entries = readdirSync(dir); } catch { return; }
-      for (const name of entries) {
-        const full = path.join(dir, name);
-        let st;
-        // lstat, NOT stat — statSync follows symlinks so
-        // isSymbolicLink() would be permanently false and we'd sign
-        // the same target twice via different names, corrupting the
-        // resource envelope.
-        try { st = lstatSync(full); } catch { continue; }
-        if (st.isSymbolicLink()) continue;
-        if (st.isDirectory()) { walk(full); continue; }
-        if (!st.isFile()) continue;
-        const kind = classifyMacho(full);
-        if (kind === "non-macho" || kind === "macho-other") continue;
-        signOne(full, kind);
-      }
-    };
-
-    walk(runtimeRoot);
-    console.log(
-      `[afterPack] Pre-signed ${signedCount} runtime binaries ` +
-      `(${execCount} executables + ${dylibCount} dylibs/bundles)`
-    );
-  }
+  const { runtimeRoot } = preSignRuntimeBinaries({
+    appPath,
+    identity,
+    entitlements: inheritEntitlements,
+    timestampArg: runtimeTimestampArg,
+    log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
+  });
 
   // STEP 2 — main @electron/osx-sign pass (bundle walk + envelope).
   //
@@ -472,7 +290,11 @@ exports.default = async function afterPack(context) {
   // interpreter build ignores PYTHONDONTWRITEBYTECODE / -B during
   // early bootstrap imports.
   assertNoBundledBytecode(appPath);
-  makeBundledPythonImportsReadOnly(appPath);
+  const locked = makeBundledPythonImportsReadOnly(appPath);
+  console.log(
+    `[afterPack] Locked bundled Python import trees read-only ` +
+    `(${locked.fileCount} files + ${locked.dirCount} directories)`,
+  );
   assertNoBundledBytecode(appPath);
 
   // Verify the finished signature. ``--strict`` catches any resource

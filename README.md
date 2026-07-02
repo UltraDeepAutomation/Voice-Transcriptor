@@ -42,6 +42,29 @@ bash INSTALL_ON_OTHER_MAC.command
 
 Public distribution must use a Developer ID Application identity plus Apple notarization and stapling. Without that identity, macOS Gatekeeper cannot treat the app as a fully trusted external download.
 
+#### Mac App Store / TestFlight builds
+
+The App Store/TestFlight artifact is a MAS `.pkg`, not the public DMG. It must use an explicit App Store Connect bundle ID, a matching Mac App Store provisioning profile, an app signing certificate, and an installer signing certificate. The build fails before packaging if any required signing input is missing.
+
+```bash
+export TRANSCRIPTOR_MAS_APP_ID="com.yourcompany.transcriptor"
+export TRANSCRIPTOR_MAS_PROVISIONING_PROFILE="/absolute/path/Transcriptor_Mac_App_Store.provisionprofile"
+export TRANSCRIPTOR_MAS_SIGNING_IDENTITY="Apple Distribution: Your Team (TEAMID)"
+export TRANSCRIPTOR_MAS_INSTALLER_IDENTITY="Mac Installer Distribution: Your Team (TEAMID)"
+
+npm --prefix desktop run dist:mas
+```
+
+Upload the generated `desktop/dist/Transcriptor-<version>-mas-arm64.pkg` after App Store Connect credentials are available:
+
+```bash
+export ASC_API_KEY="KEYID"
+export ASC_API_ISSUER="ISSUER-UUID"
+npm --prefix desktop run testflight:upload
+```
+
+Apple ID upload also works with `ASC_USERNAME` and `ASC_APP_SPECIFIC_PASSWORD`.
+
 ### Windows x64
 
 1. Download `Transcriptor Setup <version>.exe`.

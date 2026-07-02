@@ -17,6 +17,8 @@
     "dist:dir": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
     "dist:adhoc": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac dmg --arm64",
     "dist:dir:adhoc": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac --dir --arm64",
+    "dist:mas": "bash ./scripts/build-mas.sh",
+    "testflight:upload": "bash ./scripts/upload-testflight.sh",
     "dist:win": "node ./scripts/require-bash.js win-x64 && bash ./scripts/prepare-runtime.sh win-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
     "dist:linux": "bash ./scripts/prepare-runtime.sh linux-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
   },
@@ -112,6 +114,38 @@
         }
       ],
       "writeUpdateInfo": false
+    },
+    "mas": {
+      "category": "public.app-category.productivity",
+      "icon": "icon.png",
+      "identity": null,
+      "entitlements": "entitlements.mas.plist",
+      "entitlementsInherit": "entitlements.mas.inherit.plist",
+      "hardenedRuntime": true,
+      "preAutoEntitlements": true,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Transcriptor records microphone audio when you start a live transcription.",
+        "NSAppleEventsUsageDescription": "Transcriptor uses Apple Events to paste transcripts into the app you are working in."
+      },
+      "extraResources": [
+        {
+          "from": "runtime/mac-${arch}",
+          "to": "runtime",
+          "filter": [
+            "**/*",
+            "!**/__pycache__/**",
+            "!**/*.pyc"
+          ]
+        }
+      ],
+      "target": [
+        {
+          "target": "mas",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
     },
     "win": {
       "target": [
