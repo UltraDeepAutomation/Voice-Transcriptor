@@ -840,7 +840,7 @@ function startRecordingStateMonitor() {
               recordingStopInFlight = true;
               stopRecordingStateMonitor();
               appendMainLog(`[recording-autostop] trigger level=${safeLevel.toFixed(4)} rms=${safeRms.toFixed(6)} lastFrameAge=${safeLastFrameAt ? (now - safeLastFrameAt) : -1} cfgSec=${Number(cfg.seconds)} cfgDb=${Number(cfg.thresholdDb)}`);
-              guardedStopFromRecordingSurface("autostop");
+              guardedStopFromRecordingStatus("autostop");
             }
           } else {
             recordingSilenceStartedAt = 0;
@@ -852,7 +852,7 @@ function startRecordingStateMonitor() {
             recordingStopInFlight = true;
             stopRecordingStateMonitor();
             appendMainLog(`[recording-autostop-stale] audio pipeline dead for 8s, forcing stop`);
-            guardedStopFromRecordingSurface("autostop-stale");
+            guardedStopFromRecordingStatus("autostop-stale");
           }
         }
       })
@@ -861,7 +861,7 @@ function startRecordingStateMonitor() {
   try { recordingStateMonitor.unref?.(); } catch { }
 }
 
-async function beginRecordingSurfaceSession() {
+async function beginRecordingStatusSession() {
   recordingSilenceStartedAt = 0;
   recordingAutoStopConfigRefreshAt = 0;
   recordingStartedAt = Date.now();
@@ -870,13 +870,13 @@ async function beginRecordingSurfaceSession() {
   startRecordingStateMonitor();
 }
 
-async function ensureRecordingSurfaceVisible(options = {}) {
-  if (typeof options.status === "string" && options.status.trim()) {
-    await setRecordingSurfaceStatus(options.status);
-  }
+async function publishRecordingStatus(status) {
+  const text = String(status || "").trim();
+  if (!text) return;
+  await setRecordingStatus(text);
 }
 
-function resetRecordingSurfaceState() {
+function resetRecordingStatusState() {
   recordingStopInFlight = false;
   recordingSilenceStartedAt = 0;
   recordingAutoStopConfigRefreshAt = 0;
@@ -885,12 +885,12 @@ function resetRecordingSurfaceState() {
   recordingSeenAudioFrames = false;
   stopRecordingStateMonitor();
   if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
-    appendMainLog(`[recording-surface] reset-stale-pending=${pendingTranscriptionCount}`);
+    appendMainLog(`[recording-status] reset-stale-pending=${pendingTranscriptionCount}`);
     pendingTranscriptionCount = 0;
   }
 }
 
-async function setRecordingSurfaceStatus(text) {
+async function setRecordingStatus(text) {
   const status = String(text || "").trim();
   if (!status) return;
   await execRendererJsWithTimeout(
@@ -950,13 +950,13 @@ async function toggleRecordingFromShortcut() {
       pid: front.pid || 0,
       windowTitle: compactLogText(front.windowTitle || "", 80),
     });
-    await ensureRecordingSurfaceVisible({ status: hasActivePostStopWork() ? null : "Starting", resetTimer: false, startTimer: false });
-    traceStep(trace, "recording_surface_ready", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
+    await publishRecordingStatus(hasActivePostStopWork() ? "" : "Starting");
+    traceStep(trace, "recording_status_ready", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
-      await setRecordingSurfaceStatus("App Not Ready");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("App Not Ready");
+      resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "window-not-ready" });
       return;
     }
@@ -964,8 +964,8 @@ async function toggleRecordingFromShortcut() {
     const ready = await waitForRendererUiReady();
     traceStep(trace, "renderer_ready_check", { ready: !!ready });
     if (!ready) {
-      await setRecordingSurfaceStatus("App Loading");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("App Loading");
+      resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-not-ready" });
       return;
     }
@@ -976,7 +976,7 @@ async function toggleRecordingFromShortcut() {
         `[shortcut] start blocked by single-capsule post-stop work ` +
         `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
       );
-      await ensureRecordingSurfaceVisible({ status: "Transcribing", resetTimer: false, startTimer: false });
+      await publishRecordingStatus("Transcribing");
       traceStep(trace, "single_capsule_busy", {
         pending: pendingTranscriptionCount,
         queue: postStopQueue.length,
@@ -989,8 +989,8 @@ async function toggleRecordingFromShortcut() {
     const micGranted = await requestMacMicrophonePermissionOnce();
     if (!micGranted) {
       traceStep(trace, "mic_permission_denied", {});
-      await setRecordingSurfaceStatus("Grant Access");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("Grant Access");
+      resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "mic-permission-denied" });
       return;
     }
@@ -1027,15 +1027,15 @@ async function toggleRecordingFromShortcut() {
       // inflight guard via the outer finally, and let the user retry.
       appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
       shortcutToggleInFlight = false;
-      resetRecordingSurfaceState();
+      resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
       return;
     }
 
     if (!result?.ok) {
       traceStep(trace, "renderer_toggle_failed", { result: result || null });
-      await setRecordingSurfaceStatus("App Loading");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("App Loading");
+      resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
       return;
     }
@@ -1047,7 +1047,7 @@ async function toggleRecordingFromShortcut() {
         target: pasteTargetSummary(pasteTarget),
       });
       traceStep(trace, "recording_started", { auto: !!result.auto, timerText: result.timerText || "" });
-      await beginRecordingSurfaceSession();
+      await beginRecordingStatusSession();
       traceEnd(trace, "recording-started", {});
       return;
     }
@@ -1066,8 +1066,8 @@ async function toggleRecordingFromShortcut() {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       // Kill recording monitor immediately — recording is done.
       stopRecordingStateMonitor();
-      await setRecordingSurfaceStatus("Saved To App");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("Saved To App");
+      resetRecordingStatusState();
     }
     traceEnd(trace, "done", {});
   } finally {
@@ -1084,10 +1084,10 @@ async function toggleRecordingFromShortcut() {
  * unresponsive), the recording state machine would be stuck with
  * ``recordingStopInFlight = true`` forever, permanently blocking new
  * recordings. This wrapper clears the flag on EVERY exit path —
- * resolve, reject, OR timeout — and resets recording-surface state if the stop
+ * resolve, reject, OR timeout — and resets recording status state if the stop
  * never completed.
  */
-function guardedStopFromRecordingSurface(reason) {
+function guardedStopFromRecordingStatus(reason) {
   const deadlineMs = 12000;
   let settled = false;
   const finish = (why, err) => {
@@ -1100,7 +1100,7 @@ function guardedStopFromRecordingSurface(reason) {
       appendMainLog(`[recording-${reason}-timeout] stopRecordingFromMainProcess exceeded ${deadlineMs}ms deadline`);
     }
     if (why !== "resolve") {
-      resetRecordingSurfaceState();
+      resetRecordingStatusState();
     }
   };
   const timer = setTimeout(() => finish("timeout"), deadlineMs);
@@ -1160,13 +1160,13 @@ async function stopRecordingFromMainProcess() {
 
     if (!result) {
       appendMainLog("[recording-stop] renderer stop request timed out");
-      await setRecordingSurfaceStatus("App Loading");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("App Loading");
+      resetRecordingStatusState();
     } else if (result?.stale) {
       appendMainLog(
         `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
       );
-      await setRecordingSurfaceStatus("Recording");
+      await setRecordingStatus("Recording");
     } else if (result?.ok) {
       if (result.auto) {
         enqueuePostStopTask({
@@ -1178,12 +1178,12 @@ async function stopRecordingFromMainProcess() {
         });
         stopRecordingStateMonitor();
       } else {
-        await setRecordingSurfaceStatus("Saved To App");
-        resetRecordingSurfaceState();
+        await setRecordingStatus("Saved To App");
+        resetRecordingStatusState();
       }
     } else {
-      await setRecordingSurfaceStatus("Saved To App");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("Saved To App");
+      resetRecordingStatusState();
     }
   } finally {
     clearCapturedPasteTarget();
@@ -1508,7 +1508,7 @@ function looksLikeAutomationPermissionError(reason) {
   );
 }
 
-function recordingSurfaceStatusForPasteFailure(reason) {
+function recordingStatusForPasteFailure(reason) {
   const r = String(reason || "").toLowerCase();
   // The transcript is ALWAYS written to the system clipboard before
   // the paste attempt (see ``clipboard.writeText(transcript)`` in
@@ -2923,7 +2923,7 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
 // enqueuePostStopTask:
 //   * toggleRecordingFromShortcut() — fired by Alt+Left hotkey
 //   * stopRecordingFromMainProcess()    — fired by main-process auto-stop,
-//                                     wrapped in guardedStopFromRecordingSurface
+//                                     wrapped in guardedStopFromRecordingStatus
 // They use SEPARATE in-flight flags (shortcutToggleInFlight vs
 // recordingStopInFlight). A press-and-click sequence within ~50 ms can
 // invoke both before either flag has been observed, producing TWO
@@ -2987,15 +2987,15 @@ async function runPostStopQueue() {
           await processPostStopTask(task);
         } catch (e) {
           appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
-          await setRecordingSurfaceStatus("Saved To App").catch(() => { });
+          await setRecordingStatus("Saved To App").catch(() => { });
         }
       } finally {
         pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       }
       if (pendingTranscriptionCount > 0) {
-        await setRecordingSurfaceStatus("Transcribing").catch(() => { });
+        await setRecordingStatus("Transcribing").catch(() => { });
       } else {
-        resetRecordingSurfaceState();
+        resetRecordingStatusState();
       }
     }
   } finally {
@@ -3057,7 +3057,7 @@ async function processPostStopTask(task) {
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let recordingSurfacePhase = "";
+  let recordingStatusPhase = "";
   let doneStatusTranscriptSince = 0;
 
   while (Date.now() < deadline) {
@@ -3075,12 +3075,12 @@ async function processPostStopTask(task) {
     }
     const statusLower = String(state.status || "").trim().toLowerCase();
     if (!state.isRec) {
-      if (statusLower === "upscaling" && recordingSurfacePhase !== "upscaling") {
-        await setRecordingSurfaceStatus("Upscaling");
-        recordingSurfacePhase = "upscaling";
-      } else if ((statusLower === "processing" || statusLower === "transcribing") && recordingSurfacePhase !== "transcribing") {
-        await setRecordingSurfaceStatus("Transcribing");
-        recordingSurfacePhase = "transcribing";
+      if (statusLower === "upscaling" && recordingStatusPhase !== "upscaling") {
+        await setRecordingStatus("Upscaling");
+        recordingStatusPhase = "upscaling";
+      } else if ((statusLower === "processing" || statusLower === "transcribing") && recordingStatusPhase !== "transcribing") {
+        await setRecordingStatus("Transcribing");
+        recordingStatusPhase = "transcribing";
       }
     }
     const finishedRecords = Array.isArray(state.finishedRecords) ? state.finishedRecords : [];
@@ -3167,7 +3167,7 @@ async function processPostStopTask(task) {
     await sleep(30);
   }
 
-  let recordingSurfaceStatus = "Saved To App";
+  let recordingStatusText = "Saved To App";
   if (transcript) {
     traceStep(trace, "transcript_ready", {
       len: transcript.length,
@@ -3225,7 +3225,7 @@ async function processPostStopTask(task) {
       // guard at the top of processPostStopTask.
       _markRecordingPasted(task.recordingId);
       // Show success immediately once the paste actually happened.
-      await setRecordingSurfaceStatus("Pasted");
+      await setRecordingStatus("Pasted");
     }
     if (pasted.ok && task.autoSendEnter) {
       await sleep(220);
@@ -3238,7 +3238,7 @@ async function processPostStopTask(task) {
         `[cmd-enter] ${pasteTargetSummary(effectiveTarget)} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
       );
       if (sent.ok) {
-        await setRecordingSurfaceStatus("Sent");
+        await setRecordingStatus("Sent");
       }
       if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
         openPrivacyAccessibilitySettings();
@@ -3247,14 +3247,14 @@ async function processPostStopTask(task) {
     if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
       openPrivacyAccessibilitySettings();
     }
-    recordingSurfaceStatus = pasted.ok ? "Paste Sent" : recordingSurfaceStatusForPasteFailure(pasted.reason);
+    recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
   } else {
     traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
   }
 
   const isRecNow = await isRendererRecording();
   if (!isRecNow) {
-    await setRecordingSurfaceStatus(recordingSurfaceStatus);
+    await setRecordingStatus(recordingStatusText);
   }
   traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
 }
@@ -3296,13 +3296,13 @@ async function pasteLatestTranscriptFromShortcut() {
       windowTitle: compactLogText(front.windowTitle || "", 80),
     });
     setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
-    await ensureRecordingSurfaceVisible({ status: "Pasting", resetTimer: false, startTimer: false });
+    await publishRecordingStatus("Pasting");
 
     const text = await getLatestTranscriptText();
     if (!text) {
       traceStep(trace, "no_text_available", {});
-      await setRecordingSurfaceStatus("No Text");
-      resetRecordingSurfaceState();
+      await setRecordingStatus("No Text");
+      resetRecordingStatusState();
       clearCapturedPasteTarget();
       return;
     }
@@ -3325,7 +3325,7 @@ async function pasteLatestTranscriptFromShortcut() {
     appendMainLog(
       `[paste-last] ${pasteTargetSummary(pasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
-    await setRecordingSurfaceStatus(pasted.ok ? "Paste Sent" : recordingSurfaceStatusForPasteFailure(pasted.reason));
+    await setRecordingStatus(pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
       if (String(pasted.reason || "").includes("no-accessibility")) {
         openPrivacyAccessibilitySettings();
@@ -3333,7 +3333,7 @@ async function pasteLatestTranscriptFromShortcut() {
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
     clearCapturedPasteTarget();
-    resetRecordingSurfaceState();
+    resetRecordingStatusState();
   } finally {
     clearCapturedPasteTarget();
     pasteShortcutInFlight = false;
@@ -4565,12 +4565,12 @@ async function createWindow(options = {}) {
       _enqueuedRecordingIds.clear();
       _pastedRecordingIds.clear();
     }
-    // Tear down recording-surface state: it may be waiting on a transcript
+    // Tear down recording status state: it may be waiting on a transcript
     // that will never arrive.
     try {
-      resetRecordingSurfaceState();
+      resetRecordingStatusState();
     } catch (e) {
-      appendMainLog(`[render-process-gone] resetRecordingSurfaceState failed: ${e?.message || e}`);
+      appendMainLog(`[render-process-gone] resetRecordingStatusState failed: ${e?.message || e}`);
     }
     // The renderer is dead; ``reload()`` on a crashed webContents
     // throws. Schedule a fresh load so the user sees a working UI
@@ -5369,7 +5369,7 @@ app.whenReady().then(async () => {
     const recordResult = safeRegisterShortcut(shortcuts.record, () => {
       toggleRecordingFromShortcut().catch((e) => {
         appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
-        resetRecordingSurfaceState();
+        resetRecordingStatusState();
       });
     });
     if (recordResult.ok) {
@@ -5383,7 +5383,7 @@ app.whenReady().then(async () => {
     const pasteResult = safeRegisterShortcut(shortcuts.paste, () => {
       pasteLatestTranscriptFromShortcut().catch((e) => {
         appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
-        resetRecordingSurfaceState();
+        resetRecordingStatusState();
       });
     });
     if (pasteResult.ok) {
