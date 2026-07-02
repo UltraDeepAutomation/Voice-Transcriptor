@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const {
   assertNoBundledBytecode,
+  hasCertificateIdentity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
   preSignRuntimeBinaries,
@@ -33,9 +34,28 @@ function plistValue(plistPath, keyPath) {
   return run("/usr/libexec/PlistBuddy", ["-c", `Print :${keyPath}`, plistPath]).trim();
 }
 
-function decodeProvisioningProfile(profilePath) {
-  const xml = run("/usr/bin/security", ["cms", "-D", "-i", profilePath]);
-  return JSON.parse(run("/usr/bin/plutil", ["-convert", "json", "-o", "-", "--", "-"], { input: xml }));
+function plistValueOptional(plistPath, keyPath) {
+  try {
+    return plistValue(plistPath, keyPath);
+  } catch {
+    return "";
+  }
+}
+
+function readProvisioningProfileEntitlements(profilePath) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "transcriptor-mas-profile-"));
+  const plistPath = path.join(tmpDir, "profile.plist");
+  try {
+    run("/usr/bin/security", ["cms", "-D", "-i", profilePath, "-o", plistPath]);
+    return {
+      appIdentifier:
+        plistValueOptional(plistPath, "Entitlements:application-identifier") ||
+        plistValueOptional(plistPath, "Entitlements:com.apple.application-identifier"),
+      sandbox: /^true$/i.test(plistValueOptional(plistPath, "Entitlements:com.apple.security.app-sandbox")),
+    };
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 function assertBundleId(value) {
@@ -48,23 +68,18 @@ function assertBundleId(value) {
 }
 
 function assertProfileMatchesAppId(profilePath, appId) {
-  const profile = decodeProvisioningProfile(profilePath);
-  const entitlements = profile.Entitlements || {};
-  const appIdentifier = String(
-    entitlements["application-identifier"] ||
-    entitlements["com.apple.application-identifier"] ||
-    "",
-  );
+  const entitlements = readProvisioningProfileEntitlements(profilePath);
+  const appIdentifier = String(entitlements.appIdentifier || "");
   if (!appIdentifier.endsWith(`.${appId}`)) {
     throw new Error(
       `Provisioning profile does not match bundle id ${appId}. ` +
       `Profile application-identifier is "${appIdentifier || "missing"}".`,
     );
   }
-  if (!entitlements["com.apple.security.app-sandbox"]) {
+  if (!entitlements.sandbox) {
     throw new Error("Provisioning profile does not include com.apple.security.app-sandbox.");
   }
-  return profile;
+  return entitlements;
 }
 
 async function main() {
@@ -82,7 +97,7 @@ async function main() {
   if (!hasSigningIdentity(appIdentity)) {
     throw new Error(`Missing MAS app signing identity in keychain: "${appIdentity}"`);
   }
-  if (!hasSigningIdentity(installerIdentity)) {
+  if (!hasCertificateIdentity(installerIdentity)) {
     throw new Error(`Missing MAS installer signing identity in keychain: "${installerIdentity}"`);
   }
   assertProfileMatchesAppId(provisioningProfile, appId);

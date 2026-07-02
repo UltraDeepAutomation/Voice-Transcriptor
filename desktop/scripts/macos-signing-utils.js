@@ -139,6 +139,20 @@ function hasSigningIdentity(identity) {
   }
 }
 
+function hasCertificateIdentity(identity) {
+  const wanted = String(identity || "").trim();
+  if (!wanted) return false;
+  try {
+    const out = execFileSync("/usr/bin/security", ["find-certificate", "-a", "-c", wanted, "-Z"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.includes(`"alis"<blob>="${wanted}"`) || out.includes(`"labl"<blob>="${wanted}"`);
+  } catch {
+    return false;
+  }
+}
+
 function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg = "--timestamp", log = console.log }) {
   const runtimeRoot = path.join(appPath, "Contents", "Resources", "runtime");
   if (!existsSync(runtimeRoot)) {
@@ -181,6 +195,7 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
 module.exports = {
   assertNoBundledBytecode,
   classifyMacho,
+  hasCertificateIdentity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
   pathIsInside,
