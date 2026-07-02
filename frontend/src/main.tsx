@@ -25,7 +25,6 @@ interface AppConfig {
     recordings_dir?: string;
     openrouter?: { model?: string };
     ui?: {
-      mode?: string;
       provider?: string;
       language?: string;
       local_model?: string;
@@ -3128,15 +3127,6 @@ function scheduleLocalWarmup(): void {
   });
 }
 
-// Formerly toggled between "live recording" and "file upload" modes
-// based on a switch that no longer exists — live mode is the only
-// supported surface. Recording controls now live in the renderer;
-// Electron main consumes recording state through liveStatusSnapshot().
-function syncMode(): void {
-  $("livePane").hidden = false;
-  $("splitGap").hidden = false;
-}
-
 function setNetworkState(online: boolean, latencyMs: number | null = null): void {
   isNetworkOnline = !!online;
   const dot = $("netDot");
@@ -3561,7 +3551,6 @@ async function recoverLiveDraftIfAny(): Promise<void> {
 function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
   const silence = getAutoStopSilenceConfig();
   return {
-    mode: "live",
     provider: readProviderSelection(),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
     local_model: (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim(),
@@ -4464,7 +4453,6 @@ async function loadCfg(): Promise<void> {
     const providerSel = $("providerSelect") as HTMLSelectElement;
     const quickProviderSel = $("quickProviderSelect") as HTMLSelectElement;
     const modelSel = $("model") as HTMLSelectElement;
-    syncMode();
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
     }
@@ -9480,7 +9468,6 @@ try {
     : (ua.includes("windows") ? "win32" : "linux");
   document.body.classList.add(`platform-${platform}`);
 } catch { /* non-browser contexts — harmless */ }
-syncMode();
 setStatus("Idle");
 setRecordButton(false);
 setCurrentRecordingSummary(null);
