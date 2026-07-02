@@ -224,7 +224,7 @@ let traceCounter = 0;
 let overlayQuickSettingsOpen = false;
 // Win/Linux click-through fix: poll cursor against pill bounds and
 // toggle ignoreMouseEvents from the main process. See the comment
-// inside ensureOverlayWindow for the full rationale.
+// inside armOverlayMouseInterception for the full rationale.
 let overlayMouseTrackTimer = null;
 let overlayMouseInPill = false;
 let overlayQuickProvider = "local";
@@ -1927,34 +1927,16 @@ function createOverlayHtml() {
   </html>`;
 }
 
-function ensureOverlayWindow() {
-  if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
-  overlayWin = new BrowserWindow({
-    width: getOverlayWindowWidth(),
-    height: OVERLAY_FIXED_HEIGHT,
-    frame: false,
-    transparent: true,
-    resizable: false,
-    movable: false,
-    focusable: false,
-    skipTaskbar: true,
-    show: false,
-    hasShadow: false,
-    alwaysOnTop: true,
-    backgroundColor: "#00000000",
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      // Same Windows background-throttling fix as the main window.
-      // The overlay shows the recording timer + waveform — both
-      // depend on rAF / setInterval that Chromium clamps to 1 Hz
-      // on a backgrounded renderer. Without this flag the timer
-      // visibly stalls when the user switches focus during a
-      // recording session, even though the underlying mic capture
-      // is in the main window's renderer.
-      backgroundThrottling: false,
-    }
-  });
+function stopOverlayMouseInterception() {
+  if (overlayMouseTrackTimer) {
+    clearInterval(overlayMouseTrackTimer);
+    overlayMouseTrackTimer = null;
+  }
+  overlayMouseInPill = false;
+}
+
+function armOverlayMouseInterception() {
+  if (!overlayWin || overlayWin.isDestroyed()) return;
   // Allow clicks to pass through transparent regions around the capsule pill.
   // The overlay HTML reports mouse enter/leave on the pill so we toggle this.
   // The `{ forward: true }` option is macOS-only per Electron docs; passing it
@@ -1983,40 +1965,69 @@ function ensureOverlayWindow() {
   //   window and pinned to its bottom; we recompute its bounds on
   //   every tick because the overlay window can move (display change,
   //   Quick-Settings expand) and the pill height is fixed by
-  //   OVERLAY_TOKENS.window.pillHeight.
+  //   OVERLAY_TOKENS.window.height.
   if (process.platform === "darwin") {
     overlayWin.setIgnoreMouseEvents(true, { forward: true });
-  } else {
-    overlayWin.setIgnoreMouseEvents(true);
-    if (overlayMouseTrackTimer) clearInterval(overlayMouseTrackTimer);
-    overlayMouseTrackTimer = setInterval(() => {
-      if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
-      try {
-        const cursor = screen.getCursorScreenPoint();
-        const bounds = getOverlayInteractiveBounds();
-        const inPill = !!bounds &&
-          cursor.x >= bounds.x &&
-          cursor.x <= bounds.x + bounds.width &&
-          cursor.y >= bounds.y &&
-          cursor.y <= bounds.y + bounds.height;
-        // Only flip when state actually changes — repeated identical
-        // calls are cheap but the rerender on the renderer side from
-        // an event change is wasteful.
-        if (inPill !== overlayMouseInPill) {
-          overlayMouseInPill = inPill;
-          overlayWin.setIgnoreMouseEvents(!inPill);
-        }
-      } catch (e) {
-        // Window destroyed mid-tick; clear and let next ensureOverlay
-        // Window setup re-arm.
-        if (overlayMouseTrackTimer) {
-          clearInterval(overlayMouseTrackTimer);
-          overlayMouseTrackTimer = null;
-        }
-      }
-    }, 50);
-    try { overlayMouseTrackTimer.unref?.(); } catch { /* ignore */ }
+    return;
   }
+  if (overlayMouseTrackTimer) return;
+  overlayWin.setIgnoreMouseEvents(true);
+  overlayMouseInPill = false;
+  overlayMouseTrackTimer = setInterval(() => {
+    if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
+    try {
+      const cursor = screen.getCursorScreenPoint();
+      const bounds = getOverlayInteractiveBounds();
+      const inPill = !!bounds &&
+        cursor.x >= bounds.x &&
+        cursor.x <= bounds.x + bounds.width &&
+        cursor.y >= bounds.y &&
+        cursor.y <= bounds.y + bounds.height;
+      // Only flip when state actually changes — repeated identical
+      // calls are cheap but the rerender on the renderer side from
+      // an event change is wasteful.
+      if (inPill !== overlayMouseInPill) {
+        overlayMouseInPill = inPill;
+        overlayWin.setIgnoreMouseEvents(!inPill);
+      }
+    } catch (e) {
+      // Window destroyed mid-tick; clear and let the next visible
+      // overlay path re-arm the tracker for the current window.
+      stopOverlayMouseInterception();
+    }
+  }, 50);
+  try { overlayMouseTrackTimer.unref?.(); } catch { /* ignore */ }
+}
+
+function ensureOverlayWindow() {
+  if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
+  overlayWin = new BrowserWindow({
+    width: getOverlayWindowWidth(),
+    height: OVERLAY_FIXED_HEIGHT,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    skipTaskbar: true,
+    show: false,
+    hasShadow: false,
+    alwaysOnTop: true,
+    backgroundColor: "#00000000",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      // Same Windows background-throttling fix as the main window.
+      // The overlay shows the recording timer + waveform — both
+      // depend on rAF / setInterval that Chromium clamps to 1 Hz
+      // on a backgrounded renderer. Without this flag the timer
+      // visibly stalls when the user switches focus during a
+      // recording session, even though the underlying mic capture
+      // is in the main window's renderer.
+      backgroundThrottling: false,
+    }
+  });
+  armOverlayMouseInterception();
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   // "screen-saver" level puts the pill above legitimate fullscreen
   // content (games, video). "floating" still sits above normal windows
@@ -2145,13 +2156,9 @@ function ensureOverlayWindow() {
     overlayQuickSettingsInitialized = false;
     overlayQuickAutoSendInitialized = false;
     // Stop the Win/Linux mouse-tracking polling so it doesn't tick
-    // against a destroyed overlayWin reference. The next ensureOverlay
-    // Window call re-arms it for the recreated window.
-    if (overlayMouseTrackTimer) {
-      clearInterval(overlayMouseTrackTimer);
-      overlayMouseTrackTimer = null;
-    }
-    overlayMouseInPill = false;
+    // against a destroyed overlayWin reference. The next visible-overlay
+    // path re-arms it for the recreated window.
+    stopOverlayMouseInterception();
   });
   return overlayWin;
 }
@@ -2324,6 +2331,7 @@ async function showRecordingOverlay() {
   const front = await getFrontmostAppInfo();
   setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
   const ow = ensureOverlayWindow();
+  armOverlayMouseInterception();
   positionOverlayWindow();
   // Routed through ensureOverlayLoaded so a parallel call from
   // ensureOverlayVisible (rapid Alt+Left → Alt+Shift+V hotkey
@@ -2465,6 +2473,7 @@ async function ensureOverlayVisible(options = {}) {
   const { resetTimer = false, startTimer = false, status = null } = options;
   cancelScheduledOverlayHide("ensure-visible");
   const ow = ensureOverlayWindow();
+  armOverlayMouseInterception();
   positionOverlayWindow();
   // Idempotent / race-safe load: see ensureOverlayLoaded note above.
   await ensureOverlayLoaded();
@@ -2553,19 +2562,9 @@ function hideRecordingOverlay() {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
   }
-  // 1.1.25 fix: hideRecordingOverlay was missing the
-  // overlayMouseTrackTimer clear, so the 50 ms cursor-poll syscall
-  // kept firing 20 Hz forever after the overlay was dismissed —
-  // wasted CPU + battery drain for the entire app session. The timer
-  // is re-armed by ensureOverlayWindow on the next show, so behaviour
-  // on the visible-overlay path is unchanged.
-  if (typeof overlayMouseTrackTimer !== "undefined" && overlayMouseTrackTimer) {
-    clearInterval(overlayMouseTrackTimer);
-    overlayMouseTrackTimer = null;
-    if (typeof overlayMouseInPill !== "undefined") {
-      overlayMouseInPill = false;
-    }
-  }
+  // Stop the Win/Linux cursor poll while hidden; the visible-overlay
+  // paths re-arm it even when the same BrowserWindow is reused.
+  stopOverlayMouseInterception();
   // Safety net: when the overlay is fully dismissed and no worker is
   // actively draining the post-stop queue, both the counter and the
   // queue MUST be zero. If anything has drifted out of sync (e.g. a
@@ -6799,10 +6798,7 @@ app.on("before-quit", () => {
     clearInterval(overlayWaveMonitor);
     overlayWaveMonitor = null;
   }
-  if (overlayMouseTrackTimer) {
-    clearInterval(overlayMouseTrackTimer);
-    overlayMouseTrackTimer = null;
-  }
+  stopOverlayMouseInterception();
   if (overlayAutoStopTriggerTimer) {
     clearTimeout(overlayAutoStopTriggerTimer);
     overlayAutoStopTriggerTimer = null;
