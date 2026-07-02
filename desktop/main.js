@@ -222,6 +222,7 @@ let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
 let overlayQuickSettingsOpen = false;
+let overlayContentGeometry = null;
 // Win/Linux click-through fix: poll cursor against pill bounds and
 // toggle ignoreMouseEvents from the main process. See the comment
 // inside armOverlayMouseInterception for the full rationale.
@@ -270,7 +271,6 @@ let shortcutPollTimer = null;
 let backendStartInFlight = null;
 let micPermissionChecked = false;
 let loadedFrontendBuildSignature = "";
-const OVERLAY_FIXED_HEIGHT = 150;
 let pasteTarget = emptyCapturedPasteTarget();
 
 const HOST = "127.0.0.1";
@@ -289,7 +289,13 @@ const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
     collapsedWidth: 184,
     expandedWidth: 196,
+    expandedHeight: 96,
     height: 47,
+    geometryPadding: 4,
+    minWidth: 120,
+    minHeight: 32,
+    maxWidth: 360,
+    maxHeight: 260,
     bottomOffset: 10,
   }),
   pill: Object.freeze({
@@ -554,15 +560,82 @@ async function ensureWindowVisible(options = {}) {
   win.focus();
 }
 
+function clampOverlayDimension(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.ceil(n)));
+}
+
+function getOverlayFallbackWindowSize() {
+  return overlayQuickSettingsOpen
+    ? {
+      width: OVERLAY_TOKENS.window.expandedWidth,
+      height: OVERLAY_TOKENS.window.expandedHeight,
+    }
+    : {
+      width: OVERLAY_TOKENS.window.collapsedWidth,
+      height: OVERLAY_TOKENS.window.height,
+    };
+}
+
+function getOverlayMeasuredWindowSize() {
+  const geometry = overlayContentGeometry;
+  if (!geometry || geometry.quickOpen !== overlayQuickSettingsOpen) return null;
+  const pad = Math.max(0, Number(OVERLAY_TOKENS.window.geometryPadding) || 0);
+  return {
+    width: clampOverlayDimension(
+      geometry.width + pad,
+      OVERLAY_TOKENS.window.minWidth,
+      OVERLAY_TOKENS.window.maxWidth,
+    ),
+    height: clampOverlayDimension(
+      geometry.height + pad,
+      OVERLAY_TOKENS.window.minHeight,
+      OVERLAY_TOKENS.window.maxHeight,
+    ),
+  };
+}
+
+function getOverlayWindowSize() {
+  return getOverlayMeasuredWindowSize() || getOverlayFallbackWindowSize();
+}
+
+function applyOverlayGeometryPayload(rawPayload) {
+  let payload = null;
+  try {
+    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
+  } catch {
+    return;
+  }
+  const width = Number(payload?.width);
+  const height = Number(payload?.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+  const next = {
+    width: clampOverlayDimension(width, 1, OVERLAY_TOKENS.window.maxWidth),
+    height: clampOverlayDimension(height, 1, OVERLAY_TOKENS.window.maxHeight),
+    quickOpen: !!payload?.quickOpen,
+    menuOpen: !!payload?.menuOpen,
+  };
+  const prev = overlayContentGeometry;
+  if (
+    prev &&
+    prev.width === next.width &&
+    prev.height === next.height &&
+    prev.quickOpen === next.quickOpen &&
+    prev.menuOpen === next.menuOpen
+  ) {
+    return;
+  }
+  overlayContentGeometry = next;
+  applyOverlayWindowSize();
+}
+
 function getOverlayInteractiveBounds() {
   if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return null;
   const wb = overlayWin.getBounds();
-  const visibleH = overlayQuickSettingsOpen
-    ? wb.height
-    : (OVERLAY_TOKENS.window.height || 47);
-  const visibleW = overlayQuickSettingsOpen
-    ? wb.width
-    : Math.min(wb.width, OVERLAY_TOKENS.window.collapsedWidth || wb.width);
+  const size = getOverlayWindowSize();
+  const visibleW = Math.min(wb.width, size.width || wb.width);
+  const visibleH = Math.min(wb.height, size.height || wb.height);
   return {
     x: Math.round(wb.x + (wb.width - visibleW) / 2),
     y: Math.round(wb.y + wb.height - visibleH),
@@ -1517,6 +1590,7 @@ function createOverlayHtml() {
         const el = document.getElementById('timer');
         const cv = document.getElementById('wave');
         const ctx = cv.getContext('2d');
+        const stackEl = document.getElementById('stack');
         const settingsSlot = document.getElementById('settingsSlot');
         const pill = document.getElementById('pill');
         const stateIcon = document.getElementById('stateIcon');
@@ -1530,6 +1604,7 @@ function createOverlayHtml() {
         const quickAutoSendToggle = document.getElementById('quickAutoSendToggle');
         let quickUpscaleOptions = [];
         let quickUpscaleSelected = 'builtin_clean';
+        let geometryEmitScheduled = false;
         let timerId = null;
         let audioCtx = null;
         const bars = [];
@@ -1544,6 +1619,40 @@ function createOverlayHtml() {
         cv.style.width = waveW + 'px';
         cv.style.height = waveH + 'px';
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        const emitGeometry = () => {
+          geometryEmitScheduled = false;
+          const stackRect = stackEl.getBoundingClientRect();
+          let left = stackRect.left;
+          let top = stackRect.top;
+          let right = stackRect.right;
+          let bottom = stackRect.bottom;
+          const menuOpen = quickUpscaleMenu.classList.contains('open');
+          if (menuOpen) {
+            const menuRect = quickUpscaleMenu.getBoundingClientRect();
+            left = Math.min(left, menuRect.left);
+            top = Math.min(top, menuRect.top);
+            right = Math.max(right, menuRect.right);
+            bottom = Math.max(bottom, menuRect.bottom);
+          }
+          const width = Math.max(1, Math.ceil(right - left));
+          const height = Math.max(1, Math.ceil(bottom - top));
+          const payload = {
+            width,
+            height,
+            quickOpen: settingsSlot.classList.contains('on'),
+            menuOpen
+          };
+          document.title = '__overlay_geometry__' + encodeURIComponent(JSON.stringify(payload));
+        };
+        const scheduleGeometryEmit = () => {
+          if (geometryEmitScheduled) return;
+          geometryEmitScheduled = true;
+          requestAnimationFrame(() => {
+            setTimeout(emitGeometry, 0);
+          });
+        };
+        window.addEventListener('resize', scheduleGeometryEmit);
 
         const bw = ${t.wave.barWidth};
         const gap = ${t.wave.barGap};
@@ -1607,6 +1716,7 @@ function createOverlayHtml() {
           const on = !!open;
           settingsSlot.classList.toggle('on', on);
           gearBtn.classList.toggle('on', on);
+          scheduleGeometryEmit();
         };
         window.setUpscaleEnabled = (enabled) => {
           const on = !!enabled;
@@ -1629,6 +1739,7 @@ function createOverlayHtml() {
           const next = String(selected || '').trim();
           quickUpscaleSelected = next && quickUpscaleOptions.some((o) => o.id === next) ? next : quickUpscaleOptions[0].id;
           renderUpscaleMenu();
+          scheduleGeometryEmit();
         };
         window.setUpscale = (presetId) => {
           const v = String(presetId || '').trim();
@@ -1663,8 +1774,13 @@ function createOverlayHtml() {
         quickUpscaleBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           quickUpscaleMenu.classList.toggle('open');
+          scheduleGeometryEmit();
         });
-        document.addEventListener('click', () => quickUpscaleMenu.classList.remove('open'));
+        document.addEventListener('click', () => {
+          if (!quickUpscaleMenu.classList.contains('open')) return;
+          quickUpscaleMenu.classList.remove('open');
+          scheduleGeometryEmit();
+        });
         quickAutoSendToggle.addEventListener('change', () => {
           const next = quickAutoSendToggle.checked;
           document.title = '__overlay_autosend__' + (next ? '1' : '0');
@@ -1708,6 +1824,7 @@ function createOverlayHtml() {
           const rounded = Number.isFinite(raw) ? Math.round(raw) : 2;
           const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
           quickAutoStopSecs.textContent = String(sec);
+          scheduleGeometryEmit();
           document.title = '__overlay_autostop_secs__' + sec;
         };
         const readSecs = () => {
@@ -1731,6 +1848,7 @@ function createOverlayHtml() {
           const sec = Math.min(secsBounds.max, Math.max(secsBounds.min, rounded));
           if (Number(quickAutoStopSecs.textContent) !== sec) {
             quickAutoStopSecs.textContent = String(sec);
+            scheduleGeometryEmit();
           }
         };
         quickAutoStopToggle.addEventListener('change', () => {
@@ -1791,6 +1909,7 @@ function createOverlayHtml() {
           const str = String(t || '').trim();
           if (/^\\d{2,3}:\\d{2}$/.test(str)) {
             el.textContent = str;
+            scheduleGeometryEmit();
           }
         };
         window.resetTimer = () => {
@@ -1912,10 +2031,10 @@ function createOverlayHtml() {
         window.setUpscaleOptions([{ id: 'builtin_clean', name: 'Clean' }], 'builtin_clean');
         window.setUpscale('builtin_clean');
         window.setAutoSendEnabled(false);
+        scheduleGeometryEmit();
 
         // Mouse enter/leave: toggle click interception on the capsule.
         // When mouse is over the pill, we capture events; otherwise pass through.
-        const stackEl = document.getElementById('stack');
         stackEl.addEventListener('mouseenter', () => {
           document.title = '__overlay_mouse_enter__';
         });
@@ -2001,9 +2120,10 @@ function armOverlayMouseInterception() {
 
 function ensureOverlayWindow() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
+  const initialOverlaySize = getOverlayWindowSize();
   overlayWin = new BrowserWindow({
-    width: getOverlayWindowWidth(),
-    height: OVERLAY_FIXED_HEIGHT,
+    width: initialOverlaySize.width,
+    height: initialOverlaySize.height,
     frame: false,
     transparent: true,
     resizable: false,
@@ -2059,6 +2179,10 @@ function ensureOverlayWindow() {
         safeExecSync("overlay_settings:winHide", () => win.hide());
       }
       void setRendererQuickSettingsOpenChoice(overlayQuickSettingsOpen);
+      return;
+    }
+    if (raw.startsWith("__overlay_geometry__")) {
+      applyOverlayGeometryPayload(raw.replace("__overlay_geometry__", ""));
       return;
     }
     if (raw.startsWith("__overlay_upscale_enabled__")) {
@@ -2147,6 +2271,7 @@ function ensureOverlayWindow() {
     // yet overlayLoaded=true short-circuited every loadURL path —
     // permanent blank capsule until the entire process restarts.
     overlayLoaded = false;
+    overlayContentGeometry = null;
     // 1.1.25: same lifecycle hazard for the quick-settings init
     // flags. Without reset, a destroyed + recreated overlay window
     // skipped the one-time renderer-state sync and showed stale
@@ -2243,12 +2368,6 @@ function unregisterDisplayTopologyListeners() {
   _displayReposition = null;
 }
 
-function getOverlayWindowWidth() {
-  return overlayQuickSettingsOpen
-    ? OVERLAY_TOKENS.window.expandedWidth
-    : OVERLAY_TOKENS.window.collapsedWidth;
-}
-
 /**
  * Idempotent overlay HTML loader. All three call-sites that previously
  * inlined `if (!overlayLoaded) { await ow.loadURL(...); overlayLoaded = true; }`
@@ -2294,7 +2413,8 @@ async function ensureOverlayLoaded() {
 function applyOverlayWindowSize() {
   if (!overlayWin || overlayWin.isDestroyed()) return;
   safeExecSync("applyOverlayWindowSize", () => {
-    overlayWin.setSize(getOverlayWindowWidth(), OVERLAY_FIXED_HEIGHT, false);
+    const size = getOverlayWindowSize();
+    overlayWin.setSize(size.width, size.height, false);
     positionOverlayWindow();
   });
 }
