@@ -6,6 +6,7 @@ and standard text completions for upscale/post-processing.
 
 import base64
 import logging
+from pathlib import Path
 from typing import Any, Dict
 
 from backend.audio_mime import audio_content_type
@@ -44,6 +45,35 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _openrouter_audio_format(filename: str) -> str:
+    """Return OpenRouter's `input_audio.format` token for *filename*.
+
+    OpenRouter expects file-format identifiers (`mp3`, `m4a`, `webm`, ...),
+    not MIME subtypes. Deriving the value from `audio/mpeg` produced `mpeg`
+    for `.mp3`, and deriving it from `audio/mp4` produced `mp4` for `.m4a`.
+    Keep this mapping at the provider boundary so the shared MIME SSOT can
+    remain focused on HTTP Content-Type values.
+    """
+    ext = Path(filename or "").suffix.lower()
+    by_ext = {
+        ".wav": "wav",
+        ".mp3": "mp3",
+        ".m4a": "m4a",
+        ".aac": "aac",
+        ".flac": "flac",
+        ".ogg": "ogg",
+        ".oga": "ogg",
+        ".opus": "opus",
+        ".webm": "webm",
+        ".mp4": "mp4",
+        ".m4v": "mp4",
+        ".mov": "mov",
+    }
+    if ext in by_ext:
+        return by_ext[ext]
+    return audio_content_type(filename or "audio.wav").split("/")[-1]
+
+
 def _json_response(response: Any, context: str) -> Dict[str, Any]:
     try:
         payload = response.json()
@@ -66,7 +96,7 @@ def openrouter_transcribe(
     if not key:
         raise RemoteError("OpenRouter key is not configured")
 
-    fmt = audio_content_type(filename or "audio.wav").split("/")[-1]
+    fmt = _openrouter_audio_format(filename or "audio.wav")
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {

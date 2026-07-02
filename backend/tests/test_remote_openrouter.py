@@ -1,7 +1,12 @@
 import unittest
 from unittest import mock
 
-from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
+from backend.remote_openrouter import (
+    OpenRouterError,
+    _openrouter_audio_format,
+    openrouter_transcribe,
+    openrouter_upscale_text,
+)
 
 
 class OpenRouterJsonTests(unittest.TestCase):
@@ -46,6 +51,11 @@ class OpenRouterJsonTests(unittest.TestCase):
         self.assertEqual(kwargs["retries"], 2)
         audio_part = kwargs["json"]["messages"][0]["content"][1]
         self.assertEqual(audio_part["input_audio"]["format"], "opus")
+
+    def test_openrouter_audio_format_uses_provider_tokens_not_mime_subtypes(self):
+        self.assertEqual(_openrouter_audio_format("clip.mp3"), "mp3")
+        self.assertEqual(_openrouter_audio_format("clip.m4a"), "m4a")
+        self.assertEqual(_openrouter_audio_format("clip.webm"), "webm")
 
     def test_upscale_invalid_json_raises_provider_error(self):
         class FakeResponse:
