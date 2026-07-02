@@ -8,9 +8,12 @@ This file documents the current source layout. It intentionally avoids exact lin
 Voice Transcriptor/
 ├── BUILD.command                  # macOS source build + install entrypoint
 ├── INSTALL.command                # macOS delegate / Linux AppImage source build
+├── INSTALL_ON_OTHER_MAC.command   # target-Mac installer shipped inside macOS transfer zips
+├── INSTALL_OTHER_MAC.md           # target-Mac install and verification guide
 ├── README.md                      # install, build, development, troubleshooting
 ├── VERIFIED_AUDIT.md              # verified bug audit and fix history
 ├── CHANGELOG.md                   # historical release notes
+├── LICENSE                        # repository license
 ├── requirements.txt               # direct backend/runtime Python dependencies
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
 ├── .env.example                   # user-facing environment-variable SSOT
