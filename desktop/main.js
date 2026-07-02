@@ -2296,7 +2296,17 @@ function hasActivePostStopWork() {
   return pendingTranscriptionCount > 0 || postStopWorkerRunning || postStopQueue.length > 0;
 }
 
+function cancelScheduledOverlayHide(reason = "") {
+  if (overlayHideTimer === null) return;
+  clearTimeout(overlayHideTimer);
+  overlayHideTimer = null;
+  if (reason) {
+    appendMainLog(`[overlay-hide] cancelled pending hide: ${reason}`);
+  }
+}
+
 async function showRecordingOverlay() {
+  cancelScheduledOverlayHide("show-recording");
   // Preserve user's last quick-settings open/closed choice across runs.
   overlaySilenceStartedAt = 0;
   overlayAutoStopConfigRefreshAt = 0;
@@ -2453,6 +2463,7 @@ async function showRecordingOverlay() {
 
 async function ensureOverlayVisible(options = {}) {
   const { resetTimer = false, startTimer = false, status = null } = options;
+  cancelScheduledOverlayHide("ensure-visible");
   const ow = ensureOverlayWindow();
   positionOverlayWindow();
   // Idempotent / race-safe load: see ensureOverlayLoaded note above.
@@ -2511,9 +2522,7 @@ async function setOverlayTimer(text) {
  * new recording session.
  */
 function scheduleOverlayHide(ms) {
-  if (overlayHideTimer !== null) {
-    clearTimeout(overlayHideTimer);
-  }
+  cancelScheduledOverlayHide();
   overlayHideTimer = setTimeout(() => {
     overlayHideTimer = null;
     hideRecordingOverlay();
@@ -2521,10 +2530,7 @@ function scheduleOverlayHide(ms) {
 }
 
 function hideRecordingOverlay() {
-  if (overlayHideTimer !== null) {
-    clearTimeout(overlayHideTimer);
-    overlayHideTimer = null;
-  }
+  cancelScheduledOverlayHide();
   if (!overlayWin || overlayWin.isDestroyed()) return;
   overlayWin.hide();
   overlayStopInFlight = false;
