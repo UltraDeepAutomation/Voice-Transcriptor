@@ -2820,7 +2820,7 @@ async function waitForRendererUiReady(timeoutMs = 8000) {
     try {
       const remainingMs = Math.max(100, timeoutMs - (Date.now() - started));
       const ready = await execRendererJsWithTimeout(
-        `(() => !!(document.getElementById('btnStart') && document.getElementById('btnStop')) )();`,
+        `(() => typeof window.__transcriptorLiveStatusSnapshot === 'function')();`,
         false,
         Math.min(500, remainingMs)
       );
@@ -2905,7 +2905,10 @@ async function toggleRecordingFromShortcut() {
         const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
         const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
         const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
-        const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
+        const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
+          ? window.__transcriptorLiveStatusSnapshot()
+          : null;
+        const timerText = String(liveSnapshot?.timerText || '00:00').trim();
         window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
         return { ok: true, recording: !isRec, auto, autoSendEnter, timerText, recordingId };
       })();
@@ -3033,13 +3036,16 @@ async function stopRecordingFromOverlay() {
           const isRec = !!(window.__transcriptorIsRecording);
           const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
           const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-          const timerText = (document.getElementById('timer')?.textContent || '00:00').trim();
+          const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
+            ? window.__transcriptorLiveStatusSnapshot()
+            : null;
+          const timerText = String(liveSnapshot?.timerText || '00:00').trim();
           const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
           if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
           if (expectedRecordingId > 0 && recordingId !== expectedRecordingId) {
             return { ok: false, recording: true, stale: true, timerText, recordingId, expectedRecordingId, auto, autoSendEnter };
           }
-          // Use dedicated stop event — avoids dual-path race with btnStop.click().
+          // Use a dedicated stop event so overlay stop has one renderer entrypoint.
           window.dispatchEvent(new CustomEvent('transcriptor-hotkey-stop', { detail: { recordingId } }));
           return { ok: true, recording: false, timerText, recordingId, auto, autoSendEnter };
         })();
@@ -3131,10 +3137,13 @@ async function queryRendererState() {
           .slice(-30)
         : [];
       const isRec = !!(window.__transcriptorIsRecording);
-      const status = (document.getElementById('statusText')?.textContent || '').trim();
+      const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
+        ? window.__transcriptorLiveStatusSnapshot()
+        : null;
+      const status = String(liveSnapshot?.status || '').trim();
       const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
       const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
-      const busy = !!document.getElementById('btnStart')?.disabled;
+      const busy = !!liveSnapshot?.busy;
       const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
       return {
         finishedAt,

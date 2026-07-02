@@ -117,7 +117,7 @@ interface CurrentRecordingSummary {
   /** User-visible status line. Rendered via ``setStatus`` on every
    *  update and into the session notice banner when tone escalates. */
   status: string;
-  /** Drives status-dot colour and the notice banner tone. */
+  /** Drives the notice banner tone and persisted status severity. */
   tone: UiTone;
   /** Wall-clock milliseconds from stop → transcript-ready. Rendered
    *  into the ``transcribeLatency`` pill on every update. */
@@ -286,6 +286,14 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
 }
 
 type RecordingFinalSignalKind = "" | "transcript" | "status" | "error";
+type LiveStatusSnapshot = {
+  status: string;
+  statusKind: StatusKind;
+  timerText: string;
+  busy: boolean;
+  recording: boolean;
+  recordingId: number;
+};
 
 // Compile-time injected by vite.config.ts from desktop/package.json's
 // ``version`` field. SSOT for the version label rendered in the
@@ -309,6 +317,7 @@ declare global {
     __transcriptorLastUiFinalAt?: number;
     __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
+    __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorGetQuickSettingsOpen?: () => boolean;
     __transcriptorSetQuickSettingsOpen?: (open: boolean) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
@@ -396,8 +405,6 @@ const UI_TOKENS = {
   capture: {
     fallbackInitDelayMs: 1_300,
     vuAmplify: 4,
-    waveformMixRms: 6.6,
-    waveformMixPeak: 0.45,
   },
   finalize: {
     segmentEpsilonSec: 0.08,
@@ -606,6 +613,9 @@ function applyHealthModelCatalog(catalog: unknown): void {
 
 let isBusy = false;
 let isRecording = false;
+let liveStatusText = "Idle";
+let liveStatusKind: StatusKind = "idle";
+let liveTimerText = "00:00";
 let mediaRecorder: MediaRecorder | null = null;
 let recordedWebmChunks: Blob[] = [];
 let isNetworkOnline = true;
@@ -1564,7 +1574,7 @@ function setBusy(nextBusy: boolean, scopeToken = ""): void {
     busyScopeToken = "";
   }
   isBusy = !!nextBusy;
-  ["btnStart", "btnStop", "btnTranscribeFile", "pickFileBtn", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
+  ["btnTranscribeFile", "pickFileBtn", "providerSelect", "remoteModelSelect", "quickProviderSelect", "quickSettingsToggle", "upscaleToggle", "upscalePresetSelect", "upscalePresetAddBtn", "upscalePresetDeleteBtn", "upscalePresetSaveBtn", "upscalePresetCancelBtn", "orKeyActionBtn", "deepgramKeyActionBtn"].forEach((id) => {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
@@ -1576,29 +1586,7 @@ function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): voi
 }
 
 function setRecordButton(recording: boolean): void {
-  const b = $("btnStart") as HTMLButtonElement;
-  b.classList.toggle("recording", recording);
-  b.setAttribute("aria-label", recording ? "Stop recording" : "Start recording");
-}
-
-function statusKindToDotClass(kind: StatusKind): string {
-  switch (kind) {
-    case "recording":
-      return " rec";
-    case "processing":
-      return " process";
-    case "done":
-      return " done";
-    case "error":
-      return " error";
-    case "warning":
-      return " warn";
-    case "info":
-      return " process";
-    case "idle":
-    default:
-      return "";
-  }
+  isRecording = !!recording;
 }
 
 /** Maximum length for a status line that fits the pill without
@@ -1619,13 +1607,8 @@ function abbreviateForStatusPill(text: string): string {
 
 function setStatus(st: string, kind?: StatusKind): void {
   const full = String(st || "").trim();
-  const short = abbreviateForStatusPill(full);
-  const el = $("statusText");
-  el.textContent = short;
-  el.setAttribute("title", full);
-  const resolvedKind: StatusKind = kind || inferStatusKindFromText(full);
-  const dot = $("statusDot");
-  dot.className = "status-dot" + statusKindToDotClass(resolvedKind);
+  liveStatusText = abbreviateForStatusPill(full);
+  liveStatusKind = kind || inferStatusKindFromText(full);
 }
 
 function setSettingsArchiveStatus(message: string, tone: UiTone = "neutral"): void {
@@ -3029,14 +3012,12 @@ function scheduleLocalWarmup(): void {
 
 // Formerly toggled between "live recording" and "file upload" modes
 // based on a switch that no longer exists — live mode is the only
-// supported surface. Recording controls now live in the overlay, while
-// the old required DOM ids remain hidden as internal state sinks.
+// supported surface. Recording controls now live in the overlay; state
+// consumed by Electron main is published through liveStatusSnapshot().
 function syncMode(): void {
   $("livePane").hidden = false;
   $("splitGap").hidden = false;
-  $("waveCanvas").hidden = true;
   $("uploadPanel").hidden = true;
-  $("btnStart").style.display = "none";
   // Removed: setSelectedFile(null). The Live tab no longer surfaces a
   // file picker — the Upload tab fully owns batch transcription. The
   // call here was a vestige of the pre-Upload-tab era; resetting
@@ -3292,113 +3273,7 @@ async function loadMics(forceReload = false): Promise<void> {
 
 ($("refreshMicsBtn") as HTMLButtonElement).addEventListener("click", () => void loadMics(true));
 
-const LEGACY_WAVEFORM_ENABLED = false;
-const canvas = $("waveCanvas") as HTMLCanvasElement;
-const ctx = LEGACY_WAVEFORM_ENABLED ? canvas.getContext("2d") : null;
-
-// --- Ring buffer for waveform bars (avoids GC-heavy Array.slice) ---
-const WAVE_BUF_CAP = 512;
-const waveBuf = new Float32Array(WAVE_BUF_CAP);
-let waveBufHead = 0;
-let waveBufLen = 0;
-let maxBars = 0;
-let waveAnimId = 0;
-const BAR_W = 3;
-const BAR_GAP = 2;
 const WAVE_METER_INTERVAL_MS = 50;
-const WAVE_PUSH_EVERY_FRAMES = 2;
-let waveFrameCount = 0;
-let waveDirty = false;
-
-function waveBarAt(reverseIdx: number): number {
-  const idx = (waveBufHead - 1 - reverseIdx + WAVE_BUF_CAP) % WAVE_BUF_CAP;
-  return waveBuf[idx];
-}
-
-function wavePush(v: number): void {
-  if (!LEGACY_WAVEFORM_ENABLED) return;
-  waveBuf[waveBufHead] = v;
-  waveBufHead = (waveBufHead + 1) % WAVE_BUF_CAP;
-  if (waveBufLen < WAVE_BUF_CAP) waveBufLen++;
-  waveDirty = true;
-}
-
-function waveClear(): void {
-  if (!LEGACY_WAVEFORM_ENABLED) return;
-  waveBufHead = 0;
-  waveBufLen = 0;
-}
-
-function resize(): void {
-  if (!ctx) return;
-  const r = (canvas.parentElement as HTMLElement).getBoundingClientRect();
-  canvas.width = r.width;
-  canvas.height = r.height;
-  maxBars = Math.max(32, Math.floor(r.width / (BAR_W + BAR_GAP)) + 4);
-  draw();
-}
-if (LEGACY_WAVEFORM_ENABLED) {
-  new ResizeObserver(resize).observe(canvas.parentElement as Element);
-  resize();
-}
-
-function draw(): void {
-  if (!ctx) return;
-  const W = canvas.width;
-  const H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
-  const mid = H / 2;
-  if (waveBufLen === 0) {
-    ctx.strokeStyle = "#333";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, mid);
-    ctx.lineTo(W, mid);
-    ctx.stroke();
-    return;
-  }
-
-  const count = Math.min(maxBars, waveBufLen);
-  for (let i = 0; i < count; i++) {
-    const v = waveBarAt(i);
-    const x = W - (i + 1) * (BAR_W + BAR_GAP);
-    if (x < 0) break;
-
-    const h = Math.max(2, Math.min(H - 4, v * (H * 0.92)));
-    const y = (H - h) / 2;
-
-    ctx.fillStyle = "rgba(170,170,170,0.28)";
-    ctx.fillRect(x, y, BAR_W, h);
-    ctx.fillStyle = "rgba(210,210,210,0.7)";
-    ctx.fillRect(x, y + h * 0.15, BAR_W, h * 0.7);
-  }
-  waveDirty = false;
-}
-
-// --- rAF-driven render loop (decoupled from data collection) ---
-let waveLoopRunning = false;
-function waveLoop(): void {
-  if (!waveLoopRunning) {
-    waveAnimId = 0;
-    return;
-  }
-  if (waveDirty && document.visibilityState === "visible") draw();
-  waveAnimId = requestAnimationFrame(waveLoop);
-}
-function startWaveLoop(): void {
-  if (!LEGACY_WAVEFORM_ENABLED) return;
-  if (waveLoopRunning) return;
-  waveLoopRunning = true;
-  if (waveAnimId) cancelAnimationFrame(waveAnimId);
-  waveAnimId = requestAnimationFrame(waveLoop);
-}
-function stopWaveLoop(): void {
-  waveLoopRunning = false;
-  if (waveAnimId) {
-    cancelAnimationFrame(waveAnimId);
-    waveAnimId = 0;
-  }
-}
 
 let vu = 0;
 function setVU(rms: number): void {
@@ -3421,7 +3296,7 @@ function persistLiveDraft(recording: boolean): void {
   try {
     const liveText = getCanonicalLiveSourceText();
     const finalText = ($("finalOutput").textContent || "").trim();
-    const timerText = ($("timer").textContent || "00:00").trim();
+    const timerText = liveTimerText;
     const title = "Recording " + new Date(startAt || Date.now()).toLocaleString();
     const draft = {
       session_id: activeLiveSessionId || activeUiSessionToken || "",
@@ -6293,6 +6168,19 @@ let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
 let liveWsMode: LiveWsMode = "none";
 
+function liveStatusSnapshot(): LiveStatusSnapshot {
+  return {
+    status: liveStatusText,
+    statusKind: liveStatusKind,
+    timerText: liveTimerText,
+    busy: isBusy,
+    recording: isRecording,
+    recordingId: currentRecordingId,
+  };
+}
+
+window.__transcriptorLiveStatusSnapshot = liveStatusSnapshot;
+
 function resolvePendingWorkletFlushes(): void {
   for (const finish of Array.from(pendingWorkletFlushes.values())) {
     finish();
@@ -6365,7 +6253,6 @@ async function cleanupCancelledStartCaptureResources(): Promise<void> {
     clearInterval(vuIntervalId);
     vuIntervalId = null;
   }
-  stopWaveLoop();
   detachWorkletCapture("cancelled live start");
   try {
     if (src && scriptNode) src.disconnect(scriptNode);
@@ -6997,7 +6884,7 @@ function resetOutputs(): void {
   ($("upscaleOutput") as HTMLElement).dataset.upscaleNonce = "";
   $("transcribeLatency").textContent = "--";
   $("upscaleLatency").textContent = "--";
-  $("timer").textContent = "00:00";
+  liveTimerText = "00:00";
   $("progressRow").hidden = true;
   $("downloadRow").hidden = true;
   $("progressFill").style.width = "0%";
@@ -7255,7 +7142,6 @@ async function startLive(): Promise<void> {
   const sessionWsMode = liveWsMode;
   liveTranscriptBuffers.set(sessionUiToken, createLiveTranscriptBuffer(sessionWsMode));
   setBusy(true, sessionUiToken);
-  isRecording = true;
   currentRecordingId = ++liveRecordingSeq;
   // Recording started — transcription happens on stop via single sync call.
   window.__transcriptorIsRecording = true;
@@ -7267,9 +7153,6 @@ async function startLive(): Promise<void> {
   clearRecordingFinalSignal();
   window.__transcriptorCurrentRecordingId = currentRecordingId;
   setRecordButton(true);
-  // Keep single mic button interactive while recording.
-  ($("btnStart") as HTMLButtonElement).disabled = false;
-  (document.getElementById("btnStop") as HTMLButtonElement).disabled = false;
   setStatusScoped(sessionUiToken, "Starting");
   window.__transcriptorVuLevel = 0;
   window.__transcriptorRmsLevel = 0;
@@ -7285,7 +7168,7 @@ async function startLive(): Promise<void> {
   timer = window.setInterval(() => {
     const durationSec = startAt > 0 ? (Date.now() - startAt) / 1000 : 0;
     if (isCurrentUiSession(sessionUiToken)) {
-      $("timer").textContent = fmtTime(durationSec);
+      liveTimerText = fmtTime(durationSec);
     }
   }, UI_TOKENS.timer.tickMs);
 
@@ -7545,24 +7428,14 @@ async function startLive(): Promise<void> {
       }
       analyser.getFloatTimeDomainData(buf);
       let sum = 0;
-      let peak = 0;
       for (let i = 0; i < buf.length; i++) {
         const s = buf[i];
         sum += s * s;
-        const a = Math.abs(s);
-        if (a > peak) peak = a;
       }
       const rms = Math.sqrt(sum / buf.length);
       setVU(rms);
-
-      waveFrameCount += 1;
-      if (waveFrameCount % WAVE_PUSH_EVERY_FRAMES === 0) {
-        const level = Math.min(1, rms * UI_TOKENS.capture.waveformMixRms + peak * UI_TOKENS.capture.waveformMixPeak);
-        wavePush(level);
-      }
     };
     vuIntervalId = setInterval(tick, WAVE_METER_INTERVAL_MS);
-    startWaveLoop();
 
     let workletCaptureStarted = false;
     if (ac.audioWorklet && typeof AudioWorkletNode === "function") {
@@ -7703,11 +7576,6 @@ async function stopLive(enhance: boolean): Promise<void> {
   const liveSessionId = activeLiveSessionId;
   const sessionUiToken = liveSessionId;
   stoppedSessionToken = sessionUiToken;
-  const disableStopButtonForSession = (): void => {
-    if (!isCurrentUiSession(sessionUiToken)) return;
-    const stopBtn = document.getElementById("btnStop") as HTMLButtonElement | null;
-    if (stopBtn) stopBtn.disabled = true;
-  };
   const releaseStopTransitionAfterCaptureDetach = (): void => {
     if (stopTransitionReleased) return;
     stopTransitionReleased = true;
@@ -7715,7 +7583,6 @@ async function stopLive(enhance: boolean): Promise<void> {
       stopTransitionInFlight = false;
       stopTransitionOwnerToken = "";
     }
-    disableStopButtonForSession();
   };
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
@@ -7992,7 +7859,6 @@ async function stopLive(enhance: boolean): Promise<void> {
     draftSaveTimer = null;
   }
   persistLiveDraft(false);
-  stopWaveLoop();
   if (fallbackCaptureTimer) {
     clearTimeout(fallbackCaptureTimer);
     fallbackCaptureTimer = null;
@@ -8095,7 +7961,6 @@ async function stopLive(enhance: boolean): Promise<void> {
   activeLiveSessionId = "";
   activeLiveArchiveDir = "";
   activeLiveSessionSnapshot = null;
-  isRecording = false;
   // currentRecordingId / window.__transcriptorCurrentRecordingId are also
   // cleared in the outer finally below so they are guaranteed to reset on
   // every exit path — including uncaught throws before this point.
@@ -8105,10 +7970,6 @@ async function stopLive(enhance: boolean): Promise<void> {
   window.__transcriptorLastFrameAt = 0;
   window.__transcriptorCurrentRecordingId = 0;
   setRecordButton(false);
-  waveFrameCount = 0;
-  waveClear();
-  stopWaveLoop();
-  draw();
   resetVU();
 
   if (savedAudioFile) {
@@ -8215,7 +8076,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    disableStopButtonForSession();
+    releaseStopTransitionAfterCaptureDetach();
     setStatusScoped(sessionUiToken, "Error");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -8261,7 +8122,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    disableStopButtonForSession();
+    releaseStopTransitionAfterCaptureDetach();
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       status: "Silence detected. Audio remains available for review.",
@@ -8309,7 +8170,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    disableStopButtonForSession();
+    releaseStopTransitionAfterCaptureDetach();
     setStatusScoped(sessionUiToken, skippedBySetting ? "Idle" : "Error");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -8357,7 +8218,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    disableStopButtonForSession();
+    releaseStopTransitionAfterCaptureDetach();
     setStatusScoped(sessionUiToken, "Idle");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -8417,7 +8278,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }
     clearLiveDraft(sessionUiToken);
     setBusy(false, sessionUiToken);
-    disableStopButtonForSession();
+    releaseStopTransitionAfterCaptureDetach();
     return;
   }
   // (transcribeStartedAt is captured at the top of stopLive — line ~6510)
@@ -9312,7 +9173,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }, sessionUiToken);
   } finally {
     clearLiveDraft(sessionUiToken);
-    disableStopButtonForSession();
+    releaseStopTransitionAfterCaptureDetach();
     mark("stopLive:done");
     const totalMs = performance.now() - stopT0;
     const labels = stopTimings
@@ -9342,6 +9203,8 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (stoppedRecordingId > 0 && currentRecordingId === stoppedRecordingId) {
       currentRecordingId = 0;
       window.__transcriptorCurrentRecordingId = 0;
+      window.__transcriptorIsRecording = false;
+      setRecordButton(false);
     }
     // ── 1.1.22: close the live WS here, AFTER the entire transcribe
     // phase finished. See comment at the deferred-close site for the
@@ -9646,7 +9509,6 @@ drop.addEventListener("drop", (e: DragEvent) => {
 });
 
 $("btnTranscribeFile").addEventListener("click", () => void transcribeSelectedFile());
-// Legacy topbar recording buttons stay mounted only for state compatibility.
 // User-facing recording is controlled by the overlay and global hotkey events.
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
@@ -9771,7 +9633,6 @@ try {
     : (ua.includes("windows") ? "win32" : "linux");
   document.body.classList.add(`platform-${platform}`);
 } catch { /* non-browser contexts — harmless */ }
-draw();
 syncMode();
 setStatus("Idle");
 setRecordButton(false);
@@ -9895,7 +9756,6 @@ window.__setBackendBootError = (msg: string) => {
   const retryBtn = document.getElementById("bootOverlayRetry") as HTMLButtonElement | null;
   if (retryBtn) retryBtn.hidden = false;
   setStatus("Backend Error", "error");
-  ($("statusDot") as HTMLElement).className = "status-dot error";
   // Replace liveOutput with the friendly headline only — the raw
   // detail already lives in the boot overlay's disclosure. Previously
   // we wrote the raw stderr tail into the live-transcript pane which

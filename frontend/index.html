@@ -271,18 +271,6 @@
           </div>
           <div id="vuFill" hidden></div>
           <div hidden>
-            <!-- Internal state sinks for legacy recording DOM ids; the visible recorder is the overlay. -->
-            <div class="legacy-recording-sinks" id="legacyRecordingSinks" hidden aria-hidden="true">
-              <div data-internal-sink="recording-status">
-                <div class="status-dot" id="statusDot"></div>
-                <span class="status-text" id="statusText">Idle</span>
-                <span class="timer" id="timer">00:00</span>
-              </div>
-              <canvas id="waveCanvas" width="240" height="44"></canvas>
-              <button class="btn mic-btn" id="btnStart" type="button" aria-label="Legacy recording sink"
-                tabindex="-1"></button>
-              <button class="btn btn-ghost" id="btnStop" type="button" disabled hidden tabindex="-1">Stop</button>
-            </div>
             <div class="quick-settings-panel" id="quickSettingsPanel" hidden>
               <label class="quick-field">
                 <span class="quick-lbl">Provider</span>
