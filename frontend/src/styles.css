@@ -368,6 +368,61 @@ body.platform-darwin .sidebar {
   width: fit-content;
 }
 
+.window-status-pill {
+  margin-left: auto;
+  min-width: 0;
+  max-width: min(360px, 42vw);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--chip-border);
+  border-radius: var(--chip-radius);
+  min-height: 28px;
+  padding: 0 10px;
+  background: var(--chip-bg);
+  box-shadow: none;
+  -webkit-app-region: no-drag;
+}
+
+.window-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--status-neutral);
+  flex: 0 0 auto;
+}
+
+.window-status-dot.recording {
+  background: var(--status-rec);
+}
+
+.window-status-dot.processing,
+.window-status-dot.info {
+  background: var(--status-process);
+}
+
+.window-status-dot.done {
+  background: var(--status-done);
+}
+
+.window-status-dot.warning {
+  background: var(--status-warn);
+}
+
+.window-status-dot.error {
+  background: var(--danger-dot);
+}
+
+.window-status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  font-size: 10px;
+  font-weight: 650;
+}
+
 .net-pill {
   margin-left: 4px;
   display: inline-flex;
@@ -2518,6 +2573,11 @@ canvas,
     flex-direction: column;
   }
 
+  .window-status-pill {
+    margin-left: 0;
+    max-width: 100%;
+  }
+
   /*
    * When the topbar inner stacks vertically, the fixed ``--h-topbar``
    * (45 px) can't contain the 58.5 px column — the net-pill overflows
@@ -2530,6 +2590,11 @@ canvas,
     height: auto;
     padding-top: 8px;
     padding-bottom: 8px;
+  }
+
+  .window-status-pill {
+    margin-left: 0;
+    max-width: 100%;
   }
 
   .topbar {

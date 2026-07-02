@@ -1510,13 +1510,8 @@ function renderCurrentRecordingSummary(
     lastRenderedStatusTone = "neutral";
     lastNoticedStatusKey = "";
     lastRenderedLatencyMs = null;
-    // Also clear the DOM pill — previously only internal state was reset,
-    // leaving the previous session's status text (e.g. "Done", "Upscaling")
-    // visible in the header after recording ended.
-    // ``"idle"`` (not the formerly-passed ``"neutral"``) is the
-    // ``StatusKind`` enum value matching the visual neutral grey dot.
-    // ``"neutral"`` was a TS2345 error caught by tsc but tolerated
-    // because Vite skips type-checks. Now the type contract holds.
+    // Reset the shared status surface to an explicit idle state so the
+    // topbar never keeps the previous session's "Done"/"Upscaling" label.
     setStatus("", "idle");
     return;
   }
@@ -1589,6 +1584,26 @@ function setRecordButton(recording: boolean): void {
   isRecording = !!recording;
 }
 
+function statusKindToDotClass(kind: StatusKind): string {
+  switch (kind) {
+    case "recording":
+      return "recording";
+    case "processing":
+      return "processing";
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+    case "warning":
+      return "warning";
+    case "info":
+      return "info";
+    case "idle":
+    default:
+      return "idle";
+  }
+}
+
 /** Maximum length for a status line that fits the pill without
  *  truncation at the current column width. Longer messages are
  *  abbreviated in the pill and shown in full via the hover title and
@@ -1607,8 +1622,22 @@ function abbreviateForStatusPill(text: string): string {
 
 function setStatus(st: string, kind?: StatusKind): void {
   const full = String(st || "").trim();
-  liveStatusText = abbreviateForStatusPill(full);
-  liveStatusKind = kind || inferStatusKindFromText(full);
+  const text = full || "Idle";
+  liveStatusText = abbreviateForStatusPill(text);
+  liveStatusKind = kind || inferStatusKindFromText(text);
+  const pill = document.getElementById("statusPill");
+  const dot = document.getElementById("statusDot");
+  const label = document.getElementById("statusText");
+  if (pill) {
+    pill.setAttribute("title", text);
+    pill.setAttribute("aria-label", `Application status: ${text}`);
+  }
+  if (dot) {
+    dot.className = `window-status-dot ${statusKindToDotClass(liveStatusKind)}`;
+  }
+  if (label) {
+    label.textContent = liveStatusText;
+  }
 }
 
 function setSettingsArchiveStatus(message: string, tone: UiTone = "neutral"): void {
