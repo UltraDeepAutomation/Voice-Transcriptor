@@ -8342,8 +8342,8 @@ async function stopLive(enhance: boolean): Promise<void> {
     tone: "info",
   }, sessionUiToken);
   // Single-capsule invariant: keep the app busy until this stop/transcribe
-  // pipeline reaches the outer finally. That keeps hotkeys, main-process stops,
-  // and in-app recording controls behind the same source of truth.
+  // pipeline reaches the outer finally. That keeps global hotkeys,
+  // main-process stops, and the visible capsule behind the same source of truth.
   try {
     // ── Recovery-audio resolver ────────────────────────────────────
     //
