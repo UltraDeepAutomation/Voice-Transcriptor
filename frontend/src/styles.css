@@ -573,11 +573,14 @@ textarea:focus-visible,
   line-height: 1.2;
 }
 
-/* Quick settings are controlled from the recording capsule, not from the main top bar. */
+/* Legacy recording ids are JS-only state sinks for the Electron overlay. */
 #legacyRecordingSinks,
+#legacyRecordingSinks *,
 #quickSettingsPanel,
 #quickSettingsToggle {
   display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
 }
 
 .quick-settings-panel {

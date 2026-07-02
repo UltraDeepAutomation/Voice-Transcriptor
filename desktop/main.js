@@ -286,14 +286,14 @@ let BACKEND_BOOT_NONCE = "";
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const OVERLAY_TOKENS = Object.freeze({
   window: Object.freeze({
-    collapsedWidth: 184,
-    expandedWidth: 196,
+    collapsedWidth: 172,
+    expandedWidth: 172,
     expandedHeight: 96,
-    height: 47,
-    geometryPadding: 4,
-    minWidth: 120,
-    minHeight: 32,
-    maxWidth: 360,
+    height: 42,
+    geometryPadding: 2,
+    minWidth: 112,
+    minHeight: 30,
+    maxWidth: 260,
     maxHeight: 260,
     bottomOffset: 10,
   }),
@@ -301,7 +301,7 @@ const OVERLAY_TOKENS = Object.freeze({
     marginTop: 6,
     gap: 9,
     padY: 7,
-    padX: 10,
+    padX: 6,
     borderRadius: 999,
     border: "1px solid rgba(255,255,255,.18)",
     background: "linear-gradient(180deg,rgba(40,40,40,.97),rgba(24,24,24,.97))",
@@ -1136,7 +1136,7 @@ function createOverlayHtml() {
           align-items:center;
           justify-content:flex-start;
           gap:6px;
-          padding:${t.pill.padY}px 7px ${t.pill.padY}px 5px;
+          padding:${t.pill.padY}px ${t.pill.padX}px;
           border-radius:${t.pill.borderRadius}px;
           border:1px solid #333;
           background:#161616;
@@ -1148,7 +1148,7 @@ function createOverlayHtml() {
           display:flex;
           align-items:center;
           justify-content:center;
-          gap:9px;
+          gap:${t.pill.gap}px;
         }
         #settingsSlot{
           width:100%;
