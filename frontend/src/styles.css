@@ -466,11 +466,13 @@ body.platform-darwin .sidebar {
 
 .topbar-row {
   display: grid;
-  grid-template-columns: minmax(100px, 0.7fr) minmax(84px, 0.52fr) minmax(178px, 1.18fr) minmax(196px, 1.38fr) 52px;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
   align-items: start;
   gap: 14px;
   min-width: 0;
-  width: 100%;
+  width: fit-content;
+  max-width: 100%;
   -webkit-app-region: no-drag;
 }
 
@@ -501,6 +503,23 @@ body.platform-darwin .sidebar {
   gap: 6px;
   padding-bottom: 0;
   min-width: 0;
+  width: 180px;
+}
+
+.view[data-view="record"] .top-item-mic {
+  width: 300px;
+}
+
+.view[data-view="upload"] .top-item-mic {
+  width: 220px;
+}
+
+.top-item-lang {
+  width: 92px;
+}
+
+.top-item-toggle {
+  width: auto;
 }
 
 .top-item .lbl {
@@ -754,50 +773,6 @@ textarea:focus-visible,
 .btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
-}
-
-.mic-btn {
-  width: 100%;
-  height: var(--h-control);
-  padding: 0;
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.mic-btn::before {
-  content: "";
-  width: 19px;
-  height: 19px;
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: 19px 19px;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='8' y='3' width='8' height='12' rx='4' stroke='%23D4D4D4' stroke-width='2'/%3E%3Cpath d='M6 11C6 14.3137 8.68629 17 12 17C15.3137 17 18 14.3137 18 11' stroke='%23D4D4D4' stroke-width='2' stroke-linecap='round'/%3E%3Cpath d='M12 17V21' stroke='%23D4D4D4' stroke-width='2' stroke-linecap='round'/%3E%3Cpath d='M9 21H15' stroke='%23D4D4D4' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
-}
-
-.mic-btn::after {
-  content: none;
-}
-
-.mic-btn.recording {
-  background: var(--bg-11);
-  border-color: var(--line-5);
-}
-
-.mic-btn.recording::before {
-  width: 12px;
-  height: 12px;
-  border: 0;
-  border-radius: 3px;
-  background: var(--text-mute-strong);
-  background-image: none;
-}
-
-.mic-btn.recording::after {
-  border-color: transparent;
-  width: 0;
-  height: 0;
 }
 
 .split {
@@ -2598,11 +2573,11 @@ canvas,
   }
 
   .topbar {
-    overflow-x: auto;
+    overflow-x: visible;
   }
 
   .topbar-row {
-    min-width: 690px;
+    min-width: 0;
   }
 
   .settings {
@@ -2621,7 +2596,7 @@ canvas,
   }
 
   .topbar-row {
-    min-width: 690px;
+    min-width: 0;
   }
 
   .split {
@@ -2672,7 +2647,17 @@ canvas,
 
   .topbar-row {
     min-width: 0;
+    width: 100%;
+    grid-auto-flow: row;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .top-item,
+  .view[data-view="record"] .top-item-mic,
+  .view[data-view="upload"] .top-item-mic,
+  .top-item-lang,
+  .top-item-toggle {
+    width: 100%;
   }
 
   .context-chip {

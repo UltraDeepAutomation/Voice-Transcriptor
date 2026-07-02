@@ -9557,7 +9557,8 @@ drop.addEventListener("drop", (e: DragEvent) => {
 });
 
 $("btnTranscribeFile").addEventListener("click", () => void transcribeSelectedFile());
-// User-facing recording is controlled by renderer buttons and global hotkey events.
+// User-facing recording is controlled by global hotkey events that the
+// Electron main process dispatches into this renderer.
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
   if (isRecording) {
