@@ -2033,7 +2033,10 @@ function createOverlayHtml() {
           render();
         }, ${t.wave.idleTickMs});
         tick();
-        window.startTimer();
+        // Timer ownership lives in the main-process overlay state machine.
+        // Starting it during HTML bootstrap makes non-recording overlays
+        // (Starting/App Loading/Transcribing/Pasting) show a second,
+        // autonomous countdown before the main process can stop it.
         window.setQuickOpen(false);
         window.setUpscaleEnabled(false);
         window.setUpscaleOptions([{ id: 'builtin_clean', name: 'Clean' }], 'builtin_clean');
