@@ -371,6 +371,92 @@ const fmtBytes = (bytes: number): string => {
   return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 };
 
+type AppearanceMediaBinding = {
+  query: string;
+  className: string;
+  dataKey: string;
+  enabledValue: string;
+  disabledValue: string;
+};
+
+function installAppearanceStateClasses(): void {
+  const root = document.documentElement;
+  const bindings: AppearanceMediaBinding[] = [
+    {
+      query: "(prefers-reduced-transparency: reduce)",
+      className: "reduce-transparency",
+      dataKey: "reduceTransparency",
+      enabledValue: "reduce",
+      disabledValue: "no-preference",
+    },
+    {
+      query: "(prefers-contrast: more)",
+      className: "increased-contrast",
+      dataKey: "contrast",
+      enabledValue: "more",
+      disabledValue: "no-preference",
+    },
+    {
+      query: "(prefers-reduced-motion: reduce)",
+      className: "reduce-motion",
+      dataKey: "reduceMotion",
+      enabledValue: "reduce",
+      disabledValue: "no-preference",
+    },
+    {
+      query: "(forced-colors: active)",
+      className: "forced-colors",
+      dataKey: "forcedColors",
+      enabledValue: "active",
+      disabledValue: "none",
+    },
+  ];
+  const media = bindings.map((binding) => ({
+    binding,
+    mql: window.matchMedia(binding.query),
+  }));
+  const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
+  const lightScheme = window.matchMedia("(prefers-color-scheme: light)");
+  const cleanupFns: Array<() => void> = [];
+
+  const apply = () => {
+    for (const { binding, mql } of media) {
+      const enabled = !!mql.matches;
+      root.classList.toggle(binding.className, enabled);
+      root.dataset[binding.dataKey] = enabled ? binding.enabledValue : binding.disabledValue;
+    }
+    const scheme = darkScheme.matches ? "dark" : (lightScheme.matches ? "light" : "no-preference");
+    root.classList.toggle("scheme-dark", scheme === "dark");
+    root.classList.toggle("scheme-light", scheme === "light");
+    root.dataset.colorScheme = scheme;
+  };
+
+  const bindMedia = (mql: MediaQueryList) => {
+    const listener = () => apply();
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", listener);
+      cleanupFns.push(() => mql.removeEventListener("change", listener));
+      return;
+    }
+    const legacy = mql as MediaQueryList & {
+      addListener?: (listener: () => void) => void;
+      removeListener?: (listener: () => void) => void;
+    };
+    legacy.addListener?.(listener);
+    cleanupFns.push(() => legacy.removeListener?.(listener));
+  };
+
+  for (const { mql } of media) bindMedia(mql);
+  bindMedia(darkScheme);
+  bindMedia(lightScheme);
+  apply();
+  window.addEventListener("pagehide", () => {
+    for (const cleanup of cleanupFns.splice(0)) cleanup();
+  }, { once: true });
+}
+
+installAppearanceStateClasses();
+
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 // SSOT: backend defines MAX_UPLOAD_BYTES in backend/main.py and surfaces
 // it in /api/health under "max_upload_bytes". The constant below is the

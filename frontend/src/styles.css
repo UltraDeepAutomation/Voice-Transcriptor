@@ -186,6 +186,28 @@ body {
   }
 }
 
+:root.reduce-transparency,
+:root.increased-contrast {
+  --glass-bg: var(--bg-3);
+  --glass-bg-strong: var(--bg-4);
+  --glass-control-bg: var(--bg-3);
+  --glass-control-bg-subtle: var(--bg-3);
+  --glass-control-bg-hover: var(--bg-8);
+  --glass-control-bg-active: var(--bg-9);
+  --glass-chip-bg: var(--bg-8);
+  --glass-border: var(--line-2);
+  --glass-border-strong: var(--line-3);
+  --glass-highlight: transparent;
+  --glass-highlight-strong: transparent;
+  --glass-filter: none;
+  --glass-filter-soft: none;
+  --glass-popover-bg: var(--bg-2);
+  --glass-modal-bg: var(--bg-2);
+  --glass-shadow-popover: none;
+  --glass-shadow-modal: none;
+  --glass-surface-outline: none;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -2715,6 +2737,27 @@ canvas,
   }
 }
 
+:root.reduce-motion *,
+:root.reduce-motion *::before,
+:root.reduce-motion *::after {
+  transition: none !important;
+  transition-delay: 0ms !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  scroll-behavior: auto !important;
+}
+
+:root.reduce-motion .btn:active,
+:root.reduce-motion .upload-droplarge.drag {
+  transform: none;
+}
+
+:root.reduce-motion .boot-overlay-spinner,
+:root.reduce-motion .icon-btn.is-busy .reload-ico,
+:root.reduce-motion .shortcut-btn.recording {
+  animation: none;
+}
+
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
   .screen-header,
   .recordings-head,
@@ -2751,6 +2794,74 @@ canvas,
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
+}
+
+:root.reduce-transparency .screen-header,
+:root.increased-contrast .screen-header,
+:root.reduce-transparency .recordings-head,
+:root.increased-contrast .recordings-head,
+:root.reduce-transparency .window-topbar,
+:root.increased-contrast .window-topbar,
+:root.reduce-transparency .topbar,
+:root.increased-contrast .topbar,
+:root.reduce-transparency .pane-header,
+:root.increased-contrast .pane-header,
+:root.reduce-transparency .pane-footer,
+:root.increased-contrast .pane-footer,
+:root.reduce-transparency .recordings-list-toolbar,
+:root.increased-contrast .recordings-list-toolbar,
+:root.reduce-transparency .recordings-stats,
+:root.increased-contrast .recordings-stats,
+:root.reduce-transparency .recordings-viewer-header,
+:root.increased-contrast .recordings-viewer-header,
+:root.reduce-transparency .current-audio-row,
+:root.increased-contrast .current-audio-row,
+:root.reduce-transparency .session-notice,
+:root.increased-contrast .session-notice,
+:root.reduce-transparency .modal-card,
+:root.increased-contrast .modal-card,
+:root.reduce-transparency .boot-overlay-card,
+:root.increased-contrast .boot-overlay-card,
+:root.reduce-transparency .sb-item:hover,
+:root.increased-contrast .sb-item:hover,
+:root.reduce-transparency .sb-item.active,
+:root.increased-contrast .sb-item.active,
+:root.reduce-transparency .window-view,
+:root.increased-contrast .window-view,
+:root.reduce-transparency .window-status-pill,
+:root.increased-contrast .window-status-pill,
+:root.reduce-transparency .net-pill,
+:root.increased-contrast .net-pill,
+:root.reduce-transparency .context-chip,
+:root.increased-contrast .context-chip,
+:root.reduce-transparency .section-chip,
+:root.increased-contrast .section-chip,
+:root.reduce-transparency select,
+:root.increased-contrast select,
+:root.reduce-transparency input,
+:root.increased-contrast input,
+:root.reduce-transparency textarea,
+:root.increased-contrast textarea,
+:root.reduce-transparency .btn,
+:root.increased-contrast .btn,
+:root.reduce-transparency .icon-btn,
+:root.increased-contrast .icon-btn,
+:root.reduce-transparency .link-btn,
+:root.increased-contrast .link-btn,
+:root.reduce-transparency .transcribe-settings-popup,
+:root.increased-contrast .transcribe-settings-popup,
+:root.reduce-transparency .recording-audio-actions,
+:root.increased-contrast .recording-audio-actions,
+:root.reduce-transparency .key-row,
+:root.increased-contrast .key-row,
+:root.reduce-transparency .settings-toggle,
+:root.increased-contrast .settings-toggle,
+:root.reduce-transparency .shortcut-btn,
+:root.increased-contrast .shortcut-btn,
+:root.reduce-transparency .shortcut-key,
+:root.increased-contrast .shortcut-key {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 @media (forced-colors: active) {
@@ -2833,6 +2944,86 @@ canvas,
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
+}
+
+:root.forced-colors {
+  --bg: Canvas;
+  --bg-2: Canvas;
+  --bg-3: Canvas;
+  --bg-4: Canvas;
+  --surface-bg: Canvas;
+  --surface-bg-muted: Canvas;
+  --surface-header-bg: Canvas;
+  --surface-border: ButtonBorder;
+  --surface-border-strong: ButtonText;
+  --control-bg: ButtonFace;
+  --control-bg-hover: ButtonFace;
+  --control-border: ButtonBorder;
+  --chip-bg: ButtonFace;
+  --chip-border: ButtonBorder;
+  --glass-bg: Canvas;
+  --glass-bg-strong: Canvas;
+  --glass-bg-opaque: Canvas;
+  --glass-control-bg: ButtonFace;
+  --glass-control-bg-subtle: ButtonFace;
+  --glass-control-bg-hover: ButtonFace;
+  --glass-control-bg-active: ButtonFace;
+  --glass-chip-bg: ButtonFace;
+  --glass-border: ButtonBorder;
+  --glass-border-strong: ButtonText;
+  --glass-highlight: transparent;
+  --glass-highlight-strong: transparent;
+  --glass-filter: none;
+  --glass-filter-soft: none;
+  --glass-popover-bg: Canvas;
+  --glass-modal-bg: Canvas;
+  --glass-shadow-popover: none;
+  --glass-shadow-modal: none;
+  --glass-surface-outline: none;
+  --text: CanvasText;
+  --text-2: CanvasText;
+  --text-3: GrayText;
+  --focus-ring: Highlight;
+  --focus-ring-soft: Highlight;
+}
+
+:root.forced-colors .screen-header,
+:root.forced-colors .recordings-head,
+:root.forced-colors .window-topbar,
+:root.forced-colors .topbar,
+:root.forced-colors .pane-header,
+:root.forced-colors .pane-footer,
+:root.forced-colors .recordings-list-toolbar,
+:root.forced-colors .recordings-stats,
+:root.forced-colors .recordings-viewer-header,
+:root.forced-colors .current-audio-row,
+:root.forced-colors .session-notice,
+:root.forced-colors .modal-card,
+:root.forced-colors .boot-overlay-card,
+:root.forced-colors .sb-item,
+:root.forced-colors .window-view,
+:root.forced-colors .window-status-pill,
+:root.forced-colors .net-pill,
+:root.forced-colors .context-chip,
+:root.forced-colors .section-chip,
+:root.forced-colors select,
+:root.forced-colors input,
+:root.forced-colors textarea,
+:root.forced-colors .btn,
+:root.forced-colors .icon-btn,
+:root.forced-colors .link-btn,
+:root.forced-colors .transcribe-settings-popup,
+:root.forced-colors .recording-audio-actions,
+:root.forced-colors .key-row,
+:root.forced-colors .settings-toggle,
+:root.forced-colors .shortcut-btn,
+:root.forced-colors .shortcut-key {
+  background: Canvas;
+  border-color: ButtonBorder;
+  color: CanvasText;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 @media (max-width: 1180px) {
