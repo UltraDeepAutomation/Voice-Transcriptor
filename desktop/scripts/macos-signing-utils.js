@@ -153,6 +153,62 @@ function hasCertificateIdentity(identity) {
   }
 }
 
+function runPlistBuddy(plistPath, command, { optional = false } = {}) {
+  try {
+    return execFileSync("/usr/libexec/PlistBuddy", ["-c", command, plistPath], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", optional ? "ignore" : "pipe"],
+    }).trim();
+  } catch (e) {
+    if (optional) return "";
+    const stderr = e && e.stderr ? e.stderr.toString() : "";
+    throw new Error(`PlistBuddy failed for ${plistPath}: ${command}\n${stderr || (e.message || e)}`);
+  }
+}
+
+function hardenAppTransportSecurity(appPath, { log = console.log } = {}) {
+  const infoPlist = path.join(appPath, "Contents", "Info.plist");
+  if (!existsSync(infoPlist)) {
+    throw new Error(`Info.plist not found: ${infoPlist}`);
+  }
+
+  // Electron injects a broad NSAllowsArbitraryLoads=true default for
+  // compatibility. Transcriptor only needs insecure HTTP for its local
+  // loopback backend; App Store and production builds should keep ATS
+  // tight for all external traffic.
+  runPlistBuddy(infoPlist, "Delete :NSAppTransportSecurity", { optional: true });
+  runPlistBuddy(infoPlist, "Add :NSAppTransportSecurity dict");
+  runPlistBuddy(infoPlist, "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool false");
+  runPlistBuddy(infoPlist, "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true");
+  runPlistBuddy(infoPlist, "Add :NSAppTransportSecurity:NSExceptionDomains dict");
+
+  for (const host of ["127.0.0.1", "localhost"]) {
+    const base = `:NSAppTransportSecurity:NSExceptionDomains:${host}`;
+    runPlistBuddy(infoPlist, `Add ${base} dict`);
+    runPlistBuddy(infoPlist, `Add ${base}:NSIncludesSubdomains bool false`);
+    runPlistBuddy(infoPlist, `Add ${base}:NSTemporaryExceptionAllowsInsecureHTTPLoads bool true`);
+    runPlistBuddy(infoPlist, `Add ${base}:NSTemporaryExceptionAllowsInsecureHTTPSLoads bool false`);
+    runPlistBuddy(infoPlist, `Add ${base}:NSTemporaryExceptionMinimumTLSVersion string 1.2`);
+    runPlistBuddy(infoPlist, `Add ${base}:NSTemporaryExceptionRequiresForwardSecrecy bool true`);
+  }
+
+  const arbitraryLoads = runPlistBuddy(
+    infoPlist,
+    "Print :NSAppTransportSecurity:NSAllowsArbitraryLoads",
+  );
+  const localNetworking = runPlistBuddy(
+    infoPlist,
+    "Print :NSAppTransportSecurity:NSAllowsLocalNetworking",
+  );
+  if (arbitraryLoads !== "false" || localNetworking !== "true") {
+    throw new Error(
+      `ATS hardening verification failed for ${infoPlist}: ` +
+        `NSAllowsArbitraryLoads=${arbitraryLoads}, NSAllowsLocalNetworking=${localNetworking}`,
+    );
+  }
+  log(`[macos-signing] Hardened App Transport Security in ${infoPlist}`);
+}
+
 function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg = "--timestamp", log = console.log }) {
   const runtimeRoot = path.join(appPath, "Contents", "Resources", "runtime");
   if (!existsSync(runtimeRoot)) {
@@ -195,6 +251,7 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
 module.exports = {
   assertNoBundledBytecode,
   classifyMacho,
+  hardenAppTransportSecurity,
   hasCertificateIdentity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,

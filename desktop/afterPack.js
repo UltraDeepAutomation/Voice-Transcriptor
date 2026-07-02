@@ -62,6 +62,7 @@ const { existsSync } = require("node:fs");
 const path = require("node:path");
 const {
   assertNoBundledBytecode,
+  hardenAppTransportSecurity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
   preSignRuntimeBinaries,
@@ -98,6 +99,9 @@ exports.default = async function afterPack(context) {
   if (!existsSync(inheritEntitlements)) {
     throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
   }
+  hardenAppTransportSecurity(appPath, {
+    log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
+  });
   if (isMas) {
     assertNoBundledBytecode(appPath);
     if (process.env.TRANSCRIPTOR_MAS_EXTERNAL_SIGN !== "1") {

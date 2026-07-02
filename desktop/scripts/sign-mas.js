@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const {
   assertNoBundledBytecode,
+  hardenAppTransportSecurity,
   hasCertificateIdentity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
@@ -141,6 +142,9 @@ async function main() {
     if (!fs.existsSync(file)) throw new Error(`Missing MAS entitlements file: ${file}`);
   }
 
+  hardenAppTransportSecurity(appPath, {
+    log: (message) => console.log(message.replace("[macos-signing]", "[mas-sign]")),
+  });
   assertNoBundledBytecode(appPath);
   const { runtimeRoot } = preSignRuntimeBinaries({
     appPath,
