@@ -3265,11 +3265,11 @@ async function refreshNetworkState(): Promise<void> {
 // hoists above refreshNetworkState's invocations.
 let _bootOverlayHidden = false;
 function hideBootOverlayOnce(): void {
-  if (_bootOverlayHidden) return;
-  _bootOverlayHidden = true;
   const overlay = document.getElementById("bootOverlay");
   if (!overlay) return;
+  if (_bootOverlayHidden) return;
   if (overlay.hidden) return;
+  _bootOverlayHidden = true;
   overlay.dataset.state = "success";
   const statusEl = document.getElementById("bootOverlayStatus");
   if (statusEl) statusEl.textContent = "Ready";
@@ -9488,6 +9488,7 @@ window.__setBackendBootError = (msg: string) => {
   const { headline, detail } = classifyBootError(raw);
   const overlay = document.getElementById("bootOverlay");
   if (overlay) {
+    _bootOverlayHidden = false;
     overlay.dataset.state = "error";
     overlay.hidden = false;
   }
@@ -9540,7 +9541,10 @@ if (_bootRetry) {
     const statusEl = document.getElementById("bootOverlayStatus");
     if (statusEl) statusEl.textContent = "Reloading…";
     const overlay = document.getElementById("bootOverlay");
-    if (overlay) overlay.dataset.state = "loading";
+    if (overlay) {
+      _bootOverlayHidden = false;
+      overlay.dataset.state = "loading";
+    }
     window.location.reload();
   });
 }
