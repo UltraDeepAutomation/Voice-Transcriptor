@@ -2203,6 +2203,7 @@ async function toggleRecordingFromShortcut() {
   const trace = createTrace("toggle_hotkey", {});
   shortcutToggleInFlight = true;
   let keepCapturedTarget = false;
+  const frontAtHotkeyPromise = getFrontmostAppInfoWithTimeout(1200);
   try {
     const activePostStopAtPress = hasActivePostStopWork();
     await publishRecordingStatus(activePostStopAtPress ? "Transcribing" : "Starting");
@@ -2243,12 +2244,13 @@ async function toggleRecordingFromShortcut() {
 
     let front = { name: "", pid: 0, windowTitle: "" };
     if (!beforeToggleState.recording) {
-      front = await getFrontmostAppInfoWithTimeout(1200);
+      front = await frontAtHotkeyPromise;
       traceStep(trace, "front_before", {
         name: front.name || "",
         pid: front.pid || 0,
         windowTitle: compactLogText(front.windowTitle || "", 80),
         timedOut: !!front.timedOut,
+        source: "hotkey-press",
       });
       const micGranted = await requestMacMicrophonePermissionOnce();
       if (!micGranted) {
