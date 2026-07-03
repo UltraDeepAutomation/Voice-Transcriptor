@@ -5788,13 +5788,15 @@ async function createWindow(options = {}) {
   // inherit our microphone / clipboard grants. Tightened to ``_isBackendOrigin``
   // so the renderer must be on http://127.0.0.1:<our-port> to be
   // allowed.
-  const mediaTypesAreAudioOnly = (details) => {
+  const mediaRequestIsAudioOnly = (details) => {
     const mediaTypes = Array.isArray(details?.mediaTypes) ? details.mediaTypes.map(String) : [];
-    return mediaTypes.length > 0 && mediaTypes.every((type) => type === "audio");
+    if (mediaTypes.length > 0) return mediaTypes.every((type) => type === "audio");
+    const mediaType = String(details?.mediaType || "").trim();
+    return mediaType === "audio";
   };
   const permissionDecision = (permission, details = {}) => {
     const perm = String(permission || "");
-    const audioOnlyMedia = perm === "media" && mediaTypesAreAudioOnly(details);
+    const audioOnlyMedia = perm === "media" && mediaRequestIsAudioOnly(details);
     const allowedCapability =
       audioPermissions.has(perm) ||
       audioOnlyMedia ||
