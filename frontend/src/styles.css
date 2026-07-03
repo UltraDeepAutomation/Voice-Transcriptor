@@ -49,10 +49,10 @@ body {
   --status-rec: #dcdcdc;
   --status-done: #cccccc;
   --status-process: #aaaaaa;
-  --status-warn: #b8b8b8;
+  --status-warn: #c8a23a;
   --net-neutral: #878787;
-  --net-online: #bcbcbc;
-  --net-offline: #747474;
+  --net-online: #79b88a;
+  --net-offline: #b87878;
   --overlay-backdrop: rgba(0, 0, 0, 0.55);
   --glass-bg: rgba(34, 34, 34, 0.72);
   --glass-bg-strong: rgba(30, 30, 30, 0.86);
@@ -74,38 +74,38 @@ body {
   --glass-shadow-modal: 0 12px 16px rgba(0, 0, 0, 0.42);
   --glass-surface-outline: inset 0 1px 0 var(--glass-highlight);
   --shadow-popover: var(--glass-shadow-popover);
-  --accent-soft-bg: rgba(176, 176, 176, 0.16);
-  --accent-soft-border: rgba(214, 214, 214, 0.3);
-  --accent-strong-bg: rgba(184, 184, 184, 0.18);
-  --accent-strong-border: rgba(224, 224, 224, 0.34);
-  --success-soft-bg: rgba(190, 190, 190, 0.14);
-  --success-soft-border: rgba(220, 220, 220, 0.28);
-  --warning-soft-bg: rgba(168, 168, 168, 0.14);
-  --warning-soft-border: rgba(196, 196, 196, 0.28);
-  --danger-text: #d8d8d8;
-  --danger-bg: #242424;
-  --danger-border: #686868;
-  --danger-bg-hover: #303030;
-  --danger-border-hover: #8a8a8a;
-  --danger-dot: #d0d0d0;
-  --focus-ring: rgba(220, 220, 220, 0.62);
-  --focus-ring-soft: rgba(220, 220, 220, 0.22);
+  --accent-soft-bg: rgba(64, 96, 146, 0.16);
+  --accent-soft-border: rgba(108, 144, 198, 0.3);
+  --accent-strong-bg: rgba(64, 96, 146, 0.18);
+  --accent-strong-border: rgba(108, 144, 198, 0.34);
+  --success-soft-bg: rgba(94, 150, 112, 0.16);
+  --success-soft-border: rgba(126, 192, 145, 0.3);
+  --warning-soft-bg: rgba(154, 133, 85, 0.16);
+  --warning-soft-border: rgba(198, 172, 108, 0.28);
+  --danger-text: #ff8080;
+  --danger-bg: #3a1a1a;
+  --danger-border: #6a2a2a;
+  --danger-bg-hover: #4a2020;
+  --danger-border-hover: #8a3a3a;
+  --danger-dot: #ff4444;
+  --focus-ring: rgba(108, 144, 198, 0.68);
+  --focus-ring-soft: rgba(108, 144, 198, 0.24);
   --panel-soft: #222222;
   --interactive-hover: #2f2f2f;
   --recording-active-bg: #2c2c2c;
   --progress-track: #383838;
   --progress-fill-color: #bcbcbc;
   --drag-active-border: #858585;
-  --record-stop-dot: #d0d0d0;
+  --record-stop-dot: #d36d6d;
   --record-stop-hover-border: #878787;
   --record-stop-hover-bg: #2f2f2f;
-  --record-stop-active-border: #9a9a9a;
-  --record-stop-active-top: #3f3f3f;
-  --record-stop-active-bottom: #303030;
+  --record-stop-active-border: #ad5151;
+  --record-stop-active-top: #582b2b;
+  --record-stop-active-bottom: #432020;
   --record-stop-icon: #f4f4f4;
-  --toggle-track-on: #5f5f5f;
-  --toggle-track-on-border: #c8c8c8;
-  --notice-error-bg: rgba(140, 140, 140, 0.16);
+  --toggle-track-on: #1f7a49;
+  --toggle-track-on-border: #32ae69;
+  --notice-error-bg: rgba(122, 54, 54, 0.2);
   --summary-top-bg: rgba(31, 31, 31, 0.96);
   --summary-bottom-bg: rgba(26, 26, 26, 0.96);
   --toggle-track: #2e2e2e;
@@ -1243,16 +1243,31 @@ textarea:focus-visible,
   background: #ffffff;
 }
 
-/* Per-pane toggles are semantic roles, not colour roles. All checked
-   states intentionally use the same grayscale token path so the theme
-   stays monochrome while text and placement carry meaning. */
-.toggle-inline.toggle-live input:checked,
-.toggle-inline.toggle-transcribe input:checked,
-.toggle-inline.toggle-upscale input:checked,
+/* Per-pane toggles use semantic roles with deliberate colour cues:
+   live = green, transcribe = blue, upscale = purple. Class names stay
+   semantic so the visual palette remains centralized here. */
+.toggle-inline.toggle-live input:checked {
+  background: #1f7a49;
+  border-color: #3bbd78;
+  box-shadow: 0 0 0 1px rgba(59, 189, 120, 0.22);
+}
+
+.toggle-inline.toggle-transcribe input:checked {
+  background: #1e5499;
+  border-color: #5c9cf5;
+  box-shadow: 0 0 0 1px rgba(92, 156, 245, 0.22);
+}
+
+.toggle-inline.toggle-upscale input:checked {
+  background: #5a2f87;
+  border-color: #9c6ccc;
+  box-shadow: 0 0 0 1px rgba(156, 108, 204, 0.22);
+}
+
 .toggle-inline.toggle-neutral input:checked {
   background: var(--surface-3, #3a3a3a);
-  border-color: var(--text-2, #a0a0a0);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+  border-color: var(--text-2, #6b7280);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 .out {
@@ -1311,11 +1326,11 @@ textarea:focus-visible,
   gap: 10px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--glass-border);
-  background: rgba(128, 128, 128, 0.12);
+  background: rgba(82, 108, 146, 0.12);
 }
 
 .session-notice.info {
-  background: rgba(128, 128, 128, 0.12);
+  background: rgba(82, 108, 146, 0.12);
 }
 
 .session-notice.success {
@@ -1339,11 +1354,11 @@ textarea:focus-visible,
 }
 
 .session-notice.success .session-notice-dot {
-  background: var(--status-done);
+  background: #8fd3a4;
 }
 
 .session-notice.warning .session-notice-dot {
-  background: var(--status-warn);
+  background: #d8be7a;
 }
 
 .session-notice.error .session-notice-dot {
@@ -1733,7 +1748,7 @@ textarea:focus-visible,
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0)),
     var(--accent-soft-bg);
-  color: #dcdcdc;
+  color: #d6e3ff;
 }
 
 .recording-item .rec-provider-language {
@@ -1741,7 +1756,7 @@ textarea:focus-visible,
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0)),
     var(--warning-soft-bg);
-  color: #cfcfcf;
+  color: #e9d6a4;
 }
 
 .recording-item .rec-provider-audio {
@@ -1749,7 +1764,7 @@ textarea:focus-visible,
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0)),
     var(--success-soft-bg);
-  color: #e0e0e0;
+  color: #b9e8c8;
 }
 
 .recordings-viewer {
@@ -1956,13 +1971,13 @@ textarea:focus-visible,
 }
 
 .icon-btn.is-copy-ok {
-  border-color: rgba(214, 214, 214, 0.65);
-  background: rgba(190, 190, 190, 0.14);
+  border-color: rgba(98, 199, 123, 0.65);
+  background: rgba(98, 199, 123, 0.14);
 }
 
 .icon-btn.is-copy-failed {
-  border-color: rgba(190, 190, 190, 0.7);
-  background: rgba(150, 150, 150, 0.14);
+  border-color: rgba(255, 103, 103, 0.7);
+  background: rgba(255, 103, 103, 0.14);
 }
 
 .icon-btn:disabled {
@@ -1981,8 +1996,8 @@ textarea:focus-visible,
 }
 
 .send-enter-btn.active {
-  border-color: rgba(214, 214, 214, 0.7);
-  background: rgba(96, 96, 96, 0.5);
+  border-color: rgba(112, 190, 132, 0.7);
+  background: rgba(68, 118, 82, 0.5);
 }
 
 .send-enter-ico {
@@ -2224,9 +2239,9 @@ textarea:focus-visible,
    cleared automatically on focus / input in the save-error handler. */
 .key-row input.has-error,
 .key-row input[aria-invalid="true"] {
-  border-color: var(--danger-border, #686868);
-  box-shadow: 0 0 0 1px var(--danger-border, #686868) inset;
-  background: var(--danger-bg, rgba(128, 128, 128, 0.12));
+  border-color: var(--danger-border, #ef4444);
+  box-shadow: 0 0 0 1px var(--danger-border, #ef4444) inset;
+  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
 }
 
 .key-row input[data-masked="1"] {
@@ -2314,11 +2329,11 @@ textarea:focus-visible,
 }
 
 .settings-save-status-success {
-  color: var(--text-mute-strong);
+  color: #8fd3a4;
 }
 
 .settings-save-status-warning {
-  color: var(--text-2);
+  color: #d8be7a;
 }
 
 .settings-save-status-error {
@@ -2380,34 +2395,34 @@ textarea:focus-visible,
 }
 
 .shortcut-btn.recording .shortcut-keys {
-  color: #dedede;
+  color: #cddfff;
   opacity: 1;
 }
 
 .shortcut-btn.recording .shortcut-key {
   border-color: var(--accent-soft-border);
-  color: #dedede;
+  color: #cddfff;
 }
 
 @keyframes shortcut-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgba(220, 220, 220, 0.2); }
-  50% { box-shadow: 0 0 0 4px rgba(220, 220, 220, 0.35); }
+  0%, 100% { box-shadow: 0 0 0 2px rgba(108, 144, 198, 0.2); }
+  50% { box-shadow: 0 0 0 4px rgba(108, 144, 198, 0.35); }
 }
 
 /* Shortcut conflict indicator — shown when Electron main could not
  * register the accelerator (already claimed by another app, malformed
  * string, OS reservation). Hover for the exact reason in `.title`. */
 .shortcut-btn.shortcut-conflict {
-  border-color: var(--status-error, #d8d8d8);
-  box-shadow: 0 0 0 1px var(--status-error, #d8d8d8) inset;
+  border-color: var(--status-error, #c54646);
+  box-shadow: 0 0 0 1px var(--status-error, #c54646) inset;
 }
 .shortcut-btn.shortcut-conflict .shortcut-keys {
-  color: var(--status-error, #d8d8d8);
+  color: var(--status-error, #c54646);
 }
 
 .shortcut-btn.shortcut-conflict .shortcut-key {
-  border-color: var(--status-error, #d8d8d8);
-  color: var(--status-error, #d8d8d8);
+  border-color: var(--status-error, #c54646);
+  color: var(--status-error, #c54646);
 }
 
 .shortcut-keys {
@@ -2442,7 +2457,7 @@ textarea:focus-visible,
 
 .shortcut-key-prompt {
   min-width: 92px;
-  color: #dedede;
+  color: #cddfff;
 }
 
 .pane,
@@ -3187,8 +3202,8 @@ canvas {
     from 0deg,
     transparent 0deg,
     transparent 240deg,
-    #9a9a9a 300deg,
-    #e0e0e0 360deg
+    #7a50c8 300deg,
+    #b892ff 360deg
   );
   mask: radial-gradient(circle, transparent 12px, black 13px);
   -webkit-mask: radial-gradient(circle, transparent 12px, black 13px);
@@ -3199,21 +3214,20 @@ canvas {
   to { transform: rotate(360deg); }
 }
 
-/* Error state — spinner freezes into a brighter neutral arc, retry
-   button revealed. */
+/* Error state — spinner frozen red, retry button revealed. */
 .boot-overlay[data-state="error"] .boot-overlay-spinner {
   animation: none;
   background: conic-gradient(
     from 0deg,
     transparent 0deg,
     transparent 260deg,
-    #9a9a9a 320deg,
-    #e0e0e0 360deg
+    #c56060 320deg,
+    #ff8080 360deg
   );
 }
 
 .boot-overlay[data-state="error"] .boot-overlay-status {
-  color: var(--danger-text);
+  color: #ff9090;
 }
 
 .boot-overlay-retry {
@@ -3429,13 +3443,13 @@ canvas {
 
 .upload-queue-item--queued { border-color: var(--surface-3, #2a2a2a); }
 .upload-queue-item--transcribing {
-  border-color: var(--text-2, #777777);
-  background: var(--surface-2, #242424);
+  border-color: var(--text-2, #6b7280);
+  background: var(--surface-2, #1f2429);
 }
 .upload-queue-item--done { border-color: var(--surface-3, #3a3a3a); }
 .upload-queue-item--error {
-  border-color: var(--danger-border, #686868);
-  background: var(--danger-bg, #242424);
+  border-color: var(--danger-border, #6a2a2a);
+  background: var(--danger-bg, #2a1818);
 }
 .upload-queue-item--cancelled {
   border-color: var(--surface-3, #2a2a2a);
@@ -3458,10 +3472,10 @@ canvas {
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
 }
 
-.upload-queue-status-dot--queued { background: #8a8a8a; }
-.upload-queue-status-dot--transcribing { background: #b8b8b8; }
-.upload-queue-status-dot--done { background: #d8d8d8; }
-.upload-queue-status-dot--error { background: #f0f0f0; }
+.upload-queue-status-dot--queued { background: #f4c542; }
+.upload-queue-status-dot--transcribing { background: #5aa9ff; }
+.upload-queue-status-dot--done { background: #62c77b; }
+.upload-queue-status-dot--error { background: #ff6767; }
 
 .upload-queue-item-meta {
   display: flex;
@@ -3522,8 +3536,8 @@ canvas {
 }
 .upload-queue-item-remove:hover,
 .upload-queue-item-remove:focus-visible {
-  background: var(--danger-bg, rgba(128, 128, 128, 0.12));
-  color: var(--danger-text, #d8d8d8);
+  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
+  color: var(--danger-text, #ff8080);
   outline: none;
 }
 
@@ -3581,8 +3595,8 @@ canvas {
   color: var(--text-1, #d4d4d4);
 }
 .upload-queue-item--error .upload-queue-item-status {
-  background: var(--danger-bg-hover, #303030);
-  color: var(--danger-text, #d8d8d8);
+  background: var(--danger-bg-hover, #4a2020);
+  color: var(--danger-text, #ff8080);
 }
 .upload-queue-item--cancelled .upload-queue-item-status {
   background: var(--surface-3, #2a2a2a);
@@ -3603,9 +3617,9 @@ canvas {
 }
 .upload-queue-item-stop:hover,
 .upload-queue-item-stop:focus-visible {
-  background: var(--danger-bg, rgba(128, 128, 128, 0.12));
-  color: var(--danger-text, #d8d8d8);
-  border-color: var(--danger-border, #686868);
+  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
+  color: var(--danger-text, #ff8080);
+  border-color: var(--danger-border, #6a2a2a);
   outline: none;
 }
 
@@ -3649,7 +3663,7 @@ canvas {
 .upload-queue-item-error {
   margin-top: 8px;
   font-size: 12px;
-  color: var(--danger-text, #d8d8d8);
+  color: var(--danger-text, #ff8080);
   line-height: 1.5;
 }
 
