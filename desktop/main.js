@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell } = require("electron");
+const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, screen } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -171,6 +171,9 @@ _relocateUserDataOffOneDrive();
 
 let backend = null;
 let win = null;
+let recordingStatusWindow = null;
+let recordingStatusWindowLoadPromise = null;
+let recordingStatusWindowReady = false;
 let mainWindowInitialLoadPromise = null;
 let recordingStateMonitor = null;
 let tray = null;
@@ -681,6 +684,309 @@ function hasActivePostStopWork() {
   return pendingTranscriptionCount > 0 || postStopWorkerRunning || postStopQueue.length > 0;
 }
 
+const RECORDING_STATUS_CAPSULE = Object.freeze({
+  width: 334,
+  height: 64,
+  bottomMargin: 18,
+});
+
+const recordingStatusCapsuleState = {
+  status: "",
+  startedAt: 0,
+  level: 0,
+};
+
+function recordingStatusTone(status) {
+  const text = String(status || "").trim().toLowerCase();
+  if (!text) return "neutral";
+  if (text.includes("record")) return "recording";
+  if (text.includes("transcrib") || text.includes("upscal") || text.includes("processing")) return "processing";
+  if (text.includes("pasted") || text.includes("sent") || text.includes("saved")) return "success";
+  if (text.includes("access") || text.includes("loading") || text.includes("ready")) return "warning";
+  if (text.includes("fail") || text.includes("error") || text.includes("no text")) return "error";
+  return "neutral";
+}
+
+function recordingStatusCapsuleHtml() {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      color: #f4f4f4;
+      -webkit-user-select: none;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    .capsule {
+      width: 318px;
+      height: 52px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(18,18,18,0.88);
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.10),
+        0 10px 22px rgba(0,0,0,0.34);
+      backdrop-filter: blur(18px) saturate(1.12);
+      -webkit-backdrop-filter: blur(18px) saturate(1.12);
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr) 68px;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px 0 10px;
+      cursor: default;
+    }
+    .gear {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.045);
+      display: grid;
+      place-items: center;
+      color: #cfcfcf;
+      font-size: 15px;
+      line-height: 1;
+    }
+    .meter {
+      height: 16px;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      min-width: 0;
+    }
+    .bar {
+      width: 2px;
+      height: calc(4px + var(--level, 0) * 15px);
+      min-height: 4px;
+      max-height: 18px;
+      border-radius: 999px;
+      background: #bdbdbd;
+      opacity: 0.65;
+      transition: height 90ms ease, background 120ms ease, opacity 120ms ease;
+    }
+    .capsule[data-tone="recording"] .bar { background: #8fd3a4; opacity: 0.95; }
+    .capsule[data-tone="processing"] .bar { background: #cddfff; opacity: 0.9; }
+    .capsule[data-tone="success"] .bar { background: #8fd3a4; opacity: 0.8; }
+    .capsule[data-tone="warning"] .bar { background: #d8be7a; opacity: 0.85; }
+    .capsule[data-tone="error"] .bar { background: #ff8080; opacity: 0.9; }
+    .text {
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: 0;
+      color: #e8e8e8;
+    }
+    .time {
+      justify-self: end;
+      min-width: 56px;
+      text-align: right;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 17px;
+      font-weight: 800;
+      letter-spacing: 0;
+      color: #ffffff;
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  <div class="capsule" id="capsule" data-tone="neutral" title="Click to open Transcriptor">
+    <div class="gear" aria-hidden="true">●</div>
+    <div class="meter" aria-hidden="true">
+      <span class="bar" style="--level:.18"></span>
+      <span class="bar" style="--level:.28"></span>
+      <span class="bar" style="--level:.38"></span>
+      <span class="bar" style="--level:.28"></span>
+      <span class="bar" style="--level:.18"></span>
+    </div>
+    <div class="time" id="time">00:00</div>
+    <div class="text" id="status" hidden></div>
+  </div>
+  <script>
+    const capsule = document.getElementById("capsule");
+    const statusEl = document.getElementById("status");
+    const timeEl = document.getElementById("time");
+    const bars = Array.from(document.querySelectorAll(".bar"));
+    let state = { status: "", tone: "neutral", startedAt: 0, level: 0 };
+    function fmt(ms) {
+      const total = Math.max(0, Math.floor(ms / 1000));
+      const mm = String(Math.floor(total / 60)).padStart(2, "0");
+      const ss = String(total % 60).padStart(2, "0");
+      return mm + ":" + ss;
+    }
+    function render() {
+      const level = Math.max(0, Math.min(1, Number(state.level || 0)));
+      capsule.dataset.tone = state.tone || "neutral";
+      statusEl.textContent = state.status || "";
+      const elapsed = state.startedAt ? Date.now() - Number(state.startedAt) : 0;
+      timeEl.textContent = fmt(elapsed);
+      bars.forEach((bar, index) => {
+        const wave = [0.52, 0.72, 1, 0.72, 0.52][index] || 0.5;
+        bar.style.setProperty("--level", String(Math.max(0.16, level * wave)));
+      });
+    }
+    window.__setCapsuleState = (next) => {
+      state = { ...state, ...(next || {}) };
+      render();
+      return true;
+    };
+    window.setInterval(render, 250);
+    document.addEventListener("click", () => {
+      document.title = "__transcriptor_capsule_focus__" + Date.now();
+    });
+    render();
+  </script>
+</body>
+</html>`;
+}
+
+function recordingStatusCapsuleBounds() {
+  const size = RECORDING_STATUS_CAPSULE;
+  const fallback = { x: 0, y: 0, width: 1440, height: 900 };
+  let workArea = fallback;
+  try {
+    const point = screen.getCursorScreenPoint();
+    const display = screen.getDisplayNearestPoint(point) || screen.getPrimaryDisplay();
+    workArea = display?.workArea || fallback;
+  } catch {
+    workArea = fallback;
+  }
+  return {
+    x: Math.round(workArea.x + (workArea.width - size.width) / 2),
+    y: Math.round(workArea.y + workArea.height - size.height - size.bottomMargin),
+    width: size.width,
+    height: size.height,
+  };
+}
+
+async function ensureRecordingStatusCapsuleWindow() {
+  if (!app.isReady()) return null;
+  if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
+    return recordingStatusWindow;
+  }
+  if (recordingStatusWindowLoadPromise) {
+    await recordingStatusWindowLoadPromise;
+    return recordingStatusWindow && !recordingStatusWindow.isDestroyed() ? recordingStatusWindow : null;
+  }
+
+  recordingStatusWindowReady = false;
+  recordingStatusWindow = new BrowserWindow({
+    ...recordingStatusCapsuleBounds(),
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    closable: false,
+    fullscreenable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    show: false,
+    focusable: false,
+    hasShadow: false,
+    title: "Transcriptor Recording",
+    backgroundColor: "#00000000",
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      devTools: false,
+    },
+  });
+
+  recordingStatusWindow.setMenuBarVisibility(false);
+  try { recordingStatusWindow.setAlwaysOnTop(true, "floating"); } catch { }
+  try { recordingStatusWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch { }
+  recordingStatusWindow.on("closed", () => {
+    recordingStatusWindow = null;
+    recordingStatusWindowReady = false;
+    recordingStatusWindowLoadPromise = null;
+  });
+  recordingStatusWindow.webContents.on("page-title-updated", (event, title) => {
+    if (!String(title || "").startsWith("__transcriptor_capsule_focus__")) return;
+    event.preventDefault();
+    ensureWindowVisible({ manual: true, force: true }).catch((e) => {
+      appendMainLog(`[recording-capsule] focus failed: ${e?.message || e}`);
+    });
+  });
+
+  const html = recordingStatusCapsuleHtml();
+  recordingStatusWindowLoadPromise = recordingStatusWindow
+    .loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+    .then(() => {
+      recordingStatusWindowReady = true;
+    })
+    .catch((e) => {
+      appendMainLog(`[recording-capsule] load failed: ${e?.message || e}`);
+      if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
+        recordingStatusWindow.destroy();
+      }
+    })
+    .finally(() => {
+      recordingStatusWindowLoadPromise = null;
+    });
+  await recordingStatusWindowLoadPromise;
+  return recordingStatusWindow && !recordingStatusWindow.isDestroyed() ? recordingStatusWindow : null;
+}
+
+async function updateRecordingStatusCapsule(patch = {}) {
+  Object.assign(recordingStatusCapsuleState, patch);
+  const status = String(recordingStatusCapsuleState.status || "").trim();
+  if (!status) {
+    hideRecordingStatusCapsule();
+    return;
+  }
+  if (!recordingStatusCapsuleState.startedAt) {
+    recordingStatusCapsuleState.startedAt = Date.now();
+  }
+  const capsuleWindow = await ensureRecordingStatusCapsuleWindow();
+  if (!capsuleWindow || capsuleWindow.isDestroyed()) return;
+  try {
+    capsuleWindow.setBounds(recordingStatusCapsuleBounds(), false);
+  } catch { }
+  if (!recordingStatusWindowReady) return;
+  const payload = {
+    status,
+    tone: recordingStatusTone(status),
+    startedAt: recordingStatusCapsuleState.startedAt,
+    level: Math.max(0, Math.min(1, Number(recordingStatusCapsuleState.level || 0))),
+  };
+  try {
+    await capsuleWindow.webContents.executeJavaScript(
+      `window.__setCapsuleState(${JSON.stringify(payload)})`,
+      true,
+    );
+    if (!capsuleWindow.isVisible()) capsuleWindow.showInactive();
+  } catch (e) {
+    appendMainLog(`[recording-capsule] update failed: ${e?.message || e}`);
+  }
+}
+
+function hideRecordingStatusCapsule() {
+  recordingStatusCapsuleState.status = "";
+  recordingStatusCapsuleState.level = 0;
+  recordingStatusCapsuleState.startedAt = 0;
+  if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
+    try { recordingStatusWindow.hide(); } catch { }
+  }
+}
+
 function stopRecordingStateMonitor() {
   if (recordingStateMonitor) {
     clearInterval(recordingStateMonitor);
@@ -713,6 +1019,12 @@ function startRecordingStateMonitor() {
         const safeRms = Math.max(0, Number(state?.rms) || 0);
         const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
         const isRec = !!state?.isRec;
+        recordingStatusCapsuleState.level = safeLevel;
+        if (recordingStatusWindow && !recordingStatusWindow.isDestroyed() && recordingStatusWindow.isVisible()) {
+          updateRecordingStatusCapsule({ level: safeLevel }).catch((e) => {
+            appendMainLog(`[recording-capsule] level update failed: ${e?.message || e}`);
+          });
+        }
         const cfg = recordingAutoStopConfig || DEFAULT_RECORDING_AUTO_STOP_CONFIG;
         const now = Date.now();
         if (safeLastFrameAt > 0) recordingSeenAudioFrames = true;
@@ -777,6 +1089,8 @@ async function beginRecordingStatusSession() {
   recordingSilenceStartedAt = 0;
   recordingAutoStopConfigRefreshAt = 0;
   recordingStartedAt = Date.now();
+  recordingStatusCapsuleState.startedAt = recordingStartedAt;
+  recordingStatusCapsuleState.level = 0;
   recordingSeenAudioFrames = false;
   recordingAutoStopConfig = await getRendererAutoStopSilenceConfig();
   startRecordingStateMonitor();
@@ -795,6 +1109,7 @@ function resetRecordingStatusState() {
   recordingAutoStopConfigGen++;
   recordingStartedAt = 0;
   recordingSeenAudioFrames = false;
+  hideRecordingStatusCapsule();
   stopRecordingStateMonitor();
   if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
     appendMainLog(`[recording-status] reset-stale-pending=${pendingTranscriptionCount}`);
@@ -805,6 +1120,7 @@ function resetRecordingStatusState() {
 async function setRecordingStatus(text) {
   const status = String(text || "").trim();
   if (!status) return;
+  await updateRecordingStatusCapsule({ status });
   await execRendererJsWithTimeout(
     `(() => {
       const fn = window.__transcriptorSetMainStatus;
@@ -5032,6 +5348,16 @@ app.on("before-quit", () => {
     accessibilityPollTimer = null;
   }
   stopRecordingStateMonitor();
+  if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
+    try {
+      recordingStatusWindow.destroy();
+    } catch (e) {
+      appendMainLog(`[before-quit] recording capsule destroy failed: ${e?.message || e}`);
+    }
+  }
+  recordingStatusWindow = null;
+  recordingStatusWindowReady = false;
+  recordingStatusWindowLoadPromise = null;
   if (tray) {
     try {
       tray.destroy();
