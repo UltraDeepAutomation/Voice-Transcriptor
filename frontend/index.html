@@ -20,7 +20,7 @@
       margin: 0;
       padding: 0;
       background: #1a1a1a;
-      color: #e5e7eb;
+      color: #e6e6e6;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
         "Helvetica Neue", Arial, sans-serif;
     }
@@ -46,17 +46,17 @@
     }
     #bootOverlay .boot-overlay-status {
       font-size: 14px;
-      color: #9ca3af;
+      color: #a3a3a3;
       margin-bottom: 4px;
     }
     #bootOverlay .boot-overlay-detail {
       font-size: 12px;
-      color: #ef4444;
+      color: #d8d8d8;
       margin-top: 12px;
       white-space: pre-wrap;
       text-align: left;
-      background: rgba(239,68,68,0.08);
-      border: 1px solid rgba(239,68,68,0.2);
+      background: rgba(128,128,128,0.12);
+      border: 1px solid rgba(168,168,168,0.28);
       border-radius: 6px;
       padding: 8px 10px;
     }
@@ -65,7 +65,7 @@
       margin-top: 14px;
       padding: 8px 18px;
       font-size: 13px;
-      background: #2563eb;
+      background: #3a3a3a;
       color: #fff;
       border: none;
       border-radius: 6px;
@@ -77,7 +77,7 @@
       height: 24px;
       margin: 0 auto 16px;
       border: 2px solid rgba(255,255,255,0.15);
-      border-top-color: #60a5fa;
+      border-top-color: #d0d0d0;
       border-radius: 50%;
       animation: boot-spin 0.9s linear infinite;
     }
@@ -272,7 +272,7 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Live Preview</span>
                 <div class="pane-actions">
-                  <label class="toggle-inline toggle-green" title="Show live partial transcript while recording">
+                  <label class="toggle-inline toggle-live" title="Show live partial transcript while recording">
                     <input id="livePreviewToggle" type="checkbox" />
                   </label>
                 </div>
@@ -299,7 +299,7 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Transcribe <span class="pane-latency" id="transcribeLatency">--</span></span>
                 <div class="pane-actions">
-                  <label class="toggle-inline toggle-blue" title="Auto transcribe after stopping recording">
+                  <label class="toggle-inline toggle-transcribe" title="Auto transcribe after stopping recording">
                     <input id="autoTranscribeToggle" type="checkbox" checked />
                   </label>
                 </div>
@@ -403,7 +403,7 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Upscale <span class="pane-latency" id="upscaleLatency">--</span></span>
                 <div class="pane-actions">
-                  <label class="toggle-inline toggle-purple" title="Improve transcript before paste/save">
+                  <label class="toggle-inline toggle-upscale" title="Improve transcript before paste/save">
                     <input id="upscaleToggle" type="checkbox" />
                   </label>
                 </div>
