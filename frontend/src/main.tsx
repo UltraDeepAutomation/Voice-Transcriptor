@@ -6065,6 +6065,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
       // Recordings view reflects the improved result. This is safe to
       // do regardless of session state — it's archive-side state, not
       // live UI state.
+      let archiveSaveFailureMessage = "";
       try {
         await saveRecordingText({
           name: audioState.savedName,
@@ -6079,14 +6080,9 @@ $("retranscribeBtn").addEventListener("click", async () => {
             : (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
           language: lang,
         });
-      } catch { }
-      if (isCurrentUiSession(capturedToken)) {
-        patchCurrentRecordingSummary({
-          status: usedProvider === "deepgram"
-            ? "Re-transcribed via Deepgram REST."
-            : "Re-transcribed via local Whisper.",
-          tone: "success",
-        }, capturedToken);
+      } catch (saveErr) {
+        console.warn("Re-transcribe: transcript archive save failed:", saveErr);
+        archiveSaveFailureMessage = sanitizeUiErrorMessage(saveErr, "History save failed.");
       }
       // AI Upscale: if the user has upscale enabled, the re-transcript
       // should get the same rewrite treatment as a fresh live session.
@@ -6094,14 +6090,31 @@ $("retranscribeBtn").addEventListener("click", async () => {
       // visibly differs from what live recording produces for the same
       // audio — surprising inconsistency. `runUpscaleIfEnabled` is a
       // no-op when the toggle is off, and already session-guards its
-      // own DOM writes via the placeholderNonce pattern.
+      // own DOM writes via the placeholderNonce pattern. Keep final
+      // status ownership here so a save warning is not overwritten by
+      // the upscale helper's generic "Done" status.
       try {
-        await runUpscaleIfEnabled(text, capturedToken);
+        await runUpscaleIfEnabled(text, capturedToken, { setDoneStatus: false });
       } catch (upscaleErr) {
         // runUpscaleIfEnabled handles its own UI error states;
         // swallow here so retranscribe's overall success status is
         // preserved for the user.
         console.warn("Re-transcribe: upscale step failed:", upscaleErr);
+      }
+      if (isCurrentUiSession(capturedToken)) {
+        if (archiveSaveFailureMessage) {
+          patchCurrentRecordingSummary({
+            status: `Re-transcribed, but History save failed: ${archiveSaveFailureMessage}`,
+            tone: "warning",
+          }, capturedToken);
+        } else {
+          patchCurrentRecordingSummary({
+            status: usedProvider === "deepgram"
+              ? "Re-transcribed via Deepgram REST."
+              : "Re-transcribed via local Whisper.",
+            tone: "success",
+          }, capturedToken);
+        }
       }
     } else {
       if (isCurrentUiSession(capturedToken)) {
