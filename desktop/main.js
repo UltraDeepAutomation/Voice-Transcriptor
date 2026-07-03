@@ -2159,14 +2159,9 @@ async function toggleRecordingFromShortcut() {
   shortcutToggleInFlight = true;
   let keepCapturedTarget = false;
   try {
-    const front = await getFrontmostAppInfo();
-    traceStep(trace, "front_before", {
-      name: front.name || "",
-      pid: front.pid || 0,
-      windowTitle: compactLogText(front.windowTitle || "", 80),
-    });
-    await publishRecordingStatus(hasActivePostStopWork() ? "" : "Starting");
-    traceStep(trace, "recording_status_ready", { status: hasActivePostStopWork() ? "active-post-stop" : "Starting" });
+    const activePostStopAtPress = hasActivePostStopWork();
+    await publishRecordingStatus(activePostStopAtPress ? "Transcribing" : "Starting");
+    traceStep(trace, "recording_status_ready", { status: activePostStopAtPress ? "Transcribing" : "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
@@ -2201,13 +2196,23 @@ async function toggleRecordingFromShortcut() {
       return;
     }
 
-    const micGranted = await requestMacMicrophonePermissionOnce();
-    if (!micGranted) {
-      traceStep(trace, "mic_permission_denied", {});
-      await setRecordingStatus("Grant Access");
-      resetRecordingStatusState();
-      traceEnd(trace, "failed", { reason: "mic-permission-denied" });
-      return;
+    let front = { name: "", pid: 0, windowTitle: "" };
+    if (!beforeToggleState.recording) {
+      front = await getFrontmostAppInfoWithTimeout(1200);
+      traceStep(trace, "front_before", {
+        name: front.name || "",
+        pid: front.pid || 0,
+        windowTitle: compactLogText(front.windowTitle || "", 80),
+        timedOut: !!front.timedOut,
+      });
+      const micGranted = await requestMacMicrophonePermissionOnce();
+      if (!micGranted) {
+        traceStep(trace, "mic_permission_denied", {});
+        await setRecordingStatus("Grant Access");
+        resetRecordingStatusState();
+        traceEnd(trace, "failed", { reason: "mic-permission-denied" });
+        return;
+      }
     }
 
     // 1.1.25 fix: previously called ``executeJavaScript`` directly with
@@ -3030,6 +3035,23 @@ async function getFrontmostAppInfo() {
     pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0,
     windowTitle: String(windowTitle || "").trim(),
   };
+}
+
+async function getFrontmostAppInfoWithTimeout(timeoutMs = 1200) {
+  let timer = null;
+  const fallback = { name: "", pid: 0, windowTitle: "", timedOut: true };
+  try {
+    return await Promise.race([
+      getFrontmostAppInfo(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(fallback), Math.max(100, Number(timeoutMs) || 1200));
+      }),
+    ]);
+  } catch {
+    return { name: "", pid: 0, windowTitle: "" };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function activateAppByName(name) {
@@ -4517,14 +4539,15 @@ async function pasteLatestTranscriptFromShortcut() {
   pasteShortcutInFlight = true;
   try {
     clearCapturedPasteTarget();
-    const front = await getFrontmostAppInfo();
+    await publishRecordingStatus("Pasting");
+    const front = await getFrontmostAppInfoWithTimeout(1200);
     traceStep(trace, "front_before", {
       name: front.name || "",
       pid: front.pid || 0,
       windowTitle: compactLogText(front.windowTitle || "", 80),
+      timedOut: !!front.timedOut,
     });
     setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
-    await publishRecordingStatus("Pasting");
 
     const text = await getLatestTranscriptText();
     if (!text) {
