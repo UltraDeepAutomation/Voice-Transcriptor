@@ -685,16 +685,131 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  width: 334,
-  height: 64,
-  bottomMargin: 18,
+  collapsedWidth: 184,
+  expandedWidth: 196,
+  expandedHeight: 96,
+  height: 47,
+  geometryPadding: 4,
+  minWidth: 120,
+  minHeight: 32,
+  maxWidth: 360,
+  maxHeight: 260,
+  bottomMargin: 10,
+  waveWidth: 54,
+  waveHeight: 16,
+  waveBarWidth: 1.4,
+  waveBarGap: 1.0,
+  waveIdleTickMs: 120,
+  waveActiveStaleMs: 220,
+  timerTickMs: 200,
 });
 
 const recordingStatusCapsuleState = {
   status: "",
   startedAt: 0,
   level: 0,
+  settingsLoaded: false,
+  settings: {
+    autoStopEnabled: false,
+    autoStopSeconds: DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds,
+    upscaleEnabled: false,
+    upscaleSelected: "builtin_clean",
+    upscalePresets: [{ id: "builtin_clean", name: "Clean" }],
+    autoSendEnabled: false,
+  },
 };
+
+let recordingStatusQuickSettingsOpen = false;
+let recordingStatusCapsuleGeometry = null;
+
+function clampRecordingStatusCapsuleDimension(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.ceil(n)));
+}
+
+function getRecordingStatusCapsuleFallbackWindowSize() {
+  return recordingStatusQuickSettingsOpen
+    ? {
+      width: RECORDING_STATUS_CAPSULE.expandedWidth,
+      height: RECORDING_STATUS_CAPSULE.expandedHeight,
+    }
+    : {
+      width: RECORDING_STATUS_CAPSULE.collapsedWidth,
+      height: RECORDING_STATUS_CAPSULE.height,
+    };
+}
+
+function getRecordingStatusCapsuleWindowSize() {
+  const geometry = recordingStatusCapsuleGeometry;
+  if (!geometry || geometry.quickOpen !== recordingStatusQuickSettingsOpen) {
+    return getRecordingStatusCapsuleFallbackWindowSize();
+  }
+  const pad = Math.max(0, Number(RECORDING_STATUS_CAPSULE.geometryPadding) || 0);
+  return {
+    width: clampRecordingStatusCapsuleDimension(
+      geometry.width + pad,
+      RECORDING_STATUS_CAPSULE.minWidth,
+      RECORDING_STATUS_CAPSULE.maxWidth,
+    ),
+    height: clampRecordingStatusCapsuleDimension(
+      geometry.height + pad,
+      RECORDING_STATUS_CAPSULE.minHeight,
+      RECORDING_STATUS_CAPSULE.maxHeight,
+    ),
+  };
+}
+
+function applyRecordingStatusCapsuleWindowSize() {
+  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
+  const size = getRecordingStatusCapsuleWindowSize();
+  try {
+    recordingStatusWindow.setSize(size.width, size.height, false);
+    recordingStatusWindow.setBounds(recordingStatusCapsuleBounds(), false);
+  } catch { }
+}
+
+function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
+  let payload = null;
+  try {
+    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
+  } catch {
+    return;
+  }
+  const width = Number(payload?.width);
+  const height = Number(payload?.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+  const next = {
+    width: clampRecordingStatusCapsuleDimension(width, 1, RECORDING_STATUS_CAPSULE.maxWidth),
+    height: clampRecordingStatusCapsuleDimension(height, 1, RECORDING_STATUS_CAPSULE.maxHeight),
+    quickOpen: !!payload?.quickOpen,
+    menuOpen: !!payload?.menuOpen,
+  };
+  const prev = recordingStatusCapsuleGeometry;
+  if (
+    prev &&
+    prev.width === next.width &&
+    prev.height === next.height &&
+    prev.quickOpen === next.quickOpen &&
+    prev.menuOpen === next.menuOpen
+  ) {
+    return;
+  }
+  recordingStatusCapsuleGeometry = next;
+  applyRecordingStatusCapsuleWindowSize();
+}
+
+function recordingStatusMode(status) {
+  const text = String(status || "").trim().toLowerCase();
+  if (!text) return "idle";
+  if (text === "starting" || text.includes("record")) return "recording";
+  if (text.includes("auto stop")) return "autostop";
+  if (text.includes("upscal")) return "upscaling";
+  if (text.includes("transcrib") || text.includes("processing") || text.includes("pasting")) return "transcribing";
+  if (text.includes("pasted") || text.includes("sent") || text.includes("saved") || text.includes("done")) return "ok";
+  if (text.includes("access") || text.includes("loading") || text.includes("fail") || text.includes("error") || text.includes("no text")) return "fail";
+  return "transcribing";
+}
 
 function recordingStatusTone(status) {
   const text = String(status || "").trim().toLowerCase();
@@ -707,7 +822,165 @@ function recordingStatusTone(status) {
   return "neutral";
 }
 
+async function getRendererUpscalePresetContext() {
+  const fallback = {
+    selected: "builtin_clean",
+    enabled: false,
+    presets: [{ id: "builtin_clean", name: "Clean" }],
+  };
+  const out = await execRendererJsWithTimeout(
+    `
+    (() => {
+      const sel = document.getElementById('upscalePresetSelect');
+      const toggle = document.getElementById('upscaleToggle');
+      const selected = String(sel ? sel.value : 'builtin_clean').trim() || 'builtin_clean';
+      const enabled = !!(toggle && toggle.checked);
+      const presets = Array.from(sel ? sel.options : []).map((option) => ({
+        id: String(option.value || '').trim(),
+        name: String(option.textContent || option.value || '').trim(),
+      })).filter((item) => item.id);
+      return { selected, enabled, presets };
+    })();
+    `,
+    null,
+  );
+  if (!out) return fallback;
+  const presets = Array.isArray(out.presets) && out.presets.length
+    ? out.presets
+      .map((item) => ({
+        id: String(item?.id || "").trim(),
+        name: String(item?.name || item?.id || "").trim(),
+      }))
+      .filter((item) => item.id)
+    : fallback.presets;
+  const selected = String(out.selected || "").trim();
+  return {
+    enabled: !!out.enabled,
+    selected: selected && presets.some((item) => item.id === selected) ? selected : presets[0].id,
+    presets,
+  };
+}
+
+async function refreshRecordingStatusCapsuleSettings() {
+  const [upscaleCtx, autoSend, autoStop] = await Promise.all([
+    getRendererUpscalePresetContext(),
+    getRendererAutoSendEnterEnabled(),
+    getRendererAutoStopSilenceConfig(),
+  ]);
+  recordingStatusCapsuleState.settings = {
+    autoStopEnabled: !!autoStop.enabled,
+    autoStopSeconds: Number.isFinite(Number(autoStop.seconds))
+      ? Number(autoStop.seconds)
+      : DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds,
+    upscaleEnabled: !!upscaleCtx.enabled,
+    upscaleSelected: String(upscaleCtx.selected || "builtin_clean").trim() || "builtin_clean",
+    upscalePresets: Array.isArray(upscaleCtx.presets) && upscaleCtx.presets.length
+      ? upscaleCtx.presets
+      : [{ id: "builtin_clean", name: "Clean" }],
+    autoSendEnabled: !!autoSend,
+  };
+  recordingStatusCapsuleState.settingsLoaded = true;
+}
+
+async function setRendererUpscaleEnabled(enabled) {
+  await execRendererJsWithTimeout(
+    `
+    (() => {
+      const toggle = document.getElementById('upscaleToggle');
+      if (!toggle) return false;
+      const next = ${enabled ? "true" : "false"};
+      if (!!toggle.checked !== next) {
+        toggle.checked = next;
+        toggle.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return true;
+    })();
+    `,
+    false,
+    500,
+  );
+}
+
+async function setRendererUpscalePreset(presetId) {
+  const safePresetId = String(presetId || "").trim();
+  if (!safePresetId) return;
+  await execRendererJsWithTimeout(
+    `
+    (() => {
+      const sel = document.getElementById('upscalePresetSelect');
+      if (!sel) return false;
+      const next = ${JSON.stringify(safePresetId)};
+      if (!Array.from(sel.options).some((option) => option.value === next)) return false;
+      if (sel.value !== next) {
+        sel.value = next;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return true;
+    })();
+    `,
+    false,
+    500,
+  );
+}
+
+async function setRendererAutoSendEnterEnabled(enabled) {
+  await execRendererJsWithTimeout(
+    `
+    (() => {
+      const btn = document.getElementById('autoSendEnterToggle');
+      if (!btn) return false;
+      const next = ${enabled ? "true" : "false"};
+      const active = btn.classList.contains('active');
+      if (active !== next) btn.click();
+      return true;
+    })();
+    `,
+    false,
+    500,
+  );
+}
+
+async function setRendererAutoStopSilenceEnabled(enabled) {
+  await execRendererJsWithTimeout(
+    `
+    (() => {
+      const input = document.getElementById('autoStopSilenceEnabled');
+      if (!input) return false;
+      const next = ${enabled ? "true" : "false"};
+      if (!!input.checked !== next) {
+        input.checked = next;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return true;
+    })();
+    `,
+    false,
+    500,
+  );
+}
+
+async function setRendererAutoStopSilenceSeconds(seconds) {
+  const safeSeconds = Math.min(120, Math.max(1, Math.round(Number(seconds) || DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds)));
+  await execRendererJsWithTimeout(
+    `
+    (() => {
+      const input = document.getElementById('autoStopSilenceSeconds');
+      if (!input) return false;
+      const next = ${JSON.stringify(String(safeSeconds))};
+      if (String(input.value || '') !== next) {
+        input.value = next;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return true;
+    })();
+    `,
+    false,
+    500,
+  );
+}
+
 function recordingStatusCapsuleHtml() {
+  const t = RECORDING_STATUS_CAPSULE;
   return `<!doctype html>
 <html>
 <head>
@@ -726,137 +999,776 @@ function recordingStatusCapsuleHtml() {
       -webkit-user-select: none;
     }
     body {
-      display: grid;
-      place-items: center;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
     }
-    .capsule {
-      width: 318px;
-      height: 52px;
-      border-radius: 999px;
-      border: 1px solid rgba(255,255,255,0.16);
-      background: rgba(18,18,18,0.88);
-      box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.10),
-        0 10px 22px rgba(0,0,0,0.34);
-      backdrop-filter: blur(18px) saturate(1.12);
-      -webkit-backdrop-filter: blur(18px) saturate(1.12);
-      display: grid;
-      grid-template-columns: 34px minmax(0, 1fr) 68px;
+    #stack {
+      display: flex;
+      flex-direction: column;
       align-items: center;
-      gap: 10px;
-      padding: 0 14px 0 10px;
-      cursor: default;
+      gap: 4px;
+      margin: 0 auto;
     }
-    .gear {
-      width: 30px;
-      height: 30px;
-      border-radius: 50%;
-      border: 1px solid rgba(255,255,255,0.12);
-      background: rgba(255,255,255,0.045);
-      display: grid;
-      place-items: center;
-      color: #cfcfcf;
-      font-size: 15px;
-      line-height: 1;
-    }
-    .meter {
-      height: 16px;
+    #pill {
+      width: fit-content;
       display: flex;
       align-items: center;
-      gap: 3px;
-      min-width: 0;
-    }
-    .bar {
-      width: 2px;
-      height: calc(4px + var(--level, 0) * 15px);
-      min-height: 4px;
-      max-height: 18px;
+      justify-content: flex-start;
+      padding: 7px 7px 7px 5px;
       border-radius: 999px;
-      background: #bdbdbd;
-      opacity: 0.65;
-      transition: height 90ms ease, background 120ms ease, opacity 120ms ease;
-    }
-    .capsule[data-tone="recording"] .bar { background: #8fd3a4; opacity: 0.95; }
-    .capsule[data-tone="processing"] .bar { background: #cddfff; opacity: 0.9; }
-    .capsule[data-tone="success"] .bar { background: #8fd3a4; opacity: 0.8; }
-    .capsule[data-tone="warning"] .bar { background: #d8be7a; opacity: 0.85; }
-    .capsule[data-tone="error"] .bar { background: #ff8080; opacity: 0.9; }
-    .text {
-      min-width: 0;
+      border: 1px solid #333;
+      background: #161616;
+      box-shadow: none;
       overflow: hidden;
+      isolation: isolate;
+    }
+    #core {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+    }
+    #settingsSlot {
+      width: 100%;
+      height: 0;
+      min-height: 0;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      overflow: visible;
+    }
+    #settingsSlot.on {
+      height: auto;
+      min-height: 34px;
+      margin-bottom: 8px;
+    }
+    #settingsPill {
+      width: fit-content;
+      min-height: 22px;
+      padding: 8px;
+      border-radius: 14px;
+      border: 1px solid #333;
+      background: #161616;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-5px) scale(.985);
+      transition: opacity .12s ease, transform .12s ease;
+    }
+    #settingsSlot.on #settingsPill {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(-2px) scale(1);
+    }
+    #quickPanel {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 4px;
+      min-width: 0;
+      overflow: visible;
+    }
+    #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      height: 22px;
+      padding: 0 6px 0 2px;
+      border-radius: 999px;
       white-space: nowrap;
-      text-overflow: ellipsis;
-      font-size: 12px;
+    }
+    .capsuleLabel, #quickUpscaleOffLabel {
+      font-size: 10px;
       font-weight: 650;
       letter-spacing: 0;
-      color: #e8e8e8;
+      opacity: .92;
     }
-    .time {
-      justify-self: end;
-      min-width: 56px;
-      text-align: right;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 17px;
+    #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle {
+      appearance: none;
+      width: 28px;
+      height: 16px;
+      border-radius: 999px;
+      border: 1px solid #444;
+      background: #2a2a2a;
+      position: relative;
+      outline: none;
+      cursor: default;
+      flex: 0 0 28px;
+      transition: background .14s ease, border-color .14s ease;
+    }
+    #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before {
+      content: "";
+      position: absolute;
+      left: 2px;
+      top: 2px;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #d2d2d2;
+      transition: transform .14s ease, background .14s ease;
+    }
+    #quickUpscaleCapsule {
+      border: 1px solid #3d2e52;
+      background: #2a2234;
+      color: #e0e0e0;
+    }
+    #quickUpscaleToggle:checked {
+      background: #5a36a0;
+      border-color: #7a50c8;
+    }
+    #quickUpscaleToggle:checked::before {
+      transform: translateX(12px);
+      background: #fff;
+    }
+    #quickAutoSendCapsule {
+      border: 1px solid #2e4a35;
+      background: #1e2e22;
+      color: #d0e8d4;
+    }
+    #quickAutoSendToggle:checked {
+      background: #2e5c3a;
+      border-color: #4a8a5a;
+    }
+    #quickAutoSendToggle:checked::before {
+      transform: translateX(12px);
+      background: #90e0a0;
+    }
+    #quickAutoStopCapsule {
+      border: 1px solid #4a4428;
+      background: #2a2818;
+      color: #e0dcc0;
+    }
+    #quickAutoStopToggle:checked {
+      background: #5c5020;
+      border-color: #8a7a3a;
+    }
+    #quickAutoStopToggle:checked::before {
+      transform: translateX(12px);
+      background: #e8d860;
+    }
+    #quickAutoStopSecsLabel {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      margin-left: 2px;
+      height: 18px;
+      padding: 1px 3px;
+      border: 1px solid #4a4428;
+      border-radius: 8px;
+      background: #2a2818;
+    }
+    #quickAutoStopSecs {
+      display: inline-block;
+      min-width: 18px;
+      text-align: center;
+      color: #e0dcc0;
+      font-size: 10px;
+      font-weight: 700;
+      font-family: Menlo, ui-monospace, monospace;
+      line-height: 1;
+      padding: 0 2px;
+    }
+    #quickAutoStopSecsMinus, #quickAutoStopSecsPlus {
+      all: unset;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 4px;
+      color: #d4c888;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: default;
+      transition: background 80ms ease;
+    }
+    #quickAutoStopSecsMinus:hover, #quickAutoStopSecsPlus:hover {
+      background: #4a4428;
+    }
+    #quickUpscaleDrop {
+      position: relative;
+    }
+    #quickUpscaleBtn {
+      appearance: none;
+      border: 1px solid #3d2e52;
+      border-radius: 999px;
+      background: #2a2234;
+      color: #eaeaea;
+      height: 18px;
+      min-width: 96px;
+      max-width: 96px;
+      padding: 0 18px 0 8px;
+      font-size: 10px;
+      font-weight: 600;
+      text-align: left;
+      cursor: default;
+      position: relative;
+    }
+    #quickUpscaleBtn::after {
+      content: "";
+      position: absolute;
+      right: 6px;
+      top: 50%;
+      width: 8px;
+      height: 5px;
+      transform: translateY(-50%);
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 8px 5px;
+      background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+    }
+    #quickUpscaleBtnText {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #quickUpscaleMenu {
+      position: absolute;
+      left: 0;
+      top: 22px;
+      min-width: 100%;
+      max-height: 160px;
+      overflow: auto;
+      padding: 4px;
+      border: 1px solid #3d2e52;
+      border-radius: 10px;
+      background: #1e1a24;
+      display: none;
+      z-index: 5;
+    }
+    #quickUpscaleMenu.open {
+      display: block;
+    }
+    .quickUpscaleItem {
+      width: 100%;
+      appearance: none;
+      border: 0;
+      border-radius: 8px;
+      height: 22px;
+      padding: 0 8px;
+      text-align: left;
+      color: #eaeaea;
+      background: transparent;
+      font-size: 10px;
+      cursor: default;
+    }
+    .quickUpscaleItem:hover {
+      background: #2e2e2e;
+    }
+    .quickUpscaleItem.active {
+      background: #3a2a52;
+    }
+    #quickUpscaleCapsule.up-off #quickUpscaleDrop {
+      display: none;
+    }
+    #quickUpscaleCapsule.up-on #quickUpscaleOffLabel {
+      display: none;
+    }
+    #gearBtn {
+      appearance: none;
+      border: 1px solid #333;
+      border-radius: 999px;
+      background: #2a2a2a;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      position: relative;
+      flex: 0 0 22px;
+      cursor: default;
+    }
+    #gearBtn::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 11px;
+      height: 11px;
+      transform: translate(-50%,-50%);
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 11px 11px;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
+    }
+    #gearBtn.on {
+      border-color: #444;
+      background: #3a3a3a;
+    }
+    #wave {
+      display: block;
+      width: ${t.waveWidth}px;
+      height: ${t.waveHeight}px;
+      opacity: .95;
+      flex: 0 0 ${t.waveWidth}px;
+    }
+    #timer {
+      font-size: 10px;
       font-weight: 800;
-      letter-spacing: 0;
-      color: #ffffff;
+      color: rgba(255,255,255,.96);
+      font-family: Menlo, ui-monospace, monospace;
+      min-width: 36px;
+      text-align: center;
+      line-height: 1;
+      flex: 0 0 36px;
       font-variant-numeric: tabular-nums;
+    }
+    #stateIcon {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      position: relative;
+      display: inline-block;
+      flex: 0 0 14px;
+      background: transparent;
+    }
+    #stateIcon::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 8px;
+      height: 8px;
+      transform: translate(-50%,-50%);
+      border-radius: 50%;
+      background: rgba(180,180,180,.92);
+    }
+    #stateIcon::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 14px;
+      height: 14px;
+      transform: translate(-50%,-50%);
+      border-radius: 50%;
+      border: 1px solid rgba(180,180,180,.2);
+      opacity: 0;
+    }
+    #stateIcon.rec::before {
+      background: rgba(255,92,92,.94);
+      border-radius: 2px;
+      animation: coreBreathe 1.35s ease-in-out infinite;
+    }
+    #stateIcon.rec::after {
+      opacity: 1;
+      border-color: rgba(255,92,92,.44);
+      animation: recHalo 1.35s ease-out infinite;
+    }
+    #stateIcon.transcribing::before {
+      background: rgba(114,174,255,.98);
+      box-shadow: 0 0 8px rgba(114,174,255,.55);
+    }
+    #stateIcon.transcribing::after {
+      opacity: 1;
+      border-color: rgba(114,174,255,.75);
+      border-radius: 38% 62% 44% 56% / 54% 42% 58% 46%;
+      box-shadow: 0 0 10px rgba(114,174,255,.36), inset 0 0 6px rgba(114,174,255,.28);
+      animation: transBlob 1.05s ease-in-out infinite;
+    }
+    #stateIcon.upscaling::before {
+      background: rgba(173,112,255,.98);
+      box-shadow: 0 0 8px rgba(173,112,255,.5);
+    }
+    #stateIcon.upscaling::after {
+      opacity: 1;
+      border-color: rgba(173,112,255,.72);
+      border-radius: 38% 62% 44% 56% / 54% 42% 58% 46%;
+      box-shadow: 0 0 10px rgba(173,112,255,.34), inset 0 0 6px rgba(173,112,255,.26);
+      animation: transBlob 1.05s ease-in-out infinite;
+    }
+    #stateIcon.autostop::before {
+      background: rgba(255,196,74,.98);
+      box-shadow: 0 0 8px rgba(255,196,74,.46);
+    }
+    #stateIcon.autostop::after {
+      opacity: 1;
+      border-color: rgba(255,196,74,.66);
+      animation: okHalo .8s ease-out infinite;
+    }
+    #stateIcon.ok::before {
+      background: rgba(112,210,136,.96);
+      box-shadow: 0 0 8px rgba(112,210,136,.4);
+      animation: okBreathe .65s ease-out 1;
+    }
+    #stateIcon.ok::after {
+      opacity: 1;
+      border-color: rgba(112,210,136,.35);
+      animation: okHalo .7s ease-out 1;
+    }
+    #stateIcon.fail::before {
+      background: rgba(184,184,184,.95);
+    }
+    @keyframes coreBreathe {
+      0%,100% { transform: translate(-50%,-50%) scale(1); }
+      50% { transform: translate(-50%,-50%) scale(1.1); }
+    }
+    @keyframes recHalo {
+      0% { transform: translate(-50%,-50%) scale(1); opacity: .9; }
+      70% { transform: translate(-50%,-50%) scale(1.28); opacity: .16; }
+      100% { transform: translate(-50%,-50%) scale(1.36); opacity: 0; }
+    }
+    @keyframes transBlob {
+      0% { transform: translate(-50%,-50%) rotate(0deg) scale(1); border-radius: 38% 62% 44% 56% / 54% 42% 58% 46%; }
+      33% { transform: translate(-50%,-50%) rotate(40deg) scale(1.07); border-radius: 62% 38% 58% 42% / 40% 62% 38% 60%; }
+      66% { transform: translate(-50%,-50%) rotate(84deg) scale(1.02); border-radius: 46% 54% 40% 60% / 62% 36% 64% 38%; }
+      100% { transform: translate(-50%,-50%) rotate(125deg) scale(1); border-radius: 38% 62% 44% 56% / 54% 42% 58% 46%; }
+    }
+    @keyframes okBreathe {
+      0% { transform: translate(-50%,-50%) scale(.86); }
+      100% { transform: translate(-50%,-50%) scale(1); }
+    }
+    @keyframes okHalo {
+      0% { transform: translate(-50%,-50%) scale(.92); opacity: .7; }
+      100% { transform: translate(-50%,-50%) scale(1.2); opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #settingsPill,
+      #quickUpscaleToggle,
+      #quickAutoSendToggle,
+      #quickAutoStopToggle,
+      #quickUpscaleToggle::before,
+      #quickAutoSendToggle::before,
+      #quickAutoStopToggle::before,
+      #stateIcon::before,
+      #stateIcon::after {
+        animation: none !important;
+        transition: none !important;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="capsule" id="capsule" data-tone="neutral" title="Click to open Transcriptor">
-    <div class="gear" aria-hidden="true">●</div>
-    <div class="meter" aria-hidden="true">
-      <span class="bar" style="--level:.18"></span>
-      <span class="bar" style="--level:.28"></span>
-      <span class="bar" style="--level:.38"></span>
-      <span class="bar" style="--level:.28"></span>
-      <span class="bar" style="--level:.18"></span>
+  <div id="stack">
+    <div id="settingsSlot">
+      <div id="settingsPill">
+        <div id="quickPanel">
+          <div id="quickAutoStopCapsule" title="Auto stop on silence">
+            <input id="quickAutoStopToggle" type="checkbox" />
+            <span class="capsuleLabel">Stop</span>
+            <div id="quickAutoStopSecsLabel">
+              <button id="quickAutoStopSecsMinus" type="button" aria-label="Decrease seconds">&minus;</button>
+              <span id="quickAutoStopSecs" aria-live="polite">2</span>
+              <button id="quickAutoStopSecsPlus" type="button" aria-label="Increase seconds">+</button>
+            </div>
+          </div>
+          <div id="quickUpscaleCapsule" title="Upscale settings">
+            <input id="quickUpscaleToggle" type="checkbox" />
+            <span id="quickUpscaleOffLabel">Upscale</span>
+            <div id="quickUpscaleDrop">
+              <button id="quickUpscaleBtn" type="button" aria-label="Upscale preset">
+                <span id="quickUpscaleBtnText">Clean</span>
+              </button>
+              <div id="quickUpscaleMenu"></div>
+            </div>
+          </div>
+          <div id="quickAutoSendCapsule" title="Auto send after paste">
+            <input id="quickAutoSendToggle" type="checkbox" />
+            <span class="capsuleLabel">Send</span>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="time" id="time">00:00</div>
-    <div class="text" id="status" hidden></div>
+    <div id="pill">
+      <div id="core">
+        <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
+        <canvas id="wave" width="${t.waveWidth}" height="${t.waveHeight}"></canvas>
+        <span id="timer">00:00</span>
+        <span id="stateIcon" aria-hidden="true"></span>
+      </div>
+    </div>
   </div>
   <script>
-    const capsule = document.getElementById("capsule");
-    const statusEl = document.getElementById("status");
-    const timeEl = document.getElementById("time");
-    const bars = Array.from(document.querySelectorAll(".bar"));
-    let state = { status: "", tone: "neutral", startedAt: 0, level: 0 };
+    const stackEl = document.getElementById("stack");
+    const settingsSlot = document.getElementById("settingsSlot");
+    const gearBtn = document.getElementById("gearBtn");
+    const stateIcon = document.getElementById("stateIcon");
+    const timeEl = document.getElementById("timer");
+    const cv = document.getElementById("wave");
+    const ctx = cv.getContext("2d");
+    const quickUpscaleCapsule = document.getElementById("quickUpscaleCapsule");
+    const quickUpscaleToggle = document.getElementById("quickUpscaleToggle");
+    const quickUpscaleBtn = document.getElementById("quickUpscaleBtn");
+    const quickUpscaleBtnText = document.getElementById("quickUpscaleBtnText");
+    const quickUpscaleMenu = document.getElementById("quickUpscaleMenu");
+    const quickAutoSendToggle = document.getElementById("quickAutoSendToggle");
+    const quickAutoStopToggle = document.getElementById("quickAutoStopToggle");
+    const quickAutoStopSecs = document.getElementById("quickAutoStopSecs");
+    const quickAutoStopMinus = document.getElementById("quickAutoStopSecsMinus");
+    const quickAutoStopPlus = document.getElementById("quickAutoStopSecsPlus");
+    const waveW = ${t.waveWidth};
+    const waveH = ${t.waveHeight};
+    const bw = ${t.waveBarWidth};
+    const gap = ${t.waveBarGap};
+    const maxBars = Math.floor(waveW / (bw + gap));
+    const bars = [];
+    let state = {
+      status: "",
+      mode: "idle",
+      startedAt: 0,
+      level: 0,
+      settings: {
+        autoStopEnabled: false,
+        autoStopSeconds: 2,
+        upscaleEnabled: false,
+        upscaleSelected: "builtin_clean",
+        upscalePresets: [{ id: "builtin_clean", name: "Clean" }],
+        autoSendEnabled: false
+      }
+    };
+    let quickUpscaleOptions = [{ id: "builtin_clean", name: "Clean" }];
+    let quickUpscaleSelected = "builtin_clean";
+    let geometryEmitScheduled = false;
+    let lastLevelAt = 0;
+    let activeWave = true;
+    let waveMode = "recording";
+    let settingsSignature = "";
     function fmt(ms) {
       const total = Math.max(0, Math.floor(ms / 1000));
       const mm = String(Math.floor(total / 60)).padStart(2, "0");
       const ss = String(total % 60).padStart(2, "0");
       return mm + ":" + ss;
     }
+    function emitGeometry() {
+      const stackRect = stackEl.getBoundingClientRect();
+      let left = stackRect.left;
+      let top = stackRect.top;
+      let right = stackRect.right;
+      let bottom = stackRect.bottom;
+      const menuOpen = quickUpscaleMenu.classList.contains("open");
+      if (menuOpen) {
+        const menuRect = quickUpscaleMenu.getBoundingClientRect();
+        left = Math.min(left, menuRect.left);
+        top = Math.min(top, menuRect.top);
+        right = Math.max(right, menuRect.right);
+        bottom = Math.max(bottom, menuRect.bottom);
+      }
+      const payload = {
+        width: Math.max(1, Math.ceil(right - left)),
+        height: Math.max(1, Math.ceil(bottom - top)),
+        quickOpen: settingsSlot.classList.contains("on"),
+        menuOpen
+      };
+      document.title = "__recording_capsule_geometry__" + encodeURIComponent(JSON.stringify(payload));
+    }
+    function scheduleGeometryEmit() {
+      if (geometryEmitScheduled) return;
+      geometryEmitScheduled = true;
+      requestAnimationFrame(() => {
+        geometryEmitScheduled = false;
+        setTimeout(emitGeometry, 0);
+      });
+    }
+    function setQuickOpen(open) {
+      const on = !!open;
+      settingsSlot.classList.toggle("on", on);
+      gearBtn.classList.toggle("on", on);
+      scheduleGeometryEmit();
+    }
+    function setUpscaleEnabled(enabled) {
+      const on = !!enabled;
+      if (quickUpscaleToggle.checked !== on) quickUpscaleToggle.checked = on;
+      quickUpscaleCapsule.classList.toggle("up-on", on);
+      quickUpscaleCapsule.classList.toggle("up-off", !on);
+      scheduleGeometryEmit();
+    }
+    function renderUpscaleMenu() {
+      const selected = quickUpscaleOptions.find((item) => item.id === quickUpscaleSelected) || quickUpscaleOptions[0] || { id: "builtin_clean", name: "Clean" };
+      quickUpscaleBtnText.textContent = selected.name || selected.id || "Clean";
+      quickUpscaleMenu.innerHTML = "";
+      quickUpscaleOptions.forEach((item) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "quickUpscaleItem" + (item.id === quickUpscaleSelected ? " active" : "");
+        btn.textContent = item.name.length > 22 ? item.name.slice(0, 22) + "..." : item.name;
+        btn.title = item.name;
+        btn.addEventListener("click", (event) => {
+          event.stopPropagation();
+          quickUpscaleSelected = item.id;
+          renderUpscaleMenu();
+          quickUpscaleMenu.classList.remove("open");
+          scheduleGeometryEmit();
+          document.title = "__recording_capsule_upscale__" + encodeURIComponent(item.id);
+        });
+        quickUpscaleMenu.appendChild(btn);
+      });
+    }
+    function setUpscaleOptions(items, selected) {
+      const list = Array.isArray(items) ? items : [];
+      quickUpscaleOptions = list
+        .map((item) => ({
+          id: String(item && item.id || "").trim(),
+          name: String(item && item.name || item && item.id || "").trim()
+        }))
+        .filter((item) => item.id);
+      if (!quickUpscaleOptions.length) {
+        quickUpscaleOptions = [{ id: "builtin_clean", name: "Clean" }];
+      }
+      const next = String(selected || "").trim();
+      quickUpscaleSelected = next && quickUpscaleOptions.some((item) => item.id === next)
+        ? next
+        : quickUpscaleOptions[0].id;
+      renderUpscaleMenu();
+      scheduleGeometryEmit();
+    }
+    function setAutoStopConfig(enabled, seconds) {
+      const on = !!enabled;
+      if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
+      const raw = Number(seconds);
+      const sec = Math.min(120, Math.max(1, Number.isFinite(raw) ? Math.round(raw) : 2));
+      if (Number(quickAutoStopSecs.textContent) !== sec) {
+        quickAutoStopSecs.textContent = String(sec);
+      }
+      scheduleGeometryEmit();
+    }
+    function setAutoSendEnabled(enabled) {
+      const on = !!enabled;
+      if (quickAutoSendToggle.checked !== on) quickAutoSendToggle.checked = on;
+    }
+    function applyStatusMode(mode) {
+      const next = String(mode || "idle");
+      waveMode = next === "upscaling"
+        ? "upscaling"
+        : next === "transcribing"
+          ? "transcribing"
+          : next === "autostop"
+            ? "autostop"
+            : next === "recording"
+              ? "recording"
+              : "idle";
+      activeWave = waveMode === "recording" || waveMode === "autostop";
+      stateIcon.className = "";
+      if (next === "recording") stateIcon.classList.add("rec");
+      else if (next === "upscaling") stateIcon.classList.add("upscaling");
+      else if (next === "transcribing") stateIcon.classList.add("transcribing");
+      else if (next === "autostop") stateIcon.classList.add("autostop");
+      else if (next === "ok") stateIcon.classList.add("ok");
+      else if (next === "fail") stateIcon.classList.add("fail");
+      else stateIcon.classList.add("transcribing");
+    }
+    function renderWave() {
+      ctx.clearRect(0, 0, waveW, waveH);
+      for (let i = 0; i < bars.length; i += 1) {
+        const v = bars[bars.length - 1 - i];
+        const x = waveW - (i + 1) * (bw + gap);
+        if (x < 0) break;
+        const h = Math.min(waveH - 2, v * (waveH - 2));
+        if (h <= 0) continue;
+        const y = (waveH - h) / 2;
+        if (waveMode === "recording") ctx.fillStyle = "rgba(255,77,77,.88)";
+        else if (waveMode === "autostop") ctx.fillStyle = "rgba(255,196,74,.92)";
+        else if (waveMode === "transcribing") ctx.fillStyle = "rgba(114,174,255,.92)";
+        else if (waveMode === "upscaling") ctx.fillStyle = "rgba(173,112,255,.92)";
+        else ctx.fillStyle = "rgba(170,170,170,.62)";
+        ctx.fillRect(x, y, bw, h);
+      }
+    }
+    function pushLevel(value) {
+      const raw = Math.max(0, Math.min(1, Number(value) || 0));
+      const level = Math.max(0, Math.min(1, Math.pow(raw, .72) * 1.45));
+      lastLevelAt = Date.now();
+      bars.push(level);
+      while (bars.length > maxBars) bars.shift();
+      renderWave();
+    }
     function render() {
       const level = Math.max(0, Math.min(1, Number(state.level || 0)));
-      capsule.dataset.tone = state.tone || "neutral";
-      statusEl.textContent = state.status || "";
       const elapsed = state.startedAt ? Date.now() - Number(state.startedAt) : 0;
       timeEl.textContent = fmt(elapsed);
-      bars.forEach((bar, index) => {
-        const wave = [0.52, 0.72, 1, 0.72, 0.52][index] || 0.5;
-        bar.style.setProperty("--level", String(Math.max(0.16, level * wave)));
-      });
+      applyStatusMode(state.mode);
+      const nextSettingsSignature = JSON.stringify(state.settings || {});
+      if (nextSettingsSignature !== settingsSignature) {
+        settingsSignature = nextSettingsSignature;
+        setUpscaleEnabled(!!state.settings.upscaleEnabled);
+        setUpscaleOptions(state.settings.upscalePresets, state.settings.upscaleSelected);
+        setAutoSendEnabled(!!state.settings.autoSendEnabled);
+        setAutoStopConfig(!!state.settings.autoStopEnabled, state.settings.autoStopSeconds);
+      }
+      if (waveMode === "recording") pushLevel(level);
     }
     window.__setCapsuleState = (next) => {
       state = { ...state, ...(next || {}) };
+      state.settings = { ...state.settings, ...((next && next.settings) || {}) };
       render();
       return true;
     };
-    window.setInterval(render, 250);
-    document.addEventListener("click", () => {
-      document.title = "__transcriptor_capsule_focus__" + Date.now();
+    window.addEventListener("resize", scheduleGeometryEmit);
+    document.getElementById("core").addEventListener("click", (event) => {
+      if (waveMode === "recording") {
+        event.stopPropagation();
+        document.title = "__recording_capsule_stop__";
+      }
     });
+    gearBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const next = !settingsSlot.classList.contains("on");
+      setQuickOpen(next);
+      document.title = "__recording_capsule_settings__" + (next ? "1" : "0");
+    });
+    quickUpscaleToggle.addEventListener("change", () => {
+      setUpscaleEnabled(quickUpscaleToggle.checked);
+      document.title = "__recording_capsule_upscale_enabled__" + (quickUpscaleToggle.checked ? "1" : "0");
+    });
+    quickUpscaleBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      quickUpscaleMenu.classList.toggle("open");
+      scheduleGeometryEmit();
+    });
+    document.addEventListener("click", () => {
+      if (!quickUpscaleMenu.classList.contains("open")) return;
+      quickUpscaleMenu.classList.remove("open");
+      scheduleGeometryEmit();
+    });
+    quickAutoSendToggle.addEventListener("change", () => {
+      document.title = "__recording_capsule_autosend__" + (quickAutoSendToggle.checked ? "1" : "0");
+    });
+    quickAutoStopToggle.addEventListener("change", () => {
+      document.title = "__recording_capsule_autostop_enabled__" + (quickAutoStopToggle.checked ? "1" : "0");
+    });
+    function emitSecs(value) {
+      const raw = Number(value);
+      const sec = Math.min(120, Math.max(1, Number.isFinite(raw) ? Math.round(raw) : 2));
+      quickAutoStopSecs.textContent = String(sec);
+      scheduleGeometryEmit();
+      document.title = "__recording_capsule_autostop_secs__" + sec;
+    }
+    function readSecs() {
+      const raw = Number(quickAutoStopSecs.textContent);
+      return Number.isFinite(raw) && raw > 0 ? raw : 2;
+    }
+    quickAutoStopMinus.addEventListener("click", (event) => {
+      event.stopPropagation();
+      emitSecs(readSecs() - 1);
+    });
+    quickAutoStopPlus.addEventListener("click", (event) => {
+      event.stopPropagation();
+      emitSecs(readSecs() + 1);
+    });
+    setInterval(() => {
+      if (activeWave && Date.now() - lastLevelAt < ${t.waveActiveStaleMs}) return;
+      const idle = activeWave
+        ? (0.08 + Math.random() * 0.12)
+        : ((waveMode === "transcribing" || waveMode === "upscaling") ? 0.055 : (0.03 + Math.random() * 0.03));
+      bars.push(idle);
+      while (bars.length > maxBars) bars.shift();
+      renderWave();
+    }, ${t.waveIdleTickMs});
+    setInterval(() => {
+      const elapsed = state.startedAt ? Date.now() - Number(state.startedAt) : 0;
+      timeEl.textContent = fmt(elapsed);
+    }, ${t.timerTickMs});
+    setQuickOpen(false);
+    setUpscaleEnabled(false);
+    setUpscaleOptions([{ id: "builtin_clean", name: "Clean" }], "builtin_clean");
+    setAutoSendEnabled(false);
     render();
+    scheduleGeometryEmit();
   </script>
 </body>
 </html>`;
 }
 
 function recordingStatusCapsuleBounds() {
-  const size = RECORDING_STATUS_CAPSULE;
+  const size = getRecordingStatusCapsuleWindowSize();
   const fallback = { x: 0, y: 0, width: 1440, height: 900 };
   let workArea = fallback;
   try {
@@ -868,7 +1780,7 @@ function recordingStatusCapsuleBounds() {
   }
   return {
     x: Math.round(workArea.x + (workArea.width - size.width) / 2),
-    y: Math.round(workArea.y + workArea.height - size.height - size.bottomMargin),
+    y: Math.round(workArea.y + workArea.height - size.height - RECORDING_STATUS_CAPSULE.bottomMargin),
     width: size.width,
     height: size.height,
   };
@@ -907,6 +1819,7 @@ async function ensureRecordingStatusCapsuleWindow() {
       contextIsolation: true,
       sandbox: true,
       devTools: false,
+      backgroundThrottling: false,
     },
   });
 
@@ -919,11 +1832,65 @@ async function ensureRecordingStatusCapsuleWindow() {
     recordingStatusWindowLoadPromise = null;
   });
   recordingStatusWindow.webContents.on("page-title-updated", (event, title) => {
-    if (!String(title || "").startsWith("__transcriptor_capsule_focus__")) return;
+    const raw = String(title || "");
+    if (!raw.startsWith("__recording_capsule_")) return;
     event.preventDefault();
-    ensureWindowVisible({ manual: true, force: true }).catch((e) => {
-      appendMainLog(`[recording-capsule] focus failed: ${e?.message || e}`);
-    });
+    if (raw === "__recording_capsule_stop__") {
+      recordingStopInFlight = true;
+      if (win && !win.isDestroyed() && win.isVisible()) {
+        safeExecSync("recording_capsule_stop:winHide", () => win.hide());
+      }
+      guardedStopFromRecordingStatus("capsule-click");
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_geometry__")) {
+      applyRecordingStatusCapsuleGeometryPayload(raw.replace("__recording_capsule_geometry__", ""));
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_settings__")) {
+      recordingStatusQuickSettingsOpen = raw.endsWith("1");
+      applyRecordingStatusCapsuleWindowSize();
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_upscale_enabled__")) {
+      const enabled = raw.endsWith("1");
+      recordingStatusCapsuleState.settings.upscaleEnabled = enabled;
+      setRendererUpscaleEnabled(enabled).catch((e) => {
+        appendMainLog(`[recording-capsule] upscale enabled update failed: ${e?.message || e}`);
+      });
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_upscale__")) {
+      const presetId = decodeURIComponent(raw.replace("__recording_capsule_upscale__", ""));
+      recordingStatusCapsuleState.settings.upscaleSelected = presetId;
+      setRendererUpscalePreset(presetId).catch((e) => {
+        appendMainLog(`[recording-capsule] upscale preset update failed: ${e?.message || e}`);
+      });
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_autosend__")) {
+      const enabled = raw.endsWith("1");
+      recordingStatusCapsuleState.settings.autoSendEnabled = enabled;
+      setRendererAutoSendEnterEnabled(enabled).catch((e) => {
+        appendMainLog(`[recording-capsule] auto-send update failed: ${e?.message || e}`);
+      });
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_autostop_enabled__")) {
+      const enabled = raw.endsWith("1");
+      recordingStatusCapsuleState.settings.autoStopEnabled = enabled;
+      setRendererAutoStopSilenceEnabled(enabled).catch((e) => {
+        appendMainLog(`[recording-capsule] auto-stop update failed: ${e?.message || e}`);
+      });
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_autostop_secs__")) {
+      const seconds = Math.min(120, Math.max(1, Math.round(Number(raw.replace("__recording_capsule_autostop_secs__", "")) || DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds)));
+      recordingStatusCapsuleState.settings.autoStopSeconds = seconds;
+      setRendererAutoStopSilenceSeconds(seconds).catch((e) => {
+        appendMainLog(`[recording-capsule] auto-stop seconds update failed: ${e?.message || e}`);
+      });
+    }
   });
 
   const html = recordingStatusCapsuleHtml();
@@ -955,6 +1922,11 @@ async function updateRecordingStatusCapsule(patch = {}) {
   if (!recordingStatusCapsuleState.startedAt) {
     recordingStatusCapsuleState.startedAt = Date.now();
   }
+  if (!recordingStatusCapsuleState.settingsLoaded || patch.refreshSettings) {
+    await refreshRecordingStatusCapsuleSettings().catch((e) => {
+      appendMainLog(`[recording-capsule] settings refresh failed: ${e?.message || e}`);
+    });
+  }
   const capsuleWindow = await ensureRecordingStatusCapsuleWindow();
   if (!capsuleWindow || capsuleWindow.isDestroyed()) return;
   try {
@@ -963,9 +1935,11 @@ async function updateRecordingStatusCapsule(patch = {}) {
   if (!recordingStatusWindowReady) return;
   const payload = {
     status,
+    mode: recordingStatusMode(status),
     tone: recordingStatusTone(status),
     startedAt: recordingStatusCapsuleState.startedAt,
     level: Math.max(0, Math.min(1, Number(recordingStatusCapsuleState.level || 0))),
+    settings: recordingStatusCapsuleState.settings,
   };
   try {
     await capsuleWindow.webContents.executeJavaScript(
@@ -982,6 +1956,8 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.status = "";
   recordingStatusCapsuleState.level = 0;
   recordingStatusCapsuleState.startedAt = 0;
+  recordingStatusCapsuleState.settingsLoaded = false;
+  recordingStatusCapsuleGeometry = null;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     try { recordingStatusWindow.hide(); } catch { }
   }
