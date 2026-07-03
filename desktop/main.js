@@ -234,6 +234,8 @@ let backendRestartAttempts = 0;
 // destroyed webContents.
 let shortcutPollTimer = null;
 let shortcutBridgeHandler = null;
+let shortcutCaptureAbortHandler = null;
+let shortcutCaptureFailsafeTimer = null;
 let pendingShortcutBridgeMessages = [];
 // Single-flight promise for ``startBackend``. Concurrent callers
 // (window creation, restart timer, tray re-open) all await the same
@@ -4460,6 +4462,9 @@ async function createWindow(options = {}) {
     const reason = String(details?.reason || "unknown");
     const exitCode = details?.exitCode ?? "";
     appendMainLog(`[render-process-gone] reason=${reason} exitCode=${exitCode}`);
+    if (shortcutCaptureAbortHandler) {
+      shortcutCaptureAbortHandler(`render-process-gone:${reason}`);
+    }
     // ``clean-exit`` happens on normal window close and does NOT
     // require recovery. Every other reason (crashed, killed,
     // oom, etc.) leaves the Electron main process holding stale
@@ -4536,6 +4541,9 @@ async function createWindow(options = {}) {
     // instance / tray click before loadURL completed.
     if (Number(code) === -3) return;
     if (String(url || "").startsWith("data:")) return;
+    if (shortcutCaptureAbortHandler) {
+      shortcutCaptureAbortHandler(`did-fail-load:${code}`);
+    }
     const logPath = path.join(app.getPath("userData"), "main.log");
     const msg =
       "Transcriptor could not load the app window.\n\n" +
@@ -4563,6 +4571,9 @@ async function createWindow(options = {}) {
   win.webContents.on("did-finish-load", async () => {
     loadedFrontendBuildSignature = (await getFrontendBuildSignature()) || "";
     appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
+    if (shortcutCaptureAbortHandler) {
+      shortcutCaptureAbortHandler("did-finish-load");
+    }
     // Clear paste-dedup Sets on every renderer (re)load — but ONLY
     // when no in-flight recording or queued post-stop work exists.
     //
@@ -4659,6 +4670,9 @@ async function createWindow(options = {}) {
     // don't steal focus by re-creating window each time.
     if (process.platform === "darwin" && !isQuitting) {
       event.preventDefault();
+      if (shortcutCaptureAbortHandler) {
+        shortcutCaptureAbortHandler("window-hide");
+      }
       win.hide();
       return;
     }
@@ -5003,6 +5017,11 @@ app.on("before-quit", () => {
   }
   globalShortcut.unregisterAll();
   shortcutBridgeHandler = null;
+  shortcutCaptureAbortHandler = null;
+  if (shortcutCaptureFailsafeTimer) {
+    clearTimeout(shortcutCaptureFailsafeTimer);
+    shortcutCaptureFailsafeTimer = null;
+  }
   pendingShortcutBridgeMessages = [];
   if (shortcutPollTimer) {
     clearInterval(shortcutPollTimer);
@@ -5274,6 +5293,30 @@ app.whenReady().then(async () => {
     }
   }
 
+  function clearShortcutCaptureFailsafe() {
+    if (shortcutCaptureFailsafeTimer) {
+      clearTimeout(shortcutCaptureFailsafeTimer);
+      shortcutCaptureFailsafeTimer = null;
+    }
+  }
+
+  function armShortcutCaptureFailsafe() {
+    clearShortcutCaptureFailsafe();
+    shortcutCaptureFailsafeTimer = setTimeout(() => {
+      shortcutCaptureFailsafeTimer = null;
+      restoreShortcutsAfterCaptureAbort("capture-timeout");
+    }, 120000);
+    try { shortcutCaptureFailsafeTimer.unref?.(); } catch { }
+  }
+
+  function restoreShortcutsAfterCaptureAbort(reason) {
+    clearShortcutCaptureFailsafe();
+    if (!shortcutsSuspendedForCapture) return;
+    shortcutsSuspendedForCapture = false;
+    appendMainLog(`[shortcuts] settings capture aborted by ${reason}; restoring registered shortcuts`);
+    registerGlobalShortcuts();
+  }
+
   function registerGlobalShortcuts(override = null) {
     if (shortcutsSuspendedForCapture && !override) {
       appendMainLog("[shortcuts] register skipped while Settings capture is active");
@@ -5424,14 +5467,11 @@ app.whenReady().then(async () => {
         shortcutsSuspendedForCapture = true;
         unregisterRegisteredShortcuts("settings-capture");
       }
+      armShortcutCaptureFailsafe();
       return;
     }
     if (action === "capture-cancel") {
-      if (shortcutsSuspendedForCapture) {
-        shortcutsSuspendedForCapture = false;
-        appendMainLog("[shortcuts] settings capture cancelled; restoring registered shortcuts");
-        registerGlobalShortcuts();
-      }
+      restoreShortcutsAfterCaptureAbort("capture-cancel");
       return;
     }
     if (action === "update") {
@@ -5442,6 +5482,7 @@ app.whenReady().then(async () => {
         return;
       }
       shortcutsSuspendedForCapture = false;
+      clearShortcutCaptureFailsafe();
       appendMainLog(`[shortcuts] bridge live reload: record=${record} paste=${paste}`);
       registerGlobalShortcuts({ record, paste });
     }
@@ -5450,6 +5491,7 @@ app.whenReady().then(async () => {
   registerGlobalShortcuts();
 
   shortcutBridgeHandler = handleShortcutBridgeMessage;
+  shortcutCaptureAbortHandler = restoreShortcutsAfterCaptureAbort;
   if (pendingShortcutBridgeMessages.length > 0) {
     const queuedMessages = pendingShortcutBridgeMessages.splice(0);
     for (const message of queuedMessages) {
@@ -5477,6 +5519,7 @@ app.whenReady().then(async () => {
         // pending-vs-disk-write race that silently rebound users to
         // the OLD accelerator after Settings → Shortcuts capture.
         shortcutsSuspendedForCapture = false;
+        clearShortcutCaptureFailsafe();
         registerGlobalShortcuts({ record: pending.record, paste: pending.paste });
       }
     } catch { }

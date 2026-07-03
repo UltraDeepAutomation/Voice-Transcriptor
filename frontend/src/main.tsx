@@ -3914,10 +3914,15 @@ const _shortcutConflictPollHandle = window.setInterval(() => {
 // reloads in development.
 window.addEventListener("pagehide", () => {
   if (activeShortcutBtn) {
-    postShortcutBridgeMessage("capture-cancel");
+    stopShortcutRecording(true);
   }
   try { window.clearInterval(_shortcutConflictPollHandle); } catch { /* idempotent */ }
 }, { once: true });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && activeShortcutBtn) {
+    stopShortcutRecording(true);
+  }
+});
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
   // Cancel any existing recording
