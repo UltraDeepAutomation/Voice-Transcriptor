@@ -9527,7 +9527,12 @@ void loadCfg()
     await loadMics(false);
     scheduleLocalWarmup();
   })
-  .catch(() => { });
+  .catch((e) => {
+    console.warn("Startup configuration pipeline failed", e);
+    const msg = sanitizeUiErrorMessage(e, "Startup setup failed.");
+    setStatus(`Startup setup failed: ${msg}`, "warning");
+    showRecordSessionNotice(`Startup setup failed: ${msg}`, "warning", 9000);
+  });
 syncRemoteModelOptions();
 populateUpscaleModelOptions();
 // Seed the preset dropdown synchronously with the 4 built-in presets
