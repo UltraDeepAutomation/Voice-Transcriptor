@@ -3097,7 +3097,16 @@ async function recoverBackendAudioSessions(): Promise<void> {
       "success",
       9000,
     );
-    loadRecordings(true).catch(() => { });
+    void loadRecordings(true).catch((e) => {
+      console.warn("Recovery History refresh failed", e);
+      const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
+      setStatus(`Recovery saved. History refresh failed: ${msg}`, "warning");
+      showRecordSessionNotice(
+        `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"}, but History refresh failed: ${msg}`,
+        "warning",
+        9000,
+      );
+    });
   }
   if (failed > 0 && succeeded === 0) {
     showRecordSessionNotice(
@@ -3256,7 +3265,12 @@ function switchView(view: ViewName): void {
     // switches tabs. A manual Refresh button or a new recording save
     // still triggers a full reload.
     if (!recordingItems.length) {
-      void loadRecordings(true).catch(() => { });
+      void loadRecordings(true).catch((e) => {
+        console.warn("History initial load failed", e);
+        const msg = sanitizeUiErrorMessage(e, "Could not load the archive.");
+        setStatus(`History load failed: ${msg}`, "warning");
+        resetRecordingViewer(msg);
+      });
     }
   }
 }
