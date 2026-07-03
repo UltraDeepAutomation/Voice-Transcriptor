@@ -90,6 +90,37 @@ body {
   --danger-dot: #ff4444;
   --focus-ring: rgba(108, 144, 198, 0.68);
   --focus-ring-soft: rgba(108, 144, 198, 0.24);
+  --state-info-text: #cddfff;
+  --state-info-dot: #5aa9ff;
+  --state-success-text: #8fd3a4;
+  --state-success-strong-text: #b9e8c8;
+  --state-success-dot: #62c77b;
+  --state-warning-text: #d8be7a;
+  --state-warning-strong-text: #e9d6a4;
+  --state-warning-dot: #f4c542;
+  --state-danger-dot-soft: #ff6767;
+  --state-danger-soft-bg: rgba(255, 103, 103, 0.14);
+  --state-danger-soft-border: rgba(255, 103, 103, 0.7);
+  --state-danger-status-text: #ff9090;
+  --role-live-track: var(--toggle-track-on);
+  --role-live-border: #3bbd78;
+  --role-live-ring: rgba(59, 189, 120, 0.22);
+  --role-transcribe-track: #1e5499;
+  --role-transcribe-border: #5c9cf5;
+  --role-transcribe-ring: rgba(92, 156, 245, 0.22);
+  --role-upscale-track: #5a2f87;
+  --role-upscale-border: #9c6ccc;
+  --role-upscale-ring: rgba(156, 108, 204, 0.22);
+  --action-success-bg: rgba(98, 199, 123, 0.14);
+  --action-success-border: rgba(98, 199, 123, 0.65);
+  --send-active-bg: rgba(68, 118, 82, 0.5);
+  --send-active-border: rgba(112, 190, 132, 0.7);
+  --shortcut-capture-ring: rgba(108, 144, 198, 0.2);
+  --shortcut-capture-ring-strong: rgba(108, 144, 198, 0.35);
+  --recording-chip-provider-text: #d6e3ff;
+  --boot-spinner-start: var(--role-upscale-track);
+  --boot-spinner-end: var(--role-upscale-border);
+  --boot-spinner-error-start: #c56060;
   --panel-soft: #222222;
   --interactive-hover: #2f2f2f;
   --recording-active-bg: #2c2c2c;
@@ -110,8 +141,10 @@ body {
   --summary-bottom-bg: rgba(26, 26, 26, 0.96);
   --toggle-track: #2e2e2e;
   --toggle-track-border: #6b6b6b;
-  --toggle-thumb: #b8b8b8;
-  --toggle-thumb-on: #f2f2f2;
+  --toggle-thumb: #f0f0f0;
+  --toggle-thumb-on: #ffffff;
+  --toggle-on-ring: rgba(220, 220, 220, 0.16);
+  --control-check-accent: #b0b0b0;
   --scrollbar-thumb: #3d3d3d;
   --scrollbar-thumb-hover: #4c4c4c;
   --vu-low: #b3b3b3;
@@ -1186,7 +1219,7 @@ textarea:focus-visible,
 .popup-check input {
   width: 15px;
   height: 15px;
-  accent-color: #b0b0b0;
+  accent-color: var(--control-check-accent);
 }
 
 .toggle-inline {
@@ -1215,7 +1248,7 @@ textarea:focus-visible,
 .toggle-inline input:checked {
   background: var(--toggle-track-on);
   border-color: var(--toggle-track-on-border);
-  box-shadow: 0 0 0 1px rgba(220, 220, 220, 0.16);
+  box-shadow: 0 0 0 1px var(--toggle-on-ring);
 }
 
 .toggle-inline input::before {
@@ -1226,7 +1259,7 @@ textarea:focus-visible,
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: #f0f0f0;
+  background: var(--toggle-thumb);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
   transition: transform var(--dur-slow) ease, background var(--dur-base) ease;
   transform: translateY(-50%);
@@ -1240,28 +1273,28 @@ textarea:focus-visible,
      `18 - 2 = 16`. The previous 14px value left a 5px right gap
      against a 15px left gap — visible asymmetry the user noticed. */
   transform: translate(16px, -50%);
-  background: #ffffff;
+  background: var(--toggle-thumb-on);
 }
 
 /* Per-pane toggles use semantic roles with deliberate colour cues:
    live = green, transcribe = blue, upscale = purple. Class names stay
    semantic so the visual palette remains centralized here. */
 .toggle-inline.toggle-live input:checked {
-  background: #1f7a49;
-  border-color: #3bbd78;
-  box-shadow: 0 0 0 1px rgba(59, 189, 120, 0.22);
+  background: var(--role-live-track);
+  border-color: var(--role-live-border);
+  box-shadow: 0 0 0 1px var(--role-live-ring);
 }
 
 .toggle-inline.toggle-transcribe input:checked {
-  background: #1e5499;
-  border-color: #5c9cf5;
-  box-shadow: 0 0 0 1px rgba(92, 156, 245, 0.22);
+  background: var(--role-transcribe-track);
+  border-color: var(--role-transcribe-border);
+  box-shadow: 0 0 0 1px var(--role-transcribe-ring);
 }
 
 .toggle-inline.toggle-upscale input:checked {
-  background: #5a2f87;
-  border-color: #9c6ccc;
-  box-shadow: 0 0 0 1px rgba(156, 108, 204, 0.22);
+  background: var(--role-upscale-track);
+  border-color: var(--role-upscale-border);
+  box-shadow: 0 0 0 1px var(--role-upscale-ring);
 }
 
 .toggle-inline.toggle-neutral input:checked {
@@ -1354,11 +1387,11 @@ textarea:focus-visible,
 }
 
 .session-notice.success .session-notice-dot {
-  background: #8fd3a4;
+  background: var(--state-success-text);
 }
 
 .session-notice.warning .session-notice-dot {
-  background: #d8be7a;
+  background: var(--state-warning-text);
 }
 
 .session-notice.error .session-notice-dot {
@@ -1748,7 +1781,7 @@ textarea:focus-visible,
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0)),
     var(--accent-soft-bg);
-  color: #d6e3ff;
+  color: var(--recording-chip-provider-text);
 }
 
 .recording-item .rec-provider-language {
@@ -1756,7 +1789,7 @@ textarea:focus-visible,
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0)),
     var(--warning-soft-bg);
-  color: #e9d6a4;
+  color: var(--state-warning-strong-text);
 }
 
 .recording-item .rec-provider-audio {
@@ -1764,7 +1797,7 @@ textarea:focus-visible,
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0)),
     var(--success-soft-bg);
-  color: #b9e8c8;
+  color: var(--state-success-strong-text);
 }
 
 .recordings-viewer {
@@ -1971,13 +2004,13 @@ textarea:focus-visible,
 }
 
 .icon-btn.is-copy-ok {
-  border-color: rgba(98, 199, 123, 0.65);
-  background: rgba(98, 199, 123, 0.14);
+  border-color: var(--action-success-border);
+  background: var(--action-success-bg);
 }
 
 .icon-btn.is-copy-failed {
-  border-color: rgba(255, 103, 103, 0.7);
-  background: rgba(255, 103, 103, 0.14);
+  border-color: var(--state-danger-soft-border);
+  background: var(--state-danger-soft-bg);
 }
 
 .icon-btn:disabled {
@@ -1996,8 +2029,8 @@ textarea:focus-visible,
 }
 
 .send-enter-btn.active {
-  border-color: rgba(112, 190, 132, 0.7);
-  background: rgba(68, 118, 82, 0.5);
+  border-color: var(--send-active-border);
+  background: var(--send-active-bg);
 }
 
 .send-enter-ico {
@@ -2329,11 +2362,11 @@ textarea:focus-visible,
 }
 
 .settings-save-status-success {
-  color: #8fd3a4;
+  color: var(--state-success-text);
 }
 
 .settings-save-status-warning {
-  color: #d8be7a;
+  color: var(--state-warning-text);
 }
 
 .settings-save-status-error {
@@ -2395,18 +2428,18 @@ textarea:focus-visible,
 }
 
 .shortcut-btn.recording .shortcut-keys {
-  color: #cddfff;
+  color: var(--state-info-text);
   opacity: 1;
 }
 
 .shortcut-btn.recording .shortcut-key {
   border-color: var(--accent-soft-border);
-  color: #cddfff;
+  color: var(--state-info-text);
 }
 
 @keyframes shortcut-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgba(108, 144, 198, 0.2); }
-  50% { box-shadow: 0 0 0 4px rgba(108, 144, 198, 0.35); }
+  0%, 100% { box-shadow: 0 0 0 2px var(--shortcut-capture-ring); }
+  50% { box-shadow: 0 0 0 4px var(--shortcut-capture-ring-strong); }
 }
 
 /* Shortcut conflict indicator — shown when Electron main could not
@@ -2457,7 +2490,7 @@ textarea:focus-visible,
 
 .shortcut-key-prompt {
   min-width: 92px;
-  color: #cddfff;
+  color: var(--state-info-text);
 }
 
 .pane,
@@ -3202,8 +3235,8 @@ canvas {
     from 0deg,
     transparent 0deg,
     transparent 240deg,
-    #7a50c8 300deg,
-    #b892ff 360deg
+    var(--boot-spinner-start) 300deg,
+    var(--boot-spinner-end) 360deg
   );
   mask: radial-gradient(circle, transparent 12px, black 13px);
   -webkit-mask: radial-gradient(circle, transparent 12px, black 13px);
@@ -3221,13 +3254,13 @@ canvas {
     from 0deg,
     transparent 0deg,
     transparent 260deg,
-    #c56060 320deg,
-    #ff8080 360deg
+    var(--boot-spinner-error-start) 320deg,
+    var(--danger-text) 360deg
   );
 }
 
 .boot-overlay[data-state="error"] .boot-overlay-status {
-  color: #ff9090;
+  color: var(--state-danger-status-text);
 }
 
 .boot-overlay-retry {
@@ -3472,10 +3505,10 @@ canvas {
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
 }
 
-.upload-queue-status-dot--queued { background: #f4c542; }
-.upload-queue-status-dot--transcribing { background: #5aa9ff; }
-.upload-queue-status-dot--done { background: #62c77b; }
-.upload-queue-status-dot--error { background: #ff6767; }
+.upload-queue-status-dot--queued { background: var(--state-warning-dot); }
+.upload-queue-status-dot--transcribing { background: var(--state-info-dot); }
+.upload-queue-status-dot--done { background: var(--state-success-dot); }
+.upload-queue-status-dot--error { background: var(--state-danger-dot-soft); }
 
 .upload-queue-item-meta {
   display: flex;
