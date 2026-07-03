@@ -210,6 +210,7 @@ let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
+const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 let recordingSilenceStartedAt = 0;
 let recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
 let recordingAutoStopConfigRefreshAt = 0;
@@ -686,6 +687,7 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
+  visualScale: 0.5,
   collapsedWidth: 334,
   expandedWidth: 334,
   expandedHeight: 150,
@@ -738,15 +740,23 @@ function clampRecordingStatusCapsuleDimension(value, min, max) {
   return Math.max(min, Math.min(max, Math.ceil(n)));
 }
 
+function scaledRecordingStatusCapsuleDimension(value) {
+  const n = Number(value);
+  const scale = Number(RECORDING_STATUS_CAPSULE.visualScale);
+  if (!Number.isFinite(n)) return 0;
+  if (!Number.isFinite(scale) || scale <= 0) return Math.ceil(n);
+  return Math.max(1, Math.ceil(n * scale));
+}
+
 function getRecordingStatusCapsuleFallbackWindowSize() {
   return recordingStatusQuickSettingsOpen
     ? {
-      width: RECORDING_STATUS_CAPSULE.expandedWidth,
-      height: RECORDING_STATUS_CAPSULE.expandedHeight,
+      width: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.expandedWidth),
+      height: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.expandedHeight),
     }
     : {
-      width: RECORDING_STATUS_CAPSULE.collapsedWidth,
-      height: RECORDING_STATUS_CAPSULE.height,
+      width: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.collapsedWidth),
+      height: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.height),
     };
 }
 
@@ -755,17 +765,17 @@ function getRecordingStatusCapsuleWindowSize() {
   if (!geometry || geometry.quickOpen !== recordingStatusQuickSettingsOpen) {
     return getRecordingStatusCapsuleFallbackWindowSize();
   }
-  const pad = Math.max(0, Number(RECORDING_STATUS_CAPSULE.geometryPadding) || 0);
+  const pad = Math.max(0, scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.geometryPadding));
   return {
     width: clampRecordingStatusCapsuleDimension(
       geometry.width + pad,
-      RECORDING_STATUS_CAPSULE.minWidth,
-      RECORDING_STATUS_CAPSULE.maxWidth,
+      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.minWidth),
+      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.maxWidth),
     ),
     height: clampRecordingStatusCapsuleDimension(
       geometry.height + pad,
-      RECORDING_STATUS_CAPSULE.minHeight,
-      RECORDING_STATUS_CAPSULE.maxHeight,
+      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.minHeight),
+      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.maxHeight),
     ),
   };
 }
@@ -1020,6 +1030,9 @@ function recordingStatusCapsuleHtml() {
       gap: 4px;
       margin: 0 auto;
       width: min-content;
+      transform: scale(${t.visualScale});
+      transform-origin: bottom center;
+      will-change: transform;
     }
     #pill {
       width: ${t.pillWidth}px;
@@ -4236,7 +4249,7 @@ function enqueuePostStopTask(options = {}) {
     recordingId: Number(options.recordingId || 0),
     target: normalizeCapturedPasteTarget(options.target),
   };
-  if (!task.autoTranscribe) return;
+  if (!task.autoTranscribe) return false;
   // Dedup by recordingId. recordingId === 0 is the legacy fallback
   // (renderer didn't supply one, very old build); skip dedup for
   // those so the legacy path still works at least once. Modern
@@ -4247,7 +4260,7 @@ function enqueuePostStopTask(options = {}) {
         `[post-stop-queue] dedup-skipped rec=${task.recordingId} ` +
         `(already enqueued; preventing double-paste)`
       );
-      return;
+      return false;
     }
     _enqueuedRecordingIds.add(task.recordingId);
     // Roll the oldest entry out when the cap is reached.
@@ -4260,7 +4273,11 @@ function enqueuePostStopTask(options = {}) {
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
   appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
+  void setRecordingStatus("Transcribing").catch((e) => {
+    appendMainLog(`[post-stop-queue] status-publish failed: ${compactLogText(e?.message || e)}`);
+  });
   void runPostStopQueue();
+  return true;
 }
 
 async function runPostStopQueue() {
@@ -4275,12 +4292,14 @@ async function runPostStopQueue() {
       // counter can never drift above the real number of pending
       // tasks. The outer try/finally (at the function bottom) drains
       // any remaining queue entries on catastrophic failure.
+      let taskResult = null;
       try {
         try {
-          await processPostStopTask(task);
+          taskResult = await processPostStopTask(task);
         } catch (e) {
           appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
           await setRecordingStatus("Saved To App").catch(() => { });
+          taskResult = { dwellMs: RECORDING_STATUS_TERMINAL_DWELL_MS };
         }
       } finally {
         pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
@@ -4288,6 +4307,8 @@ async function runPostStopQueue() {
       if (pendingTranscriptionCount > 0) {
         await setRecordingStatus("Transcribing").catch(() => { });
       } else {
+        const dwellMs = Math.max(0, Number(taskResult?.dwellMs || 0));
+        if (dwellMs > 0) await sleep(dwellMs);
         resetRecordingStatusState();
       }
     }
@@ -4334,8 +4355,11 @@ async function processPostStopTask(task) {
       `(already pasted; second-line guard fired)`,
     );
     traceEnd(trace, "skipped", { reason: "already-pasted" });
-    return;
+    return { dwellMs: 0 };
   }
+  await setRecordingStatus("Transcribing").catch((e) => {
+    appendMainLog(`[post-stop] transcribing-status failed: ${compactLogText(e?.message || e)}`);
+  });
   // Bound post-stop wait to the renderer's live-recovery SLA. Fast paths
   // exit immediately on paste-ready; this ceiling only protects the
   // rare "stream dropped, REST/local recovery is still running" case.
@@ -4350,7 +4374,7 @@ async function processPostStopTask(task) {
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let recordingStatusPhase = "";
+  let recordingStatusPhase = "transcribing";
   let doneStatusTranscriptSince = 0;
 
   while (Date.now() < deadline) {
@@ -4550,6 +4574,9 @@ async function processPostStopTask(task) {
     await setRecordingStatus(recordingStatusText);
   }
   traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
+  return {
+    dwellMs: isRecNow ? 0 : RECORDING_STATUS_TERMINAL_DWELL_MS,
+  };
 }
 
 async function getLatestTranscriptText() {
