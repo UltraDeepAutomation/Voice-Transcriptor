@@ -686,20 +686,29 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  collapsedWidth: 184,
-  expandedWidth: 196,
-  expandedHeight: 96,
-  height: 47,
-  geometryPadding: 4,
-  minWidth: 120,
-  minHeight: 32,
+  collapsedWidth: 334,
+  expandedWidth: 334,
+  expandedHeight: 150,
+  height: 64,
+  geometryPadding: 6,
+  minWidth: 220,
+  minHeight: 52,
   maxWidth: 360,
   maxHeight: 260,
-  bottomMargin: 10,
-  waveWidth: 54,
-  waveHeight: 16,
-  waveBarWidth: 1.4,
-  waveBarGap: 1.0,
+  bottomMargin: 18,
+  pillWidth: 318,
+  pillHeight: 52,
+  pillPadLeft: 10,
+  pillPadRight: 14,
+  pillGap: 10,
+  controlSize: 30,
+  statusControlSize: 30,
+  timerWidth: 56,
+  timerFontSize: 17,
+  waveWidth: 124,
+  waveHeight: 18,
+  waveBarWidth: 2,
+  waveBarGap: 2.4,
   waveIdleTickMs: 120,
   waveActiveStaleMs: 220,
   timerTickMs: 200,
@@ -986,7 +995,7 @@ function recordingStatusCapsuleHtml() {
 <html>
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
   <style>
     * { box-sizing: border-box; }
     html, body {
@@ -1010,25 +1019,33 @@ function recordingStatusCapsuleHtml() {
       align-items: center;
       gap: 4px;
       margin: 0 auto;
+      width: min-content;
     }
     #pill {
-      width: fit-content;
+      width: ${t.pillWidth}px;
+      height: ${t.pillHeight}px;
       display: flex;
       align-items: center;
       justify-content: flex-start;
-      padding: 7px 7px 7px 5px;
+      padding: 0 ${t.pillPadRight}px 0 ${t.pillPadLeft}px;
       border-radius: 999px;
-      border: 1px solid #333;
-      background: #161616;
-      box-shadow: none;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(18,18,18,0.88);
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.10),
+        0 10px 22px rgba(0,0,0,0.34);
+      backdrop-filter: blur(18px) saturate(1.12);
+      -webkit-backdrop-filter: blur(18px) saturate(1.12);
       overflow: hidden;
       isolation: isolate;
     }
     #core {
-      display: flex;
+      width: 100%;
+      display: grid;
+      grid-template-columns: ${t.controlSize}px minmax(0, 1fr) ${t.timerWidth}px ${t.statusControlSize}px;
       align-items: center;
       justify-content: center;
-      gap: 9px;
+      gap: ${t.pillGap}px;
     }
     #settingsSlot {
       width: 100%;
@@ -1045,12 +1062,17 @@ function recordingStatusCapsuleHtml() {
       margin-bottom: 8px;
     }
     #settingsPill {
-      width: fit-content;
+      width: ${t.pillWidth}px;
       min-height: 22px;
       padding: 8px;
       border-radius: 14px;
-      border: 1px solid #333;
-      background: #161616;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(18,18,18,0.92);
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.08),
+        0 8px 18px rgba(0,0,0,0.28);
+      backdrop-filter: blur(18px) saturate(1.08);
+      -webkit-backdrop-filter: blur(18px) saturate(1.08);
       opacity: 0;
       pointer-events: none;
       transform: translateY(-5px) scale(.985);
@@ -1268,67 +1290,74 @@ function recordingStatusCapsuleHtml() {
     }
     #gearBtn {
       appearance: none;
-      border: 1px solid #333;
+      border: 1px solid rgba(255,255,255,0.12);
       border-radius: 999px;
-      background: #2a2a2a;
-      width: 22px;
-      height: 22px;
+      background: rgba(255,255,255,0.045);
+      width: ${t.controlSize}px;
+      height: ${t.controlSize}px;
       padding: 0;
       position: relative;
-      flex: 0 0 22px;
+      justify-self: center;
       cursor: default;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      transition: background .14s ease, border-color .14s ease, transform .14s ease;
     }
     #gearBtn::before {
       content: "";
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 11px;
-      height: 11px;
+      width: 15px;
+      height: 15px;
       transform: translate(-50%,-50%);
       background-repeat: no-repeat;
       background-position: center;
-      background-size: 11px 11px;
+      background-size: 15px 15px;
       background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
     }
     #gearBtn.on {
-      border-color: #444;
-      background: #3a3a3a;
+      border-color: rgba(255,255,255,0.20);
+      background: rgba(255,255,255,0.10);
+      transform: scale(1.03);
     }
     #wave {
       display: block;
-      width: ${t.waveWidth}px;
+      width: 100%;
+      max-width: ${t.waveWidth}px;
       height: ${t.waveHeight}px;
       opacity: .95;
-      flex: 0 0 ${t.waveWidth}px;
+      justify-self: center;
     }
     #timer {
-      font-size: 10px;
+      font-size: ${t.timerFontSize}px;
       font-weight: 800;
       color: rgba(255,255,255,.96);
       font-family: Menlo, ui-monospace, monospace;
-      min-width: 36px;
-      text-align: center;
+      min-width: ${t.timerWidth}px;
+      text-align: right;
       line-height: 1;
-      flex: 0 0 36px;
+      justify-self: end;
       font-variant-numeric: tabular-nums;
     }
     #stateIcon {
-      width: 14px;
-      height: 14px;
+      width: ${t.statusControlSize}px;
+      height: ${t.statusControlSize}px;
       border-radius: 50%;
       position: relative;
       display: inline-block;
-      flex: 0 0 14px;
-      background: transparent;
+      justify-self: center;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.055);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      cursor: default;
     }
     #stateIcon::before {
       content: "";
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 8px;
-      height: 8px;
+      width: 10px;
+      height: 10px;
       transform: translate(-50%,-50%);
       border-radius: 50%;
       background: rgba(180,180,180,.92);
@@ -1338,16 +1367,18 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 14px;
-      height: 14px;
+      width: 22px;
+      height: 22px;
       transform: translate(-50%,-50%);
       border-radius: 50%;
       border: 1px solid rgba(180,180,180,.2);
       opacity: 0;
     }
     #stateIcon.rec::before {
-      background: rgba(255,92,92,.94);
-      border-radius: 2px;
+      width: 9px;
+      height: 9px;
+      background: rgba(255,92,92,.96);
+      border-radius: 2.5px;
       animation: coreBreathe 1.35s ease-in-out infinite;
     }
     #stateIcon.rec::after {
@@ -1501,6 +1532,12 @@ function recordingStatusCapsuleHtml() {
     const bw = ${t.waveBarWidth};
     const gap = ${t.waveBarGap};
     const maxBars = Math.floor(waveW / (bw + gap));
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    cv.width = Math.round(waveW * dpr);
+    cv.height = Math.round(waveH * dpr);
+    cv.style.width = waveW + "px";
+    cv.style.height = waveH + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const bars = [];
     let state = {
       status: "",
@@ -1670,13 +1707,19 @@ function recordingStatusCapsuleHtml() {
         else if (waveMode === "transcribing") ctx.fillStyle = "rgba(114,174,255,.92)";
         else if (waveMode === "upscaling") ctx.fillStyle = "rgba(173,112,255,.92)";
         else ctx.fillStyle = "rgba(170,170,170,.62)";
-        ctx.fillRect(x, y, bw, h);
+        if (typeof ctx.roundRect === "function") {
+          ctx.beginPath();
+          ctx.roundRect(x, y, bw, h, Math.min(bw / 2, h / 2));
+          ctx.fill();
+        } else {
+          ctx.fillRect(x, y, bw, h);
+        }
       }
     }
     function pushLevel(value) {
       const raw = Math.max(0, Math.min(1, Number(value) || 0));
       const level = Math.max(0, Math.min(1, Math.pow(raw, .72) * 1.45));
-      lastLevelAt = Date.now();
+      if (level > 0.015) lastLevelAt = Date.now();
       bars.push(level);
       while (bars.length > maxBars) bars.shift();
       renderWave();
