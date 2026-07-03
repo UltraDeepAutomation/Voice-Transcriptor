@@ -302,6 +302,8 @@ type LiveStatusSnapshot = {
   recording: boolean;
   recordingId: number;
 };
+type ShortcutBridgeAction = "capture-start" | "capture-cancel" | "update";
+type ShortcutPair = { record: string; paste: string };
 
 // Compile-time injected by vite.config.ts from desktop/package.json's
 // ``version`` field. SSOT for the version label rendered in the
@@ -327,6 +329,13 @@ declare global {
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
+    __transcriptorPendingShortcuts?: ShortcutPair;
+    __transcriptorShortcutStatus?: {
+      record?: { active?: string; desired?: string; error?: string };
+      paste?: { active?: string; desired?: string; error?: string };
+      macFnState?: boolean | null;
+      platform?: string;
+    };
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
     /**
@@ -3678,6 +3687,30 @@ const _isMacRenderer = (() => {
 const DEFAULT_SHORTCUTS = _isMacRenderer ? _platformDefaultShortcuts.darwin : _platformDefaultShortcuts.default;
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
+const SHORTCUT_BRIDGE_TITLE_PREFIX = "__app_shortcuts__";
+
+function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: ShortcutPair = currentShortcuts): void {
+  const payload = encodeURIComponent(JSON.stringify({
+    action,
+    record: shortcuts.record,
+    paste: shortcuts.paste,
+    nonce: `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+  }));
+  const prevTitle = document.title;
+  document.title = SHORTCUT_BRIDGE_TITLE_PREFIX + payload;
+  // main.js consumes the sentinel through page-title-updated and
+  // preventDefault()s the real title change. Restore defensively for
+  // browser dev preview and for any future non-Electron surface.
+  setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+}
+
+function publishShortcutUpdateToMain(): void {
+  window.__transcriptorPendingShortcuts = {
+    record: currentShortcuts.record,
+    paste: currentShortcuts.paste,
+  };
+  postShortcutBridgeMessage("update");
+}
 
 /** Convert Electron accelerator string to Settings keycap labels. */
 function acceleratorToDisplayTokens(acc: string): string[] {
@@ -3831,14 +3864,7 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
  * nothing at all — the user has no way to know.
  */
 function refreshShortcutConflictState(): void {
-  const status = (window as unknown as {
-    __transcriptorShortcutStatus?: {
-      record?: { active?: string; desired?: string; error?: string };
-      paste?: { active?: string; desired?: string; error?: string };
-      macFnState?: boolean | null;
-      platform?: string;
-    };
-  }).__transcriptorShortcutStatus;
+  const status = window.__transcriptorShortcutStatus;
   if (!status) return;
   // On macOS, detect the "F-keys as media keys" mode. When fnState is
   // explicitly false AND the user kept an F-key accelerator, the OS
@@ -3887,16 +3913,20 @@ const _shortcutConflictPollHandle = window.setInterval(() => {
 // so clearing here prevents a stale handle from leaking across hot
 // reloads in development.
 window.addEventListener("pagehide", () => {
+  if (activeShortcutBtn) {
+    postShortcutBridgeMessage("capture-cancel");
+  }
   try { window.clearInterval(_shortcutConflictPollHandle); } catch { /* idempotent */ }
 }, { once: true });
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
   // Cancel any existing recording
-  stopShortcutRecording(false);
+  stopShortcutRecording(false, false);
   activeShortcutBtn = btn;
   btn.classList.add("recording");
   const keysSpan = btn.querySelector(".shortcut-keys");
   if (keysSpan) renderShortcutCapturePrompt(keysSpan);
+  postShortcutBridgeMessage("capture-start");
   // Add global keydown listener
   document.addEventListener("keydown", handleShortcutKeydown, true);
   // Outside-click cancel: without this, clicking ANYWHERE other than
@@ -3910,7 +3940,7 @@ function startShortcutRecording(btn: HTMLButtonElement): void {
   document.addEventListener("mousedown", handleShortcutOutsideMousedown, true);
 }
 
-function stopShortcutRecording(restoreDisplay: boolean): void {
+function stopShortcutRecording(restoreDisplay: boolean, notifyMain = true): void {
   if (!activeShortcutBtn) return;
   activeShortcutBtn.classList.remove("recording");
   if (restoreDisplay) {
@@ -3922,6 +3952,9 @@ function stopShortcutRecording(restoreDisplay: boolean): void {
   document.removeEventListener("keydown", handleShortcutKeydown, true);
   document.removeEventListener("mousedown", handleShortcutOutsideMousedown, true);
   activeShortcutBtn = null;
+  if (notifyMain && restoreDisplay) {
+    postShortcutBridgeMessage("capture-cancel");
+  }
 }
 
 /**
@@ -3989,11 +4022,12 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
   // Persist to config
   queueUiPreferencesSave();
 
-  // Signal the Electron main process to reload shortcuts
-  (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
-    record: currentShortcuts.record,
-    paste: currentShortcuts.paste,
-  };
+  // Signal the Electron main process to reload shortcuts immediately.
+  // The window flag remains as a fallback for older/polling paths, but
+  // the title bridge is the durable transport: it avoids the debounce
+  // race with /api/config writes and temporarily-suspended hotkeys are
+  // re-registered in the same path that received the captured keys.
+  publishShortcutUpdateToMain();
 }
 
 function shouldUpscale(): boolean {
@@ -4650,12 +4684,9 @@ async function loadCfg(): Promise<void> {
     updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
     updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
     if (didMigrate) {
-      // Persist + signal Electron to re-register globalShortcut
-      // with the new accelerators on the next 2 s poll tick.
-      (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
-        record: currentShortcuts.record,
-        paste: currentShortcuts.paste,
-      };
+      // Persist + signal Electron to re-register globalShortcut with
+      // the migrated accelerators immediately.
+      publishShortcutUpdateToMain();
       shouldPersistShortcutMigration = true;
     }
   } catch (configError) {
@@ -4996,10 +5027,7 @@ $("resetShortcutsBtn").addEventListener("click", () => {
   updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
   updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
   // Push to main process for live reload.
-  (window as unknown as { __transcriptorPendingShortcuts?: unknown }).__transcriptorPendingShortcuts = {
-    record: currentShortcuts.record,
-    paste: currentShortcuts.paste,
-  };
+  publishShortcutUpdateToMain();
   queueUiPreferencesSave();
 });
 

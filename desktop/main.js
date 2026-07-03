@@ -233,6 +233,8 @@ let backendRestartAttempts = 0;
 // produce unhandledRejection noise from executeJavaScript against a
 // destroyed webContents.
 let shortcutPollTimer = null;
+let shortcutBridgeHandler = null;
+let pendingShortcutBridgeMessages = [];
 // Single-flight promise for ``startBackend``. Concurrent callers
 // (window creation, restart timer, tray re-open) all await the same
 // in-flight start instead of racing to spawn duplicate Python
@@ -4221,6 +4223,32 @@ async function createWindow(options = {}) {
     const raw = String(title || "");
     if (!raw.startsWith("__app_")) return;
     event.preventDefault();
+    if (raw.startsWith("__app_shortcuts__")) {
+      let payload;
+      try {
+        payload = JSON.parse(decodeURIComponent(raw.slice("__app_shortcuts__".length)));
+      } catch (e) {
+        appendMainLog(`[shortcuts-bridge] bad payload: ${e?.message || e}`);
+        return;
+      }
+      const action = String(payload?.action || "").trim();
+      if (!["capture-start", "capture-cancel", "update"].includes(action)) {
+        appendMainLog(`[shortcuts-bridge] rejected action=${compactLogText(action, 40)}`);
+        return;
+      }
+      const message = {
+        action,
+        record: String(payload?.record || "").trim().slice(0, 96),
+        paste: String(payload?.paste || "").trim().slice(0, 96),
+      };
+      if (shortcutBridgeHandler) {
+        shortcutBridgeHandler(message);
+      } else {
+        pendingShortcutBridgeMessages.push(message);
+        pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
+      }
+      return;
+    }
     if (raw.startsWith("__app_reveal_recording__")) {
       let payload;
       try {
@@ -4974,6 +5002,8 @@ app.on("before-quit", () => {
     renderRecoveryTimer = null;
   }
   globalShortcut.unregisterAll();
+  shortcutBridgeHandler = null;
+  pendingShortcutBridgeMessages = [];
   if (shortcutPollTimer) {
     clearInterval(shortcutPollTimer);
     shortcutPollTimer = null;
@@ -5154,6 +5184,7 @@ app.whenReady().then(async () => {
   // ── Global Shortcuts (config-driven with live reload) ─────────────────────
   let registeredRecordHotkey = "";
   let registeredPasteHotkey = "";
+  let shortcutsSuspendedForCapture = false;
 
   function readShortcutsFromConfig() {
     // Must match DEFAULT_SHORTCUTS in frontend/src/main.tsx.
@@ -5225,7 +5256,29 @@ app.whenReady().then(async () => {
     }
   }
 
+  function unregisterRegisteredShortcuts(reason = "") {
+    const previousRecord = registeredRecordHotkey;
+    const previousPaste = registeredPasteHotkey;
+    if (registeredRecordHotkey) {
+      try { globalShortcut.unregister(registeredRecordHotkey); } catch { }
+    }
+    if (registeredPasteHotkey) {
+      try { globalShortcut.unregister(registeredPasteHotkey); } catch { }
+    }
+    registeredRecordHotkey = "";
+    registeredPasteHotkey = "";
+    if (reason && (previousRecord || previousPaste)) {
+      appendMainLog(
+        `[shortcuts] unregistered (${reason}): record=${previousRecord || "-"} paste=${previousPaste || "-"}`,
+      );
+    }
+  }
+
   function registerGlobalShortcuts(override = null) {
+    if (shortcutsSuspendedForCapture && !override) {
+      appendMainLog("[shortcuts] register skipped while Settings capture is active");
+      return;
+    }
     // SSOT for the accelerators we actually bind:
     //   - At startup → readShortcutsFromConfig() (disk-backed, pre-renderer).
     //   - After a Settings-UI capture → renderer pushes pending values
@@ -5260,19 +5313,12 @@ app.whenReady().then(async () => {
     } else {
       shortcuts = readShortcutsFromConfig();
     }
-    // Unregister old shortcuts (keep devtools)
-    if (registeredRecordHotkey) {
-      try { globalShortcut.unregister(registeredRecordHotkey); } catch { }
-    }
-    if (registeredPasteHotkey) {
-      try { globalShortcut.unregister(registeredPasteHotkey); } catch { }
-    }
-    // Clear stored values up-front — only set them back after a
+    // Unregister old shortcuts (keep devtools). Clear stored values
+    // up-front — only set them back after a
     // successful registration, so a failed accelerator is never
     // tracked as "active" (which would cause the next reload to
     // unregister something that was never registered).
-    registeredRecordHotkey = "";
-    registeredPasteHotkey = "";
+    unregisterRegisteredShortcuts();
 
     const recordResult = safeRegisterShortcut(shortcuts.record, () => {
       toggleRecordingFromShortcut().catch((e) => {
@@ -5371,7 +5417,45 @@ app.whenReady().then(async () => {
     );
   }
 
+  function handleShortcutBridgeMessage(message) {
+    const action = String(message?.action || "").trim();
+    if (action === "capture-start") {
+      if (!shortcutsSuspendedForCapture) {
+        shortcutsSuspendedForCapture = true;
+        unregisterRegisteredShortcuts("settings-capture");
+      }
+      return;
+    }
+    if (action === "capture-cancel") {
+      if (shortcutsSuspendedForCapture) {
+        shortcutsSuspendedForCapture = false;
+        appendMainLog("[shortcuts] settings capture cancelled; restoring registered shortcuts");
+        registerGlobalShortcuts();
+      }
+      return;
+    }
+    if (action === "update") {
+      const record = String(message?.record || "").trim();
+      const paste = String(message?.paste || "").trim();
+      if (!record || !paste) {
+        appendMainLog(`[shortcuts] bridge update rejected: record=${record || "-"} paste=${paste || "-"}`);
+        return;
+      }
+      shortcutsSuspendedForCapture = false;
+      appendMainLog(`[shortcuts] bridge live reload: record=${record} paste=${paste}`);
+      registerGlobalShortcuts({ record, paste });
+    }
+  }
+
   registerGlobalShortcuts();
+
+  shortcutBridgeHandler = handleShortcutBridgeMessage;
+  if (pendingShortcutBridgeMessages.length > 0) {
+    const queuedMessages = pendingShortcutBridgeMessages.splice(0);
+    for (const message of queuedMessages) {
+      handleShortcutBridgeMessage(message);
+    }
+  }
 
   // Poll for live shortcut changes from the renderer settings UI.
   // Skip when the window is hidden — users edit shortcuts only with
@@ -5392,6 +5476,7 @@ app.whenReady().then(async () => {
         // will NOT re-read disk for these values, eliminating the
         // pending-vs-disk-write race that silently rebound users to
         // the OLD accelerator after Settings → Shortcuts capture.
+        shortcutsSuspendedForCapture = false;
         registerGlobalShortcuts({ record: pending.record, paste: pending.paste });
       }
     } catch { }
