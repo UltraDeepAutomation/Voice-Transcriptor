@@ -143,6 +143,16 @@ interface SavedRecordingRef {
   archiveDir: string;
 }
 
+interface LoadRecordingsOptions {
+  keepSelection: boolean;
+  background?: boolean;
+  reopenSelected?: boolean;
+}
+
+interface OpenRecordingOptions {
+  silent?: boolean;
+}
+
 const RECORDING_COLLECTIONS = {
   live: "live",
   uploads: "uploads",
@@ -1624,7 +1634,71 @@ function patchCurrentRecordingSummary(patch: Partial<CurrentRecordingSummary>, s
   setCurrentRecordingSummary(next, sessionToken);
 }
 
+let deferredRecordingsRefreshPending = false;
+let deferredRecordingsRefreshInFlight = false;
+let deferredRecordingsRefreshTimer = 0;
+let deferredRecordingsRefreshLastSaved: SavedRecordingRef | null = null;
+
+function scheduleDeferredRecordingsRefresh(_reason = "save", delayMs = 160): void {
+  if (!deferredRecordingsRefreshPending) return;
+  if (deferredRecordingsRefreshTimer) {
+    window.clearTimeout(deferredRecordingsRefreshTimer);
+  }
+  deferredRecordingsRefreshTimer = window.setTimeout(() => {
+    deferredRecordingsRefreshTimer = 0;
+    void flushDeferredRecordingsRefresh("timer");
+  }, Math.max(0, delayMs));
+}
+
+function requestDeferredRecordingsRefresh(saved: SavedRecordingRef | null, reason = "save"): void {
+  deferredRecordingsRefreshPending = true;
+  if (saved?.name) {
+    deferredRecordingsRefreshLastSaved = {
+      name: saved.name,
+      archiveDir: saved.archiveDir || "",
+    };
+  }
+  if (isBusy || stopTransitionInFlight || isRecording) return;
+  scheduleDeferredRecordingsRefresh(reason);
+}
+
+async function flushDeferredRecordingsRefresh(reason = "manual"): Promise<void> {
+  if (!deferredRecordingsRefreshPending || deferredRecordingsRefreshInFlight) return;
+  if (isBusy || stopTransitionInFlight || isRecording || recordingsUiLoading) {
+    scheduleDeferredRecordingsRefresh(reason, 220);
+    return;
+  }
+
+  deferredRecordingsRefreshPending = false;
+  deferredRecordingsRefreshInFlight = true;
+  const pendingTarget = deferredRecordingsRefreshLastSaved
+    ? { ...deferredRecordingsRefreshLastSaved }
+    : null;
+  const selectedKeyBeforeRefresh = selectedRecordingKey();
+  const shouldReopenSelected =
+    !!pendingTarget?.name &&
+    selectedKeyBeforeRefresh === recordingIdentityKey(pendingTarget.name, pendingTarget.archiveDir);
+  try {
+    await loadRecordings({
+      keepSelection: true,
+      background: true,
+      reopenSelected: shouldReopenSelected,
+    });
+  } catch (e) {
+    console.warn("Deferred History refresh failed", e);
+    const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
+    setStatus(`Saved. History refresh failed: ${msg}`, "warning");
+  } finally {
+    deferredRecordingsRefreshInFlight = false;
+    deferredRecordingsRefreshLastSaved = null;
+    if (deferredRecordingsRefreshPending) {
+      scheduleDeferredRecordingsRefresh("coalesced", 120);
+    }
+  }
+}
+
 function setBusy(nextBusy: boolean, scopeToken = ""): void {
+  const wasBusy = isBusy;
   if (scopeToken) {
     if (nextBusy) {
       busyScopeToken = scopeToken;
@@ -1641,6 +1715,9 @@ function setBusy(nextBusy: boolean, scopeToken = ""): void {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLSelectElement | null;
     if (el) el.disabled = isBusy;
   });
+  if (wasBusy && !isBusy) {
+    scheduleDeferredRecordingsRefresh("busy-release", 380);
+  }
 }
 
 function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): void {
@@ -5325,9 +5402,31 @@ async function moveRecordingSelection(step: number): Promise<void> {
   target?.focus();
 }
 
-async function loadRecordings(keepSelection: boolean): Promise<void> {
+function normalizeLoadRecordingsOptions(input: boolean | LoadRecordingsOptions): LoadRecordingsOptions {
+  if (typeof input === "boolean") {
+    return { keepSelection: input };
+  }
+  return {
+    keepSelection: !!input.keepSelection,
+    background: !!input.background,
+    reopenSelected: input.reopenSelected !== false,
+  };
+}
+
+function syncSelectedRecordingViewerMetaFromList(): void {
+  const selected = findRecordingItem(selectedRecordingName, selectedRecordingArchiveDir);
+  if (!selected) return;
+  $("recordingTitleLabel").textContent = selected.display_name || recordingTitleFromName(selected.name);
+  $("recordingMeta").textContent = `${fmtDateTime(selected.modified_at)} · ${fmtBytes(selected.size_bytes || 0)}`;
+}
+
+async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOptions): Promise<void> {
+  const options = normalizeLoadRecordingsOptions(optionsOrKeepSelection);
   const requestSeq = ++recordingsLoadRequestSeq;
-  setRecordingsUiLoading(true);
+  const selectedKeyBeforeLoad = selectedRecordingKey();
+  if (!options.background) {
+    setRecordingsUiLoading(true);
+  }
   try {
     const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
     if (requestSeq !== recordingsLoadRequestSeq) return;
@@ -5335,13 +5434,21 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
     activeResolvedRecordingsDir = String(r.directory || "").trim();
     syncLatestSavedAudioFromRecordings();
     const filteredItems = getFilteredRecordings();
-    if (!keepSelection || !filteredItems.some((x) => isSelectedRecordingItem(x))) {
+    if (!options.keepSelection || !filteredItems.some((x) => isSelectedRecordingItem(x))) {
       setSelectedRecording(filteredItems[0] || null);
     }
+    const selectedKeyAfterLoad = selectedRecordingKey();
     renderRecordingsList();
     await refreshRecordingsStatsIfVisible();
     if (selectedRecordingName) {
-      await openRecording(selectedRecordingName, selectedRecordingArchiveDir);
+      const selectedChanged = selectedKeyBeforeLoad !== selectedKeyAfterLoad;
+      if (options.background && !options.reopenSelected && !selectedChanged) {
+        syncSelectedRecordingViewerMetaFromList();
+      } else {
+        await openRecording(selectedRecordingName, selectedRecordingArchiveDir, {
+          silent: options.background && !selectedChanged,
+        });
+      }
     } else {
       resetRecordingViewer(recordingsSearchQuery ? "No recordings match the current search." : "Choose a recording from the left list...");
     }
@@ -5349,7 +5456,9 @@ async function loadRecordings(keepSelection: boolean): Promise<void> {
     // Always clear loading state — even for superseded requests. The
     // old code only cleared when requestSeq matched, which left the UI
     // in a permanent loading state when a superseded request errored.
-    setRecordingsUiLoading(false);
+    if (!options.background) {
+      setRecordingsUiLoading(false);
+    }
   }
 }
 
@@ -5441,18 +5550,23 @@ async function loadRecordingsStats(): Promise<void> {
   });
 }
 
-async function openRecording(name: string, archiveDir = ""): Promise<void> {
+async function openRecording(name: string, archiveDir = "", options: OpenRecordingOptions = {}): Promise<void> {
   const matchedItem = findRecordingItem(name, archiveDir);
   const effectiveArchiveDir = matchedItem
     ? recordingArchiveDir(matchedItem)
     : String(archiveDir || selectedRecordingArchiveDir || currentArchiveDirSnapshot()).trim();
+  const previousSelectedKey = selectedRecordingKey();
   selectedRecordingName = name;
   selectedRecordingArchiveDir = effectiveArchiveDir;
-  renderRecordingsList();
-  const requestSeq = ++recordingOpenRequestSeq;
   const requestKey = selectedRecordingKey();
+  if (!options.silent || previousSelectedKey !== requestKey) {
+    renderRecordingsList();
+  }
+  const requestSeq = ++recordingOpenRequestSeq;
   const pendingDisplayName = matchedItem?.display_name || recordingTitleFromName(name);
-  setRecordingViewerLoading(pendingDisplayName);
+  if (!options.silent) {
+    setRecordingViewerLoading(pendingDisplayName);
+  }
   try {
     const params = new URLSearchParams();
     if (effectiveArchiveDir) params.set("archive_dir", effectiveArchiveDir);
@@ -5480,22 +5594,27 @@ async function openRecording(name: string, archiveDir = ""): Promise<void> {
     const player = $("recordingAudio") as HTMLAudioElement;
     const audioRow = $("recordingAudioRow");
     if (r.has_audio) {
-      try {
-        const audioFile = await fetchSavedAudioFromBackend(name, String(r.archive_dir || effectiveArchiveDir).trim());
-        if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
-        revokeRecordingViewerAudioUrl();
-        recordingViewerAudioObjectUrl = URL.createObjectURL(audioFile);
+      const keepExistingAudio = options.silent && previousSelectedKey === requestKey && !!player.getAttribute("src");
+      if (keepExistingAudio) {
         audioRow.hidden = false;
-        player.src = recordingViewerAudioObjectUrl;
-        player.load();
-      } catch (audioErr) {
-        if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
-        console.warn("Recording audio playback fetch failed", audioErr);
-        player.pause();
-        revokeRecordingViewerAudioUrl();
-        player.removeAttribute("src");
-        player.load();
-        audioRow.hidden = true;
+      } else {
+        try {
+          const audioFile = await fetchSavedAudioFromBackend(name, String(r.archive_dir || effectiveArchiveDir).trim());
+          if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+          revokeRecordingViewerAudioUrl();
+          recordingViewerAudioObjectUrl = URL.createObjectURL(audioFile);
+          audioRow.hidden = false;
+          player.src = recordingViewerAudioObjectUrl;
+          player.load();
+        } catch (audioErr) {
+          if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+          console.warn("Recording audio playback fetch failed", audioErr);
+          player.pause();
+          revokeRecordingViewerAudioUrl();
+          player.removeAttribute("src");
+          player.load();
+          audioRow.hidden = true;
+        }
       }
     } else {
       player.pause();
@@ -5634,13 +5753,16 @@ async function saveRecordingText(opts: {
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
   }
-  // Fire-and-forget: don't block critical path for recordings list reload.
+  // Fire-and-forget, coalesced through a background queue. Live saves
+  // happen while the single recording capsule is still busy; direct
+  // loadRecordings() here made History redraw during finalization and
+  // visibly flicker the latest recording timestamp. The queue flushes
+  // after busy release, or shortly after non-live saves such as Upload.
   if (opts.refreshList !== false) {
-    loadRecordings(true).catch((e) => {
-      console.warn("Recordings reload after save failed", e);
-      const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
-      setStatus(`Saved. History refresh failed: ${msg}`, "warning");
-    });
+    requestDeferredRecordingsRefresh({
+      name: savedName,
+      archiveDir: savedArchiveDir,
+    }, "save");
   }
   return {
     name: savedName,
