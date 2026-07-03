@@ -687,30 +687,30 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  visualScale: 0.5,
-  collapsedWidth: 334,
-  expandedWidth: 334,
-  expandedHeight: 150,
+  collapsedWidth: 224,
+  expandedWidth: 224,
+  expandedHeight: 168,
   height: 64,
   geometryPadding: 6,
-  minWidth: 220,
-  minHeight: 52,
-  maxWidth: 360,
-  maxHeight: 260,
+  minWidth: 190,
+  minHeight: 60,
+  maxWidth: 260,
+  maxHeight: 220,
   bottomMargin: 18,
-  pillWidth: 318,
+  pillWidth: 212,
   pillHeight: 52,
-  pillPadLeft: 10,
-  pillPadRight: 14,
-  pillGap: 10,
+  settingsWidth: 212,
+  pillPadLeft: 9,
+  pillPadRight: 9,
+  pillGap: 7,
   controlSize: 30,
   statusControlSize: 30,
-  timerWidth: 56,
-  timerFontSize: 17,
-  waveWidth: 124,
+  timerWidth: 48,
+  timerFontSize: 16,
+  waveWidth: 54,
   waveHeight: 18,
   waveBarWidth: 2,
-  waveBarGap: 2.4,
+  waveBarGap: 2.1,
   waveIdleTickMs: 120,
   waveActiveStaleMs: 220,
   timerTickMs: 200,
@@ -740,23 +740,15 @@ function clampRecordingStatusCapsuleDimension(value, min, max) {
   return Math.max(min, Math.min(max, Math.ceil(n)));
 }
 
-function scaledRecordingStatusCapsuleDimension(value) {
-  const n = Number(value);
-  const scale = Number(RECORDING_STATUS_CAPSULE.visualScale);
-  if (!Number.isFinite(n)) return 0;
-  if (!Number.isFinite(scale) || scale <= 0) return Math.ceil(n);
-  return Math.max(1, Math.ceil(n * scale));
-}
-
 function getRecordingStatusCapsuleFallbackWindowSize() {
   return recordingStatusQuickSettingsOpen
     ? {
-      width: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.expandedWidth),
-      height: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.expandedHeight),
+      width: RECORDING_STATUS_CAPSULE.expandedWidth,
+      height: RECORDING_STATUS_CAPSULE.expandedHeight,
     }
     : {
-      width: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.collapsedWidth),
-      height: scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.height),
+      width: RECORDING_STATUS_CAPSULE.collapsedWidth,
+      height: RECORDING_STATUS_CAPSULE.height,
     };
 }
 
@@ -765,17 +757,17 @@ function getRecordingStatusCapsuleWindowSize() {
   if (!geometry || geometry.quickOpen !== recordingStatusQuickSettingsOpen) {
     return getRecordingStatusCapsuleFallbackWindowSize();
   }
-  const pad = Math.max(0, scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.geometryPadding));
+  const pad = Math.max(0, Number(RECORDING_STATUS_CAPSULE.geometryPadding) || 0);
   return {
     width: clampRecordingStatusCapsuleDimension(
       geometry.width + pad,
-      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.minWidth),
-      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.maxWidth),
+      RECORDING_STATUS_CAPSULE.minWidth,
+      RECORDING_STATUS_CAPSULE.maxWidth,
     ),
     height: clampRecordingStatusCapsuleDimension(
       geometry.height + pad,
-      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.minHeight),
-      scaledRecordingStatusCapsuleDimension(RECORDING_STATUS_CAPSULE.maxHeight),
+      RECORDING_STATUS_CAPSULE.minHeight,
+      RECORDING_STATUS_CAPSULE.maxHeight,
     ),
   };
 }
@@ -1030,9 +1022,6 @@ function recordingStatusCapsuleHtml() {
       gap: 4px;
       margin: 0 auto;
       width: min-content;
-      transform: scale(${t.visualScale});
-      transform-origin: bottom center;
-      will-change: transform;
     }
     #pill {
       width: ${t.pillWidth}px;
@@ -1061,7 +1050,7 @@ function recordingStatusCapsuleHtml() {
       gap: ${t.pillGap}px;
     }
     #settingsSlot {
-      width: 100%;
+      width: ${t.settingsWidth}px;
       height: 0;
       min-height: 0;
       display: flex;
@@ -1071,13 +1060,13 @@ function recordingStatusCapsuleHtml() {
     }
     #settingsSlot.on {
       height: auto;
-      min-height: 34px;
+      min-height: 94px;
       margin-bottom: 8px;
     }
     #settingsPill {
-      width: ${t.pillWidth}px;
-      min-height: 22px;
-      padding: 8px;
+      width: ${t.settingsWidth}px;
+      min-height: 94px;
+      padding: 8px 9px;
       border-radius: 14px;
       border: 1px solid rgba(255,255,255,0.14);
       background: rgba(18,18,18,0.92);
@@ -1100,36 +1089,36 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       flex-direction: column;
       align-items: stretch;
-      gap: 4px;
+      gap: 5px;
       min-width: 0;
       overflow: visible;
     }
     #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule {
       display: flex;
       align-items: center;
-      gap: 5px;
-      height: 22px;
-      padding: 0 6px 0 2px;
+      gap: 6px;
+      height: 26px;
+      padding: 0 7px 0 3px;
       border-radius: 999px;
       white-space: nowrap;
     }
     .capsuleLabel, #quickUpscaleOffLabel {
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 650;
       letter-spacing: 0;
       opacity: .92;
     }
     #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle {
       appearance: none;
-      width: 28px;
-      height: 16px;
+      width: 30px;
+      height: 18px;
       border-radius: 999px;
       border: 1px solid #444;
       background: #2a2a2a;
       position: relative;
       outline: none;
       cursor: default;
-      flex: 0 0 28px;
+      flex: 0 0 30px;
       transition: background .14s ease, border-color .14s ease;
     }
     #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before {
@@ -1137,8 +1126,8 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 2px;
       top: 2px;
-      width: 10px;
-      height: 10px;
+      width: 12px;
+      height: 12px;
       border-radius: 999px;
       background: #d2d2d2;
       transition: transform .14s ease, background .14s ease;
@@ -1187,8 +1176,8 @@ function recordingStatusCapsuleHtml() {
       align-items: center;
       gap: 2px;
       margin-left: 2px;
-      height: 18px;
-      padding: 1px 3px;
+      height: 20px;
+      padding: 1px 4px;
       border: 1px solid #4a4428;
       border-radius: 8px;
       background: #2a2818;
@@ -1198,7 +1187,7 @@ function recordingStatusCapsuleHtml() {
       min-width: 18px;
       text-align: center;
       color: #e0dcc0;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 700;
       font-family: Menlo, ui-monospace, monospace;
       line-height: 1;
@@ -1209,8 +1198,8 @@ function recordingStatusCapsuleHtml() {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 16px;
-      height: 16px;
+      width: 18px;
+      height: 18px;
       border-radius: 4px;
       color: #d4c888;
       font-size: 12px;
@@ -1230,11 +1219,11 @@ function recordingStatusCapsuleHtml() {
       border-radius: 999px;
       background: #2a2234;
       color: #eaeaea;
-      height: 18px;
-      min-width: 96px;
-      max-width: 96px;
-      padding: 0 18px 0 8px;
-      font-size: 10px;
+      height: 22px;
+      min-width: 104px;
+      max-width: 104px;
+      padding: 0 19px 0 8px;
+      font-size: 11px;
       font-weight: 600;
       text-align: left;
       cursor: default;
@@ -1262,7 +1251,7 @@ function recordingStatusCapsuleHtml() {
     #quickUpscaleMenu {
       position: absolute;
       left: 0;
-      top: 22px;
+      top: 26px;
       min-width: 100%;
       max-height: 160px;
       overflow: auto;
@@ -1281,12 +1270,12 @@ function recordingStatusCapsuleHtml() {
       appearance: none;
       border: 0;
       border-radius: 8px;
-      height: 22px;
+      height: 26px;
       padding: 0 8px;
       text-align: left;
       color: #eaeaea;
       background: transparent;
-      font-size: 10px;
+      font-size: 11px;
       cursor: default;
     }
     .quickUpscaleItem:hover {
@@ -2798,7 +2787,7 @@ function recordingStatusForPasteFailure(reason) {
   // knows the text survived.
   if (r.includes("no-accessibility")) return "In Clipboard · Grant Access";
   if (r.includes("secure-field")) return "In Clipboard · Secure Field";
-  if (r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "In Clipboard · No Focus";
+  if (r.includes("no-target") || r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "In Clipboard · No Focus";
   if (r.includes("clipboard")) return "Clipboard Error";
   if (looksLikeAutomationPermissionError(r)) return "In Clipboard · Grant Access";
   return "In Clipboard";
@@ -3640,6 +3629,13 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
+  if (!hasCapturedPasteTarget(effectiveTarget)) {
+    traceStep(trace, "target_missing_after_clipboard_write", {});
+    logPasteTrace("failed", { reason: "no-target" });
+    traceEnd(trace, "failed", { reason: "no-target", method: "target-preflight" });
+    releaseClipboardSnapshot();
+    return { ok: false, reason: "no-target", method: "target-preflight", verified: false };
+  }
   if (hasCapturedPasteTarget(effectiveTarget)) {
     try {
       const restored = await activateCapturedPasteTarget(effectiveTarget);
@@ -3677,11 +3673,6 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
         end if
       end if
       
-      -- Priority 3: Target whatever is frontmost right now
-      if p is missing value then
-        set p to first process whose frontmost is true
-      end if
-      
       if p is missing value then return "ERR:no-process"
       
       -- Fast path: bring target to front and send physical Cmd+V keycode.
@@ -3703,6 +3694,18 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
           end if
         end try
       end if
+
+      -- If the target exposes a standard Edit > Paste command and it is
+      -- disabled, there is no editable focus to receive Cmd+V. Treating
+      -- the subsequent keycode as success produced false "Paste Sent"
+      -- statuses while the transcript stayed only in Transcriptor.
+      try
+        if exists menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p then
+          if enabled of menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p is false then
+            return "ERR:no-focus"
+          end if
+        end if
+      end try
       
       -- Perform physical V key press (key code 9) + Cmd
       -- This bypasses keyboard layout issues (like Russian "м") where keystroke "v" fails
@@ -4068,9 +4071,6 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
         if exists process targetApp then
           set p to process targetApp
         end if
-      end if
-      if p is missing value then
-        set p to first process whose frontmost is true
       end if
       if p is missing value then return "ERR:no-process"
       set frontmost of p to true

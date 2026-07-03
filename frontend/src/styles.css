@@ -179,6 +179,9 @@ body {
   --toolbar-row-gap: 12px;
   --toolbar-group-gap: 8px;
   --toolbar-upscale-gap: 6px;
+  --record-col-live: minmax(220px, 0.74fr);
+  --record-col-transcribe: minmax(320px, 1.18fr);
+  --record-col-upscale: minmax(260px, 0.98fr);
   --stack-card: 12px;
   --pane-context-lines: 1;
   --summary-text-lines: 1;
@@ -816,12 +819,14 @@ textarea:focus-visible,
   flex: 1;
   min-height: 0;
   display: grid;
-  /* Column ratios tuned to each pane's intrinsic toolbar width:
-     - Live Preview has one narrow model select and can be compact.
-     - Transcribe has provider/model controls and two icon buttons.
-     - Upscale carries the densest command cluster and gets the widest
-       pane so command buttons stay visible instead of being clipped. */
-  grid-template-columns: 0.76fr 0.96fr 1.28fr;
+  /* Record view is text-first: Transcribe owns the primary working
+     width, while Live Preview and Upscale stay readable but compact.
+     Keep the column model in tokens so Upload can intentionally
+     override it without becoming a second source of truth. */
+  grid-template-columns:
+    var(--record-col-live)
+    var(--record-col-transcribe)
+    var(--record-col-upscale);
   gap: 14px;
   padding: var(--page-gutter);
 }
@@ -1426,6 +1431,16 @@ textarea:focus-visible,
   padding: 10px 14px;
 }
 
+#currentRecordingAudioRow {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) repeat(2, 32px) minmax(42px, max-content);
+}
+
+#currentRecordingAudioRow #currentRecordingAudio {
+  width: 100%;
+  flex: none;
+}
+
 .current-audio-meta {
   font-size: 11px;
   color: var(--text-2);
@@ -1433,9 +1448,8 @@ textarea:focus-visible,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  flex: 0 1 auto;
+  justify-self: end;
   min-width: 0;
-  margin-left: auto;
 }
 
 #currentRecordingAudio,
