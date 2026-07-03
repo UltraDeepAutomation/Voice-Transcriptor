@@ -246,6 +246,7 @@ let pendingShortcutBridgeMessages = [];
 // subprocesses that leak PIDs when ``backend`` is overwritten.
 let backendStartInFlight = null;
 let micPermissionChecked = false;
+let macPastePermissionPromptAt = 0;
 let loadedFrontendBuildSignature = "";
 let pasteTarget = emptyCapturedPasteTarget();
 const HOST = "127.0.0.1";
@@ -1521,6 +1522,7 @@ function recordingStatusCapsuleHtml() {
     let lastLevelAt = 0;
     let activeWave = true;
     let waveMode = "recording";
+    let stateIconModeClass = "";
     let settingsSignature = "";
     function fmt(ms) {
       const total = Math.max(0, Math.floor(ms / 1000));
@@ -1636,14 +1638,23 @@ function recordingStatusCapsuleHtml() {
               ? "recording"
               : "idle";
       activeWave = waveMode === "recording" || waveMode === "autostop";
+      const nextClass = next === "recording"
+        ? "rec"
+        : next === "upscaling"
+          ? "upscaling"
+          : next === "transcribing"
+            ? "transcribing"
+            : next === "autostop"
+              ? "autostop"
+              : next === "ok"
+                ? "ok"
+                : next === "fail"
+                  ? "fail"
+                  : "transcribing";
+      if (nextClass === stateIconModeClass) return;
+      stateIconModeClass = nextClass;
       stateIcon.className = "";
-      if (next === "recording") stateIcon.classList.add("rec");
-      else if (next === "upscaling") stateIcon.classList.add("upscaling");
-      else if (next === "transcribing") stateIcon.classList.add("transcribing");
-      else if (next === "autostop") stateIcon.classList.add("autostop");
-      else if (next === "ok") stateIcon.classList.add("ok");
-      else if (next === "fail") stateIcon.classList.add("fail");
-      else stateIcon.classList.add("transcribing");
+      stateIcon.classList.add(nextClass);
     }
     function renderWave() {
       ctx.clearRect(0, 0, waveW, waveH);
@@ -3221,32 +3232,45 @@ async function activateCapturedPasteTarget(target) {
   return activateMacCapturedWindow(normalized);
 }
 
-async function requestMacPastePermissionsOnce() {
-  if (process.platform !== "darwin") return;
+function setCachedAccessibilityTrusted(trusted) {
+  const next = !!trusted;
+  if (lastAccessibilityTrusted === next) return;
+  lastAccessibilityTrusted = next;
+  appendMainLog(`[accessibility] trusted=${next}`);
+  if (win && !win.isDestroyed() && win.webContents) {
+    win.webContents
+      .executeJavaScript(
+        `window.__transcriptorAccessibilityStatus = ${JSON.stringify({ trusted: next })};`,
+        true,
+      )
+      .catch(() => { });
+  }
+}
 
-  // Accessibility prompt (native macOS prompt).
+function refreshMacAccessibilityTrustState({ prompt = false } = {}) {
+  if (process.platform !== "darwin") return;
   let trusted = false;
   try {
-    trusted = !!systemPreferences.isTrustedAccessibilityClient(false);
+    trusted = !!systemPreferences.isTrustedAccessibilityClient(!!prompt);
   } catch { }
-  if (!trusted) {
-    try {
-      systemPreferences.isTrustedAccessibilityClient(true);
-    } catch { }
+  setCachedAccessibilityTrusted(trusted);
+  return trusted;
+}
+
+async function promptMacPastePermissions(reason = "") {
+  if (process.platform !== "darwin") return;
+  const now = Date.now();
+  if (now - macPastePermissionPromptAt < 15000) {
+    openPrivacyAccessibilitySettings();
+    setTimeout(() => openPrivacyAutomationSettings(), 350);
+    return;
   }
-
-  // Automation prompt for System Events (Apple Events permission).
-  const probe = await runCommand(
-    "osascript",
-    ["-e", 'tell application "System Events" to keystroke ""'],
-    { timeoutMs: 7000 }
-  );
-  if (probe.ok) return;
-
-  const reason = (probe.stderr || probe.stdout || "").trim();
+  macPastePermissionPromptAt = now;
+  refreshMacAccessibilityTrustState({ prompt: true });
+  const cleanReason = String(reason || "").trim();
   const message =
     "To auto-paste transcript into any app, allow Transcriptor in Accessibility and Automation (System Events).";
-  const detail = reason ? `${message}\n\nmacOS response:\n${reason}` : message;
+  const detail = cleanReason ? `${message}\n\nmacOS response:\n${cleanReason}` : message;
   const res = await dialog.showMessageBox({
     type: "info",
     buttons: ["Open Privacy Settings", "Later"],
@@ -4445,11 +4469,11 @@ async function processPostStopTask(task) {
         await setRecordingStatus("Sent");
       }
       if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
-        openPrivacyAccessibilitySettings();
+        await promptMacPastePermissions(sent.reason);
       }
     }
     if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
-      openPrivacyAccessibilitySettings();
+      await promptMacPastePermissions(pasted.reason);
     }
     recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
   } else {
@@ -4531,8 +4555,8 @@ async function pasteLatestTranscriptFromShortcut() {
     );
     await setRecordingStatus(pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
-      if (String(pasted.reason || "").includes("no-accessibility")) {
-        openPrivacyAccessibilitySettings();
+      if (String(pasted.reason || "").includes("no-accessibility") || looksLikeAutomationPermissionError(pasted.reason)) {
+        await promptMacPastePermissions(pasted.reason);
       }
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
@@ -6395,19 +6419,7 @@ app.whenReady().then(async () => {
   if (process.platform === "darwin") {
     const checkAccessibility = () => {
       try {
-        const trusted = !!systemPreferences.isTrustedAccessibilityClient(false);
-        if (trusted !== lastAccessibilityTrusted) {
-          lastAccessibilityTrusted = trusted;
-          appendMainLog(`[accessibility] trusted=${trusted}`);
-          if (win && !win.isDestroyed() && win.webContents) {
-            win.webContents
-              .executeJavaScript(
-                `window.__transcriptorAccessibilityStatus = ${JSON.stringify({ trusted })};`,
-                true,
-              )
-              .catch(() => { });
-          }
-        }
+        refreshMacAccessibilityTrustState();
       } catch { }
     };
     checkAccessibility();
@@ -6831,20 +6843,13 @@ app.whenReady().then(async () => {
   }, 2000);
   try { shortcutPollTimer.unref?.(); } catch { }
 
-  // 1.1.25 fix: previously awaited the permission prompts before
-  // starting the backend. The permission dialog is modal and can
-  // sit there for minutes if the user is AFK — backend never
-  // booted, renderer's preload waited, user thought the app was
-  // broken. Kick the prompt off in PARALLEL with backend boot
-  // (they are orthogonal — perms gate paste at runtime, not boot).
-  const macPermPromise = requestMacPastePermissionsOnce();
+  // Startup must not summon macOS permission prompts. Permission prompts
+  // are tied to user actions: recording asks for microphone when the
+  // user records, and paste asks for Accessibility/Automation when paste
+  // actually needs them.
+  refreshMacAccessibilityTrustState();
   await startBackend();
   await ensureWindowVisible();
-  await requestMacMicrophonePermissionOnce();
-  // Drain the permission prompt promise — by now boot is complete,
-  // the user has the window in front of them, and any modal dialog
-  // is contextual rather than blocking the launch.
-  try { await macPermPromise; } catch { /* best-effort permission */ }
 }).catch((err) => {
   // The whenReady chain has many awaits — startBackend, permission
   // probes, accessibility checks, and any one of
