@@ -42,6 +42,20 @@ bash INSTALL_ON_OTHER_MAC.command
 
 Public distribution must use a Developer ID Application identity plus Apple notarization and stapling. Without that identity, macOS Gatekeeper cannot treat the app as a fully trusted external download.
 
+Developer ID DMG release flow:
+
+```bash
+export TRANSCRIPTOR_SIGNING_IDENTITY="Developer ID Application: Your Team (TEAMID)"
+npm --prefix desktop run dist
+
+export NOTARYTOOL_KEYCHAIN_PROFILE="TranscriptorNotaryProfile"
+npm --prefix desktop run notarize:dmg
+```
+
+The notarization command submits the signed DMG with `notarytool`, staples the
+ticket, validates the staple, and runs Gatekeeper validation on the final DMG.
+All release environment variables are documented in `.env.example`.
+
 #### Mac App Store / TestFlight builds
 
 The App Store/TestFlight artifact is a MAS `.pkg`, not the public DMG. It must use an explicit App Store Connect bundle ID, a matching Mac App Store provisioning profile, an app signing certificate, and an installer signing certificate. The build fails before packaging if any required signing input is missing.

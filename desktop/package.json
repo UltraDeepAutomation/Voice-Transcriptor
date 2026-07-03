@@ -17,6 +17,7 @@
     "dist:dir": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
     "dist:adhoc": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac dmg --arm64",
     "dist:dir:adhoc": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac --dir --arm64",
+    "notarize:dmg": "bash ./scripts/notarize-dmg.sh",
     "dist:mas": "bash ./scripts/build-mas.sh",
     "testflight:upload": "bash ./scripts/upload-testflight.sh",
     "dist:win": "node ./scripts/require-bash.js win-x64 && bash ./scripts/prepare-runtime.sh win-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
