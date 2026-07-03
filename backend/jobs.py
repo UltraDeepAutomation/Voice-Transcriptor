@@ -1,8 +1,11 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
+
+
+TERMINAL_JOB_PRUNE_GRACE = timedelta(minutes=15)
 
 
 @dataclass
@@ -14,6 +17,7 @@ class Job:
     result: Optional[Dict[str, Any]] = None
     result_files: Dict[str, str] = field(default_factory=dict)  # kind -> path
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    terminal_observed_at: Optional[datetime] = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
@@ -31,16 +35,23 @@ class JobStore:
     def _prune(self) -> None:
         if len(self._jobs) <= self._max_jobs:
             return
-        # Never evict jobs whose worker thread is still running or whose
-        # result has not yet been polled.  Evicting a running/queued job
-        # silently loses its result because set_done / set_error no-op on
-        # unknown ids, leaving the client stuck polling a 404 forever.
-        # Only candidates from the completed (done / error) pool are dropped;
-        # if the pool is exhausted the store silently stays over the soft cap
-        # rather than destroying in-flight work.
+        # Never evict jobs whose worker thread is still running, whose
+        # terminal state has not yet been observed by a client, or whose
+        # terminal state was observed only moments ago.  Evicting any of
+        # those silently loses result/download access: set_done / set_error
+        # no-op on unknown ids, while the HTTP poller sees a 404 instead of
+        # the terminal result it was waiting for.  The cap is deliberately
+        # soft; memory is cheaper than losing a completed transcription.
+        now = datetime.now(timezone.utc)
         evictable = sorted(
-            [j for j in self._jobs.values() if j.status in ("done", "error", "cancelled")],
-            key=lambda j: j.created_at,
+            [
+                j
+                for j in self._jobs.values()
+                if j.status in ("done", "error", "cancelled")
+                and j.terminal_observed_at is not None
+                and (now - j.terminal_observed_at) >= TERMINAL_JOB_PRUNE_GRACE
+            ],
+            key=lambda j: (j.terminal_observed_at or j.created_at, j.created_at),
         )
         drop = len(self._jobs) - self._max_jobs
         for job in evictable[:drop]:
@@ -55,7 +66,10 @@ class JobStore:
 
     def get(self, job_id: str) -> Optional[Job]:
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if job and job.status in ("done", "error", "cancelled") and job.terminal_observed_at is None:
+                job.terminal_observed_at = datetime.now(timezone.utc)
+            return job
 
     def submit(self, fn, *args, **kwargs) -> None:
         self._pool.submit(fn, *args, **kwargs)
