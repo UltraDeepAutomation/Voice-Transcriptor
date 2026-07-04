@@ -3697,15 +3697,22 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
         end try
       end if
 
-      -- If the target exposes a standard Edit > Paste command and it is
-      -- disabled, there is no editable focus to receive Cmd+V. Treating
-      -- the subsequent keycode as success produced false "Paste Sent"
-      -- statuses while the transcript stayed only in Transcriptor.
+      -- If the target exposes a standard Edit > Paste command, prefer
+      -- executing that command directly over synthesising Cmd+V. A
+      -- keycode only proves the keyboard event was delivered; the menu
+      -- command is the target app's own paste action and is a stronger
+      -- signal that the active responder can accept text.
       try
         if exists menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p then
-          if enabled of menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p is false then
+          set pasteMenuItem to menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p
+          if enabled of pasteMenuItem is false then
             return "ERR:no-focus"
           end if
+          try
+            click pasteMenuItem
+            delay 0.16
+            return "OK:menu-paste-primary"
+          end try
         end if
       end try
       
