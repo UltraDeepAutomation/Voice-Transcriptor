@@ -687,27 +687,27 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  collapsedWidth: 224,
-  expandedWidth: 224,
-  expandedHeight: 168,
-  height: 64,
+  collapsedWidth: 172,
+  expandedWidth: 232,
+  expandedHeight: 184,
+  height: 58,
   geometryPadding: 6,
-  minWidth: 190,
-  minHeight: 60,
-  maxWidth: 260,
-  maxHeight: 220,
+  minWidth: 166,
+  minHeight: 56,
+  maxWidth: 252,
+  maxHeight: 320,
   bottomMargin: 18,
-  pillWidth: 212,
+  pillWidth: 166,
   pillHeight: 52,
-  settingsWidth: 212,
-  pillPadLeft: 9,
-  pillPadRight: 9,
-  pillGap: 7,
-  controlSize: 30,
-  statusControlSize: 30,
-  timerWidth: 48,
-  timerFontSize: 16,
-  waveWidth: 54,
+  settingsWidth: 226,
+  pillPadLeft: 7,
+  pillPadRight: 7,
+  pillGap: 4,
+  controlSize: 26,
+  statusControlSize: 26,
+  timerWidth: 45,
+  timerFontSize: 15,
+  waveWidth: 32,
   waveHeight: 18,
   waveBarWidth: 2,
   waveBarGap: 2.1,
@@ -1050,7 +1050,7 @@ function recordingStatusCapsuleHtml() {
       gap: ${t.pillGap}px;
     }
     #settingsSlot {
-      width: ${t.settingsWidth}px;
+      width: 0;
       height: 0;
       min-height: 0;
       display: flex;
@@ -1059,14 +1059,15 @@ function recordingStatusCapsuleHtml() {
       overflow: visible;
     }
     #settingsSlot.on {
+      width: ${t.settingsWidth}px;
       height: auto;
-      min-height: 94px;
+      min-height: 122px;
       margin-bottom: 8px;
     }
     #settingsPill {
       width: ${t.settingsWidth}px;
-      min-height: 94px;
-      padding: 8px 9px;
+      min-height: 122px;
+      padding: 10px;
       border-radius: 14px;
       border: 1px solid rgba(255,255,255,0.14);
       background: rgba(18,18,18,0.92);
@@ -1089,7 +1090,7 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       flex-direction: column;
       align-items: stretch;
-      gap: 5px;
+      gap: 7px;
       min-width: 0;
       overflow: visible;
     }
@@ -1097,28 +1098,28 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       align-items: center;
       gap: 6px;
-      height: 26px;
-      padding: 0 7px 0 3px;
+      height: 30px;
+      padding: 0 8px 0 3px;
       border-radius: 999px;
       white-space: nowrap;
     }
     .capsuleLabel, #quickUpscaleOffLabel {
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 650;
       letter-spacing: 0;
       opacity: .92;
     }
     #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle {
       appearance: none;
-      width: 30px;
-      height: 18px;
+      width: 34px;
+      height: 20px;
       border-radius: 999px;
       border: 1px solid #444;
       background: #2a2a2a;
       position: relative;
       outline: none;
       cursor: default;
-      flex: 0 0 30px;
+      flex: 0 0 34px;
       transition: background .14s ease, border-color .14s ease;
     }
     #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before {
@@ -1126,8 +1127,8 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 2px;
       top: 2px;
-      width: 12px;
-      height: 12px;
+      width: 14px;
+      height: 14px;
       border-radius: 999px;
       background: #d2d2d2;
       transition: transform .14s ease, background .14s ease;
@@ -1142,7 +1143,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #7a50c8;
     }
     #quickUpscaleToggle:checked::before {
-      transform: translateX(12px);
+      transform: translateX(14px);
       background: #fff;
     }
     #quickAutoSendCapsule {
@@ -1155,7 +1156,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #4a8a5a;
     }
     #quickAutoSendToggle:checked::before {
-      transform: translateX(12px);
+      transform: translateX(14px);
       background: #90e0a0;
     }
     #quickAutoStopCapsule {
@@ -1168,7 +1169,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #8a7a3a;
     }
     #quickAutoStopToggle:checked::before {
-      transform: translateX(12px);
+      transform: translateX(14px);
       background: #e8d860;
     }
     #quickAutoStopSecsLabel {
@@ -1176,18 +1177,18 @@ function recordingStatusCapsuleHtml() {
       align-items: center;
       gap: 2px;
       margin-left: 2px;
-      height: 20px;
-      padding: 1px 4px;
+      height: 22px;
+      padding: 1px 5px;
       border: 1px solid #4a4428;
       border-radius: 8px;
       background: #2a2818;
     }
     #quickAutoStopSecs {
       display: inline-block;
-      min-width: 18px;
+      min-width: 20px;
       text-align: center;
       color: #e0dcc0;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 700;
       font-family: Menlo, ui-monospace, monospace;
       line-height: 1;
@@ -1198,11 +1199,11 @@ function recordingStatusCapsuleHtml() {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 18px;
-      height: 18px;
+      width: 20px;
+      height: 20px;
       border-radius: 4px;
       color: #d4c888;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 700;
       cursor: default;
       transition: background 80ms ease;
@@ -1219,11 +1220,11 @@ function recordingStatusCapsuleHtml() {
       border-radius: 999px;
       background: #2a2234;
       color: #eaeaea;
-      height: 22px;
-      min-width: 104px;
-      max-width: 104px;
+      height: 26px;
+      min-width: 118px;
+      max-width: 118px;
       padding: 0 19px 0 8px;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 600;
       text-align: left;
       cursor: default;
@@ -1251,9 +1252,9 @@ function recordingStatusCapsuleHtml() {
     #quickUpscaleMenu {
       position: absolute;
       left: 0;
-      top: 26px;
+      top: 30px;
       min-width: 100%;
-      max-height: 160px;
+      max-height: 190px;
       overflow: auto;
       padding: 4px;
       border: 1px solid #3d2e52;
@@ -1270,12 +1271,12 @@ function recordingStatusCapsuleHtml() {
       appearance: none;
       border: 0;
       border-radius: 8px;
-      height: 26px;
+      height: 30px;
       padding: 0 8px;
       text-align: left;
       color: #eaeaea;
       background: transparent;
-      font-size: 11px;
+      font-size: 12px;
       cursor: default;
     }
     .quickUpscaleItem:hover {
@@ -1309,12 +1310,12 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 15px;
-      height: 15px;
+      width: 14px;
+      height: 14px;
       transform: translate(-50%,-50%);
       background-repeat: no-repeat;
       background-position: center;
-      background-size: 15px 15px;
+      background-size: 14px 14px;
       background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
     }
     #gearBtn.on {
@@ -1358,8 +1359,8 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 10px;
-      height: 10px;
+      width: 9px;
+      height: 9px;
       transform: translate(-50%,-50%);
       border-radius: 50%;
       background: rgba(180,180,180,.92);
@@ -1369,16 +1370,16 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 22px;
-      height: 22px;
+      width: 20px;
+      height: 20px;
       transform: translate(-50%,-50%);
       border-radius: 50%;
       border: 1px solid rgba(180,180,180,.2);
       opacity: 0;
     }
     #stateIcon.rec::before {
-      width: 9px;
-      height: 9px;
+      width: 8px;
+      height: 8px;
       background: rgba(255,92,92,.96);
       border-radius: 2.5px;
       animation: coreBreathe 1.35s ease-in-out infinite;
