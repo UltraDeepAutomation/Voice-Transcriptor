@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DESKTOP_DIR = resolve(HERE, "../desktop");
+
 // 1.1.25: read the version from desktop/package.json — the SINGLE
 // source of truth for the shipped artifact's version. electron-builder
 // uses ``desktop/package.json`` for the DMG title, NSIS installer
@@ -19,10 +22,14 @@ import { dirname, resolve } from "node:path";
 // pipeline. ``frontend/package.json`` is package metadata only, not
 // the shipped application version SSOT.
 const PKG_VERSION: string = (() => {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const pkgPath = resolve(here, "../desktop/package.json");
+  const pkgPath = resolve(DESKTOP_DIR, "package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
   return String(pkg.version || "0.0.0");
+})();
+
+const SHORTCUT_DEFAULTS = (() => {
+  const defaultsPath = resolve(DESKTOP_DIR, "shortcut-defaults.json");
+  return JSON.parse(readFileSync(defaultsPath, "utf8"));
 })();
 
 export default defineConfig({
@@ -40,5 +47,6 @@ export default defineConfig({
   },
   define: {
     __APP_VERSION__: JSON.stringify(PKG_VERSION),
+    __SHORTCUT_DEFAULTS__: JSON.stringify(SHORTCUT_DEFAULTS),
   },
 });

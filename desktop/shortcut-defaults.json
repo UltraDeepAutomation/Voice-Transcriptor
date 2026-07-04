@@ -1,0 +1,19 @@
+{
+  "platformDefaults": {
+    "darwin": {
+      "record": "Alt+Left",
+      "paste": "Alt+Shift+V"
+    },
+    "default": {
+      "record": "F9",
+      "paste": "F10"
+    }
+  },
+  "legacy": {
+    "unpressablePaste": "Alt+Shift+7",
+    "macFunctionPair": {
+      "record": "F9",
+      "paste": "F10"
+    }
+  }
+}

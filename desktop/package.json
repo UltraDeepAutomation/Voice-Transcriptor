@@ -36,6 +36,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "shortcut-defaults.json",
       "package.json",
       "icon.png",
       "icon.ico",

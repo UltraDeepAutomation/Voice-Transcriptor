@@ -304,12 +304,23 @@ type LiveStatusSnapshot = {
 };
 type ShortcutBridgeAction = "capture-start" | "capture-cancel" | "update";
 type ShortcutPair = { record: string; paste: string };
+type ShortcutDefaultsManifest = {
+  platformDefaults: {
+    darwin: ShortcutPair;
+    default: ShortcutPair;
+  };
+  legacy: {
+    unpressablePaste: string;
+    macFunctionPair: ShortcutPair;
+  };
+};
 
 // Compile-time injected by vite.config.ts from desktop/package.json's
 // ``version`` field. SSOT for the version label rendered in the
 // Settings tab — previously hardcoded ``1.1.1`` in index.html and
 // drifted across every release.
 declare const __APP_VERSION__: string;
+declare const __SHORTCUT_DEFAULTS__: ShortcutDefaultsManifest;
 
 declare global {
   interface Window {
@@ -3701,30 +3712,16 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
 
 // ── Keyboard Shortcut Picker ────────────────────────────────────────────────
 
-// Cross-platform safe defaults. Function keys F9/F10 have no built-in
-// binding in Chrome/Firefox/Safari, macOS Mission Control, or Windows
-// Explorer — unlike Alt+Left (browser "Back") and Alt+Shift+N (Windows
-// input-language switcher, also impossible to press on US keyboards
-// because Shift+digit produces punctuation). Users can still rebind
-// via Settings → Shortcuts.
-// Platform-specific defaults — kept in lockstep with desktop/main.js
-// `readShortcutsFromConfig`. F-keys conflict with macOS media-key
-// mode (F9=Mission Control, F10=Notification Center), so Mac gets
-// Option-based combos. Win/Linux F-keys are clean and avoid Alt+Left
-// = browser-back / Alt+Shift+letter = Windows input-language switch.
-const _platformDefaultShortcuts: Record<string, { record: string; paste: string }> = {
-  // navigator.platform is the only reliable in-renderer probe; we
-  // can't import process.platform here.
-  darwin: { record: "Alt+Left", paste: "Alt+Shift+V" },
-  default: { record: "F9", paste: "F10" },
-};
 const _isMacRenderer = (() => {
   try {
     return /Mac|iPhone|iPad/.test(navigator.platform || "")
         || /Mac OS X/.test(navigator.userAgent || "");
   } catch { return false; }
 })();
-const DEFAULT_SHORTCUTS = _isMacRenderer ? _platformDefaultShortcuts.darwin : _platformDefaultShortcuts.default;
+const DEFAULT_SHORTCUTS = _isMacRenderer
+  ? __SHORTCUT_DEFAULTS__.platformDefaults.darwin
+  : __SHORTCUT_DEFAULTS__.platformDefaults.default;
+const LEGACY_SHORTCUTS = __SHORTCUT_DEFAULTS__.legacy;
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 const SHORTCUT_BRIDGE_TITLE_PREFIX = "__app_shortcuts__";
@@ -4712,14 +4709,18 @@ async function loadCfg(): Promise<void> {
     let rawPaste = String(ui.shortcut_paste || "").trim();
     let didMigrate = false;
     // Migration 1: broken paste shortcut.
-    if (rawPaste === "Alt+Shift+7") {
+    if (rawPaste === LEGACY_SHORTCUTS.unpressablePaste) {
       rawPaste = DEFAULT_SHORTCUTS.paste;
       didMigrate = true;
     }
     // Migration 2: Mac users with the stale F9/F10 cross-platform
     // pair. Both must match exactly; partial matches mean the user
     // customised one half and we leave both alone.
-    if (_isMacRenderer && rawRecord === "F9" && rawPaste === "F10") {
+    if (
+      _isMacRenderer &&
+      rawRecord === LEGACY_SHORTCUTS.macFunctionPair.record &&
+      rawPaste === LEGACY_SHORTCUTS.macFunctionPair.paste
+    ) {
       rawRecord = DEFAULT_SHORTCUTS.record;  // Alt+Left
       rawPaste = DEFAULT_SHORTCUTS.paste;    // Alt+Shift+V
       didMigrate = true;

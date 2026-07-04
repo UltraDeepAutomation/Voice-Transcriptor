@@ -5,6 +5,7 @@ const net = require("net");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const shortcutDefaultsManifest = require("./shortcut-defaults.json");
 
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
@@ -29,6 +30,15 @@ const PYTHON_ENV_SCRUB_KEYS = Object.freeze([
   "PYTHONUSERBASE",
 ]);
 const RUN_COMMAND_OUTPUT_MAX_CHARS = 1024 * 1024;
+
+function shortcutDefaultsForPlatform(platform = process.platform) {
+  const platformDefaults = shortcutDefaultsManifest?.platformDefaults || {};
+  const defaults = platformDefaults[platform] || platformDefaults.default || {};
+  return {
+    record: String(defaults.record || "").trim(),
+    paste: String(defaults.paste || "").trim(),
+  };
+}
 
 // Register process-level crash handlers IMMEDIATELY — the previous
 // registration happened inside app.whenReady().then(...), meaning any
@@ -6718,22 +6728,9 @@ app.whenReady().then(async () => {
   let shortcutsSuspendedForCapture = false;
 
   function readShortcutsFromConfig() {
-    // Must match DEFAULT_SHORTCUTS in frontend/src/main.tsx.
-    //
-    // Platform-specific defaults — F-keys on Mac fight the OS:
-    // F9 = Mission Control / F10 = Notification Center under the
-    // default "media keys" mode, so users had to either hold Fn or
-    // toggle the OS setting before our hotkey did anything. On
-    // Win/Linux F-keys are clean — no built-in app binding.
-    //
-    // Mac: Option+Left for record (Option = "Alt" in Electron's
-    //      accelerator vocabulary; both left and right Option work),
-    //      Option+Shift+V for paste-last (avoids the Shift+7=`&`
-    //      quirk on US/UK layouts that broke Alt+Shift+7).
-    // Win/Linux: F9 / F10 (clean function keys).
-    const defaults = process.platform === "darwin"
-      ? { record: "Alt+Left", paste: "Alt+Shift+V" }
-      : { record: "F9", paste: "F10" };
+    const defaults = shortcutDefaultsForPlatform();
+    const legacy = shortcutDefaultsManifest?.legacy || {};
+    const legacyMacPair = legacy.macFunctionPair || {};
     try {
       const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
       const cfgPath = path.join(dataDir, "config.json");
@@ -6752,17 +6749,21 @@ app.whenReady().then(async () => {
         // for those 2+ seconds (and any earlier F9 press), the
         // shortcut is a black hole. Mirror the migration here so
         // the FIRST register call uses the correct platform default.
-        if (process.platform === "darwin" && record === "F9" && paste === "F10") {
+        if (
+          process.platform === "darwin" &&
+          record === String(legacyMacPair.record || "") &&
+          paste === String(legacyMacPair.paste || "")
+        ) {
           record = defaults.record;
           paste = defaults.paste;
-          appendMainLog("[shortcuts] migrated stale F9/F10 → Alt+Left/Alt+Shift+V on Mac");
+          appendMainLog(`[shortcuts] migrated stale ${legacyMacPair.record}/${legacyMacPair.paste} → ${record}/${paste} on Mac`);
         }
         // Migration 2: legacy `Alt+Shift+7` was unpressable on
         // US/UK layouts (Shift+7 = `&`). Always rewrite to the
         // platform default's paste accelerator.
-        if (paste === "Alt+Shift+7") {
+        if (paste === String(legacy.unpressablePaste || "")) {
           paste = defaults.paste;
-          appendMainLog(`[shortcuts] migrated stale Alt+Shift+7 → ${paste}`);
+          appendMainLog(`[shortcuts] migrated stale ${legacy.unpressablePaste} → ${paste}`);
         }
         return { record, paste };
       }
