@@ -1433,6 +1433,43 @@ textarea:focus-visible,
   flex: none;
 }
 
+#recordingAudioRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 53px;
+}
+
+#recordingAudioRow[hidden] {
+  display: none;
+}
+
+#recordingAudioRow #recordingAudio {
+  grid-area: 1 / 1;
+  width: 100%;
+  min-width: 0;
+  flex: none;
+}
+
+#recordingAudioRow.is-audio-hydrating {
+  position: relative;
+}
+
+#recordingAudioRow.is-audio-hydrating::before {
+  content: "";
+  grid-area: 1 / 1;
+  align-self: center;
+  height: 32px;
+  border-radius: var(--control-radius);
+  border: 1px solid var(--surface-border);
+  background: var(--bg-3);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+}
+
+#recordingAudioRow.is-audio-hydrating #recordingAudio {
+  opacity: 0;
+  pointer-events: none;
+}
+
 .current-audio-meta {
   font-size: 11px;
   color: var(--text-2);
@@ -1473,6 +1510,8 @@ textarea:focus-visible,
 #recordingAudio::-webkit-media-controls-time-remaining-display {
   color: var(--text-2);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 42px;
 }
 
 .pane-footer-actions {

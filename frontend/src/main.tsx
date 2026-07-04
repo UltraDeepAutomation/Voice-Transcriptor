@@ -158,6 +158,7 @@ const RECORDING_COLLECTIONS = {
   uploads: "uploads",
 } as const;
 type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
+const RECORDING_VIEWER_AUDIO_READY_TIMEOUT_MS = 1500;
 
 interface TranscriptSegment {
   start: number;
@@ -817,6 +818,36 @@ function revokeRecordingViewerAudioUrl(): void {
   if (!recordingViewerAudioObjectUrl) return;
   URL.revokeObjectURL(recordingViewerAudioObjectUrl);
   recordingViewerAudioObjectUrl = "";
+}
+
+function setRecordingViewerAudioRowVisible(visible: boolean, hydrating = false): void {
+  const row = $("recordingAudioRow");
+  row.hidden = !visible;
+  row.classList.toggle("is-audio-hydrating", visible && hydrating);
+  row.setAttribute("aria-busy", visible && hydrating ? "true" : "false");
+}
+
+function waitForRecordingViewerAudioReady(player: HTMLAudioElement): Promise<void> {
+  if (player.readyState >= HTMLMediaElement.HAVE_METADATA) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId = 0;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      player.removeEventListener("loadedmetadata", finish);
+      player.removeEventListener("canplay", finish);
+      player.removeEventListener("error", finish);
+      resolve();
+    };
+
+    player.addEventListener("loadedmetadata", finish, { once: true });
+    player.addEventListener("canplay", finish, { once: true });
+    player.addEventListener("error", finish, { once: true });
+    timeoutId = window.setTimeout(finish, RECORDING_VIEWER_AUDIO_READY_TIMEOUT_MS);
+  });
 }
 
 function isCurrentUiSession(token = ""): boolean {
@@ -5134,11 +5165,11 @@ function resetRecordingViewer(placeholder = "Choose a recording from the left li
   revokeRecordingViewerAudioUrl();
   player.removeAttribute("src");
   player.load();
-  $("recordingAudioRow").hidden = true;
+  setRecordingViewerAudioRowVisible(false);
   updateRecordingCopyState();
 }
 
-function setRecordingViewerLoading(displayName: string): void {
+function setRecordingViewerLoading(displayName: string, willLoadAudio = false): void {
   $("recordingTitleLabel").textContent = displayName || "Loading recording";
   $("recordingMeta").textContent = "Loading…";
   $("recordingContent").setAttribute("aria-busy", "true");
@@ -5149,7 +5180,7 @@ function setRecordingViewerLoading(displayName: string): void {
   revokeRecordingViewerAudioUrl();
   player.removeAttribute("src");
   player.load();
-  $("recordingAudioRow").hidden = true;
+  setRecordingViewerAudioRowVisible(willLoadAudio, willLoadAudio);
   updateRecordingCopyState();
 }
 
@@ -5639,7 +5670,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
   const requestSeq = ++recordingOpenRequestSeq;
   const pendingDisplayName = matchedItem?.display_name || recordingTitleFromName(name);
   if (!options.silent) {
-    setRecordingViewerLoading(pendingDisplayName);
+    setRecordingViewerLoading(pendingDisplayName, !!matchedItem?.has_audio);
   }
   try {
     const params = new URLSearchParams();
@@ -5666,20 +5697,23 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingContent").setAttribute("data-placeholder", "Transcription will appear here...");
     $("recordingContent").textContent = (r as { display_text?: string }).display_text || r.content || "";
     const player = $("recordingAudio") as HTMLAudioElement;
-    const audioRow = $("recordingAudioRow");
     if (r.has_audio) {
       const keepExistingAudio = options.silent && previousSelectedKey === requestKey && !!player.getAttribute("src");
       if (keepExistingAudio) {
-        audioRow.hidden = false;
+        setRecordingViewerAudioRowVisible(true);
       } else {
         try {
           const audioFile = await fetchSavedAudioFromBackend(name, String(r.archive_dir || effectiveArchiveDir).trim());
           if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+          player.pause();
           revokeRecordingViewerAudioUrl();
           recordingViewerAudioObjectUrl = URL.createObjectURL(audioFile);
-          audioRow.hidden = false;
           player.src = recordingViewerAudioObjectUrl;
+          setRecordingViewerAudioRowVisible(true, true);
           player.load();
+          await waitForRecordingViewerAudioReady(player);
+          if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
+          setRecordingViewerAudioRowVisible(true);
         } catch (audioErr) {
           if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
           console.warn("Recording audio playback fetch failed", audioErr);
@@ -5687,7 +5721,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
           revokeRecordingViewerAudioUrl();
           player.removeAttribute("src");
           player.load();
-          audioRow.hidden = true;
+          setRecordingViewerAudioRowVisible(false);
         }
       }
     } else {
@@ -5695,7 +5729,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
       revokeRecordingViewerAudioUrl();
       player.removeAttribute("src");
       player.load();
-      audioRow.hidden = true;
+      setRecordingViewerAudioRowVisible(false);
     }
     // Reveal-in-folder button — surfaced when running inside Electron
     // (``__transcriptorRevealRecording`` injected by main.tsx and
@@ -5724,7 +5758,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     revokeRecordingViewerAudioUrl();
     player.removeAttribute("src");
     player.load();
-    $("recordingAudioRow").hidden = true;
+    setRecordingViewerAudioRowVisible(false);
     const revealBtn = document.getElementById("recordingRevealBtn") as HTMLButtonElement | null;
     if (revealBtn) revealBtn.hidden = true;
     updateRecordingCopyState();
