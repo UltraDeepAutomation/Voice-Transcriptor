@@ -854,6 +854,7 @@ function recordingStatusMode(status) {
   if (text.includes("upscal")) return "upscaling";
   if (text.includes("transcrib") || text.includes("processing") || text.includes("pasting")) return "transcribing";
   if (text.includes("pasted") || text.includes("sent") || text.includes("saved") || text.includes("done") || text.includes("no speech detected")) return "ok";
+  if (text.includes("in clipboard")) return "fail";
   if (text.includes("access") || text.includes("loading") || text.includes("fail") || text.includes("error") || text.includes("no text")) return "fail";
   return "transcribing";
 }
@@ -880,6 +881,7 @@ function recordingStatusTone(status) {
   }
   if (text.includes("transcrib") || text.includes("upscal") || text.includes("processing")) return "processing";
   if (text.includes("pasted") || text.includes("sent") || text.includes("saved")) return "success";
+  if (text.includes("in clipboard")) return "warning";
   if (text.includes("access") || text.includes("loading") || text.includes("ready")) return "warning";
   if (text.includes("fail") || text.includes("error") || text.includes("no text")) return "error";
   return "neutral";
