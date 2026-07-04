@@ -824,11 +824,27 @@ function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
 function recordingStatusMode(status) {
   const text = String(status || "").trim().toLowerCase();
   if (!text) return "idle";
-  if (text === "starting" || text.includes("record")) return "recording";
+  if (
+    text.startsWith("recording completed") ||
+    text.startsWith("final transcript is ready") ||
+    text.startsWith("transcript is ready")
+  ) {
+    return "ok";
+  }
+  if (
+    text === "starting" ||
+    text === "recording" ||
+    text.startsWith("recording.") ||
+    text.startsWith("recording with ") ||
+    text.startsWith("recording audio only") ||
+    text.startsWith("recording exceeds ")
+  ) {
+    return "recording";
+  }
   if (text.includes("auto stop")) return "autostop";
   if (text.includes("upscal")) return "upscaling";
   if (text.includes("transcrib") || text.includes("processing") || text.includes("pasting")) return "transcribing";
-  if (text.includes("pasted") || text.includes("sent") || text.includes("saved") || text.includes("done")) return "ok";
+  if (text.includes("pasted") || text.includes("sent") || text.includes("saved") || text.includes("done") || text.includes("no speech detected")) return "ok";
   if (text.includes("access") || text.includes("loading") || text.includes("fail") || text.includes("error") || text.includes("no text")) return "fail";
   return "transcribing";
 }
@@ -836,7 +852,23 @@ function recordingStatusMode(status) {
 function recordingStatusTone(status) {
   const text = String(status || "").trim().toLowerCase();
   if (!text) return "neutral";
-  if (text.includes("record")) return "recording";
+  if (
+    text.startsWith("recording completed") ||
+    text.startsWith("final transcript is ready") ||
+    text.startsWith("transcript is ready") ||
+    text.includes("no speech detected")
+  ) {
+    return "success";
+  }
+  if (
+    text === "recording" ||
+    text.startsWith("recording.") ||
+    text.startsWith("recording with ") ||
+    text.startsWith("recording audio only") ||
+    text.startsWith("recording exceeds ")
+  ) {
+    return "recording";
+  }
   if (text.includes("transcrib") || text.includes("upscal") || text.includes("processing")) return "processing";
   if (text.includes("pasted") || text.includes("sent") || text.includes("saved")) return "success";
   if (text.includes("access") || text.includes("loading") || text.includes("ready")) return "warning";

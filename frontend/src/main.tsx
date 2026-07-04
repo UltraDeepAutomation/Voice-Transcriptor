@@ -1567,19 +1567,35 @@ function toneToStatusKind(tone: UiTone, fallbackText: string): StatusKind {
 
 function inferStatusKindFromText(text: string): StatusKind {
   const t = (text || "").trim();
+  const lower = t.toLowerCase();
   if (!t) return "idle";
-  if (t === "Recording" || t.startsWith("Recording")) return "recording";
-  if (t === "Done") return "done";
-  if (t === "Error" || t === "Backend Error" || t.startsWith("Error")) return "error";
-  if (t === "Idle") return "idle";
+  if (lower === "idle") return "idle";
   if (
-    t === "Processing" ||
-    t.startsWith("Processing") ||
-    t === "Starting" ||
-    t === "Refining..." ||
-    t.startsWith("Finalizing") ||
-    t.startsWith("Transcribing") ||
-    t.startsWith("Upscaling")
+    lower === "done" ||
+    lower.startsWith("recording completed") ||
+    lower.startsWith("final transcript is ready") ||
+    lower.startsWith("transcript is ready")
+  ) {
+    return "done";
+  }
+  if (lower === "error" || lower === "backend error" || lower.startsWith("error")) return "error";
+  if (
+    lower === "recording" ||
+    lower.startsWith("recording.") ||
+    lower.startsWith("recording with ") ||
+    lower.startsWith("recording audio only") ||
+    lower.startsWith("recording exceeds ")
+  ) {
+    return "recording";
+  }
+  if (
+    lower === "processing" ||
+    lower.startsWith("processing") ||
+    lower === "starting" ||
+    lower === "refining..." ||
+    lower.startsWith("finalizing") ||
+    lower.startsWith("transcribing") ||
+    lower.startsWith("upscaling")
   ) {
     return "processing";
   }
