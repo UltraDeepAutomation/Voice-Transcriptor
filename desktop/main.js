@@ -758,8 +758,7 @@ function noteRecordingStatusCapsuleInteraction() {
 
 function shouldSuppressActivateForRecordingStatusCapsule() {
   if (Date.now() > recordingStatusSuppressActivateUntil) return false;
-  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed() || !recordingStatusWindow.isVisible()) return false;
-  return !win || win.isDestroyed() || !win.isVisible();
+  return true;
 }
 
 function getRecordingStatusCapsuleWindowSize() {
