@@ -1748,6 +1748,9 @@ function recordingStatusCapsuleHtml() {
       }
       if (waveMode === "recording") pushLevel(level);
     }
+    function pageIsActive() {
+      return !document.hidden && !!String(state.status || "").trim();
+    }
     window.__setCapsuleState = (next) => {
       state = { ...state, ...(next || {}) };
       state.settings = { ...state.settings, ...((next && next.settings) || {}) };
@@ -1813,6 +1816,7 @@ function recordingStatusCapsuleHtml() {
       emitSecs(readSecs() + 1);
     });
     setInterval(() => {
+      if (!pageIsActive()) return;
       if (activeWave && Date.now() - lastLevelAt < ${t.waveActiveStaleMs}) return;
       const idle = activeWave
         ? (0.08 + Math.random() * 0.12)
@@ -1822,6 +1826,10 @@ function recordingStatusCapsuleHtml() {
       renderWave();
     }, ${t.waveIdleTickMs});
     setInterval(() => {
+      if (!pageIsActive()) {
+        if (timeEl.textContent !== "00:00") timeEl.textContent = "00:00";
+        return;
+      }
       const elapsed = state.startedAt ? Date.now() - Number(state.startedAt) : 0;
       timeEl.textContent = fmt(elapsed);
     }, ${t.timerTickMs});
@@ -2032,6 +2040,12 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.settingsLoaded = false;
   recordingStatusCapsuleGeometry = null;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
+    if (recordingStatusWindowReady) {
+      recordingStatusWindow.webContents.executeJavaScript(
+        `window.__setCapsuleState(${JSON.stringify({ status: "", mode: "idle", startedAt: 0, level: 0 })})`,
+        true,
+      ).catch(() => { });
+    }
     try { recordingStatusWindow.hide(); } catch { }
   }
 }
