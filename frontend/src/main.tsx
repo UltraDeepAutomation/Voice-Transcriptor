@@ -9332,11 +9332,13 @@ async function stopLive(enhance: boolean): Promise<void> {
 
     console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)}`);
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
+    const noSpeechFinalStatus = "Recording completed, no speech detected.";
+    const finalUiText = transcriptRaw || noSpeechFinalStatus;
     patchCurrentRecordingSummary({
       title: transcriptRaw ? _smartTitle(transcriptRaw) : provisionalTitle,
       status: transcriptRaw
         ? "Final transcript is ready. Saving audio and transcript."
-        : "Recording completed, no speech detected.",
+        : noSpeechFinalStatus,
       tone: transcriptRaw ? "success" : "info",
       transcribeLatencyMs: transcriptReadyLatencyMs,
     }, sessionUiToken);
@@ -9344,7 +9346,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
-      domText: transcriptRaw,
+      domText: finalUiText,
       kind: "status",
       sessionToken: sessionUiToken,
     });
@@ -9401,7 +9403,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         ? "Transcript is ready in memory, but the original archive changed before the final save completed."
         : transcriptRaw
           ? "Final transcript is ready. Audio and transcript are both available."
-          : "Recording completed, no speech detected.",
+          : noSpeechFinalStatus,
       tone: finalSaveConflict ? "warning" : "success",
       transcribeLatencyMs: transcriptReadyLatencyMs,
       ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),

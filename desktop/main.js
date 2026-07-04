@@ -427,6 +427,19 @@ function normalizeTranscriptText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function isNoSpeechFinalStatusText(value) {
+  const txt = normalizeTranscriptText(value);
+  if (!txt) return false;
+  const lower = txt.toLowerCase();
+  return (
+    lower.includes("no speech detected") ||
+    lower.includes("no speech captured") ||
+    lower.includes("silence detected") ||
+    lower === "[silence]" ||
+    lower === "[ silence ]"
+  );
+}
+
 function textDigest(input) {
   const str = String(input || "");
   let h = 2166136261;
@@ -442,6 +455,7 @@ function isMeaningfulTranscriptText(value) {
   if (!txt) return false;
   const lower = txt.toLowerCase();
   const compact = lower.replace(/\s+/g, "");
+  if (isNoSpeechFinalStatusText(txt)) return false;
   if (lower === "error" || lower === "[websocket error]" || compact === "[silence]") return false;
   if (lower.startsWith("http ") || lower.startsWith("network error")) return false;
   return true;
@@ -712,9 +726,9 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   pillPadRight: 4,
   pillGap: 6,
   statusControlSize: 24,
-  timerWidth: 31,
-  timerFontSize: 11,
-  waveWidth: 17,
+  timerWidth: 30,
+  timerFontSize: 10,
+  waveWidth: 26,
   waveHeight: 12,
   waveBarWidth: 1.4,
   waveBarGap: 1.8,
@@ -1088,7 +1102,7 @@ function recordingStatusCapsuleHtml() {
     #core {
       width: 100%;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) ${t.timerWidth}px ${t.statusControlSize}px;
+      grid-template-columns: ${t.statusControlSize}px minmax(0, 1fr) ${t.timerWidth}px;
       align-items: center;
       justify-content: center;
       gap: ${t.pillGap}px;
@@ -1514,9 +1528,9 @@ function recordingStatusCapsuleHtml() {
     </div>
     <div id="pill">
       <div id="core">
+        <span id="stateIcon" aria-hidden="true"></span>
         <canvas id="wave" width="${t.waveWidth}" height="${t.waveHeight}"></canvas>
         <span id="timer">00:00</span>
-        <span id="stateIcon" aria-hidden="true"></span>
       </div>
     </div>
   </div>
@@ -2550,6 +2564,7 @@ async function queryRendererState() {
         ? window.__transcriptorLiveStatusSnapshot()
         : null;
       const status = String(liveSnapshot?.status || '').trim();
+      const statusKind = String(liveSnapshot?.statusKind || '').trim();
       const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
       const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
       const busy = !!liveSnapshot?.busy;
@@ -2565,6 +2580,7 @@ async function queryRendererState() {
         finishedRecords,
         isRec,
         status,
+        statusKind,
         finalText,
         liveText,
         busy,
@@ -4437,6 +4453,7 @@ async function processPostStopTask(task) {
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
   let recordingStatusPhase = "transcribing";
   let doneStatusTranscriptSince = 0;
+  let terminalWithoutPasteStatus = "";
 
   while (Date.now() < deadline) {
     pollCount += 1;
@@ -4480,6 +4497,11 @@ async function processPostStopTask(task) {
       uiFinalKind === "status" &&
       uiFinalBelongsToTask &&
       isMeaningfulTranscriptText(uiFinalText);
+    const uiFinalTerminalWithoutPaste =
+      uiFinalBelongsToTask &&
+      (uiFinalKind === "status" || uiFinalKind === "error") &&
+      !!uiFinalText &&
+      !uiFinalStatusHasTranscript;
     const uiFinalReadyByRecording =
       uiFinalKind === "transcript" &&
       isMeaningfulTranscriptText(uiFinalText) &&
@@ -4517,8 +4539,30 @@ async function processPostStopTask(task) {
       });
       break;
     }
+    if (uiFinalTerminalWithoutPaste) {
+      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
+        ? "Recording completed, no speech detected."
+        : uiFinalText;
+      traceStep(trace, "terminal_without_paste", {
+        pollCount,
+        expectedRecordingId: task.recordingId || 0,
+        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
+        uiFinalKind,
+        status: compactLogText(state.status || "", 80),
+        statusKind: compactLogText(state.statusKind || "", 40),
+        reason: isNoSpeechFinalStatusText(uiFinalText) ? "no-speech" : "ui-final-status",
+      });
+      break;
+    }
     const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
-      (state.status === "Done" || state.status === "Error" || state.status === "Idle");
+      (
+        state.status === "Done" ||
+        state.status === "Error" ||
+        state.status === "Idle" ||
+        state.statusKind === "done" ||
+        state.statusKind === "error" ||
+        state.statusKind === "idle"
+      );
     if (doneLike && state.status === "Done" && uiFinalStatusHasTranscript) {
       if (!doneStatusTranscriptSince) doneStatusTranscriptSince = Date.now();
       if (Date.now() - doneStatusTranscriptSince >= 600) {
@@ -4541,7 +4585,21 @@ async function processPostStopTask(task) {
       continue;
     }
     doneStatusTranscriptSince = 0;
-    if (doneLike) break;
+    if (doneLike) {
+      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
+        ? "Recording completed, no speech detected."
+        : "";
+      traceStep(trace, "terminal_done_without_transcript", {
+        pollCount,
+        expectedRecordingId: task.recordingId || 0,
+        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
+        uiFinalKind,
+        status: compactLogText(state.status || "", 80),
+        statusKind: compactLogText(state.statusKind || "", 40),
+        reason: terminalWithoutPasteStatus ? "no-speech" : "done-no-transcript",
+      });
+      break;
+    }
     await sleep(30);
   }
 
@@ -4627,7 +4685,11 @@ async function processPostStopTask(task) {
     }
     recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
   } else {
-    traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
+    if (terminalWithoutPasteStatus) {
+      recordingStatusText = terminalWithoutPasteStatus;
+    } else {
+      traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
+    }
   }
 
   const isRecNow = await isRendererRecording();
