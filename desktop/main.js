@@ -1788,6 +1788,14 @@ function recordingStatusCapsuleHtml() {
       render();
       return true;
     };
+    window.__setCapsuleQuickOpen = (open) => {
+      setQuickOpen(!!open);
+      if (!open && quickUpscaleMenu.classList.contains("open")) {
+        quickUpscaleMenu.classList.remove("open");
+        scheduleGeometryEmit();
+      }
+      return true;
+    };
     window.addEventListener("resize", scheduleGeometryEmit);
     document.addEventListener("pointerdown", () => {
       if (pointerEmitLocked) return;
@@ -2069,11 +2077,18 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.level = 0;
   recordingStatusCapsuleState.startedAt = 0;
   recordingStatusCapsuleState.settingsLoaded = false;
+  recordingStatusQuickSettingsOpen = false;
   recordingStatusCapsuleGeometry = null;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     if (recordingStatusWindowReady) {
       recordingStatusWindow.webContents.executeJavaScript(
-        `window.__setCapsuleState(${JSON.stringify({ status: "", mode: "idle", startedAt: 0, level: 0 })})`,
+        `(() => {
+          window.__setCapsuleState(${JSON.stringify({ status: "", mode: "idle", startedAt: 0, level: 0 })});
+          if (typeof window.__setCapsuleQuickOpen === 'function') {
+            window.__setCapsuleQuickOpen(false);
+          }
+          return true;
+        })();`,
         true,
       ).catch(() => { });
     }
