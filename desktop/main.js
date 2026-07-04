@@ -2142,6 +2142,9 @@ function resetRecordingStatusState() {
   recordingStartedAt = 0;
   recordingSeenAudioFrames = false;
   hideRecordingStatusCapsule();
+  void setRendererMainStatus("Idle").catch((e) => {
+    appendMainLog(`[recording-status] renderer idle publish failed: ${e?.message || e}`);
+  });
   stopRecordingStateMonitor();
   if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
     appendMainLog(`[recording-status] reset-stale-pending=${pendingTranscriptionCount}`);
@@ -2149,10 +2152,9 @@ function resetRecordingStatusState() {
   }
 }
 
-async function setRecordingStatus(text) {
+async function setRendererMainStatus(text) {
   const status = String(text || "").trim();
   if (!status) return;
-  await updateRecordingStatusCapsule({ status });
   await execRendererJsWithTimeout(
     `(() => {
       const fn = window.__transcriptorSetMainStatus;
@@ -2162,6 +2164,13 @@ async function setRecordingStatus(text) {
     false,
     500,
   );
+}
+
+async function setRecordingStatus(text) {
+  const status = String(text || "").trim();
+  if (!status) return;
+  await updateRecordingStatusCapsule({ status });
+  await setRendererMainStatus(status);
 }
 
 async function isRendererRecording() {

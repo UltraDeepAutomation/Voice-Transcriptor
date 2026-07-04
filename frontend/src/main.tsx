@@ -1647,6 +1647,12 @@ let deferredRecordingsRefreshPending = false;
 let deferredRecordingsRefreshInFlight = false;
 let deferredRecordingsRefreshTimer = 0;
 let deferredRecordingsRefreshLastSaved: SavedRecordingRef | null = null;
+let mainProcessRecordingStatus = "Idle";
+
+function isMainProcessRecordingStatusActive(status = mainProcessRecordingStatus): boolean {
+  const value = String(status || "").trim().toLowerCase();
+  return !!value && value !== "idle";
+}
 
 function scheduleDeferredRecordingsRefresh(_reason = "save", delayMs = 160): void {
   if (!deferredRecordingsRefreshPending) return;
@@ -1667,13 +1673,13 @@ function requestDeferredRecordingsRefresh(saved: SavedRecordingRef | null, reaso
       archiveDir: saved.archiveDir || "",
     };
   }
-  if (isBusy || stopTransitionInFlight || isRecording) return;
+  if (isBusy || stopTransitionInFlight || isRecording || isMainProcessRecordingStatusActive()) return;
   scheduleDeferredRecordingsRefresh(reason);
 }
 
 async function flushDeferredRecordingsRefresh(reason = "manual"): Promise<void> {
   if (!deferredRecordingsRefreshPending || deferredRecordingsRefreshInFlight) return;
-  if (isBusy || stopTransitionInFlight || isRecording || recordingsUiLoading) {
+  if (isBusy || stopTransitionInFlight || isRecording || recordingsUiLoading || isMainProcessRecordingStatusActive()) {
     scheduleDeferredRecordingsRefresh(reason, 220);
     return;
   }
@@ -1795,7 +1801,11 @@ function setStatus(st: string, kind?: StatusKind): void {
 }
 
 window.__transcriptorSetMainStatus = (status: string, kind?: StatusKind): boolean => {
-  setStatus(status, kind);
+  mainProcessRecordingStatus = String(status || "Idle").trim() || "Idle";
+  setStatus(mainProcessRecordingStatus, kind);
+  if (!isMainProcessRecordingStatusActive(mainProcessRecordingStatus)) {
+    scheduleDeferredRecordingsRefresh("main-status-release", 120);
+  }
   return true;
 };
 
