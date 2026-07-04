@@ -4718,6 +4718,7 @@ async function pasteLatestTranscriptFromShortcut() {
     if (!text) {
       traceStep(trace, "no_text_available", {});
       await setRecordingStatus("No Text");
+      await sleep(RECORDING_STATUS_TERMINAL_DWELL_MS);
       resetRecordingStatusState();
       clearCapturedPasteTarget();
       return;
@@ -4748,6 +4749,7 @@ async function pasteLatestTranscriptFromShortcut() {
       }
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
+    await sleep(RECORDING_STATUS_TERMINAL_DWELL_MS);
     clearCapturedPasteTarget();
     resetRecordingStatusState();
   } finally {
