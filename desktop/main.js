@@ -711,15 +711,15 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   settingsGap: 6,
   pillPadLeft: 4,
   pillPadRight: 4,
-  pillGap: 3,
+  pillGap: 6,
   controlSize: 26,
   statusControlSize: 26,
-  timerWidth: 40,
-  timerFontSize: 13,
-  waveWidth: 20,
-  waveHeight: 14,
-  waveBarWidth: 2,
-  waveBarGap: 2,
+  timerWidth: 34,
+  timerFontSize: 12,
+  waveWidth: 17,
+  waveHeight: 12,
+  waveBarWidth: 1.4,
+  waveBarGap: 1.8,
   waveIdleTickMs: 120,
   waveActiveStaleMs: 220,
   timerTickMs: 200,
@@ -1146,21 +1146,21 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       align-items: center;
       gap: 4px;
-      height: 28px;
+      height: 25px;
       padding: 0 4px 0 2px;
       border-radius: 999px;
       white-space: nowrap;
     }
     .capsuleLabel, #quickUpscaleOffLabel {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 650;
       letter-spacing: 0;
       opacity: .92;
     }
     #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle {
       appearance: none;
-      width: 30px;
-      height: 18px;
+      width: 28px;
+      height: 16px;
       border-radius: 999px;
       border: 1px solid #444;
       background: #2a2a2a;
@@ -1175,8 +1175,8 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 2px;
       top: 2px;
-      width: 12px;
-      height: 12px;
+      width: 10px;
+      height: 10px;
       border-radius: 999px;
       background: #d2d2d2;
       transition: transform .14s ease, background .14s ease;
@@ -1191,7 +1191,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #7a50c8;
     }
     #quickUpscaleToggle:checked::before {
-      transform: translateX(12px);
+      transform: translateX(14px);
       background: #fff;
     }
     #quickAutoSendCapsule {
@@ -1204,7 +1204,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #4a8a5a;
     }
     #quickAutoSendToggle:checked::before {
-      transform: translateX(12px);
+      transform: translateX(14px);
       background: #90e0a0;
     }
     #quickAutoStopCapsule {
@@ -1217,7 +1217,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #8a7a3a;
     }
     #quickAutoStopToggle:checked::before {
-      transform: translateX(12px);
+      transform: translateX(14px);
       background: #e8d860;
     }
     #quickAutoStopSecsLabel {
@@ -1225,7 +1225,7 @@ function recordingStatusCapsuleHtml() {
       align-items: center;
       gap: 2px;
       margin-left: auto;
-      height: 20px;
+      height: 18px;
       padding: 1px 3px;
       border: 1px solid #4a4428;
       border-radius: 8px;
@@ -1236,7 +1236,7 @@ function recordingStatusCapsuleHtml() {
       min-width: 16px;
       text-align: center;
       color: #e0dcc0;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 700;
       font-family: Menlo, ui-monospace, monospace;
       line-height: 1;
@@ -1247,11 +1247,11 @@ function recordingStatusCapsuleHtml() {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 16px;
-      height: 18px;
+      width: 14px;
+      height: 16px;
       border-radius: 4px;
       color: #d4c888;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 700;
       cursor: default;
       transition: background 80ms ease;
@@ -1268,11 +1268,11 @@ function recordingStatusCapsuleHtml() {
       border-radius: 999px;
       background: #2a2234;
       color: #eaeaea;
-      height: 24px;
-      min-width: 74px;
-      max-width: 74px;
-      padding: 0 16px 0 7px;
-      font-size: 12px;
+      height: 22px;
+      min-width: 68px;
+      max-width: 68px;
+      padding: 0 15px 0 7px;
+      font-size: 11px;
       font-weight: 600;
       text-align: left;
       cursor: default;
@@ -1319,12 +1319,12 @@ function recordingStatusCapsuleHtml() {
       appearance: none;
       border: 0;
       border-radius: 8px;
-      height: 28px;
+      height: 26px;
       padding: 0 7px;
       text-align: left;
       color: #eaeaea;
       background: transparent;
-      font-size: 12px;
+      font-size: 11px;
       cursor: default;
     }
     .quickUpscaleItem:hover {
