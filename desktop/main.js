@@ -697,13 +697,12 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  width: 136,
-  expandedHeight: 148,
+  width: 106,
   height: 34,
   geometryPadding: 0,
-  minWidth: 136,
+  minWidth: 106,
   minHeight: 34,
-  maxWidth: 144,
+  maxWidth: 112,
   maxHeight: 250,
   bottomMargin: 16,
   pillHeight: 34,
@@ -712,16 +711,16 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   pillPadLeft: 4,
   pillPadRight: 4,
   pillGap: 6,
-  controlSize: 26,
-  statusControlSize: 26,
-  timerWidth: 34,
-  timerFontSize: 12,
+  statusControlSize: 24,
+  timerWidth: 31,
+  timerFontSize: 11,
   waveWidth: 17,
   waveHeight: 12,
   waveBarWidth: 1.4,
   waveBarGap: 1.8,
-  waveIdleTickMs: 120,
-  waveActiveStaleMs: 220,
+  waveLevelTickMs: 220,
+  waveIdleTickMs: 280,
+  waveActiveStaleMs: 560,
   timerTickMs: 200,
 });
 
@@ -740,7 +739,6 @@ const recordingStatusCapsuleState = {
   },
 };
 
-let recordingStatusQuickSettingsOpen = false;
 let recordingStatusCapsuleGeometry = null;
 let recordingStatusSuppressActivateUntil = 0;
 
@@ -751,15 +749,10 @@ function clampRecordingStatusCapsuleDimension(value, min, max) {
 }
 
 function getRecordingStatusCapsuleFallbackWindowSize() {
-  return recordingStatusQuickSettingsOpen
-    ? {
-      width: RECORDING_STATUS_CAPSULE.width,
-      height: RECORDING_STATUS_CAPSULE.expandedHeight,
-    }
-    : {
-      width: RECORDING_STATUS_CAPSULE.width,
-      height: RECORDING_STATUS_CAPSULE.height,
-    };
+  return {
+    width: RECORDING_STATUS_CAPSULE.width,
+    height: RECORDING_STATUS_CAPSULE.height,
+  };
 }
 
 function noteRecordingStatusCapsuleInteraction() {
@@ -773,7 +766,7 @@ function shouldSuppressActivateForRecordingStatusCapsule() {
 
 function getRecordingStatusCapsuleWindowSize() {
   const geometry = recordingStatusCapsuleGeometry;
-  if (!geometry || geometry.quickOpen !== recordingStatusQuickSettingsOpen) {
+  if (!geometry) {
     return getRecordingStatusCapsuleFallbackWindowSize();
   }
   const pad = Math.max(0, Number(RECORDING_STATUS_CAPSULE.geometryPadding) || 0);
@@ -813,8 +806,8 @@ function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
   const next = {
     width: clampRecordingStatusCapsuleDimension(width, 1, RECORDING_STATUS_CAPSULE.maxWidth),
     height: clampRecordingStatusCapsuleDimension(height, 1, RECORDING_STATUS_CAPSULE.maxHeight),
-    quickOpen: !!payload?.quickOpen,
-    menuOpen: !!payload?.menuOpen,
+    quickOpen: false,
+    menuOpen: false,
   };
   const prev = recordingStatusCapsuleGeometry;
   if (
@@ -1095,7 +1088,7 @@ function recordingStatusCapsuleHtml() {
     #core {
       width: 100%;
       display: grid;
-      grid-template-columns: ${t.controlSize}px minmax(0, 1fr) ${t.timerWidth}px ${t.statusControlSize}px;
+      grid-template-columns: minmax(0, 1fr) ${t.timerWidth}px ${t.statusControlSize}px;
       align-items: center;
       justify-content: center;
       gap: ${t.pillGap}px;
@@ -1339,38 +1332,6 @@ function recordingStatusCapsuleHtml() {
     #quickUpscaleCapsule.up-on #quickUpscaleOffLabel {
       display: none;
     }
-    #gearBtn {
-      appearance: none;
-      border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 999px;
-      background: rgba(255,255,255,0.045);
-      width: ${t.controlSize}px;
-      height: ${t.controlSize}px;
-      padding: 0;
-      position: relative;
-      justify-self: center;
-      cursor: default;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-      transition: background .14s ease, border-color .14s ease, transform .14s ease;
-    }
-    #gearBtn::before {
-      content: "";
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      width: 14px;
-      height: 14px;
-      transform: translate(-50%,-50%);
-      background-repeat: no-repeat;
-      background-position: center;
-      background-size: 14px 14px;
-      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10.9 3.2a1 1 0 0 1 2.2 0l.4 1.2c.4.1.8.2 1.2.4l1.1-.6a1 1 0 0 1 1.2.2l1.6 1.6a1 1 0 0 1 .2 1.2l-.6 1.1c.2.4.3.8.4 1.2l1.2.4a1 1 0 0 1 0 2.2l-1.2.4a5.9 5.9 0 0 1-.4 1.2l.6 1.1a1 1 0 0 1-.2 1.2l-1.6 1.6a1 1 0 0 1-1.2.2l-1.1-.6c-.4.2-.8.3-1.2.4l-.4 1.2a1 1 0 0 1-2.2 0l-.4-1.2c-.4-.1-.8-.2-1.2-.4l-1.1.6a1 1 0 0 1-1.2-.2l-1.6-1.6a1 1 0 0 1-.2-1.2l.6-1.1a5.9 5.9 0 0 1-.4-1.2l-1.2-.4a1 1 0 0 1 0-2.2l1.2-.4c.1-.4.2-.8.4-1.2l-.6-1.1a1 1 0 0 1 .2-1.2l1.6-1.6a1 1 0 0 1 1.2-.2l1.1.6c.4-.2.8-.3 1.2-.4l.4-1.2Z' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3Ccircle cx='12' cy='12' r='3' stroke='rgba(165,165,165,0.9)' stroke-width='1.4'/%3E%3C/svg%3E");
-    }
-    #gearBtn.on {
-      border-color: rgba(255,255,255,0.20);
-      background: rgba(255,255,255,0.10);
-      transform: scale(1.03);
-    }
     #wave {
       display: block;
       width: 100%;
@@ -1553,7 +1514,6 @@ function recordingStatusCapsuleHtml() {
     </div>
     <div id="pill">
       <div id="core">
-        <button id="gearBtn" aria-label="Quick settings" title="Quick settings"></button>
         <canvas id="wave" width="${t.waveWidth}" height="${t.waveHeight}"></canvas>
         <span id="timer">00:00</span>
         <span id="stateIcon" aria-hidden="true"></span>
@@ -1563,7 +1523,6 @@ function recordingStatusCapsuleHtml() {
   <script>
     const stackEl = document.getElementById("stack");
     const settingsSlot = document.getElementById("settingsSlot");
-    const gearBtn = document.getElementById("gearBtn");
     const stateIcon = document.getElementById("stateIcon");
     const timeEl = document.getElementById("timer");
     const cv = document.getElementById("wave");
@@ -1608,6 +1567,7 @@ function recordingStatusCapsuleHtml() {
     let quickUpscaleSelected = "builtin_clean";
     let geometryEmitScheduled = false;
     let lastLevelAt = 0;
+    let lastWavePushAt = 0;
     let activeWave = true;
     let waveMode = "recording";
     let stateIconModeClass = "";
@@ -1650,9 +1610,10 @@ function recordingStatusCapsuleHtml() {
       });
     }
     function setQuickOpen(open) {
-      const on = !!open;
-      settingsSlot.classList.toggle("on", on);
-      gearBtn.classList.toggle("on", on);
+      settingsSlot.classList.remove("on");
+      if (quickUpscaleMenu.classList.contains("open")) {
+        quickUpscaleMenu.classList.remove("open");
+      }
       scheduleGeometryEmit();
     }
     function setUpscaleEnabled(enabled) {
@@ -1789,7 +1750,13 @@ function recordingStatusCapsuleHtml() {
         setAutoSendEnabled(!!state.settings.autoSendEnabled);
         setAutoStopConfig(!!state.settings.autoStopEnabled, state.settings.autoStopSeconds);
       }
-      if (waveMode === "recording") pushLevel(level);
+      if (waveMode === "recording") {
+        const now = Date.now();
+        if (now - lastWavePushAt >= ${t.waveLevelTickMs}) {
+          lastWavePushAt = now;
+          pushLevel(level);
+        }
+      }
     }
     function pageIsActive() {
       return !document.hidden && !!String(state.status || "").trim();
@@ -1800,12 +1767,8 @@ function recordingStatusCapsuleHtml() {
       render();
       return true;
     };
-    window.__setCapsuleQuickOpen = (open) => {
-      setQuickOpen(!!open);
-      if (!open && quickUpscaleMenu.classList.contains("open")) {
-        quickUpscaleMenu.classList.remove("open");
-        scheduleGeometryEmit();
-      }
+    window.__setCapsuleQuickOpen = () => {
+      setQuickOpen(false);
       return true;
     };
     window.addEventListener("resize", scheduleGeometryEmit);
@@ -1820,12 +1783,6 @@ function recordingStatusCapsuleHtml() {
         event.stopPropagation();
         document.title = "__recording_capsule_stop__";
       }
-    });
-    gearBtn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      const next = !settingsSlot.classList.contains("on");
-      setQuickOpen(next);
-      document.title = "__recording_capsule_settings__" + (next ? "1" : "0");
     });
     quickUpscaleToggle.addEventListener("change", () => {
       setUpscaleEnabled(quickUpscaleToggle.checked);
@@ -1980,7 +1937,6 @@ async function ensureRecordingStatusCapsuleWindow() {
       return;
     }
     if (raw.startsWith("__recording_capsule_settings__")) {
-      recordingStatusQuickSettingsOpen = raw.endsWith("1");
       applyRecordingStatusCapsuleWindowSize();
       return;
     }
@@ -2089,7 +2045,6 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.level = 0;
   recordingStatusCapsuleState.startedAt = 0;
   recordingStatusCapsuleState.settingsLoaded = false;
-  recordingStatusQuickSettingsOpen = false;
   recordingStatusCapsuleGeometry = null;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     if (recordingStatusWindowReady) {
