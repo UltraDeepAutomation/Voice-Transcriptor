@@ -7556,7 +7556,12 @@ async function startLive(): Promise<void> {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }
-    await loadMics(true);
+    // Do not force a preflight getUserMedia here. startLive is about
+    // to request the actual recording stream below; opening a second
+    // throwaway stream first causes duplicate macOS media permission /
+    // activation events and can make every recording look like it is
+    // asking for access twice.
+    await loadMics(false);
     throwIfStartCancelled();
     const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
     try {
@@ -7576,6 +7581,9 @@ async function startLive(): Promise<void> {
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");
     }
+    // Permission is now granted and the real capture stream is live.
+    // Refresh labels/device ids without another permission request.
+    void loadMics(false);
     // Device disconnect mid-recording: when AirPods/USB mic disconnect,
     // the audio track fires ``ended`` but nothing in the old code
     // listened for it. The recording would continue in silence until
