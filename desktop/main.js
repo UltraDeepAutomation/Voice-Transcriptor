@@ -3696,6 +3696,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
     frontBeforePid: frontBefore.pid || 0,
     textLen: String(text).length,
   });
+  if (!hasCapturedPasteTarget(effectiveTarget)) {
+    traceStep(trace, "target_missing_before_clipboard_write", {});
+    logPasteTrace("failed", { reason: "no-target" });
+    traceEnd(trace, "failed", { reason: "no-target", method: "target-preflight" });
+    return { ok: false, reason: "no-target", method: "target-preflight", verified: false };
+  }
   // Acquire the depth-counted shared snapshot. First paste captures
   // the user's REAL clipboard; subsequent pastes during the
   // 1500 ms restore window reuse the same snapshot so a chained
@@ -3717,13 +3723,6 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
-  if (!hasCapturedPasteTarget(effectiveTarget)) {
-    traceStep(trace, "target_missing_after_clipboard_write", {});
-    logPasteTrace("failed", { reason: "no-target" });
-    traceEnd(trace, "failed", { reason: "no-target", method: "target-preflight" });
-    releaseClipboardSnapshot();
-    return { ok: false, reason: "no-target", method: "target-preflight", verified: false };
-  }
   if (hasCapturedPasteTarget(effectiveTarget)) {
     try {
       const restored = await activateCapturedPasteTarget(effectiveTarget);
