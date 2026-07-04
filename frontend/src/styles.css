@@ -178,9 +178,7 @@ body {
   --toolbar-row-gap: 12px;
   --toolbar-group-gap: 8px;
   --toolbar-upscale-gap: 6px;
-  --record-col-live: minmax(220px, 0.74fr);
-  --record-col-transcribe: minmax(320px, 1.18fr);
-  --record-col-upscale: minmax(260px, 0.98fr);
+  --record-col: minmax(0, 1fr);
   --stack-card: 12px;
   --pane-context-lines: 1;
   --summary-text-lines: 1;
@@ -818,14 +816,9 @@ textarea:focus-visible,
   flex: 1;
   min-height: 0;
   display: grid;
-  /* Record view is text-first: Transcribe owns the primary working
-     width, while Live Preview and Upscale stay readable but compact.
-     Keep the column model in tokens so Upload can intentionally
-     override it without becoming a second source of truth. */
-  grid-template-columns:
-    var(--record-col-live)
-    var(--record-col-transcribe)
-    var(--record-col-upscale);
+  /* Live view uses equal operational panes. Upload intentionally
+     overrides this for its different drop / queue / result workflow. */
+  grid-template-columns: repeat(3, var(--record-col));
   gap: 14px;
   padding: var(--page-gutter);
 }
