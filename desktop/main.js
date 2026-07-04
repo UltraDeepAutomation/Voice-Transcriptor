@@ -687,30 +687,29 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  collapsedWidth: 172,
-  expandedWidth: 232,
-  expandedHeight: 184,
-  height: 58,
-  geometryPadding: 6,
-  minWidth: 166,
-  minHeight: 56,
-  maxWidth: 252,
-  maxHeight: 320,
-  bottomMargin: 18,
-  pillWidth: 166,
-  pillHeight: 52,
-  settingsWidth: 226,
-  pillPadLeft: 7,
-  pillPadRight: 7,
-  pillGap: 4,
+  width: 136,
+  expandedHeight: 148,
+  height: 34,
+  geometryPadding: 0,
+  minWidth: 136,
+  minHeight: 34,
+  maxWidth: 144,
+  maxHeight: 250,
+  bottomMargin: 16,
+  pillHeight: 34,
+  settingsMinHeight: 104,
+  settingsGap: 6,
+  pillPadLeft: 4,
+  pillPadRight: 4,
+  pillGap: 3,
   controlSize: 26,
   statusControlSize: 26,
-  timerWidth: 45,
-  timerFontSize: 15,
-  waveWidth: 32,
-  waveHeight: 18,
+  timerWidth: 40,
+  timerFontSize: 13,
+  waveWidth: 20,
+  waveHeight: 14,
   waveBarWidth: 2,
-  waveBarGap: 2.1,
+  waveBarGap: 2,
   waveIdleTickMs: 120,
   waveActiveStaleMs: 220,
   timerTickMs: 200,
@@ -733,6 +732,7 @@ const recordingStatusCapsuleState = {
 
 let recordingStatusQuickSettingsOpen = false;
 let recordingStatusCapsuleGeometry = null;
+let recordingStatusSuppressActivateUntil = 0;
 
 function clampRecordingStatusCapsuleDimension(value, min, max) {
   const n = Number(value);
@@ -743,13 +743,23 @@ function clampRecordingStatusCapsuleDimension(value, min, max) {
 function getRecordingStatusCapsuleFallbackWindowSize() {
   return recordingStatusQuickSettingsOpen
     ? {
-      width: RECORDING_STATUS_CAPSULE.expandedWidth,
+      width: RECORDING_STATUS_CAPSULE.width,
       height: RECORDING_STATUS_CAPSULE.expandedHeight,
     }
     : {
-      width: RECORDING_STATUS_CAPSULE.collapsedWidth,
+      width: RECORDING_STATUS_CAPSULE.width,
       height: RECORDING_STATUS_CAPSULE.height,
     };
+}
+
+function noteRecordingStatusCapsuleInteraction() {
+  recordingStatusSuppressActivateUntil = Date.now() + 700;
+}
+
+function shouldSuppressActivateForRecordingStatusCapsule() {
+  if (Date.now() > recordingStatusSuppressActivateUntil) return false;
+  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed() || !recordingStatusWindow.isVisible()) return false;
+  return !win || win.isDestroyed() || !win.isVisible();
 }
 
 function getRecordingStatusCapsuleWindowSize() {
@@ -1019,12 +1029,12 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 4px;
+      gap: ${t.settingsGap}px;
       margin: 0 auto;
       width: min-content;
     }
     #pill {
-      width: ${t.pillWidth}px;
+      width: ${t.width}px;
       height: ${t.pillHeight}px;
       display: flex;
       align-items: center;
@@ -1033,9 +1043,7 @@ function recordingStatusCapsuleHtml() {
       border-radius: 999px;
       border: 1px solid rgba(255,255,255,0.16);
       background: rgba(18,18,18,0.88);
-      box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.10),
-        0 10px 22px rgba(0,0,0,0.34);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
       backdrop-filter: blur(18px) saturate(1.12);
       -webkit-backdrop-filter: blur(18px) saturate(1.12);
       overflow: hidden;
@@ -1059,21 +1067,18 @@ function recordingStatusCapsuleHtml() {
       overflow: visible;
     }
     #settingsSlot.on {
-      width: ${t.settingsWidth}px;
+      width: ${t.width}px;
       height: auto;
-      min-height: 122px;
-      margin-bottom: 8px;
+      min-height: ${t.settingsMinHeight}px;
     }
     #settingsPill {
-      width: ${t.settingsWidth}px;
-      min-height: 122px;
-      padding: 10px;
+      width: ${t.width}px;
+      min-height: ${t.settingsMinHeight}px;
+      padding: 6px;
       border-radius: 14px;
       border: 1px solid rgba(255,255,255,0.14);
       background: rgba(18,18,18,0.92);
-      box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.08),
-        0 8px 18px rgba(0,0,0,0.28);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
       backdrop-filter: blur(18px) saturate(1.08);
       -webkit-backdrop-filter: blur(18px) saturate(1.08);
       opacity: 0;
@@ -1090,16 +1095,16 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       flex-direction: column;
       align-items: stretch;
-      gap: 7px;
+      gap: 6px;
       min-width: 0;
       overflow: visible;
     }
     #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule {
       display: flex;
       align-items: center;
-      gap: 6px;
-      height: 30px;
-      padding: 0 8px 0 3px;
+      gap: 4px;
+      height: 28px;
+      padding: 0 4px 0 2px;
       border-radius: 999px;
       white-space: nowrap;
     }
@@ -1111,15 +1116,15 @@ function recordingStatusCapsuleHtml() {
     }
     #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle {
       appearance: none;
-      width: 34px;
-      height: 20px;
+      width: 30px;
+      height: 18px;
       border-radius: 999px;
       border: 1px solid #444;
       background: #2a2a2a;
       position: relative;
       outline: none;
       cursor: default;
-      flex: 0 0 34px;
+      flex: 0 0 30px;
       transition: background .14s ease, border-color .14s ease;
     }
     #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before {
@@ -1127,8 +1132,8 @@ function recordingStatusCapsuleHtml() {
       position: absolute;
       left: 2px;
       top: 2px;
-      width: 14px;
-      height: 14px;
+      width: 12px;
+      height: 12px;
       border-radius: 999px;
       background: #d2d2d2;
       transition: transform .14s ease, background .14s ease;
@@ -1143,7 +1148,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #7a50c8;
     }
     #quickUpscaleToggle:checked::before {
-      transform: translateX(14px);
+      transform: translateX(12px);
       background: #fff;
     }
     #quickAutoSendCapsule {
@@ -1156,7 +1161,7 @@ function recordingStatusCapsuleHtml() {
       border-color: #4a8a5a;
     }
     #quickAutoSendToggle:checked::before {
-      transform: translateX(14px);
+      transform: translateX(12px);
       background: #90e0a0;
     }
     #quickAutoStopCapsule {
@@ -1169,23 +1174,23 @@ function recordingStatusCapsuleHtml() {
       border-color: #8a7a3a;
     }
     #quickAutoStopToggle:checked::before {
-      transform: translateX(14px);
+      transform: translateX(12px);
       background: #e8d860;
     }
     #quickAutoStopSecsLabel {
       display: inline-flex;
       align-items: center;
       gap: 2px;
-      margin-left: 2px;
-      height: 22px;
-      padding: 1px 5px;
+      margin-left: auto;
+      height: 20px;
+      padding: 1px 3px;
       border: 1px solid #4a4428;
       border-radius: 8px;
       background: #2a2818;
     }
     #quickAutoStopSecs {
       display: inline-block;
-      min-width: 20px;
+      min-width: 16px;
       text-align: center;
       color: #e0dcc0;
       font-size: 12px;
@@ -1199,8 +1204,8 @@ function recordingStatusCapsuleHtml() {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 20px;
-      height: 20px;
+      width: 16px;
+      height: 18px;
       border-radius: 4px;
       color: #d4c888;
       font-size: 13px;
@@ -1220,10 +1225,10 @@ function recordingStatusCapsuleHtml() {
       border-radius: 999px;
       background: #2a2234;
       color: #eaeaea;
-      height: 26px;
-      min-width: 118px;
-      max-width: 118px;
-      padding: 0 19px 0 8px;
+      height: 24px;
+      min-width: 74px;
+      max-width: 74px;
+      padding: 0 16px 0 7px;
       font-size: 12px;
       font-weight: 600;
       text-align: left;
@@ -1252,9 +1257,9 @@ function recordingStatusCapsuleHtml() {
     #quickUpscaleMenu {
       position: absolute;
       left: 0;
-      top: 30px;
+      top: 28px;
       min-width: 100%;
-      max-height: 190px;
+      max-height: 164px;
       overflow: auto;
       padding: 4px;
       border: 1px solid #3d2e52;
@@ -1271,8 +1276,8 @@ function recordingStatusCapsuleHtml() {
       appearance: none;
       border: 0;
       border-radius: 8px;
-      height: 30px;
-      padding: 0 8px;
+      height: 28px;
+      padding: 0 7px;
       text-align: left;
       color: #eaeaea;
       background: transparent;
@@ -1564,6 +1569,7 @@ function recordingStatusCapsuleHtml() {
     let waveMode = "recording";
     let stateIconModeClass = "";
     let settingsSignature = "";
+    let pointerEmitLocked = false;
     function fmt(ms) {
       const total = Math.max(0, Math.floor(ms / 1000));
       const mm = String(Math.floor(total / 60)).padStart(2, "0");
@@ -1749,6 +1755,12 @@ function recordingStatusCapsuleHtml() {
       return true;
     };
     window.addEventListener("resize", scheduleGeometryEmit);
+    document.addEventListener("pointerdown", () => {
+      if (pointerEmitLocked) return;
+      pointerEmitLocked = true;
+      setTimeout(() => { pointerEmitLocked = false; }, 80);
+      document.title = "__recording_capsule_pointer__" + Date.now();
+    }, true);
     document.getElementById("core").addEventListener("click", (event) => {
       if (waveMode === "recording") {
         event.stopPropagation();
@@ -1892,6 +1904,10 @@ async function ensureRecordingStatusCapsuleWindow() {
     const raw = String(title || "");
     if (!raw.startsWith("__recording_capsule_")) return;
     event.preventDefault();
+    noteRecordingStatusCapsuleInteraction();
+    if (raw.startsWith("__recording_capsule_pointer__")) {
+      return;
+    }
     if (raw === "__recording_capsule_stop__") {
       recordingStopInFlight = true;
       if (win && !win.isDestroyed() && win.isVisible()) {
@@ -6298,7 +6314,14 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", () => {
-  ensureWindowVisible({ manual: true, force: true });
+  const activateTimer = setTimeout(() => {
+    if (shouldSuppressActivateForRecordingStatusCapsule()) {
+      appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
+      return;
+    }
+    ensureWindowVisible({ manual: true, force: true });
+  }, 180);
+  try { activateTimer.unref?.(); } catch { }
 });
 
 /**
