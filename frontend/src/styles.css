@@ -41,7 +41,6 @@ body {
   --surface-1: var(--bg-2);
   --surface-2: var(--bg-3);
   --surface-3: var(--bg-9);
-  --surface-border: var(--line);
   --status-error: var(--danger-text);
   --text-mute-strong: #e0e0e0;
   --icon-stroke: #d8d8d8;
@@ -3490,8 +3489,8 @@ canvas {
 
 .upload-queue-item--queued { border-color: var(--surface-3, #2a2a2a); }
 .upload-queue-item--transcribing {
-  border-color: var(--text-2, #6b7280);
-  background: var(--surface-2, #1f2429);
+  border-color: var(--text-2, #c4c4c4);
+  background: var(--surface-2, #252525);
 }
 .upload-queue-item--done { border-color: var(--surface-3, #3a3a3a); }
 .upload-queue-item--error {
