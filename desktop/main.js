@@ -1934,8 +1934,6 @@ async function toggleRecordingFromShortcut() {
   const frontAtHotkeyPromise = getFrontmostAppInfoWithTimeout(1200);
   try {
     const activePostStopAtPress = hasActivePostStopWork();
-    await publishRecordingStatus(activePostStopAtPress ? "Transcribing" : "Starting");
-    traceStep(trace, "recording_status_ready", { status: activePostStopAtPress ? "Transcribing" : "Starting" });
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
@@ -1955,12 +1953,19 @@ async function toggleRecordingFromShortcut() {
     }
 
     const beforeToggleState = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
-    if (!beforeToggleState.recording && hasActivePostStopWork()) {
+    const postStopActive = activePostStopAtPress || hasActivePostStopWork();
+    const transitionStatus = beforeToggleState.recording || postStopActive ? "Transcribing" : "Starting";
+    await publishRecordingStatus(transitionStatus);
+    traceStep(trace, "recording_status_ready", {
+      status: transitionStatus,
+      recording: !!beforeToggleState.recording,
+      postStopActive: !!postStopActive,
+    });
+    if (!beforeToggleState.recording && postStopActive) {
       appendMainLog(
         `[shortcut] start blocked by single-capsule post-stop work ` +
         `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
       );
-      await publishRecordingStatus("Transcribing");
       traceStep(trace, "single_capsule_busy", {
         pending: pendingTranscriptionCount,
         queue: postStopQueue.length,
