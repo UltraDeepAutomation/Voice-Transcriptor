@@ -970,6 +970,7 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   waveIdleTickMs: 360,
   waveActiveStaleMs: 900,
 });
+const RECORDING_STATUS_CAPSULE_SESSION_PARTITION = "recording-status-capsule";
 const RECORDING_STATUS_LEVEL_POLL_MS = 180;
 const RECORDING_STATUS_LEVEL_MIN_DELTA = 0.012;
 const RECORDING_STATUS_LEVEL_MAX_STALE_MS = 600;
@@ -1590,6 +1591,7 @@ async function ensureRecordingStatusCapsuleWindow() {
     title: "Transcriptor Recording",
     backgroundColor: "#00000000",
     webPreferences: {
+      partition: RECORDING_STATUS_CAPSULE_SESSION_PARTITION,
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
