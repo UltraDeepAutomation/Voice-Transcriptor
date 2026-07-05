@@ -2512,6 +2512,15 @@ function recordingStatusForPasteFailure(reason) {
   return "In Clipboard";
 }
 
+function recordingStatusForAutoSendFailure(reason) {
+  const r = String(reason || "").toLowerCase();
+  if (looksLikeAutomationPermissionError(r)) return "Send Failed · Automation";
+  if (r.includes("no-target") || r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) {
+    return "Send Failed · No Focus";
+  }
+  return "Send Failed";
+}
+
 function openPrivacyAccessibilitySettings() {
   runCommand("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"], {
     timeoutMs: 5000
@@ -4397,9 +4406,11 @@ async function processPostStopTask(task) {
       // Show success immediately once the paste actually happened.
       await setRecordingStatus("Pasted");
     }
+    let autoSendResult = null;
     if (pasted.ok && task.autoSendEnter) {
       await sleep(220);
       const sent = await sendCommandEnterToFocusedApp(effectiveTarget);
+      autoSendResult = sent;
       traceStep(trace, "cmd_enter_result", {
         ok: !!sent.ok,
         reason: compactLogText(sent.reason || ""),
@@ -4409,6 +4420,8 @@ async function processPostStopTask(task) {
       );
       if (sent.ok) {
         await setRecordingStatus("Sent");
+      } else {
+        await setRecordingStatus(recordingStatusForAutoSendFailure(sent.reason));
       }
       if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
         scheduleMacPastePermissionsPrompt(sent.reason);
@@ -4417,7 +4430,13 @@ async function processPostStopTask(task) {
     if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
       scheduleMacPastePermissionsPrompt(pasted.reason);
     }
-    recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
+    if (pasted.ok && task.autoSendEnter) {
+      recordingStatusText = autoSendResult?.ok
+        ? "Sent"
+        : recordingStatusForAutoSendFailure(autoSendResult?.reason);
+    } else {
+      recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
+    }
   } else {
     if (terminalWithoutPasteStatus) {
       recordingStatusText = terminalWithoutPasteStatus;
