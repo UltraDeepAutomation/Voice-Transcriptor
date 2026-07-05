@@ -220,6 +220,10 @@ let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
 let mainWindowRevealInFlight = null;
+let mainWindowRevealRequestTimer = null;
+let mainWindowLastShowAt = 0;
+let mainWindowLastHideAt = 0;
+let mainWindowLastRevealReason = "";
 let macDockPresenceRequested = false;
 let macDockPresenceEnsured = false;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
@@ -288,7 +292,7 @@ if (!singleInstanceLock) {
 
 app.on("second-instance", () => {
   ensureMacDockPresence("second-instance");
-  ensureWindowVisible({ manual: true, force: true });
+  requestMainWindowReveal("second-instance");
 });
 
 // Rotate main.log when it exceeds this size. Prior code appended
@@ -522,23 +526,89 @@ async function ensureWindowVisible(options = {}) {
 
 async function ensureWindowVisibleInner(options = {}) {
   const force = !!options.force;
+  const reason = normalizeLifecycleReason(options.reason || "ensure-window-visible");
   if (!force && recordingStopInFlight) return;
-  ensureMacDockPresence("ensure-window-visible");
+  ensureMacDockPresence(reason);
   if (!win || win.isDestroyed()) {
-    await createWindow();
+    await createWindow({ showWindow: true, revealReason: reason });
     return;
   }
   if (backend === null) {
     await startBackend();
   }
-  await waitForMainWindowLoadBeforeReveal("ensure-window-visible");
-  await revealMainWindowWhenReady("ensure-window-visible");
+  await waitForMainWindowLoadBeforeReveal(reason);
+  await revealMainWindowWhenReady(reason);
+}
+
+function normalizeLifecycleReason(reason = "") {
+  return String(reason || "unknown").trim() || "unknown";
+}
+
+function isMacAppHidden() {
+  if (process.platform !== "darwin" || typeof app.isHidden !== "function") return false;
+  try {
+    return !!app.isHidden();
+  } catch {
+    return false;
+  }
+}
+
+function mainWindowLifecycleSnapshot() {
+  const parts = [`appHidden=${isMacAppHidden()}`];
+  if (win && !win.isDestroyed()) {
+    parts.push(`visible=${win.isVisible()}`);
+    parts.push(`focused=${win.isFocused()}`);
+    parts.push(`minimized=${win.isMinimized()}`);
+  } else {
+    parts.push("window=missing");
+  }
+  if (mainWindowLastRevealReason) parts.push(`lastReveal=${mainWindowLastRevealReason}`);
+  if (mainWindowLastShowAt) parts.push(`lastShowAgoMs=${Date.now() - mainWindowLastShowAt}`);
+  if (mainWindowLastHideAt) parts.push(`lastHideAgoMs=${Date.now() - mainWindowLastHideAt}`);
+  return parts.join(" ");
+}
+
+function showMacAppForWindowReveal(reason = "") {
+  if (process.platform !== "darwin") return false;
+  const label = normalizeLifecycleReason(reason);
+  if (!isMacAppHidden()) return false;
+  try {
+    app.show();
+    appendMainLog(`[main-window-reveal] app-show reason=${label}`);
+    return true;
+  } catch (e) {
+    appendMainLog(`[main-window-reveal] app-show failed reason=${label}: ${e?.message || e}`);
+    return false;
+  }
+}
+
+function requestMainWindowReveal(reason = "", options = {}) {
+  const label = normalizeLifecycleReason(reason || options.reason || "user-request");
+  const delayMs = process.platform === "darwin" ? 80 : 0;
+  if (mainWindowRevealRequestTimer) {
+    clearTimeout(mainWindowRevealRequestTimer);
+    mainWindowRevealRequestTimer = null;
+  }
+  appendMainLog(`[main-window-reveal-request] reason=${label} ${mainWindowLifecycleSnapshot()}`);
+  mainWindowRevealRequestTimer = setTimeout(() => {
+    mainWindowRevealRequestTimer = null;
+    if (isQuitting) return;
+    ensureWindowVisible({
+      manual: options.manual !== false,
+      force: options.force !== false,
+      reason: label,
+    }).catch((e) => {
+      appendMainLog(`[main-window-reveal-request] failed reason=${label}: ${e?.message || e}`);
+    });
+  }, delayMs);
+  try { mainWindowRevealRequestTimer.unref?.(); } catch { }
 }
 
 function hideMainWindow(reason = "") {
   if (!win || win.isDestroyed() || !win.isVisible()) return false;
-  const label = String(reason || "unknown").trim() || "unknown";
+  const label = normalizeLifecycleReason(reason);
   try {
+    mainWindowLastHideAt = Date.now();
     win.hide();
     appendMainLog(`[main-window-hide] reason=${label}`);
     return true;
@@ -5179,7 +5249,7 @@ function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
 async function waitForMainWindowLoadBeforeReveal(reason = "") {
   const pending = mainWindowInitialLoadPromise;
   if (!pending) return;
-  const label = String(reason || "unknown").trim() || "unknown";
+  const label = normalizeLifecycleReason(reason);
   const startedAt = Date.now();
   try {
     await pending;
@@ -5193,19 +5263,30 @@ async function waitForMainWindowLoadBeforeReveal(reason = "") {
 }
 
 async function revealMainWindowWhenReady(reason = "") {
-  const label = String(reason || "unknown").trim() || "unknown";
+  const label = normalizeLifecycleReason(reason);
   await waitForMainWindowLoadBeforeReveal(label);
   if (!win || win.isDestroyed()) return;
-  if (win.isMinimized()) win.restore();
+  mainWindowLastRevealReason = label;
+  const appWasHidden = showMacAppForWindowReveal(label);
+  if (win.isMinimized()) {
+    win.restore();
+    appendMainLog(`[main-window-reveal] restored reason=${label}`);
+  }
   if (!win.isVisible()) {
     win.show();
     appendMainLog(`[main-window-reveal] shown reason=${label}`);
   }
-  win.focus();
+  if (appWasHidden || !win.isFocused()) {
+    win.focus();
+    appendMainLog(`[main-window-reveal] focused reason=${label} ${mainWindowLifecycleSnapshot()}`);
+  } else {
+    appendMainLog(`[main-window-reveal] already-focused reason=${label} ${mainWindowLifecycleSnapshot()}`);
+  }
 }
 
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
+  const revealReason = normalizeLifecycleReason(options.revealReason || "create-window-loaded");
   ensureMacDockPresence(showWindow ? "create-window-visible" : "create-window-hidden");
 
   // Idempotency guard: if we already own a live BrowserWindow, reuse
@@ -5773,10 +5854,18 @@ async function createWindow(options = {}) {
     }
   });
   win.on("show", () => {
-    appendMainLog("[main-window] event=show");
+    mainWindowLastShowAt = Date.now();
+    appendMainLog(`[main-window] event=show ${mainWindowLifecycleSnapshot()}`);
   });
   win.on("hide", () => {
-    appendMainLog("[main-window] event=hide");
+    mainWindowLastHideAt = Date.now();
+    appendMainLog(`[main-window] event=hide ${mainWindowLifecycleSnapshot()}`);
+  });
+  win.on("focus", () => {
+    appendMainLog(`[main-window] event=focus ${mainWindowLifecycleSnapshot()}`);
+  });
+  win.on("blur", () => {
+    appendMainLog(`[main-window] event=blur ${mainWindowLifecycleSnapshot()}`);
   });
 
   win.on("closed", () => {
@@ -5851,7 +5940,7 @@ async function createWindow(options = {}) {
     // very first time the user sees a window — no transition flash,
     // no "starting up" UI, just the ready app.
     if (showWindow) {
-      await revealMainWindowWhenReady("create-window-loaded");
+      await revealMainWindowWhenReady(revealReason);
     }
   } catch (err) {
     const stderrTail = (backendStderrTail || "").trim();
@@ -5965,13 +6054,14 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("activate", () => {
+app.on("activate", (_event, hasVisibleWindows) => {
   ensureMacDockPresence("activate");
+  appendMainLog(`[app-activate] hasVisibleWindows=${!!hasVisibleWindows} ${mainWindowLifecycleSnapshot()}`);
   if (shouldSuppressActivateForRecordingStatusCapsule()) {
     appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
     return;
   }
-  ensureWindowVisible({ manual: true, force: true });
+  requestMainWindowReveal("app-activate");
 });
 
 /**
@@ -6118,6 +6208,10 @@ app.on("before-quit", () => {
     clearTimeout(renderRecoveryTimer);
     renderRecoveryTimer = null;
   }
+  if (mainWindowRevealRequestTimer) {
+    clearTimeout(mainWindowRevealRequestTimer);
+    mainWindowRevealRequestTimer = null;
+  }
   globalShortcut.unregisterAll();
   shortcutBridgeHandler = null;
   shortcutCaptureAbortHandler = null;
@@ -6260,7 +6354,7 @@ app.whenReady().then(async () => {
     {
       label: "Open Transcriptor",
       click: () => {
-        ensureWindowVisible({ manual: true, force: true });
+        requestMainWindowReveal("tray-menu-open");
       }
     },
     { type: "separator" },
@@ -6270,7 +6364,7 @@ app.whenReady().then(async () => {
     }
   ]);
   tray.on("click", () => {
-    ensureWindowVisible({ manual: true, force: true });
+    requestMainWindowReveal("tray-click");
   });
   tray.on("right-click", () => {
     tray?.popUpContextMenu(trayMenu);
