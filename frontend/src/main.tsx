@@ -295,6 +295,7 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
 }
 
 type RecordingFinalSignalKind = "" | "transcript" | "status" | "error";
+type AutoStopSilenceConfig = { enabled: boolean; seconds: number; thresholdDb: number };
 type LiveStatusSnapshot = {
   status: string;
   statusKind: StatusKind;
@@ -303,6 +304,7 @@ type LiveStatusSnapshot = {
   recording: boolean;
   recordingId: number;
   autoSendEnter: boolean;
+  autoStopSilence: AutoStopSilenceConfig;
 };
 type ShortcutBridgeAction = "capture-start" | "capture-cancel" | "update";
 type ShortcutPair = { record: string; paste: string };
@@ -1928,7 +1930,7 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function getAutoStopSilenceConfig(): { enabled: boolean; seconds: number; thresholdDb: number } {
+function getAutoStopSilenceConfig(): AutoStopSilenceConfig {
   const enabled = !!($("autoStopSilenceEnabled") as HTMLInputElement).checked;
   const secondsRaw = Number(($("autoStopSilenceSeconds") as HTMLInputElement).value);
   const thresholdRaw = Number(($("autoStopSilenceDb") as HTMLInputElement).value);
@@ -6570,6 +6572,7 @@ function liveStatusSnapshot(): LiveStatusSnapshot {
     recording: isRecording,
     recordingId: currentRecordingId,
     autoSendEnter: readAutoSendEnterEnabled(),
+    autoStopSilence: getAutoStopSilenceConfig(),
   };
 }
 

@@ -919,16 +919,12 @@ async function getRendererAutoStopSilenceConfig() {
   const out = await execRendererJsWithTimeout(
     `
     (() => {
-      const fallback = ${JSON.stringify(fallback)};
-      const enabledEl = document.getElementById('autoStopSilenceEnabled');
-      const secEl = document.getElementById('autoStopSilenceSeconds');
-      const dbEl = document.getElementById('autoStopSilenceDb');
-      const enabled = !!(enabledEl && enabledEl.checked);
-      const secRaw = Number(secEl ? secEl.value : fallback.seconds);
-      const dbRaw = Number(dbEl ? dbEl.value : fallback.thresholdDb);
-      const seconds = Math.min(120, Math.max(1, Number.isFinite(secRaw) ? Math.round(secRaw) : fallback.seconds));
-      const thresholdDb = Math.min(-10, Math.max(-80, Number.isFinite(dbRaw) ? Math.round(dbRaw) : fallback.thresholdDb));
-      return { enabled, seconds, thresholdDb };
+      const snapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
+        ? window.__transcriptorLiveStatusSnapshot()
+        : null;
+      return snapshot && typeof snapshot.autoStopSilence === 'object'
+        ? snapshot.autoStopSilence
+        : null;
     })();
     `,
     null,
