@@ -258,6 +258,7 @@ let pendingShortcutBridgeMessages = [];
 let backendStartInFlight = null;
 let micPermissionChecked = false;
 let macPastePermissionPromptAt = 0;
+const MAC_PASTE_PERMISSION_PROMPT_THROTTLE_MS = 60000;
 let loadedFrontendBuildSignature = "";
 let pasteTarget = emptyCapturedPasteTarget();
 const HOST = "127.0.0.1";
@@ -711,36 +712,38 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  width: 106,
+  width: 118,
   height: 34,
   geometryPadding: 0,
-  minWidth: 106,
+  minWidth: 118,
   minHeight: 34,
-  maxWidth: 112,
+  maxWidth: 124,
   maxHeight: 250,
   bottomMargin: 16,
   pillHeight: 34,
   settingsMinHeight: 104,
   settingsGap: 6,
   pillPadLeft: 4,
-  pillPadRight: 4,
-  pillGap: 6,
+  pillPadRight: 10,
+  pillGap: 8,
   statusControlSize: 24,
-  timerWidth: 30,
+  timerWidth: 32,
   timerFontSize: 10,
-  waveWidth: 26,
+  waveWidth: 34,
   waveHeight: 12,
   waveBarWidth: 1.4,
   waveBarGap: 1.8,
-  waveLevelTickMs: 220,
-  waveIdleTickMs: 280,
-  waveActiveStaleMs: 560,
-  timerTickMs: 200,
+  waveFrameMs: 33,
+  waveLevelTickMs: 33,
+  waveIdleTickMs: 66,
+  waveActiveStaleMs: 360,
 });
 
 const recordingStatusCapsuleState = {
   status: "",
   startedAt: 0,
+  elapsedMs: 0,
+  timerRunning: false,
   level: 0,
   settingsLoaded: false,
   settings: {
@@ -1567,6 +1570,8 @@ function recordingStatusCapsuleHtml() {
       status: "",
       mode: "idle",
       startedAt: 0,
+      elapsedMs: 0,
+      timerRunning: false,
       level: 0,
       settings: {
         autoStopEnabled: false,
@@ -1582,6 +1587,8 @@ function recordingStatusCapsuleHtml() {
     let geometryEmitScheduled = false;
     let lastLevelAt = 0;
     let lastWavePushAt = 0;
+    let lastRenderFrameAt = 0;
+    let lastTimerText = "";
     let activeWave = true;
     let waveMode = "recording";
     let stateIconModeClass = "";
@@ -1692,7 +1699,7 @@ function recordingStatusCapsuleHtml() {
     }
     function applyStatusMode(mode) {
       const next = String(mode || "idle");
-      waveMode = next === "upscaling"
+      const nextWaveMode = next === "upscaling"
         ? "upscaling"
         : next === "transcribing"
           ? "transcribing"
@@ -1701,7 +1708,11 @@ function recordingStatusCapsuleHtml() {
             : next === "recording"
               ? "recording"
               : "idle";
-      activeWave = waveMode === "recording" || waveMode === "autostop";
+      if (nextWaveMode !== waveMode) {
+        waveMode = nextWaveMode;
+        activeWave = waveMode === "recording" || waveMode === "autostop";
+        lastWavePushAt = 0;
+      }
       const nextClass = next === "recording"
         ? "rec"
         : next === "upscaling"
@@ -1751,10 +1762,45 @@ function recordingStatusCapsuleHtml() {
       while (bars.length > maxBars) bars.shift();
       renderWave();
     }
-    function render() {
+    function timerElapsedMs(now) {
+      const startedAt = Number(state.startedAt || 0);
+      const frozen = Number(state.elapsedMs || 0);
+      if (state.timerRunning && startedAt > 0) {
+        return Math.max(0, now - startedAt);
+      }
+      return Math.max(0, Number.isFinite(frozen) ? frozen : 0);
+    }
+    function tickWave(now) {
+      if (!pageIsActive()) {
+        if (bars.length) {
+          bars.length = 0;
+          renderWave();
+        }
+        return;
+      }
       const level = Math.max(0, Math.min(1, Number(state.level || 0)));
-      const elapsed = state.startedAt ? Date.now() - Number(state.startedAt) : 0;
-      timeEl.textContent = fmt(elapsed);
+      if (waveMode === "recording" || waveMode === "autostop") {
+        if (now - lastWavePushAt >= ${t.waveLevelTickMs}) {
+          lastWavePushAt = now;
+          pushLevel(level);
+        }
+      } else if (now - lastWavePushAt >= ${t.waveIdleTickMs}) {
+        lastWavePushAt = now;
+        const idle = activeWave
+          ? (0.08 + Math.random() * 0.12)
+          : ((waveMode === "transcribing" || waveMode === "upscaling") ? 0.055 : (0.03 + Math.random() * 0.03));
+        pushLevel(idle);
+      }
+      if (now - lastLevelAt > ${t.waveActiveStaleMs} && activeWave) {
+        activeWave = false;
+      }
+    }
+    function render(now = Date.now()) {
+      const nextTimerText = pageIsActive() ? fmt(timerElapsedMs(now)) : "00:00";
+      if (nextTimerText !== lastTimerText) {
+        lastTimerText = nextTimerText;
+        timeEl.textContent = nextTimerText;
+      }
       applyStatusMode(state.mode);
       const nextSettingsSignature = JSON.stringify(state.settings || {});
       if (nextSettingsSignature !== settingsSignature) {
@@ -1763,13 +1809,6 @@ function recordingStatusCapsuleHtml() {
         setUpscaleOptions(state.settings.upscalePresets, state.settings.upscaleSelected);
         setAutoSendEnabled(!!state.settings.autoSendEnabled);
         setAutoStopConfig(!!state.settings.autoStopEnabled, state.settings.autoStopSeconds);
-      }
-      if (waveMode === "recording") {
-        const now = Date.now();
-        if (now - lastWavePushAt >= ${t.waveLevelTickMs}) {
-          lastWavePushAt = now;
-          pushLevel(level);
-        }
       }
     }
     function pageIsActive() {
@@ -1837,29 +1876,21 @@ function recordingStatusCapsuleHtml() {
       event.stopPropagation();
       emitSecs(readSecs() + 1);
     });
-    setInterval(() => {
-      if (!pageIsActive()) return;
-      if (activeWave && Date.now() - lastLevelAt < ${t.waveActiveStaleMs}) return;
-      const idle = activeWave
-        ? (0.08 + Math.random() * 0.12)
-        : ((waveMode === "transcribing" || waveMode === "upscaling") ? 0.055 : (0.03 + Math.random() * 0.03));
-      bars.push(idle);
-      while (bars.length > maxBars) bars.shift();
-      renderWave();
-    }, ${t.waveIdleTickMs});
-    setInterval(() => {
-      if (!pageIsActive()) {
-        if (timeEl.textContent !== "00:00") timeEl.textContent = "00:00";
-        return;
+    function animationLoop(frameNow) {
+      const now = Date.now();
+      if (!lastRenderFrameAt || frameNow - lastRenderFrameAt >= ${t.waveFrameMs}) {
+        lastRenderFrameAt = frameNow;
+        render(now);
+        tickWave(now);
       }
-      const elapsed = state.startedAt ? Date.now() - Number(state.startedAt) : 0;
-      timeEl.textContent = fmt(elapsed);
-    }, ${t.timerTickMs});
+      requestAnimationFrame(animationLoop);
+    }
     setQuickOpen(false);
     setUpscaleEnabled(false);
     setUpscaleOptions([{ id: "builtin_clean", name: "Clean" }], "builtin_clean");
     setAutoSendEnabled(false);
     render();
+    requestAnimationFrame(animationLoop);
     scheduleGeometryEmit();
   </script>
 </body>
@@ -2021,8 +2052,19 @@ async function updateRecordingStatusCapsule(patch = {}) {
     hideRecordingStatusCapsule();
     return;
   }
-  if (!recordingStatusCapsuleState.startedAt) {
-    recordingStatusCapsuleState.startedAt = Date.now();
+  const mode = recordingStatusMode(status);
+  const now = Date.now();
+  const startedAt = Number(recordingStatusCapsuleState.startedAt || 0);
+  const previousTimerRunning = !!recordingStatusCapsuleState.timerRunning;
+  const timerCanRun = (mode === "recording" || mode === "autostop") && startedAt > 0;
+  if (timerCanRun) {
+    recordingStatusCapsuleState.timerRunning = true;
+    recordingStatusCapsuleState.elapsedMs = Math.max(0, now - startedAt);
+  } else {
+    if (previousTimerRunning && startedAt > 0) {
+      recordingStatusCapsuleState.elapsedMs = Math.max(0, now - startedAt);
+    }
+    recordingStatusCapsuleState.timerRunning = false;
   }
   if (!recordingStatusCapsuleState.settingsLoaded || patch.refreshSettings) {
     await refreshRecordingStatusCapsuleSettings().catch((e) => {
@@ -2037,9 +2079,11 @@ async function updateRecordingStatusCapsule(patch = {}) {
   if (!recordingStatusWindowReady) return;
   const payload = {
     status,
-    mode: recordingStatusMode(status),
+    mode,
     tone: recordingStatusTone(status),
     startedAt: recordingStatusCapsuleState.startedAt,
+    elapsedMs: Math.max(0, Number(recordingStatusCapsuleState.elapsedMs || 0)),
+    timerRunning: !!recordingStatusCapsuleState.timerRunning,
     level: Math.max(0, Math.min(1, Number(recordingStatusCapsuleState.level || 0))),
     settings: recordingStatusCapsuleState.settings,
   };
@@ -2058,13 +2102,15 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.status = "";
   recordingStatusCapsuleState.level = 0;
   recordingStatusCapsuleState.startedAt = 0;
+  recordingStatusCapsuleState.elapsedMs = 0;
+  recordingStatusCapsuleState.timerRunning = false;
   recordingStatusCapsuleState.settingsLoaded = false;
   recordingStatusCapsuleGeometry = null;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     if (recordingStatusWindowReady) {
       recordingStatusWindow.webContents.executeJavaScript(
         `(() => {
-          window.__setCapsuleState(${JSON.stringify({ status: "", mode: "idle", startedAt: 0, level: 0 })});
+          window.__setCapsuleState(${JSON.stringify({ status: "", mode: "idle", startedAt: 0, elapsedMs: 0, timerRunning: false, level: 0 })});
           if (typeof window.__setCapsuleQuickOpen === 'function') {
             window.__setCapsuleQuickOpen(false);
           }
@@ -2180,10 +2226,14 @@ async function beginRecordingStatusSession() {
   recordingAutoStopConfigRefreshAt = 0;
   recordingStartedAt = Date.now();
   recordingStatusCapsuleState.startedAt = recordingStartedAt;
+  recordingStatusCapsuleState.elapsedMs = 0;
+  recordingStatusCapsuleState.timerRunning = true;
   recordingStatusCapsuleState.level = 0;
   recordingSeenAudioFrames = false;
-  recordingAutoStopConfig = await getRendererAutoStopSilenceConfig();
+  recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   startRecordingStateMonitor();
+  await setRecordingStatus("Recording");
+  recordingAutoStopConfig = await getRendererAutoStopSilenceConfig();
 }
 
 async function publishRecordingStatus(status) {
@@ -2856,11 +2906,11 @@ function recordingStatusForPasteFailure(reason) {
   // (no-accessibility, automation) still open System Settings via
   // the separate callback path, so the user can grant access AND
   // knows the text survived.
-  if (r.includes("no-accessibility")) return "In Clipboard · Grant Access";
+  if (r.includes("no-accessibility")) return "In Clipboard · Accessibility";
   if (r.includes("secure-field")) return "In Clipboard · Secure Field";
   if (r.includes("no-target") || r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "In Clipboard · No Focus";
   if (r.includes("clipboard")) return "Clipboard Error";
-  if (looksLikeAutomationPermissionError(r)) return "In Clipboard · Grant Access";
+  if (looksLikeAutomationPermissionError(r)) return "In Clipboard · Automation";
   return "In Clipboard";
 }
 
@@ -3398,29 +3448,47 @@ function refreshMacAccessibilityTrustState({ prompt = false } = {}) {
 async function promptMacPastePermissions(reason = "") {
   if (process.platform !== "darwin") return;
   const now = Date.now();
-  if (now - macPastePermissionPromptAt < 15000) {
-    openPrivacyAccessibilitySettings();
-    setTimeout(() => openPrivacyAutomationSettings(), 350);
+  if (now - macPastePermissionPromptAt < MAC_PASTE_PERMISSION_PROMPT_THROTTLE_MS) {
+    appendMainLog(`[permissions] paste prompt throttled reason="${compactLogText(reason, 120)}"`);
     return;
   }
   macPastePermissionPromptAt = now;
-  refreshMacAccessibilityTrustState({ prompt: true });
   const cleanReason = String(reason || "").trim();
-  const message =
-    "To auto-paste transcript into any app, allow Transcriptor in Accessibility and Automation (System Events).";
-  const detail = cleanReason ? `${message}\n\nmacOS response:\n${cleanReason}` : message;
+  const normalizedReason = cleanReason.toLowerCase();
+  const accessibilityFailure = normalizedReason.includes("no-accessibility");
+  const automationFailure = looksLikeAutomationPermissionError(normalizedReason);
+  const accessibilityTrusted = refreshMacAccessibilityTrustState({ prompt: accessibilityFailure });
+  const route = accessibilityFailure || !accessibilityTrusted
+    ? "accessibility"
+    : automationFailure
+      ? "automation"
+      : "permissions";
+  const message = route === "accessibility"
+    ? "Enable Accessibility for Transcriptor"
+    : route === "automation"
+      ? "Enable Automation for Transcriptor"
+      : "Enable permissions for auto-paste";
+  const instruction = route === "accessibility"
+    ? "To auto-paste transcript into other apps, allow Transcriptor in Privacy & Security -> Accessibility."
+    : route === "automation"
+      ? "To auto-paste via System Events, allow Transcriptor to control System Events in Privacy & Security -> Automation."
+      : "To auto-paste transcript into any app, allow Transcriptor in Accessibility and Automation (System Events).";
+  const detail = cleanReason ? `${instruction}\n\nmacOS response:\n${cleanReason}` : instruction;
   const res = await dialog.showMessageBox({
     type: "info",
     buttons: ["Open Privacy Settings", "Later"],
     defaultId: 0,
     cancelId: 1,
     title: "Grant macOS Permissions",
-    message: "Enable permissions for auto-paste",
+    message,
     detail
   });
   if (res.response === 0) {
-    openPrivacyAccessibilitySettings();
-    setTimeout(() => openPrivacyAutomationSettings(), 350);
+    if (route === "automation") {
+      openPrivacyAutomationSettings();
+    } else {
+      openPrivacyAccessibilitySettings();
+    }
   }
 }
 
@@ -4102,7 +4170,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
         return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
       }
       if (out === "ERR:no-accessibility") {
-        lastReason = "no-accessibility";
+        lastReason = "ERR:no-accessibility";
+        traceEnd(trace, "failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
+        logPasteTrace("failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
+        try { restoreClipboard(savedClipboard); } catch { }
+        releaseClipboardSnapshot();
+        return { ok: false, reason: lastReason, method: "robust_paste", verified: false };
       } else {
         lastReason = out || "paste-return-unknown";
       }
@@ -4174,6 +4247,14 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
       scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:menu");
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: false });
       return { ok: true, reason: out, method: "menu-paste", verified: false };
+    }
+    if (out === "ERR:no-accessibility") {
+      lastReason = out;
+      traceEnd(trace, "failed", { reason: lastReason, method: "menu-paste" });
+      logPasteTrace("failed", { reason: lastReason, method: "menu-paste" });
+      try { restoreClipboard(savedClipboard); } catch { }
+      releaseClipboardSnapshot();
+      return { ok: false, reason: lastReason, method: "menu-paste", verified: false };
     }
     lastReason = out || lastReason;
   } else {
