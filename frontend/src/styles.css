@@ -3318,18 +3318,6 @@ canvas {
   margin: 12px;
 }
 
-/*
- * Upload tab uses a 3-pane split (Drop / Queue / Result). The default
- * .split column ratios (0.8/1.0/1.2) are tuned for Live tab's
- * Live-Preview / Transcribe / Upscale columns where Upscale needs
- * extra room for its toolbar; on Upload, the user wants the result
- * pane (where the transcribed text shows) to be the largest, with
- * drop and queue narrower and roughly equal. 0.85/0.85/1.3 hits that.
- */
-.view[data-view="upload"] .split {
-  grid-template-columns: 0.85fr 0.85fr 1.3fr;
-}
-
 #uploadResultPane {
   display: flex;
   flex-direction: column;
