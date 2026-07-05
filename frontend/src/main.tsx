@@ -7292,10 +7292,10 @@ function resetOutputs(): void {
 
 // EMA (exponential moving average) smoothing factor for
 // ``__transcriptorRmsLevel``. The main-process silence detector polls
-// this value every 120 ms, but the worklet posts a frame every
-// ~2.67 ms (128 samples @ 48 kHz). Without smoothing, the monitor
-// samples ONE instantaneous 2.67 ms window and can catch a micro-
-// pause between syllables (natural in conversational speech) as
+// this value every 120 ms, while the worklet posts batched capture
+// chunks roughly every 40-50 ms on common 44.1/48 kHz devices.
+// Without smoothing, the monitor samples ONE instantaneous window and
+// can catch a micro-pause between syllables (natural in conversational speech) as
 // "silence", accumulate 2 s of intermittent dips, and trigger a
 // false auto-stop WHILE THE USER IS STILL SPEAKING. An EMA with
 // alpha ~0.06 gives a ~45-frame smoothing window (~120 ms) that
