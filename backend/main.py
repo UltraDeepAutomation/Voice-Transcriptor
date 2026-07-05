@@ -1142,9 +1142,13 @@ def index():
     if not index_path.exists():
         return "frontend/dist/index.html not found. Run `npm --prefix frontend run build`."
     html = index_path.read_text(encoding="utf-8")
+    bootstrap_payload = {
+        "model_catalog": health_model_catalog(),
+    }
     injected = (
         "<script>"
         f'window.__TRANSCRIPTOR_API_TOKEN={json.dumps(API_TOKEN)};'
+        f'window.__TRANSCRIPTOR_BOOTSTRAP={json.dumps(bootstrap_payload)};'
         "</script>"
     )
     if "</body>" in html:

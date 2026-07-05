@@ -317,6 +317,25 @@ type ShortcutDefaultsManifest = {
   };
 };
 
+type ModelCatalogPayload = {
+  local?: {
+    models?: unknown;
+    default_model?: unknown;
+    live_assist_models?: unknown;
+    live_preview_models?: unknown;
+    default_live_preview_model?: unknown;
+  };
+  remote?: {
+    openrouter?: { audio_models?: unknown; default_audio_model?: unknown };
+    deepgram?: { audio_models?: unknown; default_audio_model?: unknown };
+  };
+  upscale?: { openrouter_models?: unknown; default_model?: unknown };
+};
+
+type BackendBootstrapPayload = {
+  model_catalog?: ModelCatalogPayload;
+};
+
 // Compile-time injected by vite.config.ts from desktop/package.json's
 // ``version`` field. SSOT for the version label rendered in the
 // Settings tab — previously hardcoded ``1.1.1`` in index.html and
@@ -327,6 +346,7 @@ declare const __SHORTCUT_DEFAULTS__: ShortcutDefaultsManifest;
 declare global {
   interface Window {
     __TRANSCRIPTOR_API_TOKEN?: string;
+    __TRANSCRIPTOR_BOOTSTRAP?: BackendBootstrapPayload;
     __transcriptorVuLevel?: number;
     __transcriptorRmsLevel?: number;
     __transcriptorLastFrameAt?: number;
@@ -547,48 +567,29 @@ const UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
 const UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200;
 const UPLOAD_QUEUE_MAX_PARALLEL = 2;
-let LOCAL_TRANSCRIPTION_MODELS = ["tiny", "base", "small", "medium", "large-v3"];
-let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small";
-let OPENROUTER_AUDIO_MODELS = [
-  "google/gemini-2.5-flash",
-  "google/gemini-2.0-flash-lite",
-  "openai/gpt-4o-audio-preview",
-];
-// 1.1.25 SSOT: every cold-start fallback to the OpenRouter default
-// model previously inlined ``DEFAULT_OPENROUTER_AUDIO_MODEL`` at 7+
-// sites (cfg load, autosave, getter, re-render, etc.). Adding a
-// new default required hunting all sites; missing one produced
-// drift between the cold-boot model and what the user actually
-// saw selected. Single named constant eliminates the hazard.
-let DEFAULT_OPENROUTER_AUDIO_MODEL = OPENROUTER_AUDIO_MODELS[0];
-let DEEPGRAM_AUDIO_MODELS = ["nova-3"];
-let DEFAULT_DEEPGRAM_AUDIO_MODEL = DEEPGRAM_AUDIO_MODELS[0];
+let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
+let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "";
+let LOCAL_LIVE_ASSIST_MODELS: string[] = [];
+let LOCAL_LIVE_PREVIEW_MODELS: string[] = [];
+let DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = "";
+let OPENROUTER_AUDIO_MODELS: string[] = [];
+let DEFAULT_OPENROUTER_AUDIO_MODEL = "";
+let DEEPGRAM_AUDIO_MODELS: string[] = [];
+let DEFAULT_DEEPGRAM_AUDIO_MODEL = "";
 
 /**
  * Text-generation models suitable for upscaling a raw transcript into
  * polished prose. These are separate from ``OPENROUTER_AUDIO_MODELS``
- * — audio models like ``gpt-4o-audio-preview`` accept audio input but
- * don't take the "text + instruction → text" shape that upscaling
- * needs. The first entry is the default selection on fresh installs.
- *
- * Each entry has an ``id`` (what OpenRouter expects on the wire) and
- * a ``label`` (what we render in the dropdown). The label is kept
- * short so the select doesn't force the upscale pane toolbar to wrap
- * onto a second row.
+ * — audio models accept audio input while upscale models take the
+ * "text + instruction -> text" shape. The backend injects the concrete
+ * list before the first toolbar render.
  */
 interface UpscaleModelOption {
   id: string;
   label: string;
 }
-let OPENROUTER_UPSCALE_MODELS: UpscaleModelOption[] = [
-  { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-  { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { id: "openai/gpt-4o-mini", label: "GPT-4o mini" },
-  { id: "openai/gpt-4o", label: "GPT-4o" },
-  { id: "anthropic/claude-3.5-sonnet", label: "Claude 3.5 Sonnet" },
-  { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5" },
-];
-let DEFAULT_UPSCALE_MODEL = OPENROUTER_UPSCALE_MODELS[0].id;
+let OPENROUTER_UPSCALE_MODELS: UpscaleModelOption[] = [];
+let DEFAULT_UPSCALE_MODEL = "";
 
 function labelForUpscaleModel(id: string): string {
   const known = OPENROUTER_UPSCALE_MODELS.find((m) => m.id === id);
@@ -654,19 +655,19 @@ function syncLocalModelOptions(): void {
 
 function applyHealthModelCatalog(catalog: unknown): void {
   if (!catalog || typeof catalog !== "object") return;
-  const root = catalog as {
-    local?: { models?: unknown; default_model?: unknown };
-    remote?: {
-      openrouter?: { audio_models?: unknown; default_audio_model?: unknown };
-      deepgram?: { audio_models?: unknown; default_audio_model?: unknown };
-    };
-    upscale?: { openrouter_models?: unknown; default_model?: unknown };
-  };
+  const root = catalog as ModelCatalogPayload;
   LOCAL_TRANSCRIPTION_MODELS = normalizeModelList(root.local?.models, LOCAL_TRANSCRIPTION_MODELS);
   DEFAULT_LOCAL_TRANSCRIPTION_MODEL = normalizeDefaultModel(
     root.local?.default_model,
     LOCAL_TRANSCRIPTION_MODELS,
     DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
+  );
+  LOCAL_LIVE_ASSIST_MODELS = normalizeModelList(root.local?.live_assist_models, LOCAL_LIVE_ASSIST_MODELS);
+  LOCAL_LIVE_PREVIEW_MODELS = normalizeModelList(root.local?.live_preview_models, LOCAL_LIVE_PREVIEW_MODELS);
+  DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = normalizeDefaultModel(
+    root.local?.default_live_preview_model,
+    LOCAL_LIVE_PREVIEW_MODELS,
+    DEFAULT_LIVE_PREVIEW_LOCAL_MODEL || LOCAL_LIVE_PREVIEW_MODELS[0] || DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
   );
 
   OPENROUTER_AUDIO_MODELS = normalizeModelList(root.remote?.openrouter?.audio_models, OPENROUTER_AUDIO_MODELS);
@@ -712,6 +713,12 @@ function applyHealthModelCatalog(catalog: unknown): void {
   syncLocalModelOptions();
   syncRemoteModelOptions();
   populateUpscaleModelOptions();
+}
+
+function applyBackendBootstrap(): void {
+  const bootstrap = window.__TRANSCRIPTOR_BOOTSTRAP;
+  if (!bootstrap || typeof bootstrap !== "object") return;
+  applyHealthModelCatalog(bootstrap.model_catalog);
 }
 
 let isBusy = false;
@@ -3195,14 +3202,14 @@ function resolveFastLocalLanguage(language: string): string {
 
 function resolveFastLiveLocalModel(model: string): string {
   const raw = String(model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  if (raw === "medium" || raw === "large-v3") return DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  return raw;
+  if (raw && LOCAL_LIVE_ASSIST_MODELS.includes(raw)) return raw;
+  return DEFAULT_LOCAL_TRANSCRIPTION_MODEL || LOCAL_LIVE_ASSIST_MODELS[0] || raw;
 }
 
 function resolveLivePreviewLocalModel(model: string): string {
   const raw = String(model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  if (raw === "tiny" || raw === "base") return raw;
-  return "tiny";
+  if (raw && LOCAL_LIVE_PREVIEW_MODELS.includes(raw)) return raw;
+  return DEFAULT_LIVE_PREVIEW_LOCAL_MODEL || LOCAL_LIVE_PREVIEW_MODELS[0] || DEFAULT_LOCAL_TRANSCRIPTION_MODEL || raw;
 }
 
 function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalModel: string; finalLocalModel: string } {
@@ -9601,6 +9608,8 @@ async function initRecordingsBootstrap(): Promise<void> {
     badge.textContent = __APP_VERSION__;
   }
 })();
+
+applyBackendBootstrap();
 
 void loadCfg()
   .then(async () => {

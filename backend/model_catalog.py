@@ -1,8 +1,8 @@
 """Backend-owned provider and model catalog.
 
 This module is the SSOT for model identifiers that affect runtime
-provider calls. Frontend and desktop may keep cold-boot fallbacks, but
-successful /api/health responses must refresh from these values.
+provider calls. The backend injects this catalog into the HTML bootstrap
+for first render and repeats it through /api/health for refreshes.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ LOCAL_TRANSCRIPTION_MODELS: tuple[str, ...] = (
     "large-v3",
 )
 DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small"
+LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = ("tiny", "base", "small")
+LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = ("tiny", "base")
+DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
 REMOTE_TRANSCRIPTION_PROVIDERS: tuple[str, ...] = ("openrouter", "deepgram")
 
@@ -49,6 +52,9 @@ def health_model_catalog() -> dict[str, object]:
         "local": {
             "models": list(LOCAL_TRANSCRIPTION_MODELS),
             "default_model": DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
+            "live_assist_models": list(LOCAL_LIVE_ASSIST_MODELS),
+            "live_preview_models": list(LOCAL_LIVE_PREVIEW_MODELS),
+            "default_live_preview_model": DEFAULT_LIVE_PREVIEW_LOCAL_MODEL,
         },
         "remote": {
             "providers": list(REMOTE_TRANSCRIPTION_PROVIDERS),
