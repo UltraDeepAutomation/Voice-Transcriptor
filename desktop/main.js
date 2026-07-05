@@ -3998,6 +3998,27 @@ async function processPostStopTask(task) {
         byRecording?.text || byTime?.text || state.finishedText || uiFinalText || ""
       );
       if (!isMeaningfulTranscriptText(transcript)) {
+        const terminalReason = isNoSpeechFinalStatusText(transcript)
+          ? "no-speech-ready-signal"
+          : !transcript && (byRecording || byTime || Number(state.finishedRecordingId || 0) === task.recordingId)
+            ? "empty-finished-record"
+            : uiFinalTerminalWithoutPaste
+              ? "ui-final-status"
+              : "";
+        if (terminalReason) {
+          terminalWithoutPasteStatus = isNoSpeechFinalStatusText(transcript) || terminalReason === "empty-finished-record"
+            ? "Recording completed, no speech detected."
+            : uiFinalText;
+          traceStep(trace, "signal_ready_terminal_without_paste", {
+            pollCount,
+            expectedRecordingId: task.recordingId || 0,
+            finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
+            reason: terminalReason,
+            textLen: transcript.length,
+            preview: compactLogText(transcript || uiFinalText, 80),
+          });
+          break;
+        }
         traceStep(trace, "signal_ready_ignored_non_transcript", {
           pollCount,
           textLen: transcript.length,
