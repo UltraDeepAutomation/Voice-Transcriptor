@@ -1370,6 +1370,7 @@ function recordingStatusCapsuleHtml() {
     let lastLevelAt = 0;
     let lastWavePushAt = 0;
     let lastRenderFrameAt = 0;
+    let animationFrameHandle = 0;
     let lastTimerText = "";
     let activeWave = true;
     let waveMode = "recording";
@@ -1518,9 +1519,31 @@ function recordingStatusCapsuleHtml() {
     function pageIsActive() {
       return !document.hidden && !!String(state.status || "").trim();
     }
+    function stopAnimationLoop() {
+      if (animationFrameHandle) {
+        cancelAnimationFrame(animationFrameHandle);
+        animationFrameHandle = 0;
+      }
+      lastRenderFrameAt = 0;
+    }
+    function requestAnimationLoop() {
+      if (animationFrameHandle) return;
+      animationFrameHandle = requestAnimationFrame(animationLoop);
+    }
+    function clearInactiveWave(now = Date.now()) {
+      if (!bars.length) return;
+      bars.length = 0;
+      renderWave(now);
+    }
     window.__setCapsuleState = (next) => {
       state = { ...state, ...(next || {}) };
       render();
+      if (pageIsActive()) {
+        requestAnimationLoop();
+      } else {
+        stopAnimationLoop();
+        clearInactiveWave();
+      }
       return true;
     };
     window.addEventListener("resize", scheduleGeometryEmit);
@@ -1537,16 +1560,22 @@ function recordingStatusCapsuleHtml() {
       }
     });
     function animationLoop(frameNow) {
+      animationFrameHandle = 0;
+      if (!pageIsActive()) {
+        stopAnimationLoop();
+        clearInactiveWave();
+        return;
+      }
       const now = Date.now();
       if (!lastRenderFrameAt || frameNow - lastRenderFrameAt >= ${t.waveFrameMs}) {
         lastRenderFrameAt = frameNow;
         render(now);
         tickWave(now);
       }
-      requestAnimationFrame(animationLoop);
+      requestAnimationLoop();
     }
     render();
-    requestAnimationFrame(animationLoop);
+    if (pageIsActive()) requestAnimationLoop();
     scheduleGeometryEmit();
   </script>
 </body>
