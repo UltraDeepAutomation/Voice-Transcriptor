@@ -710,19 +710,6 @@ async function getRendererLocalModelChoice() {
   return normalizeLocalModelChoice(v);
 }
 
-async function getRendererAutoSendEnterEnabled() {
-  const out = await execRendererJsWithTimeout(
-    `
-    (() => {
-      const btn = document.getElementById('autoSendEnterToggle');
-      return !!(btn && btn.classList.contains('active'));
-    })();
-    `,
-    false,
-  );
-  return !!out;
-}
-
 async function getRendererAutoStopSilenceConfig() {
   const fallback = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   const out = await execRendererJsWithTimeout(
@@ -761,11 +748,9 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   minWidth: 118,
   minHeight: 34,
   maxWidth: 124,
-  maxHeight: 250,
+  maxHeight: 34,
   bottomMargin: 16,
   pillHeight: 34,
-  settingsMinHeight: 104,
-  settingsGap: 6,
   pillPadLeft: 4,
   pillPadRight: 10,
   pillGap: 8,
@@ -788,15 +773,6 @@ const recordingStatusCapsuleState = {
   elapsedMs: 0,
   timerRunning: false,
   level: 0,
-  settingsLoaded: false,
-  settings: {
-    autoStopEnabled: false,
-    autoStopSeconds: DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds,
-    upscaleEnabled: false,
-    upscaleSelected: "builtin_clean",
-    upscalePresets: [{ id: "builtin_clean", name: "Clean" }],
-    autoSendEnabled: false,
-  },
 };
 
 let recordingStatusCapsuleGeometry = null;
@@ -866,16 +842,12 @@ function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
   const next = {
     width: clampRecordingStatusCapsuleDimension(width, 1, RECORDING_STATUS_CAPSULE.maxWidth),
     height: clampRecordingStatusCapsuleDimension(height, 1, RECORDING_STATUS_CAPSULE.maxHeight),
-    quickOpen: false,
-    menuOpen: false,
   };
   const prev = recordingStatusCapsuleGeometry;
   if (
     prev &&
     prev.width === next.width &&
-    prev.height === next.height &&
-    prev.quickOpen === next.quickOpen &&
-    prev.menuOpen === next.menuOpen
+    prev.height === next.height
   ) {
     return;
   }
@@ -940,163 +912,6 @@ function recordingStatusTone(status) {
   return "neutral";
 }
 
-async function getRendererUpscalePresetContext() {
-  const fallback = {
-    selected: "builtin_clean",
-    enabled: false,
-    presets: [{ id: "builtin_clean", name: "Clean" }],
-  };
-  const out = await execRendererJsWithTimeout(
-    `
-    (() => {
-      const sel = document.getElementById('upscalePresetSelect');
-      const toggle = document.getElementById('upscaleToggle');
-      const selected = String(sel ? sel.value : 'builtin_clean').trim() || 'builtin_clean';
-      const enabled = !!(toggle && toggle.checked);
-      const presets = Array.from(sel ? sel.options : []).map((option) => ({
-        id: String(option.value || '').trim(),
-        name: String(option.textContent || option.value || '').trim(),
-      })).filter((item) => item.id);
-      return { selected, enabled, presets };
-    })();
-    `,
-    null,
-  );
-  if (!out) return fallback;
-  const presets = Array.isArray(out.presets) && out.presets.length
-    ? out.presets
-      .map((item) => ({
-        id: String(item?.id || "").trim(),
-        name: String(item?.name || item?.id || "").trim(),
-      }))
-      .filter((item) => item.id)
-    : fallback.presets;
-  const selected = String(out.selected || "").trim();
-  return {
-    enabled: !!out.enabled,
-    selected: selected && presets.some((item) => item.id === selected) ? selected : presets[0].id,
-    presets,
-  };
-}
-
-async function refreshRecordingStatusCapsuleSettings() {
-  const [upscaleCtx, autoSend, autoStop] = await Promise.all([
-    getRendererUpscalePresetContext(),
-    getRendererAutoSendEnterEnabled(),
-    getRendererAutoStopSilenceConfig(),
-  ]);
-  recordingStatusCapsuleState.settings = {
-    autoStopEnabled: !!autoStop.enabled,
-    autoStopSeconds: Number.isFinite(Number(autoStop.seconds))
-      ? Number(autoStop.seconds)
-      : DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds,
-    upscaleEnabled: !!upscaleCtx.enabled,
-    upscaleSelected: String(upscaleCtx.selected || "builtin_clean").trim() || "builtin_clean",
-    upscalePresets: Array.isArray(upscaleCtx.presets) && upscaleCtx.presets.length
-      ? upscaleCtx.presets
-      : [{ id: "builtin_clean", name: "Clean" }],
-    autoSendEnabled: !!autoSend,
-  };
-  recordingStatusCapsuleState.settingsLoaded = true;
-}
-
-async function setRendererUpscaleEnabled(enabled) {
-  await execRendererJsWithTimeout(
-    `
-    (() => {
-      const toggle = document.getElementById('upscaleToggle');
-      if (!toggle) return false;
-      const next = ${enabled ? "true" : "false"};
-      if (!!toggle.checked !== next) {
-        toggle.checked = next;
-        toggle.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      return true;
-    })();
-    `,
-    false,
-    500,
-  );
-}
-
-async function setRendererUpscalePreset(presetId) {
-  const safePresetId = String(presetId || "").trim();
-  if (!safePresetId) return;
-  await execRendererJsWithTimeout(
-    `
-    (() => {
-      const sel = document.getElementById('upscalePresetSelect');
-      if (!sel) return false;
-      const next = ${JSON.stringify(safePresetId)};
-      if (!Array.from(sel.options).some((option) => option.value === next)) return false;
-      if (sel.value !== next) {
-        sel.value = next;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      return true;
-    })();
-    `,
-    false,
-    500,
-  );
-}
-
-async function setRendererAutoSendEnterEnabled(enabled) {
-  await execRendererJsWithTimeout(
-    `
-    (() => {
-      const btn = document.getElementById('autoSendEnterToggle');
-      if (!btn) return false;
-      const next = ${enabled ? "true" : "false"};
-      const active = btn.classList.contains('active');
-      if (active !== next) btn.click();
-      return true;
-    })();
-    `,
-    false,
-    500,
-  );
-}
-
-async function setRendererAutoStopSilenceEnabled(enabled) {
-  await execRendererJsWithTimeout(
-    `
-    (() => {
-      const input = document.getElementById('autoStopSilenceEnabled');
-      if (!input) return false;
-      const next = ${enabled ? "true" : "false"};
-      if (!!input.checked !== next) {
-        input.checked = next;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      return true;
-    })();
-    `,
-    false,
-    500,
-  );
-}
-
-async function setRendererAutoStopSilenceSeconds(seconds) {
-  const safeSeconds = Math.min(120, Math.max(1, Math.round(Number(seconds) || DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds)));
-  await execRendererJsWithTimeout(
-    `
-    (() => {
-      const input = document.getElementById('autoStopSilenceSeconds');
-      if (!input) return false;
-      const next = ${JSON.stringify(String(safeSeconds))};
-      if (String(input.value || '') !== next) {
-        input.value = next;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      return true;
-    })();
-    `,
-    false,
-    500,
-  );
-}
-
 function recordingStatusCapsuleHtml() {
   const t = RECORDING_STATUS_CAPSULE;
   return `<!doctype html>
@@ -1125,7 +940,6 @@ function recordingStatusCapsuleHtml() {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: ${t.settingsGap}px;
       margin: 0 auto;
       width: min-content;
     }
@@ -1152,245 +966,6 @@ function recordingStatusCapsuleHtml() {
       align-items: center;
       justify-content: center;
       gap: ${t.pillGap}px;
-    }
-    #settingsSlot {
-      width: 0;
-      height: 0;
-      min-height: 0;
-      display: flex;
-      align-items: flex-end;
-      justify-content: center;
-      overflow: visible;
-    }
-    #settingsSlot.on {
-      width: ${t.width}px;
-      height: auto;
-      min-height: ${t.settingsMinHeight}px;
-    }
-    #settingsPill {
-      width: ${t.width}px;
-      min-height: ${t.settingsMinHeight}px;
-      padding: 6px;
-      border-radius: 14px;
-      border: 1px solid rgba(255,255,255,0.14);
-      background: rgba(18,18,18,0.92);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-      backdrop-filter: blur(18px) saturate(1.08);
-      -webkit-backdrop-filter: blur(18px) saturate(1.08);
-      opacity: 0;
-      pointer-events: none;
-      transform: translateY(-5px) scale(.985);
-      transition: opacity .12s ease, transform .12s ease;
-    }
-    #settingsSlot.on #settingsPill {
-      opacity: 1;
-      pointer-events: auto;
-      transform: translateY(-2px) scale(1);
-    }
-    #quickPanel {
-      display: flex;
-      flex-direction: column;
-      align-items: stretch;
-      gap: 6px;
-      min-width: 0;
-      overflow: visible;
-    }
-    #quickUpscaleCapsule, #quickAutoSendCapsule, #quickAutoStopCapsule {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      height: 25px;
-      padding: 0 4px 0 2px;
-      border-radius: 999px;
-      white-space: nowrap;
-    }
-    .capsuleLabel, #quickUpscaleOffLabel {
-      font-size: 11px;
-      font-weight: 650;
-      letter-spacing: 0;
-      opacity: .92;
-    }
-    #quickUpscaleToggle, #quickAutoSendToggle, #quickAutoStopToggle {
-      appearance: none;
-      width: 28px;
-      height: 16px;
-      border-radius: 999px;
-      border: 1px solid #444;
-      background: #2a2a2a;
-      position: relative;
-      outline: none;
-      cursor: default;
-      flex: 0 0 30px;
-      transition: background .14s ease, border-color .14s ease;
-    }
-    #quickUpscaleToggle::before, #quickAutoSendToggle::before, #quickAutoStopToggle::before {
-      content: "";
-      position: absolute;
-      left: 2px;
-      top: 2px;
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: #d2d2d2;
-      transition: transform .14s ease, background .14s ease;
-    }
-    #quickUpscaleCapsule {
-      border: 1px solid #3d2e52;
-      background: #2a2234;
-      color: #e0e0e0;
-    }
-    #quickUpscaleToggle:checked {
-      background: #5a36a0;
-      border-color: #7a50c8;
-    }
-    #quickUpscaleToggle:checked::before {
-      transform: translateX(14px);
-      background: #fff;
-    }
-    #quickAutoSendCapsule {
-      border: 1px solid #2e4a35;
-      background: #1e2e22;
-      color: #d0e8d4;
-    }
-    #quickAutoSendToggle:checked {
-      background: #2e5c3a;
-      border-color: #4a8a5a;
-    }
-    #quickAutoSendToggle:checked::before {
-      transform: translateX(14px);
-      background: #90e0a0;
-    }
-    #quickAutoStopCapsule {
-      border: 1px solid #4a4428;
-      background: #2a2818;
-      color: #e0dcc0;
-    }
-    #quickAutoStopToggle:checked {
-      background: #5c5020;
-      border-color: #8a7a3a;
-    }
-    #quickAutoStopToggle:checked::before {
-      transform: translateX(14px);
-      background: #e8d860;
-    }
-    #quickAutoStopSecsLabel {
-      display: inline-flex;
-      align-items: center;
-      gap: 2px;
-      margin-left: auto;
-      height: 18px;
-      padding: 1px 3px;
-      border: 1px solid #4a4428;
-      border-radius: 8px;
-      background: #2a2818;
-    }
-    #quickAutoStopSecs {
-      display: inline-block;
-      min-width: 16px;
-      text-align: center;
-      color: #e0dcc0;
-      font-size: 11px;
-      font-weight: 700;
-      font-family: Menlo, ui-monospace, monospace;
-      line-height: 1;
-      padding: 0 2px;
-    }
-    #quickAutoStopSecsMinus, #quickAutoStopSecsPlus {
-      all: unset;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 14px;
-      height: 16px;
-      border-radius: 4px;
-      color: #d4c888;
-      font-size: 12px;
-      font-weight: 700;
-      cursor: default;
-      transition: background 80ms ease;
-    }
-    #quickAutoStopSecsMinus:hover, #quickAutoStopSecsPlus:hover {
-      background: #4a4428;
-    }
-    #quickUpscaleDrop {
-      position: relative;
-    }
-    #quickUpscaleBtn {
-      appearance: none;
-      border: 1px solid #3d2e52;
-      border-radius: 999px;
-      background: #2a2234;
-      color: #eaeaea;
-      height: 22px;
-      min-width: 68px;
-      max-width: 68px;
-      padding: 0 15px 0 7px;
-      font-size: 11px;
-      font-weight: 600;
-      text-align: left;
-      cursor: default;
-      position: relative;
-    }
-    #quickUpscaleBtn::after {
-      content: "";
-      position: absolute;
-      right: 6px;
-      top: 50%;
-      width: 8px;
-      height: 5px;
-      transform: translateY(-50%);
-      background-repeat: no-repeat;
-      background-position: center;
-      background-size: 8px 5px;
-      background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='rgba(220,220,220,0.7)' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-    }
-    #quickUpscaleBtnText {
-      display: block;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    #quickUpscaleMenu {
-      position: absolute;
-      left: 0;
-      top: 28px;
-      min-width: 100%;
-      max-height: 164px;
-      overflow: auto;
-      padding: 4px;
-      border: 1px solid #3d2e52;
-      border-radius: 10px;
-      background: #1e1a24;
-      display: none;
-      z-index: 5;
-    }
-    #quickUpscaleMenu.open {
-      display: block;
-    }
-    .quickUpscaleItem {
-      width: 100%;
-      appearance: none;
-      border: 0;
-      border-radius: 8px;
-      height: 26px;
-      padding: 0 7px;
-      text-align: left;
-      color: #eaeaea;
-      background: transparent;
-      font-size: 11px;
-      cursor: default;
-    }
-    .quickUpscaleItem:hover {
-      background: #2e2e2e;
-    }
-    .quickUpscaleItem.active {
-      background: #3a2a52;
-    }
-    #quickUpscaleCapsule.up-off #quickUpscaleDrop {
-      display: none;
-    }
-    #quickUpscaleCapsule.up-on #quickUpscaleOffLabel {
-      display: none;
     }
     #wave {
       display: block;
@@ -1526,13 +1101,6 @@ function recordingStatusCapsuleHtml() {
       100% { transform: translate(-50%,-50%) scale(1.2); opacity: 0; }
     }
     @media (prefers-reduced-motion: reduce) {
-      #settingsPill,
-      #quickUpscaleToggle,
-      #quickAutoSendToggle,
-      #quickAutoStopToggle,
-      #quickUpscaleToggle::before,
-      #quickAutoSendToggle::before,
-      #quickAutoStopToggle::before,
       #stateIcon::before,
       #stateIcon::after {
         animation: none !important;
@@ -1543,35 +1111,6 @@ function recordingStatusCapsuleHtml() {
 </head>
 <body>
   <div id="stack">
-    <div id="settingsSlot">
-      <div id="settingsPill">
-        <div id="quickPanel">
-          <div id="quickAutoStopCapsule" title="Auto stop on silence">
-            <input id="quickAutoStopToggle" type="checkbox" />
-            <span class="capsuleLabel">Stop</span>
-            <div id="quickAutoStopSecsLabel">
-              <button id="quickAutoStopSecsMinus" type="button" aria-label="Decrease seconds">&minus;</button>
-              <span id="quickAutoStopSecs" aria-live="polite">2</span>
-              <button id="quickAutoStopSecsPlus" type="button" aria-label="Increase seconds">+</button>
-            </div>
-          </div>
-          <div id="quickUpscaleCapsule" title="Upscale settings">
-            <input id="quickUpscaleToggle" type="checkbox" />
-            <span id="quickUpscaleOffLabel">Upscale</span>
-            <div id="quickUpscaleDrop">
-              <button id="quickUpscaleBtn" type="button" aria-label="Upscale preset">
-                <span id="quickUpscaleBtnText">Clean</span>
-              </button>
-              <div id="quickUpscaleMenu"></div>
-            </div>
-          </div>
-          <div id="quickAutoSendCapsule" title="Auto send after paste">
-            <input id="quickAutoSendToggle" type="checkbox" />
-            <span class="capsuleLabel">Send</span>
-          </div>
-        </div>
-      </div>
-    </div>
     <div id="pill">
       <div id="core">
         <span id="stateIcon" aria-hidden="true"></span>
@@ -1582,21 +1121,10 @@ function recordingStatusCapsuleHtml() {
   </div>
   <script>
     const stackEl = document.getElementById("stack");
-    const settingsSlot = document.getElementById("settingsSlot");
     const stateIcon = document.getElementById("stateIcon");
     const timeEl = document.getElementById("timer");
     const cv = document.getElementById("wave");
     const ctx = cv.getContext("2d");
-    const quickUpscaleCapsule = document.getElementById("quickUpscaleCapsule");
-    const quickUpscaleToggle = document.getElementById("quickUpscaleToggle");
-    const quickUpscaleBtn = document.getElementById("quickUpscaleBtn");
-    const quickUpscaleBtnText = document.getElementById("quickUpscaleBtnText");
-    const quickUpscaleMenu = document.getElementById("quickUpscaleMenu");
-    const quickAutoSendToggle = document.getElementById("quickAutoSendToggle");
-    const quickAutoStopToggle = document.getElementById("quickAutoStopToggle");
-    const quickAutoStopSecs = document.getElementById("quickAutoStopSecs");
-    const quickAutoStopMinus = document.getElementById("quickAutoStopSecsMinus");
-    const quickAutoStopPlus = document.getElementById("quickAutoStopSecsPlus");
     const waveW = ${t.waveWidth};
     const waveH = ${t.waveHeight};
     const bw = ${t.waveBarWidth};
@@ -1615,18 +1143,8 @@ function recordingStatusCapsuleHtml() {
       startedAt: 0,
       elapsedMs: 0,
       timerRunning: false,
-      level: 0,
-      settings: {
-        autoStopEnabled: false,
-        autoStopSeconds: 2,
-        upscaleEnabled: false,
-        upscaleSelected: "builtin_clean",
-        upscalePresets: [{ id: "builtin_clean", name: "Clean" }],
-        autoSendEnabled: false
-      }
+      level: 0
     };
-    let quickUpscaleOptions = [{ id: "builtin_clean", name: "Clean" }];
-    let quickUpscaleSelected = "builtin_clean";
     let geometryEmitScheduled = false;
     let lastLevelAt = 0;
     let lastWavePushAt = 0;
@@ -1635,7 +1153,6 @@ function recordingStatusCapsuleHtml() {
     let activeWave = true;
     let waveMode = "recording";
     let stateIconModeClass = "";
-    let settingsSignature = "";
     let pointerEmitLocked = false;
     function fmt(ms) {
       const total = Math.max(0, Math.floor(ms / 1000));
@@ -1649,19 +1166,9 @@ function recordingStatusCapsuleHtml() {
       let top = stackRect.top;
       let right = stackRect.right;
       let bottom = stackRect.bottom;
-      const menuOpen = quickUpscaleMenu.classList.contains("open");
-      if (menuOpen) {
-        const menuRect = quickUpscaleMenu.getBoundingClientRect();
-        left = Math.min(left, menuRect.left);
-        top = Math.min(top, menuRect.top);
-        right = Math.max(right, menuRect.right);
-        bottom = Math.max(bottom, menuRect.bottom);
-      }
       const payload = {
         width: Math.max(1, Math.ceil(right - left)),
-        height: Math.max(1, Math.ceil(bottom - top)),
-        quickOpen: settingsSlot.classList.contains("on"),
-        menuOpen
+        height: Math.max(1, Math.ceil(bottom - top))
       };
       document.title = "__recording_capsule_geometry__" + encodeURIComponent(JSON.stringify(payload));
     }
@@ -1672,73 +1179,6 @@ function recordingStatusCapsuleHtml() {
         geometryEmitScheduled = false;
         setTimeout(emitGeometry, 0);
       });
-    }
-    function setQuickOpen(open) {
-      settingsSlot.classList.remove("on");
-      if (quickUpscaleMenu.classList.contains("open")) {
-        quickUpscaleMenu.classList.remove("open");
-      }
-      scheduleGeometryEmit();
-    }
-    function setUpscaleEnabled(enabled) {
-      const on = !!enabled;
-      if (quickUpscaleToggle.checked !== on) quickUpscaleToggle.checked = on;
-      quickUpscaleCapsule.classList.toggle("up-on", on);
-      quickUpscaleCapsule.classList.toggle("up-off", !on);
-      scheduleGeometryEmit();
-    }
-    function renderUpscaleMenu() {
-      const selected = quickUpscaleOptions.find((item) => item.id === quickUpscaleSelected) || quickUpscaleOptions[0] || { id: "builtin_clean", name: "Clean" };
-      quickUpscaleBtnText.textContent = selected.name || selected.id || "Clean";
-      quickUpscaleMenu.innerHTML = "";
-      quickUpscaleOptions.forEach((item) => {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "quickUpscaleItem" + (item.id === quickUpscaleSelected ? " active" : "");
-        btn.textContent = item.name.length > 22 ? item.name.slice(0, 22) + "..." : item.name;
-        btn.title = item.name;
-        btn.addEventListener("click", (event) => {
-          event.stopPropagation();
-          quickUpscaleSelected = item.id;
-          renderUpscaleMenu();
-          quickUpscaleMenu.classList.remove("open");
-          scheduleGeometryEmit();
-          document.title = "__recording_capsule_upscale__" + encodeURIComponent(item.id);
-        });
-        quickUpscaleMenu.appendChild(btn);
-      });
-    }
-    function setUpscaleOptions(items, selected) {
-      const list = Array.isArray(items) ? items : [];
-      quickUpscaleOptions = list
-        .map((item) => ({
-          id: String(item && item.id || "").trim(),
-          name: String(item && item.name || item && item.id || "").trim()
-        }))
-        .filter((item) => item.id);
-      if (!quickUpscaleOptions.length) {
-        quickUpscaleOptions = [{ id: "builtin_clean", name: "Clean" }];
-      }
-      const next = String(selected || "").trim();
-      quickUpscaleSelected = next && quickUpscaleOptions.some((item) => item.id === next)
-        ? next
-        : quickUpscaleOptions[0].id;
-      renderUpscaleMenu();
-      scheduleGeometryEmit();
-    }
-    function setAutoStopConfig(enabled, seconds) {
-      const on = !!enabled;
-      if (quickAutoStopToggle.checked !== on) quickAutoStopToggle.checked = on;
-      const raw = Number(seconds);
-      const sec = Math.min(120, Math.max(1, Number.isFinite(raw) ? Math.round(raw) : 2));
-      if (Number(quickAutoStopSecs.textContent) !== sec) {
-        quickAutoStopSecs.textContent = String(sec);
-      }
-      scheduleGeometryEmit();
-    }
-    function setAutoSendEnabled(enabled) {
-      const on = !!enabled;
-      if (quickAutoSendToggle.checked !== on) quickAutoSendToggle.checked = on;
     }
     function applyStatusMode(mode) {
       const next = String(mode || "idle");
@@ -1845,26 +1285,13 @@ function recordingStatusCapsuleHtml() {
         timeEl.textContent = nextTimerText;
       }
       applyStatusMode(state.mode);
-      const nextSettingsSignature = JSON.stringify(state.settings || {});
-      if (nextSettingsSignature !== settingsSignature) {
-        settingsSignature = nextSettingsSignature;
-        setUpscaleEnabled(!!state.settings.upscaleEnabled);
-        setUpscaleOptions(state.settings.upscalePresets, state.settings.upscaleSelected);
-        setAutoSendEnabled(!!state.settings.autoSendEnabled);
-        setAutoStopConfig(!!state.settings.autoStopEnabled, state.settings.autoStopSeconds);
-      }
     }
     function pageIsActive() {
       return !document.hidden && !!String(state.status || "").trim();
     }
     window.__setCapsuleState = (next) => {
       state = { ...state, ...(next || {}) };
-      state.settings = { ...state.settings, ...((next && next.settings) || {}) };
       render();
-      return true;
-    };
-    window.__setCapsuleQuickOpen = () => {
-      setQuickOpen(false);
       return true;
     };
     window.addEventListener("resize", scheduleGeometryEmit);
@@ -1880,45 +1307,6 @@ function recordingStatusCapsuleHtml() {
         document.title = "__recording_capsule_stop__";
       }
     });
-    quickUpscaleToggle.addEventListener("change", () => {
-      setUpscaleEnabled(quickUpscaleToggle.checked);
-      document.title = "__recording_capsule_upscale_enabled__" + (quickUpscaleToggle.checked ? "1" : "0");
-    });
-    quickUpscaleBtn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      quickUpscaleMenu.classList.toggle("open");
-      scheduleGeometryEmit();
-    });
-    document.addEventListener("click", () => {
-      if (!quickUpscaleMenu.classList.contains("open")) return;
-      quickUpscaleMenu.classList.remove("open");
-      scheduleGeometryEmit();
-    });
-    quickAutoSendToggle.addEventListener("change", () => {
-      document.title = "__recording_capsule_autosend__" + (quickAutoSendToggle.checked ? "1" : "0");
-    });
-    quickAutoStopToggle.addEventListener("change", () => {
-      document.title = "__recording_capsule_autostop_enabled__" + (quickAutoStopToggle.checked ? "1" : "0");
-    });
-    function emitSecs(value) {
-      const raw = Number(value);
-      const sec = Math.min(120, Math.max(1, Number.isFinite(raw) ? Math.round(raw) : 2));
-      quickAutoStopSecs.textContent = String(sec);
-      scheduleGeometryEmit();
-      document.title = "__recording_capsule_autostop_secs__" + sec;
-    }
-    function readSecs() {
-      const raw = Number(quickAutoStopSecs.textContent);
-      return Number.isFinite(raw) && raw > 0 ? raw : 2;
-    }
-    quickAutoStopMinus.addEventListener("click", (event) => {
-      event.stopPropagation();
-      emitSecs(readSecs() - 1);
-    });
-    quickAutoStopPlus.addEventListener("click", (event) => {
-      event.stopPropagation();
-      emitSecs(readSecs() + 1);
-    });
     function animationLoop(frameNow) {
       const now = Date.now();
       if (!lastRenderFrameAt || frameNow - lastRenderFrameAt >= ${t.waveFrameMs}) {
@@ -1928,10 +1316,6 @@ function recordingStatusCapsuleHtml() {
       }
       requestAnimationFrame(animationLoop);
     }
-    setQuickOpen(false);
-    setUpscaleEnabled(false);
-    setUpscaleOptions([{ id: "builtin_clean", name: "Clean" }], "builtin_clean");
-    setAutoSendEnabled(false);
     render();
     requestAnimationFrame(animationLoop);
     scheduleGeometryEmit();
@@ -2024,49 +1408,6 @@ async function ensureRecordingStatusCapsuleWindow() {
       applyRecordingStatusCapsuleGeometryPayload(raw.replace("__recording_capsule_geometry__", ""));
       return;
     }
-    if (raw.startsWith("__recording_capsule_settings__")) {
-      applyRecordingStatusCapsuleWindowSize();
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_upscale_enabled__")) {
-      const enabled = raw.endsWith("1");
-      recordingStatusCapsuleState.settings.upscaleEnabled = enabled;
-      setRendererUpscaleEnabled(enabled).catch((e) => {
-        appendMainLog(`[recording-capsule] upscale enabled update failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_upscale__")) {
-      const presetId = decodeURIComponent(raw.replace("__recording_capsule_upscale__", ""));
-      recordingStatusCapsuleState.settings.upscaleSelected = presetId;
-      setRendererUpscalePreset(presetId).catch((e) => {
-        appendMainLog(`[recording-capsule] upscale preset update failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_autosend__")) {
-      const enabled = raw.endsWith("1");
-      recordingStatusCapsuleState.settings.autoSendEnabled = enabled;
-      setRendererAutoSendEnterEnabled(enabled).catch((e) => {
-        appendMainLog(`[recording-capsule] auto-send update failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_autostop_enabled__")) {
-      const enabled = raw.endsWith("1");
-      recordingStatusCapsuleState.settings.autoStopEnabled = enabled;
-      setRendererAutoStopSilenceEnabled(enabled).catch((e) => {
-        appendMainLog(`[recording-capsule] auto-stop update failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_autostop_secs__")) {
-      const seconds = Math.min(120, Math.max(1, Math.round(Number(raw.replace("__recording_capsule_autostop_secs__", "")) || DEFAULT_RECORDING_AUTO_STOP_CONFIG.seconds)));
-      recordingStatusCapsuleState.settings.autoStopSeconds = seconds;
-      setRendererAutoStopSilenceSeconds(seconds).catch((e) => {
-        appendMainLog(`[recording-capsule] auto-stop seconds update failed: ${e?.message || e}`);
-      });
-    }
   });
 
   const html = recordingStatusCapsuleHtml();
@@ -2109,11 +1450,6 @@ async function updateRecordingStatusCapsule(patch = {}) {
     }
     recordingStatusCapsuleState.timerRunning = false;
   }
-  if (!recordingStatusCapsuleState.settingsLoaded || patch.refreshSettings) {
-    await refreshRecordingStatusCapsuleSettings().catch((e) => {
-      appendMainLog(`[recording-capsule] settings refresh failed: ${e?.message || e}`);
-    });
-  }
   const capsuleWindow = await ensureRecordingStatusCapsuleWindow();
   if (!capsuleWindow || capsuleWindow.isDestroyed()) return;
   try {
@@ -2128,7 +1464,6 @@ async function updateRecordingStatusCapsule(patch = {}) {
     elapsedMs: Math.max(0, Number(recordingStatusCapsuleState.elapsedMs || 0)),
     timerRunning: !!recordingStatusCapsuleState.timerRunning,
     level: Math.max(0, Math.min(1, Number(recordingStatusCapsuleState.level || 0))),
-    settings: recordingStatusCapsuleState.settings,
   };
   try {
     await capsuleWindow.webContents.executeJavaScript(
@@ -2147,16 +1482,12 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.startedAt = 0;
   recordingStatusCapsuleState.elapsedMs = 0;
   recordingStatusCapsuleState.timerRunning = false;
-  recordingStatusCapsuleState.settingsLoaded = false;
   recordingStatusCapsuleGeometry = null;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     if (recordingStatusWindowReady) {
       recordingStatusWindow.webContents.executeJavaScript(
         `(() => {
           window.__setCapsuleState(${JSON.stringify({ status: "", mode: "idle", startedAt: 0, elapsedMs: 0, timerRunning: false, level: 0 })});
-          if (typeof window.__setCapsuleQuickOpen === 'function') {
-            window.__setCapsuleQuickOpen(false);
-          }
           return true;
         })();`,
         true,
