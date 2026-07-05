@@ -5786,18 +5786,25 @@ async function createWindow(options = {}) {
   // inherit our microphone / clipboard grants. Tightened to ``_isBackendOrigin``
   // so the renderer must be on http://127.0.0.1:<our-port> to be
   // allowed.
-  const mediaRequestIsAudioOnly = (details) => {
+  const mediaRequestTypes = (details = {}) => {
     const mediaTypes = Array.isArray(details?.mediaTypes) ? details.mediaTypes.map(String) : [];
-    if (mediaTypes.length > 0) return mediaTypes.every((type) => type === "audio");
+    if (mediaTypes.length > 0) return mediaTypes;
     const mediaType = String(details?.mediaType || "").trim();
-    return mediaType === "audio";
+    return mediaType ? [mediaType] : [];
   };
-  const permissionDecision = (permission, details = {}) => {
+  const mediaRequestIsAudioOnly = (details = {}) => {
+    const types = mediaRequestTypes(details);
+    return types.length > 0 && types.every((type) => type === "audio");
+  };
+  const permissionDecision = (permission, details = {}, mode = "request") => {
     const perm = String(permission || "");
+    const mediaTypes = mediaRequestTypes(details);
     const audioOnlyMedia = perm === "media" && mediaRequestIsAudioOnly(details);
+    const genericBackendMediaCheck = mode === "check" && perm === "media" && mediaTypes.length === 0;
     const allowedCapability =
       audioPermissions.has(perm) ||
       audioOnlyMedia ||
+      genericBackendMediaCheck ||
       clipboardWritePermissions.has(perm);
     const known =
       allowedCapability ||
@@ -5829,7 +5836,7 @@ async function createWindow(options = {}) {
       .filter(Boolean)
       .join(" | ");
   win.webContents.session.setPermissionRequestHandler((wc, permission, cb, details = {}) => {
-    const { perm, known, allowedCapability } = permissionDecision(permission, details);
+    const { perm, known, allowedCapability } = permissionDecision(permission, details, "request");
     const fromBackend = permissionFromBackendOrigin(wc, details);
     const allow = allowedCapability && fromBackend;
     const logUrl = permissionOriginsLog(wc, details);
@@ -5841,7 +5848,7 @@ async function createWindow(options = {}) {
     cb(allow);
   });
   win.webContents.session.setPermissionCheckHandler((wc, permission, requestingOrigin, details = {}) => {
-    const { perm, known, allowedCapability } = permissionDecision(permission, details);
+    const { perm, known, allowedCapability } = permissionDecision(permission, details, "check");
     const fromBackend = permissionFromBackendOrigin(wc, details, requestingOrigin);
     const allow = allowedCapability && fromBackend;
     const logUrl = permissionOriginsLog(wc, details, requestingOrigin);
