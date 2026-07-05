@@ -228,17 +228,9 @@ let mainWindowExpectedHideUntil = 0;
 let mainWindowExpectedHideReason = "";
 let mainWindowRevealProtectionUntil = 0;
 let mainWindowRevealProtectionReason = "";
-let mainWindowUnexpectedHideRecoveryTimer = null;
-let mainWindowUnexpectedHideRecoveryWindowStartedAt = 0;
-let mainWindowUnexpectedHideRecoveryCount = 0;
 let macDockPresenceRequested = false;
 let macDockPresenceEnsured = false;
 const MAIN_WINDOW_EXPECTED_HIDE_DWELL_MS = 2500;
-const MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_DELAY_MS = 120;
-const MAIN_WINDOW_PROTECTED_HIDE_RECOVERY_DELAY_MS = 0;
-const MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_WINDOW_MS = 10000;
-const MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_LIMIT = 3;
-const MAIN_WINDOW_PROTECTED_HIDE_RECOVERY_LIMIT = 8;
 const MAIN_WINDOW_REVEAL_PROTECTION_MS = 2500;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
 const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
@@ -593,86 +585,9 @@ function markMainWindowExpectedHide(reason = "") {
   mainWindowExpectedHideUntil = Date.now() + MAIN_WINDOW_EXPECTED_HIDE_DWELL_MS;
 }
 
-function isMainWindowExpectedHideInFlight() {
-  return Date.now() <= mainWindowExpectedHideUntil;
-}
-
 function markMainWindowRevealProtection(reason = "") {
   mainWindowRevealProtectionReason = normalizeLifecycleReason(reason);
   mainWindowRevealProtectionUntil = Date.now() + MAIN_WINDOW_REVEAL_PROTECTION_MS;
-}
-
-function isMainWindowRevealProtectionInFlight() {
-  return Date.now() <= mainWindowRevealProtectionUntil;
-}
-
-function shouldRecoverUnexpectedMainWindowHide() {
-  if (isQuitting) return false;
-  if (!win || win.isDestroyed()) return false;
-  if (isMainWindowExpectedHideInFlight()) return false;
-  if (isMacAppHidden()) return false;
-  try {
-    if (win.isMinimized()) return false;
-  } catch {
-    return false;
-  }
-  return true;
-}
-
-function scheduleUnexpectedMainWindowHideRecovery(reason = "") {
-  if (!shouldRecoverUnexpectedMainWindowHide()) return;
-  const label = normalizeLifecycleReason(reason || "unexpected-window-hide");
-  const protectedReveal = isMainWindowRevealProtectionInFlight();
-  if (mainWindowUnexpectedHideRecoveryTimer) {
-    if (!protectedReveal) return;
-    clearTimeout(mainWindowUnexpectedHideRecoveryTimer);
-    mainWindowUnexpectedHideRecoveryTimer = null;
-  }
-  const delayMs = protectedReveal
-    ? MAIN_WINDOW_PROTECTED_HIDE_RECOVERY_DELAY_MS
-    : MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_DELAY_MS;
-  mainWindowUnexpectedHideRecoveryTimer = setTimeout(() => {
-    mainWindowUnexpectedHideRecoveryTimer = null;
-    if (!shouldRecoverUnexpectedMainWindowHide()) return;
-    try {
-      if (win.isVisible()) {
-        appendMainLog(
-          `[main-window-hide-recovery] skipped-visible reason=${label} ` +
-          `protected=${protectedReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`,
-        );
-        return;
-      }
-    } catch {
-      return;
-    }
-    const now = Date.now();
-    if (now - mainWindowUnexpectedHideRecoveryWindowStartedAt > MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_WINDOW_MS) {
-      mainWindowUnexpectedHideRecoveryWindowStartedAt = now;
-      mainWindowUnexpectedHideRecoveryCount = 0;
-    }
-    mainWindowUnexpectedHideRecoveryCount += 1;
-    const recoveryLimit = protectedReveal
-      ? MAIN_WINDOW_PROTECTED_HIDE_RECOVERY_LIMIT
-      : MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_LIMIT;
-    if (mainWindowUnexpectedHideRecoveryCount > recoveryLimit) {
-      appendMainLog(
-        `[main-window-hide-recovery] suppressed reason=${label} protected=${protectedReveal ? 1 : 0} count=${mainWindowUnexpectedHideRecoveryCount} ${mainWindowLifecycleSnapshot()}`,
-      );
-      return;
-    }
-    appendMainLog(
-      `[main-window-hide-recovery] revealing reason=${label} protected=${protectedReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`,
-    );
-    ensureWindowVisible({
-      manual: true,
-      force: true,
-      forceShow: protectedReveal,
-      reason: label,
-    }).catch((e) => {
-      appendMainLog(`[main-window-hide-recovery] failed reason=${label}: ${e?.message || e}`);
-    });
-  }, delayMs);
-  try { mainWindowUnexpectedHideRecoveryTimer.unref?.(); } catch { }
 }
 
 function showMacAppForWindowReveal(reason = "") {
@@ -6133,7 +6048,6 @@ async function createWindow(options = {}) {
   win.on("hide", () => {
     mainWindowLastHideAt = Date.now();
     appendMainLog(`[main-window] event=hide ${mainWindowLifecycleSnapshot()}`);
-    scheduleUnexpectedMainWindowHideRecovery("unexpected-window-hide");
   });
   win.on("focus", () => {
     appendMainLog(`[main-window] event=focus ${mainWindowLifecycleSnapshot()}`);
@@ -6499,10 +6413,6 @@ app.on("before-quit", () => {
   if (mainWindowRevealRequestTimer) {
     clearTimeout(mainWindowRevealRequestTimer);
     mainWindowRevealRequestTimer = null;
-  }
-  if (mainWindowUnexpectedHideRecoveryTimer) {
-    clearTimeout(mainWindowUnexpectedHideRecoveryTimer);
-    mainWindowUnexpectedHideRecoveryTimer = null;
   }
   globalShortcut.unregisterAll();
   shortcutBridgeHandler = null;
