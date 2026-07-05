@@ -726,6 +726,20 @@ function hideMainWindow(reason = "") {
   }
 }
 
+function shouldRevealMainWindowForActivate(hasVisibleWindows = false) {
+  if (isQuitting) return false;
+  if (!win || win.isDestroyed()) return true;
+  try {
+    if (win.isMinimized()) return true;
+    if (!win.isVisible()) return true;
+  } catch {
+    return true;
+  }
+  if (isMacAppHidden()) return true;
+  if (!hasVisibleWindows) return true;
+  return false;
+}
+
 function ensureMacDockPresence(reason = "") {
   if (process.platform !== "darwin") return;
   const label = String(reason || "unknown").trim() || "unknown";
@@ -6279,9 +6293,14 @@ app.on("window-all-closed", () => {
 
 app.on("activate", (_event, hasVisibleWindows) => {
   ensureMacDockPresence("activate");
-  appendMainLog(`[app-activate] hasVisibleWindows=${!!hasVisibleWindows} ${mainWindowLifecycleSnapshot()}`);
+  const shouldReveal = shouldRevealMainWindowForActivate(!!hasVisibleWindows);
+  appendMainLog(`[app-activate] hasVisibleWindows=${!!hasVisibleWindows} shouldReveal=${shouldReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`);
   if (shouldSuppressActivateForRecordingStatusCapsule()) {
     appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
+    return;
+  }
+  if (!shouldReveal) {
+    appendMainLog(`[app-activate] native-visible-window-kept ${mainWindowLifecycleSnapshot()}`);
     return;
   }
   requestMainWindowReveal("app-activate");
