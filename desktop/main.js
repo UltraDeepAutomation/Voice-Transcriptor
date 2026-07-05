@@ -219,6 +219,7 @@ let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
+let mainWindowRevealInFlight = null;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
 const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 let recordingSilenceStartedAt = 0;
@@ -500,6 +501,23 @@ function traceEnd(ctx, status = "done", details = {}) {
 }
 
 async function ensureWindowVisible(options = {}) {
+  if (mainWindowRevealInFlight) {
+    try {
+      await mainWindowRevealInFlight;
+    } catch { }
+    return;
+  }
+  let promise;
+  promise = ensureWindowVisibleInner(options).finally(() => {
+    if (mainWindowRevealInFlight === promise) {
+      mainWindowRevealInFlight = null;
+    }
+  });
+  mainWindowRevealInFlight = promise;
+  return promise;
+}
+
+async function ensureWindowVisibleInner(options = {}) {
   const force = !!options.force;
   if (!force && recordingStopInFlight) return;
   ensureMacDockPresence("ensure-window-visible");
@@ -510,10 +528,12 @@ async function ensureWindowVisible(options = {}) {
   if (backend === null) {
     await startBackend();
   }
-  await refreshWindowForFrontendBuild(false);
-  if (win.isMinimized()) win.restore();
-  if (!win.isVisible()) win.show();
-  win.focus();
+  await waitForMainWindowLoadBeforeReveal("ensure-window-visible");
+  const refreshed = await refreshWindowForFrontendBuild(false);
+  if (refreshed) {
+    await waitForMainWindowLoadBeforeReveal("ensure-window-visible-refresh");
+  }
+  await revealMainWindowWhenReady("ensure-window-visible");
 }
 
 function ensureMacDockPresence(reason = "") {
@@ -587,19 +607,19 @@ function invalidateFrontendSignatureCache() {
 }
 
 async function refreshWindowForFrontendBuild(force = false) {
-  if (!win || win.isDestroyed() || !win.webContents) return;
+  if (!win || win.isDestroyed() || !win.webContents) return false;
   if (force) {
     invalidateFrontendSignatureCache();
   }
   const nextSignature = await getFrontendBuildSignature();
-  if (!nextSignature) return;
+  if (!nextSignature) return false;
 
   // First-launch case: the renderer hasn't reported its loaded
   // signature yet (``did-finish-load`` hasn't fired). Doing clearCache
   // + reload here would be a spurious white flash on every app startup.
-  if (!loadedFrontendBuildSignature) return;
+  if (!loadedFrontendBuildSignature) return false;
 
-  if (!force && loadedFrontendBuildSignature === nextSignature) return;
+  if (!force && loadedFrontendBuildSignature === nextSignature) return false;
 
   appendMainLog(
     `[frontend-refresh] force=${force} from=${loadedFrontendBuildSignature || "none"} to=${nextSignature}`
@@ -615,10 +635,13 @@ async function refreshWindowForFrontendBuild(force = false) {
   );
   loadedFrontendBuildSignature = nextSignature;
   if (!win.webContents.isLoading()) {
+    trackMainWindowInitialLoad(win, "frontend-refresh");
     await safeExec("refreshWindowForFrontendBuild:reload", () =>
       win.webContents.reloadIgnoringCache()
     );
+    return true;
   }
+  return false;
 }
 
 function normalizeProviderChoice(value) {
@@ -5712,36 +5735,73 @@ function waitForBackendHealth(url, timeoutMs) {
   });
 }
 
-function trackMainWindowInitialLoad(browserWindow) {
+function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
   if (!browserWindow || browserWindow.isDestroyed()) {
     mainWindowInitialLoadPromise = null;
     return null;
   }
+  const label = String(reason || "initial-load").trim() || "initial-load";
   let timeoutHandle = null;
   let resolvePromise = null;
+  const startedAt = Date.now();
+  let settled = false;
   const promise = new Promise((resolve) => {
     resolvePromise = resolve;
   });
-  const settle = () => {
+  const settle = (eventName = "settled") => {
+    if (settled) return;
+    settled = true;
     if (timeoutHandle) {
       clearTimeout(timeoutHandle);
       timeoutHandle = null;
     }
-    try { browserWindow.webContents.off("did-finish-load", settle); } catch { }
-    try { browserWindow.webContents.off("did-fail-load", settle); } catch { }
-    try { browserWindow.off("closed", settle); } catch { }
+    try { browserWindow.webContents.off("did-finish-load", onDidFinishLoad); } catch { }
+    try { browserWindow.webContents.off("did-fail-load", onDidFailLoad); } catch { }
+    try { browserWindow.off("closed", onClosed); } catch { }
     if (mainWindowInitialLoadPromise === promise) {
       mainWindowInitialLoadPromise = null;
     }
+    appendMainLog(`[main-window-load] reason=${label} event=${eventName} ms=${Date.now() - startedAt}`);
     resolvePromise?.();
   };
-  browserWindow.webContents.once("did-finish-load", settle);
-  browserWindow.webContents.once("did-fail-load", settle);
-  browserWindow.once("closed", settle);
-  timeoutHandle = setTimeout(settle, 15000);
+  const onDidFinishLoad = () => settle("did-finish-load");
+  const onDidFailLoad = () => settle("did-fail-load");
+  const onClosed = () => settle("closed");
+  browserWindow.webContents.once("did-finish-load", onDidFinishLoad);
+  browserWindow.webContents.once("did-fail-load", onDidFailLoad);
+  browserWindow.once("closed", onClosed);
+  timeoutHandle = setTimeout(() => settle("timeout"), 15000);
   timeoutHandle.unref?.();
   mainWindowInitialLoadPromise = promise;
   return promise;
+}
+
+async function waitForMainWindowLoadBeforeReveal(reason = "") {
+  const pending = mainWindowInitialLoadPromise;
+  if (!pending) return;
+  const label = String(reason || "unknown").trim() || "unknown";
+  const startedAt = Date.now();
+  try {
+    await pending;
+  } catch (e) {
+    appendMainLog(`[main-window-reveal] pending-load failed reason=${label}: ${e?.message || e}`);
+  }
+  const waitedMs = Date.now() - startedAt;
+  if (waitedMs > 50) {
+    appendMainLog(`[main-window-reveal] waited-for-load reason=${label} ms=${waitedMs}`);
+  }
+}
+
+async function revealMainWindowWhenReady(reason = "") {
+  const label = String(reason || "unknown").trim() || "unknown";
+  await waitForMainWindowLoadBeforeReveal(label);
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  if (!win.isVisible()) {
+    win.show();
+    appendMainLog(`[main-window-reveal] shown reason=${label}`);
+  }
+  win.focus();
 }
 
 async function createWindow(options = {}) {
@@ -5756,12 +5816,8 @@ async function createWindow(options = {}) {
   // ``win && !win.isDestroyed()`` — this is a defense-in-depth guard
   // so a future caller cannot silently trip the leak.
   if (win && !win.isDestroyed()) {
-    if (mainWindowInitialLoadPromise) {
-      try { await mainWindowInitialLoadPromise; } catch { }
-    }
-    if (showWindow && !win.isVisible()) {
-      win.show();
-      win.focus();
+    if (showWindow) {
+      await revealMainWindowWhenReady("create-window-existing");
     }
     return;
   }
@@ -5819,7 +5875,7 @@ async function createWindow(options = {}) {
       backgroundThrottling: false,
     }
   });
-  trackMainWindowInitialLoad(win);
+  trackMainWindowInitialLoad(win, "create-window");
 
   // Refuse navigation to any origin other than the backend. A
   // transcript containing an <a href="https://evil..."> that's clicked
@@ -6317,9 +6373,11 @@ async function createWindow(options = {}) {
     }
   });
   win.on("show", () => {
+    appendMainLog("[main-window] event=show");
     ensureMacDockPresence("main-window-show");
   });
   win.on("hide", () => {
+    appendMainLog("[main-window] event=hide");
     ensureMacDockPresence("main-window-hide");
   });
 
@@ -6394,9 +6452,8 @@ async function createWindow(options = {}) {
     // healthy. Skipping the loader page (pass 28) means this is the
     // very first time the user sees a window — no transition flash,
     // no "starting up" UI, just the ready app.
-    if (showWindow && !win.isVisible()) {
-      win.show();
-      win.focus();
+    if (showWindow) {
+      await revealMainWindowWhenReady("create-window-loaded");
     }
   } catch (err) {
     const stderrTail = (backendStderrTail || "").trim();
@@ -6464,8 +6521,7 @@ async function createWindow(options = {}) {
     `)}`
     );
     if (showWindow && win && !win.isDestroyed()) {
-      if (!win.isVisible()) win.show();
-      win.focus();
+      await revealMainWindowWhenReady("create-window-error");
     }
     let recoveryAttempt = 0;
     const updateRecoveryStatus = async (text, healthy = false) => {
@@ -6513,14 +6569,11 @@ app.on("window-all-closed", () => {
 
 app.on("activate", () => {
   ensureMacDockPresence("activate");
-  const activateTimer = setTimeout(() => {
-    if (shouldSuppressActivateForRecordingStatusCapsule()) {
-      appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
-      return;
-    }
-    ensureWindowVisible({ manual: true, force: true });
-  }, 180);
-  try { activateTimer.unref?.(); } catch { }
+  if (shouldSuppressActivateForRecordingStatusCapsule()) {
+    appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
+    return;
+  }
+  ensureWindowVisible({ manual: true, force: true });
 });
 
 /**
