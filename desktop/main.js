@@ -4568,7 +4568,8 @@ async function pasteLatestTranscriptFromShortcut() {
       windowTitle: compactLogText(front.windowTitle || "", 80),
       timedOut: !!front.timedOut,
     });
-    setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
+    const shortcutPasteTarget = capturePasteTargetFromFrontInfo(front);
+    setCapturedPasteTarget(shortcutPasteTarget);
 
     const text = await getLatestTranscriptText();
     if (!text) {
@@ -4588,7 +4589,7 @@ async function pasteLatestTranscriptFromShortcut() {
       clipboard.writeText(text);
     } catch { }
 
-    const pasted = await tryPasteToFocusedField(text, pasteTarget);
+    const pasted = await tryPasteToFocusedField(text, shortcutPasteTarget);
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
       method: pasted.method || "unknown",
@@ -4596,7 +4597,7 @@ async function pasteLatestTranscriptFromShortcut() {
       reason: compactLogText(pasted.reason || ""),
     });
     appendMainLog(
-      `[paste-last] ${pasteTargetSummary(pasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
+      `[paste-last] ${pasteTargetSummary(shortcutPasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
     await setRecordingStatus(pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
