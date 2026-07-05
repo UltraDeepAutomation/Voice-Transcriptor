@@ -302,6 +302,7 @@ type LiveStatusSnapshot = {
   busy: boolean;
   recording: boolean;
   recordingId: number;
+  autoSendEnter: boolean;
 };
 type ShortcutBridgeAction = "capture-start" | "capture-cancel" | "update";
 type ShortcutPair = { record: string; paste: string };
@@ -6492,6 +6493,7 @@ function liveStatusSnapshot(): LiveStatusSnapshot {
     busy: isBusy,
     recording: isRecording,
     recordingId: currentRecordingId,
+    autoSendEnter: readAutoSendEnterEnabled(),
   };
 }
 

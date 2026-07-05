@@ -1992,10 +1992,10 @@ async function toggleRecordingFromShortcut() {
         const isRec = !!(window.__transcriptorIsRecording);
         const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
         const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-        const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
         const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
           ? window.__transcriptorLiveStatusSnapshot()
           : null;
+        const autoSendEnter = !!liveSnapshot?.autoSendEnter;
         const timerText = String(liveSnapshot?.timerText || '00:00').trim();
         window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
         return { ok: true, recording: !isRec, auto, autoSendEnter, timerText, recordingId };
@@ -2118,7 +2118,7 @@ async function stopRecordingFromMainProcess() {
             ? window.__transcriptorLiveStatusSnapshot()
             : null;
           const timerText = String(liveSnapshot?.timerText || '00:00').trim();
-          const autoSendEnter = !!(document.getElementById('autoSendEnterToggle') && document.getElementById('autoSendEnterToggle').classList.contains('active'));
+          const autoSendEnter = !!liveSnapshot?.autoSendEnter;
           if (!isRec) return { ok: false, recording: false, timerText, recordingId, auto, autoSendEnter };
           if (expectedRecordingId > 0 && recordingId !== expectedRecordingId) {
             return { ok: false, recording: true, stale: true, timerText, recordingId, expectedRecordingId, auto, autoSendEnter };
