@@ -283,6 +283,7 @@ if (!singleInstanceLock) {
 }
 
 app.on("second-instance", () => {
+  ensureMacDockPresence("second-instance");
   ensureWindowVisible({ manual: true, force: true });
 });
 
@@ -501,9 +502,7 @@ function traceEnd(ctx, status = "done", details = {}) {
 async function ensureWindowVisible(options = {}) {
   const force = !!options.force;
   if (!force && recordingStopInFlight) return;
-  if (process.platform === "darwin" && app.dock) {
-    try { app.dock.show(); } catch { }
-  }
+  ensureMacDockPresence("ensure-window-visible");
   if (!win || win.isDestroyed()) {
     await createWindow();
     return;
@@ -515,6 +514,27 @@ async function ensureWindowVisible(options = {}) {
   if (win.isMinimized()) win.restore();
   if (!win.isVisible()) win.show();
   win.focus();
+}
+
+function ensureMacDockPresence(reason = "") {
+  if (process.platform !== "darwin") return;
+  const label = String(reason || "unknown").trim() || "unknown";
+  try {
+    app.setActivationPolicy("regular");
+  } catch (e) {
+    appendMainLog(`[dock] activation-policy failed reason=${label}: ${e?.message || e}`);
+  }
+  if (!app.dock) return;
+  try {
+    const result = app.dock.show();
+    if (result && typeof result.catch === "function") {
+      result.catch((e) => {
+        appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
+      });
+    }
+  } catch (e) {
+    appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
+  }
 }
 
 function getRepoRoot() {
@@ -5726,6 +5746,7 @@ function trackMainWindowInitialLoad(browserWindow) {
 
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
+  ensureMacDockPresence(showWindow ? "create-window-visible" : "create-window-hidden");
 
   // Idempotency guard: if we already own a live BrowserWindow, reuse
   // it instead of spawning a second one. Creating a second window
@@ -6290,12 +6311,16 @@ async function createWindow(options = {}) {
       if (shortcutCaptureAbortHandler) {
         shortcutCaptureAbortHandler("window-hide");
       }
+      ensureMacDockPresence("main-window-close-hide");
       win.hide();
       return;
     }
   });
   win.on("show", () => {
-    if (process.platform === "darwin" && app.dock) app.dock.show();
+    ensureMacDockPresence("main-window-show");
+  });
+  win.on("hide", () => {
+    ensureMacDockPresence("main-window-hide");
   });
 
   win.on("closed", () => {
@@ -6481,10 +6506,13 @@ async function createWindow(options = {}) {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
+  } else {
+    ensureMacDockPresence("window-all-closed");
   }
 });
 
 app.on("activate", () => {
+  ensureMacDockPresence("activate");
   const activateTimer = setTimeout(() => {
     if (shouldSuppressActivateForRecordingStatusCapsule()) {
       appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
@@ -6712,10 +6740,7 @@ app.whenReady().then(async () => {
   cleanupStaleTranscriptTmpFiles();
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
-    app.setActivationPolicy("regular");
-  }
-  if (process.platform === "darwin" && app.dock) {
-    app.dock.show();
+    ensureMacDockPresence("ready");
   }
   // macOS-only: poll Accessibility permission. Users who recorded
   // successfully once, then revoked the permission via System Settings
