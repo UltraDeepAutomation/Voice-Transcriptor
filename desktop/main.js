@@ -623,21 +623,6 @@ function scheduleUnexpectedMainWindowHideRecovery(reason = "") {
   if (!shouldRecoverUnexpectedMainWindowHide()) return;
   const label = normalizeLifecycleReason(reason || "unexpected-window-hide");
   const protectedReveal = isMainWindowRevealProtectionInFlight();
-  const now = Date.now();
-  if (now - mainWindowUnexpectedHideRecoveryWindowStartedAt > MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_WINDOW_MS) {
-    mainWindowUnexpectedHideRecoveryWindowStartedAt = now;
-    mainWindowUnexpectedHideRecoveryCount = 0;
-  }
-  mainWindowUnexpectedHideRecoveryCount += 1;
-  const recoveryLimit = protectedReveal
-    ? MAIN_WINDOW_PROTECTED_HIDE_RECOVERY_LIMIT
-    : MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_LIMIT;
-  if (mainWindowUnexpectedHideRecoveryCount > recoveryLimit) {
-    appendMainLog(
-      `[main-window-hide-recovery] suppressed reason=${label} protected=${protectedReveal ? 1 : 0} count=${mainWindowUnexpectedHideRecoveryCount} ${mainWindowLifecycleSnapshot()}`,
-    );
-    return;
-  }
   if (mainWindowUnexpectedHideRecoveryTimer) {
     if (!protectedReveal) return;
     clearTimeout(mainWindowUnexpectedHideRecoveryTimer);
@@ -658,6 +643,21 @@ function scheduleUnexpectedMainWindowHideRecovery(reason = "") {
         return;
       }
     } catch {
+      return;
+    }
+    const now = Date.now();
+    if (now - mainWindowUnexpectedHideRecoveryWindowStartedAt > MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_WINDOW_MS) {
+      mainWindowUnexpectedHideRecoveryWindowStartedAt = now;
+      mainWindowUnexpectedHideRecoveryCount = 0;
+    }
+    mainWindowUnexpectedHideRecoveryCount += 1;
+    const recoveryLimit = protectedReveal
+      ? MAIN_WINDOW_PROTECTED_HIDE_RECOVERY_LIMIT
+      : MAIN_WINDOW_UNEXPECTED_HIDE_RECOVERY_LIMIT;
+    if (mainWindowUnexpectedHideRecoveryCount > recoveryLimit) {
+      appendMainLog(
+        `[main-window-hide-recovery] suppressed reason=${label} protected=${protectedReveal ? 1 : 0} count=${mainWindowUnexpectedHideRecoveryCount} ${mainWindowLifecycleSnapshot()}`,
+      );
       return;
     }
     appendMainLog(
