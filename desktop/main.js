@@ -787,10 +787,10 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   waveHeight: 12,
   waveBarWidth: 1.4,
   waveBarGap: 1.8,
-  waveFrameMs: 33,
-  waveLevelTickMs: 96,
-  waveIdleTickMs: 150,
-  waveActiveStaleMs: 520,
+  waveFrameMs: 16,
+  waveLevelTickMs: 148,
+  waveIdleTickMs: 240,
+  waveActiveStaleMs: 760,
 });
 
 const recordingStatusCapsuleState = {
@@ -803,6 +803,7 @@ const recordingStatusCapsuleState = {
 
 let recordingStatusCapsuleGeometry = null;
 let recordingStatusSuppressActivateUntil = 0;
+let recordingStatusCapsuleLevelUpdateInFlight = false;
 
 function clampRecordingStatusCapsuleDimension(value, min, max) {
   const n = Number(value);
@@ -1555,9 +1556,16 @@ function startRecordingStateMonitor() {
         const isRec = !!state?.isRec;
         recordingStatusCapsuleState.level = safeLevel;
         if (recordingStatusWindow && !recordingStatusWindow.isDestroyed() && recordingStatusWindow.isVisible()) {
-          updateRecordingStatusCapsule({ level: safeLevel }).catch((e) => {
-            appendMainLog(`[recording-capsule] level update failed: ${e?.message || e}`);
-          });
+          if (!recordingStatusCapsuleLevelUpdateInFlight) {
+            recordingStatusCapsuleLevelUpdateInFlight = true;
+            updateRecordingStatusCapsule({ level: safeLevel })
+              .catch((e) => {
+                appendMainLog(`[recording-capsule] level update failed: ${e?.message || e}`);
+              })
+              .finally(() => {
+                recordingStatusCapsuleLevelUpdateInFlight = false;
+              });
+          }
         }
         const cfg = recordingAutoStopConfig || DEFAULT_RECORDING_AUTO_STOP_CONFIG;
         const now = Date.now();
