@@ -115,6 +115,7 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
 
     def test_health_exposes_upload_extension_ssot(self):
         payload = self.main.health()
+        self.assertEqual(payload["max_upload_bytes"], self.main.MAX_UPLOAD_BYTES)
         self.assertIn("accepted_audio_exts", payload)
         self.assertIn("wav", payload["accepted_audio_exts"])
         self.assertIn("opus", payload["accepted_audio_exts"])
@@ -129,6 +130,19 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             payload["runtime_limits"]["upload_queue_max_parallel"],
             self.main.jobs.max_workers,
         )
+
+    def test_frontend_bootstrap_uses_health_runtime_ssot(self):
+        health_payload = self.main.health()
+        bootstrap_payload = self.main._frontend_runtime_payload()
+
+        for key in (
+            "max_upload_bytes",
+            "accepted_audio_exts",
+            "live_sample_rate_hz",
+            "model_catalog",
+            "runtime_limits",
+        ):
+            self.assertEqual(bootstrap_payload[key], health_payload[key])
 
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):

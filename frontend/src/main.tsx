@@ -333,6 +333,9 @@ type ModelCatalogPayload = {
 };
 
 type BackendBootstrapPayload = {
+  max_upload_bytes?: unknown;
+  accepted_audio_exts?: unknown;
+  live_sample_rate_hz?: unknown;
   model_catalog?: ModelCatalogPayload;
   runtime_limits?: {
     upload_queue_max_parallel?: unknown;
@@ -510,17 +513,13 @@ function installAppearanceStateClasses(): void {
 installAppearanceStateClasses();
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
-// SSOT: backend defines MAX_UPLOAD_BYTES in backend/main.py and surfaces
-// it in /api/health under "max_upload_bytes". The constant below is the
-// fallback that applies BEFORE the first /api/health response lands (cold
-// boot, /api/health timeout in dev, mock backend without the field). It
-// is never the source of truth — refreshNetworkState() rewrites this
-// value from every successful health probe so the cap can never drift
-// from what the backend will actually accept on POST.
-let MAX_FILE_BYTES = 500 * 1024 * 1024;
+// Backend-owned; injected in window.__TRANSCRIPTOR_BOOTSTRAP and refreshed
+// through /api/health. Until it arrives, the renderer skips client-side size
+// rejection and lets the backend enforce the real cap.
+let MAX_FILE_BYTES = 0;
 // SSOT: backend/main.py exposes backend.audio_constants.LIVE_SAMPLE_RATE_HZ
-// through /api/health.live_sample_rate_hz. This fallback only applies before
-// the first health response lands.
+// through bootstrap and /api/health. This fallback is only for dev shells
+// that load the renderer without backend-injected bootstrap.
 let LIVE_SAMPLE_RATE_HZ = 16_000;
 const UI_TOKENS = {
   polling: {
@@ -555,17 +554,7 @@ const UI_TOKENS = {
     pollStepMs: 30,
   },
 } as const;
-// Fallback accepted extensions used before the first /api/health response.
-// Backend/main.py:ALLOWED_AUDIO_EXTS is the runtime SSOT; refreshNetworkState()
-// mutates this set from health.accepted_audio_exts after boot.
-const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
-  // Audio containers — natively understood by Deepgram REST and the
-  // OpenRouter audio-input pipeline. Mirrors backend/main.py:296.
-  "wav", "mp3", "m4a", "flac", "ogg", "oga", "opus", "aac", "webm", "wma",
-  // Video containers — backend extracts audio via ffmpeg before
-  // forwarding to remote providers. Mirrors backend/main.py:307.
-  "mp4", "m4v", "mov", "mkv", "avi", "mpg", "mpeg", "3gp",
-]);
+const ACCEPTED_AUDIO_VIDEO_EXTS = new Set<string>();
 const LEGACY_LIVE_DRAFT_STORAGE_KEY = "transcriptor.liveDraft.v1";
 const LEGACY_LIVE_DRAFT_CORRUPT_STORAGE_PREFIX = "transcriptor.liveDraft.corrupt.";
 const LEGACY_UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
@@ -724,8 +713,35 @@ function applyHealthModelCatalog(catalog: unknown): void {
 function applyBackendBootstrap(): void {
   const bootstrap = window.__TRANSCRIPTOR_BOOTSTRAP;
   if (!bootstrap || typeof bootstrap !== "object") return;
+  applyBackendRuntimeConfig(bootstrap);
   applyHealthModelCatalog(bootstrap.model_catalog);
   applyRuntimeLimits(bootstrap.runtime_limits);
+}
+
+function applyBackendRuntimeConfig(payload: unknown): void {
+  if (!payload || typeof payload !== "object") return;
+  const root = payload as {
+    max_upload_bytes?: unknown;
+    accepted_audio_exts?: unknown;
+    live_sample_rate_hz?: unknown;
+  };
+  const uploadBytes = Number(root.max_upload_bytes);
+  if (Number.isFinite(uploadBytes) && uploadBytes > 0) {
+    MAX_FILE_BYTES = Math.trunc(uploadBytes);
+  }
+  const sampleRate = Number(root.live_sample_rate_hz);
+  if (Number.isFinite(sampleRate) && sampleRate >= 8_000 && sampleRate <= 96_000) {
+    LIVE_SAMPLE_RATE_HZ = Math.trunc(sampleRate);
+  }
+  if (Array.isArray(root.accepted_audio_exts)) {
+    const nextExts = root.accepted_audio_exts
+      .map((value) => String(value || "").trim().toLowerCase().replace(/^\./, ""))
+      .filter((value) => /^[a-z0-9]+$/.test(value));
+    if (nextExts.length > 0) {
+      ACCEPTED_AUDIO_VIDEO_EXTS.clear();
+      for (const ext of nextExts) ACCEPTED_AUDIO_VIDEO_EXTS.add(ext);
+    }
+  }
 }
 
 function applyRuntimeLimits(limits: unknown): void {
@@ -3408,42 +3424,13 @@ async function refreshNetworkState(): Promise<void> {
   try {
     const health = await fetch("/api/health");
     if (!health.ok) throw new Error(`health ${health.status}`);
-    // SSOT for the upload cap: backend's /api/health surfaces
-    // ``max_upload_bytes`` (= MAX_UPLOAD_BYTES in backend/main.py).
-    // We refresh our cached cap from every successful health probe
-    // so the frontend never silently allows more bytes than the
-    // backend will accept (would 413 mid-upload after the user
-    // already waited for it). Defensive Number/Finite check tolerates
-    // an old backend without the field — falls back to current value.
     try {
-      const healthJson = (await health.clone().json()) as {
-        max_upload_bytes?: unknown;
-        accepted_audio_exts?: unknown;
-        live_sample_rate_hz?: unknown;
-        model_catalog?: unknown;
-        runtime_limits?: unknown;
-      };
-      const candidate = Number(healthJson?.max_upload_bytes);
-      if (Number.isFinite(candidate) && candidate > 0) {
-        MAX_FILE_BYTES = Math.trunc(candidate);
-      }
-      const sampleRateCandidate = Number(healthJson?.live_sample_rate_hz);
-      if (Number.isFinite(sampleRateCandidate) && sampleRateCandidate >= 8_000 && sampleRateCandidate <= 96_000) {
-        LIVE_SAMPLE_RATE_HZ = Math.trunc(sampleRateCandidate);
-      }
-      if (Array.isArray(healthJson?.accepted_audio_exts)) {
-        const nextExts = healthJson.accepted_audio_exts
-          .map((value) => String(value || "").trim().toLowerCase().replace(/^\./, ""))
-          .filter((value) => /^[a-z0-9]+$/.test(value));
-        if (nextExts.length > 0) {
-          ACCEPTED_AUDIO_VIDEO_EXTS.clear();
-          for (const ext of nextExts) ACCEPTED_AUDIO_VIDEO_EXTS.add(ext);
-        }
-      }
+      const healthJson = (await health.clone().json()) as BackendBootstrapPayload;
+      applyBackendRuntimeConfig(healthJson);
       applyHealthModelCatalog(healthJson?.model_catalog);
       applyRuntimeLimits(healthJson?.runtime_limits);
     } catch (e) {
-      // Non-JSON or shape mismatch — keep prior MAX_FILE_BYTES.
+      // Non-JSON or shape mismatch — keep prior backend runtime config.
       console.debug("health body parse skipped", e);
     }
     // First successful /api/health means the Python backend is up and
@@ -10056,15 +10043,9 @@ const UPLOAD_EMPTY_TRANSCRIPT_TEXT = "[No speech captured]";
 function uploadFileSizeCap(): number {
   return MAX_FILE_BYTES;
 }
-// Accept-set mirrors the backend's allowed extensions plus video
-// containers (the backend's ffmpeg path demuxes audio out of any of
-// these). Drag-drop browsers don't enforce ``accept`` so we
-// double-check at the JS level.
-// Alias to the SSOT set defined near the top of the file. Kept
-// under its old name so existing call sites (enqueueUploadFile)
-// don't need editing; the underlying set is the single canonical
-// list mirroring backend ALLOWED_AUDIO_EXTS — adding a new ext is
-// now a one-line change in ACCEPTED_AUDIO_VIDEO_EXTS.
+// Hydrated from backend ALLOWED_AUDIO_EXTS through bootstrap/health.
+// Drag-drop browsers don't enforce ``accept`` so we double-check at the
+// JS level once the backend-owned set is known.
 const UPLOAD_ALLOWED_EXTS = ACCEPTED_AUDIO_VIDEO_EXTS;
 
 function uploadExtensionFromName(name: string): string {
@@ -10076,14 +10057,14 @@ function uploadExtensionFromName(name: string): string {
 
 function uploadFileValidationError(file: File): string {
   const cap = uploadFileSizeCap();
-  if (file.size > cap) {
+  if (cap > 0 && file.size > cap) {
     return `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`;
   }
   const ext = uploadExtensionFromName(file.name);
   if (!ext) {
     return "Unsupported file type. Drop an audio or video file with a supported extension.";
   }
-  if (!UPLOAD_ALLOWED_EXTS.has(ext)) {
+  if (UPLOAD_ALLOWED_EXTS.size > 0 && !UPLOAD_ALLOWED_EXTS.has(ext)) {
     return `Unsupported file type ".${ext}". Drop an audio or video file.`;
   }
   return "";
@@ -10123,14 +10104,14 @@ function uploadSourcePathValidationError(sourcePath: string, sizeBytes = 0): str
   const path = normalizeUploadSourcePath(sourcePath);
   if (!path) return "Source file path is missing. Choose the file again.";
   const cap = uploadFileSizeCap();
-  if (sizeBytes > cap) {
+  if (cap > 0 && sizeBytes > cap) {
     return `File too large (${Math.round(sizeBytes / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`;
   }
   const ext = uploadExtensionFromName(uploadPathBasename(path));
   if (!ext) {
     return "Unsupported file type. Choose an audio or video file with a supported extension.";
   }
-  if (!UPLOAD_ALLOWED_EXTS.has(ext)) {
+  if (UPLOAD_ALLOWED_EXTS.size > 0 && !UPLOAD_ALLOWED_EXTS.has(ext)) {
     return `Unsupported file type ".${ext}". Drop an audio or video file.`;
   }
   return "";

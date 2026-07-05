@@ -1146,13 +1146,7 @@ def index():
     if not index_path.exists():
         return "frontend/dist/index.html not found. Run `npm --prefix frontend run build`."
     html = index_path.read_text(encoding="utf-8")
-    bootstrap_payload = {
-        "model_catalog": health_model_catalog(),
-        "runtime_limits": {
-            "upload_queue_max_parallel": jobs.max_workers,
-            "upload_queue_max_persisted_items": UPLOAD_QUEUE_MAX_PERSISTED_ITEMS,
-        },
-    }
+    bootstrap_payload = _frontend_runtime_payload()
     injected = (
         "<script>"
         f'window.__TRANSCRIPTOR_API_TOKEN={json.dumps(API_TOKEN)};'
@@ -1166,16 +1160,8 @@ def index():
     return HTMLResponse(html, headers=_INDEX_CACHE_HEADERS)
 
 
-@app.get("/api/health")
-def health():
-    # Backend-owned limits surface here so the frontend doesn't carry a
-    # second copy that can drift from the server-side enforcement.
-    # SSOT: MAX_UPLOAD_BYTES is the only definition; frontend reads
-    # this field on every refreshNetworkState tick and refreshes its
-    # cached cap. If the field is absent (older / dev backend) the
-    # frontend keeps its hardcoded fallback.
+def _frontend_runtime_payload() -> dict[str, Any]:
     return {
-        "ok": True,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "accepted_audio_exts": sorted(ext.lstrip(".") for ext in ALLOWED_AUDIO_EXTS),
         "live_sample_rate_hz": LIVE_SAMPLE_RATE_HZ,
@@ -1184,6 +1170,14 @@ def health():
             "upload_queue_max_parallel": jobs.max_workers,
             "upload_queue_max_persisted_items": UPLOAD_QUEUE_MAX_PERSISTED_ITEMS,
         },
+    }
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "ok": True,
+        **_frontend_runtime_payload(),
         "boot_nonce": BOOT_NONCE,
     }
 
