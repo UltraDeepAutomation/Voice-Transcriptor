@@ -220,6 +220,8 @@ let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
 let mainWindowRevealInFlight = null;
+let macDockPresenceRequested = false;
+let macDockPresenceEnsured = false;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
 const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 let recordingSilenceStartedAt = 0;
@@ -549,20 +551,34 @@ function hideMainWindow(reason = "") {
 function ensureMacDockPresence(reason = "") {
   if (process.platform !== "darwin") return;
   const label = String(reason || "unknown").trim() || "unknown";
+  if (macDockPresenceEnsured || macDockPresenceRequested) return;
+  macDockPresenceRequested = true;
   try {
     app.setActivationPolicy("regular");
   } catch (e) {
+    macDockPresenceRequested = false;
     appendMainLog(`[dock] activation-policy failed reason=${label}: ${e?.message || e}`);
+    return;
   }
   if (!app.dock) return;
   try {
     const result = app.dock.show();
     if (result && typeof result.catch === "function") {
-      result.catch((e) => {
-        appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
-      });
+      result
+        .then(() => {
+          macDockPresenceEnsured = true;
+          appendMainLog(`[dock] presence ensured reason=${label}`);
+        })
+        .catch((e) => {
+          macDockPresenceRequested = false;
+          appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
+        });
+      return;
     }
+    macDockPresenceEnsured = true;
+    appendMainLog(`[dock] presence ensured reason=${label}`);
   } catch (e) {
+    macDockPresenceRequested = false;
     appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
   }
 }
@@ -5750,11 +5766,9 @@ async function createWindow(options = {}) {
   });
   win.on("show", () => {
     appendMainLog("[main-window] event=show");
-    ensureMacDockPresence("main-window-show");
   });
   win.on("hide", () => {
     appendMainLog("[main-window] event=hide");
-    ensureMacDockPresence("main-window-hide");
   });
 
   win.on("closed", () => {
