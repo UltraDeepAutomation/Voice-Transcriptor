@@ -1200,6 +1200,23 @@ def put_upload_queue_state(payload: dict = Body(...), _auth: None = Depends(_req
     return {"ok": True, **state}
 
 
+@app.get("/api/ui/live-draft")
+def get_live_draft_state(_auth: None = Depends(_require_api_auth)):
+    return _read_live_draft_state()
+
+
+@app.put("/api/ui/live-draft")
+def put_live_draft_state(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+    state = _write_live_draft_state(payload)
+    return {"ok": True, **state}
+
+
+@app.delete("/api/ui/live-draft")
+def delete_live_draft_state(session_id: str = "", _auth: None = Depends(_require_api_auth)):
+    state = _clear_live_draft_state(session_id)
+    return {"ok": True, **state}
+
+
 @app.post("/api/transcribe/warmup")
 async def transcribe_warmup(
     _auth: None = Depends(_require_api_auth),
@@ -1878,6 +1895,95 @@ def _read_upload_queue_state() -> dict[str, Any]:
     except Exception as exc:
         logger.warning("upload queue state read failed: %s", _safe_error_text(exc))
         return _default_upload_queue_state()
+
+
+LIVE_DRAFT_STATE_PATH = UI_STATE_DIR / "live_draft.json"
+LIVE_DRAFT_STATE_VERSION = 1
+LIVE_DRAFT_MAX_TEXT_CHARS = 200_000
+
+
+def _default_live_draft_state() -> dict[str, Any]:
+    return {
+        "version": LIVE_DRAFT_STATE_VERSION,
+        "draft": None,
+    }
+
+
+def _live_draft_str(value: object, max_len: int = 4096) -> str:
+    return str(value or "").strip()[:max_len]
+
+
+def _live_draft_number(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 0 <= parsed < float("inf") else None
+
+
+def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="live draft state must be an object")
+    draft_src = payload.get("draft") if "draft" in payload and len(payload) <= 2 else payload
+    if draft_src is None:
+        return None
+    if not isinstance(draft_src, dict):
+        raise HTTPException(status_code=400, detail="live draft must be an object")
+    return {
+        "session_id": _live_draft_str(draft_src.get("session_id"), 128),
+        "started_at": _live_draft_number(draft_src.get("started_at")) or 0,
+        "updated_at": _live_draft_number(draft_src.get("updated_at")) or int(time.time() * 1000),
+        "recording": bool(draft_src.get("recording") is True),
+        "timer": _live_draft_str(draft_src.get("timer"), 32),
+        "title": _live_draft_str(draft_src.get("title"), 512),
+        "source_text": _live_draft_str(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "transcript_text": _live_draft_str(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "provider": _live_draft_str(draft_src.get("provider"), 32),
+        "model": _live_draft_str(draft_src.get("model"), 256),
+        "language": _live_draft_str(draft_src.get("language"), 32),
+        "archive_dir": _live_draft_str(draft_src.get("archive_dir"), 4096),
+        "recording_collection": _live_draft_str(draft_src.get("recording_collection"), 64),
+    }
+
+
+def _normalize_live_draft_state(payload: object) -> dict[str, Any]:
+    return {
+        "version": LIVE_DRAFT_STATE_VERSION,
+        "draft": _normalize_live_draft(payload),
+    }
+
+
+def _read_live_draft_state() -> dict[str, Any]:
+    if not LIVE_DRAFT_STATE_PATH.exists():
+        return _default_live_draft_state()
+    try:
+        raw = json.loads(LIVE_DRAFT_STATE_PATH.read_text(encoding="utf-8"))
+        return _normalize_live_draft_state(raw)
+    except Exception as exc:
+        logger.warning("live draft state read failed: %s", _safe_error_text(exc))
+        return _default_live_draft_state()
+
+
+def _write_live_draft_state(payload: object) -> dict[str, Any]:
+    state = _normalize_live_draft_state(payload)
+    atomic_write_json(LIVE_DRAFT_STATE_PATH, state)
+    return state
+
+
+def _clear_live_draft_state(session_id: str = "") -> dict[str, Any]:
+    current = _read_live_draft_state()
+    draft = current.get("draft") if isinstance(current.get("draft"), dict) else None
+    expected_owner = _live_draft_str(session_id, 128)
+    actual_owner = _live_draft_str(draft.get("session_id"), 128) if draft else ""
+    if expected_owner and actual_owner and actual_owner != expected_owner:
+        return current
+    state = _default_live_draft_state()
+    atomic_write_json(LIVE_DRAFT_STATE_PATH, state)
+    return state
 
 
 _rec_dir_cache: Optional[Path] = None

@@ -566,7 +566,8 @@ const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
   // forwarding to remote providers. Mirrors backend/main.py:307.
   "mp4", "m4v", "mov", "mkv", "avi", "mpg", "mpeg", "3gp",
 ]);
-const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
+const LEGACY_LIVE_DRAFT_STORAGE_KEY = "transcriptor.liveDraft.v1";
+const LEGACY_LIVE_DRAFT_CORRUPT_STORAGE_PREFIX = "transcriptor.liveDraft.corrupt.";
 const LEGACY_UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
 const LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_SAVE_DEBOUNCE_MS = 180;
@@ -2113,6 +2114,15 @@ async function apiPut<T>(url: string, body: unknown): Promise<T> {
   return (await r.json()) as T;
 }
 
+async function apiDelete<T>(url: string): Promise<T> {
+  const r = await fetch(url, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!r.ok) throw new Error(await parseError(r));
+  return (await r.json()) as T;
+}
+
 function downsample(buf: Float32Array, inRate: number, outRate: number): Float32Array {
   if (outRate === inRate) return new Float32Array(buf);
   const r = inRate / outRate;
@@ -3590,53 +3600,11 @@ function resetVU(): void {
   setVU(0);
 }
 
-function persistLiveDraft(recording: boolean): void {
-  try {
-    const liveText = getCanonicalLiveSourceText();
-    const finalText = ($("finalOutput").textContent || "").trim();
-    const timerText = liveTimerText;
-    const title = "Recording " + new Date(startAt || Date.now()).toLocaleString();
-    const draft = {
-      session_id: activeLiveSessionId || activeUiSessionToken || "",
-      started_at: startAt || Date.now(),
-      updated_at: Date.now(),
-      recording,
-      timer: timerText,
-      title,
-      source_text: liveText,
-      transcript_text: finalText,
-      provider: activeLiveSessionSnapshot?.provider ?? readProviderSelection(),
-      model:
-        activeLiveSessionSnapshot?.model ||
-        getRemoteModelValue(readProviderSelection()),
-      language: activeLiveSessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
-      archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
-      recording_collection: RECORDING_COLLECTIONS.live,
-    };
-    localStorage.setItem(LIVE_DRAFT_KEY, JSON.stringify(draft));
-  } catch (e) {
-    // localStorage quota or serialization problems are non-fatal.
-    console.debug("persistLiveDraft skipped", e);
-  }
-}
-
-function clearLiveDraft(sessionToken = ""): void {
-  try {
-    if (sessionToken) {
-      const raw = localStorage.getItem(LIVE_DRAFT_KEY) || "";
-      if (raw) {
-        const parsed = JSON.parse(raw) as { session_id?: unknown };
-        const owner = String(parsed.session_id || "").trim();
-        if (owner && owner !== sessionToken) return;
-      }
-    }
-    localStorage.removeItem(LIVE_DRAFT_KEY);
-  } catch (e) {
-    console.debug("clearLiveDraft skipped", e);
-  }
-}
-
 interface PersistedLiveDraft {
+  session_id?: string;
+  started_at?: number;
+  recording?: boolean;
+  timer?: string;
   title?: string;
   source_text?: string;
   transcript_text?: string;
@@ -3649,16 +3617,109 @@ interface PersistedLiveDraft {
   updated_at?: number;
 }
 
-function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
-  let parsed: unknown;
+type LiveDraftOperation =
+  | { kind: "put"; payload: PersistedLiveDraft }
+  | { kind: "clear"; sessionToken: string };
+
+const liveDraftOperationQueue: LiveDraftOperation[] = [];
+let liveDraftOperationRunner: Promise<void> | null = null;
+
+function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
+  const provider = activeLiveSessionSnapshot?.provider ?? readProviderSelection();
+  return {
+    session_id: activeLiveSessionId || activeUiSessionToken || "",
+    started_at: startAt || Date.now(),
+    updated_at: Date.now(),
+    recording,
+    timer: liveTimerText,
+    title: "Recording " + new Date(startAt || Date.now()).toLocaleString(),
+    source_text: getCanonicalLiveSourceText(),
+    transcript_text: ($("finalOutput").textContent || "").trim(),
+    provider,
+    model: activeLiveSessionSnapshot?.model || getRemoteModelValue(provider),
+    language: activeLiveSessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
+    archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
+    recording_collection: RECORDING_COLLECTIONS.live,
+  };
+}
+
+async function drainLiveDraftOperations(): Promise<void> {
   try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    console.warn("live draft: invalid JSON, discarding", e);
-    return null;
+    while (liveDraftOperationQueue.length) {
+      const op = liveDraftOperationQueue.shift();
+      if (!op) continue;
+      try {
+        if (op.kind === "put") {
+          await apiPut<{ ok?: boolean }>("/api/ui/live-draft", op.payload);
+        } else {
+          const query = op.sessionToken ? `?session_id=${encodeURIComponent(op.sessionToken)}` : "";
+          await apiDelete<{ ok?: boolean }>(`/api/ui/live-draft${query}`);
+        }
+      } catch (e) {
+        console.debug(`live draft ${op.kind} skipped`, e);
+      }
+    }
+  } finally {
+    liveDraftOperationRunner = null;
+    if (liveDraftOperationQueue.length) {
+      void startLiveDraftOperationRunner();
+    }
   }
+}
+
+function startLiveDraftOperationRunner(): Promise<void> {
+  if (!liveDraftOperationRunner) {
+    liveDraftOperationRunner = drainLiveDraftOperations();
+  }
+  return liveDraftOperationRunner;
+}
+
+function enqueueLiveDraftOperation(op: LiveDraftOperation): Promise<void> {
+  const lastIndex = liveDraftOperationQueue.length - 1;
+  const last = lastIndex >= 0 ? liveDraftOperationQueue[lastIndex] : null;
+  if (op.kind === "put" && last?.kind === "put") {
+    liveDraftOperationQueue[lastIndex] = op;
+  } else {
+    liveDraftOperationQueue.push(op);
+  }
+  return startLiveDraftOperationRunner();
+}
+
+function persistLiveDraftPayload(payload: PersistedLiveDraft): Promise<void> {
+  return enqueueLiveDraftOperation({ kind: "put", payload });
+}
+
+function persistLiveDraft(recording: boolean): void {
+  try {
+    void persistLiveDraftPayload(buildLiveDraftPayload(recording));
+  } catch (e) {
+    console.debug("persistLiveDraft skipped", e);
+  }
+}
+
+function clearLegacyLiveDraft(sessionToken = ""): void {
+  try {
+    if (sessionToken) {
+      const raw = localStorage.getItem(LEGACY_LIVE_DRAFT_STORAGE_KEY) || "";
+      if (raw) {
+        const parsed = JSON.parse(raw) as { session_id?: unknown };
+        const owner = String(parsed.session_id || "").trim();
+        if (owner && owner !== sessionToken) return;
+      }
+    }
+    localStorage.removeItem(LEGACY_LIVE_DRAFT_STORAGE_KEY);
+  } catch (e) {
+    console.debug("legacy live draft cleanup skipped", e);
+  }
+}
+
+function clearLiveDraft(sessionToken = ""): Promise<void> {
+  clearLegacyLiveDraft(sessionToken);
+  return enqueueLiveDraftOperation({ kind: "clear", sessionToken });
+}
+
+function parsePersistedLiveDraftPayload(parsed: unknown): PersistedLiveDraft | null {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    console.warn("live draft: top-level is not an object, discarding");
     return null;
   }
   // Structural type guard: every field that we use is coerced to its
@@ -3677,6 +3738,10 @@ function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
     return Number.isFinite(n) ? n : 0;
   };
   return {
+    session_id: pickString("session_id"),
+    started_at: pickNumber("started_at"),
+    recording: obj.recording === true,
+    timer: pickString("timer"),
     title: pickString("title"),
     source_text: pickString("source_text"),
     transcript_text: pickString("transcript_text"),
@@ -3690,25 +3755,60 @@ function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
   };
 }
 
-async function recoverLiveDraftIfAny(): Promise<void> {
+function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
+  try {
+    return parsePersistedLiveDraftPayload(JSON.parse(raw));
+  } catch (e) {
+    console.warn("live draft: invalid JSON, discarding", e);
+    return null;
+  }
+}
+
+async function readBackendLiveDraft(): Promise<PersistedLiveDraft | null> {
+  try {
+    const state = await apiGet<{ draft?: unknown }>("/api/ui/live-draft");
+    return parsePersistedLiveDraftPayload(state.draft);
+  } catch (e) {
+    console.debug("live draft: backend read failed", e);
+    return null;
+  }
+}
+
+function readLegacyLiveDraft(): PersistedLiveDraft | null {
   let raw = "";
   try {
-    raw = localStorage.getItem(LIVE_DRAFT_KEY) || "";
+    raw = localStorage.getItem(LEGACY_LIVE_DRAFT_STORAGE_KEY) || "";
   } catch (e) {
-    console.debug("live draft: localStorage read failed", e);
-    return;
+    console.debug("live draft: legacy read failed", e);
+    return null;
   }
-  if (!raw) return;
+  if (!raw) return null;
   const draft = parsePersistedLiveDraft(raw);
   if (!draft) {
-    clearLiveDraft();
-    return;
+    try {
+      localStorage.setItem(`${LEGACY_LIVE_DRAFT_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
+    } catch (backupErr) {
+      console.warn("live draft: corrupt legacy backup failed", backupErr);
+    }
+    clearLegacyLiveDraft();
+    return null;
   }
+  return draft;
+}
+
+async function recoverLiveDraftIfAny(): Promise<void> {
+  let draft = await readBackendLiveDraft();
+  if (!draft) {
+    draft = readLegacyLiveDraft();
+    if (draft) void persistLiveDraftPayload(draft);
+  }
+  if (!draft) return;
   try {
     const sourceText = String(draft.source_text || "").trim();
     const transcriptText = String(draft.transcript_text || "").trim();
+    const sessionId = String(draft.session_id || "").trim();
     if (!sourceText && !transcriptText) {
-      clearLiveDraft();
+      await clearLiveDraft(sessionId);
       return;
     }
     const stamp = Number(draft.updated_at || Date.now());
@@ -3739,7 +3839,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
     });
     showRecordSessionNotice("Recovered the last unsaved draft from a previous session.", "warning", 9000);
     setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
-    clearLiveDraft();
+    await clearLiveDraft(sessionId);
   } catch (e) {
     console.warn("Live draft recovery failed; keeping draft for next startup", e);
   }
