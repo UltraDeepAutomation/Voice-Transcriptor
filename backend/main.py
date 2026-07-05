@@ -481,6 +481,9 @@ _WINDOWS_RESERVED_BASENAMES = frozenset({
     "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 })
 
+DEFAULT_UPSCALE_PRESET_KEY = "clean"
+DEFAULT_UPSCALE_PRESET_ID = f"builtin_{DEFAULT_UPSCALE_PRESET_KEY}"
+
 BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
     "clean": {
         "name": "Clean",
@@ -4320,7 +4323,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
     _ensure_builtin_upscale_presets()
     preset_id = str(payload.get("preset_id") or "").strip()
     if not preset_id:
-        legacy = str(payload.get("preset") or "clean").strip().lower()
+        legacy = str(payload.get("preset") or DEFAULT_UPSCALE_PRESET_KEY).strip().lower()
         if legacy not in UPSCALE_PRESETS:
             raise HTTPException(status_code=400, detail="unsupported upscale preset")
         preset_id = f"builtin_{legacy}"
@@ -4396,6 +4399,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
 def list_upscale_presets(_auth: None = Depends(_require_api_auth)):
     items = _list_upscale_presets()
     return {
+        "default_preset_id": DEFAULT_UPSCALE_PRESET_ID,
         "items": [
             {
                 "id": x["id"],

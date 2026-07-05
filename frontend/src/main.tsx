@@ -729,6 +729,7 @@ let suppressUiPrefAutosave = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
+let defaultUpscalePresetId = "";
 let hasStoredUpscaleModelPreference = false;
 let currentRecordingAudioObjectUrl = "";
 let currentRecordingAudioSourceKey = "";
@@ -3723,7 +3724,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
-    upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
+    upscale_preset: upscalePresetId(),
     upscale_model: getUpscaleModelValue(),
     auto_send_enter: readAutoSendEnterEnabled(),
     auto_stop_silence_enabled: silence.enabled,
@@ -4123,7 +4124,7 @@ function setAutoSendEnterEnabled(enabled: boolean): void {
 }
 
 function upscalePresetId(): string {
-  return (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim();
+  return (($("upscalePresetSelect") as HTMLSelectElement).value || "").trim();
 }
 
 function selectedUpscalePreset(): UpscalePresetItem | undefined {
@@ -4133,6 +4134,8 @@ function selectedUpscalePreset(): UpscalePresetItem | undefined {
 
 function syncUpscalePresetControls(): void {
   const upscaleEnabled = shouldUpscale();
+  const catalogAvailable = upscalePresets.length > 0;
+  const controlsEnabled = upscaleEnabled && catalogAvailable;
   const sel = $("upscalePresetSelect") as HTMLSelectElement;
   const wrap = $("upscalePresetWrap") as HTMLDivElement;
   const editBtn = $("upscalePresetEditBtn") as HTMLButtonElement;
@@ -4148,15 +4151,15 @@ function syncUpscalePresetControls(): void {
   // inactive but still available, and become fully interactive the
   // moment the toggle is flipped on.
   wrap.hidden = false;
-  sel.disabled = !upscaleEnabled;
+  sel.disabled = !controlsEnabled;
   editBtn.hidden = false;
-  editBtn.disabled = !upscaleEnabled;
+  editBtn.disabled = !controlsEnabled;
   addBtn.hidden = false;
-  addBtn.disabled = !upscaleEnabled;
+  addBtn.disabled = !controlsEnabled;
   delBtn.hidden = false;
   const canDelete = !!(selectedUpscalePreset() && !selectedUpscalePreset()!.builtin);
-  delBtn.disabled = !upscaleEnabled || !canDelete;
-  delBtn.classList.toggle("can-delete", upscaleEnabled && canDelete);
+  delBtn.disabled = !controlsEnabled || !canDelete;
+  delBtn.classList.toggle("can-delete", controlsEnabled && canDelete);
   // The model select is a sibling of the preset-wrap, not inside it,
   // so it must be toggled separately. Previously this was omitted —
   // the model dropdown stayed fully interactive even when the entire
@@ -4170,8 +4173,8 @@ function syncUpscalePresetControls(): void {
   // The copy-paste bug (both branches were "") is fixed here.
   const toolbar = wrap.closest(".pane-toolbar-actions-upscale") as HTMLElement | null;
   if (toolbar) {
-    toolbar.style.opacity = upscaleEnabled ? "1" : "0.5";
-    toolbar.style.pointerEvents = upscaleEnabled ? "" : "none";
+    toolbar.style.opacity = controlsEnabled ? "1" : "0.5";
+    toolbar.style.pointerEvents = controlsEnabled ? "" : "none";
   }
 }
 
@@ -4179,30 +4182,31 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   const sel = $("upscalePresetSelect") as HTMLSelectElement;
   const prev = preferredId || sel.value || pendingUpscalePresetId || "";
   let items: UpscalePresetItem[] = [];
+  let fallbackPresetId = "";
+  let loadedFromBackend = false;
   try {
-    const r = await apiGet<{ items: UpscalePresetItem[] }>("/api/upscale/presets");
+    const r = await apiGet<{ items: UpscalePresetItem[]; default_preset_id?: string }>("/api/upscale/presets");
     items = Array.isArray(r.items) ? r.items : [];
+    fallbackPresetId = String(r.default_preset_id || "").trim();
+    loadedFromBackend = true;
   } catch (e) {
-    // Backend may still be booting or temporarily unreachable. Fall
-    // back to the client-side builtins so the dropdown is NEVER empty
-    // — the user can still choose a preset and record; the actual
-    // instruction text is resolved server-side at upscale time, so
-    // having only the id+name locally is enough.
-    console.warn("loadUpscalePresets: API call failed, using client-side builtins", e);
-    items = BUILTIN_UPSCALE_PRESETS.map((p) => ({
-      id: p.id,
-      name: p.name,
-      builtin: true,
-    }));
+    console.warn("loadUpscalePresets: backend preset catalog unavailable", e);
   }
   upscalePresets = items;
+  if (loadedFromBackend) {
+    defaultUpscalePresetId = fallbackPresetId;
+  }
   sel.innerHTML = "";
   if (!upscalePresets.length) {
     const o = document.createElement("option");
-    o.value = "builtin_clean";
-    o.textContent = "Clean";
+    o.value = "";
+    o.textContent = "Presets unavailable";
+    o.disabled = true;
     sel.appendChild(o);
-    upscalePresets = [{ id: "builtin_clean", name: "Clean", builtin: true }];
+    sel.value = "";
+    pendingUpscalePresetId = prev;
+    syncUpscalePresetControls();
+    return;
   } else {
     upscalePresets.forEach((item) => {
       const o = document.createElement("option");
@@ -4213,16 +4217,18 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   }
   // Default selection strategy when the user hasn't saved a preference yet:
   //   1. Honour explicitly-requested preferredId / pendingUpscalePresetId
-  //   2. Prefer the "Clean" builtin — it's the safest, most neutral style
-  //   3. Fall back to the first preset in the list
-  //   4. Hard-code "builtin_clean" if even the list is empty
+  //   2. Use backend-published default_preset_id
+  //   3. Fall back to the first backend preset in the list
   let next: string;
+  const defaultPresetId = defaultUpscalePresetId && upscalePresets.some((x) => x.id === defaultUpscalePresetId)
+    ? defaultUpscalePresetId
+    : "";
   if (prev && upscalePresets.some((x) => x.id === prev)) {
     next = prev;
-  } else if (upscalePresets.some((x) => x.id === "builtin_clean")) {
-    next = "builtin_clean";
+  } else if (defaultPresetId) {
+    next = defaultPresetId;
   } else {
-    next = upscalePresets[0]?.id || "builtin_clean";
+    next = upscalePresets[0]?.id || "";
   }
   sel.value = next;
   pendingUpscalePresetId = "";
@@ -4293,48 +4299,6 @@ function populateUpscaleModelOptions(): void {
     sel.appendChild(opt);
   }
   sel.value = ids.has(preferred) ? preferred : DEFAULT_UPSCALE_MODEL;
-}
-
-// Built-in upscale presets mirrored from ``BUILTIN_UPSCALE_PRESETS`` in
-// ``backend/main.py``. We keep a synchronous client-side copy so the
-// preset dropdown is never empty during the one round-trip window
-// between module init and the async ``/api/upscale/presets`` fetch.
-// The async ``loadUpscalePresets`` call overlays the authoritative
-// list (including user-created custom presets) when it resolves.
-const BUILTIN_UPSCALE_PRESETS: ReadonlyArray<{ id: string; name: string }> = [
-  { id: "builtin_clean", name: "Clean" },
-  { id: "builtin_business", name: "Business" },
-  { id: "builtin_ai_code", name: "AI & Code" },
-  { id: "builtin_refine", name: "Refine" },
-];
-
-function populateBuiltinUpscalePresetOptions(): void {
-  const sel = document.getElementById("upscalePresetSelect") as HTMLSelectElement | null;
-  if (!sel) return;
-  // Only seed if the select is empty — once ``loadUpscalePresets`` has
-  // run, its options are authoritative and we must not clobber them
-  // (they may contain custom presets the user created).
-  if (sel.options.length > 0) return;
-  const preferred = pendingUpscalePresetId || "builtin_clean";
-  sel.innerHTML = "";
-  for (const p of BUILTIN_UPSCALE_PRESETS) {
-    const opt = document.createElement("option");
-    opt.value = p.id;
-    opt.textContent = p.name;
-    sel.appendChild(opt);
-  }
-  // Seed the in-memory list too so ``selectedUpscalePreset`` and
-  // other helpers do not see an empty array before the async load.
-  if (upscalePresets.length === 0) {
-    upscalePresets = BUILTIN_UPSCALE_PRESETS.map((p) => ({
-      id: p.id,
-      name: p.name,
-      builtin: true,
-    }));
-  }
-  sel.value = BUILTIN_UPSCALE_PRESETS.some((p) => p.id === preferred)
-    ? preferred
-    : "builtin_clean";
 }
 
 /**
@@ -4408,11 +4372,13 @@ async function runUpscaleIfEnabled(
       setStatusScoped(sessionToken, `Upscaling (trimmed first ${overflow.toLocaleString()} chars)`, "warning");
     }
     try {
-      const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", {
+      const selectedPresetId = upscalePresetId();
+      const payload: { text: string; preset_id?: string; model?: string } = {
         text: payloadText,
-        preset_id: upscalePresetId(),
         model: upscaleModel || undefined,
-      });
+      };
+      if (selectedPresetId) payload.preset_id = selectedPresetId;
+      const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", payload);
       const out = String(r.text || "").trim();
       if (!out) throw new Error("Upscale returned empty text");
       // Session-aware success write. We write if EITHER:
@@ -4808,11 +4774,11 @@ async function loadCfg(): Promise<void> {
       shouldPersistShortcutMigration = true;
     }
   } catch (configError) {
-    console.warn("Initial config load failed, retrying with built-in preset", configError);
+    console.warn("Initial config load failed, retrying backend preset catalog load", configError);
     try {
-      await loadUpscalePresets("builtin_clean");
+      await loadUpscalePresets(pendingUpscalePresetId);
     } catch (presetError) {
-      console.warn("Built-in preset fallback also failed", presetError);
+      console.warn("Backend preset catalog retry failed", presetError);
     }
   } finally {
     suppressUiPrefAutosave = false;
@@ -4929,6 +4895,7 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
   queueUiPreferencesSave();
 });
 ($("upscaleToggle") as HTMLInputElement).addEventListener("change", () => {
+  syncUpscalePresetControls();
   queueUiPreferencesSave();
 });
 ["openrouter", "deepgram"].forEach((providerName) => {
@@ -9648,10 +9615,6 @@ void loadCfg()
   });
 syncRemoteModelOptions();
 populateUpscaleModelOptions();
-// Seed the preset dropdown synchronously with the 4 built-in presets
-// so the upscale pane is never empty between module init and the
-// async ``loadUpscalePresets`` call inside ``loadCfg``.
-populateBuiltinUpscalePresetOptions();
 (document.getElementById("upscaleModelSelect") as HTMLSelectElement | null)?.addEventListener(
   "change",
   () => {
