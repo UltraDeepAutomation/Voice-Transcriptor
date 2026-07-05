@@ -649,6 +649,17 @@ function scheduleUnexpectedMainWindowHideRecovery(reason = "") {
   mainWindowUnexpectedHideRecoveryTimer = setTimeout(() => {
     mainWindowUnexpectedHideRecoveryTimer = null;
     if (!shouldRecoverUnexpectedMainWindowHide()) return;
+    try {
+      if (win.isVisible()) {
+        appendMainLog(
+          `[main-window-hide-recovery] skipped-visible reason=${label} ` +
+          `protected=${protectedReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`,
+        );
+        return;
+      }
+    } catch {
+      return;
+    }
     appendMainLog(
       `[main-window-hide-recovery] revealing reason=${label} protected=${protectedReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`,
     );
