@@ -126,6 +126,10 @@ function makeBundledPythonImportsReadOnly(appPath) {
   return { fileCount, dirCount };
 }
 
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function hasSigningIdentity(identity) {
   const wanted = String(identity || "").trim();
   if (!wanted) return false;
@@ -267,8 +271,30 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
   let signedCount = 0;
   let execCount = 0;
   let dylibCount = 0;
+  const removeExistingSignature = (filePath) => {
+    try {
+      execFileSync("/usr/bin/codesign", ["--remove-signature", filePath], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+    } catch {
+      // Unsigned Mach-O files are expected in third-party wheels.
+    }
+  };
+  const removeBuildOnlyXattrs = (filePath) => {
+    for (const attr of ["com.apple.provenance"]) {
+      try {
+        execFileSync("/usr/bin/xattr", ["-d", attr, filePath], {
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+      } catch {
+        // Missing xattrs are fine; the packaged source file is left untouched.
+      }
+    }
+  };
   const signOne = (filePath, kind) => {
-    const args = ["--force", "--sign", identity, timestampArg];
+    const signIdentity = kind === "executable" ? identity : "-";
+    const args = ["--force", "--sign", signIdentity];
+    if (signIdentity !== "-") args.push(timestampArg);
     if (kind === "executable") {
       args.push("--options", "runtime", "--entitlements", entitlements);
       execCount += 1;
@@ -276,13 +302,21 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
       dylibCount += 1;
     }
     args.push(filePath);
-    try {
-      execFileSync("/usr/bin/codesign", args, { stdio: ["ignore", "ignore", "pipe"] });
-      signedCount += 1;
-    } catch (e) {
-      const stderr = e && e.stderr ? e.stderr.toString() : "";
-      throw new Error(`codesign failed for ${filePath}\n${stderr || (e.message || e)}`);
+    let lastError = "";
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      removeExistingSignature(filePath);
+      removeBuildOnlyXattrs(filePath);
+      try {
+        execFileSync("/usr/bin/codesign", args, { stdio: ["ignore", "ignore", "pipe"] });
+        signedCount += 1;
+        return;
+      } catch (e) {
+        const stderr = e && e.stderr ? e.stderr.toString() : "";
+        lastError = stderr || (e.message || String(e));
+        if (attempt < 5) sleepMs(150 * attempt);
+      }
     }
+    throw new Error(`codesign failed for ${filePath}\n${lastError}`);
   };
   walkTree(runtimeRoot, (entryPath, st) => {
     if (!st.isFile()) return;
