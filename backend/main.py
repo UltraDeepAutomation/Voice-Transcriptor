@@ -267,7 +267,8 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
-jobs = JobStore(max_workers=2)
+JOB_MAX_WORKERS = 2
+jobs = JobStore(max_workers=JOB_MAX_WORKERS)
 
 
 # Paths we consider "sensitive" — present in raw exception text from
@@ -1145,6 +1146,9 @@ def index():
     html = index_path.read_text(encoding="utf-8")
     bootstrap_payload = {
         "model_catalog": health_model_catalog(),
+        "runtime_limits": {
+            "upload_queue_max_parallel": jobs.max_workers,
+        },
     }
     injected = (
         "<script>"
@@ -1173,6 +1177,9 @@ def health():
         "accepted_audio_exts": sorted(ext.lstrip(".") for ext in ALLOWED_AUDIO_EXTS),
         "live_sample_rate_hz": LIVE_SAMPLE_RATE_HZ,
         "model_catalog": health_model_catalog(),
+        "runtime_limits": {
+            "upload_queue_max_parallel": jobs.max_workers,
+        },
         "boot_nonce": BOOT_NONCE,
     }
 

@@ -125,6 +125,10 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             payload["model_catalog"],
             self.main.health_model_catalog(),
         )
+        self.assertEqual(
+            payload["runtime_limits"]["upload_queue_max_parallel"],
+            self.main.jobs.max_workers,
+        )
 
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):

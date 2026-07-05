@@ -334,6 +334,9 @@ type ModelCatalogPayload = {
 
 type BackendBootstrapPayload = {
   model_catalog?: ModelCatalogPayload;
+  runtime_limits?: {
+    upload_queue_max_parallel?: unknown;
+  };
 };
 
 // Compile-time injected by vite.config.ts from desktop/package.json's
@@ -566,7 +569,7 @@ const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
 const UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
 const UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200;
-const UPLOAD_QUEUE_MAX_PARALLEL = 2;
+let uploadQueueMaxParallel = 1;
 let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
 let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "";
 let LOCAL_LIVE_ASSIST_MODELS: string[] = [];
@@ -719,6 +722,16 @@ function applyBackendBootstrap(): void {
   const bootstrap = window.__TRANSCRIPTOR_BOOTSTRAP;
   if (!bootstrap || typeof bootstrap !== "object") return;
   applyHealthModelCatalog(bootstrap.model_catalog);
+  applyRuntimeLimits(bootstrap.runtime_limits);
+}
+
+function applyRuntimeLimits(limits: unknown): void {
+  if (!limits || typeof limits !== "object") return;
+  const root = limits as { upload_queue_max_parallel?: unknown };
+  const uploadParallel = Number(root.upload_queue_max_parallel);
+  if (Number.isFinite(uploadParallel) && uploadParallel >= 1 && uploadParallel <= 8) {
+    uploadQueueMaxParallel = Math.trunc(uploadParallel);
+  }
 }
 
 let isBusy = false;
@@ -3389,6 +3402,7 @@ async function refreshNetworkState(): Promise<void> {
         accepted_audio_exts?: unknown;
         live_sample_rate_hz?: unknown;
         model_catalog?: unknown;
+        runtime_limits?: unknown;
       };
       const candidate = Number(healthJson?.max_upload_bytes);
       if (Number.isFinite(candidate) && candidate > 0) {
@@ -3408,6 +3422,7 @@ async function refreshNetworkState(): Promise<void> {
         }
       }
       applyHealthModelCatalog(healthJson?.model_catalog);
+      applyRuntimeLimits(healthJson?.runtime_limits);
     } catch (e) {
       // Non-JSON or shape mismatch — keep prior MAX_FILE_BYTES.
       console.debug("health body parse skipped", e);
@@ -10509,7 +10524,7 @@ function runUploadProcessor(): void {
   uploadProcessorPumpScheduled = true;
   queueMicrotask(() => {
     uploadProcessorPumpScheduled = false;
-    while (uploadActiveProcessors < UPLOAD_QUEUE_MAX_PARALLEL) {
+    while (uploadActiveProcessors < uploadQueueMaxParallel) {
       const next = uploadQueue.find((it) => it.status === "queued");
       if (!next) break;
       uploadActiveProcessors += 1;

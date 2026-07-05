@@ -29,6 +29,8 @@ class JobStore:
     def __init__(self, max_workers: int = 2, max_jobs: int = 300):
         self._lock = threading.Lock()
         self._jobs: Dict[str, Job] = {}
+        self.max_workers = max_workers
+        self.max_jobs = max_jobs
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._max_jobs = max_jobs
 
