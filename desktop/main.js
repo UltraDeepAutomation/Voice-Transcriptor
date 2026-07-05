@@ -898,30 +898,33 @@ function hasActivePostStopWork() {
 }
 
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  width: 118,
-  height: 34,
+  width: 138,
+  height: 30,
   geometryPadding: 0,
-  minWidth: 118,
-  minHeight: 34,
-  maxWidth: 124,
-  maxHeight: 34,
+  minWidth: 138,
+  minHeight: 30,
+  maxWidth: 144,
+  maxHeight: 30,
   bottomMargin: 16,
-  pillHeight: 34,
+  pillHeight: 30,
   pillPadLeft: 4,
-  pillPadRight: 10,
-  pillGap: 8,
-  statusControlSize: 24,
-  timerWidth: 32,
-  timerFontSize: 10,
-  waveWidth: 34,
-  waveHeight: 12,
-  waveBarWidth: 1.4,
-  waveBarGap: 1.8,
+  pillPadRight: 12,
+  pillGap: 10,
+  statusControlSize: 22,
+  timerWidth: 29,
+  timerFontSize: 9,
+  waveWidth: 51,
+  waveHeight: 10,
+  waveBarWidth: 1.05,
+  waveBarGap: 2.05,
   waveFrameMs: 16,
-  waveLevelTickMs: 148,
-  waveIdleTickMs: 240,
-  waveActiveStaleMs: 760,
+  waveLevelTickMs: 220,
+  waveIdleTickMs: 360,
+  waveActiveStaleMs: 900,
 });
+const RECORDING_STATUS_LEVEL_POLL_MS = 180;
+const RECORDING_STATUS_LEVEL_MIN_DELTA = 0.012;
+const RECORDING_STATUS_LEVEL_MAX_STALE_MS = 600;
 
 const recordingStatusCapsuleState = {
   status: "",
@@ -934,6 +937,8 @@ const recordingStatusCapsuleState = {
 let recordingStatusCapsuleGeometry = null;
 let recordingStatusSuppressActivateUntil = 0;
 let recordingStatusCapsuleLevelUpdateInFlight = false;
+let recordingStatusCapsuleLastLevelSent = -1;
+let recordingStatusCapsuleLastLevelSentAt = 0;
 
 function clampRecordingStatusCapsuleDimension(value, min, max) {
   const n = Number(value);
@@ -1371,11 +1376,19 @@ function recordingStatusCapsuleHtml() {
       stateIcon.className = "";
       stateIcon.classList.add(nextClass);
     }
-    function renderWave() {
+    function renderWave(now = Date.now()) {
       ctx.clearRect(0, 0, waveW, waveH);
+      const tickMs = (waveMode === "recording" || waveMode === "autostop")
+        ? ${t.waveLevelTickMs}
+        : ${t.waveIdleTickMs};
+      const step = bw + gap;
+      const progress = lastWavePushAt > 0
+        ? Math.max(0, Math.min(1, (now - lastWavePushAt) / tickMs))
+        : 0;
+      const smoothOffset = progress * step;
       for (let i = 0; i < bars.length; i += 1) {
         const v = bars[bars.length - 1 - i];
-        const x = waveW - (i + 1) * (bw + gap);
+        const x = waveW - (i + 1) * step - smoothOffset;
         if (x < 0) break;
         const h = Math.min(waveH - 2, v * (waveH - 2));
         if (h <= 0) continue;
@@ -1400,7 +1413,6 @@ function recordingStatusCapsuleHtml() {
       if (level > 0.015) lastLevelAt = Date.now();
       bars.push(level);
       while (bars.length > maxBars) bars.shift();
-      renderWave();
     }
     function timerElapsedMs(now) {
       const startedAt = Number(state.startedAt || 0);
@@ -1414,7 +1426,7 @@ function recordingStatusCapsuleHtml() {
       if (!pageIsActive()) {
         if (bars.length) {
           bars.length = 0;
-          renderWave();
+          renderWave(now);
         }
         return;
       }
@@ -1434,6 +1446,7 @@ function recordingStatusCapsuleHtml() {
       if (now - lastLevelAt > ${t.waveActiveStaleMs} && activeWave) {
         activeWave = false;
       }
+      renderWave(now);
     }
     function render(now = Date.now()) {
       const nextTimerText = pageIsActive() ? fmt(timerElapsedMs(now)) : "00:00";
@@ -1638,6 +1651,8 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.elapsedMs = 0;
   recordingStatusCapsuleState.timerRunning = false;
   recordingStatusCapsuleGeometry = null;
+  recordingStatusCapsuleLastLevelSent = -1;
+  recordingStatusCapsuleLastLevelSentAt = 0;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     if (recordingStatusWindowReady) {
       recordingStatusWindow.webContents.executeJavaScript(
@@ -1684,21 +1699,29 @@ function startRecordingStateMonitor() {
         const safeRms = Math.max(0, Number(state?.rms) || 0);
         const safeLastFrameAt = Math.max(0, Number(state?.lastFrameAt) || 0);
         const isRec = !!state?.isRec;
+        const now = Date.now();
         recordingStatusCapsuleState.level = safeLevel;
         if (recordingStatusWindow && !recordingStatusWindow.isDestroyed() && recordingStatusWindow.isVisible()) {
+          const shouldPublishLevel =
+            recordingStatusCapsuleLastLevelSent < 0 ||
+            Math.abs(safeLevel - recordingStatusCapsuleLastLevelSent) >= RECORDING_STATUS_LEVEL_MIN_DELTA ||
+            (now - recordingStatusCapsuleLastLevelSentAt) >= RECORDING_STATUS_LEVEL_MAX_STALE_MS;
           if (!recordingStatusCapsuleLevelUpdateInFlight) {
-            recordingStatusCapsuleLevelUpdateInFlight = true;
-            updateRecordingStatusCapsule({ level: safeLevel })
-              .catch((e) => {
-                appendMainLog(`[recording-capsule] level update failed: ${e?.message || e}`);
-              })
-              .finally(() => {
-                recordingStatusCapsuleLevelUpdateInFlight = false;
-              });
+            if (shouldPublishLevel) {
+              recordingStatusCapsuleLevelUpdateInFlight = true;
+              recordingStatusCapsuleLastLevelSent = safeLevel;
+              recordingStatusCapsuleLastLevelSentAt = now;
+              updateRecordingStatusCapsule({ level: safeLevel })
+                .catch((e) => {
+                  appendMainLog(`[recording-capsule] level update failed: ${e?.message || e}`);
+                })
+                .finally(() => {
+                  recordingStatusCapsuleLevelUpdateInFlight = false;
+                });
+            }
           }
         }
         const cfg = recordingAutoStopConfig || DEFAULT_RECORDING_AUTO_STOP_CONFIG;
-        const now = Date.now();
         if (safeLastFrameAt > 0) recordingSeenAudioFrames = true;
         if (now - recordingAutoStopConfigRefreshAt > 1200) {
           recordingAutoStopConfigRefreshAt = now;
@@ -1753,7 +1776,7 @@ function startRecordingStateMonitor() {
         }
       })
       .catch(() => { });
-  }, 120);
+  }, RECORDING_STATUS_LEVEL_POLL_MS);
   try { recordingStateMonitor.unref?.(); } catch { }
 }
 
@@ -1765,6 +1788,8 @@ async function beginRecordingStatusSession() {
   recordingStatusCapsuleState.elapsedMs = 0;
   recordingStatusCapsuleState.timerRunning = true;
   recordingStatusCapsuleState.level = 0;
+  recordingStatusCapsuleLastLevelSent = -1;
+  recordingStatusCapsuleLastLevelSentAt = 0;
   recordingSeenAudioFrames = false;
   recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   startRecordingStateMonitor();
@@ -3907,12 +3932,12 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
 
   const primary = `
     tell application "System Events"
-      keystroke return using command down
+      keystroke return using {command down, control down}
     end tell
   `;
   const res1 = await runCommand("osascript", ["-e", primary], { timeoutMs: 5000 });
   if (res1.ok) {
-    return { ok: true, reason: "cmd-return-sent" };
+    return { ok: true, reason: "cmd-ctrl-return-sent" };
   }
   const fallback = `
     tell application "System Events"
@@ -4080,12 +4105,14 @@ async function processPostStopTask(task) {
   // add latency to healthy recordings; it only prevents legitimate
   // slow recovery from degrading into "Saved To App" with no paste.
   const POST_STOP_TRANSCRIPT_TIMEOUT_MS = 32000;
+  const UI_FINAL_STATUS_TRANSCRIPT_FALLBACK_MS = 3500;
   const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
   let transcript = "";
   let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
   let recordingStatusPhase = "transcribing";
   let doneStatusTranscriptSince = 0;
+  let uiFinalStatusTranscriptSince = 0;
   let terminalWithoutPasteStatus = "";
 
   while (Date.now() < deadline) {
@@ -4192,6 +4219,22 @@ async function processPostStopTask(task) {
         textLen: transcript.length,
       });
       break;
+    }
+    if (uiFinalStatusHasTranscript) {
+      if (!uiFinalStatusTranscriptSince) uiFinalStatusTranscriptSince = Date.now();
+      if (Date.now() - uiFinalStatusTranscriptSince >= UI_FINAL_STATUS_TRANSCRIPT_FALLBACK_MS) {
+        transcript = uiFinalText;
+        traceStep(trace, "ui_final_status_transcript_fallback", {
+          pollCount,
+          expectedRecordingId: task.recordingId || 0,
+          uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
+          waitMs: Date.now() - uiFinalStatusTranscriptSince,
+          textLen: transcript.length,
+        });
+        break;
+      }
+    } else {
+      uiFinalStatusTranscriptSince = 0;
     }
     if (uiFinalTerminalWithoutPaste) {
       terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
