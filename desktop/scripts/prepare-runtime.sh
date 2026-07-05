@@ -162,6 +162,16 @@ install_python() {
   [ -d "${out_dir}/python" ] || die "expected ${out_dir}/python after extract"
 }
 
+pip_runner_python() {
+  local out_dir="$1"
+  local candidate="${out_dir}/python/bin/python3"
+  if [ -x "${candidate}" ] && "${candidate}" -m pip --version >/dev/null 2>&1; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+  printf '%s\n' "python3"
+}
+
 # -----------------------------------------------------------------------------
 # Install all requirements.txt wheels into the bundled Python's site-packages
 # via cross-platform pip download + install-to-target. Falls back to running
@@ -206,7 +216,10 @@ install_wheels() {
   done
   pip_args+=(-r "${REQS}")
 
-  python3 -m pip install "${pip_args[@]}"
+  local pip_python
+  pip_python="$(pip_runner_python "${out_dir}")"
+  log "using pip runner: $("${pip_python}" -m pip --version)"
+  "${pip_python}" -m pip install "${pip_args[@]}"
 }
 
 # -----------------------------------------------------------------------------
