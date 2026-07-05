@@ -184,6 +184,8 @@ body {
   --summary-text-lines: 1;
   --helper-text-lines: 1;
   --recordings-list-col: 288px;
+  --audio-play-control-width: 32px;
+  --audio-time-control-width: 58px;
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -1512,6 +1514,13 @@ textarea:focus-visible,
   background-color: var(--bg-3);
 }
 
+#currentRecordingAudio::-webkit-media-controls-play-button,
+#recordingAudio::-webkit-media-controls-play-button {
+  width: var(--audio-play-control-width);
+  min-width: var(--audio-play-control-width);
+  max-width: var(--audio-play-control-width);
+}
+
 #currentRecordingAudio::-webkit-media-controls-current-time-display,
 #currentRecordingAudio::-webkit-media-controls-time-remaining-display,
 #recordingAudio::-webkit-media-controls-current-time-display,
@@ -1519,7 +1528,10 @@ textarea:focus-visible,
   color: var(--text-2);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-  min-width: 42px;
+  width: var(--audio-time-control-width);
+  min-width: var(--audio-time-control-width);
+  max-width: var(--audio-time-control-width);
+  text-align: center;
 }
 
 .pane-footer-actions {
