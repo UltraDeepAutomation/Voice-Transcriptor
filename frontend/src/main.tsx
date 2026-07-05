@@ -336,6 +336,7 @@ type BackendBootstrapPayload = {
   model_catalog?: ModelCatalogPayload;
   runtime_limits?: {
     upload_queue_max_parallel?: unknown;
+    upload_queue_max_persisted_items?: unknown;
   };
 };
 
@@ -566,9 +567,10 @@ const ACCEPTED_AUDIO_VIDEO_EXTS = new Set([
   "mp4", "m4v", "mov", "mkv", "avi", "mpg", "mpeg", "3gp",
 ]);
 const LIVE_DRAFT_KEY = "transcriptor.liveDraft.v1";
-const UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
-const UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
-const UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200;
+const LEGACY_UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
+const LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
+const UPLOAD_QUEUE_SAVE_DEBOUNCE_MS = 180;
+let uploadQueueMaxPersistedItems = Number.MAX_SAFE_INTEGER;
 let uploadQueueMaxParallel = 1;
 let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
 let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "";
@@ -727,10 +729,17 @@ function applyBackendBootstrap(): void {
 
 function applyRuntimeLimits(limits: unknown): void {
   if (!limits || typeof limits !== "object") return;
-  const root = limits as { upload_queue_max_parallel?: unknown };
+  const root = limits as {
+    upload_queue_max_parallel?: unknown;
+    upload_queue_max_persisted_items?: unknown;
+  };
   const uploadParallel = Number(root.upload_queue_max_parallel);
   if (Number.isFinite(uploadParallel) && uploadParallel >= 1 && uploadParallel <= 8) {
     uploadQueueMaxParallel = Math.trunc(uploadParallel);
+  }
+  const persistedItems = Number(root.upload_queue_max_persisted_items);
+  if (Number.isFinite(persistedItems) && persistedItems >= 1 && persistedItems <= 1000) {
+    uploadQueueMaxPersistedItems = Math.trunc(persistedItems);
   }
 }
 
@@ -9931,6 +9940,12 @@ const uploadQueue: UploadQueueItem[] = [];
 let uploadActiveProcessors = 0;
 let uploadProcessorPumpScheduled = false;
 let uploadHideFinished = false;
+let uploadQueueSnapshotLoaded = false;
+let uploadQueueRestorePromise: Promise<void> | null = null;
+let uploadQueueSaveTimer: number | null = null;
+let uploadQueueSaveInFlight: Promise<void> = Promise.resolve();
+let uploadQueueSavePending = false;
+let uploadQueueLastSaveOk = false;
 let uploadRevealReconcileInFlight: Promise<void> | null = null;
 const UPLOAD_EMPTY_TRANSCRIPT_TEXT = "[No speech captured]";
 // Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
@@ -10250,91 +10265,176 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
   };
 }
 
-function saveUploadQueueSnapshot(): void {
-  try {
-    const payload: UploadQueueStoragePayload = {
-      version: 1,
-      hideFinished: uploadHideFinished,
-      items: uploadQueue
-        .slice(0, UPLOAD_QUEUE_MAX_PERSISTED_ITEMS)
-        .map(uploadQueueSnapshotItem),
-    };
-    localStorage.setItem(UPLOAD_QUEUE_STORAGE_KEY, JSON.stringify(payload));
-  } catch (e) {
-    console.warn("Upload queue snapshot save failed", e);
+function uploadQueueSnapshotPayload(): UploadQueueStoragePayload {
+  return {
+    version: 1,
+    hideFinished: uploadHideFinished,
+    items: uploadQueue
+      .slice(0, uploadQueueMaxPersistedItems)
+      .map(uploadQueueSnapshotItem),
+  };
+}
+
+function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): void {
+  uploadHideFinished = payload.hideFinished === true;
+  const restored = Array.isArray(payload.items) ? payload.items : [];
+  uploadQueue.splice(0, uploadQueue.length);
+  for (const src of restored.slice(0, uploadQueueMaxPersistedItems)) {
+    const displayName = String(src.displayName || "").trim();
+    if (!displayName) continue;
+    const status = String(src.status || "error") as UploadQueueStatus;
+    const interrupted = status === "queued" || status === "transcribing";
+    const restoredError = interrupted
+      ? "Interrupted by app restart before this file finished."
+      : String(src.error || "");
+    const sourcePath = normalizeUploadSourcePath(src.sourcePath || "");
+    uploadQueue.push({
+      id: String(src.id || createClientSessionId()),
+      displayName,
+      sizeBytes: Number(src.sizeBytes || 0),
+      sourcePath,
+      status: interrupted ? "error" : (isUploadTerminalStatus(status) ? status : "error"),
+      text: String(src.text || ""),
+      error: restoredError,
+      startedAt: typeof src.startedAt === "number" ? src.startedAt : undefined,
+      endedAt: typeof src.endedAt === "number" ? src.endedAt : undefined,
+      completedAt: typeof src.completedAt === "number"
+        ? src.completedAt
+        : (interrupted ? Date.now() : undefined),
+      provider: (src.provider || "") as Provider,
+      model: String(src.model || ""),
+      language: String(src.language || ""),
+      audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),
+      requestedProvider: normalizeUploadProvider(src.requestedProvider || src.provider || "deepgram"),
+      requestedLanguage: String(src.requestedLanguage || src.language || "auto"),
+      requestedDiarize: src.requestedDiarize === true,
+      savedName: String(src.savedName || ""),
+      savedArchiveDir: String(src.savedArchiveDir || ""),
+    });
   }
 }
 
-function restoreUploadQueueSnapshot(): void {
+async function flushUploadQueueSnapshotNow(): Promise<void> {
+  if (!uploadQueueSnapshotLoaded) return;
+  if (uploadQueueSaveTimer !== null) {
+    window.clearTimeout(uploadQueueSaveTimer);
+    uploadQueueSaveTimer = null;
+  }
+  const payload = uploadQueueSnapshotPayload();
+  uploadQueueSavePending = false;
+  uploadQueueSaveInFlight = uploadQueueSaveInFlight
+    .catch(() => undefined)
+    .then(async () => {
+      await apiPut<UploadQueueStoragePayload & { ok?: boolean }>("/api/ui/upload-queue", payload);
+      uploadQueueLastSaveOk = true;
+    })
+    .catch((e) => {
+      uploadQueueLastSaveOk = false;
+      console.warn("Upload queue backend snapshot save failed", e);
+    });
+  await uploadQueueSaveInFlight;
+  if (uploadQueueSavePending) {
+    uploadQueueSavePending = false;
+    await flushUploadQueueSnapshotNow();
+  }
+}
+
+function saveUploadQueueSnapshot(): void {
+  if (!uploadQueueSnapshotLoaded) return;
+  uploadQueueSavePending = true;
+  if (uploadQueueSaveTimer !== null) return;
+  uploadQueueSaveTimer = window.setTimeout(() => {
+    uploadQueueSaveTimer = null;
+    void flushUploadQueueSnapshotNow();
+  }, UPLOAD_QUEUE_SAVE_DEBOUNCE_MS);
+}
+
+function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | null {
   let raw = "";
   try {
-    raw = localStorage.getItem(UPLOAD_QUEUE_STORAGE_KEY) || "";
+    raw = localStorage.getItem(LEGACY_UPLOAD_QUEUE_STORAGE_KEY) || "";
   } catch (e) {
-    console.warn("Upload queue snapshot read failed", e);
-    return;
+    console.warn("Legacy upload queue snapshot read failed", e);
+    return null;
   }
-  if (!raw) return;
+  if (!raw) return null;
   try {
-    const payload = JSON.parse(raw) as Partial<UploadQueueStoragePayload>;
-    uploadHideFinished = payload.hideFinished === true;
-    const restored = Array.isArray(payload.items) ? payload.items : [];
-    uploadQueue.splice(0, uploadQueue.length);
-    for (const src of restored.slice(0, UPLOAD_QUEUE_MAX_PERSISTED_ITEMS)) {
-      const displayName = String(src.displayName || "").trim();
-      if (!displayName) continue;
-      const status = String(src.status || "error") as UploadQueueStatus;
-      const interrupted = status === "queued" || status === "transcribing";
-      const restoredError = interrupted
-        ? "Interrupted by app restart before this file finished."
-        : String(src.error || "");
-      const sourcePath = normalizeUploadSourcePath(src.sourcePath || "");
-      uploadQueue.push({
-        id: String(src.id || createClientSessionId()),
-        displayName,
-        sizeBytes: Number(src.sizeBytes || 0),
-        sourcePath,
-        status: interrupted ? "error" : (isUploadTerminalStatus(status) ? status : "error"),
-        text: String(src.text || ""),
-        error: restoredError,
-        startedAt: typeof src.startedAt === "number" ? src.startedAt : undefined,
-        endedAt: typeof src.endedAt === "number" ? src.endedAt : undefined,
-        completedAt: typeof src.completedAt === "number"
-          ? src.completedAt
-          : (interrupted ? Date.now() : undefined),
-        provider: (src.provider || "") as Provider,
-        model: String(src.model || ""),
-        language: String(src.language || ""),
-        audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),
-        requestedProvider: normalizeUploadProvider(src.requestedProvider || src.provider || "deepgram"),
-        requestedLanguage: String(src.requestedLanguage || src.language || "auto"),
-        requestedDiarize: src.requestedDiarize === true,
-        savedName: String(src.savedName || ""),
-        savedArchiveDir: String(src.savedArchiveDir || ""),
-      });
-    }
-    saveUploadQueueSnapshot();
+    return JSON.parse(raw) as Partial<UploadQueueStoragePayload>;
   } catch (e) {
-    console.warn("Upload queue snapshot parse failed", e);
+    console.warn("Legacy upload queue snapshot parse failed", e);
     try {
-      localStorage.setItem(`${UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
+      localStorage.setItem(`${LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
     } catch (backupErr) {
-      console.warn("Upload queue corrupt snapshot backup failed", backupErr);
+      console.warn("Legacy upload queue corrupt snapshot backup failed", backupErr);
     }
+    return null;
+  }
+}
+
+async function restoreUploadQueueSnapshot(): Promise<void> {
+  try {
+    const payload = await apiGet<UploadQueueStoragePayload>("/api/ui/upload-queue");
+    applyUploadQueueSnapshot(payload);
+  } catch (e) {
+    console.warn("Upload queue backend snapshot restore failed", e);
+  }
+
+  if (uploadQueue.length === 0) {
+    const legacy = readLegacyUploadQueueSnapshot();
+    if (legacy) {
+      applyUploadQueueSnapshot(legacy);
+    }
+  }
+
+  uploadQueueSnapshotLoaded = true;
+  await flushUploadQueueSnapshotNow();
+  if (uploadQueueLastSaveOk) {
     try {
-      localStorage.setItem(UPLOAD_QUEUE_STORAGE_KEY, JSON.stringify({
-        version: 1,
-        hideFinished: uploadHideFinished,
-        items: [],
-      } satisfies UploadQueueStoragePayload));
-    } catch (repairErr) {
-      console.warn("Upload queue snapshot repair failed", repairErr);
+      localStorage.removeItem(LEGACY_UPLOAD_QUEUE_STORAGE_KEY);
+    } catch (e) {
+      console.warn("Legacy upload queue snapshot cleanup failed", e);
     }
   }
 }
+
+function beginUploadQueueSnapshotRestore(): Promise<void> {
+  if (uploadQueueSnapshotLoaded) return Promise.resolve();
+  if (!uploadQueueRestorePromise) {
+    uploadQueueRestorePromise = restoreUploadQueueSnapshot()
+      .finally(() => {
+        uploadQueueRestorePromise = null;
+        renderUploadQueue();
+        void reconcileUploadQueueRevealTargetsFromArchive();
+      });
+  }
+  return uploadQueueRestorePromise;
+}
+
+function afterUploadQueueSnapshotLoaded(action: () => void): void {
+  if (uploadQueueSnapshotLoaded) {
+    action();
+    return;
+  }
+  void beginUploadQueueSnapshotRestore().then(action);
+}
+
+function flushUploadQueueSnapshotBestEffort(): void {
+  void flushUploadQueueSnapshotNow();
+}
+
+window.addEventListener("pagehide", flushUploadQueueSnapshotBestEffort, { capture: true });
+window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort, { capture: true });
 
 function addUploadQueueItem(item: UploadQueueItem): void {
   uploadQueue.unshift(item);
   saveUploadQueueSnapshot();
+}
+
+function enqueueUploadFiles(files: File[]): void {
+  if (!files.length) return;
+  afterUploadQueueSnapshotLoaded(() => {
+    files.forEach(enqueueUploadFile);
+  });
 }
 
 function setupUploadView(): void {
@@ -10344,7 +10444,7 @@ function setupUploadView(): void {
   const language = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   const diarize = document.getElementById("uploadDiarize") as HTMLInputElement | null;
   if (!dropZone || !fileInput || !provider || !language) return;
-  restoreUploadQueueSnapshot();
+  void beginUploadQueueSnapshotRestore();
   // Persist Upload-tab state across launches. Without this every
   // app start reset the provider to the HTML default ("Deepgram")
   // even when the user routinely worked with Local Whisper or
@@ -10379,7 +10479,7 @@ function setupUploadView(): void {
     // input value re-triggers `change` on the next pick. Without
     // this, dragging the same file twice silently no-ops.
     fileInput.value = "";
-    files.forEach(enqueueUploadFile);
+    enqueueUploadFiles(files);
   });
   // Drag visual states. We want the highlight on EITHER `dragenter`
   // (first time the dragged item enters us) OR `dragover` (continuous
@@ -10403,7 +10503,7 @@ function setupUploadView(): void {
   dropZone.addEventListener("drop", (e: DragEvent) => {
     const dt = e.dataTransfer;
     if (!dt) return;
-    Array.from(dt.files).forEach(enqueueUploadFile);
+    enqueueUploadFiles(Array.from(dt.files));
   });
   // Block the entire window from navigating away if a file is
   // dropped OUTSIDE the drop zone. Browsers navigate to dropped
@@ -10420,24 +10520,28 @@ function setupUploadView(): void {
   const clearBtn = document.getElementById("uploadQueueClearBtn") as HTMLButtonElement | null;
   if (clearBtn) {
     clearBtn.addEventListener("click", () => {
-      // Drop only finished items so an in-flight transcription is
-      // never aborted by an accidental Clear click.
-      for (let i = uploadQueue.length - 1; i >= 0; i--) {
-        const st = uploadQueue[i].status;
-        if (st === "done" || st === "error" || st === "cancelled") {
-          uploadQueue.splice(i, 1);
+      afterUploadQueueSnapshotLoaded(() => {
+        // Drop only finished items so an in-flight transcription is
+        // never aborted by an accidental Clear click.
+        for (let i = uploadQueue.length - 1; i >= 0; i--) {
+          const st = uploadQueue[i].status;
+          if (st === "done" || st === "error" || st === "cancelled") {
+            uploadQueue.splice(i, 1);
+          }
         }
-      }
-      saveUploadQueueSnapshot();
-      renderUploadQueue();
+        saveUploadQueueSnapshot();
+        renderUploadQueue();
+      });
     });
   }
   const hideBtn = document.getElementById("uploadQueueHideBtn") as HTMLButtonElement | null;
   if (hideBtn) {
     hideBtn.addEventListener("click", () => {
-      uploadHideFinished = !uploadHideFinished;
-      saveUploadQueueSnapshot();
-      renderUploadQueue();
+      afterUploadQueueSnapshotLoaded(() => {
+        uploadHideFinished = !uploadHideFinished;
+        saveUploadQueueSnapshot();
+        renderUploadQueue();
+      });
     });
   }
   // Browse button in pane header — alternative to clicking the
@@ -10464,7 +10568,6 @@ function setupUploadView(): void {
   } catch { }
   updateUploadProviderHint();
   renderUploadQueue();
-  void reconcileUploadQueueRevealTargetsFromArchive();
 }
 
 function updateUploadProviderHint(): void {

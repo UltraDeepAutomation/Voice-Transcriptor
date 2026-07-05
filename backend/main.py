@@ -80,7 +80,8 @@ from backend.transcribe import merge_channel_transcripts, transcribe_file, warm_
 UPLOADS_DIR = DATA_DIR / "uploads"
 RESULTS_DIR = DATA_DIR / "results"
 LIVE_RECOVERY_DIR = DATA_DIR / "live_recovery"
-for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR):
+UI_STATE_DIR = DATA_DIR / "ui_state"
+for d in (UPLOADS_DIR, RESULTS_DIR, LIVE_RECOVERY_DIR, UI_STATE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -268,6 +269,7 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 JOB_MAX_WORKERS = 2
+UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200
 jobs = JobStore(max_workers=JOB_MAX_WORKERS)
 
 
@@ -1148,6 +1150,7 @@ def index():
         "model_catalog": health_model_catalog(),
         "runtime_limits": {
             "upload_queue_max_parallel": jobs.max_workers,
+            "upload_queue_max_persisted_items": UPLOAD_QUEUE_MAX_PERSISTED_ITEMS,
         },
     }
     injected = (
@@ -1179,9 +1182,22 @@ def health():
         "model_catalog": health_model_catalog(),
         "runtime_limits": {
             "upload_queue_max_parallel": jobs.max_workers,
+            "upload_queue_max_persisted_items": UPLOAD_QUEUE_MAX_PERSISTED_ITEMS,
         },
         "boot_nonce": BOOT_NONCE,
     }
+
+
+@app.get("/api/ui/upload-queue")
+def get_upload_queue_state(_auth: None = Depends(_require_api_auth)):
+    return _read_upload_queue_state()
+
+
+@app.put("/api/ui/upload-queue")
+def put_upload_queue_state(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+    state = _normalize_upload_queue_state(payload)
+    atomic_write_json(UPLOAD_QUEUE_STATE_PATH, state)
+    return {"ok": True, **state}
 
 
 @app.post("/api/transcribe/warmup")
@@ -1773,6 +1789,95 @@ def _validate_config_payload(payload: dict) -> None:
         rec_dir = preferences.get("recordings_dir")
         if rec_dir is not None and not isinstance(rec_dir, str):
             raise HTTPException(status_code=400, detail="recordings_dir must be a string")
+
+
+UPLOAD_QUEUE_STATE_PATH = UI_STATE_DIR / "upload_queue.json"
+UPLOAD_QUEUE_STATE_VERSION = 1
+UPLOAD_QUEUE_STATUSES = frozenset({"queued", "transcribing", "done", "error", "cancelled"})
+
+
+def _default_upload_queue_state() -> dict[str, Any]:
+    return {
+        "version": UPLOAD_QUEUE_STATE_VERSION,
+        "hideFinished": False,
+        "items": [],
+    }
+
+
+def _upload_queue_str(value: object, max_len: int = 200_000) -> str:
+    return str(value or "").strip()[:max_len]
+
+
+def _upload_queue_number(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 0 <= parsed < float("inf") else None
+
+
+def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    display_name = _upload_queue_str(raw.get("displayName"), 512)
+    if not display_name:
+        return None
+    status = _upload_queue_str(raw.get("status"), 32)
+    if status not in UPLOAD_QUEUE_STATUSES:
+        status = "error"
+    item: dict[str, Any] = {
+        "id": _upload_queue_str(raw.get("id"), 128) or uuid.uuid4().hex,
+        "displayName": display_name,
+        "sizeBytes": int(_upload_queue_number(raw.get("sizeBytes")) or 0),
+        "sourcePath": _upload_queue_str(raw.get("sourcePath"), 4096),
+        "status": status,
+        "text": _upload_queue_str(raw.get("text")),
+        "error": _upload_queue_str(raw.get("error"), 4096),
+        "provider": _upload_queue_str(raw.get("provider"), 32),
+        "model": _upload_queue_str(raw.get("model"), 256),
+        "language": _upload_queue_str(raw.get("language"), 32),
+        "audioDurationSec": _upload_queue_number(raw.get("audioDurationSec")) or 0,
+        "requestedProvider": _upload_queue_str(raw.get("requestedProvider"), 32),
+        "requestedLanguage": _upload_queue_str(raw.get("requestedLanguage"), 32),
+        "requestedDiarize": bool(raw.get("requestedDiarize") is True),
+        "savedName": _upload_queue_str(raw.get("savedName"), 512),
+        "savedArchiveDir": _upload_queue_str(raw.get("savedArchiveDir"), 4096),
+    }
+    for field in ("startedAt", "endedAt", "completedAt"):
+        value = _upload_queue_number(raw.get(field))
+        if value is not None:
+            item[field] = value
+    return item
+
+
+def _normalize_upload_queue_state(payload: object) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="upload queue state must be an object")
+    raw_items = payload.get("items")
+    items_src = raw_items if isinstance(raw_items, list) else []
+    items: list[dict[str, Any]] = []
+    for raw in items_src[:UPLOAD_QUEUE_MAX_PERSISTED_ITEMS]:
+        item = _normalize_upload_queue_item(raw)
+        if item:
+            items.append(item)
+    return {
+        "version": UPLOAD_QUEUE_STATE_VERSION,
+        "hideFinished": payload.get("hideFinished") is True,
+        "items": items,
+    }
+
+
+def _read_upload_queue_state() -> dict[str, Any]:
+    if not UPLOAD_QUEUE_STATE_PATH.exists():
+        return _default_upload_queue_state()
+    try:
+        raw = json.loads(UPLOAD_QUEUE_STATE_PATH.read_text(encoding="utf-8"))
+        return _normalize_upload_queue_state(raw)
+    except Exception as exc:
+        logger.warning("upload queue state read failed: %s", _safe_error_text(exc))
+        return _default_upload_queue_state()
 
 
 _rec_dir_cache: Optional[Path] = None
