@@ -483,6 +483,7 @@ _WINDOWS_RESERVED_BASENAMES = frozenset({
 
 DEFAULT_UPSCALE_PRESET_KEY = "clean"
 DEFAULT_UPSCALE_PRESET_ID = f"builtin_{DEFAULT_UPSCALE_PRESET_KEY}"
+MAX_UPSCALE_INPUT_CHARS = 120_000
 
 BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
     "clean": {
@@ -4322,8 +4323,15 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
-    if len(text) > 120_000:
-        raise HTTPException(status_code=400, detail="text is too long")
+    trimmed_chars = 0
+    if len(text) > MAX_UPSCALE_INPUT_CHARS:
+        trimmed_chars = len(text) - MAX_UPSCALE_INPUT_CHARS
+        text = text[trimmed_chars:]
+        logger.warning(
+            "upscale input trimmed: leading_chars=%s max_chars=%s",
+            trimmed_chars,
+            MAX_UPSCALE_INPUT_CHARS,
+        )
     _ensure_builtin_upscale_presets()
     preset_id = str(payload.get("preset_id") or "").strip()
     if not preset_id:
@@ -4395,6 +4403,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
         "preset_id": preset.get("id"),
         "preset_name": preset.get("name"),
         "model": used_model,
+        "trimmed_chars": trimmed_chars,
         "text": (out.get("text") or "").strip(),
     }
 

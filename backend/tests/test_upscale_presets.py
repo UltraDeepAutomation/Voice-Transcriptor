@@ -56,6 +56,24 @@ class UpscalePresetContractTests(unittest.TestCase):
         self.assertEqual(response["text"], "Improved transcript")
         self.assertIn("Improve transcript readability", upscale.call_args.kwargs["instruction"])
 
+    def test_upscale_trims_oversized_input_in_backend(self):
+        self.main.save_config({
+            "providers": {"openrouter": {"key": "sk-or-v1-test-upscale-key-12345678"}},
+            "preferences": {},
+        })
+        oversized = "a" * (self.main.MAX_UPSCALE_INPUT_CHARS + 11)
+
+        with mock.patch.object(
+            self.main,
+            "openrouter_upscale_text",
+            return_value={"text": "Trimmed transcript"},
+        ) as upscale:
+            response = asyncio.run(self.main.upscale_text({"text": oversized}, _auth=None))
+
+        self.assertEqual(response["trimmed_chars"], 11)
+        self.assertEqual(len(upscale.call_args.kwargs["text"]), self.main.MAX_UPSCALE_INPUT_CHARS)
+        self.assertEqual(upscale.call_args.kwargs["text"], oversized[11:])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4364,30 +4364,21 @@ async function runUpscaleIfEnabled(
     }
     const t0 = performance.now();
     const upscaleModel = getUpscaleModelValue();
-    // Backend rejects upscale requests with text > 120 000 chars
-    // (`/api/upscale` HTTP 400). Cap client-side and surface a
-    // friendly notice so the user understands WHY the upscale was
-    // skipped instead of seeing an opaque server error. We trim
-    // from the start so the trailing summary (often the most
-    // useful part for AI rewrite) is preserved.
-    const MAX_UPSCALE_INPUT_CHARS = 120_000;
-    let payloadText = input;
-    if (payloadText.length > MAX_UPSCALE_INPUT_CHARS) {
-      const overflow = payloadText.length - MAX_UPSCALE_INPUT_CHARS;
-      payloadText = payloadText.slice(overflow);
-      console.warn(`Upscale: trimmed ${overflow} leading chars to fit ${MAX_UPSCALE_INPUT_CHARS} cap`);
-      setStatusScoped(sessionToken, `Upscaling (trimmed first ${overflow.toLocaleString()} chars)`, "warning");
-    }
     try {
       const selectedPresetId = upscalePresetId();
       const payload: { text: string; preset_id?: string; model?: string } = {
-        text: payloadText,
+        text: input,
         model: upscaleModel || undefined,
       };
       if (selectedPresetId) payload.preset_id = selectedPresetId;
-      const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string }>("/api/upscale", payload);
+      const r = await apiPost<{ ok: boolean; text: string; preset_id: string; model: string; trimmed_chars?: number }>("/api/upscale", payload);
       const out = String(r.text || "").trim();
       if (!out) throw new Error("Upscale returned empty text");
+      const trimmedChars = Number(r.trimmed_chars || 0);
+      if (trimmedChars > 0) {
+        console.warn(`Upscale: backend trimmed ${trimmedChars} leading chars`);
+        setStatusScoped(sessionToken, `Upscaling trimmed first ${trimmedChars.toLocaleString()} chars`, "warning");
+      }
       // Session-aware success write. We write if EITHER:
       //   (a) this session is still the current UI session, OR
       //   (b) the DOM is still showing OUR specific placeholder
