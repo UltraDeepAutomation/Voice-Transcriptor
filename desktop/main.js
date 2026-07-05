@@ -2036,12 +2036,34 @@ async function toggleRecordingFromShortcut() {
     }
 
     if (result.recording) {
+      const confirmedStart = await waitForRendererRecordingStart();
+      if (!confirmedStart.confirmed) {
+        appendMainLog(
+          `[shortcut] recording start not confirmed within ` +
+          `${RENDERER_RECORDING_START_CONFIRM_TIMEOUT_MS}ms ` +
+          `recording=${confirmedStart.recording ? 1 : 0} rec=${Number(confirmedStart.recordingId || 0)}`,
+        );
+        traceStep(trace, "recording_start_not_confirmed", {
+          recording: !!confirmedStart.recording,
+          recordingId: Number(confirmedStart.recordingId || 0),
+          timeoutMs: RENDERER_RECORDING_START_CONFIRM_TIMEOUT_MS,
+        });
+        await setRecordingStatus("Mic Not Started");
+        await sleep(RECORDING_STATUS_TERMINAL_DWELL_MS);
+        resetRecordingStatusState();
+        traceEnd(trace, "failed", { reason: "recording-start-not-confirmed" });
+        return;
+      }
       setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
       keepCapturedTarget = true;
       traceStep(trace, "target_captured", {
         target: pasteTargetSummary(pasteTarget),
       });
-      traceStep(trace, "recording_started", { auto: !!result.auto, timerText: result.timerText || "" });
+      traceStep(trace, "recording_started", {
+        auto: !!result.auto,
+        timerText: result.timerText || "",
+        recordingId: Number(confirmedStart.recordingId || 0),
+      });
       await beginRecordingStatusSession();
       traceEnd(trace, "recording-started", {});
       return;
@@ -2192,6 +2214,8 @@ async function stopRecordingFromMainProcess() {
 // 2 s is long enough for a healthy renderer under load but short
 // enough that a stuck renderer still lets the user stop cleanly.
 const RENDERER_STATE_QUERY_TIMEOUT_MS = 2000;
+const RENDERER_RECORDING_START_CONFIRM_TIMEOUT_MS = 8000;
+const RENDERER_RECORDING_START_CONFIRM_POLL_MS = 80;
 
 async function queryRendererState() {
   if (!win || win.isDestroyed() || !win.webContents) return null;
@@ -2278,6 +2302,29 @@ async function queryRendererRecordingState() {
   return state && typeof state === "object"
     ? state
     : { recording: false, recordingId: 0 };
+}
+
+async function waitForRendererRecordingStart(
+  timeoutMs = RENDERER_RECORDING_START_CONFIRM_TIMEOUT_MS,
+) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  let lastState = { recording: false, recordingId: 0 };
+  while (Date.now() < deadline) {
+    lastState = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    if (lastState?.recording && Number(lastState.recordingId || 0) > 0) {
+      return {
+        confirmed: true,
+        recording: true,
+        recordingId: Number(lastState.recordingId || 0),
+      };
+    }
+    await sleep(RENDERER_RECORDING_START_CONFIRM_POLL_MS);
+  }
+  return {
+    confirmed: false,
+    recording: !!lastState?.recording,
+    recordingId: Number(lastState?.recordingId || 0),
+  };
 }
 
 function sleep(ms) {
