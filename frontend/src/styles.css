@@ -2071,35 +2071,6 @@ textarea:focus-visible,
   cursor: not-allowed;
 }
 
-.send-enter-btn {
-  /* Unified with the default ``.icon-btn`` 32×32 footprint so the
-     upscale toolbar does not mix 24/28/32 px icon sizes in the same
-     row — that inconsistency was the "одни большущие, другие
-     маленькие" complaint. */
-  width: 32px;
-  height: 32px;
-  min-width: 32px;
-}
-
-.send-enter-btn.active {
-  border-color: var(--send-active-border);
-  background: var(--send-active-bg);
-}
-
-.send-enter-ico {
-  width: 12px;
-  height: 12px;
-  display: inline-block;
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: 12px 12px;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='%23A8A8A8' stroke-width='1.7' stroke-linecap='round'/%3E%3Cpath d='M8.8 4.8L12 8L8.8 11.2' stroke='%23A8A8A8' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-}
-
-.send-enter-btn.active .send-enter-ico {
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 8H12' stroke='%23D3F8DB' stroke-width='1.7' stroke-linecap='round'/%3E%3Cpath d='M8.8 4.8L12 8L8.8 11.2' stroke='%23D3F8DB' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-}
-
 .copy-ico {
   width: 14px;
   height: 14px;
