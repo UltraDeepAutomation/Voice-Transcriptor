@@ -259,6 +259,7 @@ let pendingShortcutBridgeMessages = [];
 let backendStartInFlight = null;
 let micPermissionChecked = false;
 let macPastePermissionPromptAt = 0;
+let macPastePermissionPromptInFlight = false;
 const MAC_PASTE_PERMISSION_PROMPT_THROTTLE_MS = 60000;
 let loadedFrontendBuildSignature = "";
 let pasteTarget = emptyCapturedPasteTarget();
@@ -2873,6 +2874,22 @@ async function promptMacPastePermissions(reason = "") {
   }
 }
 
+function scheduleMacPastePermissionsPrompt(reason = "") {
+  if (process.platform !== "darwin") return;
+  if (macPastePermissionPromptInFlight) {
+    appendMainLog(`[permissions] paste prompt already in flight reason="${compactLogText(reason, 120)}"`);
+    return;
+  }
+  macPastePermissionPromptInFlight = true;
+  promptMacPastePermissions(reason)
+    .catch((e) => {
+      appendMainLog(`[permissions] paste prompt failed: ${e?.message || e}`);
+    })
+    .finally(() => {
+      macPastePermissionPromptInFlight = false;
+    });
+}
+
 async function requestMacMicrophonePermissionOnce() {
   if (process.platform !== "darwin") return true;
   if (micPermissionChecked) {
@@ -4139,11 +4156,11 @@ async function processPostStopTask(task) {
         await setRecordingStatus("Sent");
       }
       if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
-        await promptMacPastePermissions(sent.reason);
+        scheduleMacPastePermissionsPrompt(sent.reason);
       }
     }
     if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
-      await promptMacPastePermissions(pasted.reason);
+      scheduleMacPastePermissionsPrompt(pasted.reason);
     }
     recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
   } else {
@@ -4235,7 +4252,7 @@ async function pasteLatestTranscriptFromShortcut() {
     await setRecordingStatus(pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
       if (String(pasted.reason || "").includes("no-accessibility") || looksLikeAutomationPermissionError(pasted.reason)) {
-        await promptMacPastePermissions(pasted.reason);
+        scheduleMacPastePermissionsPrompt(pasted.reason);
       }
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);
     }
