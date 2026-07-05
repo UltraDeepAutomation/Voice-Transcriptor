@@ -734,9 +734,9 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   waveBarWidth: 1.4,
   waveBarGap: 1.8,
   waveFrameMs: 33,
-  waveLevelTickMs: 33,
-  waveIdleTickMs: 66,
-  waveActiveStaleMs: 360,
+  waveLevelTickMs: 96,
+  waveIdleTickMs: 150,
+  waveActiveStaleMs: 520,
 });
 
 const recordingStatusCapsuleState = {

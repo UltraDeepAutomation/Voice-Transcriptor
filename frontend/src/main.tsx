@@ -3724,7 +3724,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
     upscale_preset: (($("upscalePresetSelect") as HTMLSelectElement).value || "builtin_clean").trim(),
     upscale_model: getUpscaleModelValue(),
-    auto_send_enter: !!($("autoSendEnterToggle") as HTMLButtonElement).classList.contains("active"),
+    auto_send_enter: readAutoSendEnterEnabled(),
     auto_stop_silence_enabled: silence.enabled,
     auto_stop_silence_seconds: silence.seconds,
     auto_stop_silence_db: silence.thresholdDb,
@@ -4107,12 +4107,23 @@ function shouldUpscale(): boolean {
   return !!($("upscaleToggle") as HTMLInputElement).checked;
 }
 
+function readAutoSendEnterEnabled(): boolean {
+  const settingsToggle = document.getElementById("settingsAutoSendEnterToggle") as HTMLInputElement | null;
+  if (settingsToggle) return !!settingsToggle.checked;
+  const liveBtn = document.getElementById("autoSendEnterToggle") as HTMLButtonElement | null;
+  return !!liveBtn?.classList.contains("active");
+}
+
 function setAutoSendEnterEnabled(enabled: boolean): void {
   const btn = $("autoSendEnterToggle") as HTMLButtonElement;
   const on = !!enabled;
   btn.classList.toggle("active", on);
   btn.setAttribute("aria-pressed", on ? "true" : "false");
   btn.title = on ? "Auto send after paste: ON" : "Auto send after paste: OFF";
+  const settingsToggle = document.getElementById("settingsAutoSendEnterToggle") as HTMLInputElement | null;
+  if (settingsToggle && settingsToggle.checked !== on) {
+    settingsToggle.checked = on;
+  }
 }
 
 function upscalePresetId(): string {
@@ -4932,6 +4943,10 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 ($("autoSendEnterToggle") as HTMLButtonElement).addEventListener("click", () => {
   const btn = $("autoSendEnterToggle") as HTMLButtonElement;
   setAutoSendEnterEnabled(!btn.classList.contains("active"));
+  queueUiPreferencesSave();
+});
+($("settingsAutoSendEnterToggle") as HTMLInputElement).addEventListener("change", () => {
+  setAutoSendEnterEnabled(($("settingsAutoSendEnterToggle") as HTMLInputElement).checked);
   queueUiPreferencesSave();
 });
 ($("upscalePresetSelect") as HTMLSelectElement).addEventListener("change", () => {
