@@ -1436,7 +1436,10 @@ textarea:focus-visible,
 #recordingAudioRow {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 32px;
+  align-items: center;
   min-height: 53px;
+  contain: layout paint;
 }
 
 #recordingAudioRow[hidden] {
@@ -1448,6 +1451,10 @@ textarea:focus-visible,
   width: 100%;
   min-width: 0;
   flex: none;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  contain: layout paint;
 }
 
 #recordingAudioRow.is-audio-hydrating {
@@ -1458,6 +1465,7 @@ textarea:focus-visible,
   content: "";
   grid-area: 1 / 1;
   align-self: center;
+  width: 100%;
   height: 32px;
   border-radius: var(--control-radius);
   border: 1px solid var(--surface-border);
