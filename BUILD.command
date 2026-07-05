@@ -215,6 +215,28 @@ install_app_bundle() {
   echo "Installed $target_app"
 }
 
+bundle_identifier() {
+  local app_path="$1"
+  plutil -extract CFBundleIdentifier raw -o - "$app_path/Contents/Info.plist" 2>/dev/null || true
+}
+
+retire_duplicate_app_bundle() {
+  local duplicate_app="$1"
+  local canonical_app="$2"
+  local duplicate_id
+  local canonical_id
+  [ -d "$duplicate_app" ] || return 0
+  [ "$duplicate_app" != "$canonical_app" ] || return 0
+  duplicate_id="$(bundle_identifier "$duplicate_app")"
+  canonical_id="$(bundle_identifier "$canonical_app")"
+  if [ -n "$duplicate_id" ] && [ "$duplicate_id" = "$canonical_id" ]; then
+    cleanup_path "$duplicate_app"
+    echo "Removed duplicate $duplicate_app (same bundle id as $canonical_app)"
+    return 0
+  fi
+  echo "Keeping $duplicate_app because its bundle id differs from $canonical_app" >&2
+}
+
 INSTALL_ROOT="${TRANSCRIPTOR_INSTALL_DIR:-/Applications}"
 if [ ! -d "$INSTALL_ROOT" ] || [ ! -w "$INSTALL_ROOT" ]; then
   if [ -n "${TRANSCRIPTOR_INSTALL_DIR:-}" ]; then
@@ -233,5 +255,5 @@ install_app_bundle "$PRIMARY_APP"
 
 LEGACY_USER_APP="$HOME/Applications/Transcriptor.app"
 if [ -d "$LEGACY_USER_APP" ] && [ "$LEGACY_USER_APP" != "$PRIMARY_APP" ]; then
-  install_app_bundle "$LEGACY_USER_APP"
+  retire_duplicate_app_bundle "$LEGACY_USER_APP" "$PRIMARY_APP"
 fi
