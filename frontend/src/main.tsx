@@ -4101,6 +4101,7 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
   // race with /api/config writes and temporarily-suspended hotkeys are
   // re-registered in the same path that received the captured keys.
   publishShortcutUpdateToMain();
+  void flushUiPreferencesSaveNow();
 }
 
 function shouldUpscale(): boolean {
@@ -4551,21 +4552,17 @@ async function runLivePasteUpscaleWithinSla(
 // debounce still batches bursts, and the chain guarantees FIFO
 // ordering so the last write always wins.
 let uiPrefInFlightChain: Promise<void> = Promise.resolve();
+let uiPrefPendingSave = false;
 
-function queueUiPreferencesSave(): void {
-  if (suppressUiPrefAutosave) return;
-  if (uiPrefSaveTimer) {
-    clearTimeout(uiPrefSaveTimer);
-    uiPrefSaveTimer = null;
-  }
-  uiPrefSaveTimer = window.setTimeout(() => {
-    uiPrefSaveTimer = null;
-    const provider = readProviderSelection();
-    const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
-    const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
-    const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
-    const shouldRefreshRecordingsArchive = nextRecordingsDir !== configuredRecordingsDir;
-    const payload = {
+function buildUiPreferencesSavePlan() {
+  const provider = readProviderSelection();
+  const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
+  const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
+  const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
+  return {
+    nextRecordingsDir,
+    shouldRefreshRecordingsArchive: nextRecordingsDir !== configuredRecordingsDir,
+    payload: {
       preferences: {
         recordings_dir: nextRecordingsDir,
         remote_provider: remoteProvider,
@@ -4575,44 +4572,82 @@ function queueUiPreferencesSave(): void {
         openrouter: { model: openrouterModel || DEFAULT_OPENROUTER_AUDIO_MODEL },
         ui: collectUiPreferences(),
       },
-    };
-    // Chain each save after the previous one's completion (success
-    // or failure — we don't want one transient 500 to block all
-    // future saves). The ``Promise.resolve()`` tail guarantees the
-    // chain never carries a rejected state forward.
-    uiPrefInFlightChain = uiPrefInFlightChain
-      .catch(() => { })
-      .then(async () => {
-        try {
-          await apiPost<{ ok: boolean }>("/api/config", payload);
-          configuredRecordingsDir = nextRecordingsDir;
-          if (!shouldRefreshRecordingsArchive) return;
-          setSettingsArchiveStatus("Archive folder saved.", "success");
-          activeResolvedRecordingsDir = "";
-          recordingsBootstrapReady = false;
-          const reloadTask = loadRecordings(false).catch((e) => {
-            console.warn("Recordings archive reload failed", e);
-            const msg = sanitizeUiErrorMessage(e, "Recordings archive reload failed.");
-            setSettingsArchiveStatus(`Archive reload failed: ${msg}`, "warning");
-          });
-          const trackedReloadPromise = reloadTask.finally(() => {
-            if (recordingsBootstrapPromise === trackedReloadPromise) {
-              recordingsBootstrapPromise = null;
-            }
-            recordingsBootstrapReady = !!currentArchiveDirSnapshot();
-          });
-          recordingsBootstrapPromise = trackedReloadPromise;
-        } catch (e) {
-          const msg = sanitizeUiErrorMessage(e, "Settings were not saved.");
-          setStatus(`Settings save failed: ${msg}`, "error");
-          if (shouldRefreshRecordingsArchive) {
-            setSettingsArchiveStatus(`Archive settings save failed: ${msg}`, "error");
+    },
+  };
+}
+
+function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSavePlan>): Promise<void> {
+  // Chain each save after the previous one's completion (success
+  // or failure — we don't want one transient 500 to block all
+  // future saves). The ``Promise.resolve()`` tail guarantees the
+  // chain never carries a rejected state forward.
+  uiPrefInFlightChain = uiPrefInFlightChain
+    .catch(() => { })
+    .then(async () => {
+      try {
+        await apiPost<{ ok: boolean }>("/api/config", plan.payload);
+        configuredRecordingsDir = plan.nextRecordingsDir;
+        if (!plan.shouldRefreshRecordingsArchive) return;
+        setSettingsArchiveStatus("Archive folder saved.", "success");
+        activeResolvedRecordingsDir = "";
+        recordingsBootstrapReady = false;
+        const reloadTask = loadRecordings(false).catch((e) => {
+          console.warn("Recordings archive reload failed", e);
+          const msg = sanitizeUiErrorMessage(e, "Recordings archive reload failed.");
+          setSettingsArchiveStatus(`Archive reload failed: ${msg}`, "warning");
+        });
+        const trackedReloadPromise = reloadTask.finally(() => {
+          if (recordingsBootstrapPromise === trackedReloadPromise) {
+            recordingsBootstrapPromise = null;
           }
-          showRecordSessionNotice(`Settings were not saved: ${msg}`, "error", 7000);
+          recordingsBootstrapReady = !!currentArchiveDirSnapshot();
+        });
+        recordingsBootstrapPromise = trackedReloadPromise;
+      } catch (e) {
+        const msg = sanitizeUiErrorMessage(e, "Settings were not saved.");
+        setStatus(`Settings save failed: ${msg}`, "error");
+        if (plan.shouldRefreshRecordingsArchive) {
+          setSettingsArchiveStatus(`Archive settings save failed: ${msg}`, "error");
         }
-      });
+        showRecordSessionNotice(`Settings were not saved: ${msg}`, "error", 7000);
+      }
+    });
+  return uiPrefInFlightChain;
+}
+
+function queueUiPreferencesSave(): void {
+  if (suppressUiPrefAutosave) return;
+  uiPrefPendingSave = true;
+  if (uiPrefSaveTimer) {
+    clearTimeout(uiPrefSaveTimer);
+    uiPrefSaveTimer = null;
+  }
+  uiPrefSaveTimer = window.setTimeout(() => {
+    uiPrefSaveTimer = null;
+    if (!uiPrefPendingSave) return;
+    uiPrefPendingSave = false;
+    void enqueueUiPreferencesSave(buildUiPreferencesSavePlan());
   }, UI_TOKENS.settings.saveDebounceMs);
 }
+
+function flushUiPreferencesSaveNow(): Promise<void> {
+  if (uiPrefSaveTimer) {
+    clearTimeout(uiPrefSaveTimer);
+    uiPrefSaveTimer = null;
+  }
+  if (!uiPrefPendingSave) {
+    return uiPrefInFlightChain.catch(() => { });
+  }
+  uiPrefPendingSave = false;
+  return enqueueUiPreferencesSave(buildUiPreferencesSavePlan());
+}
+
+function flushUiPreferencesSaveBestEffort(): void {
+  void flushUiPreferencesSaveNow();
+}
+
+window.addEventListener("pagehide", flushUiPreferencesSaveBestEffort, { capture: true });
+window.addEventListener("beforeunload", flushUiPreferencesSaveBestEffort, { capture: true });
 
 async function loadCfg(): Promise<void> {
   suppressUiPrefAutosave = true;
@@ -5121,6 +5156,7 @@ $("resetShortcutsBtn").addEventListener("click", () => {
   // Push to main process for live reload.
   publishShortcutUpdateToMain();
   queueUiPreferencesSave();
+  void flushUiPreferencesSaveNow();
 });
 
 let recordingItems: RecordingItem[] = [];
