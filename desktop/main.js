@@ -529,11 +529,20 @@ async function ensureWindowVisibleInner(options = {}) {
     await startBackend();
   }
   await waitForMainWindowLoadBeforeReveal("ensure-window-visible");
-  const refreshed = await refreshWindowForFrontendBuild(false);
-  if (refreshed) {
-    await waitForMainWindowLoadBeforeReveal("ensure-window-visible-refresh");
-  }
   await revealMainWindowWhenReady("ensure-window-visible");
+}
+
+function hideMainWindow(reason = "") {
+  if (!win || win.isDestroyed() || !win.isVisible()) return false;
+  const label = String(reason || "unknown").trim() || "unknown";
+  try {
+    win.hide();
+    appendMainLog(`[main-window-hide] reason=${label}`);
+    return true;
+  } catch (e) {
+    appendMainLog(`[main-window-hide] failed reason=${label}: ${e?.message || e}`);
+    return false;
+  }
 }
 
 function ensureMacDockPresence(reason = "") {
@@ -1398,9 +1407,7 @@ async function ensureRecordingStatusCapsuleWindow() {
     }
     if (raw === "__recording_capsule_stop__") {
       recordingStopInFlight = true;
-      if (win && !win.isDestroyed() && win.isVisible()) {
-        safeExecSync("recording_capsule_stop:winHide", () => win.hide());
-      }
+      hideMainWindow("recording-capsule-stop");
       guardedStopFromRecordingStatus("capsule-click");
       return;
     }
@@ -1877,7 +1884,7 @@ function guardedStopFromRecordingStatus(reason) {
 async function stopRecordingFromMainProcess() {
   await ensureBackgroundWindow();
   if (!win || win.isDestroyed() || !win.webContents) return;
-  if (win.isVisible()) win.hide();
+  hideMainWindow("stop-recording-main-process");
 
   try {
     const snapshot = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
@@ -5699,7 +5706,7 @@ async function createWindow(options = {}) {
         shortcutCaptureAbortHandler("window-hide");
       }
       ensureMacDockPresence("main-window-close-hide");
-      win.hide();
+      hideMainWindow("macos-close-button");
       return;
     }
   });
