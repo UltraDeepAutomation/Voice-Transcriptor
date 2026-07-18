@@ -73,7 +73,18 @@ else
 fi
 
 echo "[notarize-dmg] Submitting $DMG_PATH"
-xcrun notarytool submit "$DMG_PATH" "${auth_args[@]}" --wait --timeout "$WAIT_TIMEOUT" --output-format json
+SUBMIT_RESULT="$(xcrun notarytool submit "$DMG_PATH" "${auth_args[@]}" --wait --timeout "$WAIT_TIMEOUT" --output-format json)"
+echo "$SUBMIT_RESULT"
+SUBMIT_STATUS="$(printf '%s' "$SUBMIT_RESULT" | node -e 'const fs = require("fs"); const input = fs.readFileSync(0, "utf8"); try { process.stdout.write(JSON.parse(input).status || ""); } catch { process.exit(2); }')"
+SUBMIT_ID="$(printf '%s' "$SUBMIT_RESULT" | node -e 'const fs = require("fs"); const input = fs.readFileSync(0, "utf8"); try { process.stdout.write(JSON.parse(input).id || ""); } catch { process.exit(2); }')"
+if [ "$SUBMIT_STATUS" != "Accepted" ]; then
+  if [ -n "$SUBMIT_ID" ]; then
+    LOG_PATH="${DMG_PATH}.notary-log.json"
+    echo "[notarize-dmg] Fetching rejection log to $LOG_PATH" >&2
+    xcrun notarytool log "$SUBMIT_ID" "${auth_args[@]}" --output-format json | tee "$LOG_PATH" >&2 || true
+  fi
+  die "Notarization did not succeed: ${SUBMIT_STATUS:-unknown}"
+fi
 
 echo "[notarize-dmg] Stapling ticket"
 xcrun stapler staple "$DMG_PATH"

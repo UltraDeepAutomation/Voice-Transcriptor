@@ -99,19 +99,18 @@
     },
     "dmg": {
       "title": "${productName} ${version}",
-      "window": {
-        "width": 540,
-        "height": 380
-      },
+      "background": "build/dmg-background.png",
+      "iconSize": 104,
+      "iconTextSize": 12,
       "contents": [
         {
-          "x": 140,
-          "y": 180,
+          "x": 178,
+          "y": 220,
           "type": "file"
         },
         {
-          "x": 400,
-          "y": 180,
+          "x": 482,
+          "y": 220,
           "type": "link",
           "path": "/Applications"
         }
