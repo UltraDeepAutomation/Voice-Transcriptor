@@ -132,6 +132,93 @@ class LiveWindowCoverageTests(unittest.TestCase):
         self.assertEqual(session._covered_sec, 0.0)
 
 
+class FinalizeCoverageReportTests(unittest.TestCase):
+    """``finalize_envelope`` is the contract the frontend trusts when it
+    decides to adopt the live transcript instead of re-transcribing the
+    saved recording. A false ``complete`` silently ships a transcript
+    with holes, so every way of ending up short must clear the flag."""
+
+    def _session(self) -> LiveSession:
+        return LiveSession(
+            model_name="tiny",
+            language=None,
+            config=LiveConfig(window_sec=8.0, overlap_sec=1.0, ring_slack_sec=10.0),
+        )
+
+    @staticmethod
+    def _segments_for(audio, *_args, **_kwargs):
+        end = audio.shape[0] / float(LIVE_SAMPLE_RATE_HZ)
+        return {"segments": [{"start": 0.0, "end": end, "text": "hello"}]}
+
+    def test_fully_covered_session_reports_complete(self):
+        session = self._session()
+
+        async def run():
+            with mock.patch("backend.live.transcribe_audio", self._segments_for):
+                await _feed(session, 3.0)
+                await session.maybe_transcribe(force=True)
+
+        asyncio.run(run())
+        env = session.finalize_envelope()
+        self.assertTrue(env["complete"])
+        self.assertEqual(env["dropped_sec"], 0.0)
+        self.assertEqual(env["uncovered_tail_sec"], 0.0)
+        self.assertAlmostEqual(env["total_sec"], env["covered_sec"], delta=0.01)
+        self.assertTrue(env["text"])
+
+    def test_untranscribed_tail_clears_complete(self):
+        """Audio arriving after the last pass, with no forced flush."""
+        session = self._session()
+
+        async def run():
+            with mock.patch("backend.live.transcribe_audio", self._segments_for):
+                await _feed(session, 2.0)
+                await session.maybe_transcribe()
+            await _feed(session, 1.5)
+
+        asyncio.run(run())
+        env = session.finalize_envelope()
+        self.assertFalse(env["complete"])
+        self.assertGreater(env["uncovered_tail_sec"], 1.0)
+
+    def test_dropped_audio_clears_complete(self):
+        """The assist fell behind far enough that a window was capped."""
+        session = self._session()
+
+        async def run():
+            await _feed(session, 40.0)
+            with mock.patch("backend.live.transcribe_audio", self._segments_for):
+                await session.maybe_transcribe(force=True)
+
+        asyncio.run(run())
+        env = session.finalize_envelope()
+        self.assertGreater(env["dropped_sec"], 0.0)
+        self.assertFalse(env["complete"])
+
+    def test_failed_final_pass_clears_complete(self):
+        session = self._session()
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("model exploded")
+
+        async def run():
+            await _feed(session, 2.0)
+            with mock.patch("backend.live.transcribe_audio", boom):
+                await session.maybe_transcribe(force=True)
+
+        asyncio.run(run())
+        env = session.finalize_envelope()
+        self.assertFalse(env["complete"])
+        self.assertEqual(env["covered_sec"], 0.0)
+
+    def test_empty_session_is_not_complete(self):
+        """No audio at all must never certify coverage — otherwise an
+        empty transcript would be adopted as authoritative."""
+        env = self._session().finalize_envelope()
+        self.assertFalse(env["complete"])
+        self.assertEqual(env["total_sec"], 0.0)
+
+
 class DeepgramEventOrderingTests(unittest.TestCase):
     def _session(self) -> DeepgramLiveSession:
         return DeepgramLiveSession(api_key="k")

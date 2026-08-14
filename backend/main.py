@@ -1290,7 +1290,14 @@ async def transcribe_warmup(
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
     loop = asyncio.get_running_loop()
-    state = await loop.run_in_executor(None, lambda: warm_model(model, probe=False))
+    # ``probe=True`` matches the startup warm of the default model. Only
+    # loading the weights leaves the lazy VAD load and the first
+    # encoder/decoder pass to be paid by the user's first live window,
+    # which is exactly the stall that makes the assist fall behind and
+    # then have to catch up with an oversized (slower still) window.
+    # Callers fire this in the background, so the extra probe never sits
+    # on an interactive path.
+    state = await loop.run_in_executor(None, lambda: warm_model(model, probe=True))
     return {"ok": True, "model": model, "state": warm_state(model) or state}
 
 
@@ -3686,6 +3693,16 @@ async def _run_local_live_session(
                 "segments": final_state["segments"],
                 "durationSec": final_state["duration_sec"],
                 "source": "local-assist",
+                # Coverage truth for this session. ``complete`` certifies
+                # that every captured second reached the model, which lets
+                # the frontend adopt this transcript instead of paying for
+                # a full re-transcription of the saved recording. See
+                # ``LiveSession.finalize_envelope`` for the definition.
+                "complete": final_state["complete"],
+                "coveredSec": final_state["covered_sec"],
+                "totalSec": final_state["total_sec"],
+                "droppedSec": final_state["dropped_sec"],
+                "uncoveredTailSec": final_state["uncovered_tail_sec"],
             },
         )
 

@@ -220,12 +220,30 @@ interface LiveSessionSnapshot {
 
 type LiveWsMode = "none" | "local-assist" | "deepgram-stream";
 
+/**
+ * Coverage report for a local-assist session: how much of the captured
+ * stream actually reached the model. Emitted by the backend's
+ * ``LiveSession.finalize_envelope`` and absent for every other transport
+ * (Deepgram streams its own transcript and has no notion of windows).
+ */
+interface LiveCoverage {
+  /** True only when nothing was dropped and no tail went untranscribed. */
+  complete: boolean;
+  coveredSec: number;
+  totalSec: number;
+  /** Audio discarded because the assist fell behind its window budget. */
+  droppedSec: number;
+  /** Audio at the end of the stream that never reached the model. */
+  uncoveredTailSec: number;
+}
+
 interface LiveFinalEnvelope {
   text: string;
   segments: TranscriptSegment[];
   durationSec: number;
   source: string;
   error?: string;
+  coverage?: LiveCoverage;
 }
 
 /**
@@ -246,6 +264,7 @@ type LiveWsMessage =
       durationSec: number;
       source: string;
       error?: string;
+      coverage?: LiveCoverage;
     }
   | { type: "error"; error: string; fatal: boolean };
 
@@ -285,6 +304,21 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
       .map((s) => normalizeTranscriptSegment(s))
       .filter((s): s is TranscriptSegment => !!s);
     const error = typeof obj.error === "string" && obj.error ? obj.error : undefined;
+    // Coverage is only present on local-assist envelopes. It must be
+    // treated as absent unless the backend explicitly sent the boolean —
+    // a missing or malformed field can never be read as "complete", or a
+    // protocol mismatch would silently skip the full re-transcription
+    // that guarantees no words are lost.
+    const coverage: LiveCoverage | undefined =
+      typeof obj.complete === "boolean"
+        ? {
+            complete: obj.complete,
+            coveredSec: Math.max(0, Number(obj.coveredSec) || 0),
+            totalSec: Math.max(0, Number(obj.totalSec) || 0),
+            droppedSec: Math.max(0, Number(obj.droppedSec) || 0),
+            uncoveredTailSec: Math.max(0, Number(obj.uncoveredTailSec) || 0),
+          }
+        : undefined;
     return {
       type: "final",
       text: String(obj.text || ""),
@@ -292,6 +326,7 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
       durationSec: Math.max(0, Number(obj.durationSec) || 0),
       source: String(obj.source || ""),
       error,
+      coverage,
     };
   }
 
@@ -3318,6 +3353,42 @@ function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalMod
     assistLocalModel: effectiveProvider === "local" ? resolveFastLiveLocalModel(configuredLocalModel) : resolveLivePreviewLocalModel(configuredLocalModel),
     finalLocalModel,
   };
+}
+
+/**
+ * Decide whether a local-assist transcript may stand in for a full
+ * re-transcription of the saved recording at stop.
+ *
+ * The live assist decodes the recording while it is being spoken, so
+ * when it ran the same model the final pass would run and covered every
+ * captured second, the full pass is pure duplicated work whose cost
+ * scales with recording length.
+ *
+ * Completeness is NOT re-derived here. ``coverage.complete`` is computed
+ * once, in ``LiveSession.finalize_envelope``, against the same epsilon
+ * the windowing logic uses; re-checking ``droppedSec``/``uncoveredTailSec``
+ * with a locally-invented tolerance would create a second, silently
+ * diverging definition of the same property. The numeric fields exist
+ * for diagnostics. Every other guard below is about *identity* — is this
+ * envelope even the right kind — which is orthogonal to completeness.
+ *
+ * Returns null whenever anything is unproven, so the caller falls back
+ * to the full pass. "No words lost" outranks "stop is fast".
+ */
+function adoptableLiveTranscript(
+  envelope: LiveFinalEnvelope | null,
+  snapshot: { assistLocalModel: string; finalLocalModel: string },
+): { text: string; coverage: LiveCoverage } | null {
+  if (!envelope || envelope.error) return null;
+  if (envelope.source !== "local-assist") return null;
+  const coverage = envelope.coverage;
+  if (!coverage || !coverage.complete || coverage.totalSec <= 0) return null;
+  const assistModel = String(snapshot.assistLocalModel || "").trim();
+  const finalModel = String(snapshot.finalLocalModel || "").trim();
+  if (!assistModel || assistModel !== finalModel) return null;
+  const text = normalizeTranscriptWhitespace(String(envelope.text || "")).trim();
+  if (!text) return null;
+  return { text, coverage };
 }
 
 /**
@@ -7857,6 +7928,7 @@ async function startLive(): Promise<void> {
             source: msg.source || sessionWsMode,
           };
           if (msg.error) envelope.error = msg.error;
+          if (msg.coverage) envelope.coverage = msg.coverage;
           resolveLiveFinal(sessionUiToken, envelope);
           return;
         }
@@ -9237,8 +9309,31 @@ async function stopLive(enhance: boolean): Promise<void> {
         $("progressFill").style.width = "35%";
         $("progressText").textContent = "35%";
       }
-      const syncOut = await runLocalFinalPass();
-      transcriptRaw = String(syncOut.text || "").trim();
+      // The live assist already decoded this recording while it was
+      // being spoken. When it used the SAME model the final pass would
+      // use, and the backend certifies that every captured second
+      // reached that model, re-transcribing the whole file from scratch
+      // produces the same text for a cost that grows with recording
+      // length — the "sometimes it takes twenty seconds" stop.
+      //
+      // Adopting the live transcript is gated on proof, never on
+      // optimism: a missing coverage report, any dropped window, any
+      // untranscribed tail, a different assist model, or an empty
+      // transcript all fall through to the full pass. That keeps
+      // "no words are lost" strictly stronger than "stop is fast".
+      const liveEnvelope = await liveFinalPromise();
+      const adopted = adoptableLiveTranscript(liveEnvelope, liveSnapshot);
+      if (adopted) {
+        console.log(
+          `[trace stopLive] adopting live-assist transcript ` +
+          `(model=${liveSnapshot.assistLocalModel} covered=${adopted.coverage.coveredSec.toFixed(2)}s ` +
+          `of ${adopted.coverage.totalSec.toFixed(2)}s) — skipping full re-transcription`,
+        );
+        transcriptRaw = adopted.text;
+      } else {
+        const syncOut = await runLocalFinalPass();
+        transcriptRaw = String(syncOut.text || "").trim();
+      }
     } else if (provider === "deepgram") {
       // Deepgram already streamed the transcript in real time. We
       // wait up to 4000 ms for the final envelope after CloseStream

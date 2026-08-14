@@ -318,6 +318,26 @@ class LiveSession:
         by ``_run_local_live_session`` to fill the ``"final"`` WebSocket
         message — the frontend treats an empty final envelope as a
         signal to fall back to recovery.
+
+        The envelope also carries the session's **coverage truth**: how
+        much of the captured stream actually reached the model. Two
+        distinct ways exist to end up with a transcript that is missing
+        words, and neither is visible from the text alone:
+
+        * ``dropped_sec`` — the live assist fell behind (slow CPU, a
+          cold model load) far enough that a window had to be capped,
+          discarding audio between the previous coverage watermark and
+          the start of the capped window.
+        * ``uncovered_tail_sec`` — the stream ended with audio that was
+          never handed to the model, e.g. the forced final flush raised
+          and coverage stayed put.
+
+        ``complete`` is true only when neither happened, which lets the
+        frontend treat this transcript as authoritative and skip a full
+        re-transcription of the saved recording. Without this signal the
+        only safe assumption is "possibly holed", which is why the local
+        stop path used to re-transcribe the entire file every time even
+        though the live pass had already decoded it with the same model.
         """
         segments = list(self._emitted_segments)
         text = " ".join(
@@ -327,8 +347,21 @@ class LiveSession:
             (float(s.get("end") or 0.0) for s in segments),
             default=0.0,
         )
+        total_sec = float(self._total_samples) / float(self.cfg.sample_rate)
+        uncovered_tail_sec = max(0.0, total_sec - self._covered_sec)
+        eps = float(self.cfg.emit_epsilon_sec)
+        complete = (
+            uncovered_tail_sec <= eps
+            and self._dropped_sec_total <= eps
+            and total_sec > 0.0
+        )
         return {
             "text": text,
             "segments": segments,
             "duration_sec": round(duration_sec, 3),
+            "total_sec": round(total_sec, 3),
+            "covered_sec": round(float(self._covered_sec), 3),
+            "dropped_sec": round(float(self._dropped_sec_total), 3),
+            "uncovered_tail_sec": round(uncovered_tail_sec, 3),
+            "complete": bool(complete),
         }

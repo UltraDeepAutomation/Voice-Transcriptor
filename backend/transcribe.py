@@ -167,6 +167,20 @@ def _model(model_name: str) -> WhisperModel:
         return m
 
 
+def _probe_tone(seconds: float = 0.5) -> np.ndarray:
+    """Deterministic low-level tone used to warm the decode path.
+
+    Silence is not enough: with ``vad_filter=True`` the VAD discards a
+    silent buffer before the encoder ever runs, so a silence-only probe
+    warms the VAD model but leaves the first *real* inference paying the
+    encoder/decoder initialisation cost. A quiet tone passes the VAD gate
+    and forces that work to happen off the critical path.
+    """
+    n = max(1, int(seconds * LIVE_SAMPLE_RATE_HZ))
+    t = np.arange(n, dtype=np.float32) / float(LIVE_SAMPLE_RATE_HZ)
+    return (0.05 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)
+
+
 def warm_model(model_name: str, probe: bool = False) -> Dict[str, float]:
     started = time.perf_counter()
     _model(model_name)
@@ -174,18 +188,30 @@ def warm_model(model_name: str, probe: bool = False) -> Dict[str, float]:
     probe_ms = 0
     if probe:
         probe_started = time.perf_counter()
-        try:
-            transcribe_audio(
-                np.zeros((LIVE_SAMPLE_RATE_HZ,), dtype=np.float32),
-                model_name,
-                language=None,
-                vad_filter=True,
-                word_timestamps=False,
-                beam_size=1,
-                best_of=1,
-            )
-        except Exception:
-            logger.exception("whisper warm probe failed: model=%s", model_name)
+        # Two passes, because the two costly lazy initialisations sit on
+        # different code paths: the Silero VAD model is loaded on the
+        # first ``vad_filter=True`` call, the encoder/decoder kernels on
+        # the first call that actually reaches the model.
+        for kwargs in (
+            {"audio": np.zeros((LIVE_SAMPLE_RATE_HZ,), dtype=np.float32), "vad_filter": True},
+            {"audio": _probe_tone(), "vad_filter": False},
+        ):
+            try:
+                transcribe_audio(
+                    kwargs["audio"],
+                    model_name,
+                    language=None,
+                    vad_filter=bool(kwargs["vad_filter"]),
+                    word_timestamps=False,
+                    beam_size=1,
+                    best_of=1,
+                )
+            except Exception:
+                logger.exception(
+                    "whisper warm probe failed: model=%s vad=%s",
+                    model_name,
+                    kwargs["vad_filter"],
+                )
         probe_ms = int((time.perf_counter() - probe_started) * 1000)
     state = {
         "loaded_ms": float(load_ms),
