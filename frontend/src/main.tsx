@@ -3678,6 +3678,78 @@ function micCaptureConstraints(deviceId: string): MediaStreamConstraints {
   };
 }
 
+/**
+ * Longest a single ``getUserMedia`` attempt may take before it is treated
+ * as wedged. Opening an input device that is free resolves in tens of
+ * milliseconds; the multi-second cases are all "something else is
+ * holding it" — macOS Dictation, a just-quit instance of ourselves, a
+ * device still being enumerated moments after login.
+ */
+const MIC_ACQUIRE_TIMEOUT_MS = 2500;
+const MIC_ACQUIRE_ATTEMPTS = 3;
+
+/**
+ * Acquire the capture stream without ever hanging the caller.
+ *
+ * ``getUserMedia`` has no timeout of its own. When the input device is
+ * busy it simply never settles, and because ``startLive`` awaits it, the
+ * whole start hangs: the main process gives up waiting for confirmation
+ * after 8 s, the capsule sits at 00:00, and nothing recovers. Seen in
+ * main.log at 21:41:33 — ``recording_start_not_confirmed`` after
+ * 8709 ms, on the first hotkey press after a launch.
+ *
+ * Each attempt is bounded and retried, falling back to the system
+ * default device once the pinned one has failed. A stream that arrives
+ * after its attempt timed out is stopped rather than leaked, so a late
+ * resolution can never leave the microphone open behind our back.
+ */
+async function acquireMicStream(deviceId: string): Promise<MediaStream> {
+  const attempts: MediaStreamConstraints[] = [
+    micCaptureConstraints(deviceId),
+    micCaptureConstraints(deviceId),
+    micCaptureConstraints(""),
+  ].slice(0, MIC_ACQUIRE_ATTEMPTS);
+
+  let lastError: unknown = null;
+  for (let i = 0; i < attempts.length; i++) {
+    let timedOut = false;
+    try {
+      const pending = navigator.mediaDevices.getUserMedia(attempts[i]);
+      // Stop a stream that lands after we stopped waiting for it.
+      pending
+        .then((late) => {
+          if (timedOut) late.getTracks().forEach((t) => t.stop());
+        })
+        .catch(() => { /* reported through the race below */ });
+      const stream = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`microphone did not open within ${MIC_ACQUIRE_TIMEOUT_MS} ms`));
+          }, MIC_ACQUIRE_TIMEOUT_MS);
+        }),
+      ]);
+      if (stream.getAudioTracks().some((t) => t.readyState === "live")) return stream;
+      stream.getTracks().forEach((t) => t.stop());
+      lastError = new Error("microphone opened with no live audio track");
+    } catch (e) {
+      lastError = e;
+      const msg = String((e as Error)?.message || e || "").toLowerCase();
+      // A permission refusal will not become a yes on retry.
+      if (msg.includes("notallowed") || msg.includes("permission denied")) throw e;
+    }
+    console.warn(
+      `[trace startLive] microphone acquire attempt ${i + 1}/${attempts.length} failed: ` +
+      `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    );
+    // Brief pause so a device being released by another process has a
+    // moment to actually come free before the next attempt.
+    if (i < attempts.length - 1) await new Promise((r) => setTimeout(r, 250));
+  }
+  throw lastError instanceof Error ? lastError : new Error("microphone could not be opened");
+}
+
 let vu = 0;
 function setVU(rms: number): void {
   window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(rms) ? rms : 0);
@@ -7958,19 +8030,9 @@ async function startLive(): Promise<void> {
     await loadMics(false);
     throwIfStartCancelled();
     const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
-    try {
-      stream = await navigator.mediaDevices.getUserMedia(micCaptureConstraints(devId));
-    } catch (e) {
-      const msg = String((e as Error)?.message || e || "").toLowerCase();
-      const recoverable =
-        msg.includes("overconstrained") ||
-        msg.includes("notfound") ||
-        msg.includes("device") ||
-        msg.includes("constraint");
-      if (!recoverable) throw e;
-      // Selected mic could disappear after reconnect/sleep. Use system default fallback.
-      stream = await navigator.mediaDevices.getUserMedia(micCaptureConstraints(""));
-    }
+    // Bounded and retried — see acquireMicStream. The old code awaited a
+    // bare getUserMedia, so a busy input device hung the start outright.
+    stream = await acquireMicStream(devId);
     throwIfStartCancelled();
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");

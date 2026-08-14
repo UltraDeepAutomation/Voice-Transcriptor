@@ -264,11 +264,19 @@ set +a
 
 The topbar mic pill turns red and the session reports `Microphone is not delivering audio — open System Settings → Privacy & Security → Microphone…` instead of a generic "no speech captured". Three common root causes, in order of frequency:
 
-1. **TCC reset after reinstall.** macOS can revoke microphone permission for an app whose code identity changes, which a reinstall via `./BUILD.command` may do. Transcriptor asks the OS for microphone access at launch, so a fresh install shows the system prompt by itself — accept it. macOS never re-asks once a request has been declined, so if you dismissed it, open **System Settings → Privacy & Security → Microphone**, enable Transcriptor, then quit and relaunch the app.
-2. **Mic muted at the OS level.** macOS Monterey+ shows a strike-through microphone icon in the menu bar when the active input device is muted. Click it to unmute, or in **System Settings → Sound → Input** raise the input volume slider.
-3. **Wrong input device selected.** If multiple inputs are connected (e.g. external webcam, AirPods, virtual audio device), open the in-app mic selector and confirm the expected device is highlighted. The pill shows the resolved `deviceId` for inspection.
+1. **Stale permission after reinstall.** The internal build is signed without a Team ID, so macOS ties the microphone grant to the exact binary. Reinstalling via `./BUILD.command` produces a new one, and the grant can go stale while `getMediaAccessStatus` still reports `granted` — the app is listed and switched on in System Settings, yet the stream delivers pure silence. Toggle Transcriptor **off and back on** under **System Settings → Privacy & Security → Microphone**, then relaunch. Equivalently, from a terminal:
 
-The mic health probe is always-on — it runs whether or not auto-stop-on-silence is enabled. It samples the analyser every 50 ms and classifies on *digital silence* (no sample above one 16-bit LSB), not on loudness, so a quiet room is never mistaken for a broken microphone. A dead pipeline is flagged within 2.5 s of pressing record, or after 4 s of continuous digital silence mid-session; a 10 s watchdog covers the case where the audio graph never starts at all. The pill also shows `Mic muted` when the OS mutes the input device and `Mic lost` when the device disconnects mid-recording.
+   ```bash
+   tccutil reset Microphone local.transcriptor.app
+   ```
+
+   and accept the prompt on the next launch. A Developer ID signature would make the grant survive rebuilds.
+2. **Another process is holding the input device.** macOS Dictation, a video call, or a just-quit instance of Transcriptor can keep the microphone open. `getUserMedia` then either stalls or returns a stream that never carries samples. Recording start is bounded and retried automatically — three attempts, 2.5 s each, falling back to the system default device — so this normally resolves itself; if it does not, quit whatever else is listening and press record again.
+
+3. **Mic muted at the OS level.** macOS Monterey+ shows a strike-through microphone icon in the menu bar when the active input device is muted. Click it to unmute, or in **System Settings → Sound → Input** raise the input volume slider.
+4. **Wrong input device selected.** If multiple inputs are connected (e.g. external webcam, AirPods, virtual audio device), open the in-app mic selector and confirm the expected device is highlighted. The pill shows the resolved `deviceId` for inspection.
+
+The mic health probe is always-on — it runs whether or not auto-stop-on-silence is enabled. It samples the analyser every 50 ms and classifies on *digital silence* (no sample above one 16-bit LSB), not on loudness, so a quiet room is never mistaken for a broken microphone. A dead pipeline is flagged within 1.2 s of pressing record, or after 4 s of continuous digital silence mid-session; a 10 s watchdog covers the case where the audio graph never starts at all. The pill also shows `Mic muted` when the OS mutes the input device and `Mic lost` when the device disconnects mid-recording.
 
 ## Project Docs
 

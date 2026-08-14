@@ -69,8 +69,16 @@ export interface MicHealthSnapshot {
  */
 export const DEAD_PEAK_FLOOR = 1 / 32768;
 export const DEAD_RMS_FLOOR = DEAD_PEAK_FLOOR / 4;
-/** Digital silence tolerated right after start before flagging the mic. */
-export const PROBE_TIMEOUT_MS = 2500;
+/**
+ * Digital silence tolerated right after start before flagging the mic.
+ *
+ * A working capture path exceeds one 16-bit LSB within a single 50 ms
+ * window, so waiting seconds buys no extra certainty — it only delays
+ * the warning. 2500 ms was slow enough that a 2.8 s recording ended
+ * before the pill ever turned red, and the user was left with a silent
+ * WAV and no explanation.
+ */
+export const PROBE_TIMEOUT_MS = 1200;
 /** Digital silence tolerated mid-session before flagging the mic. */
 export const SILENT_CONFIRM_MS = 4000;
 /**
@@ -80,8 +88,16 @@ export const SILENT_CONFIRM_MS = 4000;
  */
 export const MAX_SAMPLE_GAP_MS = 250;
 
+/**
+ * The wording has to work for the case that actually happens most: the
+ * permission is ALREADY enabled and macOS still reports "granted", but
+ * the stream is silent because a reinstall changed the app's code
+ * identity and the grant went stale. Telling that user to "enable
+ * Transcriptor" is advice they have already followed, so the message
+ * names the off/on cycle that re-issues the grant to the new binary.
+ */
 export const MIC_SILENT_HELP =
-  "Microphone is not delivering audio — open System Settings → Privacy & Security → Microphone, enable Transcriptor, then check that the selected input device is not muted.";
+  "Microphone is not delivering audio. Open System Settings → Privacy & Security → Microphone: if Transcriptor is not listed or is off, enable it. If it is already on, the permission went stale after an app update — switch it off and back on, then restart Transcriptor.";
 export const MIC_MUTED_HELP =
   "Microphone is muted in the operating system — unmute the input device to capture audio.";
 export const MIC_LOST_HELP =
