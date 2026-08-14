@@ -3939,6 +3939,14 @@ async def _run_deepgram_live_session(
                 "durationSec": drained.get("durationSec", 0.0),
                 "source": "deepgram-live",
                 "stats": drained.get("stats"),
+                # Seconds where Deepgram's own interims recognised words
+                # that no final segment ever covered — holes inside the
+                # committed transcript, not trailing silence. Non-zero
+                # means the streamed text is provably incomplete and the
+                # frontend should re-transcribe the saved audio rather
+                # than deliver it. See
+                # ``DeepgramLiveSession._uncovered_speech_sec``.
+                "uncoveredSpeechSec": drained.get("uncoveredSpeechSec", 0.0),
             }
         except Exception as e:
             # ``str(e)`` can carry the upstream provider's raw error body

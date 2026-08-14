@@ -48,7 +48,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Iterable, Optional
 from urllib.parse import urlencode
 
 import websockets
@@ -67,6 +67,13 @@ DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
 # main.log land between 0.26 s and 0.73 s; 1.5 s covers a slow
 # cross-region link without making Stop feel unresponsive.
 FINALIZE_FLUSH_WAIT_SEC = 1.5
+# An interim must carry at least this much text before its span counts as
+# "the service heard words here". Deepgram emits 1-2 character noise
+# hypotheses during silence; those must not be mistaken for speech.
+INTERIM_SPEECH_MIN_CHARS = 8
+# Gaps shorter than this between consecutive finals are normal segment
+# boundaries, not holes.
+COVERAGE_GAP_MIN_SEC = 0.25
 
 
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
@@ -233,6 +240,16 @@ class DeepgramLiveSession:
         self._event_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=1024)
         self._queue_overflow_warned: bool = False
         self._finalized_segments: list[dict] = []
+        # Spans where an interim carried real text. Deepgram can emit a
+        # final that stops short of what its own interim already heard
+        # and then resume the next final past the difference, leaving a
+        # hole no final ever covers — words the user definitely spoke and
+        # the service definitely recognised, missing from the committed
+        # transcript. Keeping the interim spans lets ``finalize()``
+        # measure exactly that, instead of the transcript being trusted
+        # blind. Silence produces no interims, so ordinary pauses do not
+        # register here.
+        self._interim_speech_spans: list[tuple[float, float]] = []
         self._closed = False
         # Separate "consumer-visible closed" (self._closed, flipped by
         # recv_loop.finally as soon as the upstream drops so events()
@@ -649,12 +666,75 @@ class DeepgramLiveSession:
             duration_sec,
             self.stats.bytes_sent,
         )
+        uncovered_speech_sec = self._uncovered_speech_sec()
+        if uncovered_speech_sec > 0:
+            logger.warning(
+                "deepgram-live: %.2fs of recognised speech is not covered by any "
+                "final segment — the committed transcript has holes",
+                uncovered_speech_sec,
+            )
         return {
             "text": final_text,
             "segments": list(self._finalized_segments),
             "durationSec": round(duration_sec, 3),
             "stats": self.stats.as_dict(),
+            "uncoveredSpeechSec": round(uncovered_speech_sec, 3),
         }
+
+    def _uncovered_speech_sec(self) -> float:
+        """Seconds where an interim heard words but no final ever landed.
+
+        Deepgram can emit a final that stops short of what its own
+        interim already recognised and then resume the next final past
+        the difference. Observed in main.log: a final ended at 455.78 s,
+        the next started at 460.09 s, and interim #446 had covered
+        452.76-457.56 s carrying 75 characters. Those words are simply
+        absent from the committed transcript.
+
+        Ordinary pauses do not register: silence produces no interims
+        with text, so a gap with no overlapping speech span contributes
+        nothing. This measures only holes the service itself contradicts.
+        """
+        if not self._finalized_segments or not self._interim_speech_spans:
+            return 0.0
+
+        def union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+            merged: list[tuple[float, float]] = []
+            for start, end in sorted(s for s in spans if s[1] > s[0]):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        covered = union(
+            (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
+            for s in self._finalized_segments
+        )
+        speech = union(self._interim_speech_spans)
+
+        # Speech minus covered, computed as a set difference so
+        # overlapping interims can never be counted twice.
+        total = 0.0
+        for sp_start, sp_end in speech:
+            cursor = sp_start
+            for c_start, c_end in covered:
+                if c_end <= cursor:
+                    continue
+                if c_start >= sp_end:
+                    break
+                if c_start > cursor:
+                    hole = c_start - cursor
+                    if hole >= COVERAGE_GAP_MIN_SEC:
+                        total += hole
+                cursor = max(cursor, c_end)
+                if cursor >= sp_end:
+                    break
+            if cursor < sp_end:
+                hole = sp_end - cursor
+                if hole >= COVERAGE_GAP_MIN_SEC:
+                    total += hole
+        return total
 
     async def close(self) -> None:
         """Idempotently release the upstream socket and background tasks."""
@@ -1049,6 +1129,10 @@ class DeepgramLiveSession:
             }
 
         self.stats.segments_interim += 1
+        # Record where the service actually heard words. The threshold
+        # keeps single-character noise hypotheses out of the measurement.
+        if len(text) >= INTERIM_SPEECH_MIN_CHARS and end > start:
+            self._interim_speech_spans.append((start, end))
         if self.stats.segments_interim % 5 == 1:
             # Sample 1-in-5 interim emissions to keep log volume bounded
             # while still proving Deepgram is producing output.
