@@ -1673,13 +1673,61 @@ def _form_bool(value: Any, default: bool = False) -> bool:
     return _payload_bool({"value": raw}, "value", default)
 
 
+def _collect_ws_closed_exc_types() -> tuple:
+    """Exception types that mean "the peer already went away".
+
+    Resolved defensively: the ``websockets`` package is only present
+    because the Deepgram upstream needs it, and its exception module has
+    moved between major versions. A missing import must degrade to the
+    string matching below, never break startup.
+    """
+    types: list = [WebSocketDisconnect]
+    try:
+        from websockets.exceptions import ConnectionClosed  # type: ignore
+
+        types.append(ConnectionClosed)
+    except Exception:  # pragma: no cover - depends on installed version
+        pass
+    return tuple(types)
+
+
+_WS_CLOSED_EXC_TYPES = _collect_ws_closed_exc_types()
+
+
+def _exception_chain(exc: BaseException, depth: int = 6):
+    """Yield ``exc`` and its ``__cause__``/``__context__`` ancestors.
+
+    uvicorn re-raises a client disconnect wrapped in its own error, so the
+    interesting type is rarely the outermost one. Depth-bounded and
+    cycle-guarded because ``__context__`` can loop.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and depth > 0 and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        depth -= 1
+        current = current.__cause__ or current.__context__
+
+
 def _is_broken_pipe_error(exc: Exception) -> bool:
     """Return True if the exception is a harmless broken-pipe or WebSocket shutdown race.
 
     These errors occur when the client disconnects mid-stream (e.g., tab close,
     network drop) and the server tries to write to a closed pipe. They are
     transient and safe to ignore — the recording data has already been captured.
+
+    Classification is type-first. The string checks below were written for
+    specific wordings and missed ``ConnectionClosedOK``, whose message is
+    ``received 1000 (no status received [internal]); then sent 1000 …`` —
+    so an ordinary client disconnect was logged as a WARNING with a full
+    multi-frame traceback, thirteen times in one session's main.log. The
+    exception also reaches us wrapped by uvicorn/Starlette, so the cause
+    chain is walked rather than only the outermost object.
     """
+    for cause in _exception_chain(exc):
+        if _WS_CLOSED_EXC_TYPES and isinstance(cause, _WS_CLOSED_EXC_TYPES):
+            return True
     msg = str(exc or "").lower()
     if isinstance(exc, BrokenPipeError):
         return True

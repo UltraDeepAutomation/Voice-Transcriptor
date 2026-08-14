@@ -3427,7 +3427,43 @@ function restoreClipboard(snap) {
   }
 }
 
-async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget()) {
+/**
+ * Resolve where the transcript should be pasted.
+ *
+ * Policy: it goes into the field that has focus *right now*. In the
+ * normal flow — recording stopped with the global hotkey while the caret
+ * sits in the target app — focus never left, so restoring and activating
+ * a "start target" is a no-op that still pays for several Apple Event
+ * round trips. main.log for a 12 s dictation showed the target app
+ * already frontmost at paste time, and the restore plus re-activation
+ * still burned 4.7 s of the 9.6 s between Stop and the text appearing.
+ *
+ * The captured start target survives as a fallback for the single case
+ * where "current focus" is meaningless: the user stopped from
+ * Transcriptor's own window, so the front app is us and pasting into it
+ * would drop the transcript into our own UI.
+ *
+ * @returns {Promise<{target: object, alreadyFront: boolean}>}
+ *   ``alreadyFront`` tells the paste routine it can skip activation.
+ */
+async function resolvePasteDestination(capturedTarget) {
+  const startTarget = normalizeCapturedPasteTarget(capturedTarget);
+  let frontNow = null;
+  try {
+    frontNow = (await getFrontmostAppIdentityFast()) || (await getFrontmostAppInfo());
+  } catch { }
+  const frontIsForeignApp =
+    !!frontNow &&
+    Number(frontNow.pid) > 0 &&
+    !isBadActivationTarget(frontNow.name);
+  if (frontIsForeignApp) {
+    return { target: capturePasteTargetFromFrontInfo(frontNow), alreadyFront: true };
+  }
+  return { target: startTarget, alreadyFront: false };
+}
+
+async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(), options = {}) {
+  const skipActivation = !!options.alreadyFront;
   const originalTarget = normalizeCapturedPasteTarget(target);
   let effectiveTarget = cloneCapturedPasteTarget(originalTarget);
   const trace = createTrace("paste", {
@@ -3526,7 +3562,16 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   }
   traceStep(trace, "clipboard_write_ok", {});
   logPasteTrace("clipboard_write_ok", {});
-  if (hasCapturedPasteTarget(effectiveTarget)) {
+  if (skipActivation) {
+    // The destination already owns focus — the caret is sitting in it.
+    // Activating it would cost an Apple Event round trip to change
+    // nothing, and on macOS the bounce can pull our own window forward
+    // mid-sequence and fight the paste it is supposed to help.
+    traceStep(trace, "target_activation_skipped", {
+      target: pasteTargetSummary(effectiveTarget),
+      reason: "already-frontmost",
+    });
+  } else if (hasCapturedPasteTarget(effectiveTarget)) {
     try {
       const restored = await activateCapturedPasteTarget(effectiveTarget);
       traceStep(trace, restored ? "target_activated" : "target_activation_failed", {
@@ -4499,14 +4544,16 @@ async function processPostStopTask(task) {
       clipboard.writeText(transcript);
     } catch { }
 
-    // Paste target resolution is start-target-first. We preserve the
-    // window/app snapshot captured when recording began and only fall
-    // back to the current frontmost target when no valid start target
-    // exists. That matches the product contract: paste back into the
-    // place where recording started, not wherever focus happens to be
-    // when the transcript finishes.
-    let effectiveTarget = normalizeCapturedPasteTarget(task.target);
-    if (!hasCapturedPasteTarget(effectiveTarget)) {
+    // Paste destination is current-focus-first — see
+    // ``resolvePasteDestination``. The start target is only consulted
+    // when the front app is Transcriptor itself.
+    const destination = await resolvePasteDestination(task.target);
+    let effectiveTarget = destination.target;
+    if (destination.alreadyFront) {
+      traceStep(trace, "target_current_focus", {
+        target: pasteTargetSummary(effectiveTarget),
+      });
+    } else if (!hasCapturedPasteTarget(effectiveTarget)) {
       try {
         effectiveTarget = capturePasteTargetFromFrontInfo(await getFrontmostAppInfo());
         traceStep(trace, "target_fallback_current_front", {
@@ -4527,7 +4574,9 @@ async function processPostStopTask(task) {
       }
     }
 
-    const pasted = await tryPasteToFocusedField(transcript, effectiveTarget);
+    const pasted = await tryPasteToFocusedField(transcript, effectiveTarget, {
+      alreadyFront: destination.alreadyFront,
+    });
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
       method: pasted.method || "unknown",
@@ -4654,7 +4703,11 @@ async function pasteLatestTranscriptFromShortcut() {
       clipboard.writeText(text);
     } catch { }
 
-    const pasted = await tryPasteToFocusedField(text, shortcutPasteTarget);
+    // The target was just read from the frontmost app, so it already
+    // owns focus — re-activating it would only cost a round trip.
+    const pasted = await tryPasteToFocusedField(text, shortcutPasteTarget, {
+      alreadyFront: Number(front?.pid) > 0 && !isBadActivationTarget(front?.name),
+    });
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
       method: pasted.method || "unknown",
