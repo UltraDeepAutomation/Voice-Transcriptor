@@ -2767,6 +2767,55 @@ async function getLinuxFrontmostAppInfo() {
   };
 }
 
+/**
+ * macOS fast path for "which app is in front" — name and pid only.
+ *
+ * ``getFrontmostAppInfo`` asks System Events for
+ * ``first process whose frontmost is true``, which makes AppleScript
+ * enumerate every running process and evaluate a property on each. On a
+ * normally-loaded desktop that measures 790–840 ms *per call*, and the
+ * post-stop pipeline makes several of them — it was the single largest
+ * contributor to the delay between finishing a recording and seeing the
+ * text appear in the target app.
+ *
+ * ``lsappinfo`` reads the same information straight from LaunchServices:
+ * 110 ms for the two calls, no Apple Event round trip and no
+ * Accessibility permission. It ships with macOS, so there is no new
+ * dependency.
+ *
+ * It cannot report the front *window's* title, so this is only for
+ * callers that need the app identity. Anything that targets a specific
+ * window still goes through ``getFrontmostAppInfo``.
+ *
+ * @returns {Promise<{name: string, pid: number, windowTitle: string}|null>}
+ *   null when unavailable, so callers fall back to the AppleScript path.
+ */
+async function getFrontmostAppIdentityFast() {
+  if (process.platform !== "darwin") return null;
+  try {
+    const front = await runCommand("/usr/bin/lsappinfo", ["front"], { timeoutMs: 1500 });
+    const asn = String(front?.stdout || "").trim();
+    if (!front?.ok || !asn.startsWith("ASN:")) return null;
+    const info = await runCommand(
+      "/usr/bin/lsappinfo",
+      ["info", "-only", "pid,name", asn],
+      { timeoutMs: 1500 },
+    );
+    if (!info?.ok) return null;
+    // Output shape: `"Claude" ASN:0x0-0x34fc4f9: (in front)` followed by
+    // an indented `pid = 52135 …` line.
+    const raw = String(info.stdout || "");
+    const nameMatch = raw.match(/"([^"]*)"/);
+    const pidMatch = raw.match(/\bpid\s*=\s*(\d+)/);
+    const name = nameMatch ? String(nameMatch[1]).trim() : "";
+    const pid = pidMatch ? Number.parseInt(pidMatch[1], 10) || 0 : 0;
+    if (!name && !pid) return null;
+    return { name, pid, windowTitle: "" };
+  } catch {
+    return null;
+  }
+}
+
 async function getFrontmostAppInfo() {
   if (process.platform === "win32") {
     const pwsh = `
@@ -3395,7 +3444,11 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   }
   let frontBefore = { name: "", pid: 0 };
   try {
-    frontBefore = await getFrontmostAppInfo();
+    // Identity is all this path needs: the name feeds the paste-strategy
+    // hint and the pid feeds activation. The window title is only
+    // required by the generic-Electron branch below, which tops it up on
+    // demand rather than making every paste pay for it.
+    frontBefore = (await getFrontmostAppIdentityFast()) || (await getFrontmostAppInfo());
   } catch { }
   traceStep(trace, "front_before", {
     frontBeforeName: frontBefore.name || "",
@@ -3404,6 +3457,15 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   });
   const targetLooksGenericElectron = /^electron$/i.test(effectiveTarget.appName);
   if (targetLooksGenericElectron && shouldUsePasteTarget(frontBefore)) {
+    // This branch routes by the front window, so it needs the title the
+    // fast identity lookup cannot provide. Pay for the slow query only
+    // here, where it changes the outcome.
+    if (!frontBefore.windowTitle) {
+      try {
+        const detailed = await getFrontmostAppInfo();
+        if (detailed && detailed.pid === frontBefore.pid) frontBefore = detailed;
+      } catch { }
+    }
     effectiveTarget = capturePasteTargetFromFrontInfo(frontBefore);
     traceStep(trace, "target_normalized_from_front", {
       from: pasteTargetSummary(originalTarget),
@@ -3954,7 +4016,8 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget())
   // Exhausted all robust attempts
   let frontAfter = { name: "", pid: 0 };
   try {
-    frontAfter = await getFrontmostAppInfo();
+    // Diagnostics only — name and pid, so the identity fast path serves.
+    frontAfter = (await getFrontmostAppIdentityFast()) || (await getFrontmostAppInfo());
   } catch { }
   traceStep(trace, "front_after", {
     frontAfterName: frontAfter.name || "",
