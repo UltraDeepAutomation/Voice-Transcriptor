@@ -3,6 +3,93 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-08-15
+
+Recording reliability and stop-to-paste latency pass. Every number below
+was measured from `main.log`, before and after.
+
+### Fixed
+
+- **Recordings captured pure silence.** `askForMediaAccess` was only
+  reached from the global-hotkey path, so starting a recording from the
+  in-app button never asked macOS for microphone access — and a renderer
+  `getUserMedia` does not reject when access was never granted, it
+  resolves with a live track that emits zeros. No waveform, no words, no
+  error. Microphone access is now resolved once at startup through a
+  single `ensureMacMicrophoneAccess` helper shared by every entry point,
+  and the TCC status is read live instead of latched.
+- **Quiet recordings and clipped phrase boundaries.** Capture used
+  Chromium's call-oriented defaults; echo cancellation and noise
+  suppression are tuned for conferencing and both attenuate a quiet
+  source and gate low-energy speech. Both are off for dictation, gain
+  control stays on, defined once in `DICTATION_AUDIO_PROCESSING`.
+- **The opening words of short recordings were dropped.** Frames captured
+  while the live WebSocket was still connecting were drained only from
+  inside `pushCapturedFrame`, so the flush depended on another frame
+  arriving after the socket opened. A recording that ended inside the
+  handshake window kept its first frames buffered forever. The socket's
+  `open` event now drains them, and stop drains them again before
+  finalize.
+- **The last sentence went missing when Stop landed mid-phrase.**
+  `Finalize` and `CloseStream` were written in the same millisecond, so
+  the close raced the transcript Finalize had just flushed. Across 14
+  sessions, streams that ended naturally left 0.25 s of audio undecoded
+  on average; streams stopped mid-utterance left 1.86 s. `finalize()`
+  now waits for the flushed transcript, bounded and short-circuited on
+  arrival.
+- **A client disconnect was logged as a server error.**
+  `_is_broken_pipe_error` matched substrings of the message and missed
+  `ConnectionClosedOK`, producing a full traceback thirteen times in one
+  session. Classification is type-first and walks the cause chain.
+
+### Changed
+
+- **Stop → text in the target app: 9.56 s → 1.1–1.7 s.** The transcript
+  now goes into whatever holds focus rather than restoring a start
+  target. The trace showed the target app was *already* frontmost and the
+  pipeline still spent 2.46 s restoring it and 2.20 s activating it,
+  while Transcriptor's own window bounced forward mid-sequence. Target
+  resolution went from 4156 ms to 13 ms.
+- **Frontmost-app lookup: ~800 ms → ~110 ms.** `first process whose
+  frontmost is true` makes AppleScript enumerate every process;
+  `lsappinfo` reads the same facts from LaunchServices. Callers that
+  route by window still use the AppleScript path.
+- **Local stop no longer re-transcribes what was already decoded.** The
+  live assist runs the same model the final pass would in the default
+  configuration, so `LiveSession` now reports coverage truth — seconds
+  covered, dropped, and left untranscribed — and the stop path adopts the
+  live transcript only when the backend certifies full coverage, the
+  models match, and no frame was stranded in the renderer.
+- **Model warm-up is symmetric.** Startup probed the default model while
+  the user-triggered warmup only loaded weights, leaving the lazy VAD
+  load and first encoder pass to the first live window. Both probe now,
+  and the probe exercises the decode path rather than only silence.
+- **Recording capsule** narrowed 1.25× to 110 px, waveform column kept at
+  30 px with a taller 15 px envelope, and the pill is fully opaque.
+
+### Added
+
+- **Microphone health state machine** (`frontend/src/mic-health.ts`) —
+  classifies the capture stream on *digital silence*, no sample above one
+  16-bit LSB, rather than on loudness, so a quiet room is never mistaken
+  for a broken microphone. Flags a dead pipeline 2.5 s after start or
+  after 4 s mid-session, with a 10 s watchdog for an audio graph that
+  never starts. A topbar pill and the stop-time summary name the actual
+  cause — permission, OS mute, device loss — instead of "No speech
+  captured".
+- **Live-transcript adoption policy** (`frontend/src/live-coverage.ts`) —
+  pure, typed rejection reasons, so choosing the slow path is visible in
+  the trace log.
+- 42 tests across the new paths: mic-health FSM, coverage contract,
+  adoption policy, disconnect classification, finalize ordering.
+
+### Security
+
+- **Purged a leaked OpenRouter API key from the entire git history.** It
+  had been committed in `data/config.json` in the initial commit and was
+  already published to GitHub. Removing it from history does not
+  un-publish it — the key must be revoked at the provider.
+
 ## [Unreleased] — 2026-06-25
 
 ### Fixed
