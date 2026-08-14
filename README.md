@@ -261,7 +261,7 @@ set +a
 
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — current code layout and ownership.
 - [VERIFIED_AUDIT.md](VERIFIED_AUDIT.md) — verified bug audit and fixes.
-- [AUDIT_2026-08.md](AUDIT_2026-08.md) — release audit: 22 confirmed defects with code and fixes.
+- [AUDIT_2026-08.md](AUDIT_2026-08.md) — release audit: 30 confirmed defects with code and fixes.
 - [CHANGELOG.md](CHANGELOG.md) — historical release notes.
 
 ## Version SSOT
