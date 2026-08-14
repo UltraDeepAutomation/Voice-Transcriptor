@@ -123,10 +123,15 @@ def request_with_retry(
     """
     last_err: Optional[Exception] = None
     last_resp: Optional[requests.Response] = None
-    for attempt in range(retries):
+    # A caller passing retries<=0 would skip the loop entirely and trip
+    # the `assert last_resp is not None` below with an AssertionError —
+    # an opaque HTTP 500 with no provider context. Treat it as "one
+    # attempt, no retry", which is what such a caller means.
+    attempts = max(1, int(retries or 0))
+    for attempt in range(attempts):
         try:
             resp = _SESSION.request(method, url, timeout=timeout, **kwargs)
-            if resp.status_code in _TRANSIENT_HTTP_STATUS and attempt < retries - 1:
+            if resp.status_code in _TRANSIENT_HTTP_STATUS and attempt < attempts - 1:
                 last_resp = resp
                 delay = _exponential_backoff(attempt, backoff_base)
                 # Honour Retry-After per RFC 7231. Providers
@@ -142,7 +147,7 @@ def request_with_retry(
             return resp
         except RequestException as e:
             last_err = e
-            if attempt == retries - 1:
+            if attempt == attempts - 1:
                 break
             time.sleep(_exponential_backoff(attempt, backoff_base))
     if last_err is not None:
@@ -184,7 +189,7 @@ def request_with_retry(
                 " — provider took too long to respond. Retry, or switch Provider "
                 'to "local" in Settings if the link is consistently slow.'
             )
-        raise RemoteError(f"network error after {retries} attempts: {err_text}{hint}")
+        raise RemoteError(f"network error after {attempts} attempts: {err_text}{hint}")
     # All attempts returned a transient HTTP status — return the last
     # response so the caller surfaces the exact upstream error.
     assert last_resp is not None

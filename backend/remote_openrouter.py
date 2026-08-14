@@ -159,7 +159,19 @@ def openrouter_transcribe(
     js = _json_response(r, "OpenRouter transcribe")
     text = ""
     try:
-        text = js["choices"][0]["message"]["content"]
+        raw_content = js["choices"][0]["message"]["content"]
+        # ``content`` is null whenever the model declines to answer
+        # (safety refusal, empty audio, tool-call-only reply). The
+        # previous code assigned it straight through, so the ``len(text)``
+        # in the success log raised TypeError and the endpoint returned an
+        # opaque HTTP 500 instead of a typed provider error the caller
+        # could fall back from.
+        if raw_content is None:
+            raise RemoteError(
+                f"OpenRouter model '{model or DEFAULT_OPENROUTER_AUDIO_MODEL}' "
+                "returned no transcript content for this audio"
+            )
+        text = raw_content if isinstance(raw_content, str) else str(raw_content)
     except (KeyError, IndexError, TypeError) as shape_err:
         # OpenRouter changed the response shape (or echoed an empty
         # error envelope). Returning ``str(js)`` made the entire raw

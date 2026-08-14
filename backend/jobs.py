@@ -30,12 +30,16 @@ class JobStore:
         self._lock = threading.Lock()
         self._jobs: Dict[str, Job] = {}
         self.max_workers = max_workers
+        # Single field, not two. ``max_jobs`` and a private ``_max_jobs``
+        # previously held the same number: ``_prune`` read the private
+        # one while the public one was the documented knob, so setting
+        # ``store.max_jobs`` had no effect and the two could silently
+        # disagree.
         self.max_jobs = max_jobs
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
-        self._max_jobs = max_jobs
 
     def _prune(self) -> None:
-        if len(self._jobs) <= self._max_jobs:
+        if len(self._jobs) <= self.max_jobs:
             return
         # Never evict jobs whose worker thread is still running, whose
         # terminal state has not yet been observed by a client, or whose
@@ -55,7 +59,7 @@ class JobStore:
             ],
             key=lambda j: (j.terminal_observed_at or j.created_at, j.created_at),
         )
-        drop = len(self._jobs) - self._max_jobs
+        drop = len(self._jobs) - self.max_jobs
         for job in evictable[:drop]:
             self._jobs.pop(job.id, None)
 
@@ -78,7 +82,7 @@ class JobStore:
 
     # All four setters use ``.get`` + None-guard instead of bracket access.
     # _prune (invoked on every ``create``) evicts the oldest jobs when the
-    # store exceeds _max_jobs; a worker thread that is still updating an
+    # store exceeds max_jobs; a worker thread that is still updating an
     # evicted job would hit KeyError and die mid-transcription, leaving the
     # job permanently "running" from the client's perspective. Silently
     # no-op'ing on a pruned id is the correct contract here: the result is

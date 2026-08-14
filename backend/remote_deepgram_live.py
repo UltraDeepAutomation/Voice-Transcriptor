@@ -226,7 +226,6 @@ class DeepgramLiveSession:
         self._event_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=1024)
         self._queue_overflow_warned: bool = False
         self._finalized_segments: list[dict] = []
-        self._latest_interim: Optional[dict] = None
         self._closed = False
         # Separate "consumer-visible closed" (self._closed, flipped by
         # recv_loop.finally as soon as the upstream drops so events()
@@ -988,7 +987,6 @@ class DeepgramLiveSession:
 
         if is_final:
             self._finalized_segments.append(segment)
-            self._latest_interim = None
             self.stats.segments_final += 1
             logger.info(
                 "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s textLen=%d text=%r",
@@ -1008,7 +1006,6 @@ class DeepgramLiveSession:
                 "speech_final": speech_final,
             }
 
-        self._latest_interim = segment
         self.stats.segments_interim += 1
         if self.stats.segments_interim % 5 == 1:
             # Sample 1-in-5 interim emissions to keep log volume bounded

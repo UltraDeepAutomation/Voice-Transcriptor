@@ -2596,11 +2596,6 @@ def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optio
     return None
 
 
-# Backward-compat alias for any caller that imports this name. New
-# code should use ``_RECORDING_AUDIO_EXTS`` directly.
-_AUDIO_EXTS_FOR_RETENTION: tuple[str, ...] = _RECORDING_AUDIO_EXTS
-
-
 def _prune_old_recording_audio(
     target_dir: Path, keep_stem: str
 ) -> int:
@@ -2635,7 +2630,7 @@ def _prune_old_recording_audio(
             if not entry.is_file():
                 continue
             ext = entry.suffix.lower()
-            if ext not in _AUDIO_EXTS_FOR_RETENTION:
+            if ext not in _RECORDING_AUDIO_EXTS:
                 continue
             if entry.stem == keep_stem:
                 continue
