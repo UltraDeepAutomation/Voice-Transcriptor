@@ -2778,16 +2778,27 @@ async function getFrontmostAppInfo() {
         }
 "@
       $hwnd = [Window]::GetForegroundWindow()
-      $pid = 0
-      [Window]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-      $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+      # NOT $pid — that is a READ-ONLY automatic variable holding this
+      # PowerShell process's own id. Assigning to it raises "Cannot
+      # overwrite variable PID because it is read-only or constant",
+      # which is NON-terminating, so the script kept running with
+      # $pid still pointing at PowerShell itself. The [ref] write-back
+      # from GetWindowThreadProcessId failed for the same reason.
+      # Net effect on Windows: every captured paste target reported
+      # name="powershell" and PowerShell's own pid instead of the app
+      # the user was recording from — wrong app in the status capsule
+      # and in main.log, and a pid-based activation fallback that
+      # focused a dead console instead of the real window.
+      $procId = 0
+      [Window]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+      $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
       $titleSb = New-Object System.Text.StringBuilder 4096
       [Window]::GetWindowText($hwnd, $titleSb, $titleSb.Capacity) | Out-Null
       $classSb = New-Object System.Text.StringBuilder 512
       [Window]::GetClassName($hwnd, $classSb, $classSb.Capacity) | Out-Null
       $result = @{
         name = if ($proc) { $proc.Name } else { "" }
-        pid = if ($proc) { $pid } else { 0 }
+        pid = if ($proc) { $procId } else { 0 }
         hwnd = if ($hwnd -ne [IntPtr]::Zero) { ('0x{0:X}' -f ([Int64]$hwnd)) } else { "" }
         windowTitle = $titleSb.ToString()
         className = $classSb.ToString()
@@ -4011,6 +4022,16 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
   if (res1.ok) {
     return { ok: true, reason: "cmd-ctrl-return-sent" };
   }
+  const primaryReason = String(res1.stderr || res1.stdout || "cmd-ctrl-return-failed").trim();
+  // The keycode fallback below can only help when the FIRST attempt
+  // failed for a reason a different keystroke encoding could fix. The
+  // dominant failure mode — Accessibility / Automation not granted —
+  // fails both attempts identically, so retrying just burned a second
+  // 5 s osascript timeout while the post-stop queue (and the status
+  // capsule) sat blocked. Bail out early on a permission failure.
+  if (looksLikeAutomationPermissionError(primaryReason)) {
+    return { ok: false, reason: primaryReason };
+  }
   const fallback = `
     tell application "System Events"
       key code 36 using command down
@@ -4020,7 +4041,7 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
   if (res2.ok) {
     return { ok: true, reason: "cmd-enter-keycode-sent" };
   }
-  const reason = String(res2.stderr || res2.stdout || res1.stderr || res1.stdout || "cmd-enter-failed").trim();
+  const reason = String(res2.stderr || res2.stdout || primaryReason || "cmd-enter-failed").trim();
   return { ok: false, reason };
 }
 
@@ -5052,8 +5073,13 @@ async function ensureBackendRuntime(python, repoRoot) {
     pipArgs.splice(3, 0, "--user");
   }
 
+  // Same scrubbed interpreter env as every other runCommand(python, ...)
+  // call in this file. Without it a stray PYTHONPATH / PYTHONHOME /
+  // VIRTUAL_ENV inherited from the launching shell steers pip at a
+  // different site-packages than the import check that follows, so a
+  // "successful" install can be followed by a failing recheck.
   const install = await runCommand(python, pipArgs, {
-    cwd: repoRoot, timeoutMs: 300000
+    cwd: repoRoot, timeoutMs: 300000, env: buildPythonEnv(python)
   });
 
   if (!install.ok && !isAppVenv) {
@@ -5062,7 +5088,7 @@ async function ensureBackendRuntime(python, repoRoot) {
     const retry = await runCommand(
       python,
       ["-m", "pip", "install", "--user", "--break-system-packages", "-r", requirementsPath],
-      { cwd: repoRoot, timeoutMs: 300000 }
+      { cwd: repoRoot, timeoutMs: 300000, env: buildPythonEnv(python) }
     );
     if (!retry.ok) {
       return {

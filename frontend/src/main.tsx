@@ -4271,6 +4271,23 @@ function readAutoSendEnterEnabled(): boolean {
   return !!settingsToggle?.checked;
 }
 
+/**
+ * The auto-send label was hardcoded to the macOS combination in
+ * index.html, so Windows and Linux users read "Auto-send Cmd+Ctrl
+ * Enter" while the main process actually sends plain Ctrl+Enter
+ * (`SendKeys "^{ENTER}"` / `xdotool key ctrl+Return`). Derive it from
+ * the platform the renderer is running on so the setting names the
+ * keystroke the user will really get.
+ */
+function syncAutoSendEnterLabel(): void {
+  const toggle = document.getElementById("settingsAutoSendEnterToggle");
+  const label = toggle?.closest("label")?.querySelector("span");
+  if (!label) return;
+  label.textContent = _isMacRenderer
+    ? "Auto-send Cmd+Ctrl Enter"
+    : "Auto-send Ctrl+Enter";
+}
+
 function setAutoSendEnterEnabled(enabled: boolean): void {
   const on = !!enabled;
   const settingsToggle = document.getElementById("settingsAutoSendEnterToggle") as HTMLInputElement | null;
@@ -7659,7 +7676,14 @@ async function startLive(): Promise<void> {
       const slot = liveFinalSlots.get(sessionUiToken);
       if (!slot) return;
       if (slot.envelope) return;
-      if (slot.waiters.length === 0) return;
+      // No ``waiters.length === 0`` bail-out. stopLive now arms its
+      // waiter lazily (see below), so at the moment of an unclean close
+      // there is often nobody waiting yet — and dropping the synthetic
+      // error envelope here meant the later waiter had nothing to
+      // resolve against and burned its whole timeout. Recording the
+      // envelope in the slot is safe either way: ``resolveLiveFinal``
+      // is a no-op once ``slot.envelope`` is set, and the real ``final``
+      // message always arrives before ``onclose``.
       console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot.envelope} waiters=${slot.waiters.length}`);
       if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
       console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
@@ -8221,7 +8245,34 @@ async function stopLive(enhance: boolean): Promise<void> {
   // and lost those trailing segments — that was the tail-cut bug.
   const liveStreamErrorAtStop = getLiveStreamError(sessionUiToken);
 
-  let liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
+  // Lazily-armed envelope waiter.
+  //
+  // This used to be ``liveFinalPromise = waitForLiveFinalEnvelope(...)``
+  // right here — which STARTED the 4 s timer at finalize-send time,
+  // several seconds before anything actually awaits it. Between this
+  // point and the first await sit ``pcmSink.finalize()``, an
+  // ``<audio>`` duration probe worth up to 2.5 s, the whole Web Audio
+  // teardown, and ``saveRecordingText`` uploading a multi-megabyte WAV
+  // over the loopback. On a long recording the budget was fully spent
+  // before the wait began, so the post-CloseStream ``is_final`` — the
+  // trailing clause the user spoke just before Stop — was treated as
+  // "never arrived" and either lost or re-fetched through the slow
+  // recovery path.
+  //
+  // Arming lazily starts the 4 s from the moment we genuinely begin
+  // waiting. Nothing is lost in the meantime: ``resolveLiveFinal``
+  // stores the envelope on the slot whether or not a waiter exists,
+  // and ``waitForLiveFinalEnvelope`` returns it immediately if already
+  // present.
+  let liveFinalWaiterArmed = false;
+  let _liveFinalPromise: Promise<LiveFinalEnvelope | null> | null = null;
+  const liveFinalPromise = (): Promise<LiveFinalEnvelope | null> => {
+    if (!liveFinalWaiterArmed) return Promise.resolve(null);
+    if (!_liveFinalPromise) {
+      _liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, 4000);
+    }
+    return _liveFinalPromise;
+  };
   if (ws) {
     // 4000 ms budget for the full round-trip after CloseStream.
     // Covers the 700 ms endpointing threshold + Deepgram's server-
@@ -8240,8 +8291,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     // circuits this ceiling when committed segments already cover
     // the recording tail, so the new ceiling only matters on the
     // genuinely-slow path it was always there for.
-    const finalizeWaitMs = 4000;
-    liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, finalizeWaitMs);
+    liveFinalWaiterArmed = true;
     if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: "finalize" }));
@@ -9054,8 +9104,8 @@ async function stopLive(enhance: boolean): Promise<void> {
           // word, anything over is a real tail-cut.
           //
           // Recovery escalation:
-          //   1. Wait for ``liveFinalPromise`` (already in flight,
-          //      4000 ms ceiling). Its envelope contains the post-
+          //   1. Wait for the live final envelope (4000 ms ceiling,
+          //      armed lazily at this point). Its envelope contains the post-
           //      CloseStream ``is_final`` segments. If those extend
           //      beyond ``instantTranscript`` (more words / later
           //      end-time), use them.
@@ -9142,7 +9192,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             const tRace = performance.now();
             const envelopePromise: Promise<LiveFinalEnvelope | null> = skipEnvelope
               ? Promise.resolve(null)
-              : (liveFinalPromise || Promise.resolve(null));
+              : liveFinalPromise();
             // Budget split. When the live stream produced NO timestamped
             // coverage at all (``skipEnvelope``) the recovery pass IS the
             // transcript, so it gets the full budget. When we already
@@ -9341,7 +9391,7 @@ async function stopLive(enhance: boolean): Promise<void> {
               tone: noStreamingActivity ? "warning" : "info",
             }, sessionUiToken);
             const tNoFinal = performance.now();
-            const envelopeCand: Promise<NoFinalCandidate> = (liveFinalPromise || Promise.resolve(null))
+            const envelopeCand: Promise<NoFinalCandidate> = liveFinalPromise()
               .then((envelope) => {
                 const error = envelope?.error || getLiveStreamError(sessionUiToken) || "";
                 const text = error ? "" : textFromLiveFinalEnvelope(envelope);
@@ -9781,6 +9831,7 @@ void loadCfg()
     showRecordSessionNotice(`Startup setup failed: ${msg}`, "warning", 9000);
   });
 syncRemoteModelOptions();
+syncAutoSendEnterLabel();
 populateUpscaleModelOptions();
 (document.getElementById("upscaleModelSelect") as HTMLSelectElement | null)?.addEventListener(
   "change",
@@ -9879,9 +9930,15 @@ function classifyBootError(raw: string): { headline: string; detail: string } {
       low.includes("eaddrinuse") ||
       low.includes("winerror 10048") ||
       low.includes("only one usage of each socket address")) {
+    // Do NOT name a port here. The backend scans upward from
+    // TRANSCRIPTOR_PORT (default 8321) through 24 candidates before
+    // falling back to an OS-assigned port, so the number that actually
+    // collided is rarely 8321. Telling the user to free 8321 when the
+    // conflict was on 8327 sends them chasing the wrong process; the
+    // real port is in the technical-details disclosure below.
     return {
-      headline: "Port 8321 is already in use.",
-      detail: "Another copy of Transcriptor is still running. Close it via the tray icon (or reboot if that doesn't work) and try again.",
+      headline: "The backend port is already in use.",
+      detail: "Another copy of Transcriptor is still running. Close it via the tray icon (or reboot if that doesn't work) and try again. The exact port is in the technical details below.",
     };
   }
   if (low.includes("permission denied") ||

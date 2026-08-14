@@ -33,12 +33,23 @@ class DeepgramEndpointTests(unittest.TestCase):
         self.assertEqual(mod.DEEPGRAM_REST_BASE, "https://localhost:8765/v1")
         self.assertEqual(mod.DEEPGRAM_LIVE_URL, "wss://localhost:8765/v1/listen")
 
-    def test_scheme_or_path_override_is_rejected(self):
+    def test_scheme_or_path_override_falls_back_to_default(self):
+        """A malformed override must not take the backend down.
+
+        This module is imported transitively from ``backend.main``, so
+        raising here killed the process before uvicorn started: Electron
+        saw the child exit, retried eight times, and reported a generic
+        "backend did not start" with no pointer to the offending env
+        var. Matching ``backend.main._env_int``, the value is rejected
+        with a warning and the documented default is used instead.
+        """
         for value in ("https://api.deepgram.com", "api.deepgram.com/v1", "api deepgram com"):
             with self.subTest(value=value):
                 os.environ["TRANSCRIPTOR_DEEPGRAM_HOST"] = value
-                with self.assertRaises(ValueError):
-                    self._reload()
+                with self.assertLogs("backend.deepgram_endpoints", level="WARNING"):
+                    mod = self._reload()
+                self.assertEqual(mod.DEEPGRAM_REST_BASE, "https://api.deepgram.com/v1")
+                self.assertEqual(mod.DEEPGRAM_LIVE_URL, "wss://api.deepgram.com/v1/listen")
 
 
 if __name__ == "__main__":
