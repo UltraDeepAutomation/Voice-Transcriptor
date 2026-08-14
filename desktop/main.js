@@ -1740,15 +1740,12 @@ function startRecordingStateMonitor() {
             }
           }).catch(() => { });
         }
-        if (!isRec || !cfg.enabled || recordingStopInFlight) {
+        const silenceDetectionActive = isRec && cfg.enabled && !recordingStopInFlight;
+        const pastWarmup = !recordingStartedAt || (now - recordingStartedAt) >= 1500;
+        if (!silenceDetectionActive || !pastWarmup) {
           recordingSilenceStartedAt = 0;
         } else {
           const thresholdRms = Math.pow(10, Number(cfg.thresholdDb) / 20);
-          const warmupMs = 1500;
-          if (recordingStartedAt && (now - recordingStartedAt) < warmupMs) {
-            recordingSilenceStartedAt = 0;
-            return;
-          }
           // Only use dB-based silence detection — no staleAudioFrames shortcut.
           // staleAudioFrames was causing false stops during active speech when
           // the audio pipeline had minor hiccups.
@@ -1768,15 +1765,25 @@ function startRecordingStateMonitor() {
           } else {
             recordingSilenceStartedAt = 0;
           }
-          // Separate fail-safe: if audio pipeline is truly dead (no frames for 8 seconds),
-          // force stop to avoid infinite hang. This is NOT silence detection.
-          const staleAudioFrames = recordingSeenAudioFrames && safeLastFrameAt > 0 && (now - safeLastFrameAt) > 8000;
-          if (staleAudioFrames && !recordingStopInFlight) {
-            recordingStopInFlight = true;
-            stopRecordingStateMonitor();
-            appendMainLog(`[recording-autostop-stale] audio pipeline dead for 8s, forcing stop`);
-            guardedStopFromRecordingStatus("autostop-stale");
-          }
+        }
+        // Fail-safe: if the audio pipeline is truly dead (no frames for
+        // 8 s) force a stop so the session can't hang forever. This is
+        // NOT silence detection and must NOT be gated on the auto-stop
+        // setting — it previously lived inside the ``cfg.enabled``
+        // branch, so for every user with auto-stop OFF (the default) a
+        // dead mic/worklet left the capsule recording indefinitely with
+        // no way out but quitting the app.
+        const staleAudioFrames =
+          isRec &&
+          !recordingStopInFlight &&
+          recordingSeenAudioFrames &&
+          safeLastFrameAt > 0 &&
+          (now - safeLastFrameAt) > 8000;
+        if (staleAudioFrames) {
+          recordingStopInFlight = true;
+          stopRecordingStateMonitor();
+          appendMainLog(`[recording-autostop-stale] audio pipeline dead for 8s, forcing stop`);
+          guardedStopFromRecordingStatus("autostop-stale");
         }
       })
       .catch(() => { });

@@ -19,10 +19,20 @@ class LiveConfig:
     # coordinated updates in those three sites.
     sample_rate: int = LIVE_SAMPLE_RATE_HZ
     window_sec: float = 8.0
+    # Seconds of already-transcribed audio re-fed at the head of each
+    # window so a word split across two windows is still decoded with
+    # context on at least one side. Consumed by ``maybe_transcribe``.
     overlap_sec: float = 1.0
     min_step_sec: float = 1.0
     min_audio_sec: float = 0.7
     emit_epsilon_sec: float = 0.05
+    # Extra seconds retained in the ring beyond ``window_sec``. This is
+    # the catch-up budget: when one inference pass runs longer than
+    # ``window_sec`` (slow CPU, large model, first-load stall) the next
+    # window must be able to reach BACK past ``window_sec`` to cover the
+    # audio recorded meanwhile. Without it that audio is silently
+    # dropped and the user loses words mid-stream.
+    ring_slack_sec: float = 10.0
 
 
 # Consecutive transcribe failures before we escalate to a fatal error.
@@ -49,6 +59,13 @@ class LiveSession:
         self._total_samples = 0
         self._lock = asyncio.Lock()
         self._last_transcribe_sec = 0.0
+        # End (in global stream seconds) of the audio that has actually
+        # been handed to the model. Distinct from
+        # ``_last_transcribe_sec``, which only throttles how often we
+        # start a pass. Windows are sized from THIS value so a slow
+        # inference pass never leaves a hole in the coverage.
+        self._covered_sec = 0.0
+        self._dropped_sec_total = 0.0
         self._last_emitted_end = 0.0
         self._consecutive_errors = 0
         self._last_error_signature: Optional[str] = None
@@ -97,11 +114,33 @@ class LiveSession:
             self._ring_samples += int(audio.shape[0])
             self._total_samples += int(audio.shape[0])
 
-            # Keep only a rolling buffer; global timing uses _total_samples.
-            max_keep = int((self.cfg.window_sec + 10.0) * self.cfg.sample_rate)
-            while self._ring and self._ring_samples > max_keep:
+            # Keep a rolling buffer of AT LEAST ``max_keep`` samples;
+            # global timing uses _total_samples.
+            #
+            # Evict a chunk only when the remainder still covers the
+            # retention target. The previous condition
+            # (``while self._ring_samples > max_keep``) dropped the chunk
+            # that carried the buffer over the line, so the ring ended up
+            # holding *less* than the retention target — and a single
+            # chunk larger than ``max_keep`` (possible whenever the
+            # client batches aggressively, or on the first frame after a
+            # stall) emptied the ring completely, silently discarding
+            # every sample in it.
+            max_keep = int(self._ring_keep_sec() * self.cfg.sample_rate)
+            while (
+                len(self._ring) > 1
+                and (self._ring_samples - int(self._ring[0].shape[0])) >= max_keep
+            ):
                 dropped = self._ring.popleft()
                 self._ring_samples -= int(dropped.shape[0])
+
+    def _ring_keep_sec(self) -> float:
+        return float(self.cfg.window_sec) + max(0.0, float(self.cfg.ring_slack_sec))
+
+    def _max_window_sec(self) -> float:
+        """Largest window we can serve from the ring without reading a
+        chunk that ``append_pcm16le`` may evict concurrently."""
+        return max(float(self.cfg.window_sec), self._ring_keep_sec() - 1.0)
 
     async def maybe_transcribe(self, *, force: bool = False):
         sr = self.cfg.sample_rate
@@ -109,12 +148,35 @@ class LiveSession:
         async with self._lock:
             total_samples = int(self._total_samples)
             total_sec = total_samples / float(sr)
-            if force and total_sec <= self._last_transcribe_sec + self.cfg.emit_epsilon_sec:
+            # Both the throttle AND the final forced flush key off
+            # ``_covered_sec`` — what the model has actually seen. Using
+            # ``_last_transcribe_sec`` (set when a pass STARTS) made the
+            # forced tail flush a no-op whenever the last periodic pass
+            # had already begun, so the trailing words spoken just
+            # before Stop were never transcribed.
+            if force and total_sec <= self._covered_sec + self.cfg.emit_epsilon_sec:
                 return None
             if not force and total_sec - self._last_transcribe_sec < self.cfg.min_step_sec:
                 return None
 
-            win = int(self.cfg.window_sec * sr)
+            # Window spans everything not yet covered, plus an overlap
+            # head for context. When a previous pass ran longer than
+            # ``window_sec`` this reaches further back than the nominal
+            # window instead of leaving the gap untranscribed.
+            uncovered_from_sec = max(0.0, self._covered_sec - self.cfg.overlap_sec)
+            need_sec = max(0.0, total_sec - uncovered_from_sec)
+            max_window_sec = self._max_window_sec()
+            if need_sec > max_window_sec:
+                dropped = need_sec - max_window_sec
+                self._dropped_sec_total += dropped
+                logger.warning(
+                    "live assist fell behind by %.2fs (window capped at %.2fs); "
+                    "%.2fs of audio dropped this pass, %.2fs total. The saved "
+                    "recording still holds the full audio.",
+                    need_sec, max_window_sec, dropped, self._dropped_sec_total,
+                )
+            win_sec = min(max(need_sec, self.cfg.min_audio_sec), max_window_sec)
+            win = int(win_sec * sr)
             audio_window = self._get_last_samples(win)
 
             # Skip if no audio yet or audio too short
@@ -222,6 +284,10 @@ class LiveSession:
         # should not count against us forever.
         self._consecutive_errors = 0
         self._last_error_signature = None
+        # Coverage advances only on a pass that actually reached the
+        # model. On the error paths above it stays put so the same audio
+        # is retried in the next window instead of being skipped.
+        self._covered_sec = max(self._covered_sec, total_sec)
 
         new_segments = []
         for s in result.get("segments", []):

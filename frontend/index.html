@@ -4,6 +4,23 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!--
+    Defence-in-depth CSP for the renderer. Electron already runs this
+    window with contextIsolation + sandbox + nodeIntegration off and
+    blocks navigation to non-backend origins, but a CSP is the layer
+    that also stops an injected <img>/<script> from phoning home if a
+    future change ever renders untrusted transcript content as HTML.
+
+    - 'unsafe-inline' for script-src is required: the backend injects
+      the bootstrap <script> (API token + runtime config) into this
+      document at serve time.
+    - connect-src stays same-origin so the renderer can only reach the
+      local backend over HTTP and the /ws/transcribe WebSocket.
+    - media-src/img-src allow blob: for recorded-audio playback and
+      data: for inline icons.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>Transcriptor</title>
   <!--
     CRITICAL: inline fallback styles for the boot overlay.

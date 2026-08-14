@@ -88,7 +88,11 @@ For Apple accounts attached to multiple providers, also export
 
 1. Download `Transcriptor Setup <version>.exe`.
 2. Run the installer.
-3. Allow microphone access when Windows asks.
+3. Allow microphone access when Windows asks (Settings → Privacy & security →
+   Microphone → Let desktop apps access your microphone).
+
+No extra tools are required: auto-paste and auto-send use built-in Windows
+APIs, and the bundled runtime already contains Python and ffmpeg.
 
 ### Linux x64
 
@@ -100,7 +104,75 @@ chmod +x Transcriptor-<version>.AppImage
 ./Transcriptor-<version>.AppImage
 ```
 
+`xdotool` drives auto-paste and auto-send, `wmctrl` restores the window that
+was focused when recording started, and `zenity` provides the archive-folder
+picker. Without them the app still records and transcribes; only those
+integrations degrade.
+
 On Wayland, install the matching paste tools for your compositor (`wtype` or `ydotool`) and configure input permissions as required by your distro.
+
+## Permissions Per Platform
+
+| Platform | Required | Needed for | Where to grant |
+| --- | --- | --- | --- |
+| macOS | Microphone | Recording | System Settings → Privacy & Security → Microphone |
+| macOS | Accessibility | Auto-paste and auto-send keystrokes | System Settings → Privacy & Security → Accessibility |
+| macOS | Automation | Refocusing the app you recorded from | System Settings → Privacy & Security → Automation |
+| Windows | Microphone | Recording | Settings → Privacy & security → Microphone |
+| Linux | Microphone | Recording | Distro audio stack (PipeWire/PulseAudio) |
+| Linux | Input tools | Auto-paste / auto-send | `xdotool`, `wmctrl` (X11) or `wtype` / `ydotool` (Wayland) |
+
+The app never requests these at startup. Each prompt appears the first time
+the corresponding action runs.
+
+## Hotkeys
+
+Two global hotkeys work from any application, including when the Transcriptor
+window is hidden.
+
+| Action | macOS default | Windows / Linux default |
+| --- | --- | --- |
+| Start / stop recording | `Option`+`←` | `F9` |
+| Paste the last transcript again | `Option`+`Shift`+`V` | `F10` |
+
+Defaults live in `desktop/shortcut-defaults.json`, which is the SSOT for both
+the Electron main process and the Settings UI.
+
+### Changing a hotkey
+
+1. Open **Settings → Shortcuts**.
+2. Click the key row you want to rebind — it switches to `Press keys...`.
+3. Press the combination. It is saved and re-registered immediately; there is
+   no separate Save button.
+4. `Esc`, or a click outside the row, cancels the capture.
+5. **Reset shortcuts** restores the platform defaults from the table above.
+
+Rules the picker enforces:
+
+- Letter, digit and punctuation keys require at least one modifier, so a
+  binding can never swallow normal typing.
+- Function keys (`F1`–`F12`), arrows, and navigation keys (`Home`, `End`,
+  `PageUp`, `PageDown`, `Insert`, `Delete`) may be bound on their own.
+- The two actions cannot share the same combination.
+
+### When a hotkey does not fire
+
+- A red highlight on the Settings row means the OS refused the registration —
+  another application already owns that combination. Pick a different one.
+- **macOS + F-keys:** with "Use F1, F2, etc. keys as standard function keys"
+  turned OFF, macOS consumes `F9`/`F10` as Mission Control and Notification
+  Center before the app sees them. Registration still succeeds, so the row is
+  badged with a hint instead. Either enable that setting in System Settings →
+  Keyboard → Keyboard Shortcuts → Function Keys, hold `Fn` while pressing, or
+  pick a non-F-key combination. This is why macOS defaults to `Option`+`←`.
+- Auto-paste needs Accessibility permission. Without it the transcript is
+  still copied to the clipboard and the status capsule says so.
+
+### Auto-send (Enter after paste)
+
+**Settings → Auto-send** appends an `Enter` keystroke after a successful
+auto-paste, so a dictated message is sent in chat apps without touching the
+keyboard. It is off by default and only fires when the paste itself succeeded.
 
 ## Source Build
 

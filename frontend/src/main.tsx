@@ -1299,6 +1299,13 @@ const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
 const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = 13_000;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = 8_000;
 const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = 20_000;
+// Ceiling for the tail-gap recovery pass — the case where a usable
+// transcript ALREADY exists and recovery is only chasing a trailing
+// clause. Deliberately far below the empty-transcript budgets: the
+// user is waiting on Stop with a finished transcript in hand, so a long
+// wait for a marginal improvement is a worse outcome than shipping what
+// we have.
+const LIVE_TAIL_RECOVERY_TIMEOUT_MS = 6_000;
 
 function isRemoteProvider(provider: Provider): provider is RemoteProvider {
   return provider === "openrouter" || provider === "deepgram";
@@ -2141,22 +2148,51 @@ async function apiDelete<T>(url: string): Promise<T> {
   return (await r.json()) as T;
 }
 
+// Input samples left over from the previous ``downsample`` call — fewer
+// than one output-sample worth. Carrying them makes the decimation grid
+// CONTINUOUS across capture chunks.
+//
+// The previous implementation restarted the grid at index 0 on every
+// chunk and emitted ``Math.round(buf.length / r)`` samples, so on any
+// device whose AudioContext is not an integer multiple of 16 kHz
+// (44.1 kHz is the common case on Windows and on many USB mics) each
+// chunk boundary rounded independently: up to half an input sample was
+// duplicated or discarded ~21 times per second. That is both a slow
+// timing drift against wall-clock and a per-chunk discontinuity right
+// in the middle of the audio Whisper/Deepgram has to decode.
+let downsampleCarry = new Float32Array(0);
+
+function resetDownsampleState(): void {
+  downsampleCarry = new Float32Array(0);
+}
+
 function downsample(buf: Float32Array, inRate: number, outRate: number): Float32Array {
   if (outRate === inRate) return new Float32Array(buf);
   const r = inRate / outRate;
-  const out = new Float32Array(Math.round(buf.length / r));
-  let off = 0;
-  for (let i = 0; i < out.length; i++) {
-    const next = Math.round((i + 1) * r);
+  let src = buf;
+  if (downsampleCarry.length > 0) {
+    src = new Float32Array(downsampleCarry.length + buf.length);
+    src.set(downsampleCarry, 0);
+    src.set(buf, downsampleCarry.length);
+  }
+  // floor(), not round(): only emit output samples whose full input
+  // window is present. The remainder is carried, never dropped.
+  const outLen = Math.floor(src.length / r);
+  const out = new Float32Array(outLen);
+  let consumed = 0;
+  for (let i = 0; i < outLen; i++) {
+    const start = Math.round(i * r);
+    const end = Math.min(src.length, Math.round((i + 1) * r));
     let sum = 0;
     let n = 0;
-    for (let j = off; j < next && j < buf.length; j++) {
-      sum += buf[j];
+    for (let j = start; j < end; j++) {
+      sum += src[j];
       n++;
     }
     out[i] = n ? sum / n : 0;
-    off = next;
+    consumed = end;
   }
+  downsampleCarry = consumed < src.length ? src.slice(consumed) : new Float32Array(0);
   return out;
 }
 
@@ -7531,6 +7567,9 @@ async function startLive(): Promise<void> {
   capturePcmSampleCount = 0;
   captureLastActivePcmSample = 0;
   captureRmsEma = 0;
+  // The resampler carries <1 output-sample of the PREVIOUS session's
+  // audio; clear it so a new recording never starts with a stale frame.
+  resetDownsampleState();
   lastInterimSnapshot = "";
   wsPendingFrames = [];
   resetLiveDraftState();
@@ -8897,7 +8936,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     // waiting), so a delayed result still gets logged; we just don't
     // block the UI on it.
     let emptyRecoveryAttempted = false;
-    const recoverFromEmptyTranscript = async (reason: string): Promise<string> => {
+    const recoverFromEmptyTranscript = async (
+      reason: string,
+      budgetMs = RECOVERY_HARD_TIMEOUT_MS,
+    ): Promise<string> => {
       emptyRecoveryAttempted = true;
       const tStart = performance.now();
       const abortController = new AbortController();
@@ -8914,10 +8956,10 @@ async function stopLive(enhance: boolean): Promise<void> {
       });
       const timeoutPromise = new Promise<string>((resolve) => {
         timeoutHandle = setTimeout(() => {
-          console.log(`[trace recover] HARD TIMEOUT after ${RECOVERY_HARD_TIMEOUT_MS}ms — abandoning recovery`);
+          console.log(`[trace recover] HARD TIMEOUT after ${budgetMs}ms — abandoning recovery`);
           abortController.abort();
           resolve("");
-        }, RECOVERY_HARD_TIMEOUT_MS);
+        }, budgetMs);
       });
       const result = await Promise.race([innerPromise, timeoutPromise]);
       console.log(`[trace recover] outer durMs=${(performance.now() - tStart).toFixed(0)} resultLen=${result.length}`);
@@ -9101,8 +9143,19 @@ async function stopLive(enhance: boolean): Promise<void> {
             const envelopePromise: Promise<LiveFinalEnvelope | null> = skipEnvelope
               ? Promise.resolve(null)
               : (liveFinalPromise || Promise.resolve(null));
+            // Budget split. When the live stream produced NO timestamped
+            // coverage at all (``skipEnvelope``) the recovery pass IS the
+            // transcript, so it gets the full budget. When we already
+            // hold a usable transcript and are only chasing a trailing
+            // clause, spending up to 20 s on a maybe-two-extra-words
+            // improvement is the single largest contributor to the
+            // "sometimes Stop takes 20 seconds" complaint — cap it.
+            const recoveryBudgetMs = skipEnvelope
+              ? RECOVERY_HARD_TIMEOUT_MS
+              : Math.min(RECOVERY_HARD_TIMEOUT_MS, LIVE_TAIL_RECOVERY_TIMEOUT_MS);
             const recoveryPromise = recoverFromEmptyTranscript(
               `Live tail truncated (${Math.round(tailGapSec * 1000)}ms gap${skipEnvelope ? ", Deepgram WS silent" : ""}).`,
+              recoveryBudgetMs,
             );
             // ── 1.1.19: smart race instead of Promise.all ─────────────
             //

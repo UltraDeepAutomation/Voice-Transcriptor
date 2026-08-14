@@ -734,47 +734,51 @@ class DeepgramLiveSession:
                     self._event_queue.maxsize,
                 )
             return
-        # Critical (non-sentinel): evict the oldest queued interim, even
-        # if earlier queue slots hold final/error events. The previous
-        # implementation inspected only one victim, so a queue like
-        # [final, interim, ...] dropped the new critical event even
-        # though a disposable interim was available.
-        preserved = []
-        evicted_interim = False
+        # Critical (non-sentinel): evict the oldest queued interim to
+        # make room, then append the new event at the TAIL.
+        #
+        # ORDER IS THE CONTRACT. Consumers merge segments in arrival
+        # order, so the queue must stay FIFO across an eviction. The
+        # previous implementation popped items until it found an
+        # interim, then re-enqueued those popped head items — which put
+        # them BEHIND everything still sitting in the queue. Committed
+        # ``is_final`` segments were silently reordered and the user saw
+        # scrambled sentences whenever the renderer fell behind.
+        #
+        # Correct approach: drain the WHOLE queue into a list (order
+        # preserved), drop the first interim from that list, append the
+        # new event, and push the list back in the same order.
+        drained: list[object] = []
         try:
             while True:
-                victim = self._event_queue.get_nowait()
-                if isinstance(victim, dict) and victim.get("type") == "interim":
-                    evicted_interim = True
-                    break
-                preserved.append(victim)
+                drained.append(self._event_queue.get_nowait())
         except asyncio.QueueEmpty:
             pass
         except RuntimeError:
             return
-        if not evicted_interim:
-            for item in preserved:
-                try:
-                    self._event_queue.put_nowait(item)
-                except (asyncio.QueueFull, RuntimeError):
-                    break
+        victim_index = next(
+            (
+                i
+                for i, item in enumerate(drained)
+                if isinstance(item, dict) and item.get("type") == "interim"
+            ),
+            -1,
+        )
+        if victim_index >= 0:
+            drained.pop(victim_index)
+            drained.append(event)
+        else:
             logger.error(
                 "deepgram-live: queue full with no interim to evict; "
                 "critical event dropped: %r",
                 event,
             )
-            return
-        try:
-            inserted = False
-            for item in preserved:
-                if item is self._QUEUE_SENTINEL and not inserted:
-                    self._event_queue.put_nowait(event)
-                    inserted = True
+        for item in drained:
+            try:
                 self._event_queue.put_nowait(item)
-            if not inserted:
-                self._event_queue.put_nowait(event)
-        except (asyncio.QueueFull, RuntimeError) as e:
-            logger.error("deepgram-live: critical event re-enqueue failed: %s", e)
+            except (asyncio.QueueFull, RuntimeError) as e:
+                logger.error("deepgram-live: re-enqueue after eviction failed: %s", e)
+                break
 
     def _report_error(self, message: str, *, fatal: bool) -> None:
         """Record an error and push a normalized error event to the queue."""

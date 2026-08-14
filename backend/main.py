@@ -35,7 +35,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.audio_constants import (
@@ -351,8 +351,56 @@ MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
 # recovery is best-effort, the finalized transcript is already persisted
 # via the streaming path.
 MAX_LIVE_RECOVERY_BYTES = 2 * MAX_UPLOAD_BYTES
-RATE_LIMIT_PER_MIN = 120
-WS_CONNECT_LIMIT_PER_MIN = 20
+# Rate limits are a runaway/DoS backstop for a LOOPBACK-only server, not
+# a quota. They must sit far above what one healthy renderer produces, or
+# they become a self-inflicted outage.
+#
+# Steady-state renderer traffic on a single machine already reaches
+# ~120 req/min on its own: live-draft autosave (1 req / 1.2 s = 50/min)
+# + backend job polling during a transcription (1 req / 0.9 s = 66/min)
+# + upload-queue snapshot saves + /api/network (6/min) + recordings
+# list/stats refreshes after each save. The previous ceiling of 120
+# was therefore crossed during ordinary use, and the renderer started
+# getting HTTP 429 mid-recording — surfacing as random "settings save
+# failed" / stalled job polls / History refresh failures.
+RATE_LIMIT_PER_MIN = 1200
+# One WS connect per recording. A user doing rapid short dictations can
+# legitimately start well over 20 recordings in a minute.
+WS_CONNECT_LIMIT_PER_MIN = 120
+
+# ── Host-header allowlist (DNS-rebinding defence) ────────────────────
+#
+# The backend binds to 127.0.0.1, but "bound to loopback" does NOT mean
+# "only reachable by local code". A remote page can point a hostname it
+# controls at 127.0.0.1 (DNS rebinding); the browser then treats
+# ``http://attacker.example:<port>/`` as SAME-ORIGIN with the attacker's
+# page, so CORS never applies and the attacker can read our responses.
+#
+# ``GET /`` injects ``window.__TRANSCRIPTOR_API_TOKEN`` into the HTML and
+# is intentionally unauthenticated (the renderer has no other way to
+# bootstrap the token). A rebinding attack could therefore lift the API
+# token and, with it, read every transcript, recording and audio file.
+#
+# Requiring the Host header to be a literal loopback address closes it:
+# a rebound request carries the ATTACKER's hostname in Host, never
+# ``127.0.0.1`` / ``localhost``.
+_ALLOWED_HOST_NAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _host_header_allowed(raw_host: str) -> bool:
+    host = str(raw_host or "").strip()
+    if not host:
+        # Missing Host is HTTP/1.0 or a raw local client; uvicorn already
+        # rejects HTTP/1.1 without Host. Allow so non-browser tooling on
+        # the machine keeps working — such a client cannot be a rebound
+        # browser, which always sends Host.
+        return True
+    if host.startswith("["):
+        # IPv6 literal, optionally with :port after the bracket.
+        hostname = host.split("]", 1)[0] + "]"
+    else:
+        hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    return hostname.strip().lower() in _ALLOWED_HOST_NAMES
 WS_AUTH_SUBPROTOCOL = "transcriptor-auth"
 WS_AUTH_TOKEN_PREFIX = "transcriptor-token."
 
@@ -633,7 +681,20 @@ def _sweep_orphan_tmp_files() -> None:
     to avoid racing with a concurrent write from a parallel worker.
     """
     cutoff = time.time() - 60.0
-    targets: list[Path] = [DATA_DIR, UPSCALE_PRESETS_DIR]
+    # Every directory an atomic writer touches must be swept. UI_STATE_DIR
+    # (live_draft.json / upload_queue.json), RESULTS_DIR (job result
+    # .json/.txt), UPLOADS_DIR and LIVE_RECOVERY_DIR all receive
+    # ``<name>.tmp-<hex>`` siblings from storage.atomic_write_*; a crash
+    # mid-write previously left them there permanently because the sweep
+    # only looked at DATA_DIR and the presets dir.
+    targets: list[Path] = [
+        DATA_DIR,
+        UPSCALE_PRESETS_DIR,
+        UI_STATE_DIR,
+        RESULTS_DIR,
+        UPLOADS_DIR,
+        LIVE_RECOVERY_DIR,
+    ]
     try:
         targets.extend(_recordings_storage_dirs_for_roots(_get_known_archive_dirs()))
     except Exception:
@@ -1131,7 +1192,16 @@ _ASSETS_CACHE_HEADERS = {
 
 
 @app.middleware("http")
-async def add_frontend_cache_control(request: Request, call_next):
+async def guard_host_and_set_cache_control(request: Request, call_next):
+    # Host allowlist runs BEFORE the route so the unauthenticated
+    # token-bearing ``GET /`` is covered too. See _host_header_allowed
+    # for the DNS-rebinding rationale.
+    if not _host_header_allowed(request.headers.get("host")):
+        logger.warning(
+            "rejected request with non-loopback Host header path=%s",
+            request.url.path,
+        )
+        return JSONResponse(status_code=421, content={"detail": "misdirected request"})
     response = await call_next(request)
     path = request.url.path or ""
     if path.startswith("/assets/"):
@@ -2105,7 +2175,27 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
                     _rec_dir_cache_at = now
             return default_dir
 
-        p.mkdir(parents=True, exist_ok=True)
+        # A configured archive can become unusable between runs: external
+        # drive ejected, network share offline, folder renamed, perms
+        # changed. Previously the OSError from mkdir escaped
+        # ``_resolve_recordings_dir`` — which is on the path of
+        # /api/recordings, /api/recordings/stats, the retention sweep and
+        # every save — turning a recoverable misconfiguration into an
+        # HTTP 500 that made the whole History tab (and saving!) fail.
+        # Degrade to the default dir instead, exactly like the
+        # outside-home case above.
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(
+                "recordings_dir %s is not usable (%s); falling back to default %s",
+                p, e, default_dir,
+            )
+            if cache_writes_enabled:
+                with _rec_dir_cache_lock:
+                    _rec_dir_cache = default_dir
+                    _rec_dir_cache_at = now
+            return default_dir
         if cache_writes_enabled:
             with _rec_dir_cache_lock:
                 _rec_dir_cache = p
@@ -2506,10 +2596,6 @@ def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optio
     return None
 
 
-def _recording_text_sibling_exists(target_dir: Path, stem: str) -> bool:
-    return any(p.stem == stem for p in _iter_recording_text_files(target_dir))
-
-
 # Backward-compat alias for any caller that imports this name. New
 # code should use ``_RECORDING_AUDIO_EXTS`` directly.
 _AUDIO_EXTS_FOR_RETENTION: tuple[str, ...] = _RECORDING_AUDIO_EXTS
@@ -2537,6 +2623,13 @@ def _prune_old_recording_audio(
     except OSError as e:
         logger.warning("audio retention scan failed for %s: %s", target_dir, e)
         return 0
+    # Build the transcript-stem index ONCE. The previous form called
+    # ``_recording_text_sibling_exists`` inside the loop, and that helper
+    # re-listed the whole directory on every iteration — O(N²) syscalls.
+    # On an archive with a few thousand entries this turned every save
+    # (and every startup retention sweep) into seconds of blocking I/O,
+    # which the user experiences as the app stalling right after Stop.
+    text_stems = {p.stem for p in _iter_recording_text_files(target_dir)}
     for entry in entries:
         try:
             if not entry.is_file():
@@ -2548,9 +2641,8 @@ def _prune_old_recording_audio(
                 continue
             # Only delete if there's a sibling transcript — this guards
             # against nuking an orphan audio file that might belong to
-            # an in-progress save from another process. The helper uses
-            # the same case-insensitive .txt/.TXT scan as History.
-            if not _recording_text_sibling_exists(target_dir, entry.stem):
+            # an in-progress save from another process.
+            if entry.stem not in text_stems:
                 continue
             try:
                 entry.unlink()
@@ -3077,6 +3169,14 @@ async def ws_transcribe(websocket: WebSocket):
             logger.warning("live recovery cleanup failed: %s", exc)
 
     _cleanup_future.add_done_callback(_log_cleanup_error)
+    # HTTP middleware does not run for the WebSocket scope, so the
+    # loopback Host guard is applied explicitly here. Without it the WS
+    # endpoint stays reachable through a DNS-rebound origin even after
+    # the HTTP surface is locked down.
+    if not _host_header_allowed(websocket.headers.get("host")):
+        logger.warning("rejected websocket with non-loopback Host header")
+        await websocket.close(code=4421, reason="misdirected request")
+        return
     token = _websocket_api_token(websocket)
     # Constant-time comparison — matches the HTTP auth path (see
     # `_require_api_auth`). Without this a local attacker can recover
