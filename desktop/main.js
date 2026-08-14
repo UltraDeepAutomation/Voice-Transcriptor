@@ -874,26 +874,40 @@ function hasActivePostStopWork() {
   return pendingTranscriptionCount > 0 || postStopWorkerRunning || postStopQueue.length > 0;
 }
 
+// Capsule geometry SSOT. The pill's width is the sum of its parts —
+// padLeft + statusControlSize + gap + waveWidth + gap + timerWidth +
+// padRight — and the page reports that back as the window size, so the
+// two must stay consistent: 4 + 22 + 8 + 30 + 8 + 29 + 9 = 110.
+//
+// 110 is the previous 138 narrowed by 1.25×. Most of those 28 px come
+// out of the gaps and the right padding rather than the waveform: the
+// status control and the timer are sized by their content, and squeezing
+// the waveform column hard enough to absorb the whole reduction left too
+// few bars to read. The waveform keeps a 30 px column.
 const RECORDING_STATUS_CAPSULE = Object.freeze({
-  width: 138,
+  width: 110,
   height: 30,
   geometryPadding: 0,
-  minWidth: 138,
+  minWidth: 110,
   minHeight: 30,
-  maxWidth: 144,
+  maxWidth: 116,
   maxHeight: 30,
   bottomMargin: 16,
   pillHeight: 30,
   pillPadLeft: 4,
-  pillPadRight: 12,
-  pillGap: 10,
+  pillPadRight: 9,
+  pillGap: 8,
   statusControlSize: 22,
   timerWidth: 29,
   timerFontSize: 9,
-  waveWidth: 51,
-  waveHeight: 10,
-  waveBarWidth: 1.05,
-  waveBarGap: 2.05,
+  waveWidth: 30,
+  // Bar heights scale with ``waveHeight - 2``, so this is the vertical
+  // scale of the waveform. 15 of the 30 px pill reads as taller than the
+  // old squeezed 10 without the bars dominating the capsule.
+  waveHeight: 15,
+  // floor(30 / 2.4) = 12 bars in the narrowed column.
+  waveBarWidth: 1.0,
+  waveBarGap: 1.4,
   waveFrameMs: 16,
   waveLevelTickMs: 220,
   waveIdleTickMs: 360,
@@ -1092,10 +1106,12 @@ function recordingStatusCapsuleHtml() {
       padding: 0 ${t.pillPadRight}px 0 ${t.pillPadLeft}px;
       border-radius: 999px;
       border: 1px solid rgba(255,255,255,0.16);
-      background: rgba(18,18,18,0.88);
+      /* Fully opaque: nothing behind the capsule shows through. The
+         backdrop blur that used to sit here had nothing left to blur
+         once the surface stopped being translucent, and it cost a GPU
+         pass on every frame of an always-on-top window. */
+      background: #121212;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
-      backdrop-filter: blur(18px) saturate(1.12);
-      -webkit-backdrop-filter: blur(18px) saturate(1.12);
       overflow: hidden;
       isolation: isolate;
     }

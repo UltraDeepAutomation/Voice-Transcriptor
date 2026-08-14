@@ -60,6 +60,13 @@ logger = logging.getLogger(__name__)
 
 DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC = 8.0
 DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
+# How long ``close()`` waits, after sending ``Finalize``, for Deepgram to
+# return the transcript that Finalize flushed — before sending
+# ``CloseStream``. The wait ends the moment the transcript arrives, so
+# this is a ceiling, not a cost. Observed post-Finalize round trips in
+# main.log land between 0.26 s and 0.73 s; 1.5 s covers a slow
+# cross-region link without making Stop feel unresponsive.
+FINALIZE_FLUSH_WAIT_SEC = 1.5
 
 
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
@@ -238,6 +245,11 @@ class DeepgramLiveSession:
         # (never cancelled). TCP FIN-WAITs piled up until OS reclaim.
         self._close_ran = False
         self._finalize_sent = False
+        # Set by the receive loop whenever an ``is_final`` arrives. The
+        # finalize path waits on it after sending ``Finalize`` so the
+        # flushed trailing transcript has a chance to come back before
+        # the stream is closed. See ``FINALIZE_FLUSH_WAIT_SEC``.
+        self._final_arrived = asyncio.Event()
         self._last_error: Optional[str] = None
         self._last_fatal: bool = False
         self.stats = DeepgramLiveStats()
@@ -547,6 +559,35 @@ class DeepgramLiveSession:
                 logger.info("deepgram-live: Finalize skipped (already closed)")
             except WebSocketException as e:
                 logger.warning("deepgram-live: Finalize send failed: %s", e)
+
+            # Give Deepgram a moment to return the transcript that
+            # ``Finalize`` just flushed, BEFORE closing the stream.
+            #
+            # These two frames used to go out in the same millisecond, so
+            # the close raced the flush. Measured across 14 sessions in
+            # one main.log: sessions whose last segment arrived naturally
+            # (``speech_final=true``) left 0.25 s of audio undecoded on
+            # average, while sessions still mid-utterance at Stop
+            # (``speech_final=false``) left 1.86 s — the trailing clause
+            # the user had just spoken. That is the difference between
+            # "it ended exactly where I stopped" and "the last sentence
+            # is missing".
+            #
+            # Bounded, and short-circuited the instant the final lands,
+            # so a well-behaved stream pays only its actual round trip.
+            self._final_arrived.clear()
+            try:
+                await asyncio.wait_for(
+                    self._final_arrived.wait(),
+                    timeout=FINALIZE_FLUSH_WAIT_SEC,
+                )
+                logger.info("deepgram-live: post-Finalize transcript received")
+            except asyncio.TimeoutError:
+                logger.info(
+                    "deepgram-live: no post-Finalize transcript within %.1fs; closing",
+                    FINALIZE_FLUSH_WAIT_SEC,
+                )
+
             try:
                 # Same 5-second bound as send_pcm — a wedged TCP socket
                 # mustn't hang finalize indefinitely. The CloseStream
@@ -988,6 +1029,7 @@ class DeepgramLiveSession:
         if is_final:
             self._finalized_segments.append(segment)
             self.stats.segments_final += 1
+            self._final_arrived.set()
             logger.info(
                 "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s textLen=%d text=%r",
                 start, end, speech_final, len(text), text[:80],
