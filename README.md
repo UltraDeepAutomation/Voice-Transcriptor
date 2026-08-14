@@ -122,8 +122,11 @@ On Wayland, install the matching paste tools for your compositor (`wtype` or `yd
 | Linux | Microphone | Recording | Distro audio stack (PipeWire/PulseAudio) |
 | Linux | Input tools | Auto-paste / auto-send | `xdotool`, `wmctrl` (X11) or `wtype` / `ydotool` (Wayland) |
 
-The app never requests these at startup. Each prompt appears the first time
-the corresponding action runs.
+On macOS the microphone prompt is requested once at startup, because a
+recording started from the in-app button, the tray or a global hotkey must all
+find the permission already resolved — macOS hands a renderer that never asked
+a live audio stream full of silence rather than an error. Every other
+permission is requested the first time the corresponding action runs.
 
 ## Hotkeys
 

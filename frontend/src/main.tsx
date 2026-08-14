@@ -5,6 +5,10 @@ import {
   type MicHealthSnapshot,
   type MicHealthState,
 } from "./mic-health";
+import {
+  decideLiveTranscriptAdoption,
+  type LiveCoverageReport as LiveCoverage,
+} from "./live-coverage";
 
 declare global {
   interface Window {
@@ -221,22 +225,11 @@ interface LiveSessionSnapshot {
 type LiveWsMode = "none" | "local-assist" | "deepgram-stream";
 
 /**
- * Coverage report for a local-assist session: how much of the captured
- * stream actually reached the model. Emitted by the backend's
+ * ``LiveCoverage`` is re-exported from ``./live-coverage``, which owns
+ * both the shape and the policy that reads it. Emitted by the backend's
  * ``LiveSession.finalize_envelope`` and absent for every other transport
  * (Deepgram streams its own transcript and has no notion of windows).
  */
-interface LiveCoverage {
-  /** True only when nothing was dropped and no tail went untranscribed. */
-  complete: boolean;
-  coveredSec: number;
-  totalSec: number;
-  /** Audio discarded because the assist fell behind its window budget. */
-  droppedSec: number;
-  /** Audio at the end of the stream that never reached the model. */
-  uncoveredTailSec: number;
-}
-
 interface LiveFinalEnvelope {
   text: string;
   segments: TranscriptSegment[];
@@ -3353,42 +3346,6 @@ function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalMod
     assistLocalModel: effectiveProvider === "local" ? resolveFastLiveLocalModel(configuredLocalModel) : resolveLivePreviewLocalModel(configuredLocalModel),
     finalLocalModel,
   };
-}
-
-/**
- * Decide whether a local-assist transcript may stand in for a full
- * re-transcription of the saved recording at stop.
- *
- * The live assist decodes the recording while it is being spoken, so
- * when it ran the same model the final pass would run and covered every
- * captured second, the full pass is pure duplicated work whose cost
- * scales with recording length.
- *
- * Completeness is NOT re-derived here. ``coverage.complete`` is computed
- * once, in ``LiveSession.finalize_envelope``, against the same epsilon
- * the windowing logic uses; re-checking ``droppedSec``/``uncoveredTailSec``
- * with a locally-invented tolerance would create a second, silently
- * diverging definition of the same property. The numeric fields exist
- * for diagnostics. Every other guard below is about *identity* — is this
- * envelope even the right kind — which is orthogonal to completeness.
- *
- * Returns null whenever anything is unproven, so the caller falls back
- * to the full pass. "No words lost" outranks "stop is fast".
- */
-function adoptableLiveTranscript(
-  envelope: LiveFinalEnvelope | null,
-  snapshot: { assistLocalModel: string; finalLocalModel: string },
-): { text: string; coverage: LiveCoverage } | null {
-  if (!envelope || envelope.error) return null;
-  if (envelope.source !== "local-assist") return null;
-  const coverage = envelope.coverage;
-  if (!coverage || !coverage.complete || coverage.totalSec <= 0) return null;
-  const assistModel = String(snapshot.assistLocalModel || "").trim();
-  const finalModel = String(snapshot.finalLocalModel || "").trim();
-  if (!assistModel || assistModel !== finalModel) return null;
-  const text = normalizeTranscriptWhitespace(String(envelope.text || "")).trim();
-  if (!text) return null;
-  return { text, coverage };
 }
 
 /**
@@ -6724,6 +6681,49 @@ let ws: WebSocket | null = null;
 // a recording when the AudioWorklet fires frames before the WS
 // handshake completes (50–300 ms window).
 let wsPendingFrames: ArrayBuffer[] = [];
+/**
+ * Frames captured for this session that never reached the backend —
+ * discarded at the pending-buffer cap, lost to a failed ``send``, or
+ * still queued when the socket went away.
+ *
+ * This is the client half of the coverage contract. The backend's
+ * ``complete`` flag certifies that everything it *received* reached the
+ * model; it cannot know about audio that never left the renderer. Both
+ * halves must be clean before a live transcript may be adopted in place
+ * of re-transcribing the saved recording.
+ */
+let wsFramesNeverSent = 0;
+
+/**
+ * Send everything buffered while the socket was still CONNECTING.
+ *
+ * Frames only used to be drained from inside ``pushCapturedFrame``, so
+ * the flush depended on another frame arriving after the socket opened.
+ * A recording that ended inside the handshake window — a short dictated
+ * phrase — kept its opening frames in the buffer forever and streamed a
+ * transcript that was missing its first words. Now the socket's own
+ * ``open`` event drains it, and stop drains it once more before
+ * finalize so nothing can be left behind by a late-opening socket.
+ *
+ * @returns the number of frames that could not be sent.
+ */
+function flushPendingWsFrames(socket: WebSocket | null): number {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return wsPendingFrames.length;
+  while (wsPendingFrames.length > 0) {
+    const queued = wsPendingFrames[0];
+    try {
+      socket.send(queued);
+    } catch (e) {
+      // The socket transitioned to CLOSING between the readyState read
+      // and the native send. Leave the rest queued; the caller accounts
+      // for them as never-sent.
+      console.debug("live ws flush interrupted", e);
+      break;
+    }
+    wsPendingFrames.shift();
+  }
+  return wsPendingFrames.length;
+}
 let ac: AudioContext | null = null;
 let stream: MediaStream | null = null;
 let analyser: AnalyserNode | null = null;
@@ -7600,26 +7600,17 @@ function pushCapturedFrame(input: Float32Array): void {
   }
   if (!ws) return;
   if (ws.readyState === WebSocket.OPEN) {
-    // Flush any buffered frames first (FIFO order preserved). A
-    // ``send`` throw here means the socket transitioned to CLOSING
-    // mid-flush (race between readyState read and the native send
-    // call). We log the reason once per recording so the tail-cut
-    // debugger knows why some frames never reached Deepgram, and
-    // stop flushing the rest — the REST-fallback in stopLive will
-    // recover any audio from the canonical PCM sink.
-    while (wsPendingFrames.length > 0) {
-      const queued = wsPendingFrames.shift()!;
-      try {
-        ws.send(queued);
-      } catch (e) {
-        console.debug("live ws flush interrupted", e);
-        break;
-      }
-    }
+    // Buffered frames go first so FIFO order is preserved.
+    flushPendingWsFrames(ws);
     try {
       ws.send(pcm);
     } catch (e) {
+      // The socket transitioned to CLOSING between the readyState read
+      // and the native send call. This audio is in the canonical sink
+      // but never reached the live transport, so the session can no
+      // longer claim complete coverage.
       console.debug("live ws send skipped", e);
+      wsFramesNeverSent += 1;
     }
   } else if (ws.readyState === WebSocket.CONNECTING) {
     // Buffer up to 4 seconds of audio (500 frames × 128 samples/frame
@@ -7627,9 +7618,15 @@ function pushCapturedFrame(input: Float32Array): void {
     // WS is likely stuck and we should not accumulate indefinitely.
     if (wsPendingFrames.length < 500) {
       wsPendingFrames.push(pcm);
+    } else {
+      wsFramesNeverSent += 1;
     }
+  } else {
+    // CLOSING / CLOSED. The recording is ending, but the audio still
+    // existed, so it counts against coverage rather than vanishing
+    // without a trace.
+    wsFramesNeverSent += 1;
   }
-  // CLOSING / CLOSED → silently drop (recording is ending).
 }
 
 async function flushWorkletPort(timeoutMs = 350): Promise<void> {
@@ -7753,6 +7750,7 @@ async function startLive(): Promise<void> {
   resetDownsampleState();
   lastInterimSnapshot = "";
   wsPendingFrames = [];
+  wsFramesNeverSent = 0;
   resetLiveDraftState();
   clearLiveStreamState();
   liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
@@ -7809,9 +7807,21 @@ async function startLive(): Promise<void> {
     } else {
       wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
     }
-    ws = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
+    const sessionSocket = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
+    ws = sessionSocket;
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
+      // Drain whatever was captured during the handshake. Without this
+      // the flush depended on another frame arriving afterwards, so a
+      // recording that ended inside the handshake window streamed a
+      // transcript missing its opening words.
+      //
+      // Bound to ``sessionSocket`` rather than the module-level ``ws``:
+      // a late ``open`` from a superseded socket must not push this
+      // session's buffered audio into the socket of the next one.
+      if (activeUiSessionToken === sessionUiToken) {
+        flushPendingWsFrames(sessionSocket);
+      }
       const statusMsg =
         sessionWsMode === "deepgram-stream"
           ? enableVisibleLivePreview
@@ -8569,10 +8579,21 @@ async function stopLive(enhance: boolean): Promise<void> {
     // the recording tail, so the new ceiling only matters on the
     // genuinely-slow path it was always there for.
     liveFinalWaiterArmed = true;
+    // Last chance to hand over audio buffered during the handshake. The
+    // worklet is drained by now, so no further ``pushCapturedFrame``
+    // will run to do it — anything still queued here would otherwise be
+    // silently lost from the live transport, and the finalize below
+    // would ask the backend to close over an incomplete stream.
+    const strandedFrames = flushPendingWsFrames(ws);
+    if (strandedFrames > 0) {
+      wsFramesNeverSent += strandedFrames;
+      wsPendingFrames = [];
+      console.warn(`[trace stopLive] ${strandedFrames} captured frames never reached the live transport`);
+    }
     if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: "finalize" }));
-        console.log(`[trace stopLive] finalize sent to ws (state=OPEN, pendingFrames=${wsPendingFrames.length})`);
+        console.log(`[trace stopLive] finalize sent to ws (state=OPEN, neverSent=${wsFramesNeverSent})`);
       } catch (e) {
         console.warn(`[trace stopLive] finalize send threw: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -9322,15 +9343,21 @@ async function stopLive(enhance: boolean): Promise<void> {
       // transcript all fall through to the full pass. That keeps
       // "no words are lost" strictly stronger than "stop is fast".
       const liveEnvelope = await liveFinalPromise();
-      const adopted = adoptableLiveTranscript(liveEnvelope, liveSnapshot);
-      if (adopted) {
+      const decision = decideLiveTranscriptAdoption({
+        envelope: liveEnvelope,
+        assistModel: liveSnapshot.assistLocalModel,
+        finalModel: liveSnapshot.finalLocalModel,
+        framesNeverSent: wsFramesNeverSent,
+      });
+      if (decision.adopt) {
         console.log(
           `[trace stopLive] adopting live-assist transcript ` +
-          `(model=${liveSnapshot.assistLocalModel} covered=${adopted.coverage.coveredSec.toFixed(2)}s ` +
-          `of ${adopted.coverage.totalSec.toFixed(2)}s) — skipping full re-transcription`,
+          `(model=${liveSnapshot.assistLocalModel} covered=${decision.coverage.coveredSec.toFixed(2)}s ` +
+          `of ${decision.coverage.totalSec.toFixed(2)}s) — skipping full re-transcription`,
         );
-        transcriptRaw = adopted.text;
+        transcriptRaw = normalizeTranscriptWhitespace(String(liveEnvelope?.text || "")).trim();
       } else {
+        console.log(`[trace stopLive] full local pass (adoption rejected: ${decision.reason})`);
         const syncOut = await runLocalFinalPass();
         transcriptRaw = String(syncOut.text || "").trim();
       }
