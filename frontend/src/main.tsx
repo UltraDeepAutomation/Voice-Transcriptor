@@ -9342,7 +9342,11 @@ async function stopLive(enhance: boolean): Promise<void> {
       // untranscribed tail, a different assist model, or an empty
       // transcript all fall through to the full pass. That keeps
       // "no words are lost" strictly stronger than "stop is fast".
-      const liveEnvelope = await liveFinalPromise();
+      // Only wait for the envelope when one can still plausibly arrive.
+      // A stream that already errored will never produce one, and
+      // blocking on the waiter's full budget there would add seconds to
+      // a path that has to run the full pass regardless.
+      const liveEnvelope = liveStreamErrorAtStop ? null : await liveFinalPromise();
       const decision = decideLiveTranscriptAdoption({
         envelope: liveEnvelope,
         assistModel: liveSnapshot.assistLocalModel,
