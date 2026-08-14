@@ -1,4 +1,16 @@
 import "./styles.css";
+import {
+  MicHealthTracker,
+  describeMicHealth,
+  type MicHealthSnapshot,
+  type MicHealthState,
+} from "./mic-health";
+
+declare global {
+  interface Window {
+    __transcriptorMicHealth?: { get(): MicHealthSnapshot };
+  }
+}
 
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
@@ -3610,6 +3622,33 @@ async function loadMics(forceReload = false): Promise<void> {
 ($("refreshMicsBtn") as HTMLButtonElement).addEventListener("click", () => void loadMics(true));
 
 const WAVE_METER_INTERVAL_MS = 50;
+const PIPELINE_FAILSAFE_MS = 10_000;
+
+/**
+ * Audio processing profile for dictation capture — the single definition
+ * used by every ``getUserMedia`` call that opens a recording stream.
+ *
+ * Chromium defaults to a call-oriented profile. Echo cancellation and
+ * noise suppression are tuned for conferencing: both attenuate a quiet
+ * source and gate low-energy speech, which shows up as "the recording is
+ * too quiet" and as clipped words at the start and end of a phrase.
+ * Automatic gain control is kept enabled because it lifts a quiet source
+ * rather than cutting it.
+ */
+const DICTATION_AUDIO_PROCESSING = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: true,
+} as const;
+
+function micCaptureConstraints(deviceId: string): MediaStreamConstraints {
+  const id = String(deviceId || "").trim();
+  return {
+    audio: id
+      ? { deviceId: { exact: id }, ...DICTATION_AUDIO_PROCESSING }
+      : { ...DICTATION_AUDIO_PROCESSING },
+  };
+}
 
 let vu = 0;
 function setVU(rms: number): void {
@@ -3624,6 +3663,55 @@ function resetVU(): void {
   window.__transcriptorVuLevel = 0;
   setVU(0);
 }
+
+const micHealth = new MicHealthTracker();
+window.__transcriptorMicHealth = {
+  get: () => micHealth.get(),
+};
+
+/** Topbar pill labels. Hidden entirely while the mic is idle. */
+const MIC_PILL_LABEL: Record<MicHealthState, string> = {
+  idle: "Mic idle",
+  probing: "Mic connecting",
+  live: "Mic live",
+  silent: "Mic: no audio",
+  muted: "Mic muted",
+  lost: "Mic lost",
+};
+
+const MIC_PILL_TOOLTIP: Record<MicHealthState, string> = {
+  idle: "Microphone status",
+  probing: "Waiting for the first microphone samples…",
+  live: "Microphone is delivering audio.",
+  silent: describeMicHealth("silent").statusText,
+  muted: describeMicHealth("muted").statusText,
+  lost: describeMicHealth("lost").statusText,
+};
+
+function renderMicHealthPill(snap: MicHealthSnapshot): void {
+  const pill = document.getElementById("micPill");
+  const text = document.getElementById("micText");
+  if (!pill || !text) return;
+  // The class carries the state so the stylesheet owns the colours; the
+  // markup keeps its dot/label children instead of being overwritten.
+  pill.className = `mic-pill mic-pill-${snap.state}`;
+  text.textContent = MIC_PILL_LABEL[snap.state];
+  pill.setAttribute("title", MIC_PILL_TOOLTIP[snap.state]);
+  (pill as HTMLElement).hidden = snap.state === "idle";
+}
+
+micHealth.subscribe(renderMicHealthPill);
+
+function applyMicHealthStatus(snap: MicHealthSnapshot): void {
+  if (snap.state !== "silent" && snap.state !== "muted" && snap.state !== "lost") return;
+  const { statusText, statusTone } = describeMicHealth(snap.state);
+  patchCurrentRecordingSummary(
+    { status: statusText, tone: statusTone },
+    activeUiSessionToken || "",
+  );
+}
+
+micHealth.subscribe(applyMicHealthStatus);
 
 interface PersistedLiveDraft {
   session_id?: string;
@@ -6574,6 +6662,7 @@ let scriptSinkGain: GainNode | null = null;
 let src: MediaStreamAudioSourceNode | null = null;
 let timer: number | null = null;
 let vuIntervalId: ReturnType<typeof setInterval> | null = null;
+let pipelineFailsafeId: ReturnType<typeof setTimeout> | null = null;
 let startAt = 0;
 /**
  * PCM capture sink for the current recording session. Lazily created
@@ -6702,6 +6791,10 @@ async function cleanupCancelledStartCaptureResources(): Promise<void> {
   if (vuIntervalId) {
     clearInterval(vuIntervalId);
     vuIntervalId = null;
+  }
+  if (pipelineFailsafeId) {
+    clearTimeout(pipelineFailsafeId);
+    pipelineFailsafeId = null;
   }
   detachWorkletCapture("cancelled live start");
   try {
@@ -7784,7 +7877,7 @@ async function startLive(): Promise<void> {
     throwIfStartCancelled();
     const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
     try {
-      stream = await navigator.mediaDevices.getUserMedia(devId ? { audio: { deviceId: { exact: devId } } } : { audio: true });
+      stream = await navigator.mediaDevices.getUserMedia(micCaptureConstraints(devId));
     } catch (e) {
       const msg = String((e as Error)?.message || e || "").toLowerCase();
       const recoverable =
@@ -7794,7 +7887,7 @@ async function startLive(): Promise<void> {
         msg.includes("constraint");
       if (!recoverable) throw e;
       // Selected mic could disappear after reconnect/sleep. Use system default fallback.
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia(micCaptureConstraints(""));
     }
     throwIfStartCancelled();
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
@@ -7803,6 +7896,15 @@ async function startLive(): Promise<void> {
     // Permission is now granted and the real capture stream is live.
     // Refresh labels/device ids without another permission request.
     void loadMics(false);
+    // Reset the mic-health tracker for this session so the previous
+    // session's terminal state does not leak into the new run.
+    micHealth.reset();
+    const initialTracks = stream.getAudioTracks();
+    const initialDeviceId = initialTracks[0]?.getSettings?.()?.deviceId || "";
+    micHealth.observe({ kind: "session-start", deviceId: initialDeviceId });
+    if (initialTracks.some((t) => t.muted)) {
+      micHealth.observe({ kind: "track-muted", muted: true });
+    }
     // Device disconnect mid-recording: when AirPods/USB mic disconnect,
     // the audio track fires ``ended`` but nothing in the old code
     // listened for it. The recording would continue in silence until
@@ -7810,18 +7912,33 @@ async function startLive(): Promise<void> {
     // missing everything after the disconnect. We now auto-stop on
     // track ended so the user gets a clean transcript up to the
     // disconnect point and a visible "Mic disconnected" status.
+    // We also listen for ``mute``/``unmute`` so a session where the
+    // user mutes the OS-level input mid-recording (common with USB
+    // headsets / AirPods) does not silently produce a zero-signal
+    // WAV — the UI flips to a "Mic muted" warning and the post-stop
+    // recovery surfaces the right message instead of "No speech
+    // captured".
     const capturedSessionToken = sessionUiToken;
     for (const track of stream.getAudioTracks()) {
       track.addEventListener("ended", () => {
         if (!isRecording) return;
         if (activeUiSessionToken !== capturedSessionToken) return;
         console.warn("Audio track ended (device disconnect) — auto-stopping");
+        micHealth.observe({ kind: "track-ended" });
         patchCurrentRecordingSummary(
           { status: "Microphone disconnected. Saving what was captured.", tone: "warning" },
           capturedSessionToken,
         );
         void stopLive(shouldAutoTranscribe());
       }, { once: true });
+      track.addEventListener("mute", () => {
+        if (activeUiSessionToken !== capturedSessionToken) return;
+        micHealth.observe({ kind: "track-muted", muted: true });
+      });
+      track.addEventListener("unmute", () => {
+        if (activeUiSessionToken !== capturedSessionToken) return;
+        micHealth.observe({ kind: "track-muted", muted: false });
+      });
     }
     ac = new AudioContext();
     if (ac.state !== "running") {
@@ -7891,19 +8008,48 @@ async function startLive(): Promise<void> {
     if (vuIntervalId) { clearInterval(vuIntervalId); vuIntervalId = null; }
     const tick = (): void => {
       if (!analyser) {
-        if (vuIntervalId) { clearInterval(vuIntervalId); vuIntervalId = null; }
         return;
       }
       analyser.getFloatTimeDomainData(buf);
       let sum = 0;
+      let peak = 0;
       for (let i = 0; i < buf.length; i++) {
         const s = buf[i];
         sum += s * s;
+        const a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
       }
       const rms = Math.sqrt(sum / buf.length);
       setVU(rms);
+      // Single time-advance path for the health FSM: every sample carries
+      // its own timestamp, so the dwell timers never double-count.
+      micHealth.observe({ kind: "rms", rms, peak });
+      // The failsafe below only exists to catch a session that never
+      // reaches a verdict (no ticks at all, or a stuck probe). Once the
+      // FSM has left "probing" it has decided, so disarm it.
+      if (pipelineFailsafeId !== null && micHealth.get().state !== "probing") {
+        clearTimeout(pipelineFailsafeId);
+        pipelineFailsafeId = null;
+      }
     };
     vuIntervalId = setInterval(tick, WAVE_METER_INTERVAL_MS);
+    if (pipelineFailsafeId) { clearTimeout(pipelineFailsafeId); pipelineFailsafeId = null; }
+    // Last-resort watchdog: fires only when the analyser loop never
+    // produced a verdict at all (AudioContext never started, worklet
+    // failed to load, interval starved). With a healthy loop the FSM
+    // decides within PROBE_TIMEOUT_MS and this timer is disarmed above.
+    // The status copy comes from the mic-health subscriber, so the
+    // wording stays single-sourced.
+    pipelineFailsafeId = setTimeout(() => {
+      pipelineFailsafeId = null;
+      if (!isRecording) return;
+      if (micHealth.get().state !== "probing") return;
+      patchCurrentRecordingSummary(
+        { title: "Microphone is not delivering audio" },
+        activeUiSessionToken,
+      );
+      micHealth.observe({ kind: "force-silent", reason: "pipeline-failsafe" });
+    }, Math.max(2000, PIPELINE_FAILSAFE_MS));
 
     let workletCaptureStarted = false;
     if (ac.audioWorklet && typeof AudioWorkletNode === "function") {
@@ -8139,6 +8285,65 @@ async function stopLive(enhance: boolean): Promise<void> {
         (tooShortToTrust && likelySilenceWithoutPreview),
     };
   };
+
+  // Stop-time SSOT for "why is this session empty?". Combines the
+  // capture-side RMS/peak snapshot with the mic-health tracker's
+  // terminal state so the user sees the *root cause* (mic permission
+  // reset, mic muted in OS, or simply quiet room) instead of a generic
+  // "No speech captured" message.
+  const finalMicHealth = micHealth.get();
+  // Stop-time copy per terminal mic-health state. Deliberately worded
+  // differently from the live-session copy in ``mic-health.ts``: the
+  // recording is already saved by this point, so the actionable next
+  // step is "fix the input, then re-record". Membership in this table is
+  // also the single definition of "the capture hardware was at fault",
+  // which the branches below read instead of re-listing the states.
+  const STOP_COPY: Partial<
+    Record<MicHealthState, { status: string; tone: UiTone; notice: boolean }>
+  > = {
+    silent: {
+      status:
+        "Recording saved, but the microphone delivered no audio. Open System Settings → Privacy & Security → Microphone, enable Transcriptor, then re-record.",
+      tone: "error",
+      notice: true,
+    },
+    muted: {
+      status:
+        "Recording saved, but the microphone was muted in the operating system. Unmute the input device and re-record.",
+      tone: "warning",
+      notice: true,
+    },
+    lost: {
+      status: "Recording saved, but the microphone stream ended unexpectedly.",
+      tone: "error",
+      notice: false,
+    },
+  };
+  const micHealthBad = !!STOP_COPY[finalMicHealth.state];
+  const stopFailureReason = (liveText: string): {
+    status: string;
+    tone: UiTone;
+    notice: string | null;
+  } => {
+    const health = STOP_COPY[finalMicHealth.state];
+    if (health) {
+      return {
+        status: health.status,
+        tone: health.tone,
+        notice: health.notice ? health.status : null,
+      };
+    }
+    const noLiveText = !String(liveText || "").trim();
+    const silence = captureSilenceSnapshot(liveText);
+    if (noLiveText && (silence.hardSilence || silence.likelySilenceWithoutPreview)) {
+      return {
+        status: "Recording completed, no speech detected.",
+        tone: "info",
+        notice: null,
+      };
+    }
+    return { status: "", tone: "info", notice: null };
+  };
   const provider = effectiveProvider;
   const metadataProvider = provider || (providerValue ? providerValue : "none");
   let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
@@ -8347,6 +8552,10 @@ async function stopLive(enhance: boolean): Promise<void> {
   if (vuIntervalId) {
     clearInterval(vuIntervalId);
     vuIntervalId = null;
+  }
+  if (pipelineFailsafeId) {
+    clearTimeout(pipelineFailsafeId);
+    pipelineFailsafeId = null;
   }
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
@@ -8583,12 +8792,15 @@ async function stopLive(enhance: boolean): Promise<void> {
 
   const drainedSourceLiveText = latestSourceForSave();
   const drainedSilence = provider ? captureSilenceSnapshot(drainedSourceLiveText) : null;
-  if (drainedSilence?.silentCapture) {
+  const drainedFailureReason = provider ? stopFailureReason(drainedSourceLiveText) : null;
+  const drainedIsSilent = !!drainedSilence?.silentCapture || (!!provider && micHealthBad);
+  if (drainedIsSilent) {
+    const drainedDomText = micHealthBad ? "[ Mic not delivering audio ]" : "[ Silence ]";
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
-      domText: "[ Silence ]",
-      kind: "status",
+      domText: drainedDomText,
+      kind: micHealthBad ? "error" : "status",
       sessionToken: sessionUiToken,
     });
     setStatusScoped(sessionUiToken, "Done");
@@ -8599,7 +8811,7 @@ async function stopLive(enhance: boolean): Promise<void> {
         requireExisting: !!persistedRecordingName,
         title: latestSourceTitle(),
         sourceText: latestSourceForSave(),
-        transcriptText: "[ Silence ]",
+        transcriptText: drainedDomText,
         provider: metadataProvider,
         model: modelValue,
         language: languageValue,
@@ -8609,7 +8821,8 @@ async function stopLive(enhance: boolean): Promise<void> {
       if (isArchiveMutationConflict(e)) {
         patchCurrentRecordingSummary({
           title: provisionalTitle,
-          status: "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
+          status: drainedFailureReason?.notice ||
+            "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
           tone: "warning",
         }, sessionUiToken);
       }
@@ -8619,8 +8832,8 @@ async function stopLive(enhance: boolean): Promise<void> {
     releaseStopTransitionAfterCaptureDetach();
     patchCurrentRecordingSummary({
       title: provisionalTitle,
-      status: "Silence detected. Audio remains available for review.",
-      tone: "success",
+      status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
+      tone: drainedFailureReason?.tone || "success",
       transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
     return;
@@ -9368,16 +9581,18 @@ async function stopLive(enhance: boolean): Promise<void> {
           };
           const noStreamingActivity = !hasStreamingActivity(instantBuffer);
           const noFinalSilence = captureSilenceSnapshot(getSessionCanonicalLiveSourceText(sessionUiToken));
+          const failureReason = stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken));
           const definitelySilent = noStreamingActivity && (
             noFinalSilence.hardSilence ||
-            noFinalSilence.likelySilenceWithoutPreview
+            noFinalSilence.likelySilenceWithoutPreview ||
+            micHealthBad
           );
           if (definitelySilent) {
             console.log(`[trace no-final] silent recording — skipping envelope/recovery wait`);
             patchCurrentRecordingSummary({
               title: provisionalTitle,
-              status: "Recording completed, no speech detected.",
-              tone: "info",
+              status: failureReason.status || "Recording completed, no speech detected.",
+              tone: failureReason.tone,
             }, sessionUiToken);
           } else {
             const reason = noStreamingActivity
@@ -9476,16 +9691,18 @@ async function stopLive(enhance: boolean): Promise<void> {
         // to the recovery branch below).
         const noStreamingActivity = !hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken));
         const finalSilence = captureSilenceSnapshot(getSessionCanonicalLiveSourceText(sessionUiToken) || transcriptRaw);
+        const failureReason = stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken) || transcriptRaw);
         const definitelySilent = noStreamingActivity && (
           finalSilence.hardSilence ||
-          finalSilence.likelySilenceWithoutPreview
+          finalSilence.likelySilenceWithoutPreview ||
+          micHealthBad
         );
         if (definitelySilent) {
           console.log(`[trace stopLive] silent recording — skipping recovery (no streaming activity at all)`);
           patchCurrentRecordingSummary({
             title: provisionalTitle,
-            status: "Recording completed, no speech detected.",
-            tone: "info",
+            status: failureReason.status || "Recording completed, no speech detected.",
+            tone: failureReason.tone,
           }, sessionUiToken);
         } else {
           transcriptRaw = await recoverFromEmptyTranscript(
@@ -9683,6 +9900,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     }, sessionUiToken);
   } finally {
     clearLiveDraft(sessionUiToken);
+    micHealth.observe({ kind: "session-stop" });
     releaseStopTransitionAfterCaptureDetach();
     mark("stopLive:done");
     const totalMs = performance.now() - stopT0;

@@ -96,6 +96,8 @@ backend/.pytest_cache/
 **/.DS_Store
 **/__MACOSX/
 .claude/
+# Local agent/tool state — never part of a release checkout
+.mcode/
 # Per-version release staging folders (release-1.1.x/). Built
 # artifacts (~600 MB each) live in dist/ and per-release folders
 # during ship; never committed to git. SHA-256 in INSTALL.txt is

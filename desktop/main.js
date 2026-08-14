@@ -269,7 +269,11 @@ let pendingShortcutBridgeMessages = [];
 // in-flight start instead of racing to spawn duplicate Python
 // subprocesses that leak PIDs when ``backend`` is overwritten.
 let backendStartInFlight = null;
-let micPermissionChecked = false;
+// Guards the "Open Microphone Settings" escalation dialog so a denied
+// user is told once per process, not on every recording attempt. The TCC
+// status itself is never cached — ``ensureMacMicrophoneAccess`` always
+// reads it live, so granting access mid-session takes effect immediately.
+let micPermissionDialogShown = false;
 let macPastePermissionPromptAt = 0;
 let macPastePermissionPromptInFlight = false;
 const MAC_PASTE_PERMISSION_PROMPT_THROTTLE_MS = 60000;
@@ -3152,25 +3156,51 @@ function scheduleMacPastePermissionsPrompt(reason = "") {
     });
 }
 
-async function requestMacMicrophonePermissionOnce() {
-  if (process.platform !== "darwin") return true;
-  if (micPermissionChecked) {
-    try {
-      return systemPreferences.getMediaAccessStatus("microphone") === "granted";
-    } catch {
-      return true;
-    }
-  }
-  micPermissionChecked = true;
+/**
+ * Resolve the macOS microphone TCC state, triggering the one-time system
+ * prompt while the state is still undetermined.
+ *
+ * This is the single place that talks to TCC. It is safe to call from any
+ * entry point and as often as needed: ``askForMediaAccess`` only shows UI
+ * while the status is "not-determined" and resolves immediately after.
+ *
+ * Why this matters: on macOS a renderer ``getUserMedia`` call does **not**
+ * reject when microphone access was never granted — it resolves with a
+ * live ``MediaStreamTrack`` that emits digital silence. Without an
+ * explicit ask, a recording therefore produces no waveform, no error and
+ * a zero-signal WAV. Any code path that can start a capture must go
+ * through here first.
+ *
+ * @returns {Promise<"granted"|"denied"|"restricted"|"not-determined"|"unknown">}
+ */
+async function ensureMacMicrophoneAccess() {
+  if (process.platform !== "darwin") return "granted";
   let status = "unknown";
   try {
     status = String(systemPreferences.getMediaAccessStatus("microphone") || "unknown");
-  } catch { }
-  if (status === "granted") return true;
+  } catch {
+    return "unknown";
+  }
+  if (status === "granted") return status;
+  // "denied"/"restricted" are terminal until the user changes them in
+  // System Settings; asking again would be a silent no-op.
+  if (status !== "not-determined" && status !== "unknown") return status;
   try {
     const granted = await systemPreferences.askForMediaAccess("microphone");
-    if (granted) return true;
-  } catch { }
+    return granted ? "granted" : "denied";
+  } catch {
+    return status;
+  }
+}
+
+async function requestMacMicrophonePermissionOnce() {
+  if (process.platform !== "darwin") return true;
+  const status = await ensureMacMicrophoneAccess();
+  if (status === "granted") return true;
+  // Escalate to an actionable dialog once per process so a denied user
+  // is told why nothing records, without a modal on every attempt.
+  if (micPermissionDialogShown) return false;
+  micPermissionDialogShown = true;
   const res = await dialog.showMessageBox({
     type: "warning",
     buttons: ["Open Microphone Settings", "Later"],
@@ -6543,6 +6573,23 @@ app.whenReady().then(async () => {
     // pending handle.
     accessibilityPollTimer = setInterval(checkAccessibility, 30000);
     try { accessibilityPollTimer.unref?.(); } catch { }
+  }
+  if (process.platform === "darwin") {
+    // Resolve microphone TCC up front. Recording can be started from the
+    // global hotkey, the tray or the in-app button, and only the hotkey
+    // path used to ask — so starting from the UI on a fresh install (or
+    // after any rebuild, which gives the bundle a new code identity and
+    // resets TCC) handed the renderer a live-but-silent audio track with
+    // no prompt and no error: no waveform, no words, no explanation.
+    // Priming here makes the system prompt appear once, for every entry
+    // point. Fire-and-forget so a stalled prompt cannot block startup.
+    void ensureMacMicrophoneAccess()
+      .then((status) => {
+        appendMainLog(`[permissions] microphone access status=${status}`);
+      })
+      .catch((e) => {
+        appendMainLog(`[permissions] microphone probe failed: ${e?.message || e}`);
+      });
   }
   // Create a 5-bar sound wave tray icon matching the app icon (icon.png).
   // 32×32 @2x retina, template image auto-adapts to light/dark menu bar.

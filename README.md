@@ -257,6 +257,16 @@ set +a
 - If port `8321` is busy, Electron can pick another local port. Do not blanket-kill processes with `kill -9`; identify the process first.
 - Rebuild the app with `./BUILD.command` on macOS after source changes.
 
+### Recording captures silence ("Mic is not delivering audio")
+
+The topbar mic pill turns red and the session reports `Microphone is not delivering audio — open System Settings → Privacy & Security → Microphone…` instead of a generic "no speech captured". Three common root causes, in order of frequency:
+
+1. **TCC reset after reinstall.** macOS can revoke microphone permission for an app whose code identity changes, which a reinstall via `./BUILD.command` may do. Transcriptor asks the OS for microphone access at launch, so a fresh install shows the system prompt by itself — accept it. macOS never re-asks once a request has been declined, so if you dismissed it, open **System Settings → Privacy & Security → Microphone**, enable Transcriptor, then quit and relaunch the app.
+2. **Mic muted at the OS level.** macOS Monterey+ shows a strike-through microphone icon in the menu bar when the active input device is muted. Click it to unmute, or in **System Settings → Sound → Input** raise the input volume slider.
+3. **Wrong input device selected.** If multiple inputs are connected (e.g. external webcam, AirPods, virtual audio device), open the in-app mic selector and confirm the expected device is highlighted. The pill shows the resolved `deviceId` for inspection.
+
+The mic health probe is always-on — it runs whether or not auto-stop-on-silence is enabled. It samples the analyser every 50 ms and classifies on *digital silence* (no sample above one 16-bit LSB), not on loudness, so a quiet room is never mistaken for a broken microphone. A dead pipeline is flagged within 2.5 s of pressing record, or after 4 s of continuous digital silence mid-session; a 10 s watchdog covers the case where the audio graph never starts at all. The pill also shows `Mic muted` when the OS mutes the input device and `Mic lost` when the device disconnects mid-recording.
+
 ## Project Docs
 
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — current code layout and ownership.

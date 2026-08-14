@@ -560,6 +560,71 @@ body.platform-darwin .sidebar {
   color: var(--text-2);
 }
 
+.mic-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--glass-surface, rgba(255, 255, 255, 0.04));
+  backdrop-filter: var(--glass-blur, blur(14px));
+  -webkit-backdrop-filter: var(--glass-blur, blur(14px));
+  box-shadow: var(--glass-surface-outline);
+  margin-left: 6px;
+}
+
+.mic-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--net-neutral);
+}
+
+.mic-pill.mic-pill-idle .mic-dot {
+  background: var(--net-neutral, #888);
+}
+.mic-pill.mic-pill-probing .mic-dot {
+  background: var(--net-neutral, #888);
+  animation: mic-probe-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes mic-probe-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.mic-pill.mic-pill-live {
+  outline: 1px solid rgba(72, 207, 145, 0.45);
+}
+.mic-pill.mic-pill-live .mic-dot {
+  background: #48cf91;
+}
+/* Colour tracks the tone the health FSM assigns: silent/lost are errors,
+   muted is a warning. */
+.mic-pill.mic-pill-silent {
+  outline: 1px solid rgba(255, 102, 102, 0.55);
+}
+.mic-pill.mic-pill-silent .mic-dot {
+  background: #ff6666;
+}
+.mic-pill.mic-pill-muted {
+  outline: 1px solid rgba(255, 196, 0, 0.55);
+}
+.mic-pill.mic-pill-muted .mic-dot {
+  background: #ffc400;
+}
+.mic-pill.mic-pill-lost {
+  outline: 1px solid rgba(255, 102, 102, 0.75);
+}
+.mic-pill.mic-pill-lost .mic-dot {
+  background: #ff4444;
+}
+
+.mic-text {
+  font-size: 10px;
+  color: var(--text-2);
+}
+
 .topbar {
   border-bottom: 1px solid var(--glass-border);
   padding: 14px var(--page-gutter-screen);
