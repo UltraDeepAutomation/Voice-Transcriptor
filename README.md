@@ -174,3 +174,20 @@ cp .env.example .env
 ---
 
 **English version:** [README.en.md](README.en.md)
+
+## Поддержать проект
+
+Если Transcriptor пригодился — можно сказать спасибо копейкой:
+
+**USDT (TRC20)**
+```
+TVan3h93wZKeHt4Na4zsU3mVHnjpbKoghE
+```
+
+---
+
+## Лицензия
+
+MIT — свободное использование, модификация, распространение.
+Автор: **Leo Erdman** (c) 2026
+См. [LICENSE](LICENSE).
