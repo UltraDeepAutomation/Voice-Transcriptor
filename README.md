@@ -1,5 +1,9 @@
 # Transcriptor
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Transcriptor — демо" width="800" />
+</p>
+
 Десктопное приложение для транскрибации речи: запись с микрофона, загрузка файлов, ИИ-очистка текста, локальная история, глобальные хоткеи, автовставка.
 
 ## Возможности
@@ -42,6 +46,46 @@
 - Работает над любым текстом из истории.
 
 > **Граф (Graph view)** — удалён из проекта. Код, вью и бэкенд-маршрут убраны. При необходимости вернём отдельной веткой.
+
+## Скриншоты
+
+<div class="carousel">
+  <img src="assets/screenshot-1.jpg" alt="Transcriptor — главный экран" />
+  <img src="assets/screenshot-2.png" alt="Transcriptor — настройки и история" />
+</div>
+
+<style>
+.carousel {
+  display: flex;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  gap: 1rem;
+  padding: 1rem 0;
+  max-width: 100%;
+}
+.carousel img {
+  scroll-snap-align: start;
+  flex: 0 0 auto;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+.carousel::-webkit-scrollbar {
+  height: 8px;
+}
+.carousel::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+.carousel::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 4px;
+}
+.carousel::-webkit-scrollbar-thumb:hover {
+  background: #666;
+}
+</style>
 
 ## Установка
 
