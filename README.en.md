@@ -171,5 +171,6 @@ TVan3h93wZKeHt4Na4zsU3mVHnjpbKoghE
 ## License
 
 MIT — free to use, modify and redistribute.
-Copyright (c) 2026 **Leo Erdman**. See [LICENSE](LICENSE), which also carries
-the third-party component notices and the privacy statement.
+Copyright (c) 2026 **Leo Erdman**. See [LICENSE](LICENSE), and
+[NOTICE.md](NOTICE.md) for the third-party component notices and the
+privacy statement.
