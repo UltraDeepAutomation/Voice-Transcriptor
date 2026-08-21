@@ -2,8 +2,13 @@
   "name": "transcriptor",
   "version": "1.2.1",
   "description": "Voice-to-text transcription with auto-paste",
-  "author": "Transcriptor",
+  "author": "Leo Erdman",
   "license": "MIT",
+  "homepage": "https://github.com/UltraDeepAutomation/Voice-Transcriptor",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/UltraDeepAutomation/Voice-Transcriptor.git"
+  },
   "private": true,
   "main": "main.js",
   "engines": {
@@ -30,6 +35,7 @@
     "electron-builder": "26.15.3"
   },
   "build": {
+    "copyright": "Copyright (c) 2026 Leo Erdman. Licensed under the MIT License.",
     "appId": "local.transcriptor.app",
     "productName": "Transcriptor",
     "afterPack": "./afterPack.js",
@@ -75,6 +81,7 @@
       "hardenedRuntime": true,
       "identity": null,
       "extendInfo": {
+        "NSHumanReadableCopyright": "Copyright (c) 2026 Leo Erdman. Licensed under the MIT License.",
         "NSMicrophoneUsageDescription": "Transcriptor records microphone audio when you start a live transcription.",
         "NSAppleEventsUsageDescription": "Transcriptor uses Apple Events to paste transcripts into the app you are working in."
       },
@@ -127,6 +134,7 @@
       "hardenedRuntime": true,
       "preAutoEntitlements": true,
       "extendInfo": {
+        "NSHumanReadableCopyright": "Copyright (c) 2026 Leo Erdman. Licensed under the MIT License.",
         "NSMicrophoneUsageDescription": "Transcriptor records microphone audio when you start a live transcription.",
         "NSAppleEventsUsageDescription": "Transcriptor uses Apple Events to paste transcripts into the app you are working in."
       },
