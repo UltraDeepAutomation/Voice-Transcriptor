@@ -7,7 +7,7 @@
 1. Форкни репозиторий.
 2. Создай ветку: `git checkout -b feat/моя-фича` или `fix/мой-баг`.
 3. Внеси изменения.
-4. Проверь: `npm --prefix frontend run lint && npm --prefix frontend run typecheck` (если есть).
+4. Проверь: `npm --prefix frontend run typecheck` (если есть).
 5. Отправь PR с понятным описанием: что и зачем.
 
 ## Правила
@@ -130,7 +130,6 @@ frontend/      # React + Vite UI
 
 | Задача | Команда |
 |--------|---------|
-| Линт frontend | `npm --prefix frontend run lint` |
 | Типы frontend | `npm --prefix frontend run typecheck` |
 | Тесты бэкенда | `cd backend && python -m pytest` |
 | Подготовка runtime (все платформы) | `npm --prefix desktop run prepare:runtime` |
