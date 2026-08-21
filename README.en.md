@@ -97,4 +97,12 @@ cp .env.example .env
 
 ---
 
-**English version:** [README.en.md](README.en.md)
+**Русская версия:** [README.md](README.md)
+
+---
+
+## License
+
+MIT — free to use, modify and redistribute.
+Copyright (c) 2026 **Leo Erdman**. See [LICENSE](LICENSE), which also carries the
+third-party component notices and the privacy statement.
