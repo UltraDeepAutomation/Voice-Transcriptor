@@ -114,12 +114,19 @@ create_release_package() {
     echo "Internal ZIP not found: $INTERNAL_ZIP" >&2
     exit 1
   }
+  # Single definition of where the install guide lives. It moved to
+  # docs/ during the repo-root cleanup while this script still had the
+  # old root path in six places, which broke release packaging. Resolve
+  # it once and accept either location so an older checkout still packs.
+  INSTALL_DOC="$SCRIPT_DIR/docs/INSTALL_OTHER_MAC.md"
+  [ -f "$INSTALL_DOC" ] || INSTALL_DOC="$SCRIPT_DIR/INSTALL_OTHER_MAC.md"
+
   [ -f "$SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" ] || {
     echo "Installer script not found: $SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" >&2
     exit 1
   }
-  [ -f "$SCRIPT_DIR/INSTALL_OTHER_MAC.md" ] || {
-    echo "Install docs not found: $SCRIPT_DIR/INSTALL_OTHER_MAC.md" >&2
+  [ -f "$INSTALL_DOC" ] || {
+    echo "Install docs not found: $INSTALL_DOC" >&2
     exit 1
   }
   command -v zip >/dev/null 2>&1 || {
@@ -138,14 +145,14 @@ create_release_package() {
   cp "$DMG_PATH" "$RELEASE_DIR/"
   cp "$INTERNAL_ZIP" "$RELEASE_DIR/"
   cp "$SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" "$RELEASE_DIR/"
-  cp "$SCRIPT_DIR/INSTALL_OTHER_MAC.md" "$RELEASE_DIR/"
+  cp "$INSTALL_DOC" "$RELEASE_DIR/"
   chmod +x "$RELEASE_DIR/INSTALL_ON_OTHER_MAC.command"
 
   cleanup_path "$INSTALL_KIT_DIR"
   mkdir -p "$INSTALL_KIT_DIR"
   cp "$DMG_PATH" "$INSTALL_KIT_DIR/"
   cp "$SCRIPT_DIR/INSTALL_ON_OTHER_MAC.command" "$INSTALL_KIT_DIR/"
-  cp "$SCRIPT_DIR/INSTALL_OTHER_MAC.md" "$INSTALL_KIT_DIR/"
+  cp "$INSTALL_DOC" "$INSTALL_KIT_DIR/"
   cp "$RELEASE_DIR/$RELEASE_MANIFEST_NAME" "$INSTALL_KIT_DIR/"
   chmod +x "$INSTALL_KIT_DIR/INSTALL_ON_OTHER_MAC.command"
 
