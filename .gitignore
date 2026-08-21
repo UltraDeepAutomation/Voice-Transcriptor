@@ -33,12 +33,16 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Runtime data / logs / temp
-data/*.log
-data/*.pid
-data/api_token.txt
-data/config.json
-data/uploads/
-data/results/
+# Legacy per-repo data directory. The app writes to the OS userData
+# directory now and only reads this path when migrating an old install,
+# but everything that can land here is sensitive: config.json holds
+# provider API keys, .encryption_key decrypts them, api_token.txt is the
+# local API credential, and recordings are the user's own audio. The
+# previous list named files one by one, which is how data/.encryption_key
+# and data/recordings/ ended up unignored — and how an API key reached a
+# commit in the first place. Ignore the whole directory instead of chasing
+# filenames.
+data/
 *.log
 *.pid
 tmp/
