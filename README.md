@@ -45,61 +45,32 @@
 - Пресеты промптов через OpenRouter: «очистить от воды», «сделать протокол», «выделить задачи», «перевести», кастомный.
 - Работает над любым текстом из истории.
 
-> **Граф (Graph view)** — удалён из проекта. Код, вью и бэкенд-маршрут убраны. При необходимости вернём отдельной веткой.
-
 ## Скриншоты
 
-<div class="carousel">
+<p align="center">
   <img src="assets/screenshot-1.jpg" alt="Transcriptor — главный экран" />
   <img src="assets/screenshot-2.png" alt="Transcriptor — настройки и история" />
-</div>
+</p>
 
-<style>
-.carousel {
-  display: flex;
-  overflow-x: auto;
-  scroll-snap-type: x mandatory;
-  gap: 1rem;
-  padding: 1rem 0;
-  max-width: 100%;
-}
-.carousel img {
-  scroll-snap-align: start;
-  flex: 0 0 auto;
-  max-width: 100%;
-  height: auto;
-  border-radius: 8px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-}
-.carousel::-webkit-scrollbar {
-  height: 8px;
-}
-.carousel::-webkit-scrollbar-track {
-  background: #f1f1f1;
-  border-radius: 4px;
-}
-.carousel::-webkit-scrollbar-thumb {
-  background: #888;
-  border-radius: 4px;
-}
-.carousel::-webkit-scrollbar-thumb:hover {
-  background: #666;
-}
-</style>
 
 ## Установка
 
+> Готовых релизов на GitHub пока нет: сборки подписываются ad-hoc, а без
+> Developer ID и нотаризации macOS заблокирует скачанное приложение. Пока
+> что приложение собирается из исходников — см. [Разработка](#разработка).
+> Команды ниже описывают установку **уже собранного** комплекта.
+
 ### macOS (Apple Silicon)
 
-1. Скачайте `Transcriptor-<версия>-arm64-macos-install.zip` из `desktop/dist/release`.
+1. Возьмите `Transcriptor-<версия>-arm64-macos-install.zip` — его создаёт
+   `./BUILD.command` в `desktop/dist/release/`.
 2. Распакуйте и запустите `bash INSTALL_ON_OTHER_MAC.command`.
 3. Разрешите **Микрофон**, **Universal Access**, **Автоматизацию** (Системные настройки → Приватность и безопасность).
 
-> Публичные релизы требуют Developer ID + нотаризацию. Сборки из репозитория — ad-hoc, для доверенных машин.
-
 ### Windows x64
 
-1. Скачайте `Transcriptor Setup <версия>.exe`.
+1. Возьмите `Transcriptor Setup <версия>.exe` из `desktop/dist/`
+   (создаётся командой `npm --prefix desktop run dist:win`).
 2. Запустите установщик.
 3. Разрешите доступ к микрофону (Параметры → Приватность → Микрофон).
 

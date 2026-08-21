@@ -1,69 +1,117 @@
 # Transcriptor
 
-Десктопное приложение для транскрибации речи: запись с микрофона, загрузка файлов, ИИ-очистка текста, локальная история, глобальные хоткеи, автовставка.
+<p align="center">
+  <img src="assets/demo.gif" alt="Transcriptor — demo" width="800" />
+</p>
 
-## Возможности
+Desktop speech-to-text app: record from the microphone, transcribe your own files, clean the text up with an LLM, keep a local history, drive it all from global hotkeys, and have the result pasted straight into whatever you were typing in.
 
-- **Живая транскрибация** — Local Whisper (офлайн) или Deepgram (облако).
-- **Файловая транскрибация** — Whisper / Deepgram / OpenRouter.
-- **История** — сохранённые транскрипты и исходный аудио, поиск, статистика, повторная транскрибация.
-- **ИИ-апскейл** — пресеты через OpenRouter.
-- **Автовставка** — результат сразу в фокусное поле (Enter после вставки — опционально).
-- **Платформы** — macOS Apple Silicon, Windows x64, Linux x64.
+## Features
 
-## Установка
+- **Live transcription** — Local Whisper (offline) or Deepgram (cloud).
+- **File transcription** — Whisper / Deepgram / OpenRouter.
+- **History** — saved transcripts and their source audio, search, statistics, re-transcription.
+- **AI upscale** — prompt presets via OpenRouter.
+- **Auto-paste** — the result goes into the focused field (optional `Enter` after pasting).
+- **Platforms** — macOS Apple Silicon, Windows x64, Linux x64.
+
+## How it works
+
+### 1. Live — record from the microphone in real time
+
+- Start it from the in-app button, the tray menu, or a global hotkey (`Option`+`←` / `F9`).
+- Engines: **Local Whisper** (fully offline, faster on Apple Silicon) or **Deepgram Nova-3** (cloud, better on noisy recordings).
+- Pauses are detected automatically — segments are committed on silence and the final text is assembled without duplicates.
+- A microphone health pill in the topbar: green means audio is flowing, amber means silence, red means no access or the device is busy.
+- The result is pasted into the focused field, copied to the clipboard, and saved to history.
+
+### 2. Upload — transcribe your own audio or video
+
+- Drag a file into the window or press **Upload**.
+- Supported formats: **audio** — wav, mp3, m4a, flac, ogg, opus, webm; **video** — mp4, mov, mkv, webm, avi (the audio track is extracted automatically).
+- Limit: **500 MB** per file.
+- Engines: Local Whisper / Deepgram / OpenRouter, selected in the provider settings.
+- Progress is visible in the upload list; when it finishes the same pipeline runs — auto-paste, clipboard, history.
+
+### 3. History — everything you recorded or uploaded
+
+- Every entry keeps the text, the source audio, and metadata (duration, engine, date, model).
+- Full-text search, filtering by engine and date.
+- Actions: **reveal in folder**, **re-transcribe** with a different engine or model, **AI upscale**, **delete**.
+- Statistics: total time, session count, models used.
+
+### 4. AI upscale
+
+- Prompt presets through OpenRouter: strip the filler, turn it into minutes, extract action items, translate, or your own prompt.
+- Works on any text in the history.
+
+## Screenshots
+
+<p align="center">
+  <img src="assets/screenshot-1.jpg" alt="Transcriptor — main screen" />
+  <img src="assets/screenshot-2.png" alt="Transcriptor — settings and history" />
+</p>
+
+## Install
+
+> There are no GitHub releases yet: builds are ad-hoc signed, and without a
+> Developer ID signature and notarisation macOS blocks a downloaded app. For
+> now the app is built from source — see [Development](#development). The
+> steps below describe installing a kit you have already built.
 
 ### macOS (Apple Silicon)
 
-1. Скачайте `Transcriptor-<версия>-arm64-macos-install.zip` из `desktop/dist/release`.
-2. Распакуйте и запустите `bash INSTALL_ON_OTHER_MAC.command`.
-3. Разрешите **Микрофон**, **Universal Access**, **Автоматизация** (Системные настройки → Приватность и безопасность).
-
-> Публичные релизы требуют Developer ID + нотаризацию. Сборки из репозитория — ad-hoc, для доверенных машин.
+1. Take `Transcriptor-<version>-arm64-macos-install.zip`, produced by
+   `./BUILD.command` in `desktop/dist/release/`.
+2. Unpack it and run `bash INSTALL_ON_OTHER_MAC.command`.
+3. Grant **Microphone**, **Accessibility** and **Automation** in
+   System Settings → Privacy & Security.
 
 ### Windows x64
 
-1. Скачайте `Transcriptor Setup <версия>.exe`.
-2. Запустите установщик.
-3. Разрешите доступ к микрофону (Параметры → Приватность → Микрофон).
+1. Take `Transcriptor Setup <version>.exe` from `desktop/dist/`
+   (produced by `npm --prefix desktop run dist:win`).
+2. Run the installer.
+3. Allow microphone access (Settings → Privacy & security → Microphone).
 
 ### Linux x64
 
 ```bash
 sudo apt install xdotool wmctrl zenity
-chmod +x Transcriptor-<версия>.AppImage
-./Transcriptor-<версия>.AppImage
+chmod +x Transcriptor-<version>.AppImage
+./Transcriptor-<version>.AppImage
 ```
 
-На Wayland — `wtype`/`ydotool` вместо `xdotool`.
+On Wayland use `wtype` / `ydotool` instead of `xdotool`.
 
-## Глобальные хоткеи
+## Global hotkeys
 
-| Действие | macOS | Windows / Linux |
-|----------|-------|-----------------|
-| Запись / Стоп | `Option`+`←` | `F9` |
-| Вставить последний текст повторно | `Option`+`Shift`+`V` | `F10` |
+| Action | macOS | Windows / Linux |
+|--------|-------|-----------------|
+| Record / stop | `Option`+`←` | `F9` |
+| Paste the last transcript again | `Option`+`Shift`+`V` | `F10` |
 
-Настройка: **Настройки → Ярлыки**. Красная подсветка = комбинация занята другой программой.
+Rebind them under **Settings → Shortcuts**. A red highlight means another
+application already owns that combination.
 
-## Разработка
+## Development
 
 ```bash
 cd "Voice Transcriptor"
 
 # macOS
-./BUILD.command          # сборка DMG + замена установленного приложения
+./BUILD.command          # build the DMG and replace the installed app
 
 # Linux
 ./INSTALL.command
 
-# Windows (из Git Bash / WSL / macOS хоста)
+# Windows (from Git Bash / WSL / a macOS host)
 npm --prefix frontend ci
 npm --prefix desktop ci
 npm --prefix desktop run dist:win
 ```
 
-### Запуск в dev-режиме
+### Running in dev mode
 
 ```bash
 npm --prefix frontend ci
@@ -72,39 +120,56 @@ npm --prefix frontend run build
 npm --prefix desktop run dev
 ```
 
-Электрон сам управляет бэкендом — отдельный `uvicorn` не нужен.
+Electron manages the backend itself — you do not need to start `uvicorn`
+separately.
 
-## Конфигурация
+## Configuration
 
 ```bash
 cp .env.example .env
-# отредактируйте .env при необходимости
+# edit .env as needed
 ```
 
-Переменные: токен API, порт бэкенда, Deepgram хост, TTL результатов, Whisper-потоки, пути кэша и др. Полный список в `.env.example`.
+Variables cover the API token, backend port, Deepgram host, result TTL,
+Whisper thread counts, cache paths and more. The full list is in
+`.env.example`.
 
-## Траблшутинг
+## Troubleshooting
 
-- **Логи**: `~/Library/Application Support/Transcriptor/main.log` (macOS) или `%APPDATA%\Transcriptor\main.log` (Windows).
-- **Микрофон тишина**: переключите разрешение **Микрофон** выкл/вкл в настройках macOS или `tccutil reset Microphone local.transcriptor.app`.
-- **Порт 8321 занят**: Electron сам выберет другой.
+- **Logs**: `~/Library/Application Support/Transcriptor/main.log` (macOS) or
+  `%APPDATA%\Transcriptor\main.log` (Windows).
+- **Microphone records silence**: toggle the **Microphone** permission off and
+  back on in macOS settings, or run
+  `tccutil reset Microphone local.transcriptor.app`. The build is signed
+  without a Team ID, so macOS ties the grant to the exact binary and a
+  reinstall can leave it stale while still reporting "granted".
+- **Port 8321 is busy**: Electron picks another one by itself.
 
-## Документация
+## Documentation
 
-- [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — структура кода.
-- [VERIFIED_AUDIT.md](docs/VERIFIED_AUDIT.md) — аудит багов и фиксы.
-- [AUDIT_2026-08.md](docs/AUDIT_2026-08.md) — релиз-аудит: 30 дефектов с кодом и фиксами.
-- [CHANGELOG.md](CHANGELOG.md) — история релизов.
-- [INSTALL_OTHER_MAC.md](docs/INSTALL_OTHER_MAC.md) — установка внутренней сборки на другой Mac.
+- [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — code layout.
+- [VERIFIED_AUDIT.md](docs/VERIFIED_AUDIT.md) — bug audit and fixes.
+- [AUDIT_2026-08.md](docs/AUDIT_2026-08.md) — release audit: 30 defects with code and fixes.
+- [CHANGELOG.md](CHANGELOG.md) — release history.
+- [INSTALL_OTHER_MAC.md](docs/INSTALL_OTHER_MAC.md) — installing an internal build on another Mac.
 
 ---
 
 **Русская версия:** [README.md](README.md)
+
+## Support the project
+
+If Transcriptor turned out useful, you can say thanks:
+
+**USDT (TRC20)**
+```
+TVan3h93wZKeHt4Na4zsU3mVHnjpbKoghE
+```
 
 ---
 
 ## License
 
 MIT — free to use, modify and redistribute.
-Copyright (c) 2026 **Leo Erdman**. See [LICENSE](LICENSE), which also carries the
-third-party component notices and the privacy statement.
+Copyright (c) 2026 **Leo Erdman**. See [LICENSE](LICENSE), which also carries
+the third-party component notices and the privacy statement.
