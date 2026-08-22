@@ -4127,29 +4127,47 @@ function publishShortcutUpdateToMain(): void {
 }
 
 /** Convert Electron accelerator string to Settings keycap labels. */
+function normalizeAcceleratorForDisplay(acc: string, isMac: boolean): string {
+  if (!acc) return acc;
+  return acc
+    .split("+")
+    .map((tok) => {
+      const lc = tok.trim().toLowerCase();
+      if (isMac) {
+        if (lc === "commandorcontrol" || lc === "cmdorctrl") return "Command";
+        if (lc === "meta") return "Command";
+        return tok.trim();
+      }
+      if (lc === "command" || lc === "cmd" || lc === "meta") return "Super";
+      if (lc === "commandorcontrol" || lc === "cmdorctrl") return "Control";
+      return tok.trim();
+    })
+    .join("+");
+}
+
 function acceleratorToDisplayTokens(acc: string): string[] {
   if (!acc) return ["—"];
-  const parts = acc.split("+");
+  const normalized = normalizeAcceleratorForDisplay(acc, _isMacRenderer);
+  const parts = normalized.split("+");
   const labels: string[] = [];
   for (const p of parts) {
     const lc = p.trim().toLowerCase();
-    if (lc === "command" || lc === "cmd" || lc === "meta" || lc === "super") { labels.push("Command"); continue; }
+    if (_isMacRenderer && (lc === "command" || lc === "cmd")) { labels.push("Command"); continue; }
+    if (!_isMacRenderer && lc === "super") { labels.push("Super"); continue; }
     if (lc === "control" || lc === "ctrl") { labels.push("Control"); continue; }
-    if (lc === "commandorcontrol" || lc === "cmdorctrl") { labels.push("Command or Control"); continue; }
+    if (lc === "commandorcontrol" || lc === "cmdorctrl") { labels.push(_isMacRenderer ? "Command" : "Control"); continue; }
     if (lc === "alt" || lc === "option") { labels.push(_isMacRenderer ? "Option" : "Alt"); continue; }
     if (lc === "shift") { labels.push("Shift"); continue; }
-    // Arrow keys
-    if (lc === "left" || lc === "arrowleft") { labels.push("←"); continue; }
-    if (lc === "right" || lc === "arrowright") { labels.push("→"); continue; }
+    if (lc === "tab") { labels.push("Tab"); continue; }
+    if (lc === "enter" || lc === "return") { labels.push("Return"); continue; }
+    if (lc === "esc" || lc === "escape") { labels.push("Esc"); continue; }
+    if (lc === "space" || lc === "spacebar") { labels.push("Space"); continue; }
+    if (lc === "backspace" || lc === "delete") { labels.push("Delete"); continue; }
     if (lc === "up" || lc === "arrowup") { labels.push("↑"); continue; }
     if (lc === "down" || lc === "arrowdown") { labels.push("↓"); continue; }
-    if (lc === "space") { labels.push("Space"); continue; }
-    if (lc === "enter" || lc === "return") { labels.push("Enter"); continue; }
-    if (lc === "backspace") { labels.push("Backspace"); continue; }
-    if (lc === "delete") { labels.push("Delete"); continue; }
-    if (lc === "tab") { labels.push("Tab"); continue; }
-    if (lc === "escape" || lc === "esc") { labels.push("Escape"); continue; }
-    labels.push(p.trim().toUpperCase());
+    if (lc === "left" || lc === "arrowleft") { labels.push("←"); continue; }
+    if (lc === "right" || lc === "arrowright") { labels.push("→"); continue; }
+    labels.push(p.trim());
   }
   return labels;
 }
@@ -5004,14 +5022,14 @@ async function loadCfg(): Promise<void> {
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
     const livePreview = $("livePreviewToggle") as HTMLInputElement;
     auto.checked = ui.auto_transcribe !== false;
-    // Live preview defaults to ON for new users. Previously this was
-    // ``ui.live_preview === true`` (strict equal) — which returned
-    // false for any fresh config without that key, leaving the user
-    // with an empty Live Preview pane they never saw fill in. The
-    // "live транскрипция не работает" report was caused by the
-    // default, not by broken streaming. Using ``!== false`` keeps
-    // backwards compatibility: explicit ``false`` stays off.
-    livePreview.checked = ui.live_preview !== false;
+    // Live preview defaults to OFF. History: the original ``=== true``
+    // gate left fresh users staring at an empty pane ("live транскрипция
+    // не работает" was the default, not broken streaming), so it became
+    // ``!== false``; the user then explicitly chose OFF as the shipped
+    // default — streaming itself was never the problem, and a pane that
+    // fills in uninvited is noise during dictation. Strict-equal keeps
+    // existing explicit ``true`` preferences working unchanged.
+    livePreview.checked = ui.live_preview === true;
     const autoStopEnabledEl = $("autoStopSilenceEnabled") as HTMLInputElement;
     const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
@@ -5772,13 +5790,116 @@ function renderRecordingsEmptyState(message: string, actionLabel: string, onClic
   return wrap;
 }
 
+function buildRecordingItemButton(it: RecordingItem): HTMLButtonElement {
+  const itemKey = recordingItemKey(it);
+  const isActive = itemKey === selectedRecordingKey();
+  const btn = document.createElement("button");
+  btn.className = "recording-item" + (isActive ? " active" : "");
+  btn.type = "button";
+  btn.dataset.recordingName = it.name;
+  btn.dataset.recordingKey = recordingDomKey(it);
+  btn.dataset.archiveDir = recordingArchiveDir(it);
+  btn.setAttribute("aria-current", isActive ? "true" : "false");
+  const title = document.createElement("span");
+  title.className = "rec-title";
+  const meta = document.createElement("span");
+  meta.className = "rec-meta";
+  const badges = document.createElement("div");
+  badges.className = "rec-badges";
+  // Always attach the badges container even when empty — its
+  // ``min-height: 22px`` rule gives every recording-item the same
+  // intrinsic content height, so old recordings (no provider,
+  // no language, no audio) render at the same size as new ones
+  // with full badge metadata. The "у старых записей огромного
+  // размера разросшиеся" report was caused by the mix of
+  // differently-tall items across new/old content.
+  btn.appendChild(title);
+  btn.appendChild(meta);
+  btn.appendChild(badges);
+  updateRecordingItemButton(btn, it);
+  return btn;
+}
+
+function updateRecordingItemButton(btn: HTMLElement, it: RecordingItem): void {
+  const itemKey = recordingItemKey(it);
+  const isActive = itemKey === selectedRecordingKey();
+  const nextClassName = "recording-item" + (isActive ? " active" : "");
+  if (btn.className !== nextClassName) {
+    btn.className = nextClassName;
+  }
+  btn.dataset.recordingName = it.name;
+  btn.dataset.archiveDir = recordingArchiveDir(it);
+  btn.setAttribute("aria-current", isActive ? "true" : "false");
+  const title = btn.querySelector<HTMLElement>(".rec-title");
+  const nextTitle = it.display_name;
+  if (title && title.textContent !== nextTitle) {
+    title.textContent = nextTitle;
+  }
+  const meta = btn.querySelector<HTMLElement>(".rec-meta");
+  const nextMeta = `${fmtDateTime(it.modified_at)} · ${fmtBytes(it.size_bytes)}`;
+  if (meta && meta.textContent !== nextMeta) {
+    meta.textContent = nextMeta;
+  }
+  const badges = btn.querySelector<HTMLElement>(".rec-badges");
+  if (badges) syncRecordingBadges(badges, it);
+  btn.onclick = () => void openRecording(it.name, recordingArchiveDir(it));
+}
+
+function syncRecordingBadges(container: HTMLElement, it: RecordingItem): void {
+  const wanted: Array<[string, string]> = [];
+  if (it.provider && it.provider !== "unknown") {
+    wanted.push(["rec-provider rec-provider-provider", providerLabel(it.provider)]);
+  }
+  if (it.language) {
+    wanted.push(["rec-provider rec-provider-language", String(it.language).toUpperCase()]);
+  }
+  if (it.has_audio) {
+    wanted.push(["rec-provider rec-provider-audio", "Audio"]);
+  }
+  const existing = Array.from(container.children) as HTMLElement[];
+  let changed = existing.length !== wanted.length;
+  if (!changed) {
+    for (let i = 0; i < wanted.length; i++) {
+      const [cls, text] = wanted[i];
+      const node = existing[i];
+      if (node.className !== cls || node.textContent !== text) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (!changed) return;
+  container.replaceChildren(
+    ...wanted.map(([cls, text]) => {
+      const badge = document.createElement("span");
+      badge.className = cls;
+      badge.textContent = text;
+      return badge;
+    })
+  );
+}
+
+/**
+ * Rebuild the recordings list WITHOUT discarding unchanged DOM nodes.
+ *
+ * The list refreshes on every background reload (post-save, post-
+ * transcribe, focus return), and each of those used to run
+ * ``replaceChildren()`` + full rebuild — which resets the container's
+ * scrollTop to 0. With several hundred recordings the user reading the
+ * middle of the list was yanked back to the top by any unrelated
+ * background refresh ("я пролистал пятьсот элементов, а меня откидывает
+ * наверх"). Reconciling by ``data-recording-key`` keeps every untouched
+ * row's DOM node — and therefore the scroll position, hover state and
+ * focus — exactly where it was, while still reflecting adds/removes/
+ * metadata updates. A full replacement remains for the empty-state
+ * transitions where there is nothing to reconcile.
+ */
 function renderRecordingsList(): void {
   const list = $("recordingsList");
-  list.replaceChildren();
   const filteredItems = getFilteredRecordings();
   syncRecordingsSearchControls();
   if (!recordingItems.length) {
-    list.appendChild(
+    list.replaceChildren(
       renderRecordingsEmptyState("No recordings yet.", "Start Recording", () => {
         switchView("record");
       })
@@ -5786,7 +5907,7 @@ function renderRecordingsList(): void {
     return;
   }
   if (!filteredItems.length) {
-    list.appendChild(
+    list.replaceChildren(
       renderRecordingsEmptyState("No recordings match the current search.", "Clear Search", () => {
         recordingsSearchQuery = "";
         const input = $("recordingsSearchInput") as HTMLInputElement;
@@ -5801,56 +5922,42 @@ function renderRecordingsList(): void {
     );
     return;
   }
+
+  const existingByKey = new Map<string, HTMLElement>();
+  for (const node of Array.from(list.children)) {
+    if (!(node instanceof HTMLElement)) continue;
+    const key = node.dataset.recordingKey;
+    if (key && !existingByKey.has(key)) existingByKey.set(key, node);
+  }
+
+  const usedKeys = new Set<string>();
+  let refNode: ChildNode | null = list.firstChild;
   filteredItems.forEach((it) => {
-    const itemKey = recordingItemKey(it);
-    const itemDomKey = recordingDomKey(it);
-    const isActive = itemKey === selectedRecordingKey();
-    const btn = document.createElement("button");
-    btn.className = "recording-item" + (isActive ? " active" : "");
-    btn.type = "button";
-    btn.dataset.recordingName = it.name;
-    btn.dataset.recordingKey = itemDomKey;
-    btn.dataset.archiveDir = recordingArchiveDir(it);
-    btn.setAttribute("aria-current", isActive ? "true" : "false");
-    const title = document.createElement("span");
-    title.className = "rec-title";
-    title.textContent = it.display_name;
-    const meta = document.createElement("span");
-    meta.className = "rec-meta";
-    meta.textContent = `${fmtDateTime(it.modified_at)} · ${fmtBytes(it.size_bytes)}`;
-    const badges = document.createElement("div");
-    badges.className = "rec-badges";
-    if (it.provider && it.provider !== "unknown") {
-      const providerBadge = document.createElement("span");
-      providerBadge.className = "rec-provider rec-provider-provider";
-      providerBadge.textContent = providerLabel(it.provider);
-      badges.appendChild(providerBadge);
+    const key = recordingDomKey(it);
+    usedKeys.add(key);
+    let node = existingByKey.get(key);
+    if (node) {
+      updateRecordingItemButton(node as HTMLButtonElement, it);
+    } else {
+      node = buildRecordingItemButton(it);
+      existingByKey.set(key, node);
     }
-    if (it.language) {
-      const languageBadge = document.createElement("span");
-      languageBadge.className = "rec-provider rec-provider-language";
-      languageBadge.textContent = String(it.language).toUpperCase();
-      badges.appendChild(languageBadge);
+    if (refNode === node) {
+      refNode = node.nextSibling;
+    } else {
+      list.insertBefore(node, refNode);
     }
-    if (it.has_audio) {
-      const audioBadge = document.createElement("span");
-      audioBadge.className = "rec-provider rec-provider-audio";
-      audioBadge.textContent = "Audio";
-      badges.appendChild(audioBadge);
-    }
-    btn.appendChild(title);
-    btn.appendChild(meta);
-    // Always attach the badges container even when empty — its
-    // ``min-height: 22px`` rule gives every recording-item the same
-    // intrinsic content height, so old recordings (no provider,
-    // no language, no audio) render at the same size as new ones
-    // with full badge metadata. The "у старых записей огромного
-    // размера разросшиеся" report was caused by the mix of
-    // differently-tall items across new/old content.
-    btn.appendChild(badges);
-    btn.onclick = () => void openRecording(it.name, recordingArchiveDir(it));
-    list.appendChild(btn);
   });
+
+  // Drop rows that no longer belong (deleted recordings, filtered out,
+  // stale empty-state placeholders). Snapshot first — removing while
+  // iterating a live HTMLCollection skips siblings.
+  for (const node of Array.from(list.children)) {
+    const key = node instanceof HTMLElement ? node.dataset.recordingKey : undefined;
+    if (!key || !usedKeys.has(key)) {
+      node.remove();
+    }
+  }
 }
 
 async function moveRecordingSelection(step: number): Promise<void> {
