@@ -9,6 +9,8 @@ import {
   decideLiveTranscriptAdoption,
   type LiveCoverageReport as LiveCoverage,
 } from "./live-coverage";
+import { acceleratorToDisplayTokens } from "./shortcut-display";
+import { reconcileRecordingsList } from "./recordings-list-reconciler";
 
 declare global {
   interface Window {
@@ -4126,54 +4128,12 @@ function publishShortcutUpdateToMain(): void {
   postShortcutBridgeMessage("update");
 }
 
-/** Convert Electron accelerator string to Settings keycap labels. */
-function normalizeAcceleratorForDisplay(acc: string, isMac: boolean): string {
-  if (!acc) return acc;
-  return acc
-    .split("+")
-    .map((tok) => {
-      const lc = tok.trim().toLowerCase();
-      if (isMac) {
-        if (lc === "commandorcontrol" || lc === "cmdorctrl") return "Command";
-        if (lc === "meta") return "Command";
-        return tok.trim();
-      }
-      if (lc === "command" || lc === "cmd" || lc === "meta") return "Super";
-      if (lc === "commandorcontrol" || lc === "cmdorctrl") return "Control";
-      return tok.trim();
-    })
-    .join("+");
-}
-
-function acceleratorToDisplayTokens(acc: string): string[] {
-  if (!acc) return ["—"];
-  const normalized = normalizeAcceleratorForDisplay(acc, _isMacRenderer);
-  const parts = normalized.split("+");
-  const labels: string[] = [];
-  for (const p of parts) {
-    const lc = p.trim().toLowerCase();
-    if (_isMacRenderer && (lc === "command" || lc === "cmd")) { labels.push("Command"); continue; }
-    if (!_isMacRenderer && lc === "super") { labels.push("Super"); continue; }
-    if (lc === "control" || lc === "ctrl") { labels.push("Control"); continue; }
-    if (lc === "commandorcontrol" || lc === "cmdorctrl") { labels.push(_isMacRenderer ? "Command" : "Control"); continue; }
-    if (lc === "alt" || lc === "option") { labels.push(_isMacRenderer ? "Option" : "Alt"); continue; }
-    if (lc === "shift") { labels.push("Shift"); continue; }
-    if (lc === "tab") { labels.push("Tab"); continue; }
-    if (lc === "enter" || lc === "return") { labels.push("Return"); continue; }
-    if (lc === "esc" || lc === "escape") { labels.push("Esc"); continue; }
-    if (lc === "space" || lc === "spacebar") { labels.push("Space"); continue; }
-    if (lc === "backspace" || lc === "delete") { labels.push("Delete"); continue; }
-    if (lc === "up" || lc === "arrowup") { labels.push("↑"); continue; }
-    if (lc === "down" || lc === "arrowdown") { labels.push("↓"); continue; }
-    if (lc === "left" || lc === "arrowleft") { labels.push("←"); continue; }
-    if (lc === "right" || lc === "arrowright") { labels.push("→"); continue; }
-    labels.push(p.trim());
-  }
-  return labels;
-}
+// acceleratorToDisplayTokens lives in ./shortcut-display (SSOT — the
+// unit-tested module this file imports at the top); _isMacRenderer is
+// injected per call so the module itself stays platform-pure.
 
 function renderShortcutKeys(container: Element, accelerator: string): void {
-  const tokens = acceleratorToDisplayTokens(accelerator);
+  const tokens = acceleratorToDisplayTokens(accelerator, _isMacRenderer);
   container.replaceChildren(...tokens.map((token) => {
     const keycap = document.createElement("span");
     keycap.className = "shortcut-key";
@@ -5893,6 +5853,11 @@ function syncRecordingBadges(container: HTMLElement, it: RecordingItem): void {
  * focus — exactly where it was, while still reflecting adds/removes/
  * metadata updates. A full replacement remains for the empty-state
  * transitions where there is nothing to reconcile.
+ *
+ * The reconciliation algorithm itself is the unit-tested SSOT in
+ * ``./recordings-list-reconciler``; this function supplies only the
+ * domain pieces: key derivation (archive-scoped name) and row
+ * construction/update callbacks.
  */
 function renderRecordingsList(): void {
   const list = $("recordingsList");
@@ -5923,41 +5888,18 @@ function renderRecordingsList(): void {
     return;
   }
 
-  const existingByKey = new Map<string, HTMLElement>();
-  for (const node of Array.from(list.children)) {
-    if (!(node instanceof HTMLElement)) continue;
-    const key = node.dataset.recordingKey;
-    if (key && !existingByKey.has(key)) existingByKey.set(key, node);
-  }
-
-  const usedKeys = new Set<string>();
-  let refNode: ChildNode | null = list.firstChild;
-  filteredItems.forEach((it) => {
-    const key = recordingDomKey(it);
-    usedKeys.add(key);
-    let node = existingByKey.get(key);
-    if (node) {
-      updateRecordingItemButton(node as HTMLButtonElement, it);
-    } else {
-      node = buildRecordingItemButton(it);
-      existingByKey.set(key, node);
-    }
-    if (refNode === node) {
-      refNode = node.nextSibling;
-    } else {
-      list.insertBefore(node, refNode);
-    }
-  });
-
-  // Drop rows that no longer belong (deleted recordings, filtered out,
-  // stale empty-state placeholders). Snapshot first — removing while
-  // iterating a live HTMLCollection skips siblings.
-  for (const node of Array.from(list.children)) {
-    const key = node instanceof HTMLElement ? node.dataset.recordingKey : undefined;
-    if (!key || !usedKeys.has(key)) {
-      node.remove();
-    }
-  }
+  // Rows carry their identity on data-recording-key (set by
+  // buildRecordingItemButton); the keyed reconciler reuses matching DOM
+  // nodes, inserts new ones at the right position and drops the rest —
+  // untouched rows keep scroll position, hover state and focus.
+  reconcileRecordingsList(
+    list,
+    filteredItems.map((it) => ({ key: recordingDomKey(it), item: it })),
+    {
+      create: ({ item }) => buildRecordingItemButton(item),
+      update: (row, { item }) => updateRecordingItemButton(row, item),
+    },
+  );
 }
 
 async function moveRecordingSelection(step: number): Promise<void> {
