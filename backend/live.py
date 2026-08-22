@@ -33,6 +33,27 @@ class LiveConfig:
     # audio recorded meanwhile. Without it that audio is silently
     # dropped and the user loses words mid-stream.
     ring_slack_sec: float = 10.0
+    # Decode each window with word-level timestamps so already-emitted
+    # audio can be trimmed PRECISELY instead of by segment-end heuristic.
+    # Every window re-feeds ``overlap_sec`` of previously committed audio
+    # (see ``overlap_sec``), and Whisper's SEGMENT timestamps are coarse
+    # enough to drift across window boundaries between passes: a segment
+    # that lies entirely inside the re-fed region on one pass can come
+    # back with an estimated end slightly PAST the watermark on the next,
+    # passing the ``g_end <= _last_emitted_end`` guard and being emitted
+    # again — the duplicated-phrase report. Word timestamps let us drop
+    # exactly the words that were already emitted and keep exactly the
+    # new ones, which also removes the mirror-image failure (a boundary-
+    # straddling segment whose estimated end lands within epsilon of the
+    # watermark gets skipped wholesale today, swallowing its genuinely
+    # new trailing words).
+    #
+    # Costs ~10-20% extra inference per window (alignment pass); at
+    # beam_size=1 on 8 s windows that is well inside the 60 s ceiling.
+    # Flip to False only on hardware too slow to afford it — the code
+    # falls back to the segment-watermark heuristic automatically when
+    # the model returns no word data.
+    word_timestamps: bool = True
 
 
 # Consecutive transcribe failures before we escalate to a fatal error.
@@ -230,7 +251,7 @@ class LiveSession:
                         self.model_name,
                         language=self.language,
                         vad_filter=True,
-                        word_timestamps=False,
+                        word_timestamps=self.cfg.word_timestamps,
                         beam_size=1,
                         best_of=1,
                     ),
@@ -290,14 +311,58 @@ class LiveSession:
         self._covered_sec = max(self._covered_sec, total_sec)
 
         new_segments = []
+        # Everything at or before this instant was already emitted by a
+        # previous pass; only strictly-new audio may cross it.
+        cutoff = self._last_emitted_end + self.cfg.emit_epsilon_sec
         for s in result.get("segments", []):
             g_end = offset_sec + float(s.get("end", 0.0) or 0.0)
-            if g_end <= self._last_emitted_end + self.cfg.emit_epsilon_sec:
-                continue
-            g_start = offset_sec + float(s.get("start", 0.0) or 0.0)
             text = (s.get("text") or "").strip()
             if not text:
                 continue
+            words = s.get("words") or []
+            if self.cfg.word_timestamps and words:
+                # Word-precise trim: drop the head of the segment that
+                # re-decodes already-committed overlap audio. A segment
+                # with NO surviving word lies fully inside the committed
+                # region — even when its coarse estimated end drifted a
+                # few hundred ms past the watermark (the duplication
+                # bug). A segment WITH surviving words is trimmed to its
+                # new tail so the boundary clause is neither duplicated
+                # nor swallowed whole.
+                kept_words = [
+                    w for w in words
+                    if offset_sec + float(w.get("end", 0.0) or 0.0) > cutoff
+                ]
+                if not kept_words:
+                    continue
+                if len(kept_words) != len(words):
+                    # faster-whisper words carry faster-whisper's own
+                    # spacing convention (leading space on every token
+                    # except the first), so plain concatenation
+                    # reconstructs the original spacing exactly.
+                    text = "".join(
+                        str(w.get("word") or "") for w in kept_words
+                    ).strip()
+                    if not text:
+                        continue
+                    # Anchor the trimmed event at the FIRST NEW word's
+                    # onset (never before the segment head): reporting
+                    # the untrimmed start would make the frontend's
+                    # time-ordered merge believe this event overlaps
+                    # already-committed content.
+                    g_start = max(
+                        offset_sec + float(s.get("start", 0.0) or 0.0),
+                        offset_sec + float(kept_words[0].get("start", 0.0) or 0.0),
+                    )
+                else:
+                    g_start = offset_sec + float(s.get("start", 0.0) or 0.0)
+            else:
+                # No word data available (alignment unsupported, or
+                # ``word_timestamps`` disabled): fall back to the
+                # segment-end watermark heuristic.
+                if g_end <= cutoff:
+                    continue
+                g_start = offset_sec + float(s.get("start", 0.0) or 0.0)
             new_segments.append({"start": g_start, "end": g_end, "text": text})
             self._last_emitted_end = max(self._last_emitted_end, g_end)
 
