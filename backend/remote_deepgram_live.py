@@ -74,6 +74,11 @@ INTERIM_SPEECH_MIN_CHARS = 8
 # Gaps shorter than this between consecutive finals are normal segment
 # boundaries, not holes.
 COVERAGE_GAP_MIN_SEC = 0.25
+# When grouping retained interim words into fallback segments, a silence
+# gap longer than this between two consecutive words starts a new group.
+# Matches a natural inter-clause pause; smaller values would fuse words
+# the user spoke several sentences apart into one run-on blob.
+INTERIM_WORD_GAP_SPLIT_SEC = 1.0
 
 
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
@@ -250,6 +255,23 @@ class DeepgramLiveSession:
         # blind. Silence produces no interims, so ordinary pauses do not
         # register here.
         self._interim_speech_spans: list[tuple[float, float]] = []
+        # Retained word-level hypotheses from interims: {word, start, end}.
+        #
+        # Deepgram can emit a final that stops short of what its own
+        # interim already heard and resume the next final past the
+        # difference, leaving a hole no final ever covers (see the
+        # ``_interim_speech_spans`` docstring above for a measured
+        # example). The interim words are real recognitions of real
+        # audio — discarding them throws away the only transcript that
+        # exists for that ground. We retain them so ``finalize()`` can
+        # splice exactly the words NO final covers back into the
+        # committed transcript.
+        #
+        # Bounded by construction: each new interim supersedes prior
+        # hypotheses over its own time range, and every arriving final
+        # prunes the words it covers, so steady-state size tracks only
+        # the currently-uncovered speech — typically near zero.
+        self._interim_words: list[dict] = []
         self._closed = False
         # Separate "consumer-visible closed" (self._closed, flipped by
         # recv_loop.finally as soon as the upstream drops so events()
@@ -644,6 +666,7 @@ class DeepgramLiveSession:
 
         await self.close()
 
+        recovered_words = self._splice_uncovered_interim_words()
         self.stats.finalize_ms = (time.perf_counter() - started) * 1000.0
         final_text = self.final_text()
         duration_sec = 0.0
@@ -680,6 +703,84 @@ class DeepgramLiveSession:
             "stats": self.stats.as_dict(),
             "uncoveredSpeechSec": round(uncovered_speech_sec, 3),
         }
+
+    def _splice_uncovered_interim_words(self) -> int:
+        """Fold interim-recognised words no final ever covered into the
+        committed transcript, in time order.
+
+        Returns the number of words spliced. After this runs,
+        ``_uncovered_speech_sec`` measures only speech Deepgram itself
+        never hypothesised — the honest residual, not the recoverable
+        loss it used to be.
+        """
+        if not self._interim_words:
+            return 0
+
+        def union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+            merged: list[tuple[float, float]] = []
+            for start, end in sorted(s for s in spans if s[1] > s[0]):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        covered = union(
+            (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
+            for s in self._finalized_segments
+        )
+
+        def is_covered(word: dict) -> bool:
+            center = (word["start"] + word["end"]) / 2.0
+            return any(c_start < center < c_end for c_start, c_end in covered)
+
+        survivors = sorted(
+            (w for w in self._interim_words if not is_covered(w)),
+            key=lambda w: (w["start"], w["end"]),
+        )
+        # Retained hypotheses are consumed exactly once: whether they
+        # were spliced or judged covered-and-discarded here, keeping
+        # them would let a second finalize() call splice duplicates.
+        self._interim_words = []
+        if not survivors:
+            return 0
+
+        # Group consecutive words into segments; a silence gap longer
+        # than INTERIM_WORD_GAP_SPLIT_SEC starts a new group so words
+        # from different clauses do not fuse into one run-on blob.
+        groups: list[list[dict]] = [[survivors[0]]]
+        for prev, cur in zip(survivors, survivors[1:]):
+            if cur["start"] - prev["end"] > INTERIM_WORD_GAP_SPLIT_SEC:
+                groups.append([cur])
+            else:
+                groups[-1].append(cur)
+
+        fallback_segments = [
+            {
+                "start": round(group[0]["start"], 3),
+                "end": round(max(w["end"] for w in group), 3),
+                "text": " ".join(str(w["word"]) for w in group),
+                "confidence": 0.0,
+                "is_final": True,
+                "speech_final": False,
+                # Distinguishes recovered content from native finals;
+                # the frontend merges by time and text like any other
+                # segment, so this is diagnostic metadata only.
+                "source": "interim-fallback",
+            }
+            for group in groups
+        ]
+        self._finalized_segments = sorted(
+            [*self._finalized_segments, *fallback_segments],
+            key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))),
+        )
+        logger.warning(
+            "deepgram-live: spliced %d uncovered interim words across %d "
+            "fallback segment(s) into the final transcript",
+            len(survivors),
+            len(fallback_segments),
+        )
+        return len(survivors)
 
     def _uncovered_speech_sec(self) -> float:
         """Seconds where an interim heard words but no final ever landed.
@@ -1110,6 +1211,16 @@ class DeepgramLiveSession:
             self._finalized_segments.append(segment)
             self.stats.segments_final += 1
             self._final_arrived.set()
+            # This final is now the authoritative transcript for its own
+            # time range: drop retained interim words whose CENTER lies
+            # inside it. Center-based matching keeps words that merely
+            # straddle the final's edges (they may still carry new
+            # content just outside the covered ground) while removing
+            # everything the final genuinely accounts for.
+            self._interim_words = [
+                w for w in self._interim_words
+                if not (start < (w["start"] + w["end"]) / 2.0 < end)
+            ]
             logger.info(
                 "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s textLen=%d text=%r",
                 start, end, speech_final, len(text), text[:80],
@@ -1133,6 +1244,34 @@ class DeepgramLiveSession:
         # keeps single-character noise hypotheses out of the measurement.
         if len(text) >= INTERIM_SPEECH_MIN_CHARS and end > start:
             self._interim_speech_spans.append((start, end))
+        # Retain this hypothesis's words for hole-splicing at finalize.
+        # An interim is a ROLLING re-decode of recent audio, so each new
+        # one supersedes every stored word that overlaps its range —
+        # without that, the same spoken word would pile up once per
+        # interim message and the splice would duplicate it.
+        raw_words = alt.get("words")
+        if isinstance(raw_words, list):
+            new_words: list[dict] = []
+            for w in raw_words:
+                if not isinstance(w, dict):
+                    continue
+                token = str(w.get("word") or w.get("punctuated_word") or "").strip()
+                if not token:
+                    continue
+                w_start = _as_float(w.get("start"))
+                w_end = _as_float(w.get("end"))
+                if w_end <= w_start:
+                    continue
+                new_words.append(
+                    {"word": token, "start": round(w_start, 3), "end": round(w_end, 3)}
+                )
+            if new_words:
+                self._interim_words = [
+                    stored
+                    for stored in self._interim_words
+                    if stored["end"] <= start or stored["start"] >= end
+                ]
+                self._interim_words.extend(new_words)
         if self.stats.segments_interim % 5 == 1:
             # Sample 1-in-5 interim emissions to keep log volume bounded
             # while still proving Deepgram is producing output.
