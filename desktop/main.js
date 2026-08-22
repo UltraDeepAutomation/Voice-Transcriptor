@@ -31,6 +31,50 @@ const PYTHON_ENV_SCRUB_KEYS = Object.freeze([
 ]);
 const RUN_COMMAND_OUTPUT_MAX_CHARS = 1024 * 1024;
 
+// Canonical Electron accelerator vocabulary per platform — the renderer
+// stores bindings using the user-intent tokens "Command" (Cmd on darwin,
+// Meta/Super elsewhere) and "CommandOrControl" (Cmd on darwin, Ctrl
+// elsewhere) so a single saved binding still reads correctly in
+// cross-platform JSON. Electron's globalShortcut API, however, only
+// recognises those tokens on darwin; on win32/linux "Command" must be
+// rewritten to "Super" and "CommandOrControl" to "Control" before
+// registration. This is the single SSOT boundary that every accelerator
+// passes through: safeRegisterShortcut calls it, and the status payload
+// published to the renderer records the canonical form so the Settings
+// UI shows exactly what was actually bound.
+const _ACCELERATOR_TOKEN_NORMALIZE = {
+  darwin: {
+    cmd: "Command",
+    commandorcontrol: "Command",
+    meta: "Command",
+  },
+  default: {
+    cmd: "Super",
+    commandorcontrol: "Control",
+    meta: "Super",
+  },
+};
+
+function canonicalAcceleratorForPlatform(acc, platform = process.platform) {
+  if (!acc || typeof acc !== "string") return acc;
+  const map = _ACCELERATOR_TOKEN_NORMALIZE[platform] || _ACCELERATOR_TOKEN_NORMALIZE.default;
+  const tokens = acc.split("+").map((t) => t.trim()).filter(Boolean);
+  const out = new Array(tokens.length);
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = tokens[i];
+    const lower = raw.toLowerCase();
+    if (lower === "command" || lower === "cmd") out[i] = map.cmd;
+    else if (lower === "commandorcontrol" || lower === "cmdorctrl") out[i] = map.commandorcontrol;
+    else if (lower === "meta") out[i] = map.meta;
+    else if (lower === "super") out[i] = platform === "darwin" ? "Super" : "Super";
+    else if (lower === "control" || lower === "ctrl") out[i] = "Control";
+    else if (lower === "alt" || lower === "option") out[i] = platform === "darwin" ? "Option" : "Alt";
+    else if (lower === "shift") out[i] = "Shift";
+    else out[i] = raw;
+  }
+  return out.join("+");
+}
+
 function shortcutDefaultsForPlatform(platform = process.platform) {
   const platformDefaults = shortcutDefaultsManifest?.platformDefaults || {};
   const defaults = platformDefaults[platform] || platformDefaults.default || {};
@@ -6864,11 +6908,12 @@ app.whenReady().then(async () => {
   // the caller can log + surface the failure without crashing the
   // Electron main process.
   function safeRegisterShortcut(accelerator, handler) {
+    const canonical = canonicalAcceleratorForPlatform(accelerator, process.platform);
     try {
-      const ok = globalShortcut.register(accelerator, handler);
-      return { ok: !!ok, error: ok ? "" : "already in use" };
+      const ok = globalShortcut.register(canonical, handler);
+      return { ok: !!ok, accelerator: canonical, error: ok ? "" : "already in use" };
     } catch (e) {
-      return { ok: false, error: String(e?.message || e) };
+      return { ok: false, accelerator: canonical, error: String(e?.message || e) };
     }
   }
 
@@ -7026,13 +7071,13 @@ app.whenReady().then(async () => {
     }
     const status = {
       record: {
-        desired: shortcuts.record,
-        active: recordResult.ok ? shortcuts.record : "",
+        desired: recordResult.accelerator || shortcuts.record,
+        active: recordResult.ok ? recordResult.accelerator : "",
         error: recordResult.ok ? "" : recordResult.error,
       },
       paste: {
-        desired: shortcuts.paste,
-        active: pasteResult.ok ? shortcuts.paste : "",
+        desired: pasteResult.accelerator || shortcuts.paste,
+        active: pasteResult.ok ? pasteResult.accelerator : "",
         error: pasteResult.ok ? "" : pasteResult.error,
       },
       // Renderer uses this to decide whether to show the "macOS is
