@@ -334,7 +334,13 @@ def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
         text = text[:max_len].rstrip() + "…"
     return text
 
-MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+# Upload ceiling. 2 GB covers feature-film-length uploads; the whole
+# pipeline is streaming end-to-end so the ceiling costs no memory:
+# _save_upload_file writes 1 MB chunks to disk, ffmpeg converts with
+# bounded buffers, faster-whisper decodes the WAV lazily per window,
+# and the remote path re-compresses into REMOTE_TRANSCRIBE_CHUNK_SEC
+# Opus/WebM chunks before any provider call.
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 # Hard ceiling on recovery-promote PCM reads. A 10-hour 16 kHz/16-bit PCM
 # spool is 1.15 GB; loading it into a numpy float32 array allocates ~4.6 GB
 # on top of the raw bytes, which OOM-kills the backend on 8-16 GB hosts.
@@ -342,8 +348,11 @@ MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 # so the user can retrieve it manually from LIVE_RECOVERY_DIR.
 MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
 # Hard ceiling on the live-recovery SPOOL (distinct from the promote
-# ceiling above). 16 kHz mono PCM16 = 32 KB/s, so 1 GB ≈ 8.7 h of
-# continuous audio — longer than any realistic dictation session.
+# ceiling above). Derived from MAX_UPLOAD_BYTES so any file the app
+# accepts as an upload can also exist as a recovery spool; at the
+# current upload ceiling that is 4 GB, and 16 kHz mono PCM16 = 32 KB/s,
+# so 4 GB ≈ 35 h of continuous audio — far beyond any realistic
+# dictation session.
 # Without this cap, a user who leaves a tab open and crashes Electron
 # while still recording can write the spool indefinitely and fill a
 # small SSD. When crossed we stop writing further chunks (logged once)
