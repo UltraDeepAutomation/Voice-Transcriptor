@@ -11,8 +11,10 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from faster_whisper import WhisperModel
-
+# WhisperModel is imported lazily inside `_model()` so the faster_whisper
+# cold-import (ctranslate2 + tokenizers + huggingface_hub, ~1 s) does NOT
+# block backend startup. /api/health becomes responsive seconds earlier,
+# and any crash-restart loop pays the import only on first transcription.
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
 
 logger = logging.getLogger(__name__)
@@ -93,7 +95,8 @@ def _empty_transcribe_result(duration: float = 0.0) -> Dict[str, Any]:
     }
 
 
-def _model(model_name: str) -> WhisperModel:
+def _model(model_name: str) -> "WhisperModel":
+    from faster_whisper import WhisperModel
     # CPU default tuned for typical laptops.
     # Fast path: hot cache hit with no lock held (dict reads are
     # atomic under the GIL). Prevents parallel users of model A from
