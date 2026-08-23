@@ -6,6 +6,9 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const shortcutDefaultsManifest = require("./shortcut-defaults.json");
+// SSOT for cross-platform accelerator canonicalisation — required by
+// main.js and unit-tested directly (desktop/accelerator.test.js).
+const { canonicalAcceleratorForPlatform } = require("./accelerator");
 
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
@@ -31,49 +34,8 @@ const PYTHON_ENV_SCRUB_KEYS = Object.freeze([
 ]);
 const RUN_COMMAND_OUTPUT_MAX_CHARS = 1024 * 1024;
 
-// Canonical Electron accelerator vocabulary per platform — the renderer
-// stores bindings using the user-intent tokens "Command" (Cmd on darwin,
-// Meta/Super elsewhere) and "CommandOrControl" (Cmd on darwin, Ctrl
-// elsewhere) so a single saved binding still reads correctly in
-// cross-platform JSON. Electron's globalShortcut API, however, only
-// recognises those tokens on darwin; on win32/linux "Command" must be
-// rewritten to "Super" and "CommandOrControl" to "Control" before
-// registration. This is the single SSOT boundary that every accelerator
-// passes through: safeRegisterShortcut calls it, and the status payload
-// published to the renderer records the canonical form so the Settings
-// UI shows exactly what was actually bound.
-const _ACCELERATOR_TOKEN_NORMALIZE = {
-  darwin: {
-    cmd: "Command",
-    commandorcontrol: "Command",
-    meta: "Command",
-  },
-  default: {
-    cmd: "Super",
-    commandorcontrol: "Control",
-    meta: "Super",
-  },
-};
-
-function canonicalAcceleratorForPlatform(acc, platform = process.platform) {
-  if (!acc || typeof acc !== "string") return acc;
-  const map = _ACCELERATOR_TOKEN_NORMALIZE[platform] || _ACCELERATOR_TOKEN_NORMALIZE.default;
-  const tokens = acc.split("+").map((t) => t.trim()).filter(Boolean);
-  const out = new Array(tokens.length);
-  for (let i = 0; i < tokens.length; i++) {
-    const raw = tokens[i];
-    const lower = raw.toLowerCase();
-    if (lower === "command" || lower === "cmd") out[i] = map.cmd;
-    else if (lower === "commandorcontrol" || lower === "cmdorctrl") out[i] = map.commandorcontrol;
-    else if (lower === "meta") out[i] = map.meta;
-    else if (lower === "super") out[i] = platform === "darwin" ? "Super" : "Super";
-    else if (lower === "control" || lower === "ctrl") out[i] = "Control";
-    else if (lower === "alt" || lower === "option") out[i] = platform === "darwin" ? "Option" : "Alt";
-    else if (lower === "shift") out[i] = "Shift";
-    else out[i] = raw;
-  }
-  return out.join("+");
-}
+// canonicalAcceleratorForPlatform lives in ./accelerator (SSOT — the
+// unit-tested module required at the top of this file).
 
 function shortcutDefaultsForPlatform(platform = process.platform) {
   const platformDefaults = shortcutDefaultsManifest?.platformDefaults || {};

@@ -18,6 +18,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "NODE_ENV=development electron .",
+    "test": "node --test",
     "build:frontend": "npm --prefix ../frontend run build",
     "dist": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac dmg --arm64",
     "dist:dir": "bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
