@@ -85,7 +85,10 @@ def _fsync_parent_dir(path: Path) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    with open(path, "rb") as f:
+    # ``r+b`` (read/write) rather than ``rb``: POSIX permits fsync on a
+    # read-only descriptor, but some exotic filesystems return EBADF for
+    # it. The file is our own tmp artefact, so a write handle is free.
+    with open(path, "r+b") as f:
         os.fsync(f.fileno())
 
 

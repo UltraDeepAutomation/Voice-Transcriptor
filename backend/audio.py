@@ -519,6 +519,47 @@ def write_wav(path_wav: str, data: np.ndarray, sr: int = LIVE_SAMPLE_RATE_HZ) ->
     sf.write(path_wav, data, sr, subtype="PCM_16")
 
 
+# Frames per streaming chunk (1 MiB of int16 = 2 MB RAM per block).
+_PCM16_STREAM_CHUNK_FRAMES = 1 << 20
+
+
+def write_wav_from_pcm16_stream(pcm_path: str, path_wav: str, sr: int = LIVE_SAMPLE_RATE_HZ) -> int:
+    """Convert a raw mono PCM16 spool file to WAV without loading it whole.
+
+    The recovery-promote path can face multi-gigabyte spools (the spool
+    ceiling is derived from the upload ceiling). Reading one into a
+    numpy float32 array costs ~3x the file size in RAM and OOM-kills
+    8-16 GB hosts; this streams fixed-size chunks through soundfile's
+    writer instead, so memory stays flat regardless of duration.
+
+    The source is already int16 PCM, so chunks are written verbatim —
+    no float round-trip, no quantisation drift.
+
+    Returns the number of frames written. Raises OSError/soundfile
+    errors on failure; the partially written target is the caller's
+    tmp file to clean up (same contract as ``write_wav``).
+    """
+    frames_written = 0
+    with open(pcm_path, "rb") as src, sf.SoundFile(
+        path_wav, mode="w", samplerate=sr, channels=1, subtype="PCM_16"
+    ) as dst:
+        while True:
+            chunk = src.read(_PCM16_STREAM_CHUNK_FRAMES * 2)
+            if not chunk:
+                break
+            # A trailing odd byte would make frombuffer raise; the
+            # caller has already normalised the readable size, but stay
+            # defensive at the stream boundary too.
+            if len(chunk) % 2:
+                chunk = chunk[:-1]
+                if not chunk:
+                    break
+            block = np.frombuffer(chunk, dtype=np.int16)
+            dst.write(block)
+            frames_written += block.size
+    return frames_written
+
+
 def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
     """Split a 16k WAV into per-channel mono wav files.
 

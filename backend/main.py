@@ -61,6 +61,7 @@ from backend.audio import (
     ensure_wav_16k_preserve_channels,
     split_channels,
     write_wav,
+    write_wav_from_pcm16_stream,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
 from backend.storage import atomic_promote_file, atomic_write_bytes, atomic_write_json, atomic_write_text
@@ -341,18 +342,11 @@ def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
 # and the remote path re-compresses into REMOTE_TRANSCRIBE_CHUNK_SEC
 # Opus/WebM chunks before any provider call.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
-# Hard ceiling on recovery-promote PCM reads. A 10-hour 16 kHz/16-bit PCM
-# spool is 1.15 GB; loading it into a numpy float32 array allocates ~4.6 GB
-# on top of the raw bytes, which OOM-kills the backend on 8-16 GB hosts.
-# Any recovery file larger than this is rejected with 413 and left on disk
-# so the user can retrieve it manually from LIVE_RECOVERY_DIR.
-MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
-# Hard ceiling on the live-recovery SPOOL (distinct from the promote
-# ceiling above). Derived from MAX_UPLOAD_BYTES so any file the app
-# accepts as an upload can also exist as a recovery spool; at the
-# current upload ceiling that is 4 GB, and 16 kHz mono PCM16 = 32 KB/s,
-# so 4 GB ≈ 35 h of continuous audio — far beyond any realistic
-# dictation session.
+# Hard ceiling on the live-recovery SPOOL. Derived from MAX_UPLOAD_BYTES
+# so any file the app accepts as an upload can also exist as a recovery
+# spool; at the current upload ceiling that is 4 GB, and 16 kHz mono
+# PCM16 = 32 KB/s, so 4 GB ≈ 35 h of continuous audio — far beyond any
+# realistic dictation session.
 # Without this cap, a user who leaves a tab open and crashes Electron
 # while still recording can write the spool indefinitely and fill a
 # small SSD. When crossed we stop writing further chunks (logged once)
@@ -360,6 +354,17 @@ MAX_RECOVERY_PROMOTE_BYTES = 500 * 1024 * 1024
 # recovery is best-effort, the finalized transcript is already persisted
 # via the streaming path.
 MAX_LIVE_RECOVERY_BYTES = 2 * MAX_UPLOAD_BYTES
+# Recovery-promote ceiling, DERIVED from the spool ceiling above so the
+# two can never silently drift apart again. History: the spool ceiling
+# was raised to 2×MAX_UPLOAD_BYTES while this one stayed at 500 MB, so a
+# dictation longer than ~4.3 h recorded fine into the spool and then
+# became UNRECOVERABLE after a crash (promote answered 413) — the worst
+# data-loss class in the app. Promotion now STREAMS the PCM→WAV
+# conversion through write_wav_from_pcm16_stream at constant memory
+# (~2 MB per chunk), so accepting the full spool size no longer costs
+# RAM; the old 500 MB cap existed only to bound the previous whole-file
+# float32 conversion (~3x file size in RAM).
+MAX_RECOVERY_PROMOTE_BYTES = MAX_LIVE_RECOVERY_BYTES
 # Rate limits are a runaway/DoS backstop for a LOOPBACK-only server, not
 # a quota. They must sit far above what one healthy renderer produces, or
 # they become a self-inflicted outage.
@@ -1094,10 +1099,10 @@ def _promote_live_recovery(
                         f"{MAX_RECOVERY_PROMOTE_BYTES // (1024 * 1024)} MB)"
                     ),
                 )
-            with pcm_path.open("rb") as pcm_file:
-                audio_bytes = pcm_file.read(readable_pcm_size)
-
-            pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            # Stream PCM16 → WAV at constant memory (BUG-01): the spool
+            # may now be as large as the promote ceiling (4 GB); reading
+            # it whole into a float32 array cost ~3x its size in RAM and
+            # OOM-killed 8-16 GB hosts.
             started_at = str(meta.get("started_at") or "").strip()
             model = str(meta.get("model") or DEFAULT_LOCAL_TRANSCRIPTION_MODEL).strip() or DEFAULT_LOCAL_TRANSCRIPTION_MODEL
             language = str(meta.get("language") or "auto").strip() or "auto"
@@ -1117,7 +1122,7 @@ def _promote_live_recovery(
             text_out = target_dir / f"{stem}.txt"
             tmp_audio = _atomic_temp_path(audio_out)
             try:
-                write_wav(str(tmp_audio), pcm, LIVE_SAMPLE_RATE_HZ)
+                write_wav_from_pcm16_stream(str(pcm_path), str(tmp_audio), LIVE_SAMPLE_RATE_HZ)
                 atomic_promote_file(tmp_audio, audio_out)
                 _write_recording_text_file(
                     out=text_out,
@@ -1869,6 +1874,11 @@ def _submit_local_transcription_job(
         try:
             jobs.raise_if_cancelled(job_id)
             jobs.set_running(job_id)
+
+            def _on_local_progress(value: float) -> None:
+                jobs.raise_if_cancelled(job_id)
+                jobs.set_progress(job_id, value)
+
             result = _run_local_transcribe_once(
                 run_id=job_id,
                 upload_path=upload_path,
@@ -1876,10 +1886,7 @@ def _submit_local_transcription_job(
                 language=language,
                 split_stereo=split_stereo,
                 word_timestamps=word_timestamps,
-                progress_cb=lambda value: (
-                    jobs.raise_if_cancelled(job_id),
-                    jobs.set_progress(job_id, value),
-                ),
+                progress_cb=_on_local_progress,
             )
             jobs.raise_if_cancelled(job_id)
 
@@ -4420,6 +4427,10 @@ def _submit_remote_transcription_job(
             jobs.set_progress(job_id, 0.05)
             _check_cancelled()
             jobs.set_progress(job_id, 0.15)
+            def _on_remote_progress(value: float) -> None:
+                jobs.raise_if_cancelled(job_id)
+                jobs.set_progress(job_id, value)
+
             result = _run_remote_transcribe_once(
                 provider_norm=provider_norm,
                 upload_path=upload_path,
@@ -4429,10 +4440,7 @@ def _submit_remote_transcription_job(
                 num_speakers=num_speakers,
                 remote_model=remote_model,
                 cancel_event=cancel_event,
-                progress_cb=lambda value: (
-                    jobs.raise_if_cancelled(job_id),
-                    jobs.set_progress(job_id, value),
-                ),
+                progress_cb=_on_remote_progress,
             )
 
             _check_cancelled()

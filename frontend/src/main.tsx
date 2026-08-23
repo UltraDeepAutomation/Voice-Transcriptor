@@ -468,7 +468,10 @@ const fmtBytes = (bytes: number): string => {
   const value = Math.max(0, Number(bytes) || 0);
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
-  return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  if (value < 1024 ** 3) {
+    return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  }
+  return `${(value / 1024 ** 3).toFixed(value < 10 * 1024 ** 3 ? 1 : 0)} GB`;
 };
 
 type AppearanceMediaBinding = {
@@ -10660,7 +10663,7 @@ function uploadExtensionFromName(name: string): string {
 function uploadFileValidationError(file: File): string {
   const cap = uploadFileSizeCap();
   if (cap > 0 && file.size > cap) {
-    return `File too large (${Math.round(file.size / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`;
+    return `File too large (${fmtBytes(file.size)} > ${fmtBytes(cap)} cap).`;
   }
   const ext = uploadExtensionFromName(file.name);
   if (!ext) {
@@ -10707,7 +10710,7 @@ function uploadSourcePathValidationError(sourcePath: string, sizeBytes = 0): str
   if (!path) return "Source file path is missing. Choose the file again.";
   const cap = uploadFileSizeCap();
   if (cap > 0 && sizeBytes > cap) {
-    return `File too large (${Math.round(sizeBytes / (1024 * 1024))} MB > ${Math.round(cap / (1024 * 1024))} MB cap).`;
+    return `File too large (${fmtBytes(sizeBytes)} > ${fmtBytes(cap)} cap).`;
   }
   const ext = uploadExtensionFromName(uploadPathBasename(path));
   if (!ext) {
