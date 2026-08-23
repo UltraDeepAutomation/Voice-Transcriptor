@@ -3,9 +3,22 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — 2026-08-15
+## [1.3.0] — 2026-08-23
 
 Recording reliability and stop-to-paste latency pass. Every number below
+was measured from `main.log`, before and after.
+
+### Added (integration pass, same release)
+
+- **ESLint 9 flat config** as a hard CI gate at zero-warning baseline
+  (`npm run lint`; adopted from external PR #4 by @chiliec).
+- **GitHub Actions** running all three suites on every push/PR:
+  backend unittest on the shipped Python 3.12 runtime (including the
+  ten live-coverage TS cross-tests), frontend lint/typecheck/vitest/
+  build on Node pinned by `.nvmrc`, desktop node:test.
+- **BUGS_AUDIT.md** — full 19-defect audit with per-bug resolution
+  status kept in-repo.
+ and stop-to-paste latency pass. Every number below
 was measured from `main.log`, before and after.
 
 ### Fixed
