@@ -1898,7 +1898,16 @@ function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): voi
 }
 
 function setRecordButton(recording: boolean): void {
+  const was = isRecording;
   isRecording = !!recording;
+  // State transition ⇒ repaint. This is the single choke point every
+  // start/stop path flows through (UI button, hotkey toggle, main-
+  // process status sync), so the live pane's preview-off recording
+  // status line appears and clears exactly once per transition —
+  // regardless of which exit path a stop took.
+  if (was !== isRecording) {
+    syncLiveOutputFromState();
+  }
 }
 
 function statusKindToDotClass(kind: StatusKind): string {
@@ -7556,7 +7565,21 @@ function scheduleLiveOutputRender(): void {
     liveOutputRenderScheduled = false;
     const el = $("liveOutput");
     if (!shouldLivePreview()) {
-      if (el.textContent !== "") el.textContent = "";
+      // Preview off must not mean a dark pane: while a recording is
+      // active the user still needs proof that capture is alive and
+      // where the transcript will land ("если я live превью отключаю,
+      // то не знаю, что происходит"). The elapsed clock reuses
+      // ``liveTimerText`` — the same value the per-second tick and the
+      // liveStatusSnapshot publish — so the app has exactly ONE
+      // recording clock. Interim capture keeps filling the session
+      // buffer underneath; only its display is suppressed here, and
+      // Stop still renders the full transcript as usual.
+      const status = isRecording && startAt > 0
+        ? `● Recording ${liveTimerText} — live preview is off; the transcript will appear here after Stop.`
+        : "";
+      if (el.textContent !== status) {
+        el.textContent = status;
+      }
       return;
     }
     const text = getVisibleLivePreviewText();
@@ -7906,6 +7929,11 @@ async function startLive(): Promise<void> {
     if (isCurrentUiSession(sessionUiToken)) {
       liveTimerText = fmtTime(durationSec);
     }
+    // Repaint the live pane each tick so the preview-off recording
+    // status line ("● Recording 0:42 — …") tracks the same clock.
+    // rAF-coalesced and diff-checked inside the render; with preview
+    // on this is a no-op unless transcript state changed.
+    syncLiveOutputFromState();
   }, UI_TOKENS.timer.tickMs);
 
   const enableVisibleLivePreview = sessionWsMode !== "none" && shouldLivePreview();
