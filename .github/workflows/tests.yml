@@ -23,7 +23,17 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
+      # Node + frontend/node_modules are REQUIRED here, not optional:
+      # backend/tests/test_live_coverage_policy.py compiles and executes
+      # frontend/src/live-coverage.ts via node/tsc and silently
+      # self-skips when either is missing. Without these two steps CI
+      # reports green while running ten fewer real tests than local.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
       # The shipped runtime interpreter is Python 3.12; CI matches it so
       # asyncio-primitive construction semantics cannot drift again.
       - run: python -m unittest discover -s backend/tests -p "test_*.py" -v

@@ -7,7 +7,7 @@
 1. Форкни репозиторий.
 2. Создай ветку: `git checkout -b feat/моя-фича` или `fix/мой-баг`.
 3. Внеси изменения.
-4. Проверь: `npm --prefix frontend run lint && npm --prefix frontend run typecheck` (если есть).
+4. Проверь: `npm --prefix frontend run typecheck && npm --prefix frontend test`.
 5. Отправь PR с понятным описанием: что и зачем.
 
 ## Правила
@@ -123,18 +123,19 @@ npm --prefix desktop run dev
 ```
 backend/       # Python FastAPI + Whisper/Deepgram/OpenRouter
 desktop/       # Electron main + упаковка (DMG, NSIS, AppImage)
-frontend/      # React + Vite UI
+frontend/      # Vanilla TypeScript + Vite UI
 ```
 
 ## Полезные скрипты
 
 | Задача | Команда |
 |--------|---------|
-| Линт frontend | `npm --prefix frontend run lint` |
 | Типы frontend | `npm --prefix frontend run typecheck` |
-| Тесты бэкенда | `cd backend && python -m pytest` |
-| Подготовка runtime (все платформы) | `npm --prefix desktop run prepare:runtime` |
-| Очистка сборки | `npm --prefix desktop run clean` |
+| Тесты frontend | `npm --prefix frontend test` |
+| Тесты desktop (хоткеи, упаковка) | `npm --prefix desktop test` |
+| Тесты бэкенда (Python 3.12) | `python -m unittest discover -s backend/tests -p "test_*.py"` |
+| Сборка DMG (macOS arm64) | `npm --prefix desktop run dist:dir` |
+| Полная проверка как в CI | три команды выше + `npm --prefix frontend run build` |
 
 ## Лицензия
 
