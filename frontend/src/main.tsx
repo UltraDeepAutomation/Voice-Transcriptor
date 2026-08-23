@@ -12,6 +12,11 @@ import {
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { reconcileRecordingsList } from "./recordings-list-reconciler";
 import { livePaneDisplayText } from "./live-pane";
+import {
+  countWords,
+  normalizeComparable,
+  normalizeWords,
+} from "./text-match";
 
 declare global {
   interface Window {
@@ -562,9 +567,21 @@ installAppearanceStateClasses();
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 // Backend-owned; injected in window.__TRANSCRIPTOR_BOOTSTRAP and refreshed
-// through /api/health. Until it arrives, the renderer skips client-side size
-// rejection and lets the backend enforce the real cap.
-let MAX_FILE_BYTES = 0;
+// through /api/health. Until it arrives, the renderer falls back to the
+// last value the backend ever reported (cached in localStorage below) so
+// the client-side size check works from the first cold-start frame
+// instead of silently skipping validation until hydration lands
+// (BUG-03). The cached value is a cache with explicit provenance, not a
+// second source of truth: the backend cap always wins once known.
+const UPLOAD_CAP_CACHE_KEY = "transcriptor.uploadCapBytes.v1";
+let MAX_FILE_BYTES = (() => {
+  try {
+    const cached = Number(localStorage.getItem(UPLOAD_CAP_CACHE_KEY));
+    return Number.isFinite(cached) && cached > 0 ? Math.trunc(cached) : 0;
+  } catch {
+    return 0;
+  }
+})();
 // SSOT: backend/main.py exposes backend.audio_constants.LIVE_SAMPLE_RATE_HZ
 // through bootstrap and /api/health. This fallback is only for dev shells
 // that load the renderer without backend-injected bootstrap.
@@ -776,6 +793,13 @@ function applyBackendRuntimeConfig(payload: unknown): void {
   const uploadBytes = Number(root.max_upload_bytes);
   if (Number.isFinite(uploadBytes) && uploadBytes > 0) {
     MAX_FILE_BYTES = Math.trunc(uploadBytes);
+    // Persist the backend-reported cap so cold starts validate sizes
+    // before /api/health lands (BUG-03). Cache only — server wins.
+    try {
+      localStorage.setItem(UPLOAD_CAP_CACHE_KEY, String(MAX_FILE_BYTES));
+    } catch {
+      /* quota/private-mode: validation just falls back to skip-until-hydrated */
+    }
   }
   const sampleRate = Number(root.live_sample_rate_hz);
   if (Number.isFinite(sampleRate) && sampleRate >= 8_000 && sampleRate <= 96_000) {
@@ -1412,12 +1436,6 @@ function createLinkedAbortSignal(
     cleanup,
     didTimeout: () => timedOut,
   };
-}
-
-function countWords(text: string): number {
-  const value = String(text || "").trim();
-  if (!value) return 0;
-  return value.split(/\s+/).filter(Boolean).length;
 }
 
 function traceTextStats(label: string, text: string): string {
@@ -7126,11 +7144,8 @@ function composeCanonicalLiveSourceText(
     return left;
   };
 
-  const normalizeWords = (s: string): string[] =>
-    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
-  const normalizeComparable = (s: string): string =>
-    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
-
+  // Word normalisation comes from ./text-match (SSOT — shared with the
+  // adoption policy and coverage confirmation below).
   const mergeInterim = (baseRaw: string, interimRaw: string): string => {
     const base = normalizeTranscriptWhitespace(baseRaw);
     const interim = normalizeTranscriptWhitespace(interimRaw);
@@ -7272,8 +7287,6 @@ function richerTranscript(currentText: string, candidateText: string): string {
   const candidateWords = countWords(candidate);
   if (candidateWords > currentWords) return candidate;
   if (candidateWords === currentWords && candidate.length > current.length) {
-    const normalizeComparable = (s: string): string =>
-      s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
     const currentNorm = normalizeComparable(current);
     const candidateNorm = normalizeComparable(candidate);
     if (candidateNorm.startsWith(currentNorm) || candidateNorm.endsWith(currentNorm)) {
@@ -7293,8 +7306,6 @@ function candidateConfirmsTranscriptCoverage(currentText: string, candidateText:
   if (candidateWords >= currentWords) return true;
   if (candidateWords < Math.max(1, Math.floor(currentWords * 0.9))) return false;
 
-  const normalizeWords = (s: string): string[] =>
-    s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
   const currentSet = new Set(normalizeWords(current));
   const candidateNormWords = normalizeWords(candidate);
   if (!candidateNormWords.length) return false;
