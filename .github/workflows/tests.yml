@@ -1,0 +1,58 @@
+# Runs every suite the repo ships, on the same interpreters the product
+# uses: Node 22 LTS (>=22.12 per both package.json engines) and Python
+# 3.12 (the version bundled under desktop/runtime).
+#
+# The desktop job needs no `npm install` — its tests (accelerator,
+# packaging whitelist) are pure node:test modules with zero dependencies;
+# requiring "electron" would need it only if a future test imports an
+# entrypoint, and that failure mode is exactly what packaging.test.js
+# exists to describe.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # The shipped runtime interpreter is Python 3.12; CI matches it so
+      # asyncio-primitive construction semantics cannot drift again.
+      - run: python -m unittest discover -s backend/tests -p "test_*.py" -v
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm test

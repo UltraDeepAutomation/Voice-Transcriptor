@@ -43,6 +43,7 @@
     "afterAllArtifactBuild": "./afterAllArtifactBuild.js",
     "files": [
       "main.js",
+      "accelerator.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",
