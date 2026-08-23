@@ -2337,7 +2337,6 @@ function buildWavHeader(sampleRate: number, dataBytes: number, channels = 1): Ar
   return header;
 }
 
-// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
 type OpfsFileSystemWritableFileStream = {
   write(data: BufferSource): Promise<void>;
   close(): Promise<void>;
@@ -3847,6 +3846,12 @@ function applyMicHealthStatus(snap: MicHealthSnapshot): void {
 micHealth.subscribe(applyMicHealthStatus);
 
 interface PersistedLiveDraft {
+  /**
+   * Payload schema version (BUG-12). The backend stores this blob
+   * opaquely; bump on any breaking field change and branch the reader
+   * on it instead of minting another LEGACY_* storage key.
+   */
+  schema_version: number;
   session_id?: string;
   started_at?: number;
   recording?: boolean;
@@ -3863,6 +3868,9 @@ interface PersistedLiveDraft {
   updated_at?: number;
 }
 
+/** Bump on any breaking change to PersistedLiveDraft. */
+const LIVE_DRAFT_SCHEMA_VERSION = 2;
+
 type LiveDraftOperation =
   | { kind: "put"; payload: PersistedLiveDraft }
   | { kind: "clear"; sessionToken: string };
@@ -3873,6 +3881,7 @@ let liveDraftOperationRunner: Promise<void> | null = null;
 function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
   const provider = activeLiveSessionSnapshot?.provider ?? readProviderSelection();
   return {
+    schema_version: LIVE_DRAFT_SCHEMA_VERSION,
     session_id: activeLiveSessionId || activeUiSessionToken || "",
     started_at: startAt || Date.now(),
     updated_at: Date.now(),
@@ -3984,6 +3993,7 @@ function parsePersistedLiveDraftPayload(parsed: unknown): PersistedLiveDraft | n
     return Number.isFinite(n) ? n : 0;
   };
   return {
+    schema_version: LIVE_DRAFT_SCHEMA_VERSION,
     session_id: pickString("session_id"),
     started_at: pickNumber("started_at"),
     recording: obj.recording === true,
@@ -4254,7 +4264,7 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   else if (key === "Tab" || code === "Tab") mapped = "Tab";
   else if (key === "Escape" || code === "Escape") mapped = "Escape";
   else if (/^F\d{1,2}$/.test(key)) mapped = key.toUpperCase();
-  else if (key.length === 1 && /^[!@#$%^&*()_+\-=\[\]{}\\|;:'",.<>/?`~]$/.test(key)) mapped = key;
+  else if (key.length === 1 && /^[!@#$%^&*()_+\-=\]{}\\|;:'",.<>/?`~]$/.test(key)) mapped = key;
   else if (code === "Backquote") mapped = "`";
   else if (code === "Minus") mapped = "-";
   else if (code === "Equal") mapped = "=";
@@ -6917,7 +6927,6 @@ let draftSaveTimer: number | null = null;
 let workletLastFrameAt = 0;
 let fallbackCaptureTimer: number | null = null;
 let captureFrameCount = 0;
-let captureRmsAccum = 0;
 // Running sum of squared per-frame RMS. Average RMS over a session is
 // the square root of the mean of the SQUARED sample-level RMS — not the
 // mean of the per-frame RMS (which systematically underestimates energy
@@ -7725,7 +7734,6 @@ function pushCapturedFrame(input: Float32Array): void {
   }
   const rms = Math.sqrt(sum / input.length);
   captureFrameCount += 1;
-  captureRmsAccum += rms;
   captureRmsSqAccum += rms * rms;
   if (peak > capturePeakMax) capturePeakMax = peak;
   // Smooth RMS via EMA so the main-process silence detector sees the
@@ -7921,7 +7929,6 @@ async function startLive(): Promise<void> {
   pcmSink = await createPcmSink(sessionUiToken);
   workletLastFrameAt = 0;
   captureFrameCount = 0;
-  captureRmsAccum = 0;
   captureRmsSqAccum = 0;
   capturePeakMax = 0;
   capturePcmSampleCount = 0;
@@ -11360,7 +11367,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // reached the head of the queue, it's already in cancelled
   // state — don't transition it back to transcribing.
   if (item.status === "cancelled") return;
-  let sourceFile = item.file || null;
+  const sourceFile = item.file || null;
   let sourcePath = normalizeUploadSourcePath(item.sourcePath || "");
   if (!sourcePath && sourceFile) {
     sourcePath = uploadSourcePathFromFile(sourceFile);
@@ -11677,8 +11684,8 @@ async function retryUploadItem(id: string): Promise<void> {
     if (!file) return;
     assignUploadRetryFile(item, file);
   }
-  let sourcePath = normalizeUploadSourcePath(item.sourcePath || "");
-  let validationError = item.file
+  const sourcePath = normalizeUploadSourcePath(item.sourcePath || "");
+  const validationError = item.file
     ? uploadFileValidationError(item.file)
     : uploadSourcePathValidationError(sourcePath, uploadItemSize(item));
   if (validationError) {
