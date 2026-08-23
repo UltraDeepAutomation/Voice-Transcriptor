@@ -23,6 +23,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # Backend dependencies MUST be installed before discovery — without
+      # this every module importing numpy/soundfile/fastapi fails to load
+      # (regression caught by CI run 32623507428 after the Node steps
+      # were added for the TS cross-tests).
+      - run: pip install -r requirements.txt
       # Node + frontend/node_modules are REQUIRED here, not optional:
       # backend/tests/test_live_coverage_policy.py compiles and executes
       # frontend/src/live-coverage.ts via node/tsc and silently
