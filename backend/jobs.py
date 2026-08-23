@@ -71,6 +71,14 @@ class JobStore:
             return job
 
     def get(self, job_id: str) -> Optional[Job]:
+        """Return the job, marking a terminal state as client-observed.
+
+        Invariant: the 15-minute prune grace starts at the FIRST poll
+        after completion, whoever polls. Polling is therefore part of
+        the lifecycle contract, not a side effect — clients must fetch
+        the job they care about; a health-check that merely lists jobs
+        must use a non-observing path (there is none today by design).
+        """
         with self._lock:
             job = self._jobs.get(job_id)
             if job and job.status in ("done", "error", "cancelled") and job.terminal_observed_at is None:

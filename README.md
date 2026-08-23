@@ -157,11 +157,10 @@ cp .env.example .env
 TVan3h93wZKeHt4Na4zsU3mVHnjpbKoghE
 ```
 
----
+## Storage & privacy
 
-## Лицензия
-
-MIT — свободное использование, модификация, распространение.
-Автор: **Leo Erdman** (c) 2026
-См. [LICENSE](LICENSE) и [NOTICE.md](NOTICE.md) — сторонние компоненты и
-заявление о приватности.
+Recordings are stored locally in your chosen archive folder as `.txt` transcripts.
+**Audio retention policy:** the app keeps the audio file of the most recent recording only;
+on every new save the audio of older recordings is deleted automatically to bound disk
+usage. Transcripts are kept forever. The status line shows how many older audio files were
+removed after each save.

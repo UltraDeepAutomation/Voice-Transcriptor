@@ -6243,6 +6243,11 @@ async function saveRecordingText(opts: {
   }
   let savedName = existingName;
   let savedArchiveDir = archiveDir;
+  // Audio-retention observability (BUG-02): the backend deletes older
+  // recordings' audio on every save (policy: newest keeps audio,
+  // transcripts are forever). The count comes back in every save
+  // response; surface it so the deletion is never silent.
+  let prunedAudioCount = 0;
   if (audioFile) {
     const fd = new FormData();
     fd.append("file", audioFile, audioFile.name || "recording.wav");
@@ -6259,9 +6264,10 @@ async function saveRecordingText(opts: {
     if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
     const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
     if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { name?: string; archive_dir?: string };
+    const js = (await r.json()) as { name?: string; archive_dir?: string; pruned_audio_count?: number };
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
   } else if (audioSourcePath) {
     const payload: Record<string, unknown> = {
       source_path: audioSourcePath,
@@ -6277,11 +6283,12 @@ async function saveRecordingText(opts: {
       consume_source_path: !!opts.consumeAudioSourcePath,
     };
     if (archiveDir) payload.archive_dir = archiveDir;
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save-from-path", {
+    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string; pruned_audio_count?: number }>("/api/recordings/save-from-path", {
       ...payload,
     });
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
   } else {
     const payload: Record<string, unknown> = {
       name: existingName,
@@ -6295,11 +6302,12 @@ async function saveRecordingText(opts: {
       language: opts.language,
     };
     if (archiveDir) payload.archive_dir = archiveDir;
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string }>("/api/recordings/save", {
+    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string; pruned_audio_count?: number }>("/api/recordings/save", {
       ...payload,
     });
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
+    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
   }
   // Fire-and-forget, coalesced through a background queue. Live saves
   // happen while the single recording capsule is still busy; direct
@@ -6311,6 +6319,16 @@ async function saveRecordingText(opts: {
       name: savedName,
       archiveDir: savedArchiveDir,
     }, "save");
+  }
+  // BUG-02: audio retention deletes older recordings' audio on every
+  // save (policy: newest keeps audio, transcripts are forever). The
+  // deletion must never be silent — the user otherwise discovers it
+  // only when trying to re-listen to a previous take.
+  if (prunedAudioCount > 0) {
+    setStatus(
+      `Saved. Audio removed from ${prunedAudioCount} older recording${prunedAudioCount === 1 ? "" : "s"} (storage policy keeps audio for the latest recording only).`,
+      "info",
+    );
   }
   return {
     name: savedName,

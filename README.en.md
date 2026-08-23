@@ -166,11 +166,10 @@ If Transcriptor turned out useful, you can say thanks:
 TVan3h93wZKeHt4Na4zsU3mVHnjpbKoghE
 ```
 
----
+## Storage & privacy
 
-## License
-
-MIT — free to use, modify and redistribute.
-Copyright (c) 2026 **Leo Erdman**. See [LICENSE](LICENSE), and
-[NOTICE.md](NOTICE.md) for the third-party component notices and the
-privacy statement.
+Recordings are stored locally in your chosen archive folder as `.txt` transcripts.
+**Audio retention policy:** the app keeps the audio file of the most recent recording only;
+on every new save the audio of older recordings is deleted automatically to bound disk
+usage. Transcripts are kept forever. The status line shows how many older audio files were
+removed after each save.
