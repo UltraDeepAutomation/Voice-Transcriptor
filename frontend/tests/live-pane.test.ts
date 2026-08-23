@@ -1,0 +1,34 @@
+import { describe, it, expect } from "vitest";
+
+import { livePaneDisplayText, LIVE_PANE_STATUS_PREFIX } from "../src/live-pane";
+
+const base = { previewEnabled: false, recording: false, started: false, timerText: "00:00" };
+
+describe("livePaneDisplayText", () => {
+  it("is empty when idle with preview off (placeholder shows through)", () => {
+    expect(livePaneDisplayText(base)).toBe("");
+  });
+
+  it("is empty while recording but the first frame has not landed yet", () => {
+    expect(livePaneDisplayText({ ...base, recording: true })).toBe("");
+  });
+
+  it("shows the status line once capture is live", () => {
+    const text = livePaneDisplayText({ ...base, recording: true, started: true, timerText: "0:42" });
+    expect(text).toBe(
+      `${LIVE_PANE_STATUS_PREFIX} 0:42 — live preview is off; the transcript will appear here after Stop.`,
+    );
+    expect(text).toContain("0:42");
+    expect(text).toContain("after Stop");
+  });
+
+  it("clears as soon as the recording stops, even before state resets", () => {
+    expect(livePaneDisplayText({ ...base, recording: false, started: true, timerText: "1:03" })).toBe("");
+  });
+
+  it("refuses to own preview-on rendering — that stays in the caller", () => {
+    expect(() =>
+      livePaneDisplayText({ ...base, previewEnabled: true, recording: true, started: true }),
+    ).toThrow(/preview-off/);
+  });
+});

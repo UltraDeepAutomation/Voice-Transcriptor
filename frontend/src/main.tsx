@@ -11,6 +11,7 @@ import {
 } from "./live-coverage";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { reconcileRecordingsList } from "./recordings-list-reconciler";
+import { livePaneDisplayText } from "./live-pane";
 
 declare global {
   interface Window {
@@ -7574,9 +7575,14 @@ function scheduleLiveOutputRender(): void {
       // recording clock. Interim capture keeps filling the session
       // buffer underneath; only its display is suppressed here, and
       // Stop still renders the full transcript as usual.
-      const status = isRecording && startAt > 0
-        ? `● Recording ${liveTimerText} — live preview is off; the transcript will appear here after Stop.`
-        : "";
+      // The display contract (including the exact status wording) is
+      // the unit-tested pure function in ./live-pane.
+      const status = livePaneDisplayText({
+        previewEnabled: false,
+        recording: isRecording,
+        started: startAt > 0,
+        timerText: liveTimerText,
+      });
       if (el.textContent !== status) {
         el.textContent = status;
       }
