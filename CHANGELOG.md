@@ -3,6 +3,11 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.6] - 2026-08-24
+
+### Fixed
+- **GigaAM never installed on existing setups**: the engine installer lived inside the requirements.txt reinstall branch, which healthy venvs skip entirely (early return on import check). Installation is now an independent gate — it runs whenever ENABLE_GIGAAM exists and `import gigaam` fails, on every launch path.
+
 ## [1.3.5] - 2026-08-24
 
 ### Added

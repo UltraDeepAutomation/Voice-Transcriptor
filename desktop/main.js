@@ -5218,6 +5218,48 @@ function broadcastBackendBootError() {
   });
 }
 
+/**
+ * Optional engine installer: GigaAM (Sber Russian ASR).
+ *
+ * Runs whenever ENABLE_GIGAAM exists next to requirements.txt AND the
+ * current interpreter cannot import gigaam — INDEPENDENT of the
+ * requirements.txt reinstall branch. That branch is skipped entirely
+ * when the venv already passes its import check, which would have left
+ * existing installs unable to ever fetch the engine.
+ */
+async function installGigaamEngineIfRequested(python, repoRoot) {
+  const marker = path.join(repoRoot, "ENABLE_GIGAAM");
+  if (!fs.existsSync(marker)) return;
+  const req = path.join(repoRoot, "requirements-gigaam.txt");
+  if (!fs.existsSync(req)) return;
+
+  const probe = await runCommand(python, ["-c", "import gigaam"], {
+    cwd: repoRoot, timeoutMs: 20000, env: buildPythonEnv(python)
+  });
+  if (probe.ok) return;
+
+  setBackendBootStatus("Installing GigaAM engine (large download)…");
+  appendMainLog("[backend-runtime] ENABLE_GIGAAM present and gigaam importable=false; installing stack");
+  const args = ["-m", "pip", "install", "-r", req];
+  // The venv path needs no --user; system pythons do.
+  const venvDirNormalized = path.resolve(getAppVenvDir());
+  const pythonResolved = path.resolve(python);
+  const ciFs = process.platform === "win32" || process.platform === "darwin";
+  const insideVenv = ciFs
+    ? pythonResolved.toLowerCase().startsWith(venvDirNormalized.toLowerCase() + path.sep)
+      || pythonResolved.toLowerCase() === venvDirNormalized.toLowerCase()
+    : pythonResolved.startsWith(venvDirNormalized + path.sep)
+      || pythonResolved === venvDirNormalized;
+  if (!insideVenv) args.splice(3, 0, "--user");
+  const res = await runCommand(python, args, {
+    cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
+  });
+  appendMainLog(
+    `[backend-runtime] gigaam install ${res.ok ? "ok" : "FAILED"}`
+    + (res.ok ? "" : `: ${(res.details || "").slice(0, 400)}`)
+  );
+}
+
 async function ensureBackendRuntime(python, repoRoot) {
   const importCheck = await runCommand(
     python,
@@ -5225,7 +5267,10 @@ async function ensureBackendRuntime(python, repoRoot) {
     { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
   );
 
-  if (importCheck.ok) return { ok: true };
+  if (importCheck.ok) {
+    await installGigaamEngineIfRequested(python, repoRoot);
+    return { ok: true };
+  }
 
   // If the selected Python IS the bundled runtime, deps are pre-installed
   // into its site-packages at release build time. An import failure here
@@ -5291,27 +5336,9 @@ async function ensureBackendRuntime(python, repoRoot) {
     cwd: repoRoot, timeoutMs: 300000, env: buildPythonEnv(python)
   });
 
-  // Optional engine: GigaAM (Russian Sber ASR). Installed only when the
-  // ENABLE_GIGAAM marker sits next to requirements.txt; failure here is
-  // non-fatal — /api/health reports engine availability and the UI
-  // disables the model entries when absent.
-  const gigaamMarker = path.join(repoRoot, "ENABLE_GIGAAM");
-  if (fs.existsSync(gigaamMarker)) {
-    const gigaamReq = path.join(repoRoot, "requirements-gigaam.txt");
-    if (fs.existsSync(gigaamReq)) {
-      setBackendBootStatus("Installing GigaAM engine (large download)…");
-      appendMainLog("[backend-runtime] ENABLE_GIGAAM present; installing gigaam stack");
-      const gigaamArgs = ["-m", "pip", "install", "-r", gigaamReq];
-      if (!isAppVenv) gigaamArgs.splice(3, 0, "--user");
-      const gigaamInstall = await runCommand(python, gigaamArgs, {
-        cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
-      });
-      appendMainLog(
-        `[backend-runtime] gigaam install ${gigaamInstall.ok ? "ok" : "FAILED"}`
-        + (gigaamInstall.ok ? "" : `: ${(gigaamInstall.details || "").slice(0, 400)}`)
-      );
-    }
-  }
+  // Optional engine handled by installGigaamEngineIfRequested above —
+  // it must also run when requirements reinstall is skipped.
+  await installGigaamEngineIfRequested(python, repoRoot);
 
   if (!install.ok && !isAppVenv) {
     // Retry with --break-system-packages for macOS 14+ managed Python
