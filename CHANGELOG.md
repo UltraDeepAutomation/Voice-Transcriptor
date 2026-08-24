@@ -3,6 +3,14 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.3] - 2026-08-24
+
+### Fixed
+- **Duplicated trailing phrases in live transcripts**: an interim hypothesis restating its own span with different word forms ("...на визуальную часть" → "...на визуальное") was appended as new content; stem-normalized subsequence matching now recognizes re-statements (seen live, session 20-32-21).
+- **Word fragments severed at Deepgram flush boundaries** ("четыре, пя | ть"): adjacent touching finals whose boundary tokens form one vowel-less fragment are re-joined in the canonical transcript.
+### Added
+- **Finalize tail guard**: when Deepgram stays silent after Finalize AND streamed audio runs past the last final, the flush is retried once instead of closing blind (19 silent-close sessions on 2026-08-24 were benign by luck only).
+
 ## [1.3.2] — 2026-08-24
 
 ### Fixed
