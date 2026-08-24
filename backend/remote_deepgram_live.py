@@ -365,6 +365,14 @@ class DeepgramLiveSession:
         # prunes the words it covers, so steady-state size tracks only
         # the currently-uncovered speech — typically near zero.
         self._interim_words: list[dict] = []
+        # Orphan pool: words DISPLACED by a newer rolling hypothesis are
+        # unconfirmed-but-heard speech. Deepgram occasionally never
+        # re-emits such regions as finals (observed live: a 10.5 s window
+        # vanished between two finals while every interim that had first
+        # decoded it was itself superseded). Displaced words move here
+        # instead of dying, stay subject to newer-evidence pruning, and
+        # join the finalize-time hole splice.
+        self._orphan_interim_words: list[dict] = []
         self._closed = False
         # Separate "consumer-visible closed" (self._closed, flipped by
         # recv_loop.finally as soon as the upstream drops so events()
@@ -851,7 +859,10 @@ class DeepgramLiveSession:
         never hypothesised — the honest residual, not the recoverable
         loss it used to be.
         """
-        if not self._interim_words:
+        # Orphans join retained words: both are unconfirmed hypotheses;
+        # the same covered/discarded/consumed rules apply to each.
+        candidates = self._interim_words + self._orphan_interim_words
+        if not candidates:
             return 0
 
         def union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -873,13 +884,20 @@ class DeepgramLiveSession:
             return any(c_start < center < c_end for c_start, c_end in covered)
 
         survivors = sorted(
-            (w for w in self._interim_words if not is_covered(w)),
+            (w for w in candidates if not is_covered(w)),
             key=lambda w: (w["start"], w["end"]),
         )
-        # Retained hypotheses are consumed exactly once: whether they
-        # were spliced or judged covered-and-discarded here, keeping
-        # them would let a second finalize() call splice duplicates.
+        # Hypotheses are consumed exactly once: whether they were
+        # spliced or judged covered-and-discarded here, keeping them
+        # would let a second finalize() call splice duplicates.
+        orphan_count = len(self._orphan_interim_words)
         self._interim_words = []
+        self._orphan_interim_words = []
+        if orphan_count:
+            logger.info(
+                "deepgram-live: splice pool included %d orphaned interim words",
+                orphan_count,
+            )
         if not survivors:
             return 0
 
@@ -1360,6 +1378,10 @@ class DeepgramLiveSession:
                 w for w in self._interim_words
                 if not (start < (w["start"] + w["end"]) / 2.0 < end)
             ]
+            self._orphan_interim_words = [
+                w for w in self._orphan_interim_words
+                if not (start < (w["start"] + w["end"]) / 2.0 < end)
+            ]
             logger.info(
                 "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s textLen=%d text=%r",
                 start, end, speech_final, len(text), text[:80],
@@ -1405,10 +1427,32 @@ class DeepgramLiveSession:
                     {"word": token, "start": round(w_start, 3), "end": round(w_end, 3)}
                 )
             if new_words:
+                def _overlaps_range(w: dict) -> bool:
+                    return not (w["end"] <= start or w["start"] >= end)
+
+                displaced = [w for w in self._interim_words if _overlaps_range(w)]
                 self._interim_words = [
-                    stored
-                    for stored in self._interim_words
-                    if stored["end"] <= start or stored["start"] >= end
+                    w for w in self._interim_words if not _overlaps_range(w)
+                ]
+                # Displaced ≠ wrong: the newer hypothesis merely did not
+                # confirm them YET. Park them as orphans unless the NEWEST
+                # words actually cover the same ground (newest wins).
+                seen = {
+                    (o["word"], o["start"], o["end"])
+                    for o in self._orphan_interim_words
+                }
+                for w in displaced:
+                    key = (w["word"], w["start"], w["end"])
+                    if key not in seen:
+                        seen.add(key)
+                        self._orphan_interim_words.append(dict(w))
+                self._orphan_interim_words = [
+                    o
+                    for o in self._orphan_interim_words
+                    if not any(
+                        not (o["end"] <= n["start"] or o["start"] >= n["end"])
+                        for n in new_words
+                    )
                 ]
                 self._interim_words.extend(new_words)
         if self.stats.segments_interim % 5 == 1:
