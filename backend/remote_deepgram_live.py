@@ -74,6 +74,92 @@ DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
 # slow/cross-region sessions; healthy ones end the wait at first
 # transcript and pay nothing extra.
 FINALIZE_FLUSH_WAIT_SEC = 3.0
+
+# Tail guard: if the streamed audio runs this many seconds past the last
+# finalized segment when the post-Finalize wait times out, the trailing
+# words are still unflushed upstream. One extra Finalize round-trip is
+# cheaper than silently dropping everything the user said after the last
+# periodic flush (2026-08-24 log: 19 sessions exited on the first
+# timeout; all benign by luck — every one had a flush landing exactly at
+# Stop. This guard removes the "by luck").
+TAIL_GUARD_MIN_SEC = 0.75
+
+# Seam repair: Deepgram's periodic forced flushes may cut a word in half
+# across two consecutive finals ("…четыре, пя" | "ть. Далее"). When two
+# finals touch within SEAM_MERGE_MAX_GAP seconds, neither side ends the
+# sentence, and exactly one of the touching tokens is a vowel-less
+# fragment, the tokens are one spoken word split by the flush boundary —
+# join them instead of shipping both halves to the transcript.
+SEAM_MERGE_MAX_GAP_SEC = 0.05
+_SEAM_VOWELS = set("аеёиоуыэюяaeiouy")
+
+
+def _token_alpha_core(token: str) -> str:
+    return "".join(ch for ch in token if ch.isalpha())
+
+
+def _has_vowel(core: str) -> bool:
+    return any(ch.lower() in _SEAM_VOWELS for ch in core)
+
+
+def merge_seam_fragments(
+    segments: list[dict],
+) -> list[dict]:
+    """Return ``segments`` with word fragments severed at final boundaries rejoined.
+
+    Pure function over ``{"start", "end", "text"}`` dicts (the canonical
+    finalized-segment shape). Two adjacent segments are merged at the
+    text level only when every guard below holds — otherwise the pair is
+    left untouched:
+
+    * temporal: ``next.start - prev.end <= SEAM_MERGE_MAX_GAP_SEC``
+      (a real pause between utterances is never bridged);
+    * prosody: ``prev.text`` does not end with sentence punctuation;
+    * casing: ``next.text`` begins with a lowercase letter (a mid-sentence
+      continuation, not a new sentence);
+    * morphology: exactly one of the touching alpha-token cores is
+      vowel-less — a syllable fragment, not a word ("пя"+"ть." merges,
+      "и"+"тут" does not);
+    * size: the larger fragment core is at most 4 letters, keeping the
+      heuristic away from real vocabulary.
+    """
+    if len(segments) < 2:
+        return segments
+    out = [dict(segments[0])]
+    for nxt in segments[1:]:
+        prev = out[-1]
+        gap = float(nxt.get("start", 0.0)) - float(prev.get("end", 0.0))
+        p_text = str(prev.get("text") or "").strip()
+        n_text = str(nxt.get("text") or "").strip()
+        if not p_text or not n_text or gap > SEAM_MERGE_MAX_GAP_SEC:
+            out.append(dict(nxt))
+            continue
+        if p_text[-1] in ".!?…":
+            out.append(dict(nxt))
+            continue
+        if n_text[:1].isupper():
+            out.append(dict(nxt))
+            continue
+        p_tokens = p_text.split()
+        n_tokens = n_text.split()
+        ta = _token_alpha_core(p_tokens[-1]) if p_tokens else ""
+        tb = _token_alpha_core(n_tokens[0]) if n_tokens else ""
+        if (
+            not ta
+            or not tb
+            or max(len(ta), len(tb)) > 4
+            or _has_vowel(ta) == _has_vowel(tb)
+        ):
+            out.append(dict(nxt))
+            continue
+        # Guards passed: the two touching tokens are one spoken word.
+        prev["text"] = " ".join(p_tokens[:-1] + [p_tokens[-1] + n_tokens[0]])
+        nxt_rest = " ".join(n_tokens[1:])
+        if nxt_rest:
+            nxt["text"] = nxt_rest
+            out.append(nxt)
+        # else: next contributed only the fragment tail — fully absorbed.
+    return out
 # An interim must carry at least this much text before its span counts as
 # "the service heard words here". Deepgram emits 1-2 character noise
 # hypotheses during silence; those must not be mistaken for speech.
@@ -629,10 +715,55 @@ class DeepgramLiveSession:
                 )
                 logger.info("deepgram-live: post-Finalize transcript received")
             except asyncio.TimeoutError:
-                logger.info(
-                    "deepgram-live: no post-Finalize transcript within %.1fs; closing",
-                    FINALIZE_FLUSH_WAIT_SEC,
+                # Tail guard: silence after Finalize is only fatal if the
+                # stream actually has unflushed speech. Measure how far the
+                # streamed audio runs past the last finalized segment; when
+                # it does, one retry costs a second round trip and can save
+                # the user's closing sentence — when it doesn't, close
+                # immediately instead of stalling every stop by a fixed
+                # grace period.
+                streamed_sec = self.stats.bytes_sent / (
+                    2 * max(1, int(self._cfg.sample_rate))
                 )
+                covered_end = max(
+                    (float(s.get("end", 0.0) or 0.0) for s in self._finalized_segments),
+                    default=0.0,
+                )
+                tail_gap = streamed_sec - covered_end
+                if tail_gap >= TAIL_GUARD_MIN_SEC:
+                    logger.warning(
+                        "deepgram-live: tail guard: %.2fs of audio past last final; "
+                        "retrying Finalize once",
+                        tail_gap,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._ws.send(json.dumps({"type": "Finalize"})),
+                            timeout=5.0,
+                        )
+                    except (asyncio.TimeoutError, ConnectionClosed, WebSocketException) as e:
+                        logger.warning("deepgram-live: tail-guard Finalize failed: %s", e)
+                    else:
+                        self._final_arrived.clear()
+                        try:
+                            await asyncio.wait_for(
+                                self._final_arrived.wait(),
+                                timeout=FINALIZE_FLUSH_WAIT_SEC,
+                            )
+                            logger.info("deepgram-live: tail guard: transcript arrived on retry")
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "deepgram-live: tail guard: still silent after retry "
+                                "(%.2fs uncovered); closing",
+                                tail_gap,
+                            )
+                else:
+                    logger.info(
+                        "deepgram-live: no post-Finalize transcript within %.1fs "
+                        "(streamed %.2fs fully covered); closing",
+                        FINALIZE_FLUSH_WAIT_SEC,
+                        streamed_sec,
+                    )
 
             try:
                 # Same 5-second bound as send_pcm — a wedged TCP socket
@@ -904,8 +1035,9 @@ class DeepgramLiveSession:
         return self._last_fatal
 
     def final_text(self) -> str:
+        merged = merge_seam_fragments(list(self._finalized_segments))
         parts: list[str] = []
-        for seg in self._finalized_segments:
+        for seg in merged:
             text = str(seg.get("text") or "").strip()
             if text:
                 parts.append(text)

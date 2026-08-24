@@ -4,6 +4,8 @@ import {
   normalizeWords,
   normalizeComparable,
   countWords,
+  stemKey,
+  tokensInOrder,
 } from "../src/text-match";
 
 describe("text-match SSOT primitives", () => {
@@ -39,5 +41,39 @@ describe("text-match SSOT primitives", () => {
       // countWords intentionally mirrors the historical behaviour.
       expect(countWords("well-known")).toBe(1);
     });
+  });
+});
+
+describe("stemKey + tokensInOrder — interim re-statement guard", () => {
+  it("collides inflectional variants of the same word", () => {
+    expect(stemKey("визуальную")).toBe(stemKey("визуальное"));
+    expect(stemKey("записи")).toBe(stemKey("записях"));
+  });
+
+  it("real session 20-32-21: re-stated tail is recognized as covered", () => {
+    const base = normalizeWords(
+      "чтобы ты изучил именно обратил внимание на визуальную часть",
+    ).map(stemKey);
+    const interim = normalizeWords(
+      "именно обратил внимание на визуальное",
+    ).map(stemKey);
+    expect(tokensInOrder(base, interim)).toBe(true);
+  });
+
+  it("genuinely new content is never claimed as covered", () => {
+    const base = normalizeWords("собери ролик на озвучке автора").map(stemKey);
+    const fresh = normalizeWords("и потом сравним покадрово").map(stemKey);
+    expect(tokensInOrder(base, fresh)).toBe(false);
+  });
+
+  it("order matters", () => {
+    const base = normalizeWords("первый второй третий").map(stemKey);
+    expect(tokensInOrder(base, ["третьего", "первого"])).toBe(false);
+  });
+
+  it("empty needle is trivially covered; longer needle is not", () => {
+    const base = normalizeWords("один два").map(stemKey);
+    expect(tokensInOrder(base, [])).toBe(true);
+    expect(tokensInOrder(base, ["один", "два", "три"])).toBe(false);
   });
 });

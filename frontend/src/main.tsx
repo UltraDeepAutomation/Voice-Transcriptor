@@ -17,6 +17,8 @@ import {
   normalizeComparable,
   normalizeTranscriptWhitespace,
   normalizeWords,
+  stemKey,
+  tokensInOrder,
 } from "./text-match";
 import {
   candidateConfirmsTranscriptCoverage,
@@ -7200,6 +7202,18 @@ function composeCanonicalLiveSourceText(
     const lastBaseNorm = normalizeWords(lastBaseWords).join(" ");
     const interimNorm = interimWords.join(" ");
     if (lastBaseNorm.endsWith(interimNorm)) return base;
+
+    // Re-statement guard: a fresh hypothesis often restates its own span
+    // with different word forms/counts ("…на визуальную часть" →
+    // "…на визуальное"). Exact suffix matching above can never align
+    // those; without this check the hypothesis would be appended as new
+    // content and the phrase duplicated (seen live 2026-08-24, session
+    // 20-32-21). Stem-normalized subsequence containment means "same
+    // words in the same order, different rendering" — the committed
+    // text already covers it.
+    const baseStems = normalizeWords(lastBaseWords).map(stemKey);
+    const interimStems = interimWords.map(stemKey);
+    if (tokensInOrder(baseStems, interimStems)) return base;
 
     // Interim hypotheses can overlap committed text with a shifted
     // boundary, e.g. committed="... сказал больше" and interim="больше
