@@ -3828,3 +3828,35 @@ canvas {
   font-size: 12px;
   color: var(--text-2, #777777);
 }
+
+/* ── Settings → Local models ─────────────────────────────── */
+.models-table { display: flex; flex-direction: column; gap: 6px; }
+.model-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 10px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+}
+.model-row.ready { opacity: 0.92; }
+.model-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-size { color: var(--text-dim, #9aa); font-variant-numeric: tabular-nums; }
+.model-state { min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+.model-state.ok { color: var(--ok, #4ade80); }
+.model-state.err { color: var(--err, #f87171); }
+.settings-note { margin: 0; color: var(--text-dim, #9aa); font-size: 12.5px; }
+
+/* Download-confirm modal */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.modal-card {
+  width: min(420px, calc(100vw - 32px));
+  padding: 18px 20px; border-radius: 14px;
+  background: var(--surface, #16181d); color: inherit;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+.modal-card h3 { margin: 0 0 8px; font-size: 15px; }
+.modal-card p { margin: 0 0 14px; color: var(--text-dim, #aab); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.btn-primary { background: var(--accent, #5b8cff) !important; color: #fff !important; }

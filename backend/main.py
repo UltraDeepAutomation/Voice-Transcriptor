@@ -43,6 +43,7 @@ from backend.audio_constants import (
     LIVE_RECOVERY_MIN_BYTES,
     LIVE_SAMPLE_RATE_HZ,
 )
+from backend.models_manager import list_local_models, start_download
 from backend.model_catalog import (
     DEFAULT_DEEPGRAM_AUDIO_MODEL,
     DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
@@ -4026,6 +4027,25 @@ async def _run_deepgram_live_session(
 def list_live_recoveries(_auth: None = Depends(_require_api_auth)):
     _cleanup_live_recovery_files()
     return {"items": _list_live_recoveries()}
+
+
+@app.get("/api/models/local")
+def api_models_local(_auth: None = Depends(_require_api_auth)):
+    return {"ok": True, "models": list_local_models()}
+
+
+@app.post("/api/models/local/{model_id}/download")
+def api_model_download(
+    model_id: str,
+    _auth: None = Depends(_require_api_auth),
+):
+    try:
+        result = start_download(model_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown local model {model_id}")
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"ok": True, "model_id": model_id, **result}
 
 
 @app.post("/api/live/recoveries/{session_id}/discard")

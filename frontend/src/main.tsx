@@ -719,7 +719,7 @@ function normalizeUpscaleModelOptions(value: unknown, fallback: UpscaleModelOpti
 function syncLocalModelOptions(): void {
   const sel = document.getElementById("model") as HTMLSelectElement | null;
   if (!sel) return;
-  const preferred = (sel.value || "").trim();
+  const preferred = (pendingModelSelection || sel.value || "").trim();
   const nextValue = LOCAL_TRANSCRIPTION_MODELS.includes(preferred)
     ? preferred
     : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
@@ -738,6 +738,193 @@ function syncLocalModelOptions(): void {
     LOCAL_TRANSCRIPTION_MODELS.includes(nextValue) &&
     LOCAL_ENGINE_AVAILABILITY[engineFor(nextValue)] !== false;
   sel.value = preferredAvailable ? nextValue : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+  if (preferredAvailable && !pendingModelSelection) {
+    lastAppliedLocalModel = sel.value;
+  }
+}
+
+type LocalModelRow = {
+  key: string;
+  id: string;
+  engine: string;
+  downloaded: boolean;
+  status?: string;
+  progress?: number;
+  error?: string;
+  note?: string;
+  size_hint_bytes?: number | null;
+};
+
+let localModelsCache: LocalModelRow[] = [];
+let localModelsTimer: number | null = null;
+let pendingModelSelection: string | null = null;
+let lastAppliedLocalModel = "";
+
+function findLocalModelRow(id: string): LocalModelRow | undefined {
+  return localModelsCache.find((m) => m.id === id);
+}
+
+function isLocalModelReady(id: string): boolean {
+  const row = findLocalModelRow(id);
+  return !!row && row.downloaded;
+}
+
+function renderLocalModels(): void {
+  const wrap = document.getElementById("localModelsTable");
+  if (!wrap) return;
+  for (const row of localModelsCache) row.key = `model:${row.id}`;
+  reconcileRecordingsList(wrap, localModelsCache, {
+    create: (row) => {
+      const card = document.createElement("div");
+      card.className = "model-row" + (row.downloaded ? " ready" : "");
+      const name = document.createElement("span");
+      name.className = "model-name";
+      name.textContent = row.id + (row.note ? ` — ${row.note}` : "");
+      card.appendChild(name);
+      if (row.size_hint_bytes) {
+        const size = document.createElement("span");
+        size.className = "model-size";
+        size.textContent = fmtBytes(row.size_hint_bytes);
+        card.appendChild(size);
+      }
+      const state = document.createElement("span");
+      state.className = "model-state";
+      if (row.status === "downloading") {
+        state.textContent = `↓ ${Math.round(row.progress || 0)}%`;
+      } else if (row.status === "error") {
+        state.textContent = "failed — retry";
+        state.classList.add("err");
+      } else if (row.downloaded) {
+        state.textContent = "✓";
+        state.classList.add("ok");
+      }
+      card.appendChild(state);
+      if (!row.downloaded && row.engine === "whisper" && row.status !== "downloading") {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn model-dl";
+        btn.textContent = "Download";
+        btn.dataset.dlModel = row.id;
+        card.appendChild(btn);
+      }
+      return card;
+    },
+    update: (card, row) => {
+      const state = card.querySelector<HTMLElement>(".model-state");
+      if (!state) return;
+      if (row.status === "downloading") {
+        state.textContent = `↓ ${Math.round(row.progress || 0)}%`;
+        state.classList.remove("ok", "err");
+      } else if (row.status === "error") {
+        state.textContent = "failed — retry";
+        state.classList.add("err");
+      } else if (row.downloaded) {
+        state.textContent = "✓";
+        state.classList.add("ok");
+        card.classList.add("ready");
+        card.querySelector<HTMLButtonElement>(".model-dl")?.remove();
+      }
+    },
+  });
+}
+
+async function refreshLocalModels(): Promise<void> {
+  try {
+    const js = await apiGet<{ ok: boolean; models: LocalModelRow[] }>("/api/models/local");
+    localModelsCache = Array.isArray(js.models) ? js.models : [];
+    renderLocalModels();
+    syncLocalModelOptions();
+    // A pending selection becomes real the moment its model lands.
+    if (
+      pendingModelSelection &&
+      isLocalModelReady(pendingModelSelection) &&
+      !findLocalModelRow(pendingModelSelection)?.status
+    ) {
+      const sel = document.getElementById("model") as HTMLSelectElement | null;
+      if (sel) {
+        sel.value = pendingModelSelection;
+        sel.dispatchEvent(new Event("change"));
+      }
+      pendingModelSelection = null;
+    }
+  } catch {
+    /* backend briefly down — next tick retries */
+  }
+  ensureLocalModelsPolling();
+}
+
+function ensureLocalModelsPolling(): void {
+  const anyDownloading = localModelsCache.some((m) => m.status === "downloading");
+  const settingsView = document.querySelector<HTMLElement>('.view[data-view="settings"]');
+  const settingsVisible = !settingsView?.hidden;
+  if ((anyDownloading || settingsVisible) && localModelsTimer === null) {
+    localModelsTimer = window.setInterval(() => void refreshLocalModels(), 2000);
+  } else if (!anyDownloading && !settingsVisible && localModelsTimer !== null) {
+    window.clearInterval(localModelsTimer);
+    localModelsTimer = null;
+  }
+}
+
+async function requestModelDownload(id: string): Promise<void> {
+  try {
+    await apiPost<{ ok: boolean }>(`/api/models/local/${encodeURIComponent(id)}/download`, {});
+    setStatus(`Downloading ${id}…`, "info");
+    await refreshLocalModels();
+  } catch (e) {
+    setStatus(`Download failed for ${id}: ${e instanceof Error ? e.message : String(e)}`, "error");
+  }
+}
+
+function wireLocalModelsUi(): void {
+  const table = document.getElementById("localModelsTable");
+  table?.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    const id = target?.closest?.("[data-dl-model]")?.getAttribute("data-dl-model");
+    if (id) void requestModelDownload(id);
+  });
+
+  const modal = document.getElementById("modelDownloadModal");
+  const textEl = document.getElementById("modelDownloadText");
+  const confirmBtn = document.getElementById("modelDownloadConfirmBtn");
+  const cancelBtn = document.getElementById("modelDownloadCancelBtn");
+  const closeModal = (): void => {
+    if (modal) modal.hidden = true;
+    pendingModelSelection = null;
+  };
+  cancelBtn?.addEventListener("click", closeModal);
+  modal?.addEventListener("click", (ev) => {
+    if (ev.target === modal) closeModal();
+  });
+  confirmBtn?.addEventListener("click", () => {
+    const id = pendingModelSelection;
+    closeModal();
+    if (id) void requestModelDownload(id).then(() => {
+      pendingModelSelection = id; // applied automatically once ready
+    });
+  });
+
+  const sel = document.getElementById("model") as HTMLSelectElement | null;
+  if (sel) {
+    lastAppliedLocalModel = sel.value || "";
+    sel.addEventListener("change", () => {
+      const value = sel.value;
+      if (isLocalModelReady(value)) {
+        lastAppliedLocalModel = value;
+        return;
+      }
+      const rowSize = findLocalModelRow(value)?.size_hint_bytes;
+      pendingModelSelection = value;
+      sel.value = lastAppliedLocalModel || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+      if (textEl) {
+        textEl.textContent =
+          `${value} is not on this machine yet`
+          + (rowSize ? ` (~${fmtBytes(rowSize)} download)` : "")
+          + ". Download it now?";
+      }
+      if (modal) modal.hidden = false;
+      confirmBtn?.focus();
+    });
+  }
 }
 
 function applyHealthModelCatalog(catalog: unknown): void {
@@ -814,6 +1001,8 @@ function applyBackendBootstrap(): void {
   if (!bootstrap || typeof bootstrap !== "object") return;
   applyBackendRuntimeConfig(bootstrap);
   applyHealthModelCatalog(bootstrap.model_catalog);
+  wireLocalModelsUi();
+  void refreshLocalModels();
   applyRuntimeLimits(bootstrap.runtime_limits);
 }
 
@@ -3500,6 +3689,7 @@ function parseViewName(value: string): ViewName {
 }
 
 function switchView(view: ViewName): void {
+  if (view === "settings") void refreshLocalModels();
   document.querySelectorAll(".view").forEach((el) => {
     const node = el as HTMLElement;
     node.hidden = node.dataset.view !== view;

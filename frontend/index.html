@@ -569,6 +569,22 @@
             </div>
           </div>
           <div class="settings">
+          <div class="card card-models">
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Local models</h2>
+              </div>
+            </div>
+            <div class="field-stack">
+              <p class="settings-note" id="modelsNote">
+                Recognition models stored on this machine. Download once —
+                selection marks are live; picking a missing model offers to
+                fetch it.
+              </p>
+              <div class="models-table" id="localModelsTable" role="table"
+                   aria-label="Local recognition models"></div>
+            </div>
+          </div>
           <div class="card card-api">
             <div class="card-header">
               <div class="card-header-copy">
@@ -721,6 +737,17 @@
     </div>
   </div>
 
+
+  <div class="modal-overlay" id="modelDownloadModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modelDownloadTitle">
+      <h3 id="modelDownloadTitle">Model not downloaded</h3>
+      <p id="modelDownloadText"></p>
+      <div class="modal-actions">
+        <button class="btn" id="modelDownloadCancelBtn" type="button">Not now</button>
+        <button class="btn btn-primary" id="modelDownloadConfirmBtn" type="button">Download</button>
+      </div>
+    </div>
+  </div>
   <script type="module" src="/src/main.tsx"></script>
 </body>
 

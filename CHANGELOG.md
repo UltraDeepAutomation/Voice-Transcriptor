@@ -3,6 +3,15 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.5] - 2026-08-24
+
+### Added
+- **GigaAM-v3 engine (Sber)** — Russian-only local ASR alongside faster-whisper: `gigaam-v3-e2e-rnnt` / `gigaam-v3-rnnt` in the same model catalog, dispatched to a new adapter that maps upstream results (incl. word timestamps) onto the existing segment shape; >20 s audio is auto-sliced under the upstream 25 s cap. Opt-in install via `ENABLE_GIGAAM` marker → app venv (never bloats the DMG); selector disables entries whose engine is missing.
+- **Settings → Local models**: per-model download management — presence detection via HF cache, one-click Download with live progress, ✓ when stored. Selecting a missing model now asks first ("Download it now?") and applies the choice automatically once the download lands.
+
+### Fixed
+- **BUG-24**: superseded interim hypotheses no longer destroy the only record of unconfirmed speech — an orphan pool feeds the finalize splice (root cause of backend-side mid-recording holes).
+
 ## [1.3.4] - 2026-08-24
 
 ### Fixed (expanded audit wave 2 — desktop/main.js, backend API surface, config/persistence layer)
