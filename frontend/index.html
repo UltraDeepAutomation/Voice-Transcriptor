@@ -301,15 +301,6 @@
                   </label>
                 </div>
               </div>
-              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
-                <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-live">
-                  <!-- Live Preview has NO model choice by design: when the
-                       toggle is on, chunks from the transcription pipeline
-                       stream here; when off, nothing renders. The model
-                       lives in the Transcribe toolbar (SSOT:
-                       frontend/src/transcription-catalog.ts). -->
-                </div>
-              </div>
             </div>
             <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
           </div>
@@ -339,7 +330,6 @@
                       <option value="gigaam">GigaAM (Russian)</option>
                       <option value="deepgram">Deepgram</option>
                       <option value="openrouter">OpenRouter</option>
-                      <option value="">None</option>
                     </select>
                     <!-- Universal model select for the chosen provider
                          group: Whisper Tiny…Large-v3, GigaAM v3 models,

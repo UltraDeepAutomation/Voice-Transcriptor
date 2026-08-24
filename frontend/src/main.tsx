@@ -5510,7 +5510,9 @@ async function loadCfg(): Promise<void> {
       }
       uiModelByGroup.deepgram = remoteModelByProvider.deepgram;
       uiModelByGroup.openrouter = remoteModelByProvider.openrouter;
-      uiProviderGroup = hasStoredProvider && wire === "" ? "" : group;
+      // The "None" provider option was removed: transcription always has
+      // a provider now, so a legacy stored "" coerces to Whisper.
+      uiProviderGroup = group;
     }
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
     const livePreview = $("livePreviewToggle") as HTMLInputElement;
@@ -7975,11 +7977,11 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     // ``transcript`` kind so status/error messages (which are
     // intermediate) keep the live preview visible for context.
     if (kind === "transcript" && pasteText) {
-      liveDraftText = "";
-      liveDraftDisplayText = "";
-      liveInterimText = "";
-      liveTranscriptSegments = [];
-      scheduleLiveOutputRender();
+      // KEEP the live preview text after stop: the user compares the
+      // streamed preview against the final transcript (Deepgram
+      // sometimes swallows words — the pane is the evidence). The pane
+      // clears when the NEXT recording starts (resetLiveDraftState),
+      // not when the current one ends.
     }
   }
 }
@@ -10141,7 +10143,35 @@ async function stopLive(enhance: boolean): Promise<void> {
             (tailHasCapturedActivity || tailHasInterimSpeechEvidence) &&
             !liveStreamErrorAtStop;
           console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} lastCapturedActivitySec=${lastCapturedActivitySec.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} tailActivityGapSec=${tailActivityGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
-          if (tailLikelyMissing) {
+          // Interim words are ALREADY part of the canonical instant
+          // transcript (committed + interim), so interim evidence at the
+          // tail means the visible transcript covers the tail — the
+          // expensive REST recovery is pointless there. Only captured PCM
+          // activity WITHOUT interim coverage is genuinely unprocessed
+          // audio.
+          const tailCoveredByInterim = tailHasInterimSpeechEvidence;
+          if (tailCoveredByInterim && recordedSec > 1.0 && !liveStreamErrorAtStop) {
+            // ── Short envelope confirmation (the 5-7 s stop fix) ────
+            // The user reported: preview visually complete, yet 5-7 s
+            // before the final transcript. That was the envelope(4 s) ∥
+            // REST(6 s) race firing on interim evidence alone. Post-
+            // CloseStream finals usually land in 1-2 s; race the envelope
+            // against a 1.5 s cap, upgrade if richer, move on.
+            const tEnv = performance.now();
+            const env = await Promise.race([
+              liveFinalPromise(),
+              new Promise<LiveFinalEnvelope | null>((resolve) =>
+                window.setTimeout(() => resolve(null), 1500),
+              ),
+            ]);
+            const envText = textFromEnvelope(env);
+            const better = richerTranscript(transcriptRaw, envText);
+            console.log(
+              `[trace tail-gap] interim-covered: envelope ` +
+              `${better !== transcriptRaw ? "upgraded" : "confirmed"} instant transcript ms=${(performance.now() - tEnv).toFixed(0)}`,
+            );
+            if (better !== transcriptRaw) transcriptRaw = better;
+          } else if (tailLikelyMissing) {
             // ── Parallel race: envelope + REST recovery ─────────────
             //
             // Previous (1.1.15-1.1.16) implementation was SEQUENTIAL:
