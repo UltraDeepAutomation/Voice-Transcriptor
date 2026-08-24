@@ -4843,6 +4843,18 @@ function fileExists(p) {
   try { return fs.existsSync(p); } catch { return false; }
 }
 
+// Live children spawned by runCommand (BUG-61): pip installs can run
+// for 30 minutes; a quit must SIGKILL them, not orphan them. Populated
+// on spawn, drained on close, flushed by killAllTrackedChildren().
+const trackedChildren = new Set();
+
+function killAllTrackedChildren() {
+  for (const child of trackedChildren) {
+    try { child.kill("SIGKILL"); } catch { /* already dead */ }
+  }
+  trackedChildren.clear();
+}
+
 function runCommand(cmd, args, options = {}) {
   const timeoutMs = options.timeoutMs || 30000;
   // On Windows, PowerShell emits stdout in the system OEM code page
@@ -4904,6 +4916,14 @@ function runCommand(cmd, args, options = {}) {
       env: options.env || process.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
+    // Live-children registry (BUG-61): a quit during a long runCommand
+    // (the multi-GB engine pip install) previously left the child
+    // running orphaned for its whole timeout. Tracked here and killed
+    // by killAllTrackedChildren on the quit paths.
+    trackedChildren.add(child);
+    const untrackChild = () => trackedChildren.delete(child);
+    child.once("close", untrackChild);
+    child.once("error", untrackChild);
     // Force UTF-8 decoding on the streams. This is the default on macOS
     // and Linux, but explicit here so a platform quirk cannot silently
     // switch the encoding.
@@ -4948,6 +4968,12 @@ function getEngineSiteDir() {
   // backend imports the engine through PYTHONPATH instead.
   return path.join(app.getPath("userData"), "engine-site");
 }
+
+// Written into a staging tree only AFTER pip + reconciliation succeed
+// and the tree is complete (BUG-76). A site without it is treated as
+// not-installed: the installer re-runs instead of trusting a half-built
+// tree whose `gigaam` may import but miss lazy transitive deps.
+const ENGINE_INSTALL_MARKER = ".install-complete";
 
 function buildPythonEnv(python, overrides = {}) {
   const env = { ...process.env };
@@ -5460,7 +5486,8 @@ async function installGigaamEngine(python, repoRoot) {
   setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.PROBING);
   broadcastEngineStatus();
 
-  if (await probeGigaamImportable(python, repoRoot)) {
+  if (await probeGigaamImportable(python, repoRoot)
+    && fs.existsSync(path.join(getEngineSiteDir(), ENGINE_INSTALL_MARKER))) {
     setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE, { reason: "already installed" });
     broadcastEngineStatus();
     return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
@@ -5524,10 +5551,25 @@ async function installGigaamEngine(python, repoRoot) {
         );
       }
 
+      // Completion marker (BUG-76): written INTO staging so a tree is
+      // only ever considered "installed" once it is fully assembled and
+      // reconciled. A half-installed site (crash mid-pip) whose `gigaam`
+      // happens to import would otherwise pass the probe and defer its
+      // breakage to model-load time with no installer re-trigger.
+      fs.writeFileSync(path.join(staging, ENGINE_INSTALL_MARKER), new Date().toISOString());
+
       const retired = `${engineSite}.old-${Date.now()}`;
       if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
       fs.renameSync(staging, engineSite);
-      fs.rmSync(retired, { recursive: true, force: true });
+      // Retired-tree cleanup is best-effort (BUG-60): on Windows AV and
+      // indexers routinely hold handles on a just-renamed ~7 GB tree, and
+      // an rmSync failure here must NOT report the install as FAILED —
+      // the new engine is already live. Orphans are swept at next boot.
+      try {
+        fs.rmSync(retired, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        appendMainLog(`[engine-install] retired-tree cleanup deferred to next boot: ${cleanupErr?.message || cleanupErr}`);
+      }
 
       setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
       appendMainLog("[engine-install] ok (engine-site swapped)");
@@ -5566,6 +5608,56 @@ async function reconcileEngineSiteAtBoot(python, repoRoot) {
   const engineSite = getEngineSiteDir();
   if (!fs.existsSync(path.join(engineSite, "gigaam"))) return;
   await reconcileEngineSiteWithBundle(engineSite, python, repoRoot, "reconcile");
+}
+
+/**
+ * Boot-time engine-site hygiene (BUG-60/BUG-76). At boot no install is
+ * in flight, so every leftover is attributable to a previous run:
+ *
+ *  - a complete staging tree (marker present) is PROMOTED when the live
+ *    site is missing/incomplete — the app died between the two renames
+ *    of the atomic swap, and the ~6 GB download is still good;
+ *  - `engine-site.old-*` trees (retired by a swap, cleanup deferred) are
+ *    removed — each one is ~6-7 GB and the BUG-33 disk gate would
+ *    otherwise block the next install once they accumulate;
+ *  - an incomplete staging tree (no marker) is removed — pip died
+ *    mid-install and it can never be trusted.
+ */
+function sweepEngineSiteLeftoversAtBoot() {
+  const engineSite = getEngineSiteDir();
+  const parent = path.dirname(engineSite);
+  const base = path.basename(engineSite);
+  let entries;
+  try {
+    entries = fs.readdirSync(parent);
+  } catch { /* userData not readable — nothing to sweep */ return; }
+
+  const siteIncomplete = !fs.existsSync(path.join(engineSite, "gigaam"));
+  for (const name of entries) {
+    const full = path.join(parent, name);
+    if (name.startsWith(`${base}.old-`)) {
+      try {
+        fs.rmSync(full, { recursive: true, force: true });
+        appendMainLog(`[engine-install] swept retired tree ${name}`);
+      } catch { /* retried next boot */ }
+      continue;
+    }
+    if (name === `${base}.staging`) {
+      const stagingComplete = fs.existsSync(path.join(full, ENGINE_INSTALL_MARKER))
+        && fs.existsSync(path.join(full, "gigaam"));
+      try {
+        if (siteIncomplete && stagingComplete) {
+          fs.renameSync(full, engineSite);
+          appendMainLog("[engine-install] promoted completed staging tree (crash between renames)");
+        } else {
+          fs.rmSync(full, { recursive: true, force: true });
+          if (!stagingComplete) {
+            appendMainLog("[engine-install] removed incomplete staging tree");
+          }
+        }
+      } catch { /* retried next boot */ }
+    }
+  }
 }
 
 async function ensureBackendRuntime(python, repoRoot) {
@@ -5914,6 +6006,12 @@ async function startBackend() {
   backend.on("error", (err) => {
     backendBootError = err.message;
     appendMainLog(`[backend-error] ${err.message}`);
+    // A spawn error (missing python binary, EACCES, EMFILE) leaves the
+    // ChildProcess object dead but still truthy, so startBackend's
+    // "already running" guard would silently refuse every restart until
+    // the app relaunches (BUG-62). Drop the dead handle so the normal
+    // retry/backoff path can bring the backend back.
+    backend = null;
   });
   })();
 
@@ -6627,6 +6725,19 @@ async function createWindow(options = {}) {
         appendMainLog(`[did-finish-load] backendBootError replay failed: ${e?.message || e}`);
       }
     }
+    // Replay the boot STATUS too (BUG-74): a reload mid-install (or mid
+    // dependency setup) lost the progress line and rendered a bare
+    // overlay with no indication of what is happening.
+    if (backendBootStatus && win && !win.isDestroyed() && win.webContents) {
+      try {
+        await win.webContents.executeJavaScript(
+          `window.__setBackendBootStatus && window.__setBackendBootStatus(${JSON.stringify(backendBootStatus)});`,
+          true,
+        );
+      } catch (e) {
+        appendMainLog(`[did-finish-load] backendBootStatus replay failed: ${e?.message || e}`);
+      }
+    }
   });
 
   win.on("close", (event) => {
@@ -7012,6 +7123,9 @@ function killBackendHard(reason, opts = {}) {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  // Long-running runCommand children (the multi-GB engine pip install)
+  // must die with the app, not orphan for their full timeout (BUG-61).
+  killAllTrackedChildren();
   // Clear the auto-restart timer FIRST, before any other cleanup.
   // killBackendHard at the bottom of this handler also clears it, but
   // by then we've already spent ~tens of milliseconds tearing down
@@ -7108,6 +7222,7 @@ app.whenReady().then(async () => {
   cleanupStaleTranscriptTmpFiles();
   recoverOrphanRotatingLogs();
   pruneMainLogArchives();
+  sweepEngineSiteLeftoversAtBoot();
 
   // Engine lifecycle IPC (Settings → Local models). Handlers are
   // registered once, before any window exists, so the very first render

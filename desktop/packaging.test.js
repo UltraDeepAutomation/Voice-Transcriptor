@@ -102,3 +102,19 @@ test("the accelerator SSOT module itself is packaged", () => {
     "accelerator.js must stay in build.files",
   );
 });
+
+test("frontend and desktop package versions match the desktop SSOT", () => {
+  // desktop/package.json is the version SSOT (AGENTS.md rule 4);
+  // frontend/package.json duplicates the number for tooling, and the
+  // two have drifted in the past (BUG-75). A release that bumps one
+  // and not the other now fails npm test instead of shipping a
+  // renderer that reports a different version than the shell.
+  const frontendPkg = JSON.parse(
+    fs.readFileSync(path.join(DESKTOP_DIR, "..", "frontend", "package.json"), "utf8"),
+  );
+  assert.equal(
+    frontendPkg.version,
+    pkg.version,
+    `version drift: desktop/package.json=${pkg.version}, frontend/package.json=${frontendPkg.version} — bump both together`,
+  );
+});
