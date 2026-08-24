@@ -103,7 +103,7 @@ BUGS_AUDIT 19+BUG-20…23+W2-01…11), большинство типовых к�
 - **Исправленный код (в адаптере, единственное место):**
   ```python
   first = not out
-  token = str(getattr(w, "text", "") or "").strip()
+  token = [secret redacted], "text", "") or "").strip()
   if not token or w_end <= w_start:
       continue
   out.append({"word": token if first else f" {token}",
@@ -112,6 +112,19 @@ BUGS_AUDIT 19+BUG-20…23+W2-01…11), большинство типовых к�
 - **Объяснение:** SSOT-фикс в точке адаптации: все потребители (live-trim,
   фронтовый merge, text-match) продолжают работать по одной конвенции
   faster-whisper, вместо того чтобы учить каждый из них о втором движке.
+
+### BUG-38. Результат адаптера GigaAM без `text`/`language_probability`: sync-маршрут теряет текст
+
+- **Файл:** `backend/transcribe_gigaam.py:185` (найден при фиксе Группы A)
+- **Суть:** адаптер обещает «shape как `transcribe_audio`», но возвращает
+  только `{segments, language, duration}` — без `text` и
+  `language_probability`, которые потребители читают напрямую
+  (`main.py:4405` `result.get("text")`).
+- **Последствие:** gigaam-транскрипция через sync-путь (numpy-вход) даёт
+  ПУСТОЙ текст при непустых сегментах — тихая потеря результата.
+- **Исправление:** вернуть полный контракт: `text` = join сегментных
+  текстов, `language_probability` = 1.0 (движок детерминированно ru).
+
 
 ### BUG-27. Settings: поля вылезают из карточек и наезжают на соседнюю карточку (воспроизведено)
 

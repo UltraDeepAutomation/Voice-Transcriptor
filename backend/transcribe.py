@@ -11,6 +11,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import soundfile as sf
 # WhisperModel is imported lazily inside `_model()` so the faster_whisper
 # cold-import (ctranslate2 + tokenizers + huggingface_hub, ~1 s) does NOT
 # block backend startup. /api/health becomes responsive seconds earlier,
@@ -187,7 +188,15 @@ def _probe_tone(seconds: float = 0.5) -> np.ndarray:
 
 def warm_model(model_name: str, probe: bool = False) -> Dict[str, float]:
     started = time.perf_counter()
-    _model(model_name)
+    # Engine dispatch (same SSOT branch as transcribe_audio/transcribe_file):
+    # warmup is part of the model-catalog contract, so gigaam ids must warm
+    # the GigaAM engine instead of reaching WhisperModel.
+    if model_name.startswith(GIGAAM_MODEL_PREFIX):
+        from backend.transcribe_gigaam import warm_gigaam
+
+        warm_gigaam(model_name)
+    else:
+        _model(model_name)
     load_ms = int((time.perf_counter() - started) * 1000)
     probe_ms = 0
     if probe:
@@ -368,6 +377,14 @@ def transcribe_file(
     if not os.path.exists(path_wav_16k_mono):
         raise FileNotFoundError(path_wav_16k_mono)
 
+    # Engine dispatch (same SSOT branch as transcribe_audio): file jobs,
+    # sync transcribe and re-transcribe accept every catalog id, so a
+    # gigaam id must reach the GigaAM engine instead of WhisperModel.
+    if model_name.startswith(GIGAAM_MODEL_PREFIX):
+        return _transcribe_file_gigaam(
+            path_wav_16k_mono, model_name, word_timestamps=word_timestamps
+        )
+
     model = _model(model_name)
     if os.path.getsize(path_wav_16k_mono) <= 64:
         return _empty_transcribe_result(0.0)
@@ -387,6 +404,37 @@ def transcribe_file(
         raise
 
     return _build_result(segments, info, word_timestamps)
+
+
+def _transcribe_file_gigaam(
+    path_wav_16k_mono: str,
+    model_name: str,
+    *,
+    word_timestamps: bool,
+) -> Dict[str, Any]:
+    """GigaAM side of the file-path entry point.
+
+    The file pipeline (backend/audio.py) hands over a 16 kHz mono WAV —
+    the same contract ``path_wav_16k_mono`` names. Read it back to the
+    adapter's float32-PCM input instead of duplicating engine logic here;
+    a rate outside the contract is a pipeline bug and must fail loudly
+    rather than be silently resampled with lossy math.
+    """
+    if os.path.getsize(path_wav_16k_mono) <= 64:
+        return _empty_transcribe_result(0.0)
+    audio, sr = sf.read(path_wav_16k_mono, dtype="float32", always_2d=True)
+    if sr != LIVE_SAMPLE_RATE_HZ:
+        raise ValueError(
+            f"expected {LIVE_SAMPLE_RATE_HZ} Hz mono WAV, got {sr} Hz: "
+            f"{path_wav_16k_mono}"
+        )
+    from backend.transcribe_gigaam import transcribe_gigaam
+
+    return transcribe_gigaam(
+        audio.mean(axis=1),
+        model_name,
+        word_timestamps=word_timestamps,
+    )
 
 
 def merge_channel_transcripts(t1: Dict[str, Any], t2: Dict[str, Any]) -> Dict[str, Any]:

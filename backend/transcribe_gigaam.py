@@ -68,6 +68,16 @@ def _load_model(model_id: str) -> Any:
         return model
 
 
+def warm_gigaam(model_id: str) -> None:
+    """Preload the engine weights without running inference.
+
+    Part of the model-catalog warmup contract (``backend.transcribe.
+    warm_model`` dispatches here for ``gigaam-`` ids): the download +
+    load cost must land on the warmup call, not on the first utterance.
+    """
+    _load_model(model_id)
+
+
 def _write_wav(audio_16k_mono: np.ndarray) -> Path:
     handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     handle.close()
@@ -103,7 +113,17 @@ def _words_from_result(result: Any, offset: float) -> list[dict]:
             continue
         if not text or w_end <= w_start:
             continue
-        out.append({"word": text, "start": round(w_start, 3), "end": round(w_end, 3)})
+        # faster-whisper word convention (the shape this adapter promises):
+        # the segment's first token is bare, every later token carries a
+        # LEADING space. Upstream GigaAM strips token text, so rebuild the
+        # convention here — live trim (backend/live.py) reconstructs
+        # trimmed segment text by plain concatenation and every other
+        # consumer (frontend merge, text-match) normalises on top of it.
+        out.append({
+            "word": text if not out else f" {text}",
+            "start": round(w_start, 3),
+            "end": round(w_end, 3),
+        })
     return out
 
 
@@ -162,4 +182,19 @@ def transcribe_gigaam(
         except OSError:
             pass
 
-    return {"segments": segments, "language": "ru", "duration": round(total_sec, 3)}
+    # Full transcribe_audio result contract: callers read ``text`` and
+    # ``language_probability`` directly (sync route, jobs, telemetry), so
+    # the adapter must carry them exactly like ``_build_result`` does —
+    # not leave them to ``.get()``-shaped Nones downstream.
+    joined_text = " ".join(
+        str(seg["text"]) for seg in segments if seg.get("text")
+    ).strip()
+    return {
+        "segments": segments,
+        "language": "ru",
+        # The engine is Russian-only by design: the language decision is
+        # deterministic, hence probability 1.0 (whisper semantics).
+        "language_probability": 1.0,
+        "duration": round(total_sec, 3),
+        "text": joined_text,
+    }
