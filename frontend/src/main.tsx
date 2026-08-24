@@ -392,6 +392,7 @@ type ModelCatalogPayload = {
     live_assist_models?: unknown;
     live_preview_models?: unknown;
     default_live_preview_model?: unknown;
+    engines?: Record<string, unknown>;
   };
   remote?: {
     openrouter?: { audio_models?: unknown; default_audio_model?: unknown };
@@ -651,6 +652,7 @@ let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
 let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "";
 let LOCAL_LIVE_ASSIST_MODELS: string[] = [];
 let LOCAL_LIVE_PREVIEW_MODELS: string[] = [];
+let LOCAL_ENGINE_AVAILABILITY: Record<string, boolean> = { whisper: true, gigaam: false };
 let DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = "";
 let OPENROUTER_AUDIO_MODELS: string[] = [];
 let DEFAULT_OPENROUTER_AUDIO_MODEL = "";
@@ -722,15 +724,20 @@ function syncLocalModelOptions(): void {
     ? preferred
     : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   sel.innerHTML = "";
+  const engineFor = (m: string): string =>
+    m.startsWith("gigaam-") ? "gigaam" : "whisper";
   for (const model of LOCAL_TRANSCRIPTION_MODELS) {
     const opt = document.createElement("option");
     opt.value = model;
-    opt.textContent = model;
+    const available = LOCAL_ENGINE_AVAILABILITY[engineFor(model)] !== false;
+    opt.textContent = available ? model : `${model} — engine not installed`;
+    opt.disabled = !available;
     sel.appendChild(opt);
   }
-  sel.value = LOCAL_TRANSCRIPTION_MODELS.includes(nextValue)
-    ? nextValue
-    : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+  const preferredAvailable =
+    LOCAL_TRANSCRIPTION_MODELS.includes(nextValue) &&
+    LOCAL_ENGINE_AVAILABILITY[engineFor(nextValue)] !== false;
+  sel.value = preferredAvailable ? nextValue : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
 }
 
 function applyHealthModelCatalog(catalog: unknown): void {
@@ -743,6 +750,13 @@ function applyHealthModelCatalog(catalog: unknown): void {
     DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
   );
   LOCAL_LIVE_ASSIST_MODELS = normalizeModelList(root.local?.live_assist_models, LOCAL_LIVE_ASSIST_MODELS);
+  const engines = root.local?.engines;
+  if (engines && typeof engines === "object") {
+    LOCAL_ENGINE_AVAILABILITY = { ...LOCAL_ENGINE_AVAILABILITY };
+    for (const [engine, available] of Object.entries(engines as Record<string, unknown>)) {
+      LOCAL_ENGINE_AVAILABILITY[engine] = available === true;
+    }
+  }
   LOCAL_LIVE_PREVIEW_MODELS = normalizeModelList(root.local?.live_preview_models, LOCAL_LIVE_PREVIEW_MODELS);
   DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = normalizeDefaultModel(
     root.local?.default_live_preview_model,

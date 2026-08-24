@@ -1,0 +1,4 @@
+# Optional Russian ASR engine (Sber GigaAM-v3).
+# Installed only when ENABLE_GIGAAM marker exists next to this file.
+# Pulls torch (~2 GB) into the APP VENV (userData/.venv) - never into the DMG.
+gigaam[torch] @ git+https://github.com/salute-developers/GigaAM.git

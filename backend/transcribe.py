@@ -16,6 +16,7 @@ import numpy as np
 # block backend startup. /api/health becomes responsive seconds earlier,
 # and any crash-restart loop pays the import only on first transcription.
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.model_catalog import GIGAAM_MODEL_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +320,17 @@ def transcribe_audio(
     # Accept either (n,) or (n,1)
     if audio_16k_mono.ndim == 2 and audio_16k_mono.shape[1] == 1:
         audio_16k_mono = audio_16k_mono[:, 0]
+
+    # Engine dispatch: GigaAM ids share the local-model catalog but run
+    # on Sber's Conformer stack, not faster-whisper.
+    if model_name.startswith(GIGAAM_MODEL_PREFIX):
+        from backend.transcribe_gigaam import transcribe_gigaam
+
+        return transcribe_gigaam(
+            audio_16k_mono,
+            model_name,
+            word_timestamps=word_timestamps,
+        )
 
     model = _model(model_name)
     try:

@@ -7,15 +7,34 @@ for first render and repeats it through /api/health for refreshes.
 
 from __future__ import annotations
 
-LOCAL_TRANSCRIPTION_MODELS: tuple[str, ...] = (
+from importlib.util import find_spec
+
+
+def gigaam_available() -> bool:
+    """True when the GigaAM engine can be imported in this runtime."""
+    return find_spec("gigaam") is not None and find_spec("torch") is not None
+
+
+WHISPER_LOCAL_MODELS: tuple[str, ...] = (
     "tiny",
     "base",
     "small",
     "medium",
     "large-v3",
 )
+# Sber GigaAM-v3 line: Russian-only ASR, state-of-the-art WER for ru.
+# Engine prefix "gigaam-" dispatches to backend/transcribe_gigaam.py;
+# availability depends on the `gigaam` package being installed in the
+# app venv (see requirements-gigaam.txt) — surfaced via /api/health.
+GIGAAM_MODELS: tuple[str, ...] = (
+    "gigaam-v3-e2e-rnnt",
+    "gigaam-v3-rnnt",
+)
+GIGAAM_MODEL_PREFIX = "gigaam-"
+
+LOCAL_TRANSCRIPTION_MODELS: tuple[str, ...] = WHISPER_LOCAL_MODELS + GIGAAM_MODELS
 DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small"
-LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = ("tiny", "base", "small")
+LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = ("tiny", "base", "small") + GIGAAM_MODELS[:1]
 LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = ("tiny", "base")
 DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
@@ -55,6 +74,9 @@ def health_model_catalog() -> dict[str, object]:
             "live_assist_models": list(LOCAL_LIVE_ASSIST_MODELS),
             "live_preview_models": list(LOCAL_LIVE_PREVIEW_MODELS),
             "default_live_preview_model": DEFAULT_LIVE_PREVIEW_LOCAL_MODEL,
+            # Engine id -> availability right now. The UI uses this to
+            # disable entries whose package the runtime does not carry.
+            "engines": {"whisper": True, "gigaam": gigaam_available()},
         },
         "remote": {
             "providers": list(REMOTE_TRANSCRIPTION_PROVIDERS),

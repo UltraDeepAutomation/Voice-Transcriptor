@@ -1,0 +1,2 @@
+# Opt-in flag for the optional GigaAM engine (see requirements-gigaam.txt).
+# Delete this file to skip the torch install on fresh runtimes.

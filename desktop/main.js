@@ -5291,6 +5291,28 @@ async function ensureBackendRuntime(python, repoRoot) {
     cwd: repoRoot, timeoutMs: 300000, env: buildPythonEnv(python)
   });
 
+  // Optional engine: GigaAM (Russian Sber ASR). Installed only when the
+  // ENABLE_GIGAAM marker sits next to requirements.txt; failure here is
+  // non-fatal — /api/health reports engine availability and the UI
+  // disables the model entries when absent.
+  const gigaamMarker = path.join(repoRoot, "ENABLE_GIGAAM");
+  if (fs.existsSync(gigaamMarker)) {
+    const gigaamReq = path.join(repoRoot, "requirements-gigaam.txt");
+    if (fs.existsSync(gigaamReq)) {
+      setBackendBootStatus("Installing GigaAM engine (large download)…");
+      appendMainLog("[backend-runtime] ENABLE_GIGAAM present; installing gigaam stack");
+      const gigaamArgs = ["-m", "pip", "install", "-r", gigaamReq];
+      if (!isAppVenv) gigaamArgs.splice(3, 0, "--user");
+      const gigaamInstall = await runCommand(python, gigaamArgs, {
+        cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
+      });
+      appendMainLog(
+        `[backend-runtime] gigaam install ${gigaamInstall.ok ? "ok" : "FAILED"}`
+        + (gigaamInstall.ok ? "" : `: ${(gigaamInstall.details || "").slice(0, 400)}`)
+      );
+    }
+  }
+
   if (!install.ok && !isAppVenv) {
     // Retry with --break-system-packages for macOS 14+ managed Python
     appendMainLog("[backend-runtime] retrying pip with --break-system-packages");
