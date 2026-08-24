@@ -797,3 +797,40 @@ a3d2be8. Уже исправленное (BUG-01..52) не переотчиты�
 
 ## Suspected — не чинится вслепую (нужны репро)
 - orphan-pool timing-jitter дубль; live watermark overshoot потеря слова; remote_deepgram null-transcript len(None); stitcher eps=0.05 over-drop; seam merge отрицательный gap; проба 20 c vs холодный torch; captive portal при офлайн-гейте; powerMonitor-ресинк хоткеев.
+
+---
+
+## Статус волны 2 (все группы выполнены, HEAD 8d5dca8)
+
+| Баг | Статус |
+|-----|--------|
+| BUG-53 | ✅ POST больше не ретранслируется на ReadTimeout (запрос мог быть обработан → двойное списание); ConnectTimeout ретраится; GET/PUT/DELETE — как раньше |
+| BUG-54 | ✅ set_config ловит RuntimeError шифрования → чистый 503 «config not saved» вместо сырого 500 |
+| BUG-55 | ✅ Text-only фоллбек ститчера срабатывает только когда слов нет ВООБЩЕ; рядом со словоносными сегментами шовный текст отбрасывается |
+| BUG-56 | ✅ create() ставит dataset.recordingKey — reconciler переиспользует строки, DOM-чурн каждые 2 с исчез |
+| BUG-57 | ✅ requestedModel снапшотится при enqueue (+retry), персистится (backend whitelist), при обработке гейтится на доступность с фолбэком |
+| BUG-58 | ✅ syncLocalModelOptions пересобирает опции только при изменении сигнатуры (доступность из /api/health) — открытый дропдаун не закрывается |
+| BUG-59 | ✅ Кап CONNECTING-буфера в выходных сэмплах (64 000 = 4 c), счётчик сбрасывается на flush/clear |
+| BUG-60 | ✅ Boot-sweep engine-site.old-*; клинап ретайра — WARN, не FAILED |
+| BUG-61 | ✅ Реестр trackedChildren в runCommand; killAllTrackedChildren на before-quit |
+| BUG-62 | ✅ backend.on("error") обнуляет мёртвый хэндл — retry/backoff снова работает |
+| BUG-63 | ✅ Claim загрузки модели атомарен под _lock — двойной клик не плодит воркеров |
+| BUG-64 | ✅ split_channels пишет через .tmp-<hex> + os.replace; caller регистрирует пути до вызова |
+| BUG-65 | ✅ set_progress монотонен |
+| BUG-66 | ✅ «image input» вместо «image»; upscale различает shape-ошибку и пустой текст |
+| BUG-67 | ✅ merge_seam_fragments мутирует только копии в out |
+| BUG-68 | ✅ _final_arrived.clear() перенесён ДО отправки Finalize (оба пути: основной и tail-guard retry) |
+| BUG-69 | ✅ Forced-flush ограничен asyncio.wait_for(30 s) |
+| BUG-70 | ✅ Per-model локи в адаптере GigaAM (SSOT с политикой transcribe.py) |
+| BUG-71 | ✅ pendingModelSelection снимается при status="error" |
+| BUG-72 | ✅ Таймер mic-acquire очищается через .finally — ни одного unhandled rejection |
+| BUG-73 | ✅ Гейты schema_version: live-draft (старшая → карантин), upload-queue (версия от сервера — SSOT backend UPLOAD_QUEUE_STATE_VERSION) |
+| BUG-74 | ✅ backendBootStatus реплеится на did-finish-load |
+| BUG-75 | ✅ packaging.test.js проверяет равенство версий desktop/frontend package.json |
+| BUG-76 | ✅ Маркер .install-complete пишется в staging после reconcile; проба требует маркер; boot поднимает полный staging (смерть между rename) и сносит неполный |
+
+Suspected-список (8 позиций) остаётся открытым сознательно: каждому нужен
+воспроизводимый репро-кейс, чинить вслепую — враньё, а не инженерия.
+
+Верификация волны 2: backend unittest 247+, frontend tsc+ESLint+vitest 60,
+desktop node --test 25 (включая новый version-drift тест) — все зелёные.
