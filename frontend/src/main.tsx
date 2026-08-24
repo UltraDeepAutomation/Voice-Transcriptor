@@ -1698,10 +1698,18 @@ async function renderLatestSavedAudio(): Promise<void> {
   if (!latestSavedAudioState) {
     // The player row is a permanent part of the Transcribe pane: with no
     // recording yet it renders as a disabled empty state, never hides.
+    // The seek thumb parks at the START (a dot at the beginning), and
+    // both time labels reset.
     audioEl.pause();
     audioEl.removeAttribute("src");
     audioEl.load();
     setPlayerEnabled(false);
+    const seekEl = document.getElementById("cpSeek") as HTMLInputElement | null;
+    const curEl = document.getElementById("cpCurrentTime") as HTMLSpanElement | null;
+    const durEl = document.getElementById("cpDuration") as HTMLSpanElement | null;
+    if (seekEl) seekEl.value = "0";
+    if (curEl) curEl.textContent = "0:00";
+    if (durEl) durEl.textContent = "0:00";
     metaEl.textContent = "No recording yet";
     return;
   }
@@ -11083,7 +11091,13 @@ updateRecordingCopyState();
 // the overlay with a user-actionable diagnosis.
 
 window.__setBackendBootStatus = (msg: string) => {
-  if (!msg) return;
+  if (!msg) {
+    // Empty message = boot finished successfully: retire the transient
+    // "Starting backend…" pill instead of leaving it stuck for the
+    // whole session.
+    setStatus("Ready", "info");
+    return;
+  }
   const statusEl = document.getElementById("bootOverlayStatus");
   if (statusEl) statusEl.textContent = msg;
   // Mirror into the topbar status pill as a secondary signal — some

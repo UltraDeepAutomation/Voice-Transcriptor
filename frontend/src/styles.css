@@ -3924,10 +3924,10 @@ canvas {
 .cp-seek {
   flex: 1;
   min-width: 60px;
-  height: 3px;
+  height: 5px;
   appearance: none;
   -webkit-appearance: none;
-  border-radius: 2px;
+  border-radius: 999px;
   background: var(--line);
   outline: none;
   cursor: pointer;

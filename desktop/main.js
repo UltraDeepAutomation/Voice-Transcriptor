@@ -6882,6 +6882,10 @@ async function createWindow(options = {}) {
     // runtime is typically <5 s; the budget just bounds the wait
     // before the catch branch surfaces a real error to the user.
     await waitForBackendHealth(`${BASE_URL}/api/health`, 60_000);
+    // Backend is up — clear the "Starting backend…" pill. Nothing ever
+    // cleared it before, so the amber chip lingered next to the green
+    // "Online" pill for the whole session (user-reported).
+    setBackendBootStatus("");
     // Backend is healthy — treat this as a successful recovery signal
     // and clear the restart-attempt counter. Without this reset the
     // counter only decayed on a clean `exit code 0`, which never fires
