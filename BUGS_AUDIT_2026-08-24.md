@@ -292,3 +292,30 @@ BUGS_AUDIT 19+BUG-20…23+W2-01…11), большинство типовых к�
 3. Группа C (фронт): BUG-27 (CSS + повторный зонд), BUG-29, BUG-30, BUG-31.
 4. Группа D (desktop): BUG-32, BUG-33, BUG-34, BUG-35, BUG-36.
 5. Группа E (доки): BUG-37.
+
+---
+
+## Статус исправлений (обновлено 2026-08-24, все группы выполнены)
+
+| Баг | Статус |
+|-----|--------|
+| BUG-24 | ✅ ИСПРАВЛЕН — `transcribe_file` диспетчит gigaam в адаптер (16 kHz mono WAV → float32 PCM), офф-контракт sample rate валится с понятной ошибкой; +2 теста |
+| BUG-25 | ✅ ИСПРАВЛЕН — `warm_model` диспетчит в новый `warm_gigaam()`; +1 тест |
+| BUG-26 | ✅ ИСПРАВЛЕН — адаптер эмитит faster-whisper конвенцию слов (первый токен без пробела, далее с ведущим); live-trim склейка корректна; +1 тест |
+| BUG-38 | ✅ ИСПРАВЛЕН — результат адаптера несёт `text` и `language_probability` (полный контракт `transcribe_audio`); покрыт тестом |
+| BUG-27 | ✅ ИСПРАВЛЕН — `grid-auto-rows: max-content` (корень: Chromium занижает intrinsic-оценку flex-карточки в auto-треке); верифицировано headless-зондом: ряд 314.3px, overflowов нет |
+| BUG-28 | ✅ ИСПРАВЛЕН — чанкеры перекрываются на 1.2 c; time-based ститчер оставляет полную копию слова, отбрасывая обрубки; +3 теста |
+| BUG-29 | ✅ ИСПРАВЛЕН — аплоад использует `selectedLocalModel()` (новый SSOT-геттер выбора) |
+| BUG-30 | ✅ ИСПРАВЛЕН — авто-применение ждёт `status === "done"` |
+| BUG-31 | ✅ ИСПРАВЛЕН — плейсхолдер «Loading models…» / «Model list unavailable — backend offline» (рендерится и на ошибке fetch) |
+| BUG-32 | ✅ ИСПРАВЛЕН — диагностика провала установки читает `stderr`/`stdout` |
+| BUG-33 | ✅ ИСПРАВЛЕН — гейт 8 GB через `fs.statfsSync`; при нехватке — внятный статус, установка не стартует |
+| BUG-34 | ✅ ИСПРАВЛЕН — boot-retention архивов лога: ≤10 штук и ≤50 MB, свежей архив не удаляется никогда |
+| BUG-35 | ✅ ИСПРАВЛЕН — пин `@7447938d…` + актуальный комментарий (engine-site) |
+| BUG-36 | ✅ ИСПРАВЛЕН — установка в свежий `engine-site.staging` → prune → атомарный rename-обмен; `--upgrade`-мусор невозможен структурно |
+| BUG-37 | ✅ ИСПРАВЛЕН — PROJECT_STRUCTURE.md синхронизирован (docs/, models_manager.py, transcribe_gigaam.py, requirements-gigaam.txt) |
+
+Верификация: backend 242 теста (unittest, bundled runtime), frontend tsc + ESLint
++ 60 тестов (vitest), desktop 15 тестов (node --test), headless-Electron зонд
+раскладки — всё зелёное.
+

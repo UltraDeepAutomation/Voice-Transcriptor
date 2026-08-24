@@ -9,14 +9,14 @@ Voice Transcriptor/
 ├── BUILD.command                  # macOS source build + install entrypoint
 ├── INSTALL.command                # macOS delegate / Linux AppImage source build
 ├── INSTALL_ON_OTHER_MAC.command   # target-Mac installer shipped inside macOS transfer zips
-├── INSTALL_OTHER_MAC.md           # target-Mac install and verification guide
 ├── README.md                      # install, build, development, troubleshooting
-├── VERIFIED_AUDIT.md              # verified bug audit and fix history
 ├── CHANGELOG.md                   # historical release notes
 ├── LICENSE                        # repository license
 ├── requirements.txt               # direct backend/runtime Python dependencies
+├── requirements-gigaam.txt        # optional GigaAM engine stack (ENABLE_GIGAAM opt-in)
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
 ├── .env.example                   # user-facing environment-variable SSOT
+├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
 ├── frontend/                      # Vite/TypeScript renderer
 └── desktop/                       # Electron shell and package config
@@ -26,7 +26,8 @@ Removed root clutter:
 
 - `INCONSISTENCIES.md` was an obsolete research snapshot and is no longer SSOT.
 - `desktop/README.md` duplicated stale desktop instructions and was removed.
-- `AUDIT_100_BUGS.md` was renamed to `VERIFIED_AUDIT.md` because the audit intentionally lists only verified real bugs.
+- `AUDIT_100_BUGS.md` was renamed to `VERIFIED_AUDIT.md` and moved to `docs/` because the audit intentionally lists only verified real bugs.
+- `INSTALL_OTHER_MAC.md` and the audit documents live under `docs/`, not the root.
 
 ## Backend
 
@@ -37,7 +38,9 @@ backend/
 ├── audio.py                   # ffmpeg/soundfile conversion and chunking
 ├── audio_constants.py         # shared audio constants
 ├── live.py                    # local live transcription session logic
-├── transcribe.py              # faster-whisper model cache and local transcription
+├── transcribe.py              # engine dispatch, faster-whisper model cache, local transcription
+├── transcribe_gigaam.py       # optional Sber GigaAM-v3 engine adapter (gigaam-* ids)
+├── models_manager.py          # local model presence/download manager (Settings → Local models)
 ├── remote_deepgram.py         # Deepgram prerecorded REST provider
 ├── remote_deepgram_live.py    # Deepgram live WebSocket provider
 ├── remote_openrouter.py       # OpenRouter audio transcription and text upscale
