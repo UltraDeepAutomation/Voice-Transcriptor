@@ -1,7 +1,9 @@
 # Optional Russian ASR engine (Sber GigaAM-v3).
-# Installed by desktop/main.js into userData/engine-site (never into the
-# signed bundle) when the ENABLE_GIGAAM marker exists next to
-# requirements.txt. Pinned to an upstream commit (BUG-35): a floating
-# git HEAD made every install non-reproducible and let an upstream push
-# break shipped apps. Bump the pin deliberately, with a smoke test.
+# Installed into userData/engine-site (never into the signed bundle) ONLY on
+# explicit user request: Settings -> Local models -> "Install engine"
+# (desktop/main.js installGigaamEngine). The ENABLE_GIGAAM marker next to
+# requirements.txt gates availability of that affordance; nothing installs
+# at boot. Pinned to an upstream commit (BUG-35): a floating git HEAD made
+# every install non-reproducible and let an upstream push break shipped
+# apps. Bump the pin deliberately, with a smoke test.
 gigaam[torch] @ git+https://github.com/salute-developers/GigaAM.git@7447938d791c4f3e643386ee22c33777004293a5

@@ -3,10 +3,21 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **Audit wave 2 (BUG-39..52)**: offline machines no longer stall boot on a pip attempt (engine install is never part of the boot path); a failed model-download request can no longer pin `#model` to an un-downloaded model; config loading survives an unusable encryption keyfile instead of raising; the model-manager card derives its button/state from row state in both create and update paths; dead full-audio WAV write removed from the GigaAM adapter; model download progress is byte-weighted; cancelling the download modal restores the previous model choice.
+- **GigaAM adapter contract**: empty-audio early return carries the full result shape (`text`, `language_probability`); model cache is LRU-capped (`TRANSCRIPTOR_GIGAAM_CACHE_SIZE`, default 1).
+- **Backend hygiene**: recordings cache-key probe moved off the event loop; recovery session-id fallback handles ids containing underscores.
+
+### Changed
+- **Engine install is user-initiated** (Settings → Local models → "Install engine"): explicit consent, network/disk gates, staged install with atomic swap, backend auto-restart after success. Boot never installs the engine.
+- **Dependency-overlap policy** (`desktop/engine-deps.js`): engine-site may only add names the pinned bundle lacks — every overlap is pruned when the bundle satisfies all declared requirements and fails the install loudly otherwise. Boot-time reconcile heals pre-existing dirty installs.
+
 ## [1.3.8] - 2026-08-24
 
 ### Fixed
-- **numpy shadowing**: the GigaAM stack installs its own numpy into engine-site, which would shadow the bundled runtime's pinned numpy for every import. The installer now prunes duplicate `numpy`/`ml_dtypes` after install — the bundle provides the single numpy; torch/gigaam are verified to run against it.
+- **numpy shadowing**: the GigaAM stack installs its own numpy into engine-site, which would shadow the bundled runtime's pinned numpy for every import. The installer now prunes duplicate `numpy`/`ml_dtypes` after install — the bundle provides the single numpy; torch/gigaam are verified to run against it. *(Superseded by the generalized overlap policy in Unreleased.)*
 
 ## [1.3.7] - 2026-08-24
 

@@ -15,6 +15,8 @@ Voice Transcriptor/
 ├── requirements.txt               # direct backend/runtime Python dependencies
 ├── requirements-gigaam.txt        # optional GigaAM engine stack (ENABLE_GIGAAM opt-in)
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
+├── BUGS_AUDIT.md                  # running audit ledger (2026-08-23 wave)
+├── BUGS_AUDIT_2026-08-24.md       # dated audit waves + fix statuses (root per audit charter)
 ├── .env.example                   # user-facing environment-variable SSOT
 ├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
@@ -66,14 +68,20 @@ Graph is dormant: no backend graph route is registered.
 
 ```text
 frontend/
-├── index.html              # renderer DOM shell; dormant Graph markup removed
-├── package.json            # frontend build dependencies/scripts
-├── tsconfig.json           # TypeScript config
-├── vite.config.ts          # Vite config and app-version injection
+├── index.html                        # renderer DOM shell; dormant Graph markup removed
+├── package.json                      # frontend build dependencies/scripts
+├── tsconfig.json                     # TypeScript config
+├── vite.config.ts                    # Vite config and app-version injection
 └── src/
-    ├── main.tsx            # renderer app logic
-    ├── styles.css          # renderer styles; Graph styles removed while dormant
-    └── pcm-worklet.js      # AudioWorklet PCM/VU processor
+    ├── main.tsx                      # renderer app logic
+    ├── styles.css                    # renderer styles; Graph styles removed while dormant
+    ├── pcm-worklet.js                # AudioWorklet PCM/VU processor
+    ├── text-match.ts                 # transcript word-normalisation SSOT (pure)
+    ├── transcript-merge.ts           # transcript adoption policy SSOT (pure)
+    ├── live-coverage.ts              # live-envelope reuse decision SSOT (pure)
+    ├── mic-health.ts                 # microphone-health FSM SSOT (clock-injected, pure)
+    ├── recordings-list-reconciler.ts # keyed DOM reconciler for the history list (pure)
+    └── update-check.ts               # GitHub release detection (Level 1), version compare (pure)
 ```
 
 Frontend owns:
@@ -90,8 +98,11 @@ Frontend owns:
 ```text
 desktop/
 ├── main.js                         # Electron main process, backend lifecycle, recording monitor, hotkeys
-├── preload.js                      # safe renderer bridge
+├── accelerator.js                  # accelerator canonicalisation SSOT (pure, node --test)
+├── engine-deps.js                  # GigaAM engine dependency-policy SSOT (pure, node --test)
+├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only)
 ├── package.json                    # electron-builder config and desktop scripts
+├── shortcut-defaults.json          # per-platform default hotkey manifest
 ├── afterPack.js                    # macOS bundle signing/runtime fixups
 ├── afterAllArtifactBuild.js        # macOS DMG artifact signing hook
 ├── unlockDist.js                   # build artifact lock cleanup
@@ -118,6 +129,9 @@ Desktop owns:
 - headless recording state monitor and global hotkey coordination.
 - auto-paste platform integrations.
 - log writing and non-destructive rotation.
+- GigaAM engine lifecycle: user-initiated install (Settings → Local models),
+  network/disk gates, staging+swap into userData/engine-site, overlap policy
+  against the pinned bundle (`engine-deps.js`), boot-time reconcile only.
 - bundled runtime packaging for macOS, Windows, and Linux.
 - Developer ID app/DMG signing handoff for notarization.
 - Mac App Store packaging, provisioning preflight, and TestFlight upload handoff.
