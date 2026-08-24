@@ -2211,6 +2211,13 @@ textarea:focus-visible,
   flex: 1;
   align-content: start;
   grid-auto-flow: row;
+  /* ``max-content`` tracks, NOT ``auto``: for an auto track Chromium
+     sizes a flex-container card by a fictitious flex layout that
+     under-reports its content (279px instead of 314px for Defaults),
+     so taller cards painted their inputs outside the card border over
+     the next row. max-content measures real content; the stretch below
+     still equalizes cards within a row (BUG-27, verified by probe). */
+  grid-auto-rows: max-content;
 }
 
 .card {
@@ -2249,12 +2256,14 @@ textarea:focus-visible,
 }
 
 /* Field-stack expands to fill the card body so short content stays
-   top-aligned and tall content can scroll if it overflows. Without
-   this the card-stretch rule above would leave a big empty gap
-   below the fields. */
+   top-aligned. NO ``min-height: 0`` here on purpose: it let the stack
+   shrink below its content inside a stretch-sized card, so the grid
+   row was sized by the SHORTER sibling card and taller content painted
+   outside its card over the next row (inputs escaping their containers
+   in Settings). Without the shrink allowance the row grows to fit the
+   tallest card; the settings grid scrolls as a whole (BUG-27). */
 .card .field-stack {
   flex: 1 1 auto;
-  min-height: 0;
 }
 
 .card-header-copy {
@@ -3837,6 +3846,11 @@ canvas {
   background: var(--surface-2, rgba(255, 255, 255, 0.04));
 }
 .model-row.ready { opacity: 0.92; }
+.model-row-empty {
+  background: transparent;
+  color: var(--text-dim, #9aa);
+  font-size: 12.5px;
+}
 .model-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-size { color: var(--text-dim, #9aa); font-variant-numeric: tabular-nums; }
 .model-state { min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }

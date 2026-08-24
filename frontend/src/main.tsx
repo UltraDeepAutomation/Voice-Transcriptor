@@ -743,6 +743,17 @@ function syncLocalModelOptions(): void {
   }
 }
 
+// Canonical reader of the user's local-model choice (SSOT): every flow
+// that sends a local transcription request — record, re-transcribe and
+// the upload queue — must go through this, not re-derive the value.
+function selectedLocalModel(): string {
+  const sel = document.getElementById("model") as HTMLSelectElement | null;
+  const value = (sel?.value || "").trim();
+  return LOCAL_TRANSCRIPTION_MODELS.includes(value)
+    ? value
+    : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+}
+
 type LocalModelRow = {
   key: string;
   id: string;
@@ -757,6 +768,7 @@ type LocalModelRow = {
 
 let localModelsCache: LocalModelRow[] = [];
 let localModelsTimer: number | null = null;
+let localModelsFetchFailed = false;
 let pendingModelSelection: string | null = null;
 let lastAppliedLocalModel = "";
 
@@ -772,6 +784,18 @@ function isLocalModelReady(id: string): boolean {
 function renderLocalModels(): void {
   const wrap = document.getElementById("localModelsTable");
   if (!wrap) return;
+  if (localModelsCache.length === 0) {
+    // Empty state (BUG-31): a blank card reads as "broken". Say what is
+    // happening instead. The reconciler drops this keyless node
+    // automatically once real rows arrive.
+    const placeholder = document.createElement("div");
+    placeholder.className = "model-row model-row-empty";
+    placeholder.textContent = localModelsFetchFailed
+      ? "Model list unavailable — backend offline"
+      : "Loading models…";
+    wrap.replaceChildren(placeholder);
+    return;
+  }
   for (const row of localModelsCache) row.key = `model:${row.id}`;
   reconcileRecordingsList(wrap, localModelsCache, {
     create: (row) => {
@@ -832,13 +856,16 @@ async function refreshLocalModels(): Promise<void> {
   try {
     const js = await apiGet<{ ok: boolean; models: LocalModelRow[] }>("/api/models/local");
     localModelsCache = Array.isArray(js.models) ? js.models : [];
+    localModelsFetchFailed = false;
     renderLocalModels();
     syncLocalModelOptions();
-    // A pending selection becomes real the moment its model lands.
+    // A pending selection becomes real the moment its model lands:
+    // the download worker finishes with status "done" (the only
+    // terminal success state the backend emits).
     if (
       pendingModelSelection &&
       isLocalModelReady(pendingModelSelection) &&
-      !findLocalModelRow(pendingModelSelection)?.status
+      findLocalModelRow(pendingModelSelection)?.status === "done"
     ) {
       const sel = document.getElementById("model") as HTMLSelectElement | null;
       if (sel) {
@@ -848,7 +875,11 @@ async function refreshLocalModels(): Promise<void> {
       pendingModelSelection = null;
     }
   } catch {
-    /* backend briefly down — next tick retries */
+    // BUG-31: surface the failure instead of leaving a blank table. A
+    // populated cache is kept (stale rows beat a flickering empty
+    // state); only the never-loaded case shows the placeholder.
+    localModelsFetchFailed = true;
+    if (localModelsCache.length === 0) renderLocalModels();
   }
   ensureLocalModelsPolling();
 }
@@ -11720,7 +11751,9 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     let saveAudioSourcePath = useSourcePath ? sourcePath : "";
     let consumeSaveAudioSourcePath = false;
     if (provider === "local") {
-      modelLabel = DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+      // The user's model choice governs uploads too (BUG-29): the
+      // hardcoded default silently downgraded large-v3/gigaam picks.
+      modelLabel = selectedLocalModel();
       const localOpts = {
         language: resolveFastLocalLanguage(language),
         model: modelLabel,
