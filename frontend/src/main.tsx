@@ -463,7 +463,25 @@ declare global {
      * preview and other unsupported contexts.
      */
     __transcriptorFilePathForFile?: (file: File) => string;
+    /**
+     * Engine lifecycle bridge (Electron main process). Absent in
+     * browser dev preview — every consumer must feature-check.
+     */
+    __transcriptorEngine?: {
+      getStatus: () => Promise<EngineInstallStatus>;
+      install: () => Promise<EngineInstallStatus & { ok?: boolean; status?: string }>;
+    };
   }
+}
+
+/** Phase of the desktop-side GigaAM engine install state machine. */
+type EngineInstallPhase = "idle" | "probing" | "installing" | "done" | "failed";
+
+interface EngineInstallStatus {
+  phase: EngineInstallPhase;
+  reason?: string;
+  error?: string;
+  startedAtMs?: number;
 }
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
@@ -786,6 +804,10 @@ let localModelsTimer: number | null = null;
 let localModelsFetchFailed = false;
 let pendingModelSelection: string | null = null;
 let lastAppliedLocalModel = "";
+// Desktop-side GigaAM engine install state machine mirror. Populated via
+// the __transcriptorEngine bridge; absent entirely in browser dev preview
+// where gigaam rows simply show their backend-reported note.
+let engineInstallState: EngineInstallStatus = { phase: "idle" };
 
 function findLocalModelRow(id: string): LocalModelRow | undefined {
   return localModelsCache.find((m) => m.id === id);
@@ -855,9 +877,28 @@ function renderLocalModels(): void {
       state.classList.remove("ok", "err");
     }
     // The button exists exactly when a download CAN be started from here:
-    // whisper engine, not on disk, and no download in flight.
-    const wantButton = !row.downloaded && row.engine === "whisper" && row.status !== "downloading";
+    // whisper engine, not on disk, and no download in flight. GigaAM rows
+    // get an ENGINE-install button instead — the engine is installed at
+    // the desktop layer, never via the backend model manager.
+    const installing = engineInstallState.phase === "installing" || engineInstallState.phase === "probing";
     let btn = card.querySelector<HTMLButtonElement>(".model-dl");
+    if (row.engine === "gigaam" && !row.downloaded) {
+      if (installing) {
+        btn?.remove();
+        state.textContent = "Installing engine…";
+        state.classList.remove("ok", "err");
+      } else if (!btn) {
+        btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn model-dl";
+        btn.textContent = "Install engine";
+        btn.dataset.engineInstall = "gigaam";
+        card.appendChild(btn);
+      }
+      card.classList.toggle("ready", false);
+      return;
+    }
+    const wantButton = !row.downloaded && row.engine === "whisper" && row.status !== "downloading";
     if (wantButton && !btn) {
       btn = document.createElement("button");
       btn.type = "button";
@@ -890,6 +931,7 @@ async function refreshLocalModels(): Promise<void> {
     localModelsFetchFailed = false;
     renderLocalModels();
     syncLocalModelOptions();
+    void syncEngineInstallState();
     // A pending selection becomes real the moment its model lands:
     // the download worker finishes with status "done" (the only
     // terminal success state the backend emits).
@@ -917,9 +959,11 @@ async function refreshLocalModels(): Promise<void> {
 
 function ensureLocalModelsPolling(): void {
   const anyDownloading = localModelsCache.some((m) => m.status === "downloading");
+  const engineInstalling =
+    engineInstallState.phase === "installing" || engineInstallState.phase === "probing";
   const settingsView = document.querySelector<HTMLElement>('.view[data-view="settings"]');
   const settingsVisible = !settingsView?.hidden;
-  if ((anyDownloading || settingsVisible) && localModelsTimer === null) {
+  if ((anyDownloading || engineInstalling || settingsVisible) && localModelsTimer === null) {
     localModelsTimer = window.setInterval(() => void refreshLocalModels(), 2000);
   } else if (!anyDownloading && !settingsVisible && localModelsTimer !== null) {
     window.clearInterval(localModelsTimer);
@@ -941,12 +985,82 @@ async function requestModelDownload(id: string): Promise<boolean> {
   }
 }
 
+// Engine install consent flag for the shared confirm modal. Distinct
+// from pendingModelSelection so one modal serves both flows without
+// overloading model ids with engine semantics.
+let pendingEngineInstall = false;
+
+async function requestEngineInstall(): Promise<void> {
+  const bridge = window.__transcriptorEngine;
+  if (!bridge) {
+    setStatus("Engine install is only available in the desktop app", "error");
+    return;
+  }
+  try {
+    const result = await bridge.install();
+    engineInstallState = result;
+    if (result.phase === "done") {
+      setStatus("GigaAM engine installed — restarting backend", "info");
+      await refreshLocalModels();
+    } else if (result.phase === "failed") {
+      const why = result.reason || result.error || "unknown error";
+      setStatus(`GigaAM engine install failed: ${why}`, "error");
+    }
+  } catch (e) {
+    setStatus(`Engine install failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+  }
+}
+
+/**
+ * Mirror the desktop engine-install state machine into renderer state.
+ * Called from the same poll cycle as the local-models table (2 s while
+ * Settings is visible, or while an install runs) — pull beats push here:
+ * no subscription lifecycle to leak across window reloads. Skipped when
+ * the bridge is absent (browser dev preview).
+ */
+async function syncEngineInstallState(): Promise<void> {
+  const bridge = window.__transcriptorEngine;
+  if (!bridge) return;
+  const needsWatch =
+    engineInstallState.phase === "installing" ||
+    engineInstallState.phase === "probing";
+  const anyGigaamPending = localModelsCache.some((m) => m.engine === "gigaam" && !m.downloaded);
+  if (!needsWatch && !anyGigaamPending) return;
+  try {
+    const next = await bridge.getStatus();
+    if (next.phase !== engineInstallState.phase) {
+      engineInstallState = next;
+      renderLocalModels();
+      if (next.phase === "done") {
+        // The main process restarts the backend on completion; the next
+        // health poll flips LOCAL_ENGINE_AVAILABILITY and enables the
+        // gigaam options. Nudge the first refresh immediately.
+        void refreshLocalModels();
+      }
+    } else {
+      engineInstallState = next;
+    }
+  } catch { /* transient IPC failure — retried on the next tick */ }
+}
+
 function wireLocalModelsUi(): void {
   const table = document.getElementById("localModelsTable");
   table?.addEventListener("click", (ev) => {
     const target = ev.target as HTMLElement | null;
     const id = target?.closest?.("[data-dl-model]")?.getAttribute("data-dl-model");
     if (id) void requestModelDownload(id);
+    // Engine install (GigaAM): desktop-layer action with explicit user
+    // consent — a multi-GB download must never start from a stray click.
+    if (target?.closest?.("[data-engine-install]")) {
+      pendingEngineInstall = true;
+      if (textEl) {
+        textEl.textContent =
+          "Install the Russian GigaAM engine? This downloads ~2 GB and needs "
+          + "8 GB of free disk space. The backend restarts when it finishes.";
+      }
+      if (modal) modal.hidden = false;
+      confirmBtn?.focus();
+    }
   });
 
   const modal = document.getElementById("modelDownloadModal");
@@ -955,6 +1069,7 @@ function wireLocalModelsUi(): void {
   const cancelBtn = document.getElementById("modelDownloadCancelBtn");
   const closeModal = (): void => {
     if (modal) modal.hidden = true;
+    pendingEngineInstall = false;
     pendingModelSelection = null;
     // BUG-45: Cancel must undo the whole interaction, not just hide the
     // dialog — restore the select to the last model the user actually
@@ -973,8 +1088,10 @@ function wireLocalModelsUi(): void {
     if (ev.target === modal) closeModal();
   });
   confirmBtn?.addEventListener("click", () => {
+    const engineRequested = pendingEngineInstall;
     const id = pendingModelSelection;
     closeModal();
+    if (engineRequested) void requestEngineInstall();
     if (id) void requestModelDownload(id).then((started) => {
       if (!started) return; // BUG-40: never pin on a failed request
       pendingModelSelection = id; // applied automatically once ready

@@ -5283,35 +5283,81 @@ function broadcastBackendBootError() {
 }
 
 /**
- * Optional engine installer: GigaAM (Sber Russian ASR).
+ * Optional engine: GigaAM (Sber Russian ASR).
  *
- * Runs whenever ENABLE_GIGAAM exists next to requirements.txt AND the
- * current interpreter cannot import gigaam — INDEPENDENT of the
- * requirements.txt reinstall branch. That branch is skipped entirely
- * when the venv already passes its import check, which would have left
- * existing installs unable to ever fetch the engine.
+ * Lifecycle is USER-INITIATED (Settings → Local models → "Install
+ * engine"), never boot-initiated: a multi-gigabyte pip run behind the
+ * backend spawn wedged first-use for minutes and could not be cancelled.
+ * ENABLE_GIGAAM next to requirements.txt remains the build-level feature
+ * switch — it now gates AVAILABILITY of the Install affordance, not an
+ * automatic download. The pure decision logic lives in ./engine-deps
+ * (SSOT, unit-tested); this file owns orchestration only.
  */
-/**
- * Post-install dedupe: the engine stack drags its own numpy, which
- * shadows the bundled runtime's pinned numpy for EVERY import (engine
- * or not) once engine-site hits PYTHONPATH. Verified live: bundle
- * numpy 2.0.2 satisfies torch 2.13 + gigaam, so the duplicate goes.
- */
-const ENGINE_SITE_PRUNE_PREFIXES = ["numpy", "ml_dtypes"];
+const engineDeps = require("./engine-deps");
 
-function sanitizeEngineSite(siteDir) {
-  try {
-    for (const name of fs.readdirSync(siteDir)) {
-      if (!ENGINE_SITE_PRUNE_PREFIXES.some((p) => name === p || name.startsWith(`${p}-`))) {
-        continue;
-      }
-      try {
-        fs.rmSync(path.join(siteDir, name), { recursive: true, force: true });
-        appendMainLog(`[gigaam-install] pruned duplicate ${name} from engine-site`);
-      } catch { /* non-fatal */ }
-    }
-  } catch { /* non-fatal */ }
+// Interpreter sys.path query: authoritative site-packages location for
+// ANY runtime (bundled, app-venv, dev venv, system) without path guessing.
+const SITE_PACKAGES_QUERY = [
+  "import json, sysconfig",
+  "print(json.dumps(sysconfig.get_paths()['purelib']))",
+].join("; ");
+const _sitePackagesCache = new Map(); // python path -> purelib dir | null
+
+async function resolveSitePackagesDir(python, repoRoot) {
+  if (_sitePackagesCache.has(python)) return _sitePackagesCache.get(python);
+  const check = await runCommand(python, ["-c", SITE_PACKAGES_QUERY], {
+    cwd: repoRoot, timeoutMs: 15000, env: buildPythonEnv(python),
+  });
+  const dir = check.ok ? (check.stdout || "").trim() : "";
+  const value = dir && fs.existsSync(dir) ? dir : null;
+  _sitePackagesCache.set(python, value);
+  return value;
 }
+
+function readDistInfoInventory(dir) {
+  try {
+    return engineDeps.distInfoInventory(() => fs.readdirSync(dir));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Overlap policy enforcement (BUG-46): prune every engine-site copy of a
+ * package the release-pinned bundle also ships, UNLESS the bundle copy
+ * fails a requirement some engine distribution declares — then report a
+ * CONFLICT instead of silently winning or losing the import-resolution
+ * race. `mode` distinguishes hard failure (fresh install) from boot-time
+ * reconciliation of a pre-existing dirty engine-site (log-only).
+ */
+async function reconcileEngineSiteWithBundle(siteDir, python, repoRoot, mode) {
+  const bundleSite = await resolveSitePackagesDir(python, repoRoot);
+  if (!bundleSite || !fs.existsSync(siteDir)) return { ok: true, conflicts: [] };
+  const staged = readDistInfoInventory(siteDir);
+  const bundle = readDistInfoInventory(bundleSite);
+  const needs = engineDeps.collectRequirementIndex(siteDir, fs);
+  const { prune, conflicts } = engineDeps.planEngineSitePrune({ staged, bundle, needs });
+  for (const name of prune) {
+    // Dist-info inventory keys are import names; on disk the directory
+    // may use underscores. Remove both spellings defensively.
+    for (const spelling of new Set([name, name.replace(/-/g, "_")])) {
+      const distInfo = `${siteDir}/${spelling}-${staged[name]}.dist-info`;
+      try {
+        if (fs.existsSync(distInfo)) {
+          fs.rmSync(distInfo, { recursive: true, force: true });
+          appendMainLog(`[engine-policy] pruned duplicate ${name} (${staged[name]}) — bundle ${bundle[name]} satisfies all declared needs`);
+        }
+      } catch { /* non-fatal: shadowing risk logged below */ }
+    }
+  }
+  if (conflicts.length > 0) {
+    const report = conflicts.map((c) => `${c.name}: need ${c.required}, bundle has ${c.have}`).join("; ");
+    appendMainLog(`[engine-policy] OVERLAP CONFLICTS (${mode}): ${report}`);
+    return { ok: mode === "reconcile", conflicts };
+  }
+  return { ok: true, conflicts: [] };
+}
+
 
 // BUG-39: pip's failure mode on an offline / captive-portal machine is
 // minutes of TCP retries per package URL. A bounded connect probe to the
@@ -5337,97 +5383,189 @@ function probeTcpReachable(host, port, timeoutMs = 2500) {
 async function isEngineInstallNetworkAvailable() {
   // Sequential by design: an offline machine fails the first probe fast
   // and never touches the second; an online machine pays one extra RTT.
-  if (!(await probeTcpReachable("pypi.org", 443))) return false;
-  if (!(await probeTcpReachable("github.com", 443))) return false;
+  for (const { host, port } of engineDeps.ENGINE_NETWORK_HOSTS) {
+    if (!(await probeTcpReachable(host, port))) return false;
+  }
   return true;
 }
 
-async function installGigaamEngineIfRequested(python, repoRoot) {
+// ── Engine install lifecycle (user-initiated, single-flight) ─────────
+//
+// State is the SSOT for every surface: IPC "engine:get-status" returns
+// this snapshot verbatim, and every phase transition is logged. The
+// renderer never learns about pip internals — only phases and a reason.
+const engineInstall = {
+  phase: engineDeps.ENGINE_INSTALL_PHASES.IDLE,
+  reason: "",
+  error: "",
+  startedAtMs: 0,
+  inFlight: null,
+};
+
+function setEnginePhase(phase, fields = {}) {
+  engineInstall.phase = phase;
+  engineInstall.reason = String(fields.reason ?? "");
+  engineInstall.error = String(fields.error ?? "");
+  if (phase === engineDeps.ENGINE_INSTALL_PHASES.INSTALLING) {
+    engineInstall.startedAtMs = Date.now();
+  }
+}
+
+function engineInstallSnapshot() {
+  return {
+    phase: engineInstall.phase,
+    reason: engineInstall.reason,
+    error: engineInstall.error,
+    startedAtMs: engineInstall.startedAtMs,
+  };
+}
+
+function broadcastEngineStatus() {
+  const snapshot = engineInstallSnapshot();
+  for (const win of BrowserWindow.getAllWindows()) {
+    try { win.webContents.send("engine:status", snapshot); } catch { /* closing */ }
+  }
+}
+
+async function probeGigaamImportable(python, repoRoot) {
+  const probe = await runCommand(python, ["-c", "import gigaam"], {
+    cwd: repoRoot, timeoutMs: 20000, env: buildPythonEnv(python),
+  });
+  return probe.ok;
+}
+
+/**
+ * Install the GigaAM engine stack on explicit user request.
+ *
+ * Gates run in cheapest-first order (marker → already-installed →
+ * network → disk). The pip run targets a staging dir which is then
+ * policy-pruned against the bundle (BUG-46 invariant) and swapped in
+ * atomically (BUG-36); on success the backend is hard-restarted so the
+ * CURRENT session picks the engine up via PYTHONPATH without an app
+ * relaunch — the existing crash-restart machinery owns the respawn.
+ */
+async function installGigaamEngine(python, repoRoot) {
+  if (engineInstall.inFlight) {
+    return { ok: false, status: "already-running", ...engineInstallSnapshot() };
+  }
+  const marker = path.join(repoRoot, "ENABLE_GIGAAM");
+  if (!fs.existsSync(marker)) {
+    return { ok: false, status: "disabled", reason: "engine feature not enabled in this build" };
+  }
+  const req = path.join(repoRoot, "requirements-gigaam.txt");
+  if (!fs.existsSync(req)) {
+    return { ok: false, status: "disabled", reason: "requirements-gigaam.txt missing" };
+  }
+
+  setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.PROBING);
+  broadcastEngineStatus();
+
+  if (await probeGigaamImportable(python, repoRoot)) {
+    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE, { reason: "already installed" });
+    broadcastEngineStatus();
+    return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
+  }
+
+  engineInstall.inFlight = (async () => {
+    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.INSTALLING);
+    broadcastEngineStatus();
+    appendMainLog("[engine-install] started (user request)");
+
+    try {
+      // Network gate first: ~2.5 s worst case offline, versus minutes of
+      // pip retries for a result we can predict (see BUG-39).
+      if (!(await isEngineInstallNetworkAvailable())) {
+        throw Object.assign(new Error("offline"), { userReason: "no network access" });
+      }
+      // Disk gate (BUG-33): constants are the SSOT values from engine-deps.
+      try {
+        const st = fs.statfsSync(path.dirname(getEngineSiteDir()));
+        const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
+        if (freeBytes < BigInt(engineDeps.ENGINE_MIN_FREE_BYTES)) {
+          const gb = Math.floor(Number(freeBytes / (1024 * 1024 * 1024)));
+          throw Object.assign(
+            new Error(`only ${gb} GB free, need ${engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3)} GB`),
+            { userReason: `insufficient disk space (${gb} GB free, 8 GB needed)` },
+          );
+        }
+      } catch (e) {
+        if (e.userReason) throw e;
+        appendMainLog(`[engine-install] free-space check failed (${e?.message || e}); proceeding`);
+      }
+
+      // Staging + swap (BUG-36): --target upgrades never remove replaced
+      // files; a fresh staging dir swapped in with two renames is the
+      // canonical pip pattern.
+      const engineSite = getEngineSiteDir();
+      const staging = `${engineSite}.staging`;
+      fs.rmSync(staging, { recursive: true, force: true });
+      fs.mkdirSync(staging, { recursive: true });
+      let res;
+      try {
+        res = await runCommand(python, ["-m", "pip", "install", "--target", staging, "-r", req], {
+          cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python),
+        });
+      } catch (e) {
+        res = { ok: false, stderr: e?.message || String(e), stdout: "" };
+      }
+      if (!res || !res.ok) {
+        // BUG-32 class: real diagnostics come from stderr, not a phantom field.
+        throw new Error(`pip failed: ${(res?.stderr || res?.stdout || "").slice(0, 400)}`);
+      }
+
+      // BUG-46 invariant: engine-site may only ADD names. Overlap with
+      // the release-pinned bundle is pruned when provably safe and ABORTS
+      // the install when not.
+      const reconcile = await reconcileEngineSiteWithBundle(staging, python, repoRoot, "install");
+      if (!reconcile.ok) {
+        throw new Error(
+          "dependency overlap cannot be resolved safely: "
+          + reconcile.conflicts.map((c) => `${c.name} needs ${c.required}, bundle ships ${c.have}`).join("; "),
+        );
+      }
+
+      const retired = `${engineSite}.old-${Date.now()}`;
+      if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
+      fs.renameSync(staging, engineSite);
+      fs.rmSync(retired, { recursive: true, force: true });
+
+      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
+      appendMainLog("[engine-install] ok (engine-site swapped)");
+
+      // Activate NOW: killing the backend makes the exit handler respawn
+      // it with the refreshed PYTHONPATH — no app relaunch needed.
+      if (backend && !isQuitting) {
+        appendMainLog("[engine-install] restarting backend to activate engine");
+        killBackendHard("gigaam-engine-installed");
+      }
+    } catch (e) {
+      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, {
+        reason: e.userReason || "",
+        error: e?.message || String(e),
+      });
+      appendMainLog(`[engine-install] FAILED: ${e.userReason ? `${e.userReason} — ` : ""}${e?.message || e}`);
+      try { fs.rmSync(`${getEngineSiteDir()}.staging`, { recursive: true, force: true }); } catch { /* best effort */ }
+    } finally {
+      engineInstall.inFlight = null;
+      broadcastEngineStatus();
+    }
+  })();
+
+  return engineInstall.inFlight.then(() => ({ ok: engineInstall.phase === engineDeps.ENGINE_INSTALL_PHASES.DONE, ...engineInstallSnapshot() }));
+}
+
+/**
+ * Boot-time reconciliation ONLY: heal a pre-existing dirty engine-site
+ * (installed before the BUG-46 policy existed) by pruning provably-safe
+ * overlaps. Never installs, never aborts boot; conflicts are logged for
+ * release engineering instead of silently shadowing pinned versions.
+ */
+async function reconcileEngineSiteAtBoot(python, repoRoot) {
   const marker = path.join(repoRoot, "ENABLE_GIGAAM");
   if (!fs.existsSync(marker)) return;
-  const req = path.join(repoRoot, "requirements-gigaam.txt");
-  if (!fs.existsSync(req)) return;
-
-  const probe = await runCommand(python, ["-c", "import gigaam"], {
-    cwd: repoRoot, timeoutMs: 20000, env: buildPythonEnv(python)
-  });
-  if (probe.ok) return;
-
-  setBackendBootStatus("Installing GigaAM engine (large download)…");
-  appendMainLog("[backend-runtime] ENABLE_GIGAAM present and gigaam importable=false; installing stack");
-
-  // BUG-39: network gate. The stack needs PyPI (wheels) AND github.com
-  // (the pinned GigaAM git checkout). Offline, pip would spend its whole
-  // retry budget here — minutes of wedged boot per launch for a result we
-  // can predict in ~2.5 s. Skip now; the engine simply shows unavailable
-  // and the next online launch retries the install.
-  if (!(await isEngineInstallNetworkAvailable())) {
-    appendMainLog(
-      "[backend-runtime] gigaam install SKIPPED: pypi.org/github.com unreachable " +
-      "(offline or captive portal); will retry on a future launch"
-    );
-    setBackendBootStatus("GigaAM not installed: no network access");
-    return;
-  }
-
-  // Disk-space gate (BUG-33): the stack downloads ~2 GB and unpacks to
-  // ~6-7 GB, plus pip's cache copy mid-install. An ENOSPC halfway leaves
-  // a half-written engine-site that fails `import gigaam` on EVERY
-  // launch, re-triggering this multi-minute install each boot. 8 GB is
-  // the verified ceiling with headroom; skipping the install degrades
-  // gracefully (engine shows unavailable) instead of wedging the boot.
   const engineSite = getEngineSiteDir();
-  const GIGAAM_MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024;
-  try {
-    const st = fs.statfsSync(path.dirname(engineSite));
-    const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
-    if (freeBytes < BigInt(GIGAAM_MIN_FREE_BYTES)) {
-      appendMainLog(
-        `[backend-runtime] gigaam install SKIPPED: only ${Math.floor(Number(freeBytes / (1024 * 1024 * 1024)))} GB free, need ${GIGAAM_MIN_FREE_BYTES / (1024 * 1024 * 1024)} GB`
-      );
-      setBackendBootStatus("GigaAM not installed: insufficient disk space (8 GB needed)");
-      return;
-    }
-  } catch (e) {
-    // statfs unavailable/failing is not a reason to block: proceed and
-    // let pip surface a real ENOSPC with the diagnostics below.
-    appendMainLog(`[backend-runtime] gigaam free-space check failed (${e?.message || e}); proceeding`);
-  }
-
-  // Staging + swap (BUG-36): `pip install --target DIR --upgrade`
-  // overwrites but never REMOVES files of replaced versions, so stale
-  // modules accumulate in engine-site across upstream updates. Install
-  // into a fresh staging dir and swap it in with two renames — the
-  // canonical pip pattern for --target upgrades.
-  const staging = `${engineSite}.staging`;
-  try {
-    fs.rmSync(staging, { recursive: true, force: true });
-    fs.mkdirSync(staging, { recursive: true });
-    const args = [
-      "-m", "pip", "install",
-      "--target", staging,
-      "-r", req,
-    ];
-    const res = await runCommand(python, args, {
-      cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
-    });
-    if (!res.ok) {
-      appendMainLog(
-        `[backend-runtime] gigaam install FAILED`
-        + `: ${(res.stderr || res.stdout || "").slice(0, 400)}` // BUG-32: .details never existed
-      );
-      return;
-    }
-    sanitizeEngineSite(staging);
-    const retired = `${engineSite}.old-${Date.now()}`;
-    if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
-    fs.renameSync(staging, engineSite);
-    fs.rmSync(retired, { recursive: true, force: true });
-    appendMainLog("[backend-runtime] gigaam install ok (engine-site swapped)");
-  } catch (e) {
-    appendMainLog(`[backend-runtime] gigaam install FAILED: ${e?.message || e}`);
-    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
+  if (!fs.existsSync(path.join(engineSite, "gigaam"))) return;
+  await reconcileEngineSiteWithBundle(engineSite, python, repoRoot, "reconcile");
 }
 
 async function ensureBackendRuntime(python, repoRoot) {
@@ -5438,7 +5576,11 @@ async function ensureBackendRuntime(python, repoRoot) {
   );
 
   if (importCheck.ok) {
-    await installGigaamEngineIfRequested(python, repoRoot);
+    // Engine installs are USER-initiated (Settings → Local models), never
+    // boot-initiated: a boot-time pip run wedged first-use for minutes and
+    // could not be declined. Boot only reconciles an existing engine-site
+    // against the pinned bundle (BUG-46 heal, log-only).
+    await reconcileEngineSiteAtBoot(python, repoRoot);
     return { ok: true };
   }
 
@@ -5506,9 +5648,8 @@ async function ensureBackendRuntime(python, repoRoot) {
     cwd: repoRoot, timeoutMs: 300000, env: buildPythonEnv(python)
   });
 
-  // Optional engine handled by installGigaamEngineIfRequested above —
-  // it must also run when requirements reinstall is skipped.
-  await installGigaamEngineIfRequested(python, repoRoot);
+  // The optional engine is NOT installed here: installs are user-initiated
+  // from Settings (installGigaamEngine). Boot never blocks on pip.
 
   if (!install.ok && !isAppVenv) {
     // Retry with --break-system-packages for macOS 14+ managed Python
@@ -6967,6 +7108,25 @@ app.whenReady().then(async () => {
   cleanupStaleTranscriptTmpFiles();
   recoverOrphanRotatingLogs();
   pruneMainLogArchives();
+
+  // Engine lifecycle IPC (Settings → Local models). Handlers are
+  // registered once, before any window exists, so the very first render
+  // can already query status. invoke-only: the renderer never receives
+  // raw ipcRenderer and cannot initiate arbitrary channels.
+  const { ipcMain } = require("electron");
+  ipcMain.handle("engine:get-status", () => engineInstallSnapshot());
+  ipcMain.handle("engine:install", async () => {
+    const repoRoot = getRepoRoot();
+    try {
+      const python = await resolvePython(repoRoot);
+      if (!python) return { ok: false, status: "no-python", reason: "no usable Python runtime" };
+      return await installGigaamEngine(python, repoRoot);
+    } catch (e) {
+      appendMainLog(`[engine-install] handler error: ${e?.message || e}`);
+      return { ok: false, status: "error", error: e?.message || String(e) };
+    }
+  });
+
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
     ensureMacDockPresence("ready");

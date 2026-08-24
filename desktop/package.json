@@ -44,6 +44,7 @@
     "files": [
       "main.js",
       "accelerator.js",
+      "engine-deps.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",
