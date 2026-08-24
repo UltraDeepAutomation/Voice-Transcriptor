@@ -1638,6 +1638,13 @@ async function fetchSavedAudioFromBackend(
   return new File([audioBlob], filename, { type: mimeType });
 }
 
+function setPlayerEnabled(enabled: boolean): void {
+  for (const id of ["cpPlayBtn", "cpSeek"]) {
+    const el = document.getElementById(id) as HTMLButtonElement | HTMLInputElement | null;
+    if (el) el.disabled = !enabled;
+  }
+}
+
 async function renderLatestSavedAudio(): Promise<void> {
   const renderSeq = ++currentRecordingAudioRenderSeq;
   const row = $("currentRecordingAudioRow");
@@ -1689,10 +1696,13 @@ async function renderLatestSavedAudio(): Promise<void> {
   revokeCurrentRecordingAudioUrl();
 
   if (!latestSavedAudioState) {
-    row.hidden = true;
+    // The player row is a permanent part of the Transcribe pane: with no
+    // recording yet it renders as a disabled empty state, never hides.
+    audioEl.pause();
     audioEl.removeAttribute("src");
     audioEl.load();
-    metaEl.textContent = "";
+    setPlayerEnabled(false);
+    metaEl.textContent = "No recording yet";
     return;
   }
 
@@ -1741,14 +1751,16 @@ async function renderLatestSavedAudio(): Promise<void> {
       : "session-file";
   }
   if (!playbackUrl) {
-    row.hidden = true;
+    audioEl.pause();
     audioEl.removeAttribute("src");
     audioEl.load();
-    metaEl.textContent = "";
+    setPlayerEnabled(false);
+    metaEl.textContent = "Audio unavailable";
     return;
   }
   // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
   // free it later. Media never receives the persistent API token in URL.
+  setPlayerEnabled(true);
   currentRecordingAudioObjectUrl = playbackUrl;
   currentRecordingAudioSourceKey = playbackSourceKey;
   audioEl.src = playbackUrl;
@@ -1814,8 +1826,7 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
   const seek = document.getElementById("cpSeek") as HTMLInputElement | null;
   const cur = document.getElementById("cpCurrentTime") as HTMLSpanElement | null;
   const dur = document.getElementById("cpDuration") as HTMLSpanElement | null;
-  const muteBtn = document.getElementById("cpMuteBtn") as HTMLButtonElement | null;
-  if (!audio || !playBtn || !seek || !cur || !dur || !muteBtn) return;
+  if (!audio || !playBtn || !seek || !cur || !dur) return;
   const fmt = (t: number): string => {
     if (!Number.isFinite(t)) return "0:00";
     const m = Math.floor(t / 60);
@@ -1846,11 +1857,6 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
   });
   seek.addEventListener("pointerdown", () => { seekDragging = true; });
   seek.addEventListener("pointerup", () => { seekDragging = false; });
-  muteBtn.addEventListener("click", () => {
-    audio.muted = !audio.muted;
-    muteBtn.textContent = audio.muted ? "🔇" : "🔊";
-    muteBtn.setAttribute("aria-label", audio.muted ? "Unmute" : "Mute");
-  });
   syncPlayIcon();
 })();
 
@@ -4194,7 +4200,16 @@ async function loadMics(forceReload = false): Promise<void> {
   }
 }
 
-($("refreshMicsBtn") as HTMLButtonElement).addEventListener("click", () => void loadMics(true));
+// Mic list refreshes when the dropdown is OPENED (the reload button is
+    // gone from the topbar). Debounced: getUserMedia re-probe is expensive
+    // and spaming it on every open would flicker the device list.
+let lastMicProbeAt = 0;
+($("micSelect") as HTMLSelectElement).addEventListener("pointerdown", () => {
+  const now = Date.now();
+  if (now - lastMicProbeAt < 3000) return;
+  lastMicProbeAt = now;
+  void loadMics(true);
+});
 
 const WAVE_METER_INTERVAL_MS = 50;
 const PIPELINE_FAILSAFE_MS = 10_000;

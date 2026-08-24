@@ -273,10 +273,6 @@
                 <select id="micSelect">
                   <option value="">Select mic</option>
                 </select>
-                <button class="icon-btn mic-refresh-btn" id="refreshMicsBtn" type="button" aria-label="Reload microphones"
-                  title="Reload microphones">
-                  <span class="refresh-ico" aria-hidden="true"></span>
-                </button>
               </div>
             </label>
             <label class="top-item top-item-lang">
@@ -372,7 +368,7 @@
 
             <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
 
-            <div class="pane-footer current-audio-row" id="currentRecordingAudioRow" hidden>
+            <div class="pane-footer current-audio-row" id="currentRecordingAudioRow">
               <!-- Custom app-styled player (native <audio controls>
                    looked like a web widget). The <audio> element stays
                    hidden as the media engine; controls below drive it. -->
@@ -381,7 +377,6 @@
                 <span class="cp-time" id="cpCurrentTime">0:00</span>
                 <input type="range" class="cp-seek" id="cpSeek" min="0" max="1000" value="0" aria-label="Seek" />
                 <span class="cp-time cp-dur" id="cpDuration">0:00</span>
-                <button class="cp-btn cp-mute" id="cpMuteBtn" type="button" aria-label="Mute">🔊</button>
                 <audio id="currentRecordingAudio" preload="auto" style="display:none"></audio>
               </div>
               <button class="icon-btn" id="retranscribeBtn" type="button"
