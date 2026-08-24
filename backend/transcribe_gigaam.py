@@ -22,6 +22,7 @@ signature compatibility and pinned to ru semantics upstream.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 import logging
 import tempfile
 import threading
@@ -36,6 +37,13 @@ logger = logging.getLogger(__name__)
 # Upstream hard limit is 25 s; stay clear of it so encoder padding and
 # rounding never push a request past the boundary.
 GIGAAM_MAX_CHUNK_SEC = 20.0
+# Sequential chunks overlap so a word straddling a cut is decoded whole
+# by at least one chunk; the stitcher then keeps the best (longest)
+# copy and drops truncated fragments and duplicates.
+GIGAAM_CHUNK_OVERLAP_SEC = 1.2
+# Two word timings closer than this are the same word seen from two
+# chunks; anything less is RNNT boundary jitter between distinct words.
+GIGAAM_WORD_DEDUPE_EPSILON_SEC = 0.05
 
 _MODEL_CACHE: Dict[str, Any] = {}
 _MODEL_LOCK = threading.Lock()
@@ -92,11 +100,61 @@ def _chunk_bounds(total_sec: float) -> list[tuple[float, float]]:
         return [(0.0, total_sec)]
     bounds: list[tuple[float, float]] = []
     t = 0.0
+    step = GIGAAM_MAX_CHUNK_SEC - GIGAAM_CHUNK_OVERLAP_SEC
     while t < total_sec - 1e-6:
         end = min(t + GIGAAM_MAX_CHUNK_SEC, total_sec)
         bounds.append((t, end))
-        t = end
+        if end >= total_sec - 1e-6:
+            break
+        t = end - GIGAAM_CHUNK_OVERLAP_SEC
     return bounds
+
+
+def _merge_overlapping_words(chunk_word_lists: list[list[dict]]) -> list[dict]:
+    """Stitch absolute-time words across overlapped chunks.
+
+    A word cut by a chunk boundary is decoded whole by at least one of
+    the overlapping chunks; truncated fragments and re-decoded copies
+    overlap it in time. Greedy accept in (start, longest-duration) order
+    keeps the best copy and drops everything temporally overlapping an
+    already-accepted word. Words that merely touch (end == next start)
+    are distinct and survive the epsilon guard.
+    """
+    tagged: list[tuple[float, float, float, int, dict]] = []
+    for chunk_idx, words in enumerate(chunk_word_lists):
+        for w in words:
+            w["_chunk"] = chunk_idx
+            start = float(w["start"])
+            end = float(w["end"])
+            tagged.append((start, -(end - start), end, chunk_idx, w))
+    # (start, -duration) sorts full words ahead of truncated copies at
+    # the same onset; the trailing end/chunk_idx keep the sort total.
+    tagged.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+
+    # Accepted words are kept sorted by start. A candidate can only
+    # overlap words that START inside [start - max_word_len, end]; the
+    # max word length is bounded by the chunk length, which bounds the
+    # bisect window and keeps the stitch near-linear in practice.
+    accepted_starts: list[float] = []
+    accepted_ends: list[float] = []
+    accepted: list[dict] = []
+    for start, _neg, end, _idx, w in tagged:
+        lo = bisect_left(accepted_starts, start - GIGAAM_MAX_CHUNK_SEC)
+        hi = bisect_right(accepted_starts, end)
+        overlap = False
+        for i in range(lo, hi):
+            a_start = accepted_starts[i]
+            a_end = accepted_ends[i]
+            if min(a_end, end) - max(a_start, start) > GIGAAM_WORD_DEDUPE_EPSILON_SEC:
+                overlap = True
+                break
+        if overlap:
+            continue
+        pos = bisect_left(accepted_starts, start)
+        accepted.insert(pos, w)
+        accepted_starts.insert(pos, start)
+        accepted_ends.insert(pos, end)
+    return accepted
 
 
 def _words_from_result(result: Any, offset: float) -> list[dict]:
@@ -146,10 +204,12 @@ def transcribe_gigaam(
         return {"segments": [], "language": "ru", "duration": 0.0}
 
     model = _load_model(model_id)
-    segments: list[dict[str, Any]] = []
+    bounds = _chunk_bounds(total_sec)
+    chunk_word_lists: list[list[dict]] = []
+    chunk_texts: list[str] = []
     wav_path = _write_wav(audio)
     try:
-        for start, end in _chunk_bounds(total_sec):
+        for start, end in bounds:
             lo = int(start * 16000)
             hi = int(end * 16000)
             chunk_path = _write_wav(audio[lo:hi])
@@ -160,27 +220,46 @@ def transcribe_gigaam(
                     chunk_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-            text = str(getattr(result, "text", "") or "").strip()
-            seg_words = _words_from_result(result, offset=start) if word_timestamps else []
-            if not text and not seg_words:
-                continue
-            seg_start = start
-            if seg_words:
-                seg_start = min(seg_start, seg_words[0]["start"])
-                seg_end = max(end, seg_words[-1]["end"])
-            else:
-                seg_end = end
-            segments.append({
-                "start": round(seg_start, 3),
-                "end": round(min(seg_end, total_sec), 3),
-                "text": text,
-                **({"words": seg_words} if seg_words else {}),
-            })
+            # Words are requested from the model UNCONDITIONALLY (they
+            # are cheap for RNNT): the stitcher needs absolute times to
+            # dedupe the overlapped chunk boundaries even when the
+            # caller asked for text only.
+            chunk_word_lists.append(_words_from_result(result, offset=start))
+            chunk_texts.append(str(getattr(result, "text", "") or "").strip())
     finally:
         try:
             wav_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    accepted = _merge_overlapping_words(chunk_word_lists)
+    by_chunk: dict[int, list[dict]] = {}
+    for w in accepted:
+        by_chunk.setdefault(w.pop("_chunk"), []).append(w)
+
+    segments: list[dict[str, Any]] = []
+    for idx, owned in by_chunk.items():
+        seg_text = "".join(str(w["word"]) for w in owned).strip()
+        if not seg_text:
+            continue
+        segments.append({
+            "start": owned[0]["start"],
+            "end": max(float(w["end"]) for w in owned),
+            "text": seg_text,
+            **({"words": owned} if word_timestamps else {}),
+        })
+    # Defensive: a chunk that returned text but no word timings cannot
+    # take part in time-based dedupe — keep its text verbatim rather
+    # than silently dropping speech.
+    for idx, text in enumerate(chunk_texts):
+        if text and idx not in by_chunk:
+            start, end = bounds[idx]
+            segments.append({
+                "start": round(start, 3),
+                "end": round(min(end, total_sec), 3),
+                "text": text,
+            })
+    segments.sort(key=lambda seg: float(seg["start"]))
 
     # Full transcribe_audio result contract: callers read ``text`` and
     # ``language_probability`` directly (sync route, jobs, telemetry), so
