@@ -873,12 +873,6 @@ class DeepgramLiveSession:
         never hypothesised — the honest residual, not the recoverable
         loss it used to be.
         """
-        # Orphans join retained words: both are unconfirmed hypotheses;
-        # the same covered/discarded/consumed rules apply to each.
-        candidates = self._interim_words + self._orphan_interim_words
-        if not candidates:
-            return 0
-
         def union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
             merged: list[tuple[float, float]] = []
             for start, end in sorted(s for s in spans if s[1] > s[0]):
@@ -897,10 +891,43 @@ class DeepgramLiveSession:
             center = (word["start"] + word["end"]) / 2.0
             return any(c_start < center < c_end for c_start, c_end in covered)
 
-        survivors = sorted(
-            (w for w in candidates if not is_covered(w)),
-            key=lambda w: (w["start"], w["end"]),
-        )
+        # Orphan-vs-interim dedupe (BUG-78): a word displaced to the
+        # orphan pool can be re-emitted by a LATER interim at shifted
+        # times — the rolling re-decode moves word boundaries, and the
+        # range-overlap purge in the interim handler only catches small
+        # shifts. Both copies would survive `is_covered` and the splice
+        # would emit the same spoken word twice. Same alpha core +
+        # majority temporal overlap = the same word; the interim copy
+        # wins (newer hypothesis). Legit repeats ("да, да") have
+        # disjoint times and survive.
+        interim_words_norm = [
+            (w, _token_alpha_core(str(w.get("word") or "")))
+            for w in self._interim_words
+        ]
+
+        def _is_shifted_orphan_duplicate(orphan: dict) -> bool:
+            token = _token_alpha_core(str(orphan.get("word") or ""))
+            if not token:
+                return False
+            o_start, o_end = float(orphan["start"]), float(orphan["end"])
+            o_dur = max(o_end - o_start, 1e-6)
+            for w, w_token in interim_words_norm:
+                if w_token != token:
+                    continue
+                w_start, w_end = float(w["start"]), float(w["end"])
+                overlap = min(o_end, w_end) - max(o_start, w_start)
+                if overlap > 0.5 * min(o_dur, max(w_end - w_start, 1e-6)):
+                    return True
+            return False
+
+        candidates_deduped = [
+            w for w in self._orphan_interim_words
+            if not _is_shifted_orphan_duplicate(w)
+        ]
+        candidates = self._interim_words + candidates_deduped
+        if not candidates:
+            self._orphan_interim_words = []
+            return 0
         # Hypotheses are consumed exactly once: whether they were
         # spliced or judged covered-and-discarded here, keeping them
         # would let a second finalize() call splice duplicates.
@@ -912,6 +939,10 @@ class DeepgramLiveSession:
                 "deepgram-live: splice pool included %d orphaned interim words",
                 orphan_count,
             )
+        survivors = sorted(
+            (w for w in candidates if not is_covered(w)),
+            key=lambda w: (w["start"], w["end"]),
+        )
         if not survivors:
             return 0
 

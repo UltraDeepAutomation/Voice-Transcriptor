@@ -92,6 +92,42 @@ class OrphanPoolTests(unittest.TestCase):
         s._process_deepgram_message(_final_msg(0.0, 4.0, "всё подтвердилось"))
         self.assertEqual(s._orphan_interim_words, [])
 
+    def test_splice_dedupes_shifted_orphan_copy_against_new_interim(self):
+        # BUG-78: a word displaced to the orphan pool, then re-decoded by
+        # a newer interim at SHIFTED times (boundary moved beyond the
+        # range-overlap purge), must not be spliced twice.
+        s = self._session()
+        s._process_deepgram_message(
+            _msg(0.0, 2.0, "привет", [_w("привет", 1.0, 1.8)])
+        )
+        # Newer hypothesis re-decodes the same spoken word at a shifted
+        # boundary (1.35..2.05 does not overlap 1.0..1.8 by enough for
+        # the interim-handler purge to drop the orphan copy).
+        s._process_deepgram_message(
+            _msg(0.5, 3.0, "привет мир", [_w("привет", 1.35, 2.05), _w("мир", 2.2, 2.6)])
+        )
+        spliced = s._splice_uncovered_interim_words()
+        texts = [str(seg.get("text") or "") for seg in s._finalized_segments]
+        joined = " ".join(texts)
+        self.assertEqual(joined.count("привет"), 1, f"word duplicated in splice: {joined!r}")
+        # Legit repeat with DISJOINT times is not deduped away.
+        self.assertIn("мир", joined)
+        self.assertGreaterEqual(spliced, 2)
+
+    def test_splice_keeps_legitimate_disjoint_repeats(self):
+        s = self._session()
+        s._process_deepgram_message(
+            _msg(0.0, 2.0, "да", [_w("да", 1.0, 1.4)])
+        )
+        s._process_deepgram_message(
+            _msg(5.0, 7.0, "да", [_w("да", 6.0, 6.4)])
+        )
+        s._splice_uncovered_interim_words()
+        joined = " ".join(
+            str(seg.get("text") or "") for seg in s._finalized_segments
+        )
+        self.assertEqual(joined.count("да"), 2, "a genuinely repeated word was wrongly deduped")
+
 
 if __name__ == "__main__":
     unittest.main()

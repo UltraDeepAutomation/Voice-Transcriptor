@@ -249,7 +249,11 @@ def deepgram_transcribe(
         # Fallback to flat transcript
         if not text:
             if alternatives:
-                text = alternatives[0].get("transcript", "")
+                # ``or ""`` is load-bearing (BUG-77): a literal JSON null
+                # passes .get's default (it only fires on a MISSING key),
+                # and the None reached len(text) below — outside this
+                # try — as an unhandled TypeError → raw 500.
+                text = alternatives[0].get("transcript") or ""
     except (KeyError, IndexError, TypeError) as e:
         # 1.1.25: previously ``pass``-swallowed without context. A
         # Deepgram schema change (rename/restructure of channels/

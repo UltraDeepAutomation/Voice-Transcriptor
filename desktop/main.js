@@ -5406,13 +5406,48 @@ function probeTcpReachable(host, port, timeoutMs = 2500) {
   });
 }
 
+/**
+ * HTTPS reachability probe (BUG-80): a captive portal ACCEPTS TCP but
+ * intercepts HTTP and breaks TLS (its own cert), so a TCP-only gate
+ * waved the install straight into a minute of pip SSL failures. A
+ * certificate-validated HTTPS request is the smallest probe a portal
+ * cannot fake.
+ */
+function probeHttpsReachable(url, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    try {
+      const { net } = require("electron");
+      const request = net.request({ method: "HEAD", url });
+      const timer = setTimeout(() => {
+        try { request.abort(); } catch { }
+        resolve(false);
+      }, timeoutMs);
+      request.on("response", (response) => {
+        clearTimeout(timer);
+        // Any real TLS-validated HTTP response — even 403 from a
+        // blocked path — proves the pipe is not portal-intercepted.
+        resolve(response.statusCode >= 200);
+      });
+      request.on("error", () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+      request.end();
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 async function isEngineInstallNetworkAvailable() {
   // Sequential by design: an offline machine fails the first probe fast
   // and never touches the second; an online machine pays one extra RTT.
   for (const { host, port } of engineDeps.ENGINE_NETWORK_HOSTS) {
     if (!(await probeTcpReachable(host, port))) return false;
   }
-  return true;
+  // TCP says a pipe exists; TLS says it is the real internet and not a
+  // captive portal that would fail pip mid-download (BUG-80).
+  return probeHttpsReachable("https://pypi.org/simple/", 4000);
 }
 
 // ── Engine install lifecycle (user-initiated, single-flight) ─────────
@@ -5454,8 +5489,13 @@ function broadcastEngineStatus() {
 }
 
 async function probeGigaamImportable(python, repoRoot) {
+  // 60 s (BUG-79): the first `import gigaam` in a runtime pays the full
+  // torch + CUDA-libs load; on cold caches with AV scanning (Windows)
+  // that legitimately exceeds 20 s, and a false negative here made the
+  // "already installed" gate fail — offering a pointless multi-GB
+  // reinstall of a working engine.
   const probe = await runCommand(python, ["-c", "import gigaam"], {
-    cwd: repoRoot, timeoutMs: 20000, env: buildPythonEnv(python),
+    cwd: repoRoot, timeoutMs: 60000, env: buildPythonEnv(python),
   });
   return probe.ok;
 }
@@ -7474,7 +7514,22 @@ app.whenReady().then(async () => {
     if (!shortcutsSuspendedForCapture) return;
     shortcutsSuspendedForCapture = false;
     appendMainLog(`[shortcuts] settings capture aborted by ${reason}; restoring registered shortcuts`);
-    registerGlobalShortcuts();
+  registerGlobalShortcuts();
+
+  // Re-claim global shortcuts after system resume (BUG-81): while the
+  // machine slept, another application may have registered the same
+  // accelerators and the OS may have dropped ours. registerGlobalShortcuts
+  // is idempotent (unregister-then-register), so a resume re-claim is
+  // safe and restores hotkeys that silently died with the sleep cycle.
+  const { powerMonitor } = require("electron");
+  powerMonitor.on("resume", () => {
+    appendMainLog("[power] resume — re-registering global shortcuts");
+    try {
+      registerGlobalShortcuts();
+    } catch (e) {
+      appendMainLog(`[power] shortcut re-register failed: ${e?.message || e}`);
+    }
+  });
   }
 
   function registerGlobalShortcuts(override = null) {
