@@ -13,6 +13,14 @@ import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { reconcileRecordingsList } from "./recordings-list-reconciler";
 import { livePaneDisplayText } from "./live-pane";
 import {
+  buildTranscriptionCatalog,
+  groupFromWire,
+  isLocalGroup,
+  wireProviderForGroup,
+  type TranscriptionGroupId,
+  type TranscriptionGroup,
+} from "./transcription-catalog";
+import {
   countWords,
   normalizeComparable,
   normalizeTranscriptWhitespace,
@@ -81,7 +89,7 @@ interface AppConfig {
       // Mirrored into the same ``preferences.ui`` namespace as the
       // Live tab keys (``provider``, ``language``) — separate keys so
       // the two tabs don't fight over the same value.
-      upload_provider?: string;
+      provider_group?: string;
       upload_language?: string;
       upload_diarize?: boolean;
     };
@@ -388,6 +396,8 @@ type ShortcutDefaultsManifest = {
 type ModelCatalogPayload = {
   local?: {
     models?: unknown;
+    whisper_models?: unknown;
+    gigaam_models?: unknown;
     default_model?: unknown;
     live_assist_models?: unknown;
     live_preview_models?: unknown;
@@ -675,6 +685,12 @@ let LOCAL_LIVE_ASSIST_MODELS: string[] = [];
 let LOCAL_LIVE_PREVIEW_MODELS: string[] = [];
 let LOCAL_ENGINE_AVAILABILITY: Record<string, boolean> = { whisper: true, gigaam: false };
 let DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = "";
+// Explicit engine taxonomy from /api/health (SSOT for provider groups).
+let LOCAL_WHISPER_MODELS: string[] = [];
+let LOCAL_GIGAAM_MODELS: string[] = [];
+// Last local group the user had selected — remote selections must not
+// lose it, so fallback paths keep a valid local engine.
+let lastLocalGroup: "local-whisper" | "gigaam" = "local-whisper";
 let OPENROUTER_AUDIO_MODELS: string[] = [];
 let DEFAULT_OPENROUTER_AUDIO_MODEL = "";
 let DEEPGRAM_AUDIO_MODELS: string[] = [];
@@ -737,67 +753,135 @@ function normalizeUpscaleModelOptions(value: unknown, fallback: UpscaleModelOpti
   return out.length ? out : fallback.slice();
 }
 
-function syncLocalModelOptions(): void {
-  const sel = document.getElementById("model") as HTMLSelectElement | null;
-  if (!sel) return;
-  const engineFor = (m: string): string =>
-    m.startsWith("gigaam-") ? "gigaam" : "whisper";
-  // Idempotent rebuild (BUG-58): this runs on every 2 s poll tick, and a
-  // blind `innerHTML = ""` closed the user's open dropdown every time.
-  // Rebuild only when the option set actually changed (availability is
-  // the only thing /api/health can flip at runtime).
-  const signature = LOCAL_TRANSCRIPTION_MODELS.map(
-    (m) => `${m}:${LOCAL_ENGINE_AVAILABILITY[engineFor(m)] !== false ? "1" : "0"}`
-  ).join("|");
-  const currentSignature = Array.from(sel.options)
-    .map((o) => `${o.value}:${o.disabled ? "0" : "1"}`)
-    .join("|");
-  const needsRebuild = signature !== currentSignature;
-  const preferred = (pendingModelSelection || sel.value || "").trim();
-  const nextValue = LOCAL_TRANSCRIPTION_MODELS.includes(preferred)
-    ? preferred
-    : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  if (needsRebuild) {
-    sel.innerHTML = "";
-    for (const model of LOCAL_TRANSCRIPTION_MODELS) {
-      const opt = document.createElement("option");
-      opt.value = model;
-      const available = LOCAL_ENGINE_AVAILABILITY[engineFor(model)] !== false;
-      opt.textContent = available ? model : `${model} — engine not installed`;
-      opt.disabled = !available;
-      sel.appendChild(opt);
+// ── Unified transcription selection (SSOT) ───────────────────────────
+//
+// ONE state drives every transcription-model surface: the Transcribe
+// toolbar, the Upload mirror toolbar, the live preview's derived assist
+// model, and every request builder. The taxonomy comes from
+// transcription-catalog.ts (backend /api/health is the upstream SSOT);
+// these selects are VIEWS — never re-derive provider groups or model
+// lists from the DOM.
+
+let uiProviderGroup: TranscriptionGroupId | "" = "local-whisper";
+const uiModelByGroup: Record<string, string> = {};
+let transcriptionCatalogCache: TranscriptionGroup[] | null = null;
+
+function splitLocalModels(): { whisper: string[]; gigaam: string[] } {
+  return {
+    whisper: LOCAL_TRANSCRIPTION_MODELS.filter((m) => !m.startsWith("gigaam-")),
+    gigaam: LOCAL_TRANSCRIPTION_MODELS.filter((m) => m.startsWith("gigaam-")),
+  };
+}
+
+function transcriptionCatalog(): TranscriptionGroup[] {
+  if (!transcriptionCatalogCache) {
+    const split = splitLocalModels();
+    transcriptionCatalogCache = buildTranscriptionCatalog({
+      whisperModels: LOCAL_WHISPER_MODELS.length ? LOCAL_WHISPER_MODELS : split.whisper,
+      gigaamModels: LOCAL_GIGAAM_MODELS.length ? LOCAL_GIGAAM_MODELS : split.gigaam,
+      engines: LOCAL_ENGINE_AVAILABILITY,
+      deepgramModels: DEEPGRAM_AUDIO_MODELS,
+      openrouterModels: OPENROUTER_AUDIO_MODELS,
+    });
+  }
+  return transcriptionCatalogCache;
+}
+
+function invalidateTranscriptionCatalog(): void {
+  transcriptionCatalogCache = null;
+}
+
+/**
+ * Render BOTH toolbars (Transcribe + Upload mirror) from the single
+ * state. Idempotent rebuild (BUG-58 pattern): options are rewritten only
+ * when their value:availability signature changes, so the 2 s health
+ * poll never closes an open dropdown.
+ */
+function renderTranscriptionSelectors(): void {
+  const groups = transcriptionCatalog();
+  for (const id of ["providerSelect", "uploadProviderMirror"]) {
+    const sel = document.getElementById(id) as HTMLSelectElement | null;
+    if (!sel) continue;
+    const signature = groups
+      .map((g) => `${g.id}:${g.models.some((m) => m.available) ? "1" : "0"}`)
+      .join("|");
+    const current = Array.from(sel.options)
+      .map((o) => `${o.value}:${o.disabled ? "0" : "1"}`)
+      .join("|");
+    if (signature !== current) {
+      sel.innerHTML = "";
+      for (const g of groups) {
+        const opt = document.createElement("option");
+        opt.value = g.id;
+        opt.textContent = g.label;
+        opt.disabled = !g.models.some((m) => m.available);
+        sel.appendChild(opt);
+      }
+      // "None" (no transcription) is a Transcribe-toolbar concept; the
+      // Upload mirror always transcribes.
+      if (id === "providerSelect") {
+        const none = document.createElement("option");
+        none.value = "";
+        none.textContent = "None";
+        sel.appendChild(none);
+      }
     }
+    if (uiProviderGroup) sel.value = uiProviderGroup;
   }
-  const preferredAvailable =
-    LOCAL_TRANSCRIPTION_MODELS.includes(nextValue) &&
-    LOCAL_ENGINE_AVAILABILITY[engineFor(nextValue)] !== false;
-  if (pendingModelSelection) {
-    // A modal decision is in flight (or a confirmed download is running):
-    // the select must keep showing the last APPLIED model, never the
-    // pending un-downloaded candidate — otherwise one failed download
-    // POST would silently re-point every record/upload/re-transcribe
-    // request at a model that is not on disk (BUG-40), and Cancel could
-    // not restore what the user actually had (BUG-45).
-    const applied = lastAppliedLocalModel;
-    sel.value =
-      LOCAL_TRANSCRIPTION_MODELS.includes(applied) &&
-      LOCAL_ENGINE_AVAILABILITY[engineFor(applied)] !== false
-        ? applied
-        : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-    return;
-  }
-  sel.value = preferredAvailable ? nextValue : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  if (preferredAvailable) {
-    lastAppliedLocalModel = sel.value;
+  const group = groups.find((g) => g.id === uiProviderGroup) || null;
+  for (const id of ["remoteModelSelect", "uploadModelMirror"]) {
+    const sel = document.getElementById(id) as HTMLSelectElement | null;
+    if (!sel) continue;
+    if (!group) {
+      sel.hidden = true;
+      continue;
+    }
+    sel.hidden = false;
+    const signature = group.models
+      .map((m) => `${m.id}:${m.available ? "1" : "0"}`)
+      .join("|");
+    const current = Array.from(sel.options)
+      .map((o) => `${o.value}:${o.disabled ? "0" : "1"}`)
+      .join("|");
+    if (signature !== current) {
+      sel.innerHTML = "";
+      for (const m of group.models) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.available ? m.label : `${m.label} — engine not installed`;
+        opt.disabled = !m.available;
+        sel.appendChild(opt);
+      }
+    }
+    sel.value = uiModelByGroup[group.id] || group.models[0]?.id || "";
   }
 }
 
-// Canonical reader of the user's local-model choice (SSOT): every flow
-// that sends a local transcription request — record, re-transcribe and
-// the upload queue — must go through this, not re-derive the value.
+/** Single writer for the unified selection. */
+function setTranscriptionSelection(group: TranscriptionGroupId | "", model?: string): void {
+  uiProviderGroup = group;
+  if (group && model) uiModelByGroup[group] = model;
+  renderTranscriptionSelectors();
+  queueUiPreferencesSave();
+  if (isLocalGroup(group)) scheduleLocalWarmup();
+}
+
+function readProviderGroup(): TranscriptionGroupId | "" {
+  return uiProviderGroup;
+}
+
+function readProviderSelection(): Provider {
+  return wireProviderForGroup(uiProviderGroup) as Provider;
+}
+
+// Canonical reader of the user's local-model choice: every flow that
+// sends a LOCAL transcription request — record, re-transcribe and the
+// upload queue — must go through this, not re-derive the value. When a
+// remote group is selected it still reports the last local model, so
+// fallback paths (remote provider down → local) keep a valid engine.
 function selectedLocalModel(): string {
-  const sel = document.getElementById("model") as HTMLSelectElement | null;
-  const value = (sel?.value || "").trim();
+  const localGroup = isLocalGroup(uiProviderGroup) ? uiProviderGroup : lastLocalGroup;
+  const value = (uiModelByGroup[localGroup || "local-whisper"] || "").trim();
   return LOCAL_TRANSCRIPTION_MODELS.includes(value)
     ? value
     : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
@@ -819,7 +903,6 @@ let localModelsCache: LocalModelRow[] = [];
 let localModelsTimer: number | null = null;
 let localModelsFetchFailed = false;
 let pendingModelSelection: string | null = null;
-let lastAppliedLocalModel = "";
 // Desktop-side GigaAM engine install state machine mirror. Populated via
 // the __transcriptorEngine bridge; absent entirely in browser dev preview
 // where gigaam rows simply show their backend-reported note.
@@ -950,7 +1033,7 @@ async function refreshLocalModels(): Promise<void> {
     localModelsCache = Array.isArray(js.models) ? js.models : [];
     localModelsFetchFailed = false;
     renderLocalModels();
-    syncLocalModelOptions();
+    invalidateTranscriptionCatalog(); renderTranscriptionSelectors();
     void syncEngineInstallState();
     // A pending selection becomes real the moment its model lands:
     // the download worker finishes with status "done" (the only
@@ -960,11 +1043,12 @@ async function refreshLocalModels(): Promise<void> {
       isLocalModelReady(pendingModelSelection) &&
       findLocalModelRow(pendingModelSelection)?.status === "done"
     ) {
-      const sel = document.getElementById("model") as HTMLSelectElement | null;
-      if (sel) {
-        sel.value = pendingModelSelection;
-        sel.dispatchEvent(new Event("change"));
-      }
+      // Apply through the SSOT: the group stays whatever it is (the
+      // downloaded model's group becomes the selection), both toolbars
+      // re-render from the single state.
+      const group = pendingModelSelection.startsWith("gigaam-") ? "gigaam" : "local-whisper";
+      setTranscriptionSelection(group, pendingModelSelection);
+      lastLocalGroup = group;
       pendingModelSelection = null;
     }
     // A pending pin whose download ENDED IN ERROR must not survive
@@ -977,7 +1061,7 @@ async function refreshLocalModels(): Promise<void> {
       findLocalModelRow(pendingModelSelection)?.status === "error"
     ) {
       pendingModelSelection = null;
-      syncLocalModelOptions();
+      invalidateTranscriptionCatalog(); renderTranscriptionSelectors();
     }
   } catch {
     // BUG-31: surface the failure instead of leaving a blank table. A
@@ -1102,18 +1186,12 @@ function wireLocalModelsUi(): void {
   const closeModal = (): void => {
     if (modal) modal.hidden = true;
     pendingEngineInstall = false;
+    // The unified selection state is only mutated on a CONFIRMED,
+    // successful download (auto-apply in refreshLocalModels), so Cancel
+    // has nothing to restore — the BUG-45 stale-select class cannot
+    // exist when the selects are views of the SSOT rather than its
+    // source.
     pendingModelSelection = null;
-    // BUG-45: Cancel must undo the whole interaction, not just hide the
-    // dialog — restore the select to the last model the user actually
-    // applied, so a later syncLocalModelOptions cannot re-pin the
-    // un-downloaded candidate from the stale select value.
-    const sel = document.getElementById("model") as HTMLSelectElement | null;
-    if (sel && !isLocalModelReady(sel.value)) {
-      sel.value =
-        LOCAL_TRANSCRIPTION_MODELS.includes(lastAppliedLocalModel)
-          ? lastAppliedLocalModel
-          : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-    }
   };
   cancelBtn?.addEventListener("click", closeModal);
   modal?.addEventListener("click", (ev) => {
@@ -1130,18 +1208,16 @@ function wireLocalModelsUi(): void {
     });
   });
 
-  const sel = document.getElementById("model") as HTMLSelectElement | null;
-  if (sel) {
-    lastAppliedLocalModel = sel.value || "";
-    sel.addEventListener("change", () => {
-      const value = sel.value;
-      if (isLocalModelReady(value)) {
-        lastAppliedLocalModel = value;
-        return;
-      }
+  const modelSel = document.getElementById("remoteModelSelect") as HTMLSelectElement | null;
+  if (modelSel) {
+    modelSel.addEventListener("change", () => {
+      const value = modelSel.value;
+      if (isLocalModelReady(value)) return;
+      // Not on disk yet: keep the candidate visible in the VIEW while
+      // the modal asks, but the SSOT state itself only mutates after a
+      // confirmed, successful download (auto-apply above) — the
+      // BUG-45 stale-select class cannot exist when selects are views.
       const rowSize = findLocalModelRow(value)?.size_hint_bytes;
-      pendingModelSelection = value;
-      sel.value = lastAppliedLocalModel || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
       if (textEl) {
         textEl.textContent =
           `${value} is not on this machine yet`
@@ -1158,6 +1234,8 @@ function applyHealthModelCatalog(catalog: unknown): void {
   if (!catalog || typeof catalog !== "object") return;
   const root = catalog as ModelCatalogPayload;
   LOCAL_TRANSCRIPTION_MODELS = normalizeModelList(root.local?.models, LOCAL_TRANSCRIPTION_MODELS);
+  LOCAL_WHISPER_MODELS = normalizeModelList(root.local?.whisper_models, []);
+  LOCAL_GIGAAM_MODELS = normalizeModelList(root.local?.gigaam_models, []);
   DEFAULT_LOCAL_TRANSCRIPTION_MODEL = normalizeDefaultModel(
     root.local?.default_model,
     LOCAL_TRANSCRIPTION_MODELS,
@@ -1218,8 +1296,8 @@ function applyHealthModelCatalog(catalog: unknown): void {
     }
   }
 
-  syncLocalModelOptions();
-  syncRemoteModelOptions();
+  invalidateTranscriptionCatalog(); renderTranscriptionSelectors();
+  renderTranscriptionSelectors();
   populateUpscaleModelOptions();
 }
 
@@ -1809,10 +1887,6 @@ function normalizeProviderSelection(value: unknown, fallback: Provider = "local"
     return provider as Provider;
   }
   return fallback;
-}
-
-function readProviderSelection(): Provider {
-  return normalizeProviderSelection(($("providerSelect") as HTMLSelectElement).value, "local");
 }
 
 const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
@@ -3229,14 +3303,14 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
 function getRemoteModelValue(provider: Provider): string {
   if (!provider) return "";
   if (provider === "openrouter") {
-    const v = (remoteModelByProvider.openrouter || "").trim();
+    const v = (uiModelByGroup.openrouter || remoteModelByProvider.openrouter || "").trim();
     return v || DEFAULT_OPENROUTER_AUDIO_MODEL;
   }
   if (provider === "deepgram") {
-    const v = (remoteModelByProvider.deepgram || "").trim();
+    const v = (uiModelByGroup.deepgram || remoteModelByProvider.deepgram || "").trim();
     return v || DEFAULT_DEEPGRAM_AUDIO_MODEL;
   }
-  return ($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+  return selectedLocalModel();
 }
 
 function appendRemoteModelFormFields(fd: FormData, provider: Provider, model: string | undefined): void {
@@ -3256,58 +3330,6 @@ function remoteModelJsonFields(provider: Provider, model: string | undefined): R
     remote_model: value,
     openrouter_model: value,
   };
-}
-
-function syncLiveLocalModelVisibility(): void {
-  const provider = readProviderSelection();
-  const effective = resolveEffectiveProvider(provider);
-  const group = document.getElementById("liveLocalModelGroup");
-  const toolbarRow = document.getElementById("livePaneToolbarRow");
-  if (!group || !toolbarRow) return;
-  // The Whisper model selector is only meaningful when live transcription
-  // uses local faster-whisper. For Deepgram-as-primary mode the selector
-  // is a confusing leftover (it doesn't control Deepgram's model) so we
-  // hide it and collapse the row when nothing else lives there.
-  const shouldShow = effective === "local";
-  group.hidden = !shouldShow;
-  toolbarRow.hidden = !shouldShow;
-}
-
-function syncRemoteModelOptions(): void {
-  const provider = readProviderSelection();
-  const sel = $("remoteModelSelect") as HTMLSelectElement;
-  syncLiveLocalModelVisibility();
-  if (provider === "local" || !provider) {
-    sel.hidden = true;
-    return;
-  }
-  if (provider === "deepgram") {
-    sel.hidden = false;
-    sel.innerHTML = "";
-    DEEPGRAM_AUDIO_MODELS.forEach((model) => {
-      const opt = document.createElement("option");
-      opt.value = model;
-      opt.textContent = model;
-      sel.appendChild(opt);
-    });
-    const preferredDeepgram = (remoteModelByProvider.deepgram || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
-    sel.value = DEEPGRAM_AUDIO_MODELS.includes(preferredDeepgram) ? preferredDeepgram : DEFAULT_DEEPGRAM_AUDIO_MODEL;
-    remoteModelByProvider.deepgram = sel.value;
-    return;
-  }
-  const preferred = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
-  const models = new Set<string>(OPENROUTER_AUDIO_MODELS);
-  if (preferred) models.add(preferred);
-  sel.hidden = false;
-  sel.innerHTML = "";
-  Array.from(models).forEach((model) => {
-    const opt = document.createElement("option");
-    opt.value = model;
-    opt.textContent = model;
-    sel.appendChild(opt);
-  });
-  sel.value = preferred;
-  remoteModelByProvider.openrouter = sel.value;
 }
 
 async function remoteJob(
@@ -3813,7 +3835,7 @@ function resolveLivePreviewLocalModel(model: string): string {
 }
 
 function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalModel: string; finalLocalModel: string } {
-  const configuredLocalModel = (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim();
+  const configuredLocalModel = selectedLocalModel();
   const finalLocalModel = configuredLocalModel || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   const effectiveProvider = resolveEffectiveProvider(selectedProvider);
   return {
@@ -4566,8 +4588,9 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
   const silence = getAutoStopSilenceConfig();
   return {
     provider: readProviderSelection(),
+    provider_group: readProviderGroup(),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
-    local_model: (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL).trim(),
+    local_model: selectedLocalModel(),
     mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
     auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
@@ -4578,14 +4601,13 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     auto_stop_silence_enabled: silence.enabled,
     auto_stop_silence_seconds: silence.seconds,
     auto_stop_silence_db: silence.thresholdDb,
-    remote_model_openrouter: (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL,
-    remote_model_deepgram: (remoteModelByProvider.deepgram || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL,
+    remote_model_openrouter: (uiModelByGroup.openrouter || remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL,
+    remote_model_deepgram: (uiModelByGroup.deepgram || remoteModelByProvider.deepgram || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL,
     shortcut_record: currentShortcuts.record,
     shortcut_paste: currentShortcuts.paste,
     // Upload tab — mirrors current DOM values. Optional-chained because
     // setupUploadView may not have run yet on a page that loaded
     // without the Upload section (defensive against future view splits).
-    upload_provider: ((document.getElementById("uploadProvider") as HTMLSelectElement | null)?.value || "deepgram").trim(),
     upload_language: ((document.getElementById("uploadLanguage") as HTMLSelectElement | null)?.value || "auto").trim(),
     upload_diarize: !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked,
   };
@@ -5466,20 +5488,29 @@ async function loadCfg(): Promise<void> {
     remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEFAULT_DEEPGRAM_AUDIO_MODEL || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
     const languageSel = $("language") as HTMLSelectElement;
-    const providerSel = $("providerSelect") as HTMLSelectElement;
-    const modelSel = $("model") as HTMLSelectElement;
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
     }
-    const hasStoredProvider = Object.prototype.hasOwnProperty.call(ui, "provider");
-    const providerCandidate = hasStoredProvider
-      ? normalizeProviderSelection(ui.provider, providerSel.value as Provider)
-      : null;
-    if (providerCandidate !== null && Array.from(providerSel.options).some((o) => o.value === providerCandidate)) {
-      providerSel.value = providerCandidate;
-    }
-    if (ui.local_model && Array.from(modelSel.options).some((o) => o.value === ui.local_model)) {
-      modelSel.value = ui.local_model;
+    // Restore the unified selection from persisted wire values
+    // (provider + local_model + per-provider remote models). The UI
+    // group is DERIVED (gigaam-* local model ⇒ gigaam group), never
+    // persisted — the wire format stays backward compatible.
+    {
+      const hasStoredProvider = Object.prototype.hasOwnProperty.call(ui, "provider");
+      const wire = hasStoredProvider
+        ? normalizeProviderSelection(ui.provider, "local")
+        : "local";
+      const storedLocal = String(ui.local_model || "").trim();
+      const group = groupFromWire(wire, storedLocal);
+      if (group === "local-whisper" || group === "gigaam") {
+        if (storedLocal && LOCAL_TRANSCRIPTION_MODELS.includes(storedLocal)) {
+          uiModelByGroup[group] = storedLocal;
+        }
+        lastLocalGroup = group;
+      }
+      uiModelByGroup.deepgram = remoteModelByProvider.deepgram;
+      uiModelByGroup.openrouter = remoteModelByProvider.openrouter;
+      uiProviderGroup = hasStoredProvider && wire === "" ? "" : group;
     }
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
     const livePreview = $("livePreviewToggle") as HTMLInputElement;
@@ -5524,28 +5555,14 @@ async function loadCfg(): Promise<void> {
     }
     populateUpscaleModelOptions();
     preferredMicId = String(ui.mic_id || "").trim();
-    syncRemoteModelOptions();
-    const remoteSel = $("remoteModelSelect") as HTMLSelectElement;
-    if (providerSel.value === "openrouter") {
-      remoteSel.value = getRemoteModelValue("openrouter");
-    } else if (providerSel.value === "deepgram") {
-      remoteSel.value = getRemoteModelValue("deepgram");
-    }
+    renderTranscriptionSelectors();
     await loadUpscalePresets(pendingUpscalePresetId);
 
-    // Upload tab — restore persisted provider/language/diarize. Each
-    // input is guarded so a config carried over from a build without
-    // the Upload tab (or with a different option set) gracefully falls
-    // through to the HTML default instead of crashing on missing DOM.
-    const uploadProviderEl = document.getElementById("uploadProvider") as HTMLSelectElement | null;
-    if (uploadProviderEl) {
-      const wanted = String(ui.upload_provider || "").trim();
-      const fallback: Provider = isProviderKeyConfigured("deepgram") ? "deepgram" : "local";
-      const next = wanted || fallback;
-      if (Array.from(uploadProviderEl.options).some((o) => o.value === next)) {
-        uploadProviderEl.value = next;
-      }
-    }
+    // Upload tab — provider/model mirrors are rendered from the SAME
+    // unified SSOT state as the Transcribe toolbar (no separate
+    // upload provider any more); only language/diarize are
+    // upload-specific and restored here.
+    renderTranscriptionSelectors();
     updateUploadProviderHint();
     const uploadLanguageEl = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
     if (uploadLanguageEl && ui.upload_language) {
@@ -7044,7 +7061,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
 
     // 2. Local Whisper fallback — always available, no API key required.
     if (!text) {
-      const model = ($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+      const model = selectedLocalModel();
       triedProviders.push(`local Whisper ${model}`);
       // Two-line message captures both the fallback context AND the
       // current step: the user sees Deepgram-failed reason without
@@ -7081,7 +7098,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
           provider: usedProvider,
           model: usedProvider === "deepgram"
             ? getRemoteModelValue("deepgram")
-            : (($("model") as HTMLSelectElement).value || DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
+            : selectedLocalModel(),
           language: lang,
         });
       } catch (saveErr) {
@@ -7288,28 +7305,17 @@ function shouldLivePreview(): boolean {
 }
 
 ($("providerSelect") as HTMLSelectElement).addEventListener("change", () => {
-  syncRemoteModelOptions();
-  queueUiPreferencesSave();
-  scheduleLocalWarmup();
+  setTranscriptionSelection(
+    ($("providerSelect") as HTMLSelectElement).value as TranscriptionGroupId | "",
+  );
 });
 ($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
   const v = (($("remoteModelSelect") as HTMLSelectElement).value || "").trim();
-  const provider = readProviderSelection();
-  if (v && provider === "openrouter") {
-    remoteModelByProvider.openrouter = v;
-  }
-  if (v && provider === "deepgram") {
-    remoteModelByProvider.deepgram = v;
-  }
-  queueUiPreferencesSave();
+  setTranscriptionSelection(readProviderGroup(), v || undefined);
 });
 
 ($("language") as HTMLSelectElement).addEventListener("change", () => {
   queueUiPreferencesSave();
-});
-($("model") as HTMLSelectElement).addEventListener("change", () => {
-  queueUiPreferencesSave();
-  scheduleLocalWarmup();
 });
 ($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
   queueUiPreferencesSave();
@@ -10905,7 +10911,7 @@ void loadCfg()
     setStatus(`Startup setup failed: ${msg}`, "warning");
     showRecordSessionNotice(`Startup setup failed: ${msg}`, "warning", 9000);
   });
-syncRemoteModelOptions();
+renderTranscriptionSelectors();
 syncAutoSendEnterLabel();
 populateUpscaleModelOptions();
 (document.getElementById("upscaleModelSelect") as HTMLSelectElement | null)?.addEventListener(
@@ -11336,10 +11342,11 @@ function currentUploadTranscriptionOptions(): {
   language: string;
   diarize: boolean;
 } {
-  const providerSel = document.getElementById("uploadProvider") as HTMLSelectElement | null;
   const languageSel = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   return {
-    provider: normalizeUploadProvider(providerSel?.value || "deepgram"),
+    // Upload shares the unified transcription selection (SSOT) — same
+    // provider+model as the Transcribe toolbar, no separate source.
+    provider: readProviderSelection(),
     language: (languageSel?.value || "auto").trim() || "auto",
     diarize: !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked,
   };
@@ -11735,10 +11742,9 @@ function enqueueUploadFiles(files: File[]): void {
 function setupUploadView(): void {
   const dropZone = document.getElementById("uploadLargeDrop");
   const fileInput = document.getElementById("uploadLargeFileInput") as HTMLInputElement | null;
-  const provider = document.getElementById("uploadProvider") as HTMLSelectElement | null;
   const language = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   const diarize = document.getElementById("uploadDiarize") as HTMLInputElement | null;
-  if (!dropZone || !fileInput || !provider || !language) return;
+  if (!dropZone || !fileInput || !language) return;
   void beginUploadQueueSnapshotRestore();
   // Persist Upload-tab state across launches. Without this every
   // app start reset the provider to the HTML default ("Deepgram")
@@ -11746,10 +11752,18 @@ function setupUploadView(): void {
   // OpenRouter — silent UX regression. The autosave debouncer +
   // queueUiPreferencesSave write to /api/config in the same
   // ``preferences.ui`` payload as Live-tab settings.
-  provider.addEventListener("change", () => {
-    queueUiPreferencesSave();
-    updateUploadProviderHint();
-  });
+  for (const mirrorId of ["uploadProviderMirror", "uploadModelMirror"]) {
+    document.getElementById(mirrorId)?.addEventListener("change", () => {
+      const el = document.getElementById(mirrorId) as HTMLSelectElement | null;
+      setTranscriptionSelection(
+        mirrorId === "uploadProviderMirror"
+          ? ((el?.value || "local-whisper") as TranscriptionGroupId | "")
+          : readProviderGroup(),
+        mirrorId === "uploadModelMirror" ? el?.value || undefined : undefined,
+      );
+      updateUploadProviderHint();
+    });
+  }
   language.addEventListener("change", () => queueUiPreferencesSave());
   if (diarize) {
     diarize.addEventListener("change", () => queueUiPreferencesSave());
@@ -11866,17 +11880,22 @@ function setupUploadView(): void {
 }
 
 function updateUploadProviderHint(): void {
-  const provider = (document.getElementById("uploadProvider") as HTMLSelectElement | null)?.value || "deepgram";
+  const provider = readProviderSelection();
+  const group = readProviderGroup();
   const hintEl = document.getElementById("uploadProviderHint");
   if (!hintEl) return;
   if (provider === "deepgram") {
     hintEl.textContent = isProviderKeyConfigured("deepgram")
-      ? "Cloud transcription via Deepgram Nova-3 — fastest, multi-language."
+      ? "Cloud transcription via Deepgram — fastest, multi-language."
       : "Add a Deepgram key in Settings, or switch to Local for offline transcription.";
   } else if (provider === "openrouter") {
     hintEl.textContent = isProviderKeyConfigured("openrouter")
       ? "Audio transcription via OpenRouter."
       : "Add an OpenRouter key in Settings, or switch to Local for offline transcription.";
+  } else if (group === "gigaam") {
+    hintEl.textContent = LOCAL_ENGINE_AVAILABILITY.gigaam === true
+      ? "Offline Russian transcription via GigaAM v3. No API key required."
+      : "GigaAM engine is not installed — install it in Settings → Local models.";
   } else {
     hintEl.textContent = "Offline transcription via Whisper. Slower than cloud, no API key required.";
   }

@@ -1,0 +1,142 @@
+/**
+ * Transcription catalog + selection SSOT.
+ *
+ * ONE canonical structure drives every transcription-model surface in
+ * the app — the Transcribe toolbar, the Upload toolbar, and the live
+ * preview's derived assist model. Nothing else may derive provider
+ * groups by prefix-sniffing or hardcode model lists.
+ *
+ * The backend /api/health model catalog owns the taxonomy
+ * (`local.whisper_models`, `local.gigaam_models`,
+ * `remote.deepgram.audio_models`, `remote.openrouter.audio_models`,
+ * `local.engines`); this module shapes it into provider groups and owns
+ * the UI↔wire mapping:
+ *
+ *   UI group "gigaam"  →  wire provider "local" + model "gigaam-*"
+ *   UI group "local-whisper" → wire provider "local" + whisper model
+ *   UI group "deepgram" / "openrouter" → wire provider + remote model
+ *
+ * Pure: no DOM, no state. Unit-tested in tests/transcription-catalog.test.ts
+ */
+
+export type TranscriptionGroupId =
+  | "local-whisper"
+  | "gigaam"
+  | "deepgram"
+  | "openrouter";
+
+export type WireProvider = "local" | "deepgram" | "openrouter" | "";
+
+export interface TranscriptionModelOption {
+  id: string;
+  label: string;
+  /** Engine/package present on this machine (local groups only). */
+  available: boolean;
+}
+
+export interface TranscriptionGroup {
+  id: TranscriptionGroupId;
+  label: string;
+  models: TranscriptionModelOption[];
+}
+
+export interface TranscriptionCatalogInput {
+  whisperModels: string[];
+  gigaamModels: string[];
+  /** engine id → installed (from /api/health local.engines). */
+  engines: Record<string, boolean>;
+  deepgramModels: string[];
+  openrouterModels: string[];
+}
+
+const WHISPER_LABELS: Record<string, string> = {
+  tiny: "Whisper Tiny",
+  base: "Whisper Base",
+  small: "Whisper Small",
+  medium: "Whisper Medium",
+  "large-v3": "Whisper Large-v3",
+};
+
+const GIGAAM_LABELS: Record<string, string> = {
+  "gigaam-v3-e2e-rnnt": "GigaAM v3 E2E RNNT",
+  "gigaam-v3-rnnt": "GigaAM v3 RNNT",
+};
+
+/** Human label for a model id inside a group; falls back to the id. */
+export function transcriptionModelLabel(group: TranscriptionGroupId, id: string): string {
+  if (group === "local-whisper") return WHISPER_LABELS[id] || `Whisper ${id}`;
+  if (group === "gigaam") return GIGAAM_LABELS[id] || id;
+  return id;
+}
+
+/** Build the provider groups from the backend catalog payload pieces. */
+export function buildTranscriptionCatalog(
+  input: TranscriptionCatalogInput,
+): TranscriptionGroup[] {
+  const whisperAvailable = input.engines.whisper !== false;
+  const gigaamAvailable = input.engines.gigaam === true;
+  return [
+    {
+      id: "local-whisper",
+      label: "Local Whisper",
+      models: input.whisperModels.map((id) => ({
+        id,
+        label: transcriptionModelLabel("local-whisper", id),
+        available: whisperAvailable,
+      })),
+    },
+    {
+      id: "gigaam",
+      label: "GigaAM (Russian)",
+      models: input.gigaamModels.map((id) => ({
+        id,
+        label: transcriptionModelLabel("gigaam", id),
+        available: gigaamAvailable,
+      })),
+    },
+    {
+      id: "deepgram",
+      label: "Deepgram",
+      models: input.deepgramModels.map((id) => ({
+        id,
+        label: id,
+        available: true,
+      })),
+    },
+    {
+      id: "openrouter",
+      label: "OpenRouter",
+      models: input.openrouterModels.map((id) => ({
+        id,
+        label: id,
+        available: true,
+      })),
+    },
+  ];
+}
+
+/** Wire provider a UI group transcribes through. */
+export function wireProviderForGroup(group: TranscriptionGroupId | ""): WireProvider {
+  if (group === "deepgram") return "deepgram";
+  if (group === "openrouter") return "openrouter";
+  if (group === "local-whisper" || group === "gigaam") return "local";
+  return "";
+}
+
+/** Map a persisted wire selection back to its UI group. */
+export function groupFromWire(
+  provider: string,
+  model: string,
+): TranscriptionGroupId {
+  const p = String(provider || "").trim();
+  if (p === "deepgram") return "deepgram";
+  if (p === "openrouter") return "openrouter";
+  if (p === "local") {
+    return String(model || "").startsWith("gigaam-") ? "gigaam" : "local-whisper";
+  }
+  return "local-whisper";
+}
+
+export function isLocalGroup(group: TranscriptionGroupId | ""): boolean {
+  return group === "local-whisper" || group === "gigaam";
+}

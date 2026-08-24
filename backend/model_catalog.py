@@ -34,7 +34,12 @@ GIGAAM_MODEL_PREFIX = "gigaam-"
 
 LOCAL_TRANSCRIPTION_MODELS: tuple[str, ...] = WHISPER_LOCAL_MODELS + GIGAAM_MODELS
 DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small"
-LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = ("tiny", "base", "small") + GIGAAM_MODELS[:1]
+# Live preview follows the transcription model (no separate preview
+# choice in the UI): every local model the user can select for
+# transcription is also a valid live-assist engine. The windowing in
+# backend/live.py adapts to slow models via the catch-up ring, and the
+# 60 s inference ceiling bounds worst-case latency.
+LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = LOCAL_TRANSCRIPTION_MODELS
 LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = ("tiny", "base")
 DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
@@ -70,6 +75,12 @@ def health_model_catalog() -> dict[str, object]:
     return {
         "local": {
             "models": list(LOCAL_TRANSCRIPTION_MODELS),
+            # Explicit engine taxonomy (SSOT for the UI's provider groups):
+            # the UI renders "Local Whisper" and "GigaAM" as separate
+            # provider groups from THESE lists, never by prefix-sniffing
+            # the merged `models` list.
+            "whisper_models": list(WHISPER_LOCAL_MODELS),
+            "gigaam_models": list(GIGAAM_MODELS),
             "default_model": DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
             "live_assist_models": list(LOCAL_LIVE_ASSIST_MODELS),
             "live_preview_models": list(LOCAL_LIVE_PREVIEW_MODELS),

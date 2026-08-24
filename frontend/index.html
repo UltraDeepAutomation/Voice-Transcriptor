@@ -160,13 +160,16 @@
       <section class="view" data-view="upload" hidden>
         <div class="topbar">
           <div class="topbar-row">
+            <!-- Mirror of the unified Transcribe selection (SSOT:
+                 frontend/src/transcription-catalog.ts). Both toolbars
+                 render from one state; changing either updates both. -->
             <label class="top-item top-item-mic">
               <span class="lbl">Provider</span>
-              <select id="uploadProvider">
-                <option value="deepgram">Deepgram Nova-3</option>
-                <option value="openrouter">OpenRouter</option>
-                <option value="local">Local (Whisper)</option>
-              </select>
+              <select id="uploadProviderMirror" aria-label="Upload transcription provider"></select>
+            </label>
+            <label class="top-item top-item-mic">
+              <span class="lbl">Model</span>
+              <select id="uploadModelMirror" aria-label="Upload transcription model"></select>
             </label>
             <label class="top-item top-item-lang">
               <span class="lbl">Lang</span>
@@ -298,17 +301,13 @@
                   </label>
                 </div>
               </div>
-              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row" id="livePaneToolbarRow">
+              <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
                 <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-live">
-                  <div class="pane-control-group pane-control-group-compact" id="liveLocalModelGroup" title="Whisper model for local live preview and offline fallback">
-                    <select id="model" aria-label="Local Whisper model">
-                      <option value="tiny">tiny</option>
-                      <option value="base">base</option>
-                      <option value="small" selected>small</option>
-                      <option value="medium">medium</option>
-                      <option value="large-v3">large-v3</option>
-                    </select>
-                  </div>
+                  <!-- Live Preview has NO model choice by design: when the
+                       toggle is on, chunks from the transcription pipeline
+                       stream here; when off, nothing renders. The model
+                       lives in the Transcribe toolbar (SSOT:
+                       frontend/src/transcription-catalog.ts). -->
                 </div>
               </div>
             </div>
@@ -328,33 +327,26 @@
               <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
                 <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-transcribe">
                   <div class="pane-control-group pane-control-group-primary">
-                    <select id="providerSelect">
-                      <option value="local">Local (Whisper)</option>
+                    <!-- Two-level unified model selection (SSOT:
+                         frontend/src/transcription-catalog.ts). Option
+                         values are UI GROUP ids; the wire provider is
+                         derived by the catalog module (gigaam and
+                         local-whisper both transcribe through wire
+                         provider "local"). Options are re-rendered from
+                         /api/health by renderTranscriptionSelectors(). -->
+                    <select id="providerSelect" aria-label="Transcription provider">
+                      <option value="local-whisper">Local Whisper</option>
+                      <option value="gigaam">GigaAM (Russian)</option>
                       <option value="deepgram">Deepgram</option>
                       <option value="openrouter">OpenRouter</option>
                       <option value="">None</option>
                     </select>
-                    <!-- Options below are placeholders: ``syncRemoteModelOptions``
-                         (frontend/src/main.tsx) overwrites this select from
-                         backend /api/health model_catalog after boot, with
-                         frontend fallbacks only for the cold-start window.
-                         The first
-                         ``<option>`` was previously
-                         ``google/gemini-3.1-flash-lite-preview`` which is
-                         NOT a valid OpenRouter slug — surfaced by the
-                         renderer for ~milliseconds during cold boot until
-                         the SSOT-driven repopulate ran. Replaced with the
-                         canonical SSOT default so the cold-boot flash
-                         never shows a stale model id. -->
-                    <!-- 1.1.25+: empty placeholder. syncRemoteModelOptions
-                         rebuilds this select from the current runtime model
-                         catalog. /api/health is the SSOT after boot.
-                         Previously this placeholder hardcoded a stale list
-                         that mixed nova-3 (Deepgram) under what should have
-                         been an OpenRouter-only fallback, producing a
-                         millisecond cold-boot flash with the wrong content
-                         and a fourth maintenance surface to keep in sync. -->
-                    <select id="remoteModelSelect" title="Remote model" hidden></select>
+                    <!-- Universal model select for the chosen provider
+                         group: Whisper Tiny…Large-v3, GigaAM v3 models,
+                         Deepgram or OpenRouter audio models. Rendered by
+                         renderTranscriptionSelectors() from the health
+                         catalog; empty placeholder avoids cold-boot flash. -->
+                    <select id="remoteModelSelect" aria-label="Transcription model"></select>
                   </div>
                   <div class="pane-control-group pane-control-group-secondary">
                     <div class="transcribe-settings-wrap">

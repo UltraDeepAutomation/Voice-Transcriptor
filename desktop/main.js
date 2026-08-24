@@ -855,6 +855,9 @@ async function refreshWindowForFrontendBuild(force = false) {
 
 function normalizeProviderChoice(value) {
   const v = String(value || "").trim();
+  // UI group ids (transcription-catalog SSOT) map onto wire providers:
+  // both local groups transcribe through provider "local".
+  if (v === "local-whisper" || v === "gigaam") return "local";
   if (v === "local" || v === "openrouter" || v === "deepgram" || v === "") return v;
   return "local";
 }
@@ -913,7 +916,7 @@ async function getRendererProviderChoice() {
 
 async function getRendererLocalModelChoice() {
   const v = await execRendererJsWithTimeout(
-    `(() => String((document.getElementById('model')?.value || 'small')).trim())();`,
+    `(() => String((document.getElementById('remoteModelSelect')?.value || 'small')).trim())();`,
     "small",
   );
   return normalizeLocalModelChoice(v);
