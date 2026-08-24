@@ -1,4 +1,7 @@
 # Optional Russian ASR engine (Sber GigaAM-v3).
-# Installed only when ENABLE_GIGAAM marker exists next to this file.
-# Pulls torch (~2 GB) into the APP VENV (userData/.venv) - never into the DMG.
-gigaam[torch] @ git+https://github.com/salute-developers/GigaAM.git
+# Installed by desktop/main.js into userData/engine-site (never into the
+# signed bundle) when the ENABLE_GIGAAM marker exists next to
+# requirements.txt. Pinned to an upstream commit (BUG-35): a floating
+# git HEAD made every install non-reproducible and let an upstream push
+# break shipped apps. Bump the pin deliberately, with a smoke test.
+gigaam[torch] @ git+https://github.com/salute-developers/GigaAM.git@7447938d791c4f3e643386ee22c33777004293a5

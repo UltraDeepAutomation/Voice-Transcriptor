@@ -354,6 +354,48 @@ function recoverOrphanRotatingLogs() {
   } catch { /* directory unreadable — non-fatal */ }
 }
 
+// Archive retention (BUG-34): rotation deliberately never deletes, so
+// without a boot-time cap the archives grow without bound (up to 5 MB
+// per rotation, forever). Keep the newest MAIN_LOG_ARCHIVE_KEEP_COUNT
+// archives and at most MAIN_LOG_ARCHIVE_KEEP_BYTES in total; the sweep
+// runs once per boot, never during rotation.
+const MAIN_LOG_ARCHIVE_KEEP_COUNT = 10;
+const MAIN_LOG_ARCHIVE_KEEP_BYTES = 50 * 1024 * 1024;
+
+function pruneMainLogArchives() {
+  if (!mainLogFilePath) return;
+  try {
+    const dir = path.dirname(mainLogFilePath);
+    const prefix = path.basename(mainLogFilePath) + ".";
+    const archives = [];
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(prefix)) continue;
+      const full = path.join(dir, name);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile()) continue;
+      archives.push({ full, mtimeMs: st.mtimeMs, size: st.size });
+    }
+    archives.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    let keptBytes = 0;
+    for (let i = 0; i < archives.length; i += 1) {
+      const a = archives[i];
+      // The newest archive always survives (it holds the freshest
+      // crash evidence); count and byte caps apply to the older tail.
+      const overCaps = i + 1 > MAIN_LOG_ARCHIVE_KEEP_COUNT
+        || keptBytes + a.size > MAIN_LOG_ARCHIVE_KEEP_BYTES;
+      if (i > 0 && overCaps) {
+        try {
+          fs.rmSync(a.full, { force: true });
+          appendMainLog(`[log-rotation] pruned old archive ${path.basename(a.full)}`);
+        } catch { /* keep in place; retried next boot */ }
+        continue;
+      }
+      keptBytes += a.size;
+    }
+  } catch { /* directory unreadable — non-fatal */ }
+}
+
 function rotateMainLogIfNeeded() {
   if (!mainLogFilePath) return;
   try {
@@ -5280,24 +5322,65 @@ async function installGigaamEngineIfRequested(python, repoRoot) {
 
   setBackendBootStatus("Installing GigaAM engine (large download)…");
   appendMainLog("[backend-runtime] ENABLE_GIGAAM present and gigaam importable=false; installing stack");
-  // --target into userData/engine-site: keeps the signed bundle sealed,
-  // survives app updates, removable by deleting one folder.
+
+  // Disk-space gate (BUG-33): the stack downloads ~2 GB and unpacks to
+  // ~6-7 GB, plus pip's cache copy mid-install. An ENOSPC halfway leaves
+  // a half-written engine-site that fails `import gigaam` on EVERY
+  // launch, re-triggering this multi-minute install each boot. 8 GB is
+  // the verified ceiling with headroom; skipping the install degrades
+  // gracefully (engine shows unavailable) instead of wedging the boot.
   const engineSite = getEngineSiteDir();
-  fs.mkdirSync(engineSite, { recursive: true });
-  const args = [
-    "-m", "pip", "install",
-    "--target", engineSite,
-    "--upgrade",
-    "-r", req,
-  ];
-  const res = await runCommand(python, args, {
-    cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
-  });
-  if (res.ok) sanitizeEngineSite(engineSite);
-  appendMainLog(
-    `[backend-runtime] gigaam install ${res.ok ? "ok" : "FAILED"}`
-    + (res.ok ? "" : `: ${(res.details || "").slice(0, 400)}`)
-  );
+  const GIGAAM_MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024;
+  try {
+    const st = fs.statfsSync(path.dirname(engineSite));
+    const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
+    if (freeBytes < BigInt(GIGAAM_MIN_FREE_BYTES)) {
+      appendMainLog(
+        `[backend-runtime] gigaam install SKIPPED: only ${Math.floor(Number(freeBytes / (1024 * 1024 * 1024)))} GB free, need ${GIGAAM_MIN_FREE_BYTES / (1024 * 1024 * 1024)} GB`
+      );
+      setBackendBootStatus("GigaAM not installed: insufficient disk space (8 GB needed)");
+      return;
+    }
+  } catch (e) {
+    // statfs unavailable/failing is not a reason to block: proceed and
+    // let pip surface a real ENOSPC with the diagnostics below.
+    appendMainLog(`[backend-runtime] gigaam free-space check failed (${e?.message || e}); proceeding`);
+  }
+
+  // Staging + swap (BUG-36): `pip install --target DIR --upgrade`
+  // overwrites but never REMOVES files of replaced versions, so stale
+  // modules accumulate in engine-site across upstream updates. Install
+  // into a fresh staging dir and swap it in with two renames — the
+  // canonical pip pattern for --target upgrades.
+  const staging = `${engineSite}.staging`;
+  try {
+    fs.rmSync(staging, { recursive: true, force: true });
+    fs.mkdirSync(staging, { recursive: true });
+    const args = [
+      "-m", "pip", "install",
+      "--target", staging,
+      "-r", req,
+    ];
+    const res = await runCommand(python, args, {
+      cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
+    });
+    if (!res.ok) {
+      appendMainLog(
+        `[backend-runtime] gigaam install FAILED`
+        + `: ${(res.stderr || res.stdout || "").slice(0, 400)}` // BUG-32: .details never existed
+      );
+      return;
+    }
+    sanitizeEngineSite(staging);
+    const retired = `${engineSite}.old-${Date.now()}`;
+    if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
+    fs.renameSync(staging, engineSite);
+    fs.rmSync(retired, { recursive: true, force: true });
+    appendMainLog("[backend-runtime] gigaam install ok (engine-site swapped)");
+  } catch (e) {
+    appendMainLog(`[backend-runtime] gigaam install FAILED: ${e?.message || e}`);
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 }
 
 async function ensureBackendRuntime(python, repoRoot) {
@@ -6836,6 +6919,7 @@ app.whenReady().then(async () => {
   // captured. No duplicate registration needed here.
   cleanupStaleTranscriptTmpFiles();
   recoverOrphanRotatingLogs();
+  pruneMainLogArchives();
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
     ensureMacDockPresence("ready");
