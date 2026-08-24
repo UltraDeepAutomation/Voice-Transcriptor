@@ -24,6 +24,7 @@ import {
   richerTranscript,
   textFromEnvelope,
 } from "./transcript-merge";
+import { checkForUpdate, shouldAutoCheck } from "./update-check";
 
 declare global {
   interface Window {
@@ -413,6 +414,8 @@ type BackendBootstrapPayload = {
 // Settings tab — previously hardcoded ``1.1.1`` in index.html and
 // drifted across every release.
 declare const __APP_VERSION__: string;
+/** Injected from desktop/package.json (version + repository.url) — see vite.config.ts. */
+declare const __APP_UPDATE_META__: { version: string; repoSlug: string };
 declare const __SHORTCUT_DEFAULTS__: ShortcutDefaultsManifest;
 
 declare global {
@@ -10338,6 +10341,78 @@ async function initRecordingsBootstrap(): Promise<void> {
   if (badge && typeof __APP_VERSION__ === "string" && __APP_VERSION__) {
     badge.textContent = __APP_VERSION__;
   }
+})();
+
+// ── Update detection (detect-only; no download/install) ─────────────────
+// Level 1 of the update story: answer "is there a newer GitHub release?"
+// and link to it. Silent auto-install is blocked on Apple Developer ID
+// signing and stays out of scope until that exists.
+const UPDATE_CHECK_CACHE_KEY = "transcriptor.updateCheck.lastCheckedAt";
+const updateStatusEl = document.getElementById("updateCheckStatus");
+const updateBtnEl = document.getElementById("updateCheckBtn") as HTMLButtonElement | null;
+
+function renderUpdateStatus(text: string, tone: "neutral" | "ok" | "new" | "error"): void {
+  if (!updateStatusEl) return;
+  updateStatusEl.textContent = text;
+  updateStatusEl.dataset.tone = tone;
+}
+
+async function runUpdateCheck(): Promise<void> {
+  if (!updateBtnEl) return;
+  updateBtnEl.disabled = true;
+  renderUpdateStatus("Checking…", "neutral");
+  const result = await checkForUpdate(__APP_UPDATE_META__, fetch);
+  try {
+    localStorage.setItem(UPDATE_CHECK_CACHE_KEY, String(Date.now()));
+  } catch {
+    /* quota/private-mode: the throttle just resets each launch */
+  }
+  switch (result.status) {
+    case "update-available": {
+      renderUpdateStatus(`New version ${result.latest.version} available — click to open the release page.`, "new");
+      // The status span itself becomes the link: one click from
+      // "there is an update" to its release page. setWindowOpenHandler
+      // in desktop/main.js routes target=_blank to the OS browser.
+      if (updateStatusEl) {
+        updateStatusEl.classList.add("update-check-status-link");
+        const link = document.createElement("a");
+        link.href = result.latest.htmlUrl;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = `Open release ${result.latest.version}`;
+        updateStatusEl.appendChild(document.createElement("br"));
+        updateStatusEl.appendChild(link);
+      }
+      break;
+    }
+    case "up-to-date":
+      renderUpdateStatus(`You're up to date (v${__APP_UPDATE_META__.version}).`, "ok");
+      break;
+    case "unknown":
+      renderUpdateStatus(`Couldn't check for updates (${result.reason}).`, "error");
+      break;
+  }
+  updateBtnEl.disabled = false;
+}
+
+if (updateBtnEl) {
+  updateBtnEl.addEventListener("click", () => {
+    void runUpdateCheck();
+  });
+}
+// Passive boot check at most once per day — silent on failure so an
+// offline start never nags.
+(() => {
+  let lastChecked = 0;
+  try {
+    lastChecked = Number(localStorage.getItem(UPDATE_CHECK_CACHE_KEY)) || 0;
+  } catch {
+    /* storage unavailable → treat as never checked */
+  }
+  if (!shouldAutoCheck(Date.now(), lastChecked)) return;
+  window.setTimeout(() => {
+    void runUpdateCheck();
+  }, 4000);
 })();
 
 applyBackendBootstrap();

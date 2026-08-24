@@ -1,0 +1,30 @@
+
+/* Update detection (Settings header): quiet inline status + link. */
+.screen-header-update {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.update-check-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.update-check-status {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.update-check-status[data-tone="ok"] {
+  color: var(--text-2);
+}
+.update-check-status[data-tone="new"] {
+  color: var(--accent, #6ee7b7);
+}
+.update-check-status[data-tone="error"] {
+  color: var(--text-3);
+  font-style: italic;
+}
+.update-check-status-link a {
+  color: inherit;
+  text-decoration: underline;
+}

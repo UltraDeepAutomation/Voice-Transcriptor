@@ -27,6 +27,22 @@ const PKG_VERSION: string = (() => {
   return String(pkg.version || "0.0.0");
 })();
 
+// Update-check coordinates, derived from the SAME manifest that owns the
+// version — repository.url is the single source of truth for where
+// releases live, so a repo move updates the checker without a second
+// edit. Parsed down to a bare "owner/repo" slug for the GitHub API.
+const APP_UPDATE_META: { version: string; repoSlug: string } = (() => {
+  const pkgPath = resolve(DESKTOP_DIR, "package.json");
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  const url: string = String(pkg.repository?.url || "");
+  // github.com/<owner>/<repo>(.git), tolerating scheme/case variants.
+  const m = url.match(/github\.com[/:]([^/]+)\/([^/.?#]+?)(?:\.git)?\/?$/i);
+  return {
+    version: PKG_VERSION,
+    repoSlug: m ? `${m[1]}/${m[2]}` : "",
+  };
+})();
+
 const SHORTCUT_DEFAULTS = (() => {
   const defaultsPath = resolve(DESKTOP_DIR, "shortcut-defaults.json");
   return JSON.parse(readFileSync(defaultsPath, "utf8"));
@@ -47,6 +63,7 @@ export default defineConfig({
   },
   define: {
     __APP_VERSION__: JSON.stringify(PKG_VERSION),
+    __APP_UPDATE_META__: JSON.stringify(APP_UPDATE_META),
     __SHORTCUT_DEFAULTS__: JSON.stringify(SHORTCUT_DEFAULTS),
   },
 });

@@ -1,0 +1,80 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+
+import {
+  checkForUpdate,
+  compareVersions,
+  parseLatestRelease,
+  shouldAutoCheck,
+  type UpdateMeta,
+} from "../src/update-check";
+
+const meta: UpdateMeta = { version: "1.3.0", repoSlug: "owner/repo" };
+
+function fetchOk(payload: unknown): typeof fetch {
+  return vi.fn().mockResolvedValue({
+    ok: true,
+    json: () => Promise.resolve(payload),
+  }) as unknown as typeof fetch;
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+describe("compareVersions", () => {
+  it("compares numerically per segment (1.10 > 1.9)", () => {
+    expect(compareVersions("1.10.0", "1.9.2")).toBeGreaterThan(0);
+    expect(compareVersions("1.2.1", "1.3.0")).toBeLessThan(0);
+    expect(compareVersions("1.3.0", "1.3.0")).toBe(0);
+  });
+  it("pads missing segments as zeros", () => {
+    expect(compareVersions("1.3", "1.3.0")).toBe(0);
+    expect(compareVersions("1.3", "1.3.1")).toBeLessThan(0);
+  });
+});
+
+describe("parseLatestRelease", () => {
+  it("strips a single leading v from the tag", () => {
+    expect(parseLatestRelease({ tag_name: "v1.4.0", html_url: "https://x" })).toEqual({
+      version: "1.4.0",
+      htmlUrl: "https://x",
+    });
+  });
+  it("returns null for drafts, empty tags, or missing url", () => {
+    expect(parseLatestRelease({ tag_name: "v1", html_url: "https://x", draft: true })).toBeNull();
+    expect(parseLatestRelease({ tag_name: "", html_url: "https://x" })).toBeNull();
+    expect(parseLatestRelease({ tag_name: "v1" })).toBeNull();
+    expect(parseLatestRelease(null)).toBeNull();
+  });
+});
+
+describe("checkForUpdate", () => {
+  it("detects a newer release", async () => {
+    const r = await checkForUpdate(meta, fetchOk({ tag_name: "v1.4.0", html_url: "u" }));
+    expect(r).toEqual({ status: "update-available", latest: { version: "1.4.0", htmlUrl: "u" } });
+  });
+  it("reports up-to-date on equal/older", async () => {
+    const r = await checkForUpdate(meta, fetchOk({ tag_name: "v1.3.0", html_url: "u" }));
+    expect(r.status).toBe("up-to-date");
+  });
+  it("degrades network failures to unknown with reason", async () => {
+    const f = vi.fn().mockRejectedValue(new Error("offline")) as unknown as typeof fetch;
+    const r = await checkForUpdate(meta, f);
+    expect(r.status).toBe("unknown");
+  });
+  it("treats non-2xx as unknown, never as up-to-date", async () => {
+    const f = vi.fn().mockResolvedValue({ ok: false, status: 403 }) as unknown as typeof fetch;
+    const r = await checkForUpdate(meta, f);
+    expect(r.status).toBe("unknown");
+  });
+});
+
+describe("shouldAutoCheck", () => {
+  it("checks when never checked before", () => {
+    expect(shouldAutoCheck(1000, 0)).toBe(true);
+  });
+  it("skips within the 24h window", () => {
+    expect(shouldAutoCheck(24 * 3600 * 1000, 23 * 3600 * 1000)).toBe(false);
+  });
+  it("passes after the window elapses", () => {
+    expect(shouldAutoCheck(25 * 3600 * 1000, 3600 * 1000)).toBe(true);
+  });
+});
