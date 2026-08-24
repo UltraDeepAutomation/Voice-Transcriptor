@@ -213,7 +213,19 @@ def start_download(model_id: str) -> Dict[str, Any]:
     if current.get("status") == "downloading":
         return current
 
-    _set_state(model_id, status="downloading", progress=0.0, error=None)
+    # Check-and-set must be atomic (BUG-63): two concurrent start_download
+    # calls (double-click, health poll racing a user action) could both
+    # observe "idle" here and each spawn a download worker for the same
+    # model — duplicated bandwidth and two writers fighting over the
+    # progress state. The claim happens under the same lock the workers
+    # use, so a claimed download is visible before we release.
+    with _lock:
+        current = _state.get(model_id) or {"status": "idle", "progress": 0.0}
+        if current.get("status") == "downloading":
+            return dict(current)
+        entry = dict(current)
+        entry.update({"status": "downloading", "progress": 0.0, "error": None})
+        _state[model_id] = entry
     thread = threading.Thread(
         target=_download_worker,
         args=(model_id,),

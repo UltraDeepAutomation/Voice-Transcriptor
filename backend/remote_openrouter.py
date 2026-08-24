@@ -149,7 +149,13 @@ def openrouter_transcribe(
 
     if r.status_code >= 400:
         error_text = r.text[:400]
-        if "input_audio" in error_text.lower() or "image" in error_text.lower():
+        # Audio-unsupported signature (BUG-66): the bare "image" token
+        # misclassified unrelated errors (a model id containing "image",
+        # throttling copy mentioning images) as audio-unsupported and
+        # hid the real cause. The upstream refusal names the rejected
+        # content type, so match the phrase, not one word.
+        lowered = error_text.lower()
+        if "input_audio" in lowered or "image input" in lowered:
             raise RemoteError(
                 f"Model '{model}' does not support audio input. Please use a model that supports audio, "
                 f"such as: {', '.join(OPENROUTER_AUDIO_MODELS)}"
@@ -238,8 +244,12 @@ def openrouter_upscale_text(
     out_text = ""
     try:
         out_text = (js["choices"][0]["message"]["content"] or "").strip()
-    except Exception:
-        out_text = ""
+    except (KeyError, IndexError, TypeError) as shape_err:
+        # A response-shape change must not masquerade as "empty text"
+        # (BUG-66): triage needs to see WHAT was actually received.
+        raise RemoteError(
+            f"openrouter upscale: unexpected response shape ({shape_err}): {str(js)[:200]}"
+        )
     if not out_text:
         raise RemoteError("openrouter upscale returned empty text")
 

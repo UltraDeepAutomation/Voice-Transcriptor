@@ -153,11 +153,15 @@ def merge_seam_fragments(
             out.append(dict(nxt))
             continue
         # Guards passed: the two touching tokens are one spoken word.
+        # Pure-function contract: edits land on the copies in ``out`` —
+        # mutating ``nxt`` directly leaked changes into the caller's
+        # segment list (BUG-67).
         prev["text"] = " ".join(p_tokens[:-1] + [p_tokens[-1] + n_tokens[0]])
         nxt_rest = " ".join(n_tokens[1:])
         if nxt_rest:
-            nxt["text"] = nxt_rest
-            out.append(nxt)
+            merged_nxt = dict(nxt)
+            merged_nxt["text"] = nxt_rest
+            out.append(merged_nxt)
         # else: next contributed only the fragment tail — fully absorbed.
     return out
 # An interim must carry at least this much text before its span counts as
@@ -682,6 +686,13 @@ class DeepgramLiveSession:
             # Finalize. Sending Finalize first guarantees that flush;
             # CloseStream then closes cleanly with the buffer already
             # emptied.
+            #
+            # The event is armed BEFORE the send (BUG-68): a final that
+            # lands while the Finalize frame is still in flight (network
+            # RTT, up to the 5 s send timeout) used to be erased by the
+            # post-send clear(), forcing the full flush wait below even
+            # though the answer was already in hand.
+            self._final_arrived.clear()
             try:
                 await asyncio.wait_for(
                     self._ws.send(json.dumps({"type": "Finalize"})),
@@ -715,7 +726,7 @@ class DeepgramLiveSession:
             #
             # Bounded, and short-circuited the instant the final lands,
             # so a well-behaved stream pays only its actual round trip.
-            self._final_arrived.clear()
+            # (The clear moved ABOVE the send — BUG-68.)
             try:
                 await asyncio.wait_for(
                     self._final_arrived.wait(),
@@ -744,6 +755,10 @@ class DeepgramLiveSession:
                         "retrying Finalize once",
                         tail_gap,
                     )
+                    # Armed BEFORE the retry send (BUG-68): a final
+                    # landing while the frame is in flight must be seen
+                    # by the wait below, not erased by a post-send clear.
+                    self._final_arrived.clear()
                     try:
                         await asyncio.wait_for(
                             self._ws.send(json.dumps({"type": "Finalize"})),
@@ -752,7 +767,6 @@ class DeepgramLiveSession:
                     except (asyncio.TimeoutError, ConnectionClosed, WebSocketException) as e:
                         logger.warning("deepgram-live: tail-guard Finalize failed: %s", e)
                     else:
-                        self._final_arrived.clear()
                         try:
                             await asyncio.wait_for(
                                 self._final_arrived.wait(),

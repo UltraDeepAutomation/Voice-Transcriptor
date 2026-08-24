@@ -113,7 +113,10 @@ class JobStore:
                 return
             if job.status not in ("queued", "running"):
                 return
-            job.progress = max(0.0, min(1.0, float(progress)))
+            # Monotonic by contract (BUG-65): a late callback from a
+            # superseded pipeline stage must never drag the displayed
+            # percentage backwards.
+            job.progress = max(job.progress, min(1.0, max(0.0, float(progress))))
 
     def set_done(
         self, job_id: str, result: Dict[str, Any], result_files: Dict[str, str]

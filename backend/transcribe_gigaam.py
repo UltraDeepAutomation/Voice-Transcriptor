@@ -48,7 +48,12 @@ GIGAAM_CHUNK_OVERLAP_SEC = 1.2
 GIGAAM_WORD_DEDUPE_EPSILON_SEC = 0.05
 
 _MODEL_CACHE: "OrderedDict[str, Any]" = OrderedDict()
-_MODEL_LOCK = threading.Lock()
+# Per-model locks (SSOT with backend/transcribe.py's documented policy):
+# loading model A must not serialise with loading model B — the single
+# global lock that sat here made the first v3_rnnt load block a
+# concurrent v3_e2e_rnnt load for the whole multi-second weight read.
+_MODEL_LOCKS_GUARD = threading.Lock()
+_MODEL_LOCKS: "dict[str, threading.Lock]" = {}
 
 # Max simultaneously-resident GigaAM models. Torch weights are large
 # (~1 GB each); a user who tried both catalog entries must not keep both
@@ -70,8 +75,20 @@ def gigaam_import_error() -> Optional[str]:
         return _LAST_LOAD_ERROR
 
 
+def _model_lock(model_id: str) -> threading.Lock:
+    """One lock per model id: same-name loads serialise, cross-name
+    loads stay parallel. The guard dict itself is only touched under
+    ``_MODEL_LOCKS_GUARD``."""
+    with _MODEL_LOCKS_GUARD:
+        lock = _MODEL_LOCKS.get(model_id)
+        if lock is None:
+            lock = threading.Lock()
+            _MODEL_LOCKS[model_id] = lock
+        return lock
+
+
 def _load_model(model_id: str) -> Any:
-    with _MODEL_LOCK:
+    with _model_lock(model_id):
         model = _MODEL_CACHE.get(model_id)
         if model is not None:
             # LRU bookkeeping: a hit promotes the entry to most-recently-
@@ -268,16 +285,21 @@ def transcribe_gigaam(
             **({"words": owned} if word_timestamps else {}),
         })
     # Defensive: a chunk that returned text but no word timings cannot
-    # take part in time-based dedupe — keep its text verbatim rather
-    # than silently dropping speech.
-    for idx, text in enumerate(chunk_texts):
-        if text and idx not in by_chunk:
-            start, end = bounds[idx]
-            segments.append({
-                "start": round(start, 3),
-                "end": round(min(end, total_sec), 3),
-                "text": text,
-            })
+    # take part in time-based dedupe. Its verbatim text INCLUDES the
+    # 1.2 s overlap already covered by the neighbours' accepted words,
+    # so keeping it next to word-bearing segments duplicates the seam
+    # (BUG-55). The fallback is therefore only meaningful when NO chunk
+    # produced usable words — a words-less engine response — and is
+    # dropped as seam noise whenever any accepted words exist.
+    if not by_chunk:
+        for idx, text in enumerate(chunk_texts):
+            if text:
+                start, end = bounds[idx]
+                segments.append({
+                    "start": round(start, 3),
+                    "end": round(min(end, total_sec), 3),
+                    "text": text,
+                })
     segments.sort(key=lambda seg: float(seg["start"]))
 
     # Full transcribe_audio result contract: callers read ``text`` and

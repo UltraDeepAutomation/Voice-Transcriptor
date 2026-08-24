@@ -577,6 +577,14 @@ def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
     base, _ = os.path.splitext(path_wav_16k)
     ch1 = base + ".ch1.wav"
     ch2 = base + ".ch2.wav"
-    write_wav(ch1, data[:, 0:1], LIVE_SAMPLE_RATE_HZ)
-    write_wav(ch2, data[:, 1:2], LIVE_SAMPLE_RATE_HZ)
+    # Atomic-write SSOT (BUG-64): write to the canonical ``.tmp-<hex>``
+    # convention and os.replace into place, like every other user-data
+    # write in the app. A crash mid-write previously left a torn
+    # ch1/ch2.wav that no orphan sweep recognised.
+    tmp_ch1 = f"{ch1}.tmp-{uuid.uuid4().hex}"
+    tmp_ch2 = f"{ch2}.tmp-{uuid.uuid4().hex}"
+    write_wav(tmp_ch1, data[:, 0:1], LIVE_SAMPLE_RATE_HZ)
+    write_wav(tmp_ch2, data[:, 1:2], LIVE_SAMPLE_RATE_HZ)
+    os.replace(tmp_ch1, ch1)
+    os.replace(tmp_ch2, ch2)
     return ch1, ch2

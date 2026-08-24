@@ -128,6 +128,13 @@ def request_with_retry(
     # an opaque HTTP 500 with no provider context. Treat it as "one
     # attempt, no retry", which is what such a caller means.
     attempts = max(1, int(retries or 0))
+    # Idempotency gate (BUG-53): a read timeout on a POST means the
+    # provider MAY have already processed (and billed) the request —
+    # blind retrying double-charges the user. Non-idempotent methods
+    # retry only on connect-phase failures, where the request provably
+    # never reached the server; read timeouts are terminal for them.
+    _http_method = str(method or "GET").upper()
+    _idempotent = _http_method in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
     for attempt in range(attempts):
         try:
             resp = _SESSION.request(method, url, timeout=timeout, **kwargs)
@@ -147,6 +154,14 @@ def request_with_retry(
             return resp
         except RequestException as e:
             last_err = e
+            if not _idempotent and isinstance(e, requests.ReadTimeout):
+                # The request was sent and the response never came back:
+                # the provider may have completed the work. Retrying a
+                # paid transcription risks double billing — fail loudly
+                # instead (BUG-53). ConnectTimeout is NOT here: it fires
+                # before the request reaches the server, so a retry is
+                # safe even for POST.
+                break
             if attempt == attempts - 1:
                 break
             time.sleep(_exponential_backoff(attempt, backoff_base))

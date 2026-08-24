@@ -1860,13 +1860,21 @@ def _run_local_transcribe_once(
             temp_paths.append(wav_path)
             ensure_wav_16k_preserve_channels(str(upload_path), wav_path)
             set_progress(0.15)
+            # Register the channel files BEFORE split_channels writes
+            # them (BUG-64): the paths are deterministic, and if the ch2
+            # write fails the already-written ch1 would otherwise never
+            # be cleaned up. The cleanup below tolerates absent files.
+            _split_base = os.path.splitext(wav_path)[0]
+            temp_paths.extend([
+                f"{_split_base}.ch1.wav",
+                f"{_split_base}.ch2.wav",
+            ])
             ch1, ch2 = split_channels(wav_path)
         else:
             ch1, ch2 = (None, None)
             set_progress(0.15)
 
         if ch1 and ch2:
-            temp_paths.extend([ch1, ch2])
             set_progress(0.2)
             t1 = _transcribe_with_retry(
                 ch1, model, language=language, word_timestamps=word_timestamps
@@ -3767,11 +3775,20 @@ async def _run_local_live_session(
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        # Best-effort final emit in case transcriber missed the tail
+        # Best-effort final emit in case transcriber missed the tail.
+        # Bounded (BUG-69): maybe_transcribe(force=True) awaits any
+        # in-flight pass, and a wedged inference thread has no internal
+        # ceiling — without an outer bound a hung pass stalled the whole
+        # WS close path for minutes. 30 s covers the slowest legitimate
+        # CPU pass over a ≤17 s window.
         try:
-            tail = await session.maybe_transcribe(force=True)
+            tail = await asyncio.wait_for(
+                session.maybe_transcribe(force=True), timeout=30.0
+            )
             if tail:
                 await _ws_send_json(websocket, tail)
+        except asyncio.TimeoutError:
+            logger.warning("ws local tail emit skipped: forced flush exceeded 30s")
         except Exception as e:
             if not _is_broken_pipe_error(e):
                 logger.debug("ws local tail emit failed: %s", e)
@@ -5043,6 +5060,16 @@ def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_aut
         raise HTTPException(
             status_code=500,
             detail=f"failed to persist config: {_safe_error_text(e)}",
+        )
+    except RuntimeError as e:
+        # encrypt_value's documented loud-fail (crypto present but keyfile
+        # unusable): persisting provider keys in the clear is forbidden by
+        # design, so the save must fail — as a clean envelope, not a raw
+        # 500 (BUG-54, the save-side twin of BUG-41).
+        logger.error("save_config refused: encryption unavailable: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail="config not saved: encryption is unavailable (key file unusable); fix the key file and retry",
         )
     _invalidate_recordings_dir_cache()
     _invalidate_recordings_cache()
