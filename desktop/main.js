@@ -5245,6 +5245,28 @@ function broadcastBackendBootError() {
  * when the venv already passes its import check, which would have left
  * existing installs unable to ever fetch the engine.
  */
+/**
+ * Post-install dedupe: the engine stack drags its own numpy, which
+ * shadows the bundled runtime's pinned numpy for EVERY import (engine
+ * or not) once engine-site hits PYTHONPATH. Verified live: bundle
+ * numpy 2.0.2 satisfies torch 2.13 + gigaam, so the duplicate goes.
+ */
+const ENGINE_SITE_PRUNE_PREFIXES = ["numpy", "ml_dtypes"];
+
+function sanitizeEngineSite(siteDir) {
+  try {
+    for (const name of fs.readdirSync(siteDir)) {
+      if (!ENGINE_SITE_PRUNE_PREFIXES.some((p) => name === p || name.startsWith(`${p}-`))) {
+        continue;
+      }
+      try {
+        fs.rmSync(path.join(siteDir, name), { recursive: true, force: true });
+        appendMainLog(`[gigaam-install] pruned duplicate ${name} from engine-site`);
+      } catch { /* non-fatal */ }
+    }
+  } catch { /* non-fatal */ }
+}
+
 async function installGigaamEngineIfRequested(python, repoRoot) {
   const marker = path.join(repoRoot, "ENABLE_GIGAAM");
   if (!fs.existsSync(marker)) return;
@@ -5271,6 +5293,7 @@ async function installGigaamEngineIfRequested(python, repoRoot) {
   const res = await runCommand(python, args, {
     cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
   });
+  if (res.ok) sanitizeEngineSite(engineSite);
   appendMainLog(
     `[backend-runtime] gigaam install ${res.ok ? "ok" : "FAILED"}`
     + (res.ok ? "" : `: ${(res.details || "").slice(0, 400)}`)

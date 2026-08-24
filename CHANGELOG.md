@@ -3,6 +3,11 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.8] - 2026-08-24
+
+### Fixed
+- **numpy shadowing**: the GigaAM stack installs its own numpy into engine-site, which would shadow the bundled runtime's pinned numpy for every import. The installer now prunes duplicate `numpy`/`ml_dtypes` after install — the bundle provides the single numpy; torch/gigaam are verified to run against it.
+
 ## [1.3.7] - 2026-08-24
 
 ### Fixed
