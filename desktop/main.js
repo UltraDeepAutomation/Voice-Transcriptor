@@ -330,6 +330,30 @@ function mainLogArchivePath(kind) {
   return candidate;
 }
 
+function recoverOrphanRotatingLogs() {
+  // Rotation is rename→rename; a crash between the two steps leaves
+  // ``main.log.<kind>-<stamp>.rotating`` orphans that nothing else ever
+  // promotes — silently stranded support logs. Sweep them at boot.
+  if (!mainLogFilePath) return;
+  try {
+    const dir = path.dirname(mainLogFilePath);
+    const prefix = path.basename(mainLogFilePath) + ".";
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(prefix) || !name.endsWith(".rotating")) continue;
+      const orphan = path.join(dir, name);
+      const promoted = orphan.slice(0, -".rotating".length);
+      try {
+        if (fs.existsSync(promoted)) {
+          fs.renameSync(orphan, `${promoted}-recovered-${Date.now()}`);
+        } else {
+          fs.renameSync(orphan, promoted);
+        }
+        appendMainLog(`[log-rotation] recovered orphan ${name}`);
+      } catch { /* keep orphan in place; retried next boot */ }
+    }
+  } catch { /* directory unreadable — non-fatal */ }
+}
+
 function rotateMainLogIfNeeded() {
   if (!mainLogFilePath) return;
   try {
@@ -4915,7 +4939,12 @@ async function pickBackendPort(host, preferred = DEFAULT_BACKEND_PORT) {
     // eslint-disable-next-line no-await-in-loop
     if (await canBindPort(host, p)) return p;
   }
-  return new Promise((resolve) => {
+  // Last resort: ask the OS for an ephemeral port. A zero result (never
+  // observed in practice, but the API allows it on bind failure) used to
+  // fall back to ``start`` — a port we just proved is occupied — which
+  // guaranteed an EADDRINUSE crash loop. Now: retry the ephemeral ask,
+  // then extend the linear scan before ever reusing a known-busy port.
+  const ephemeralOnce = () => new Promise((resolve) => {
     const srv = net.createServer();
     srv.listen(0, host, () => {
       const addr = srv.address();
@@ -4923,10 +4952,22 @@ async function pickBackendPort(host, preferred = DEFAULT_BACKEND_PORT) {
       try {
         srv.close();
       } catch { }
-      resolve(port || start);
+      resolve(port);
     });
-    srv.once("error", () => resolve(start));
+    srv.once("error", () => resolve(0));
   });
+  return (async () => {
+    for (let i = 0; i < 3; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const port = await ephemeralOnce();
+      if (port > 0) return port;
+    }
+    for (let p = start + 24; p < start + 1048; p += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await canBindPort(host, p)) return p;
+    }
+    return 0;
+  })();
 }
 
 // ── App-scoped venv (persists across app updates) ──
@@ -5708,7 +5749,6 @@ async function createWindow(options = {}) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      enableRemoteModule: false,
       webSecurity: true,
       // Sandbox: renderer has no Node.js access even in worst case
       // (a preload script exploit would not break out of sandbox).
@@ -6482,8 +6522,13 @@ if (process.platform === "darwin") {
  * ``backend`` reference has been cleared.
  */
 let backendTerminationInProgress = false;
-function killBackendHard(reason) {
-  if (backendTerminationInProgress) return;
+function killBackendHard(reason, opts = {}) {
+  // ``force`` lets a second lifecycle caller (before-quit after a
+  // signal) proceed even though an earlier call is still mid-sequence;
+  // without it the before-quit retry was a silent no-op and the
+  // SIGKILL escalation depended entirely on the first call's timer
+  // surviving teardown.
+  if (backendTerminationInProgress && !opts.force) return;
   backendTerminationInProgress = true;
   const proc = backend;
   backend = null;
@@ -6564,30 +6609,45 @@ function killBackendHard(reason) {
     return;
   }
 
+  const escalateSync = () => {
+    if (!pidForFallback) return;
+    try {
+      process.kill(pidForFallback, "SIGKILL");
+      appendMainLog(`[backend-kill] escalated to SIGKILL pid=${pidForFallback} (${reason})`);
+    } catch (e) {
+      appendMainLog(`[backend-kill] SIGKILL failed: ${e?.message || e}`);
+    }
+    pidForFallback = null;
+    backendTerminationInProgress = false;
+  };
   try {
     proc.kill("SIGTERM");
   } catch (e) {
     appendMainLog(`[backend-kill] SIGTERM failed: ${e?.message || e}`);
   }
+  if (opts.synchronous) {
+    // ``process.on("exit")`` context: NO pending timer will ever run —
+    // the only reliable escalation is a synchronous SIGKILL right here.
+    // The backend's own stdin watchdog remains the deeper backstop.
+    escalateSync();
+    return;
+  }
   // Hard-kill timeout — if the process ignores SIGTERM (e.g., blocked
-  // in a native call), SIGKILL it so we don't orphan it.
+  // in a native call), SIGKILL it so we don't orphan it. Signal paths
+  // shorten the window so escalation lands BEFORE their bounded
+  // ``app.exit`` fallback tears the loop down.
   setTimeout(() => {
     if (!pidForFallback) return;
     try {
       process.kill(pidForFallback, 0);
       // Still alive — escalate to SIGKILL.
-      try {
-        process.kill(pidForFallback, "SIGKILL");
-        appendMainLog(`[backend-kill] escalated to SIGKILL pid=${pidForFallback}`);
-      } catch (e) {
-        appendMainLog(`[backend-kill] SIGKILL failed: ${e?.message || e}`);
-      }
+      escalateSync();
     } catch {
       // ESRCH — process is already gone, nothing to do.
+      pidForFallback = null;
+      backendTerminationInProgress = false;
     }
-    pidForFallback = null;
-    backendTerminationInProgress = false;
-  }, 1500);
+  }, opts.escalateAfterMs || 1500);
 }
 
 app.on("before-quit", () => {
@@ -6650,14 +6710,14 @@ app.on("before-quit", () => {
     }
     tray = null;
   }
-  killBackendHard("before-quit");
+  killBackendHard("before-quit", { force: true });
 });
 
 // Hook the raw node process exit events too — covers crashes and
 // external signals that bypass Electron's ``before-quit`` handler.
 process.on("exit", () => {
   isQuitting = true;
-  killBackendHard("process-exit");
+  killBackendHard("process-exit", { force: true, synchronous: true });
 });
 const SIGNAL_EXIT_CODES = Object.freeze({
   SIGHUP: 129,
@@ -6668,7 +6728,7 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(sig, () => {
     appendMainLog(`[signal] ${sig}`);
     isQuitting = true;
-    killBackendHard(`signal-${sig}`);
+    killBackendHard(`signal-${sig}`, { escalateAfterMs: 250 });
     try {
       app.quit();
     } catch {
@@ -6686,6 +6746,7 @@ app.whenReady().then(async () => {
   // already registered at module top-level so pre-whenReady crashes are
   // captured. No duplicate registration needed here.
   cleanupStaleTranscriptTmpFiles();
+  recoverOrphanRotatingLogs();
   lastTranscriptText = loadLastTranscriptFromDisk();
   if (process.platform === "darwin") {
     ensureMacDockPresence("ready");

@@ -153,6 +153,20 @@ def _load_or_create_fernet_key() -> bytes:
         # NTFS ACL is what protects user data and the file lands in
         # %APPDATA%\Transcriptor\ which is already user-private. The
         # atomic primitive is good enough on Win.
+        if _KEYFILE.exists():
+            # Mirror the POSIX contract exactly: an existing keyfile is
+            # NEVER replaced. Reaching generate-key here means the file
+            # exists but was unreadable/corrupt; overwriting it would
+            # permanently destroy decryptability of every stored `enc:`
+            # value (e.g. an AV/ACL lock clearing after we clobbered the
+            # key). Refusing keeps old values readable on the next boot.
+            logger.error(
+                "keyfile at %s exists but yielded no usable key — REFUSING "
+                "to overwrite it (existing encrypted values stay "
+                "decryptable once the file becomes readable again)",
+                _KEYFILE,
+            )
+            return b""
         try:
             atomic_write_bytes(_KEYFILE, key)
         except OSError as e:
@@ -238,7 +252,16 @@ def encrypt_value(plain: str) -> str:
     if not plain:
         return ""
     if _FERNET is None:
-        return plain  # no-crypto fallback
+        if not _HAS_CRYPTO:
+            return plain  # documented no-crypto fallback
+        # Library present but the KEY is unavailable (persist failure /
+        # refusal above). Silently writing plaintext API tokens beside
+        # existing `enc:` values would be a silent at-rest regression
+        # exactly when protection is already degraded — fail loudly so
+        # save_config surfaces it instead of storing secrets in the clear.
+        raise RuntimeError(
+            "encryption key unavailable; refusing to store secret as plaintext"
+        )
     token = _FERNET.encrypt(plain.encode("utf-8"))
     return _ENC_PREFIX + token.decode("ascii")
 
@@ -461,10 +484,10 @@ _migrate_legacy_data()
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
-    "providers": {
-        "openrouter": {"key": ""},
-        "deepgram": {"key": ""},
-    },
+    # Skeleton keys derive from the same SSOT tuple that validation and
+    # the health catalog use — adding a provider there now automatically
+    # provisions its config slot.
+    "providers": {name: {"key": ""} for name in REMOTE_TRANSCRIPTION_PROVIDERS},
     "preferences": {
         "remote_provider": "openrouter",
         "recordings_dir": "",
@@ -720,6 +743,21 @@ def _load_config_unlocked() -> Dict[str, Any]:
     # unstamped forever. Self-heals on the first save_config, but leaves
     # load_config's idempotency invariant broken.
     original_schema_version: int | None = None
+    if not CONFIG_PATH.exists() and _CONFIG_BACKUP_PATH.exists():
+        # Divergent-reader guard: the provider-key loader treats a valid
+        # backup as authoritative when the primary is gone; without this
+        # mirror branch load_config returned bare DEFAULTS while keys
+        # still resolved from .bak — two readers disagreeing about the
+        # SSOT in one process.
+        try:
+            raw = _read_json_file(_CONFIG_BACKUP_PATH)
+            source = "backup"
+            logger.warning(
+                "primary config missing at %s — recovered from backup %s",
+                CONFIG_PATH, _CONFIG_BACKUP_PATH,
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass  # fall through to the default empty-start path below
     if CONFIG_PATH.exists():
         try:
             raw = _read_json_file(CONFIG_PATH)

@@ -292,3 +292,40 @@ SSOT-нарушения: BUG-07 устранён; BUG-08/14 закрыты об�
 **Исправление:** tail-guard: если стрим ушёл дальше последнего финала ≥0.75 c — один ретрай Finalize; иначе мгновенное закрытие без штрафа латентности; 2 теста.
 
 **Статус после групп D (2026-08-24): P0 0/0 · P1 4/4 · P2 12/12 исправлено · P3 3/3 исправлено · WONTFIX 1**
+
+---
+
+# Расширенный аудит — волна 2 (2026-08-24): зоны, не покрытые первым аудитом
+
+Методология: четыре параллельных построчных ревизии (desktop/main.js целиком вне прежних зон · REST/WS-поверхность backend/main.py · фронтенд вне прежних зон · поддерживающий слой + кросс-SBOT). Ниже только реальные дефекты; чистые вердикты — в конце.
+
+## Исправлено в этой волне
+
+| ID | Файл:строка | Суть | Последствие | Фикс |
+|---|---|---|---|---|
+| W2-01 (P1) | `backend/live.py:166+` | force-флаш гоняет периодический проход (lock не покрывает emit-секцию) | дублированный/перепутанный хвост локального live-текста | single-flight: force ждёт in-flight, тики пропускаются; 2 теста |
+| W2-02 (P1) | `backend/main.py:1064+` | promote живой сессии: нет проверки статуса | обрезанный WAV + unlink PCM под писателем → тихая потеря остатка записи | 409 при status=recording |
+| W2-03 (P1) | `desktop/main.js:6487+` | SIGKILL-эскалация в setTimeout, мёртвом на exit/signal путях | зависший uvicorn-сирота держит порт и модели в RAM | signal→250ms эскалация; process-exit→синхронный SIGKILL |
+| W2-04 (P2) | `desktop/main.js:4912+` | port 0 → fallback на занятый preferred | EADDRINUSE crash-loop | ретрай ephemeral ×3 + расширенный скан |
+| W2-05 (P2) | `backend/config.py` Windows-ветка | перезапись существующего нечитаемого keyfile | перманентная потеря всех enc:-значений | зеркальный POSIX отказ |
+| W2-06 (P2) | `backend/config.py encrypt_value` | тихий plaintext при недоступном ключе | секреты пишутся открыто именно когда защита деградировала | RuntimeError вместо молчания |
+| W2-07 (P2) | `backend/config.py:686+` vs `:334` | два читателя расходятся при отсутствии primary (.bak) | ключи из .bak при дефолтном остальном конфиге | ветка восстановления из .bak |
+| W2-08 (P3) | `config.py DEFAULT_CONFIG` | providers-скелет вручную, мимо SSOT-кортежа | новый провайдер = забытая правка в двух местах | comprehension от REMOTE_TRANSCRIPTION_PROVIDERS |
+| W2-09 (P3) | `desktop/main.js rotateMainLogIfNeeded` | crash между rename'ами оставляет *.rotating навсегда | потерянные саппорт-логи | boot-sweep с promote |
+| W2-10 (P3) | `backend/main.py:4841/4887` | instruction без капа | гигабайтные JSON-телa парсятся в RAM | 413 >20000 символов |
+| W2-11 (P4) | `desktop/main.js:5752` enableRemoteModule · `http_retry.py` timeout-hint | мёртвый код / неточная докстринга | шум, вводящая в заблуждение правка | удалён / исправлена |
+
+## Принято без кода (обосновано)
+
+- **OBS-A** `main.tsx:11440`: try-зона processUploadItem начинается после ~60 синхронных строк пролога — теоретический unhandled rejection; пролог оперирует плоскими полями очереди, .finally декрементирует счётчик при любом исходе. Расширение try = реиндент 60 строк ради недостижимого пути.
+
+## Проверено чистым (построчно)
+
+- `desktop/preload.js` — весь IPC-allowlist
+- Фронтенд: id-проводка (123 used ⊆ 144 declared, $ fail-fast), 107 listener-ов (3 безопасных класса), все таймеры/rAF (очистка на stop/cancel/pagehide), draft-queue (коалесинг, FIFO, без retry-storms), XSS (13 innerHTML — все очистки/статика, текст через createTextNode), settings-sync (FIFO-цепочка + suppress-флаг в finally), storage (все 11 сайтов try-wrapped)
+- Бэкенд: WS disconnect/cancel пути, event-queue overflow, jobs-drain
+- requirements.txt ↔ импорты; build.files whitelist ↔ require-граф main.js+preload.js; electron-версия ↔ используемые API
+
+## Итог волны 2
+
+Найдено 11 дефектов (P1×3, P2×4, P3×2, P4×2 — считая пары мелких вместе), **10 исправлено в этой же волне**, 1 принято с обоснованием. SSOT-дрейфов после W2-08 не осталось.

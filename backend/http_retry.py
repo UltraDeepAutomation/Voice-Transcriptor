@@ -100,7 +100,7 @@ def request_with_retry(
     *,
     retries: int = 3,
     backoff_base: float = 0.3,
-    timeout: Optional[int] = 60,
+    timeout: Optional["Tuple[float, float] | float"] = 60.0,
     **kwargs,
 ) -> requests.Response:
     """Send an HTTP request with automatic retry on transient failures.

@@ -1068,6 +1068,17 @@ def _promote_live_recovery(
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 meta = {}
+            # TOCTOU guard: promoting a session that is STILL recording
+            # would produce a truncated WAV and then unlink the PCM out
+            # from under the live WS writer — every subsequent second of
+            # the session streams into an unlinked inode and is lost
+            # silently at finalize. The UI only lists crashed sessions,
+            # but the API surface must defend itself too.
+            if str(meta.get("status") or "") == "recording":
+                raise HTTPException(
+                    status_code=409,
+                    detail="session is still recording; stop it before promoting",
+                )
             # Reject oversized spool files BEFORE the read to avoid OOM:
             # np.frombuffer + astype(float32) materialises 3× the raw PCM
             # size in RAM simultaneously.
@@ -4828,6 +4839,8 @@ def create_upscale_preset(payload: dict = Body(...), _auth: None = Depends(_requ
     _ensure_builtin_upscale_presets()
     name = str(payload.get("name") or "").strip()
     instruction = str(payload.get("instruction") or "").strip()
+    if len(instruction) > 20_000:
+        raise HTTPException(status_code=413, detail="instruction too long (max 20000 chars)")
     if not name:
         raise HTTPException(status_code=400, detail="preset name is required")
     if not instruction:
@@ -4874,6 +4887,8 @@ def update_upscale_preset(preset_id: str, payload: dict = Body(...), _auth: None
     _ensure_builtin_upscale_presets()
     item = _resolve_upscale_preset(preset_id)
     instruction = str(payload.get("instruction") or "").strip()
+    if len(instruction) > 20_000:
+        raise HTTPException(status_code=413, detail="instruction too long (max 20000 chars)")
     if not instruction:
         raise HTTPException(status_code=400, detail="preset instruction is required")
     next_payload = {

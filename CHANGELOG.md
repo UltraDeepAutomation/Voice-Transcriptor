@@ -3,6 +3,21 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.4] - 2026-08-24
+
+### Fixed (expanded audit wave 2 — desktop/main.js, backend API surface, config/persistence layer)
+- **live.py single-flight**: a Stop-time forced flush could run concurrently with an in-flight periodic pass — overlapping windows interleaved emits (duplicate/out-of-order tail text). Forced flush now awaits the running pass; periodic ticks during a pass are skipped.
+- **Recovery promote TOCTOU**: promoting a session that is still recording truncated the WAV and unlinked the PCM out from under the live writer; now rejected with 409.
+- **Backend kill escalation on exit paths**: SIGKILL escalation lived in a timer that cannot fire during `process.on("exit")`/signals — hung uvicorn could survive as an orphan. Signal paths now escalate after 250 ms; the exit path escalates synchronously.
+- **Port picker degenerate fallback**: ephemeral port `0` fell back to a port just proven occupied → EADDRINUSE crash loop. Now retried, then extended scan.
+- **config.py keyfile contract**: Windows branch overwrote an existing-but-unreadable keyfile (permanent loss of all `enc:` values) — now mirrors POSIX refusal. Plaintext downgrade when the key is unavailable is refused loudly instead of silently writing secrets. Backup recovery unified between the two config readers (missing-primary case).
+- **DEFAULT_CONFIG providers skeleton** derives from `REMOTE_TRANSCRIPTION_PROVIDERS` (SSOT).
+- **Log rotation orphans**: crash between rotation renames stranded `*.rotating` support logs forever; swept and promoted at boot.
+- Minor: upscale `instruction` capped (413 >20k), stale `enableRemoteModule` removed, http_retry timeout hint corrected.
+
+### Verified clean (wave 2)
+preload.js IPC surface · frontend id-wiring/listener-leaks/timers/draft-queue/XSS/settings-races/storage · backend WS disconnect/cancel paths · requirements vs imports · packaging whitelist vs require graph.
+
 ## [1.3.3] - 2026-08-24
 
 ### Fixed

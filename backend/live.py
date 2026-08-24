@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from collections import deque
@@ -79,6 +80,12 @@ class LiveSession:
         self._ring_samples = 0
         self._total_samples = 0
         self._lock = asyncio.Lock()
+        # Single-flight guard: at most one transcription pass may run at a
+        # time. A forced (Stop-time) flush awaits the in-flight periodic
+        # pass instead of racing it — two concurrent passes transcribe
+        # overlapping windows and interleave their emits, duplicating or
+        # reordering tail text.
+        self._inflight: Optional["asyncio.Task"] = None
         self._last_transcribe_sec = 0.0
         # End (in global stream seconds) of the audio that has actually
         # been handed to the model. Distinct from
@@ -164,6 +171,31 @@ class LiveSession:
         return max(float(self.cfg.window_sec), self._ring_keep_sec() - 1.0)
 
     async def maybe_transcribe(self, *, force: bool = False):
+        """Single-flight entry point around :meth:`_transcribe_pass`.
+
+        A periodic tick that arrives while a pass is running is skipped —
+        the next tick covers the gap. A forced (Stop-time) flush instead
+        AWAITS the in-flight pass, so its window selection sees the
+        updated ``_covered_sec`` and transcribes only the true remainder
+        instead of an overlapping copy of it.
+        """
+        inflight = self._inflight
+        if inflight is not None and not inflight.done():
+            if not force:
+                return None
+            with contextlib.suppress(Exception):
+                # The in-flight pass records its own errors/envelopes;
+                # here we only need its completion for a clean handoff.
+                await asyncio.shield(inflight)
+        task = asyncio.create_task(self._transcribe_pass(force=force))
+        self._inflight = task
+        try:
+            return await task
+        finally:
+            if self._inflight is task:
+                self._inflight = None
+
+    async def _transcribe_pass(self, *, force: bool = False):
         sr = self.cfg.sample_rate
 
         async with self._lock:
