@@ -662,6 +662,9 @@ const ACCEPTED_AUDIO_VIDEO_EXTS = new Set<string>();
 const LEGACY_LIVE_DRAFT_STORAGE_KEY = "transcriptor.liveDraft.v1";
 const LEGACY_LIVE_DRAFT_CORRUPT_STORAGE_PREFIX = "transcriptor.liveDraft.corrupt.";
 const LEGACY_UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
+// Schema version the SERVER reported for the queue snapshot (SSOT:
+// backend UPLOAD_QUEUE_STATE_VERSION); gates the legacy-localStorage read.
+let uploadQueueServerVersion = 1;
 const LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_SAVE_DEBOUNCE_MS = 180;
 let uploadQueueMaxPersistedItems = Number.MAX_SAFE_INTEGER;
@@ -737,20 +740,33 @@ function normalizeUpscaleModelOptions(value: unknown, fallback: UpscaleModelOpti
 function syncLocalModelOptions(): void {
   const sel = document.getElementById("model") as HTMLSelectElement | null;
   if (!sel) return;
+  const engineFor = (m: string): string =>
+    m.startsWith("gigaam-") ? "gigaam" : "whisper";
+  // Idempotent rebuild (BUG-58): this runs on every 2 s poll tick, and a
+  // blind `innerHTML = ""` closed the user's open dropdown every time.
+  // Rebuild only when the option set actually changed (availability is
+  // the only thing /api/health can flip at runtime).
+  const signature = LOCAL_TRANSCRIPTION_MODELS.map(
+    (m) => `${m}:${LOCAL_ENGINE_AVAILABILITY[engineFor(m)] !== false ? "1" : "0"}`
+  ).join("|");
+  const currentSignature = Array.from(sel.options)
+    .map((o) => `${o.value}:${o.disabled ? "0" : "1"}`)
+    .join("|");
+  const needsRebuild = signature !== currentSignature;
   const preferred = (pendingModelSelection || sel.value || "").trim();
   const nextValue = LOCAL_TRANSCRIPTION_MODELS.includes(preferred)
     ? preferred
     : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  sel.innerHTML = "";
-  const engineFor = (m: string): string =>
-    m.startsWith("gigaam-") ? "gigaam" : "whisper";
-  for (const model of LOCAL_TRANSCRIPTION_MODELS) {
-    const opt = document.createElement("option");
-    opt.value = model;
-    const available = LOCAL_ENGINE_AVAILABILITY[engineFor(model)] !== false;
-    opt.textContent = available ? model : `${model} — engine not installed`;
-    opt.disabled = !available;
-    sel.appendChild(opt);
+  if (needsRebuild) {
+    sel.innerHTML = "";
+    for (const model of LOCAL_TRANSCRIPTION_MODELS) {
+      const opt = document.createElement("option");
+      opt.value = model;
+      const available = LOCAL_ENGINE_AVAILABILITY[engineFor(model)] !== false;
+      opt.textContent = available ? model : `${model} — engine not installed`;
+      opt.disabled = !available;
+      sel.appendChild(opt);
+    }
   }
   const preferredAvailable =
     LOCAL_TRANSCRIPTION_MODELS.includes(nextValue) &&
@@ -915,6 +931,10 @@ function renderLocalModels(): void {
     create: (row) => {
       const card = document.createElement("div");
       card.className = "model-row" + (row.downloaded ? " ready" : "");
+      // Reconciler identity (BUG-56): without dataset.recordingKey the
+      // keyed lookup never matches, so every 2 s poll dropped and
+      // recreated the whole table (lost hover state, button flicker).
+      card.dataset.recordingKey = row.key;
       applyRowToCard(card, row);
       return card;
     },
@@ -946,6 +966,18 @@ async function refreshLocalModels(): Promise<void> {
         sel.dispatchEvent(new Event("change"));
       }
       pendingModelSelection = null;
+    }
+    // A pending pin whose download ENDED IN ERROR must not survive
+    // (BUG-71): it would pin the select to lastAppliedLocalModel forever
+    // (syncLocalModelOptions forces that value while a pin exists) and
+    // silently swallow every later user choice. The row keeps its
+    // "failed — retry" button, so releasing the pin costs nothing.
+    if (
+      pendingModelSelection &&
+      findLocalModelRow(pendingModelSelection)?.status === "error"
+    ) {
+      pendingModelSelection = null;
+      syncLocalModelOptions();
     }
   } catch {
     // BUG-31: surface the failure instead of leaving a blank table. A
@@ -4164,13 +4196,19 @@ async function acquireMicStream(deviceId: string): Promise<MediaStream> {
           if (timedOut) late.getTracks().forEach((t) => t.stop());
         })
         .catch(() => { /* reported through the race below */ });
+      // The timer handle MUST be cleared on success (BUG-72): an uncleared
+      // timer fires 2.5 s after every successful open and its reject has
+      // no consumer left — an unhandled promise rejection per mic start.
+      let timerId: number | undefined;
       const stream = await Promise.race([
         pending,
         new Promise<never>((_, reject) => {
-          setTimeout(() => {
+          timerId = window.setTimeout(() => {
             timedOut = true;
             reject(new Error(`microphone did not open within ${MIC_ACQUIRE_TIMEOUT_MS} ms`));
           }, MIC_ACQUIRE_TIMEOUT_MS);
+        }).finally(() => {
+          if (timerId !== undefined) window.clearTimeout(timerId);
         }),
       ]);
       if (stream.getAudioTracks().some((t) => t.readyState === "live")) return stream;
@@ -4386,6 +4424,18 @@ function clearLiveDraft(sessionToken = ""): Promise<void> {
 
 function parsePersistedLiveDraftPayload(parsed: unknown): PersistedLiveDraft | null {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  // Schema gate (BUG-73): a payload written by a NEWER schema version
+  // must not be fed through the old reader — structural coercion would
+  // silently misread fields instead of taking the corrupt-quarantine
+  // path. Missing version = pre-versioning legacy, accepted as v1.
+  const rawVersion = (parsed as Record<string, unknown>).schema_version;
+  const storedVersion = typeof rawVersion === "number" ? rawVersion : 1;
+  if (!Number.isFinite(storedVersion) || storedVersion > LIVE_DRAFT_SCHEMA_VERSION) {
+    console.warn(
+      `live draft: schema_version ${storedVersion} > supported ${LIVE_DRAFT_SCHEMA_VERSION}, discarding`,
+    );
     return null;
   }
   // Structural type guard: every field that we use is coerced to its
@@ -7272,6 +7322,13 @@ let ws: WebSocket | null = null;
 // a recording when the AudioWorklet fires frames before the WS
 // handshake completes (50–300 ms window).
 let wsPendingFrames: ArrayBuffer[] = [];
+// Cap measured in OUTPUT SAMPLES, not frame count (BUG-59): a frame
+// holds the worklet's input quantum (e.g. 128 samples at 48 kHz),
+// which downsamples to ~42.7 output samples — 500 frames were ~1.3 s
+// of audio, not the 4 s the old comment promised, so a slow handshake
+// silently dropped opening words. 64 000 samples = 4 s at 16 kHz.
+const WS_PENDING_MAX_SAMPLES = 64_000;
+let wsPendingFrameSamples = 0;
 /**
  * Frames captured for this session that never reached the backend —
  * discarded at the pending-buffer cap, lost to a failed ``send``, or
@@ -7313,6 +7370,7 @@ function flushPendingWsFrames(socket: WebSocket | null): number {
     }
     wsPendingFrames.shift();
   }
+  if (wsPendingFrames.length === 0) wsPendingFrameSamples = 0;
   return wsPendingFrames.length;
 }
 let ac: AudioContext | null = null;
@@ -8184,11 +8242,14 @@ function pushCapturedFrame(input: Float32Array): void {
       wsFramesNeverSent += 1;
     }
   } else if (ws.readyState === WebSocket.CONNECTING) {
-    // Buffer up to 4 seconds of audio (500 frames × 128 samples/frame
-    // at 16 kHz after downsampling = 64 000 samples). Beyond that the
-    // WS is likely stuck and we should not accumulate indefinitely.
-    if (wsPendingFrames.length < 500) {
+    // Buffer up to 4 seconds of audio, measured in OUTPUT SAMPLES
+    // (BUG-59): the old 500-frame cap actually held ~1.3 s because each
+    // worklet frame downsamples to ~42.7 samples at 16 kHz, so slow
+    // handshakes silently dropped opening words and failed the
+    // coverage contract.
+    if (wsPendingFrameSamples + ds.length <= WS_PENDING_MAX_SAMPLES) {
       wsPendingFrames.push(pcm);
+      wsPendingFrameSamples += ds.length;
     } else {
       wsFramesNeverSent += 1;
     }
@@ -8320,6 +8381,7 @@ async function startLive(): Promise<void> {
   resetDownsampleState();
   lastInterimSnapshot = "";
   wsPendingFrames = [];
+  wsPendingFrameSamples = 0;
   wsFramesNeverSent = 0;
   resetLiveDraftState();
   clearLiveStreamState();
@@ -9160,6 +9222,7 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (strandedFrames > 0) {
       wsFramesNeverSent += strandedFrames;
       wsPendingFrames = [];
+  wsPendingFrameSamples = 0;
       console.warn(`[trace stopLive] ${strandedFrames} captured frames never reached the live transport`);
     }
     if (ws.readyState === WebSocket.OPEN) {
@@ -9318,6 +9381,7 @@ async function stopLive(enhance: boolean): Promise<void> {
   _wsToCloseAtEnd = ws;
   ws = null;
   wsPendingFrames = [];
+  wsPendingFrameSamples = 0;
   mediaRecorder = null;
   recordedWebmChunks = [];
   // Release the PCM sink reference after capture teardown, but DO NOT
@@ -11091,6 +11155,7 @@ interface UploadQueueSnapshotItem {
   audioDurationSec?: number;
   requestedProvider?: Provider;
   requestedLanguage?: string;
+  requestedModel?: string;
   requestedDiarize?: boolean;
   savedName?: string;
   savedArchiveDir?: string;
@@ -11135,6 +11200,7 @@ interface UploadQueueItem {
   audioDurationSec?: number;
   requestedProvider?: Provider;
   requestedLanguage?: string;
+  requestedModel?: string;
   requestedDiarize?: boolean;
   savedName?: string;
   savedArchiveDir?: string;
@@ -11463,6 +11529,7 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
     language: item.language || "",
     audioDurationSec: Math.max(0, Number(item.audioDurationSec || 0) || 0),
     requestedProvider: item.requestedProvider || "",
+    requestedModel: item.requestedModel || "",
     requestedLanguage: item.requestedLanguage || "",
     requestedDiarize: item.requestedDiarize === true,
     savedName: item.savedName || "",
@@ -11481,6 +11548,12 @@ function uploadQueueSnapshotPayload(): UploadQueueStoragePayload {
 }
 
 function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): void {
+  // The backend owns the queue schema version (UPLOAD_QUEUE_STATE_VERSION);
+  // remember what it reported so the legacy-localStorage gate below
+  // compares against the server's truth instead of a duplicated constant.
+  if (typeof payload.version === "number" && payload.version > 0) {
+    uploadQueueServerVersion = payload.version;
+  }
   uploadHideFinished = payload.hideFinished === true;
   const restored = Array.isArray(payload.items) ? payload.items : [];
   uploadQueue.splice(0, uploadQueue.length);
@@ -11511,6 +11584,7 @@ function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): 
       language: String(src.language || ""),
       audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),
       requestedProvider: normalizeUploadProvider(src.requestedProvider || src.provider || "deepgram"),
+      requestedModel: String(src.requestedModel || ""),
       requestedLanguage: String(src.requestedLanguage || src.language || "auto"),
       requestedDiarize: src.requestedDiarize === true,
       savedName: String(src.savedName || ""),
@@ -11563,8 +11637,9 @@ function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | n
     return null;
   }
   if (!raw) return null;
+  let parsed: Partial<UploadQueueStoragePayload>;
   try {
-    return JSON.parse(raw) as Partial<UploadQueueStoragePayload>;
+    parsed = JSON.parse(raw) as Partial<UploadQueueStoragePayload>;
   } catch (e) {
     console.warn("Legacy upload queue snapshot parse failed", e);
     try {
@@ -11574,6 +11649,21 @@ function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | n
     }
     return null;
   }
+  // Schema gate (BUG-73): a snapshot from a NEWER schema must take the
+  // corrupt-quarantine path, not flow through the old parser.
+  const storedVersion = typeof parsed?.version === "number" ? parsed.version : 1;
+  if (storedVersion > uploadQueueServerVersion) {
+    console.warn(
+      `Legacy upload queue snapshot version ${storedVersion} > supported ${uploadQueueServerVersion}, quarantining`,
+    );
+    try {
+      localStorage.setItem(`${LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
+    } catch (backupErr) {
+      console.warn("Legacy upload queue future-version backup failed", backupErr);
+    }
+    return null;
+  }
+  return parsed;
 }
 
 async function restoreUploadQueueSnapshot(): Promise<void> {
@@ -11821,6 +11911,9 @@ function enqueueUploadFile(file: File): void {
       status: "queued",
       requestedProvider: uploadOptions.provider,
       requestedLanguage: uploadOptions.language,
+      // Snapshot at ENQUEUE time (BUG-57): the queue can sit for minutes;
+      // processing-time reads would silently follow later select changes.
+      requestedModel: selectedLocalModel(),
       requestedDiarize: uploadOptions.diarize,
     });
   renderUploadQueue();
@@ -11917,7 +12010,17 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     if (provider === "local") {
       // The user's model choice governs uploads too (BUG-29): the
       // hardcoded default silently downgraded large-v3/gigaam picks.
-      modelLabel = selectedLocalModel();
+      // Honor the enqueue-time snapshot (BUG-57); if the requested
+      // model is not usable on this machine (uninstalled engine, wiped
+      // cache), fall back to a downloaded default instead of failing the
+      // whole batch item — the queue's contract is to keep files moving.
+      {
+        const requested = String(item.requestedModel || "").trim();
+        const usable = requested && LOCAL_TRANSCRIPTION_MODELS.includes(requested)
+          && LOCAL_ENGINE_AVAILABILITY[(requested.startsWith("gigaam-") ? "gigaam" : "whisper")] !== false
+          && (requested.startsWith("gigaam-") || isLocalModelReady(requested));
+        modelLabel = usable ? requested : selectedLocalModel();
+      }
       const localOpts = {
         language: resolveFastLocalLanguage(language),
         model: modelLabel,
@@ -12195,6 +12298,7 @@ async function retryUploadItem(id: string): Promise<void> {
   item.audioDurationSec = 0;
   item.requestedProvider = uploadOptions.provider;
   item.requestedLanguage = uploadOptions.language;
+  item.requestedModel = selectedLocalModel();
   item.requestedDiarize = uploadOptions.diarize;
   item.savedName = "";
   item.savedArchiveDir = "";

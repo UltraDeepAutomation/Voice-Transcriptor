@@ -2034,6 +2034,7 @@ def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
         "audioDurationSec": _upload_queue_number(raw.get("audioDurationSec")) or 0,
         "requestedProvider": _upload_queue_str(raw.get("requestedProvider"), 32),
         "requestedLanguage": _upload_queue_str(raw.get("requestedLanguage"), 32),
+        "requestedModel": _upload_queue_str(raw.get("requestedModel"), 256),
         "requestedDiarize": bool(raw.get("requestedDiarize") is True),
         "savedName": _upload_queue_str(raw.get("savedName"), 512),
         "savedArchiveDir": _upload_queue_str(raw.get("savedArchiveDir"), 4096),
