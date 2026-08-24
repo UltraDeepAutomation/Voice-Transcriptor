@@ -5727,6 +5727,33 @@ async function ensureBackendRuntime(python, repoRoot) {
   // can report it.
   const bundled = getBundledPythonPath();
   if (bundled && path.resolve(python) === path.resolve(bundled)) {
+    // Attribution (BUG-82): buildPythonEnv prepends engine-site to
+    // PYTHONPATH, so a broken engine site can fail imports that the
+    // pinned bundle would pass — the old message blamed the bundle and
+    // sent users hunting for antivirus ghosts with no way out. Re-run
+    // the IDENTICAL check in a clean environment: pass → the engine
+    // site is the culprit (point at its reinstall path); fail → the
+    // bundle really is damaged (keep the AV diagnosis).
+    const cleanEnv = { ...process.env };
+    for (const key of PYTHON_ENV_SCRUB_KEYS) delete cleanEnv[key];
+    delete cleanEnv.PYTHONPATH;
+    const attribution = await runCommand(
+      python,
+      ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
+      { cwd: repoRoot, timeoutMs: 12000, env: cleanEnv }
+    );
+    if (attribution.ok) {
+      appendMainLog("[backend-runtime] import check passes WITHOUT engine-site — engine-site is shadowing the bundle");
+      return {
+        ok: false,
+        details: [
+          "The optional engine install (userData/engine-site) is breaking the bundled runtime's imports.",
+          "Fix: Settings → Local models → reinstall the engine, or delete the engine-site folder.",
+          `python: ${python}`,
+          (importCheck.stderr || importCheck.stdout || "").trim(),
+        ].filter(Boolean).join("\n"),
+      };
+    }
     return {
       ok: false,
       details: [
