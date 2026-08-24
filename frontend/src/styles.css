@@ -3874,3 +3874,61 @@ canvas {
 .modal-card p { margin: 0 0 14px; color: var(--text-dim, #aab); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .btn-primary { background: var(--accent, #5b8cff) !important; color: #fff !important; }
+
+/* ── Custom audio player (app-styled, replaces <audio controls>) ── */
+.custom-player {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius);
+  background: var(--surface-bg);
+}
+.cp-btn {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--surface-border);
+  background: var(--glass-bg);
+  color: var(--text-primary, inherit);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cp-btn:hover { background: var(--hover-bg, rgba(255, 255, 255, 0.06)); }
+.cp-play { font-size: 13px; padding-left: 2px; }
+.cp-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  opacity: 0.85;
+  min-width: 34px;
+  text-align: center;
+}
+.cp-seek {
+  flex: 1;
+  min-width: 60px;
+  height: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 2px;
+  background: var(--surface-border);
+  outline: none;
+  cursor: pointer;
+}
+.cp-seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent, #6ea8fe);
+  border: none;
+}
+.cp-mute { font-size: 14px; }

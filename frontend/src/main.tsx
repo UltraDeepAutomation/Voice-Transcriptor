@@ -1804,6 +1804,56 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
 // always points at the freshest source — when the user re-transcribes
 // the same audio, the in-memory File is replaced and the cached URL
 // would otherwise download the previous take.
+// ── Custom player controls ───────────────────────────────────────────
+// The native <audio controls> chrome looks like a web widget inside the
+// Electron shell. The audio element stays (hidden) as the media engine;
+// every control below is app-styled DOM driving it programmatically.
+(() => {
+  const audio = document.getElementById("currentRecordingAudio") as HTMLAudioElement | null;
+  const playBtn = document.getElementById("cpPlayBtn") as HTMLButtonElement | null;
+  const seek = document.getElementById("cpSeek") as HTMLInputElement | null;
+  const cur = document.getElementById("cpCurrentTime") as HTMLSpanElement | null;
+  const dur = document.getElementById("cpDuration") as HTMLSpanElement | null;
+  const muteBtn = document.getElementById("cpMuteBtn") as HTMLButtonElement | null;
+  if (!audio || !playBtn || !seek || !cur || !dur || !muteBtn) return;
+  const fmt = (t: number): string => {
+    if (!Number.isFinite(t)) return "0:00";
+    const m = Math.floor(t / 60);
+    const sec = Math.floor(t % 60);
+    return `${m}:${String(sec).padStart(2, "0")}`;
+  };
+  const syncPlayIcon = (): void => {
+    playBtn.textContent = audio.paused ? "▶" : "❚❚";
+    playBtn.setAttribute("aria-label", audio.paused ? "Play" : "Pause");
+  };
+  playBtn.addEventListener("click", () => {
+    if (audio.paused) void audio.play().catch(() => { /* no src yet */ });
+    else audio.pause();
+  });
+  audio.addEventListener("play", syncPlayIcon);
+  audio.addEventListener("pause", syncPlayIcon);
+  audio.addEventListener("ended", () => { audio.currentTime = 0; syncPlayIcon(); });
+  let seekDragging = false;
+  audio.addEventListener("timeupdate", () => {
+    cur.textContent = fmt(audio.currentTime);
+    if (!seekDragging) {
+      seek.value = String(audio.duration ? (audio.currentTime / audio.duration) * 1000 : 0);
+    }
+  });
+  audio.addEventListener("loadedmetadata", () => { dur.textContent = fmt(audio.duration); });
+  seek.addEventListener("input", () => {
+    if (audio.duration) audio.currentTime = (Number(seek.value) / 1000) * audio.duration;
+  });
+  seek.addEventListener("pointerdown", () => { seekDragging = true; });
+  seek.addEventListener("pointerup", () => { seekDragging = false; });
+  muteBtn.addEventListener("click", () => {
+    audio.muted = !audio.muted;
+    muteBtn.textContent = audio.muted ? "🔇" : "🔊";
+    muteBtn.setAttribute("aria-label", audio.muted ? "Unmute" : "Mute");
+  });
+  syncPlayIcon();
+})();
+
 (() => {
   const btn = document.getElementById("currentRecordingDownloadBtn") as HTMLButtonElement | null;
   if (!btn) return;
@@ -8046,6 +8096,7 @@ function publishRecordingFinalSignal(opts: {
  * at most once per frame.
  */
 let liveOutputRenderScheduled = false;
+let livePreviewFloorText = "";
 
 function scheduleLiveOutputRender(): void {
   if (liveOutputRenderScheduled) return;
@@ -8076,7 +8127,13 @@ function scheduleLiveOutputRender(): void {
       }
       return;
     }
-    const text = getVisibleLivePreviewText();
+    // Monotonic display floor: Deepgram interims reset at utterance
+    // boundaries and can transiently drop words the user already saw.
+    // The preview never regresses — it only grows (the final transcript
+    // remains the authoritative text; this is the live evidence pane).
+    const candidate = getVisibleLivePreviewText();
+    const text = richerTranscript(livePreviewFloorText, candidate);
+    livePreviewFloorText = text;
     if (el.textContent !== text) {
       el.textContent = text;
       el.scrollTop = el.scrollHeight;
@@ -8094,6 +8151,7 @@ function syncLiveOutputFromState(): void {
 }
 
 function resetLiveDraftState(): void {
+  livePreviewFloorText = "";
   liveDraftText = "";
   liveDraftDisplayText = "";
   liveInterimText = "";
