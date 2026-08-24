@@ -8,7 +8,7 @@ import datetime as _dt
 import random
 import time
 from email.utils import parsedate_to_datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
 from requests import RequestException

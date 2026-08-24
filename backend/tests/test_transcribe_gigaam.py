@@ -298,6 +298,52 @@ class GigaAMWordConventionTests(unittest.TestCase):
         self.assertEqual(out["text"], "слово1")
         self.assertEqual(out["language_probability"], 1.0)
 
+    def test_empty_audio_early_return_keeps_full_contract(self):
+        # BUG-48: the zero-length shortcut must satisfy the same result
+        # contract as the normal path — callers read text and
+        # language_probability unconditionally.
+        from backend.transcribe import transcribe_audio
+
+        out = transcribe_audio(
+            np.zeros(0, dtype=np.float32), "gigaam-v3-e2e-rnnt"
+        )
+        self.assertEqual(out["segments"], [])
+        self.assertEqual(out["text"], "")
+        self.assertEqual(out["language_probability"], 1.0)
+        self.assertEqual(out["duration"], 0.0)
+
+
+class GigaAMCacheTests(unittest.TestCase):
+    """BUG-47: torch weights are ~GB each — the cache must evict LRU."""
+
+    def setUp(self):
+        self._prev = sys.modules.get("gigaam")
+        _install_fake_gigaam([])
+        from backend import transcribe_gigaam
+
+        self._mod = transcribe_gigaam
+        self._saved_cap = transcribe_gigaam._GIGAAM_CACHE_MAX
+        transcribe_gigaam._MODEL_CACHE.clear()
+        transcribe_gigaam._GIGAAM_CACHE_MAX = 1
+
+    def tearDown(self):
+        self._mod._GIGAAM_CACHE_MAX = self._saved_cap
+        self._mod._MODEL_CACHE.clear()
+        if self._prev is None:
+            sys.modules.pop("gigaam", None)
+        else:
+            sys.modules["gigaam"] = self._prev
+
+    def test_cache_evicts_lru_entry_beyond_cap(self):
+        self._mod._load_model("gigaam-v3-e2e-rnnt")
+        self._mod._load_model("gigaam-v3-rnnt")
+        self.assertEqual(list(self._mod._MODEL_CACHE), ["gigaam-v3-rnnt"])
+        # A hit re-promotes: touching e2e again then loading rnnt must
+        # evict rnnt (the new LRU tail), not the just-used e2e.
+        self._mod._load_model("gigaam-v3-e2e-rnnt")
+        self._mod._load_model("gigaam-v3-rnnt")
+        self.assertEqual(list(self._mod._MODEL_CACHE), ["gigaam-v3-rnnt"])
+
 
 class GigaAMFileDispatchTests(unittest.TestCase):
     """transcribe_file / warm_model must route gigaam ids to the adapter.

@@ -123,6 +123,33 @@ def is_downloaded(model_id: str) -> bool:
     return whisper_downloaded(model_id)
 
 
+def _repo_file_sizes(repo: str, files: list[str]) -> dict[str, int]:
+    """Best-effort byte sizes for *files* in *repo* (BUG-44).
+
+    faster-whisper repos are dominated by one ``model.bin`` (~95 % of the
+    bytes); a per-FILE progress counter therefore sits at ~0 % for nearly
+    the whole multi-gigabyte transfer and jumps to 100 % at the end,
+    which reads as a hang. Weighting by bytes needs the sizes up front:
+    one ``HfApi.repo_info(files_metadata=True)`` call provides them.
+    Any failure degrades to an empty mapping — the caller falls back to
+    the old count-based scheme rather than blocking the download.
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().repo_info(repo_id=repo, files_metadata=True)
+        sizes: dict[str, int] = {}
+        for sibling in getattr(info, "siblings", None) or []:
+            name = getattr(sibling, "rfilename", None)
+            size = getattr(sibling, "size", None)
+            if name and isinstance(size, int) and size > 0:
+                sizes[name] = size
+        return {name: sizes[name] for name in files if name in sizes}
+    except Exception as e:  # metadata endpoint down / rate-limited — non-fatal
+        logger.debug("models: file-size metadata unavailable for %s: %s", repo, e)
+        return {}
+
+
 def _download_worker(model_id: str) -> None:
     import time
 
@@ -134,13 +161,22 @@ def _download_worker(model_id: str) -> None:
             f for f in list_repo_files(repo)
             if not f.startswith(".")
         ]
-        total = max(1, len(files))
-        for i, name in enumerate(files, start=1):
-            _set_state(model_id, status="downloading", progress=(i - 1) / total * 100.0)
+        sizes = _repo_file_sizes(repo, files)
+        total_bytes = sum(sizes.values())
+        done_bytes = 0
+        for i, name in enumerate(files):
+            _set_state(
+                model_id,
+                status="downloading",
+                # Byte-weighted when sizes are known; otherwise the
+                # legacy per-file fraction. Both stay monotonic.
+                progress=(done_bytes / total_bytes * 100.0) if total_bytes
+                else (i / max(1, len(files)) * 100.0),
+            )
             hf_hub_download(repo_id=repo, filename=name)
-            _set_state(model_id, progress=i / total * 100.0)
+            done_bytes += sizes.get(name, 0)
         _set_state(model_id, status="done", progress=100.0)
-        logger.info("models: %s downloaded (%d files)", model_id, total)
+        logger.info("models: %s downloaded (%d files)", model_id, len(files))
     except Exception as e:
         logger.warning("models: download failed for %s: %s", model_id, e)
         _set_state(model_id, status="error", error=f"{type(e).__name__}: {e}")

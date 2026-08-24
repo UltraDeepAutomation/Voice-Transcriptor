@@ -79,5 +79,34 @@ class Pcm16StreamConverterTests(unittest.TestCase):
         )
 
 
+class RecoverySessionIdFromStemTests(unittest.TestCase):
+    """BUG-52: session ids may contain underscores.
+
+    ``LIVE_SESSION_ID_RE`` allows ``_`` inside an id, so the meta-less
+    fallback must recover the LONGEST valid suffix of
+    ``<prefix>_<session_id>``, not blindly take the last segment.
+    """
+
+    def test_underscore_inside_id_is_kept(self):
+        self.assertEqual(
+            backend_main._session_id_from_recovery_stem("20260824T1200_session_a_b"),
+            "session_a_b",
+        )
+
+    def test_plain_id_still_resolves(self):
+        self.assertEqual(
+            backend_main._session_id_from_recovery_stem("prefix_abc123"),
+            "abc123",
+        )
+
+    def test_invalid_tail_falls_back_to_last_segment(self):
+        # No suffix matches the id grammar (e.g. contains "/") — the
+        # last segment is returned and downstream validation decides.
+        self.assertEqual(
+            backend_main._session_id_from_recovery_stem("a_b/c"),
+            "b/c",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

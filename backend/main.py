@@ -924,13 +924,34 @@ def _safe_delete_live_recovery(session_id: str) -> bool:
         return False
 
 
+def _session_id_from_recovery_stem(stem: str) -> str:
+    """Recover the session id from a ``<prefix>_<session_id>`` stem (BUG-52).
+
+    ``LIVE_SESSION_ID_RE`` allows underscores INSIDE an id, so a blind
+    ``stem.split("_")[-1]`` truncated ids like ``a_b`` to ``b`` — producing
+    mislabelled or duplicated recovery rows whenever the meta JSON was
+    lost. Walk suffixes shortest-first and take the first that is itself
+    a valid session id; if none matches, fall back to the last segment so
+    downstream validation still gets to decide.
+    """
+    parts = stem.split("_")
+    for cut in range(1, len(parts)):
+        candidate = "_".join(parts[cut:])
+        if LIVE_SESSION_ID_RE.fullmatch(candidate):
+            return candidate
+    return parts[-1] if parts else ""
+
+
 def _list_live_recoveries() -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for pcm_path in sorted(LIVE_RECOVERY_DIR.glob("*.pcm16"), reverse=True):
         try:
             meta_path = pcm_path.with_suffix(".json")
             raw = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-            session_id = str(raw.get("session_id") or "").strip() or pcm_path.stem.split("_")[-1]
+            session_id = (
+                str(raw.get("session_id") or "").strip()
+                or _session_id_from_recovery_stem(pcm_path.stem)
+            )
             if not LIVE_SESSION_ID_RE.fullmatch(session_id):
                 continue
             bytes_count = int(raw.get("bytes") or pcm_path.stat().st_size or 0)
@@ -5327,8 +5348,13 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
     d = _resolve_recordings_dir()
     now = time.monotonic()
 
-    # Cache key probe — cheap per active storage dir, kept sync.
-    cache_key = _recordings_scan_cache_key(d)
+    # Cache key probe (BUG-51): the key is an O(N) stat over every tracked
+    # file of every active storage dir — NOT cheap for a library of
+    # thousands of recordings, and this route runs on the event loop, so
+    # computing it inline stalled WS transcription frames on every poll.
+    # Same worker-thread hop as the rebuild below; the fast path still
+    # avoids the full scan.
+    cache_key = await asyncio.to_thread(_recordings_scan_cache_key, d)
 
     # Fast path: cache hit.
     with _recordings_caches_lock:
@@ -5556,7 +5582,9 @@ async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
     d = _resolve_recordings_dir()
     now = time.monotonic()
 
-    cache_key = _recordings_scan_cache_key(d)
+    # BUG-51 (same reasoning as list_recordings): the O(N) stat probe
+    # belongs on a worker thread, not the event loop.
+    cache_key = await asyncio.to_thread(_recordings_scan_cache_key, d)
 
     with _recordings_caches_lock:
         if (

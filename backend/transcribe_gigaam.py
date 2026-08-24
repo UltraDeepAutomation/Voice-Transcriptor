@@ -23,7 +23,9 @@ signature compatibility and pinned to ru semantics upstream.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from collections import OrderedDict
 import logging
+import os
 import tempfile
 import threading
 from pathlib import Path
@@ -45,8 +47,14 @@ GIGAAM_CHUNK_OVERLAP_SEC = 1.2
 # chunks; anything less is RNNT boundary jitter between distinct words.
 GIGAAM_WORD_DEDUPE_EPSILON_SEC = 0.05
 
-_MODEL_CACHE: Dict[str, Any] = {}
+_MODEL_CACHE: "OrderedDict[str, Any]" = OrderedDict()
 _MODEL_LOCK = threading.Lock()
+
+# Max simultaneously-resident GigaAM models. Torch weights are large
+# (~1 GB each); a user who tried both catalog entries must not keep both
+# resident forever — mirror the whisper-side LRU policy
+# (backend/transcribe.py ``_MODEL_CACHE_MAX``) with a tighter default.
+_GIGAAM_CACHE_MAX = max(1, int(os.environ.get("TRANSCRIPTOR_GIGAAM_CACHE_SIZE", "1")))
 
 _LAST_LOAD_ERROR: Optional[str] = None
 
@@ -66,6 +74,9 @@ def _load_model(model_id: str) -> Any:
     with _MODEL_LOCK:
         model = _MODEL_CACHE.get(model_id)
         if model is not None:
+            # LRU bookkeeping: a hit promotes the entry to most-recently-
+            # used so the eviction below always drops the coldest model.
+            _MODEL_CACHE.move_to_end(model_id)
             return model
         import gigaam
 
@@ -73,6 +84,12 @@ def _load_model(model_id: str) -> Any:
         logger.info("gigaam: loading %s (upstream name %s)", model_id, upstream_name)
         model = gigaam.load_model(upstream_name)
         _MODEL_CACHE[model_id] = model
+        while len(_MODEL_CACHE) > _GIGAAM_CACHE_MAX:
+            evicted_id, _ = _MODEL_CACHE.popitem(last=False)
+            logger.info(
+                "gigaam: evicted %s from cache (cap=%d)",
+                evicted_id, _GIGAAM_CACHE_MAX,
+            )
         return model
 
 
@@ -201,36 +218,38 @@ def transcribe_gigaam(
     audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
     total_sec = len(audio) / 16000.0
     if total_sec <= 0:
-        return {"segments": [], "language": "ru", "duration": 0.0}
+        # Same full result contract as the normal path below: callers
+        # read ``text``/``language_probability`` directly (BUG-38 class),
+        # so an early return may not omit them.
+        return {
+            "segments": [],
+            "language": "ru",
+            "language_probability": 1.0,
+            "duration": 0.0,
+            "text": "",
+        }
 
     model = _load_model(model_id)
     bounds = _chunk_bounds(total_sec)
     chunk_word_lists: list[list[dict]] = []
     chunk_texts: list[str] = []
-    wav_path = _write_wav(audio)
-    try:
-        for start, end in bounds:
-            lo = int(start * 16000)
-            hi = int(end * 16000)
-            chunk_path = _write_wav(audio[lo:hi])
-            try:
-                result = model.transcribe(str(chunk_path), word_timestamps=True)
-            finally:
-                try:
-                    chunk_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            # Words are requested from the model UNCONDITIONALLY (they
-            # are cheap for RNNT): the stitcher needs absolute times to
-            # dedupe the overlapped chunk boundaries even when the
-            # caller asked for text only.
-            chunk_word_lists.append(_words_from_result(result, offset=start))
-            chunk_texts.append(str(getattr(result, "text", "") or "").strip())
-    finally:
+    for start, end in bounds:
+        lo = int(start * 16000)
+        hi = int(end * 16000)
+        chunk_path = _write_wav(audio[lo:hi])
         try:
-            wav_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            result = model.transcribe(str(chunk_path), word_timestamps=True)
+        finally:
+            try:
+                chunk_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # Words are requested from the model UNCONDITIONALLY (they
+        # are cheap for RNNT): the stitcher needs absolute times to
+        # dedupe the overlapped chunk boundaries even when the
+        # caller asked for text only.
+        chunk_word_lists.append(_words_from_result(result, offset=start))
+        chunk_texts.append(str(getattr(result, "text", "") or "").strip())
 
     accepted = _merge_overlapping_words(chunk_word_lists)
     by_chunk: dict[int, list[dict]] = {}

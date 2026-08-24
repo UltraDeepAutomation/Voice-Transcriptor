@@ -737,8 +737,23 @@ function syncLocalModelOptions(): void {
   const preferredAvailable =
     LOCAL_TRANSCRIPTION_MODELS.includes(nextValue) &&
     LOCAL_ENGINE_AVAILABILITY[engineFor(nextValue)] !== false;
+  if (pendingModelSelection) {
+    // A modal decision is in flight (or a confirmed download is running):
+    // the select must keep showing the last APPLIED model, never the
+    // pending un-downloaded candidate — otherwise one failed download
+    // POST would silently re-point every record/upload/re-transcribe
+    // request at a model that is not on disk (BUG-40), and Cancel could
+    // not restore what the user actually had (BUG-45).
+    const applied = lastAppliedLocalModel;
+    sel.value =
+      LOCAL_TRANSCRIPTION_MODELS.includes(applied) &&
+      LOCAL_ENGINE_AVAILABILITY[engineFor(applied)] !== false
+        ? applied
+        : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+    return;
+  }
   sel.value = preferredAvailable ? nextValue : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  if (preferredAvailable && !pendingModelSelection) {
+  if (preferredAvailable) {
     lastAppliedLocalModel = sel.value;
   }
 }
@@ -797,57 +812,73 @@ function renderLocalModels(): void {
     return;
   }
   for (const row of localModelsCache) row.key = `model:${row.id}`;
+  // BUG-42: card content must be a pure function of row state, applied
+  // identically on create AND update — otherwise a node born mid-download
+  // never grows a retry button after an error, and an idle-born node
+  // keeps a clickable Download ghost during progress.
+  const applyRowToCard = (card: HTMLElement, row: LocalModelRow): void => {
+    let name = card.querySelector<HTMLElement>(".model-name");
+    if (!name) {
+      name = document.createElement("span");
+      name.className = "model-name";
+      card.prepend(name);
+    }
+    name.textContent = row.id + (row.note ? ` — ${row.note}` : "");
+    let size = card.querySelector<HTMLElement>(".model-size");
+    if (row.size_hint_bytes) {
+      if (!size) {
+        size = document.createElement("span");
+        size.className = "model-size";
+        name.after(size);
+      }
+      size.textContent = fmtBytes(row.size_hint_bytes);
+    } else {
+      size?.remove();
+    }
+    let state = card.querySelector<HTMLElement>(".model-state");
+    if (!state) {
+      state = document.createElement("span");
+      state.className = "model-state";
+      (size ?? name).after(state);
+    }
+    if (row.status === "downloading") {
+      state.textContent = `↓ ${Math.round(row.progress || 0)}%`;
+      state.classList.remove("ok", "err");
+    } else if (row.status === "error") {
+      state.textContent = "failed — retry";
+      state.classList.add("err");
+    } else if (row.downloaded) {
+      state.textContent = "✓";
+      state.classList.add("ok");
+    } else {
+      state.textContent = "";
+      state.classList.remove("ok", "err");
+    }
+    // The button exists exactly when a download CAN be started from here:
+    // whisper engine, not on disk, and no download in flight.
+    const wantButton = !row.downloaded && row.engine === "whisper" && row.status !== "downloading";
+    let btn = card.querySelector<HTMLButtonElement>(".model-dl");
+    if (wantButton && !btn) {
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn model-dl";
+      btn.textContent = "Download";
+      btn.dataset.dlModel = row.id;
+      card.appendChild(btn);
+    } else if (!wantButton && btn) {
+      btn.remove();
+    }
+    card.classList.toggle("ready", row.downloaded);
+  };
   reconcileRecordingsList(wrap, localModelsCache, {
     create: (row) => {
       const card = document.createElement("div");
       card.className = "model-row" + (row.downloaded ? " ready" : "");
-      const name = document.createElement("span");
-      name.className = "model-name";
-      name.textContent = row.id + (row.note ? ` — ${row.note}` : "");
-      card.appendChild(name);
-      if (row.size_hint_bytes) {
-        const size = document.createElement("span");
-        size.className = "model-size";
-        size.textContent = fmtBytes(row.size_hint_bytes);
-        card.appendChild(size);
-      }
-      const state = document.createElement("span");
-      state.className = "model-state";
-      if (row.status === "downloading") {
-        state.textContent = `↓ ${Math.round(row.progress || 0)}%`;
-      } else if (row.status === "error") {
-        state.textContent = "failed — retry";
-        state.classList.add("err");
-      } else if (row.downloaded) {
-        state.textContent = "✓";
-        state.classList.add("ok");
-      }
-      card.appendChild(state);
-      if (!row.downloaded && row.engine === "whisper" && row.status !== "downloading") {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn model-dl";
-        btn.textContent = "Download";
-        btn.dataset.dlModel = row.id;
-        card.appendChild(btn);
-      }
+      applyRowToCard(card, row);
       return card;
     },
     update: (card, row) => {
-      const state = card.querySelector<HTMLElement>(".model-state");
-      if (!state) return;
-      if (row.status === "downloading") {
-        state.textContent = `↓ ${Math.round(row.progress || 0)}%`;
-        state.classList.remove("ok", "err");
-      } else if (row.status === "error") {
-        state.textContent = "failed — retry";
-        state.classList.add("err");
-      } else if (row.downloaded) {
-        state.textContent = "✓";
-        state.classList.add("ok");
-        card.classList.add("ready");
-        card.querySelector<HTMLButtonElement>(".model-dl")?.remove();
-      }
+      applyRowToCard(card, row);
     },
   });
 }
@@ -896,13 +927,17 @@ function ensureLocalModelsPolling(): void {
   }
 }
 
-async function requestModelDownload(id: string): Promise<void> {
+async function requestModelDownload(id: string): Promise<boolean> {
   try {
     await apiPost<{ ok: boolean }>(`/api/models/local/${encodeURIComponent(id)}/download`, {});
     setStatus(`Downloading ${id}…`, "info");
     await refreshLocalModels();
+    return true;
   } catch (e) {
     setStatus(`Download failed for ${id}: ${e instanceof Error ? e.message : String(e)}`, "error");
+    // BUG-40: a failed request must not leave a pending pin behind — the
+    // caller only arms auto-apply when this resolves truthy.
+    return false;
   }
 }
 
@@ -921,6 +956,17 @@ function wireLocalModelsUi(): void {
   const closeModal = (): void => {
     if (modal) modal.hidden = true;
     pendingModelSelection = null;
+    // BUG-45: Cancel must undo the whole interaction, not just hide the
+    // dialog — restore the select to the last model the user actually
+    // applied, so a later syncLocalModelOptions cannot re-pin the
+    // un-downloaded candidate from the stale select value.
+    const sel = document.getElementById("model") as HTMLSelectElement | null;
+    if (sel && !isLocalModelReady(sel.value)) {
+      sel.value =
+        LOCAL_TRANSCRIPTION_MODELS.includes(lastAppliedLocalModel)
+          ? lastAppliedLocalModel
+          : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+    }
   };
   cancelBtn?.addEventListener("click", closeModal);
   modal?.addEventListener("click", (ev) => {
@@ -929,7 +975,8 @@ function wireLocalModelsUi(): void {
   confirmBtn?.addEventListener("click", () => {
     const id = pendingModelSelection;
     closeModal();
-    if (id) void requestModelDownload(id).then(() => {
+    if (id) void requestModelDownload(id).then((started) => {
+      if (!started) return; // BUG-40: never pin on a failed request
       pendingModelSelection = id; // applied automatically once ready
     });
   });

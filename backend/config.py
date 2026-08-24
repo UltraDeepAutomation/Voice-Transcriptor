@@ -826,10 +826,14 @@ def _load_config_unlocked() -> Dict[str, Any]:
                 "migrated plain-text provider keys to Fernet-encrypted form at %s",
                 CONFIG_PATH,
             )
-        except (OSError, ValueError, TypeError) as e:
-            # In-memory decrypted config is still valid — we return it
-            # below. The on-disk form stays in legacy plain-text; next
-            # save will re-encrypt.
+        except (OSError, ValueError, TypeError, RuntimeError) as e:
+            # RuntimeError is encrypt_value's documented loud-fail when the
+            # crypto library is present but the keyfile is unusable. It MUST
+            # be caught here: load_config's contract is "never raises", and
+            # an escaped RuntimeError turned a degraded-but-working session
+            # into a raw 500 on every config-reading endpoint (BUG-41). The
+            # in-memory view below stays valid; on-disk keys stay plain-text
+            # and the next successful save re-encrypts.
             logger.warning(
                 "provider-key encryption migration write failed at %s: %s — "
                 "keys remain usable this session",
@@ -853,7 +857,9 @@ def _load_config_unlocked() -> Dict[str, Any]:
                     "config schema stamped with version=%d at %s (was: %r)",
                     SCHEMA_VERSION, CONFIG_PATH, original_schema_version,
                 )
-            except OSError as e:
+            except (OSError, RuntimeError) as e:
+                # Same BUG-41 reasoning as above: the stamp is an
+                # optimisation, not a precondition for serving config.
                 logger.warning("schema-version stamp write failed at %s: %s", CONFIG_PATH, e)
 
     # 6. Return the decrypted view (keys are plain-text for callers;

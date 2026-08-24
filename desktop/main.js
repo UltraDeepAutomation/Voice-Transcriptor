@@ -5229,7 +5229,11 @@ async function resolvePython(repoRoot) {
     : path.join(getAppVenvDir(), "bin", "python3");
   if (fileExists(appVenvPy)) {
     const check = await runCommand(appVenvPy, ["-c", "import sys; print(sys.executable)"], {
-      cwd: repoRoot, timeoutMs: 8000
+      // BUG-50: same scrubbed env as the bundled-runtime probe. A stray
+      // PYTHONHOME/PYTHONPATH from the user's shell must not be able to
+      // fail a healthy venv's `import sys` and push interpreter choice
+      // down to the system fallback.
+      cwd: repoRoot, timeoutMs: 8000, env: buildPythonEnv(appVenvPy)
     });
     if (check.ok) return (check.stdout || "").trim() || appVenvPy;
   }
@@ -5240,7 +5244,7 @@ async function resolvePython(repoRoot) {
     : path.join(repoRoot, ".venv", "bin", "python3");
   if (fileExists(devVenvPy)) {
     const check = await runCommand(devVenvPy, ["-c", "import sys; print(sys.executable)"], {
-      cwd: repoRoot, timeoutMs: 8000
+      cwd: repoRoot, timeoutMs: 8000, env: buildPythonEnv(devVenvPy)
     });
     if (check.ok) return (check.stdout || "").trim() || devVenvPy;
   }
@@ -5309,6 +5313,35 @@ function sanitizeEngineSite(siteDir) {
   } catch { /* non-fatal */ }
 }
 
+// BUG-39: pip's failure mode on an offline / captive-portal machine is
+// minutes of TCP retries per package URL. A bounded connect probe to the
+// two hosts the engine install actually needs (PyPI for wheels,
+// github.com for the pinned GigaAM checkout) decides in ~seconds whether
+// the attempt can even start — without it every offline launch paid the
+// full pip retry cycle BEFORE uvicorn spawned, wedging first-run behind
+// "Installing GigaAM engine…" with no cancel.
+function probeTcpReachable(host, port, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port });
+    const settle = (ok) => {
+      try { socket.destroy(); } catch { /* already closed */ }
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("timeout", () => settle(false));
+    socket.once("connect", () => settle(true));
+    socket.once("error", () => settle(false));
+  });
+}
+
+async function isEngineInstallNetworkAvailable() {
+  // Sequential by design: an offline machine fails the first probe fast
+  // and never touches the second; an online machine pays one extra RTT.
+  if (!(await probeTcpReachable("pypi.org", 443))) return false;
+  if (!(await probeTcpReachable("github.com", 443))) return false;
+  return true;
+}
+
 async function installGigaamEngineIfRequested(python, repoRoot) {
   const marker = path.join(repoRoot, "ENABLE_GIGAAM");
   if (!fs.existsSync(marker)) return;
@@ -5322,6 +5355,20 @@ async function installGigaamEngineIfRequested(python, repoRoot) {
 
   setBackendBootStatus("Installing GigaAM engine (large download)…");
   appendMainLog("[backend-runtime] ENABLE_GIGAAM present and gigaam importable=false; installing stack");
+
+  // BUG-39: network gate. The stack needs PyPI (wheels) AND github.com
+  // (the pinned GigaAM git checkout). Offline, pip would spend its whole
+  // retry budget here — minutes of wedged boot per launch for a result we
+  // can predict in ~2.5 s. Skip now; the engine simply shows unavailable
+  // and the next online launch retries the install.
+  if (!(await isEngineInstallNetworkAvailable())) {
+    appendMainLog(
+      "[backend-runtime] gigaam install SKIPPED: pypi.org/github.com unreachable " +
+      "(offline or captive portal); will retry on a future launch"
+    );
+    setBackendBootStatus("GigaAM not installed: no network access");
+    return;
+  }
 
   // Disk-space gate (BUG-33): the stack downloads ~2 GB and unpacks to
   // ~6-7 GB, plus pip's cache copy mid-install. An ENOSPC halfway leaves
