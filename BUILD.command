@@ -177,6 +177,11 @@ create_release_package() {
       "$RELEASE_MANIFEST_NAME" \
       > SHA256SUMS.txt
   )
+  # The root-level INTERNAL_ZIP is a build-time intermediate: the release
+  # directory already embeds its own copy inside the install kit. Drop the
+  # root duplicate so a finished build leaves DMG + kit (~470 MB), not
+  # three full copies of the same version (~715 MB).
+  cleanup_path "$INTERNAL_ZIP"
   echo "Created release package in $RELEASE_DIR"
 }
 
