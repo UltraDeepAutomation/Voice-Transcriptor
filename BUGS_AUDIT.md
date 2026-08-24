@@ -259,3 +259,11 @@ path traversal, SSOT-дубли (модели/расширения/лимиты/
 
 **P0: 0 (не обнаружено). P1: 4 из 4 исправлены (100%) — BUG-04 закрыт интеграцией ESLint после одобрения владельца. SSOT-нарушений не осталось.**
 SSOT-нарушения: BUG-07 устранён; BUG-08/14 закрыты обоснованными решениями; новые модули text-match/live-pane/shortcut-display/reconciler — единственные источники.
+
+---
+
+## BUG-20 (найден 2026-08-24 по живому main.log) — обрезание хвоста live-транскрипта — ✅ ИСПРАВЛЕН
+
+- **Файлы:** `backend/remote_deepgram_live.py:69`, `frontend/src/main.tsx` (case "final", tailLikelyMissing, smart race)
+- **Суть:** два режима потери хвоста на Deepgram: (1) drain-таймаут 1.5 с закрывал поток до прихода финализированного хвоста (07:35, delta=0); (2) `uncoveredSpeechSec` от бэкенда фронтендом игнорировался — доказанные дыры доставались пользователю молча (07:33, 1.19 s).
+- **Исправление:** потолок ожидания финализации 3.0 c (здоровые сессии не платят — wait ends at first transcript); interim-хвост считается доказательством речи в `tailLikelyMissing`; `uncoveredSpeechSec` пробрасывается в envelope и после гонки показывает warning при >0.5 c; merge-эвристики вынесены в SSOT `src/transcript-merge.ts` (+10 тестов).
