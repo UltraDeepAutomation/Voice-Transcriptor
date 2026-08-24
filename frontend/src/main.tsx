@@ -15,8 +15,15 @@ import { livePaneDisplayText } from "./live-pane";
 import {
   countWords,
   normalizeComparable,
+  normalizeTranscriptWhitespace,
   normalizeWords,
 } from "./text-match";
+import {
+  candidateConfirmsTranscriptCoverage,
+  joinTranscriptSegments,
+  richerTranscript,
+  textFromEnvelope,
+} from "./transcript-merge";
 
 declare global {
   interface Window {
@@ -245,6 +252,13 @@ interface LiveFinalEnvelope {
   source: string;
   error?: string;
   coverage?: LiveCoverage;
+  /**
+   * Seconds where the backend's own interims recognised speech that no
+   * final segment covers (backend ``_uncovered_speech_sec``). Non-zero
+   * is PROOF the streamed text is incomplete — drives the tail-recovery
+   * escalation instead of silently delivering a truncated transcript.
+   */
+  uncoveredSpeechSec?: number;
 }
 
 /**
@@ -266,6 +280,7 @@ type LiveWsMessage =
       source: string;
       error?: string;
       coverage?: LiveCoverage;
+      uncoveredSpeechSec?: number;
     }
   | { type: "error"; error: string; fatal: boolean };
 
@@ -1512,14 +1527,6 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   // are filtered by the regex tests above (which trigger the fallback
   // before we ever reach the length comparison).
   return cleaned.length > 800 ? fallback : cleaned;
-}
-
-function normalizeTranscriptWhitespace(text: string): string {
-  return String(text || "").replace(/\s+/g, " ").trim();
-}
-
-function joinTranscriptSegments(segments: TranscriptSegment[]): string {
-  return segments.map((segment) => normalizeTranscriptWhitespace(segment.text)).filter(Boolean).join(" ").trim();
 }
 
 function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): TranscriptSegment | null {
@@ -7298,48 +7305,6 @@ function maxLiveBufferSpeechEnd(buffer: LiveTranscriptBuffer | null): number {
   );
 }
 
-function textFromLiveFinalEnvelope(envelope: LiveFinalEnvelope | null | undefined): string {
-  if (!envelope) return "";
-  const text = normalizeTranscriptWhitespace(envelope.text || "");
-  const segmentsText = joinTranscriptSegments(envelope.segments || []);
-  return countWords(text) >= countWords(segmentsText) ? text : segmentsText;
-}
-
-function richerTranscript(currentText: string, candidateText: string): string {
-  const current = normalizeTranscriptWhitespace(currentText);
-  const candidate = normalizeTranscriptWhitespace(candidateText);
-  if (!candidate) return current;
-  if (!current) return candidate;
-  const currentWords = countWords(current);
-  const candidateWords = countWords(candidate);
-  if (candidateWords > currentWords) return candidate;
-  if (candidateWords === currentWords && candidate.length > current.length) {
-    const currentNorm = normalizeComparable(current);
-    const candidateNorm = normalizeComparable(candidate);
-    if (candidateNorm.startsWith(currentNorm) || candidateNorm.endsWith(currentNorm)) {
-      return candidate;
-    }
-  }
-  return current;
-}
-
-function candidateConfirmsTranscriptCoverage(currentText: string, candidateText: string): boolean {
-  const current = normalizeTranscriptWhitespace(currentText);
-  const candidate = normalizeTranscriptWhitespace(candidateText);
-  if (!current || !candidate) return false;
-  const currentWords = countWords(current);
-  const candidateWords = countWords(candidate);
-  if (currentWords <= 0 || candidateWords <= 0) return false;
-  if (candidateWords >= currentWords) return true;
-  if (candidateWords < Math.max(1, Math.floor(currentWords * 0.9))) return false;
-
-  const currentSet = new Set(normalizeWords(current));
-  const candidateNormWords = normalizeWords(candidate);
-  if (!candidateNormWords.length) return false;
-  const overlap = candidateNormWords.filter((word) => currentSet.has(word)).length;
-  return overlap / candidateNormWords.length >= 0.85;
-}
-
 function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
   if (!buffer) return false;
   return (
@@ -8133,6 +8098,13 @@ async function startLive(): Promise<void> {
           };
           if (msg.error) envelope.error = msg.error;
           if (msg.coverage) envelope.coverage = msg.coverage;
+          // BUG-20: the backend measures speech its own interims heard
+          // but no final ever covered. Non-zero is proof of truncation —
+          // surface it on the envelope so the stop path can escalate to
+          // tail recovery instead of delivering holes silently.
+          if (typeof msg.uncoveredSpeechSec === "number" && msg.uncoveredSpeechSec > 0) {
+            envelope.uncoveredSpeechSec = msg.uncoveredSpeechSec;
+          }
           resolveLiveFinal(sessionUiToken, envelope);
           return;
         }
@@ -9645,7 +9617,7 @@ async function stopLive(enhance: boolean): Promise<void> {
           // the maintenance hazard of two divergent definitions.
           const wordCountOf = countWords;
           const alreadyResolvedEnvelope = liveFinalSlots.get(sessionUiToken)?.envelope || null;
-          const opportunisticEnvelopeText = textFromLiveFinalEnvelope(alreadyResolvedEnvelope);
+          const opportunisticEnvelopeText = textFromEnvelope(alreadyResolvedEnvelope);
           const opportunisticTranscript = richerTranscript(transcriptRaw, opportunisticEnvelopeText);
           if (opportunisticTranscript !== transcriptRaw) {
             transcriptRaw = opportunisticTranscript;
@@ -9669,11 +9641,18 @@ async function stopLive(enhance: boolean): Promise<void> {
           // Also skip when the only gap is trailing silence; otherwise
           // a normal pause before Stop looks like missing speech and
           // starts the expensive REST recovery path.
+          // An unflushed interim at the tail IS speech evidence even
+          // when PCM activity already decayed (BUG-20): Deepgram heard
+          // words it had not finalized, which is exactly the reported
+          // "конец сообщения обрезается".
+          const tailHasInterimSpeechEvidence = !!(
+            instantBuffer?.interimText?.trim() || instantBuffer?.lastInterimText?.trim()
+          );
           const tailLikelyMissing =
             recordedSec > 1.0 &&
             hasTimestampedLiveCoverage &&
             tailGapSec > 0.6 &&
-            tailHasCapturedActivity &&
+            (tailHasCapturedActivity || tailHasInterimSpeechEvidence) &&
             !liveStreamErrorAtStop;
           console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} lastCapturedActivitySec=${lastCapturedActivitySec.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} tailActivityGapSec=${tailActivityGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" decision=${tailLikelyMissing ? "RECOVER" : "skip"}`);
           if (tailLikelyMissing) {
@@ -9756,12 +9735,17 @@ async function stopLive(enhance: boolean): Promise<void> {
             //   5. If neither beat instant, keep instant.
             //
             // Saves ~1.5 s per long recording in the typical case.
-            type Cand = { label: "envelope" | "recovery"; text: string; words: number };
+            type Cand = { label: "envelope" | "recovery"; text: string; words: number; uncovered?: number };
             const baseTranscriptForRace = transcriptRaw;
             const wcInstant = wordCountOf(baseTranscriptForRace);
             const envelopeCand: Promise<Cand> = envelopePromise.then((env) => {
-              const text = textFromLiveFinalEnvelope(env);
-              return { label: "envelope" as const, text, words: wordCountOf(text) };
+              const text = textFromEnvelope(env);
+              return {
+                label: "envelope" as const,
+                text,
+                words: wordCountOf(text),
+                uncovered: env?.uncoveredSpeechSec,
+              };
             });
             const recoveryCand: Promise<Cand> = recoveryPromise.then((text) => ({
               label: "recovery" as const, text, words: wordCountOf(text),
@@ -9828,6 +9812,17 @@ async function stopLive(enhance: boolean): Promise<void> {
               }
             } else if (!firstConfirmsInstant) {
               console.log(`[trace tail-gap] decision=KEEP_INSTANT (no improvement) totalMs=${totalRaceMs.toFixed(0)}`);
+            }
+            // BUG-20 observability: even after recovery, report PROVEN
+            // holes the provider itself admitted to. Recovery candidates
+            // carry no such number — only the envelope does.
+            const provenUncoveredSec = Math.max(chose?.uncovered ?? 0, first.uncovered ?? 0);
+            if ((!chose || chose.label !== "recovery") && provenUncoveredSec > 0.5) {
+              patchCurrentRecordingSummary({
+                title: provisionalTitle,
+                status: `${provenUncoveredSec.toFixed(1)}s of recognised speech never reached a final segment — the transcript may be incomplete.`,
+                tone: "warning",
+              }, sessionUiToken);
             }
           }
 
@@ -9919,7 +9914,7 @@ async function stopLive(enhance: boolean): Promise<void> {
             const envelopeCand: Promise<NoFinalCandidate> = liveFinalPromise()
               .then((envelope) => {
                 const error = envelope?.error || getLiveStreamError(sessionUiToken) || "";
-                const text = error ? "" : textFromLiveFinalEnvelope(envelope);
+                const text = error ? "" : textFromEnvelope(envelope);
                 return {
                   label: "envelope" as const,
                   text,

@@ -36,3 +36,8 @@ export function countWords(text: string): number {
   if (!value) return 0;
   return value.split(/\s+/).filter(Boolean).length;
 }
+
+/** Collapse all whitespace runs to single spaces and trim. */
+export function normalizeTranscriptWhitespace(text: string): string {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}

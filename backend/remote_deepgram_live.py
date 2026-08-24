@@ -64,9 +64,16 @@ DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
 # return the transcript that Finalize flushed — before sending
 # ``CloseStream``. The wait ends the moment the transcript arrives, so
 # this is a ceiling, not a cost. Observed post-Finalize round trips in
-# main.log land between 0.26 s and 0.73 s; 1.5 s covers a slow
-# cross-region link without making Stop feel unresponsive.
-FINALIZE_FLUSH_WAIT_SEC = 1.5
+# main.log land between 0.26 s and 0.73 s.
+#
+# 1.5 → 3.0 s (tail-truncation fix): main.log 2026-08-24 07:35 shows a
+# session where the post-Finalize transcript did NOT arrive within 1.5 s
+# ("no post-Finalize transcript within 1.5s; closing") and the finalize
+# delta was 0 — the user's trailing clause never reached any final
+# segment and the tail was lost. The ceiling only bites on exactly such
+# slow/cross-region sessions; healthy ones end the wait at first
+# transcript and pay nothing extra.
+FINALIZE_FLUSH_WAIT_SEC = 3.0
 # An interim must carry at least this much text before its span counts as
 # "the service heard words here". Deepgram emits 1-2 character noise
 # hypotheses during silence; those must not be mistaken for speech.
