@@ -3,6 +3,11 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.7] - 2026-08-24
+
+### Fixed
+- **GigaAM engine location**: torch must never live inside the signed `.app` — writes break the code signature and every update wipes them. The installer now targets `userData/engine-site` via `pip --target`, and the backend imports the engine through a prepended `PYTHONPATH`. Both files (`requirements-gigaam.txt`, `ENABLE_GIGAAM`) now ship inside the bundle's resources, so packaged installs can actually see the opt-in.
+
 ## [1.3.6] - 2026-08-24
 
 ### Fixed

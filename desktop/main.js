@@ -4900,6 +4900,13 @@ function isBundledPythonRuntime(python) {
   return !!bundled && path.resolve(python) === path.resolve(bundled);
 }
 
+function getEngineSiteDir() {
+  // OUTSIDE the signed .app: torch must never live inside the bundle
+  // (writes break the code signature; updates would wipe it). The
+  // backend imports the engine through PYTHONPATH instead.
+  return path.join(app.getPath("userData"), "engine-site");
+}
+
 function buildPythonEnv(python, overrides = {}) {
   const env = { ...process.env };
   if (isBundledPythonRuntime(python)) {
@@ -4908,6 +4915,17 @@ function buildPythonEnv(python, overrides = {}) {
     }
     env.PYTHONNOUSERSITE = "1";
   }
+  // Engine site-packages (GigaAM/torch) — prepended when present so
+  // both the availability probe and the backend itself see it.
+  try {
+    const engineSite = getEngineSiteDir();
+    if (fs.existsSync(path.join(engineSite, "gigaam"))) {
+      const existing = env.PYTHONPATH || "";
+      if (!existing.split(path.delimiter).includes(engineSite)) {
+        env.PYTHONPATH = existing ? `${engineSite}${path.delimiter}${existing}` : engineSite;
+      }
+    }
+  } catch { /* userData unavailable this early — skip */ }
   return {
     ...env,
     ...overrides,
@@ -5240,17 +5258,16 @@ async function installGigaamEngineIfRequested(python, repoRoot) {
 
   setBackendBootStatus("Installing GigaAM engine (large download)…");
   appendMainLog("[backend-runtime] ENABLE_GIGAAM present and gigaam importable=false; installing stack");
-  const args = ["-m", "pip", "install", "-r", req];
-  // The venv path needs no --user; system pythons do.
-  const venvDirNormalized = path.resolve(getAppVenvDir());
-  const pythonResolved = path.resolve(python);
-  const ciFs = process.platform === "win32" || process.platform === "darwin";
-  const insideVenv = ciFs
-    ? pythonResolved.toLowerCase().startsWith(venvDirNormalized.toLowerCase() + path.sep)
-      || pythonResolved.toLowerCase() === venvDirNormalized.toLowerCase()
-    : pythonResolved.startsWith(venvDirNormalized + path.sep)
-      || pythonResolved === venvDirNormalized;
-  if (!insideVenv) args.splice(3, 0, "--user");
+  // --target into userData/engine-site: keeps the signed bundle sealed,
+  // survives app updates, removable by deleting one folder.
+  const engineSite = getEngineSiteDir();
+  fs.mkdirSync(engineSite, { recursive: true });
+  const args = [
+    "-m", "pip", "install",
+    "--target", engineSite,
+    "--upgrade",
+    "-r", req,
+  ];
   const res = await runCommand(python, args, {
     cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python)
   });
