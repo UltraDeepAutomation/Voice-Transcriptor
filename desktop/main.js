@@ -1664,7 +1664,20 @@ async function ensureRecordingStatusCapsuleWindow() {
   // about to show again.
   cancelRecordingStatusCapsuleTeardown();
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
-    return recordingStatusWindow;
+    // The window OBJECT exists the moment `new BrowserWindow` returns —
+    // its document does not. A caller handed the object mid-load used to
+    // fall out at the `recordingStatusWindowReady` check below, which was
+    // harmless while some other caller was still going to paint. It
+    // stopped being harmless once every update takes a sequence number:
+    // the early return had already claimed the newest number, so the
+    // caller that WAS waiting for the load then saw itself superseded and
+    // skipped its paint too. Both left, nothing painted, and the capsule
+    // stayed invisible for a whole recording — 2026-08-25 08:59:19, the
+    // window created in 198 ms and first shown 6 s later by the stop.
+    if (recordingStatusWindowLoadPromise) {
+      await recordingStatusWindowLoadPromise;
+    }
+    return recordingStatusWindow && !recordingStatusWindow.isDestroyed() ? recordingStatusWindow : null;
   }
   if (recordingStatusWindowLoadPromise) {
     await recordingStatusWindowLoadPromise;
@@ -1774,12 +1787,19 @@ async function updateRecordingStatusCapsule(patch = {}) {
   }
   const capsuleWindow = await ensureRecordingStatusCapsuleWindow();
   if (!capsuleWindow || capsuleWindow.isDestroyed()) return;
-  // Superseded while this call waited for the window.
+  // Superseded while this call waited for the window. Safe only because
+  // every caller now waits for the load: a caller that gives up early
+  // while holding the newest sequence number silences the one that would
+  // have painted.
   if (seq !== recordingStatusCapsuleUpdateSeq) return;
   try {
     capsuleWindow.setBounds(recordingStatusCapsuleBounds(), false);
   } catch { }
-  if (!recordingStatusWindowReady) return;
+  if (!recordingStatusWindowReady) {
+    // The load failed; ensure() already logged it. Nothing to paint on.
+    appendMainLog(`[recording-capsule] update dropped: window never loaded (status="${status}")`);
+    return;
+  }
   const payload = {
     status,
     mode,
