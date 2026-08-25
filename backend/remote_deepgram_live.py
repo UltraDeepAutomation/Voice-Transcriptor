@@ -204,7 +204,8 @@ INTERIM_WORD_GAP_SPLIT_SEC = 1.0
 # centralised host as the REST module so a regional override sets
 # both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
-from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL  # noqa: E402,F401
+from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
+from backend.deepgram_words import deepgram_word_text  # noqa: E402
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
 
 
@@ -1515,7 +1516,7 @@ class DeepgramLiveSession:
             for w in raw_words:
                 if not isinstance(w, dict):
                     continue
-                token = str(w.get("word") or w.get("punctuated_word") or "").strip()
+                token = deepgram_word_text(w)
                 if not token:
                     continue
                 w_start = _as_float(w.get("start"))

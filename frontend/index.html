@@ -302,12 +302,22 @@
               microphone-permission prompt, the frontmost-window capture
               used by auto-paste, the single-capsule busy guard and the
               trace all behave identically whichever way the user asked.
+
+              Wrapped in the same `.top-item` label/control pair as MIC and
+              LANG. Without the caption the button had nothing above it, so
+              flex baseline alignment floated it against the top of the row
+              while its labelled neighbours sat a caption's height lower —
+              it read as misplaced rather than as the third control in a
+              row of three.
             -->
-            <button class="btn record-toggle-btn" id="recordToggleBtn" type="button"
-              aria-pressed="false" title="Start recording">
-              <span class="record-toggle-dot" aria-hidden="true"></span>
-              <span class="record-toggle-label" id="recordToggleLabel">Record</span>
-            </button>
+            <div class="top-item top-item-record">
+              <span class="lbl">Rec</span>
+              <button class="btn record-toggle-btn" id="recordToggleBtn" type="button"
+                aria-pressed="false" title="Start recording">
+                <span class="record-toggle-dot" aria-hidden="true"></span>
+                <span class="record-toggle-label" id="recordToggleLabel">Record</span>
+              </button>
+            </div>
           </div>
         </div>
 

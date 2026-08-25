@@ -48,6 +48,7 @@ backend/
 ├── remote_deepgram_live.py    # Deepgram live WebSocket provider
 ├── remote_openrouter.py       # OpenRouter audio transcription and text upscale
 ├── deepgram_endpoints.py      # Deepgram endpoint SSOT
+├── deepgram_words.py          # Deepgram word-spelling SSOT (punctuated vs raw)
 ├── http_retry.py              # remote request retry handling
 ├── jobs.py                    # in-memory job store and cancellation
 ├── storage.py                 # atomic write helpers

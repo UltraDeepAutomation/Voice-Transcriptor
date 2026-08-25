@@ -478,11 +478,11 @@ body.platform-darwin .sidebar {
    they cannot drift apart the way the mic chip had. */
 /* In-window Record / Stop control (Live topbar). Sits at the end of the
    MIC / LANG row so the recording control is where the recording setup
-   is. The dot carries the state; the label says what the click will do,
-   not what is happening — a button labelled "Recording" reads as a
-   status, and users press it expecting to start. */
+   is, captioned "Rec" like its neighbours so all three align on the same
+   baseline. The dot carries the state; the label says what the click
+   will DO, not what is happening — a button reading "Recording" is a
+   status, and users press those expecting to start one. */
 .record-toggle-btn {
-  margin-left: auto;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -629,8 +629,15 @@ body.platform-darwin .sidebar {
   50% { opacity: 1; }
 }
 
+/* State tint on the chip's OWN border, never an outline.
+   `.window-status-pill` and `.net-pill` express state through the dot
+   colour alone; the mic chip additionally tints its border, which is a
+   difference of degree. An `outline` is a difference of KIND: it is
+   painted outside the border box by separate machinery, so it read as a
+   hard rectangle pinned to a rounded pill and made this chip look like
+   a different component from its two neighbours. */
 .mic-pill.mic-pill-live {
-  outline: 1px solid rgba(72, 207, 145, 0.45);
+  border-color: rgba(72, 207, 145, 0.55);
 }
 .mic-pill.mic-pill-live .mic-dot {
   background: #48cf91;
@@ -638,19 +645,19 @@ body.platform-darwin .sidebar {
 /* Colour tracks the tone the health FSM assigns: silent/lost are errors,
    muted is a warning. */
 .mic-pill.mic-pill-silent {
-  outline: 1px solid rgba(255, 102, 102, 0.55);
+  border-color: rgba(255, 102, 102, 0.65);
 }
 .mic-pill.mic-pill-silent .mic-dot {
   background: #ff6666;
 }
 .mic-pill.mic-pill-muted {
-  outline: 1px solid rgba(255, 196, 0, 0.55);
+  border-color: rgba(255, 196, 0, 0.65);
 }
 .mic-pill.mic-pill-muted .mic-dot {
   background: #ffc400;
 }
 .mic-pill.mic-pill-lost {
-  outline: 1px solid rgba(255, 102, 102, 0.75);
+  border-color: rgba(255, 102, 102, 0.85);
 }
 .mic-pill.mic-pill-lost .mic-dot {
   background: #ff4444;
@@ -726,6 +733,16 @@ body.platform-darwin .sidebar {
 
 .top-item-toggle {
   width: auto;
+}
+
+/* Recording control, right-aligned at the end of the MIC / LANG row.
+   `margin-left: auto` lives on the wrapper, not on the button, so the
+   caption travels with it — putting it on the button would have pushed
+   the button right while leaving "Rec" behind at the left edge. */
+.top-item-record {
+  width: auto;
+  margin-left: auto;
+  align-items: flex-end;
 }
 
 .top-item .lbl {
@@ -3896,24 +3913,60 @@ canvas {
 }
 
 /* ── Settings → Local models ─────────────────────────────── */
-.models-table { display: flex; flex-direction: column; gap: 6px; }
-/* Columns, not a flow of inline spans. The size and state read-outs
-   used to sit wherever the preceding name happened to end, so the
-   figures never lined up down the card. A grid gives them one x
-   position each; ``auto`` on the action column keeps rows without a
-   button from reserving its width. */
-.model-row {
+/* The table owns the column tracks; each row inherits them via subgrid.
+   ──────────────────────────────────────────────────────────────────
+   Making every row its own grid does NOT line the rows up: grid tracks
+   are sized per container, so each row measured its own columns from
+   its own content. The GigaAM rows carry no action button, so their
+   trailing `auto` track collapsed to zero and pushed their size and
+   state cells to different x positions from the Whisper rows above —
+   which is exactly the misalignment that survived the first attempt.
+
+   Subgrid is the primitive for this: one set of tracks, defined once
+   here, adopted by every row, while each row keeps its own background,
+   padding and radius (which `display: contents` would have destroyed).
+   The action track is sized to hold "Download", the widest label, so a
+   row without a button still reserves the column instead of collapsing
+   it. */
+.models-table {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 5.5em 4.5em auto;
+  grid-template-columns: minmax(0, 1fr) 5.5em 3.5em 6.5em;
+  /* Both gutters are declared HERE and nowhere else. A subgrid may
+     override its parent's gutters, and a row that did so would place
+     its cells at different offsets from the tracks the table measured —
+     re-introducing the misalignment by a subtler route. */
+  column-gap: 10px;
+  row-gap: 6px;
   align-items: center;
-  gap: 10px;
+}
+
+/* Each row spans every track and adopts the table's, so the size and
+   state read-outs share one x position down the whole card while the
+   row keeps its own background, padding and radius. */
+.model-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  align-items: center;
   padding: 7px 10px; border-radius: 10px;
   background: var(--surface-2, rgba(255, 255, 255, 0.04));
+}
+
+/* Engines without subgrid fall back to per-row tracks. Columns then
+   align only as far as fixed track sizes allow — which is why the
+   action track is a fixed width above rather than `auto`. */
+@supports not (grid-template-columns: subgrid) {
+  .models-table { display: flex; flex-direction: column; gap: 6px; }
+  .model-row {
+    grid-template-columns: minmax(0, 1fr) 5.5em 3.5em 6.5em;
+    column-gap: 10px;
+  }
 }
 
 /* The empty/loading placeholder is a single message, not a row of
    columns. */
 .model-row-empty {
+  grid-column: 1 / -1;
   display: block;
   color: var(--text-dim, #9aa);
 }
@@ -3923,7 +3976,7 @@ canvas {
   color: var(--text-dim, #9aa);
   font-size: 12.5px;
 }
-.model-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-size {
   color: var(--text-dim, #9aa);
   font-variant-numeric: tabular-nums;
@@ -3937,14 +3990,16 @@ canvas {
 }
 /* Both action buttons share the last grid column, so a row can only
    ever show one of them (Download when absent, Delete when present). */
+/* Both actions occupy the same track and stretch to fill it, so their
+   edges line up down the column instead of each shrink-wrapping its own
+   label ("Download" and "Delete" are different widths). */
 .model-dl,
 .model-del {
-  justify-self: end;
+  justify-self: stretch;
   white-space: nowrap;
-}
-.model-del {
+  text-align: center;
   font-size: 12px;
-  padding: 4px 10px;
+  padding: 5px 0;
 }
 .model-del:hover {
   color: var(--danger-text, #f87171);

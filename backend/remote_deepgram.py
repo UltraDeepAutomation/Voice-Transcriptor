@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from backend.audio_mime import audio_content_type
+from backend.deepgram_words import deepgram_word_text
 from backend.http_retry import RemoteError, request_with_retry
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 
@@ -96,7 +97,7 @@ def _format_deepgram_speaker_words(words: object) -> str:
     for item in words:
         if not isinstance(item, dict):
             continue
-        token = str(item.get("punctuated_word") or item.get("word") or "").strip()
+        token = deepgram_word_text(item)
         if not token:
             continue
         speaker_raw = item.get("speaker")
