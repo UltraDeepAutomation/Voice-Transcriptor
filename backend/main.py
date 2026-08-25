@@ -5457,46 +5457,154 @@ _LIST_CACHE_TTL = 5.0
 _list_cache_rebuild_lock: Optional[asyncio.Lock] = None
 
 
+# ── Recordings-list scan cache ──────────────────────────────────────
+#
+# Rebuilding the History list used to cost, per transcript: one full
+# ``read_text`` to parse four metadata fields out of the header, plus a
+# probe of every accepted audio/video extension to find the sibling
+# audio file. On a real archive (~5900 transcripts, 3 collection dirs)
+# that is ~12 MB of reads and ~100k stat() calls — measured at 4.1 s.
+#
+# And it ran often: ``_invalidate_recordings_cache`` drops the whole
+# list after every single save, so the first History load after each
+# recording paid the full rescan.
+#
+# Two structural fixes, no change to the response contract:
+#
+#   * Per-file metadata cache keyed by identity + (mtime_ns, size). A
+#     saved transcript is immutable, so after the first scan every
+#     unchanged file is a dict lookup instead of a read + parse. The
+#     cache is pruned to exactly the set of files seen by each scan, so
+#     deletions cannot make it grow without bound and it needs no LRU.
+#   * One directory listing builds a stem -> audio-path index, replacing
+#     the per-item extension probe. O(entries) once, not O(items x exts).
+_recordings_entry_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+_recordings_entry_cache_lock = threading.Lock()
+
+
+def _recording_audio_index(archive_dir: Path) -> dict[str, Path]:
+    """Map transcript stem -> its audio file, from ONE directory listing.
+
+    Replaces ``_recording_audio_path``'s per-item probe of every
+    accepted extension. Deterministic when a stem somehow has more than
+    one audio sibling: ``_RECORDING_AUDIO_EXTS`` is sorted, and the
+    earliest extension wins, matching the probe's first-match order.
+    """
+    index: dict[str, Path] = {}
+    rank = {ext: i for i, ext in enumerate(_RECORDING_AUDIO_EXTS)}
+    try:
+        entries = list(archive_dir.iterdir())
+    except OSError:
+        return index
+    for entry in entries:
+        ext = entry.suffix.lower()
+        if ext not in rank:
+            continue
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        current = index.get(entry.stem)
+        if current is None or rank[ext] < rank[current.suffix.lower()]:
+            index[entry.stem] = entry
+    return index
+
+
+def _audio_payload_from_index(
+    stem: str, audio_index: dict[str, Path]
+) -> dict[str, Any]:
+    """``_recording_audio_payload`` for an already-listed directory."""
+    audio_path = audio_index.get(stem)
+    if audio_path is None:
+        return {
+            "has_audio": False,
+            "audio_name": "",
+            "audio_size_bytes": 0,
+            "audio_mime": "",
+        }
+    try:
+        size_bytes = audio_path.stat().st_size
+    except OSError:
+        size_bytes = 0
+    return {
+        "has_audio": True,
+        "audio_name": audio_path.name,
+        "audio_size_bytes": size_bytes,
+        "audio_mime": _audio_content_type(audio_path.name),
+    }
+
+
+def _prune_recordings_entry_cache(live_keys: set[str]) -> None:
+    """Drop cache entries for transcripts the latest scan did not see.
+
+    Keeps the cache exactly the size of the archive — a deleted or moved
+    recording releases its entry on the next scan, so no eviction policy
+    is required.
+    """
+    with _recordings_entry_cache_lock:
+        for stale in [k for k in _recordings_entry_cache if k not in live_keys]:
+            _recordings_entry_cache.pop(stale, None)
+
+
 def _build_recordings_list_payload(d: "Path") -> dict:
     """Expensive sync scan — runs in a thread pool via asyncio.to_thread.
 
     Extracted so the async route above can offload it cleanly. Kept
     sync because Path.glob / stat / read_text are synchronous and
     there's no async stdlib equivalent.
+
+    Per transcript the scan needs four header fields and the identity of
+    the sibling audio file. Both are cached: header parsing behind a
+    (mtime_ns, size) identity check, audio lookup behind one directory
+    listing per archive dir. See the cache block above for the numbers
+    that motivated it.
     """
     items = []
+    live_keys: set[str] = set()
     for archive_dir in _recordings_scan_dirs(d):
         collection = _recording_collection_for_dir(archive_dir)
+        audio_index = _recording_audio_index(archive_dir)
         for p in _iter_recording_text_files(archive_dir):
             try:
                 st = p.stat()
-                raw = p.read_text(encoding="utf-8", errors="replace")
-                source_file = _recording_source_file(raw)
-                display = _recording_display_name_from_content(raw, p.stem)
-                provider = _extract_meta_field(raw, "Provider").lower() or ""
-                language = _extract_meta_field(raw, "Language").lower() or ""
+                cache_key = str(p)
+                live_keys.add(cache_key)
+                # A saved transcript never changes in place, so identity
+                # plus (mtime_ns, size) is a sound freshness test — and
+                # a rewritten file changes at least one of them.
+                identity = (int(st.st_mtime_ns), int(st.st_size))
+                with _recordings_entry_cache_lock:
+                    cached = _recordings_entry_cache.get(cache_key)
+                if cached is not None and cached[0] == identity:
+                    parsed = cached[1]
+                else:
+                    raw = p.read_text(encoding="utf-8", errors="replace")
+                    parsed = {
+                        "display_name": _recording_display_name_from_content(raw, p.stem),
+                        "source_file": _recording_source_file(raw),
+                        "provider": _extract_meta_field(raw, "Provider").lower() or "",
+                        "language": _extract_meta_field(raw, "Language").lower() or "",
+                    }
+                    with _recordings_entry_cache_lock:
+                        _recordings_entry_cache[cache_key] = (identity, parsed)
                 items.append(
                     {
                         "name": p.name,
-                        "display_name": display,
-                        "source_file": source_file,
+                        "display_name": parsed["display_name"],
+                        "source_file": parsed["source_file"],
                         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
                         "size_bytes": st.st_size,
-                        "provider": provider,
-                        "language": language,
+                        "provider": parsed["provider"],
+                        "language": parsed["language"],
                         "archive_dir": str(archive_dir),
                         "recording_collection": collection,
-                        # 1.1.25 fix: thread the listed directory through to
-                        # ``_recording_audio_payload``. Previously called
-                        # without target_dir, which silently fell back to
-                        # ``_resolve_recordings_dir()``. Currently the
-                        # caller passes the resolved default dir, so values
-                        # match — but a future caller listing a non-default
-                        # archive would silently report has_audio=false on
-                        # every entry. Mirrors the pattern in
-                        # ``get_recording_audio`` and
-                        # ``transcribe_recording_on_disk``.
-                        **_recording_audio_payload(p.name, target_dir=archive_dir),
+                        # Audio fields come from the directory index built
+                        # once above. The previous form called
+                        # ``_recording_audio_payload`` per item, which
+                        # probed every accepted extension with exists() —
+                        # ~17 stat() calls per recording.
+                        **_audio_payload_from_index(p.stem, audio_index),
                     }
                 )
             except Exception as e:
@@ -5508,6 +5616,7 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                 # name and exception class are still in the support log.
                 logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
                 continue
+    _prune_recordings_entry_cache(live_keys)
     items.sort(key=lambda x: x["modified_at"], reverse=True)
     return {"items": items, "directory": str(d)}
 

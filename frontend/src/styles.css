@@ -1797,6 +1797,16 @@ textarea:focus-visible,
   height: 30px;
 }
 
+/* Coverage line for the windowed History list ("Showing 200 of 5900").
+   Sits under the search row inside the toolbar because the keyed
+   reconciler owns every child of #recordingsList. */
+.recordings-window-status {
+  margin: 6px 2px 0;
+  font-size: 11px;
+  opacity: 0.72;
+  letter-spacing: 0.01em;
+}
+
 .recordings-list {
   flex: 1;
   min-height: 0;

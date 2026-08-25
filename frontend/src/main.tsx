@@ -11,6 +11,13 @@ import {
 } from "./live-coverage";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
+import {
+  RECORDINGS_WINDOW_MINIMUM,
+  grownWindowSize,
+  resolveWindowSize,
+  shouldGrowWindow,
+  windowStatusText,
+} from "./list-window";
 import { reconcileRecordingsList } from "./recordings-list-reconciler";
 import { livePaneDisplayText } from "./live-pane";
 import {
@@ -6136,6 +6143,31 @@ let selectedRecordingName = "";
 let selectedRecordingArchiveDir = "";
 let recordingsStatsOpen = false;
 let recordingsSearchQuery = "";
+// How many filtered rows are currently materialised. Grows as the user
+// scrolls toward the end; reset (never silently shrunk) whenever the
+// filtered set is replaced wholesale. See ./list-window for the policy.
+let recordingsWindowSize = RECORDINGS_WINDOW_MINIMUM;
+
+/**
+ * Single writer for the History search query.
+ *
+ * Changing the query replaces the filtered set, which makes the carried
+ * window meaningless — a window grown to 1400 rows over the previous
+ * query would materialise 1400 rows of the new one on its first paint.
+ * Routing every write through here is what keeps the reset paired with
+ * the change; four separate call sites previously each assigned the
+ * variable directly.
+ */
+function setRecordingsSearchQuery(next: string): void {
+  const normalized = String(next || "").trim().toLowerCase();
+  if (normalized === recordingsSearchQuery) return;
+  recordingsSearchQuery = normalized;
+  resetRecordingsWindow();
+}
+
+function resetRecordingsWindow(): void {
+  recordingsWindowSize = RECORDINGS_WINDOW_MINIMUM;
+}
 let recordingsLoadRequestSeq = 0;
 let recordingOpenRequestSeq = 0;
 let recordingsStatsRequestSeq = 0;
@@ -6559,7 +6591,7 @@ function renderRecordingsList(): void {
   if (!filteredItems.length) {
     list.replaceChildren(
       renderRecordingsEmptyState("No recordings match the current search.", "Clear Search", () => {
-        recordingsSearchQuery = "";
+        setRecordingsSearchQuery("");
         const input = $("recordingsSearchInput") as HTMLInputElement;
         input.value = "";
         renderRecordingsList();
@@ -6573,18 +6605,86 @@ function renderRecordingsList(): void {
     return;
   }
 
+  // Windowed render. The archive is unbounded — a heavy user reaches
+  // several thousand recordings — and materialising every filtered item
+  // meant ~35 000 DOM nodes for a list showing about twenty. The window
+  // caps what is built; search, keyboard navigation and selection still
+  // run over the complete ``filteredItems`` array, so nothing about what
+  // the list MEANS changes. ``resolveWindowSize`` guarantees the
+  // selected row is always inside the window, which is what keeps
+  // moveRecordingSelection working: it looks the row up by key and
+  // focuses it, and focus() is what scrolls it into view.
+  const selectedIndex = filteredItems.findIndex((item) => isSelectedRecordingItem(item));
+  recordingsWindowSize = resolveWindowSize({
+    total: filteredItems.length,
+    current: recordingsWindowSize,
+    minimum: RECORDINGS_WINDOW_MINIMUM,
+    selectedIndex,
+  });
+  const windowItems = filteredItems.slice(0, recordingsWindowSize);
+
   // Rows carry their identity on data-recording-key (set by
   // buildRecordingItemButton); the keyed reconciler reuses matching DOM
   // nodes, inserts new ones at the right position and drops the rest —
   // untouched rows keep scroll position, hover state and focus.
   reconcileRecordingsList(
     list,
-    filteredItems.map((it) => ({ key: recordingDomKey(it), item: it })),
+    windowItems.map((it) => ({ key: recordingDomKey(it), item: it })),
     {
       create: ({ item }) => buildRecordingItemButton(item),
       update: (row, { item }) => updateRecordingItemButton(row, item),
     },
   );
+  renderRecordingsWindowStatus(windowItems.length, filteredItems.length);
+}
+
+/**
+ * Coverage line under the search box.
+ *
+ * A list that silently stops at row 200 reads as data loss. This says
+ * how much is materialised out of how many match, and disappears once
+ * the whole set is on screen. It lives in the toolbar rather than at the
+ * end of the list because the keyed reconciler owns every child of
+ * ``#recordingsList`` and removes anything without a row key.
+ */
+function renderRecordingsWindowStatus(rendered: number, total: number): void {
+  const toolbar = document.querySelector<HTMLElement>(".recordings-list-toolbar");
+  if (!toolbar) return;
+  const text = windowStatusText(rendered, total);
+  let node = toolbar.querySelector<HTMLElement>(".recordings-window-status");
+  if (!text) {
+    node?.remove();
+    return;
+  }
+  if (!node) {
+    node = document.createElement("div");
+    node.className = "recordings-window-status hint";
+    node.setAttribute("aria-live", "polite");
+    toolbar.appendChild(node);
+  }
+  if (node.textContent !== text) node.textContent = text;
+}
+
+/**
+ * Grow the window when the user scrolls toward the end.
+ *
+ * Attached once; a no-op while everything already fits. Growth is
+ * monotonic within a filtered set, so scrolling back up never tears
+ * down rows the user just passed.
+ */
+function handleRecordingsListScroll(): void {
+  const list = $("recordingsList");
+  const total = getFilteredRecordings().length;
+  if (recordingsWindowSize >= total) return;
+  if (!shouldGrowWindow({
+    scrollTop: list.scrollTop,
+    clientHeight: list.clientHeight,
+    scrollHeight: list.scrollHeight,
+  })) {
+    return;
+  }
+  recordingsWindowSize = grownWindowSize(recordingsWindowSize, total);
+  renderRecordingsList();
 }
 
 async function moveRecordingSelection(step: number): Promise<void> {
@@ -6630,6 +6730,10 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
     const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
     if (requestSeq !== recordingsLoadRequestSeq) return;
     recordingItems = r.items || [];
+    // A fresh archive load replaces the filtered set wholesale, so the
+    // window carried from the previous list no longer describes
+    // anything. Reset for the same reason a query change resets.
+    resetRecordingsWindow();
     activeResolvedRecordingsDir = String(r.directory || "").trim();
     syncLatestSavedAudioFromRecordings();
     const filteredItems = getFilteredRecordings();
@@ -6996,8 +7100,11 @@ $("recordingsRefreshBtn").addEventListener("click", () =>
     updateRecordingCopyState();
   })
 );
+// Window growth. Passive: the handler only reads geometry and never
+// calls preventDefault, so it must not block the compositor's scroll.
+$("recordingsList").addEventListener("scroll", handleRecordingsListScroll, { passive: true });
 $("recordingsSearchInput").addEventListener("input", (ev) => {
-  recordingsSearchQuery = String((ev.target as HTMLInputElement).value || "").trim().toLowerCase();
+  setRecordingsSearchQuery(String((ev.target as HTMLInputElement).value || ""));
   const filteredItems = getFilteredRecordings();
   if (selectedRecordingName && !filteredItems.some((item) => isSelectedRecordingItem(item))) {
     setSelectedRecording(filteredItems[0] || null);
@@ -7013,7 +7120,7 @@ $("recordingsSearchInput").addEventListener("input", (ev) => {
 });
 $("recordingsSearchClearBtn").addEventListener("click", () => {
   if (!recordingsSearchQuery) return;
-  recordingsSearchQuery = "";
+  setRecordingsSearchQuery("");
   const input = $("recordingsSearchInput") as HTMLInputElement;
   input.value = "";
   renderRecordingsList();
@@ -7062,7 +7169,7 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
 ($("recordingsSearchInput") as HTMLInputElement).addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") {
     if (!recordingsSearchQuery) return;
-    recordingsSearchQuery = "";
+    setRecordingsSearchQuery("");
     const input = ev.currentTarget as HTMLInputElement;
     input.value = "";
     renderRecordingsList();
