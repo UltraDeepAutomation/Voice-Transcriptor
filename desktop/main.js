@@ -2117,6 +2117,17 @@ function macMicrophoneAccessGranted() {
  * 2 s ceiling that keeps a wedged renderer from turning the hotkey into
  * a permanent no-op.
  */
+/**
+ * A stop of a recording the renderer threw away produces nothing: no
+ * transcript, no history entry, no paste — and, the part that was
+ * actually breaking recordings, no post-stop work for the next press to
+ * queue behind.
+ *
+ * The user's report: two fast presses, and the second "start" was
+ * refused with ``start blocked by single-capsule post-stop work`` while
+ * a 3-second fragment went to the clipboard. The block is correct — one
+ * capsule at a time — but there was no work worth blocking for.
+ */
 async function dispatchRendererTogglePress(allowStart) {
   return execRendererJsWithTimeout(
     `
@@ -2128,7 +2139,14 @@ async function dispatchRendererTogglePress(allowStart) {
       const liveSnapshot = uiReady ? window.__transcriptorLiveStatusSnapshot() : null;
       const autoSendEnter = !!liveSnapshot?.autoSendEnter;
       const timerText = String(liveSnapshot?.timerText || '00:00').trim();
-      const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, auto, autoSendEnter, timerText, recordingId };
+      // The renderer owns the recording clock and the floor under it.
+      // Asking it — rather than timing the press here — is what keeps
+      // the two processes from disagreeing about whether this stop
+      // produced anything.
+      const tooShort = isRec && typeof window.__transcriptorRecordingTooShort === 'function'
+        ? !!window.__transcriptorRecordingTooShort()
+        : false;
+      const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, discarded: tooShort, auto, autoSendEnter, timerText, recordingId };
       if (!uiReady) return state;
       if (!isRec && !${allowStart ? "true" : "false"}) return state;
       window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
@@ -2195,6 +2213,22 @@ async function toggleRecordingFromShortcut() {
       dispatched: !!result.dispatched,
       wasRecording: !!result.wasRecording,
     });
+
+    if (result.discarded) {
+      // The renderer threw this recording away — it was shorter than the
+      // floor, i.e. a double-tap on the hotkey. There is no transcript
+      // coming, so queueing post-stop work would only block the next
+      // press behind a capsule that has nothing to do.
+      appendMainLog(`[shortcut] discarded a too-short recording rec=${Number(result.recordingId || 0)}`);
+      traceStep(trace, "recording_discarded", {
+        recordingId: Number(result.recordingId || 0),
+        timerText: result.timerText || "",
+      });
+      stopRecordingStateMonitor();
+      resetRecordingStatusState();
+      traceEnd(trace, "discarded", { reason: "below-minimum-duration" });
+      return;
+    }
 
     // Published, not awaited. Creating the capsule window costs 110-380 ms
     // (it is destroyed 8 s after going idle, so most presses pay a fresh

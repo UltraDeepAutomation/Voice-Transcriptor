@@ -493,6 +493,7 @@ declare global {
     __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
+    __transcriptorRecordingTooShort?: () => boolean;
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __transcriptorShortcutStatus?: {
       record?: { active?: string; desired?: string; error?: string };
@@ -700,6 +701,18 @@ const UI_TOKENS = {
   capture: {
     fallbackInitDelayMs: 1_300,
     vuAmplify: 4,
+    /**
+     * Shortest recording that is kept. Below it the press is treated as
+     * a double-tap on the hotkey and nothing is produced at all.
+     *
+     * 500 ms, from the archive: across 3681 recordings the shortest are
+     * 0.00 s (six of them — a second press landing before any audio
+     * arrived), 0.22 s and 0.25 s, and then NOTHING until 0.55 s. The
+     * floor sits inside that gap, so it discards every accident on
+     * record (8 of 3681, 0.22 %) and no recording that looks like
+     * speech. Eight is also the entire population it can affect.
+     */
+    minRecordingMs: 500,
   },
   finalize: {
     segmentEpsilonSec: 0.08,
@@ -7847,6 +7860,26 @@ let timer: number | null = null;
 let vuIntervalId: ReturnType<typeof setInterval> | null = null;
 let pipelineFailsafeId: ReturnType<typeof setTimeout> | null = null;
 let startAt = 0;
+
+/**
+ * Is the recording in progress too short to be one?
+ *
+ * The clock is ``startAt`` — the first captured audio frame — so this is
+ * the duration of AUDIO, not of the hotkey being held, and a session
+ * that never produced a frame answers true.
+ *
+ * Exported on ``window`` because the main process asks the same question
+ * before it queues any post-stop work: one clock, one threshold, one
+ * answer. Two measurements would disagree at the boundary, and the
+ * disagreement would be the main process waiting for a transcript the
+ * renderer had already thrown away.
+ */
+function recordingIsTooShortToKeep(): boolean {
+  if (!isRecording) return false;
+  const elapsedMs = startAt > 0 ? Date.now() - startAt : 0;
+  return elapsedMs < UI_TOKENS.capture.minRecordingMs;
+}
+window.__transcriptorRecordingTooShort = recordingIsTooShortToKeep;
 /**
  * PCM capture sink for the current recording session. Lazily created
  * inside ``startLive`` once the mic has yielded its first frames,
@@ -9365,7 +9398,14 @@ async function waitForWorkletDrain(
   }
 }
 
-async function stopLive(enhance: boolean): Promise<void> {
+async function stopLive(
+  enhance: boolean,
+  options: { discard?: boolean } = {},
+): Promise<void> {
+  // A press that lands within MIN_RECORDING_MS of the start is a
+  // double-tap, not a recording. The teardown below still runs in full —
+  // this only decides that nothing is produced from it.
+  const discarding = !!options.discard;
   if (stopTransitionInFlight) return;
   if (!isRecording) {
     // A start that failed after ``new AudioContext()`` but before
@@ -9750,7 +9790,11 @@ async function stopLive(enhance: boolean): Promise<void> {
   wsPendingFrameSamples = 0;
       console.warn(`[trace stopLive] ${strandedFrames} captured frames never reached the live transport`);
     }
-    if (ws.readyState === WebSocket.OPEN) {
+    if (discarding) {
+      // Nothing downstream will read the result, and Finalize is what
+      // makes the provider decode (and bill for) the audio.
+      console.log(`[trace stopLive] discard: finalize not sent`);
+    } else if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: "finalize" }));
         // Phase marker, not a side effect: the interval between Stop and
@@ -9931,6 +9975,40 @@ async function stopLive(enhance: boolean): Promise<void> {
   window.__transcriptorCurrentRecordingId = 0;
   setRecordButton(false);
   resetVU();
+
+  if (discarding) {
+    // Everything is torn down; nothing is written. No transcript, no
+    // history entry, no audio on disk, and no post-stop work for the
+    // main process to wait behind — which is what made the NEXT press
+    // land on a busy capsule and do nothing.
+    console.log(
+      `[trace stopLive] discarded ${recordedMs.toFixed(0)}ms recording ` +
+      `(below the ${UI_TOKENS.capture.minRecordingMs}ms floor) rec=${recordingId}`,
+    );
+    publishRecordingFinalSignal({
+      recordingId,
+      signalText: "",
+      domText: "",
+      kind: "status",
+      sessionToken: sessionUiToken,
+    });
+    if (liveSessionId) {
+      void discardLiveRecovery(liveSessionId).catch((e) => {
+        console.warn("discardLiveRecovery failed for a discarded recording", e);
+      });
+    }
+    if (deferredSinkDestroy) {
+      void deferredSinkDestroy.destroy();
+    }
+    clearLiveDraft(sessionUiToken);
+    setBusy(false, sessionUiToken);
+    releaseStopTransitionAfterCaptureDetach();
+    setStatusScoped(sessionUiToken, "Idle");
+    if (isCurrentUiSession(sessionUiToken)) {
+      $("progressRow").hidden = true;
+    }
+    return;
+  }
 
   if (savedAudioFile) {
     setCurrentRecordingAudio(savedAudioFile, "", sessionArchiveDir, sessionUiToken);
@@ -11338,7 +11416,7 @@ document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
   if (isRecording) {
-    void stopLive(shouldAutoTranscribe());
+    void stopLive(shouldAutoTranscribe(), { discard: recordingIsTooShortToKeep() });
   } else {
     void startLive();
   }
@@ -11349,7 +11427,7 @@ window.addEventListener("transcriptor-hotkey-stop", (ev) => {
   const requestedRecordingId = Number((ev as CustomEvent<{ recordingId?: number }>).detail?.recordingId || 0);
   if (requestedRecordingId > 0 && currentRecordingId !== requestedRecordingId) return;
   if (isRecording) {
-    void stopLive(shouldAutoTranscribe());
+    void stopLive(shouldAutoTranscribe(), { discard: recordingIsTooShortToKeep() });
   }
 });
 
