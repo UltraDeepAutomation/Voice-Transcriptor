@@ -8766,14 +8766,26 @@ function pushCapturedFrame(input: Float32Array): void {
   }
 }
 
-async function flushWorkletPort(timeoutMs = 350): Promise<void> {
+/**
+ * Drain the capture worklet's pending frames.
+ *
+ * Returns true when the worklet ACKNOWLEDGED the flush. That
+ * acknowledgement is a complete delivery barrier, not a hint: the
+ * processor runs `flushPending()` and posts `flush-ack` in the same
+ * handler, and a MessagePort preserves order — so every PCM message
+ * posted before the ack has already been handed to this thread.
+ *
+ * False means there is no worklet (the ScriptProcessor fallback) or the
+ * ack never came, and the caller has no barrier from here.
+ */
+async function flushWorkletPort(timeoutMs = 350): Promise<boolean> {
   const node = workletNode;
-  if (!node) return;
+  if (!node) return false;
   const token = `flush-${Date.now()}-${++flushRequestSeq}`;
-  await new Promise<void>((resolve) => {
+  return new Promise<boolean>((resolve) => {
     let settled = false;
     let timerId: number | null = null;
-    const finish = (): void => {
+    const finish = (acked: boolean): void => {
       if (settled) return;
       settled = true;
       if (timerId !== null) {
@@ -8781,15 +8793,15 @@ async function flushWorkletPort(timeoutMs = 350): Promise<void> {
         timerId = null;
       }
       pendingWorkletFlushes.delete(token);
-      resolve();
+      resolve(acked);
     };
-    pendingWorkletFlushes.set(token, finish);
-    timerId = window.setTimeout(finish, timeoutMs);
+    pendingWorkletFlushes.set(token, () => finish(true));
+    timerId = window.setTimeout(() => finish(false), timeoutMs);
     try {
       node.port.postMessage({ type: "flush", token });
     } catch (e) {
       console.debug("flushWorkletPort: postMessage failed", e);
-      finish();
+      finish(false);
     }
   });
 }
@@ -9658,16 +9670,39 @@ async function stopLive(enhance: boolean): Promise<void> {
   mark("stream.getTracks.stop");
 
   const t0Drain = performance.now();
-  await flushWorkletPort();
+  // The ack IS the barrier. `waitForWorkletDrain` is the fallback for
+  // when there isn't one.
+  //
+  // The drain waits for a 120 ms gap with no new frame, bounded at
+  // 450 ms. But the microphone track is stopped in step 1 above while
+  // the worklet node stays connected, so the audio thread keeps calling
+  // `process()` and keeps handing over frames — of silence. The idle
+  // condition can therefore never be satisfied, and the measured cost
+  // was the ceiling, every time:
+  //
+  //   waitForWorkletDrain: 467ms   (ceiling 450ms + one poll step)
+  //
+  // Half a second added to every stop, waiting out a clock for an
+  // event that had already happened. When the worklet acknowledges the
+  // flush, every captured sample has provably been delivered — the
+  // track was already stopped, so anything arriving afterwards is
+  // post-stop silence and holds nothing back.
+  //
+  // The ScriptProcessor fallback has no port and no ack, so it still
+  // drains: there the silence heuristic is the only barrier available,
+  // and paying for it is correct.
+  const workletAcked = await flushWorkletPort();
   mark("flushWorkletPort");
   const flushDur = performance.now() - t0Drain;
-  await waitForWorkletDrain();
+  if (!workletAcked) {
+    await waitForWorkletDrain();
+  }
   mark("waitForWorkletDrain");
   const drainDur = performance.now() - t0Drain - flushDur;
   await stopMediaRecorderAndFlush();
   mark("stopMediaRecorderAndFlush");
   const recorderDur = performance.now() - t0Drain - flushDur - drainDur;
-  console.log(`[trace stopLive] drained flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms recorder=${recorderDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? liveTranscriptSegments.length}`);
+  console.log(`[trace stopLive] drained ackBarrier=${workletAcked ? 1 : 0} flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms recorder=${recorderDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? liveTranscriptSegments.length}`);
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
