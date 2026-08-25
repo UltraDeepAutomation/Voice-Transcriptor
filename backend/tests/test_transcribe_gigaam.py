@@ -18,6 +18,7 @@ import numpy as np
 
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
 from backend.model_catalog import (
+    GIGAAM_MODELS,
     GIGAAM_MODEL_PREFIX,
     LOCAL_TRANSCRIPTION_MODELS,
 )
@@ -185,8 +186,16 @@ class GigaAMDispatchTests(unittest.TestCase):
 
     def test_catalog_contains_gigaam_ids_with_prefix(self):
         gigaam_ids = [m for m in LOCAL_TRANSCRIPTION_MODELS if m.startswith(GIGAAM_MODEL_PREFIX)]
+        # The prefix is the dispatch key, so every GigaAM entry must carry
+        # it — asserted over whatever the catalog offers rather than a
+        # hardcoded list, which is what broke when the line was cut to one
+        # variant.
+        self.assertTrue(gigaam_ids)
+        self.assertEqual(gigaam_ids, list(GIGAAM_MODELS))
+        # The end-to-end head is the one a dictation app wants: it emits
+        # punctuated, normalised text. Plain `rnnt` returns lowercase with
+        # no punctuation and exists for WER scoring.
         self.assertIn("gigaam-v3-e2e-rnnt", gigaam_ids)
-        self.assertIn("gigaam-v3-rnnt", gigaam_ids)
 
     def test_dispatch_produces_absolute_time_segments(self):
         from backend.transcribe import transcribe_audio

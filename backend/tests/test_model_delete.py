@@ -8,6 +8,8 @@ cache-eviction contract rather than the huggingface_hub call itself.
 
 import sys
 import unittest
+
+from backend.model_catalog import GIGAAM_MODELS
 from unittest import mock
 
 from backend import models_manager
@@ -32,7 +34,7 @@ class DeleteModelGuardTests(unittest.TestCase):
         # userData/engine-site. Deleting an HF cache entry for it would
         # leave the engine installed while the UI claimed it was gone.
         with self.assertRaises(ModelDeleteError) as ctx:
-            delete_model("gigaam-v3-rnnt")
+            delete_model(GIGAAM_MODELS[0])
         self.assertIn("engine", str(ctx.exception).lower())
 
     def test_in_flight_download_is_refused(self) -> None:

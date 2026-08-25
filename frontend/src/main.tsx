@@ -24,6 +24,7 @@ import { livePaneDisplayText } from "./live-pane";
 import {
   buildTranscriptionCatalog,
   groupFromWire,
+  defaultModelForGroup,
   isLocalGroup,
   wireProviderForGroup,
   type TranscriptionGroupId,
@@ -932,7 +933,22 @@ function renderTranscriptionSelectors(): void {
 /** Single writer for the unified selection. */
 function setTranscriptionSelection(group: TranscriptionGroupId | "", model?: string): void {
   uiProviderGroup = group;
-  if (group && model) uiModelByGroup[group] = model;
+  if (group) {
+    // Selecting a GROUP selects a model in it. The group's change
+    // handler has no model to pass, and leaving the slot empty made the
+    // selection ambiguous: the selector displayed the group's first
+    // model while the reader fell back to the global default. A user who
+    // switched to GigaAM saw a GigaAM model and had Whisper `small`
+    // transcribe — the WS query in the log says `model=small` on five
+    // consecutive sessions. Resolving here, through the same function
+    // the selector renders from, leaves one answer.
+    const resolved = (
+      model
+      || uiModelByGroup[group]
+      || defaultModelForGroup(transcriptionCatalog(), group)
+    ).trim();
+    if (resolved) uiModelByGroup[group] = resolved;
+  }
   renderTranscriptionSelectors();
   queueUiPreferencesSave();
   // Unconditional call: ``scheduleLocalWarmup`` is the single gate on
@@ -958,10 +974,15 @@ function readProviderSelection(): Provider {
 // fallback paths (remote provider down → local) keep a valid engine.
 function selectedLocalModel(): string {
   const localGroup = isLocalGroup(uiProviderGroup) ? uiProviderGroup : lastLocalGroup;
-  const value = (uiModelByGroup[localGroup || "local-whisper"] || "").trim();
-  return LOCAL_TRANSCRIPTION_MODELS.includes(value)
-    ? value
-    : DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
+  const group = localGroup || "local-whisper";
+  const value = (uiModelByGroup[group] || "").trim();
+  if (LOCAL_TRANSCRIPTION_MODELS.includes(value)) return value;
+  // Fall back INSIDE the chosen group before falling back to the global
+  // default. The global default is a Whisper model, so answering with it
+  // for a GigaAM group silently changes the engine the user picked.
+  const groupDefault = defaultModelForGroup(transcriptionCatalog(), group);
+  if (groupDefault && LOCAL_TRANSCRIPTION_MODELS.includes(groupDefault)) return groupDefault;
+  return DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
 }
 
 type LocalModelRow = {

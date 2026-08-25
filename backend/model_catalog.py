@@ -15,9 +15,13 @@ def gigaam_available() -> bool:
     return find_spec("gigaam") is not None and find_spec("torch") is not None
 
 
+# Three sizes, not five. `tiny` and `base` were listed as choices but
+# were never a reason to choose them: on this app's workload they are
+# fast in exchange for a transcript the user has to correct, and the
+# only thing five near-duplicate entries bought was a longer menu.
+# `small` is the default and the floor; `medium` and `large-v3` are the
+# accuracy steps above it.
 WHISPER_LOCAL_MODELS: tuple[str, ...] = (
-    "tiny",
-    "base",
     "small",
     "medium",
     "large-v3",
@@ -26,10 +30,15 @@ WHISPER_LOCAL_MODELS: tuple[str, ...] = (
 # Engine prefix "gigaam-" dispatches to backend/transcribe_gigaam.py;
 # availability depends on the `gigaam` package being installed in the
 # app venv (see requirements-gigaam.txt) — surfaced via /api/health.
-GIGAAM_MODELS: tuple[str, ...] = (
-    "gigaam-v3-e2e-rnnt",
-    "gigaam-v3-rnnt",
-)
+# One variant. The two differ by their decoding head, not by quality of
+# hearing: `e2e-rnnt` is trained end to end over a 1024-piece
+# SentencePiece vocabulary and emits punctuated, normalised text
+# directly, and it is the faster decode. Plain `rnnt` has a 33-character
+# vocabulary (space + а-я) and emits lowercase text with no punctuation —
+# it exists so word-error rate can be scored without case and punctuation
+# absorbing the errors. That is a benchmarking tool, not a dictation
+# engine, and offering it as a peer choice only invited picking it.
+GIGAAM_MODELS: tuple[str, ...] = ("gigaam-v3-e2e-rnnt",)
 GIGAAM_MODEL_PREFIX = "gigaam-"
 
 LOCAL_TRANSCRIPTION_MODELS: tuple[str, ...] = WHISPER_LOCAL_MODELS + GIGAAM_MODELS
@@ -40,7 +49,10 @@ DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small"
 # backend/live.py adapts to slow models via the catch-up ring, and the
 # 60 s inference ceiling bounds worst-case latency.
 LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = LOCAL_TRANSCRIPTION_MODELS
-LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = ("tiny", "base")
+# Follows the catalog: the preview engine has to be a model the app
+# still ships. It was ("tiny", "base") — both now gone — which would have
+# resolved every preview to a model that is no longer offered.
+LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = ("small",)
 DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
 REMOTE_TRANSCRIPTION_PROVIDERS: tuple[str, ...] = ("openrouter", "deepgram")

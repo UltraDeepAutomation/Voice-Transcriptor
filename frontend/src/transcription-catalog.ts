@@ -59,7 +59,6 @@ const WHISPER_LABELS: Record<string, string> = {
 
 const GIGAAM_LABELS: Record<string, string> = {
   "gigaam-v3-e2e-rnnt": "GigaAM v3 E2E RNNT",
-  "gigaam-v3-rnnt": "GigaAM v3 RNNT",
 };
 
 /** Human label for a model id inside a group; falls back to the id. */
@@ -139,4 +138,26 @@ export function groupFromWire(
 
 export function isLocalGroup(group: TranscriptionGroupId | ""): boolean {
   return group === "local-whisper" || group === "gigaam";
+}
+
+/**
+ * The model a group falls back to when nothing has been chosen in it.
+ *
+ * There must be exactly one answer to this. The selector rendered
+ * `group.models[0]?.id` while the reader of the selection fell back to
+ * the global default model, so switching the group to GigaAM showed a
+ * GigaAM model and ran Whisper `small` — the user picked one engine and
+ * another one transcribed. Both sides now ask this function.
+ *
+ * Prefers an available model: an engine whose package is not installed
+ * cannot be the implicit choice, and offering it silently would move the
+ * same failure one step later.
+ */
+export function defaultModelForGroup(
+  groups: ReadonlyArray<TranscriptionGroup>,
+  group: TranscriptionGroupId | "",
+): string {
+  if (!group) return "";
+  const models = groups.find((g) => g.id === group)?.models || [];
+  return (models.find((m) => m.available) || models[0])?.id || "";
 }
