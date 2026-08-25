@@ -764,8 +764,8 @@ class DeepgramLiveSession:
             # after a timeout has elapsed. Measuring it first is what
             # turns "wait 3 s, then discover nothing was missing" into
             # "notice nothing is missing, wait 0.75 s to confirm".
-            streamed_sec, covered_end, tail_gap = self._tail_coverage()
-            tail_uncovered = tail_gap >= TAIL_GUARD_MIN_SEC
+            streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
+            tail_uncovered = self._tail_needs_flush(tail_gap, tail_speech)
             flush_wait = (
                 FINALIZE_FLUSH_WAIT_SEC if tail_uncovered else FINALIZE_COVERED_WAIT_SEC
             )
@@ -776,11 +776,13 @@ class DeepgramLiveSession:
                 )
                 logger.info(
                     "deepgram-live: post-Finalize transcript received "
-                    "(budget=%.2fs streamed=%.2fs covered=%.2fs gap=%.2fs)",
+                    "(budget=%.2fs streamed=%.2fs covered=%.2fs gap=%.2fs "
+                    "speech_in_gap=%.2fs)",
                     flush_wait,
                     streamed_sec,
                     covered_end,
                     tail_gap,
+                    tail_speech,
                 )
             except asyncio.TimeoutError:
                 # Tail guard: silence after Finalize is only fatal if the
@@ -788,12 +790,13 @@ class DeepgramLiveSession:
                 # reader task may have finalized more segments while we
                 # waited, which can close a gap that was open when the
                 # budget was chosen.
-                streamed_sec, covered_end, tail_gap = self._tail_coverage()
-                if tail_gap >= TAIL_GUARD_MIN_SEC:
+                streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
+                if self._tail_needs_flush(tail_gap, tail_speech):
                     logger.warning(
-                        "deepgram-live: tail guard: %.2fs of audio past last final; "
-                        "retrying Finalize once",
+                        "deepgram-live: tail guard: %.2fs of audio past last final "
+                        "(%.2fs of it recognised speech); retrying Finalize once",
                         tail_gap,
+                        tail_speech,
                     )
                     # Armed BEFORE the retry send (BUG-68): a final
                     # landing while the frame is in flight must be seen
@@ -816,18 +819,20 @@ class DeepgramLiveSession:
                         except asyncio.TimeoutError:
                             logger.warning(
                                 "deepgram-live: tail guard: still silent after retry "
-                                "(%.2fs uncovered); closing",
+                                "(%.2fs uncovered, %.2fs of it speech); closing",
                                 tail_gap,
+                                tail_speech,
                             )
                 else:
                     logger.info(
                         "deepgram-live: no post-Finalize transcript within %.2fs "
-                        "(streamed=%.2fs covered=%.2fs gap=%.2fs — nothing was "
-                        "unflushed); closing",
+                        "(streamed=%.2fs covered=%.2fs gap=%.2fs speech_in_gap=%.2fs "
+                        "— nothing was unflushed); closing",
                         flush_wait,
                         streamed_sec,
                         covered_end,
                         tail_gap,
+                        tail_speech,
                     )
 
             try:
@@ -1026,15 +1031,35 @@ class DeepgramLiveSession:
         )
         return len(survivors)
 
-    def _tail_coverage(self) -> tuple[float, float, float]:
-        """How much streamed audio is not yet represented in a final.
+    def _tail_coverage(self) -> tuple[float, float, float, float]:
+        """What is unflushed at the end of the stream.
 
-        Returns ``(streamed_sec, covered_end_sec, tail_gap_sec)``.
+        Returns ``(streamed_sec, covered_end_sec, tail_gap_sec,
+        tail_speech_sec)``.
 
-        This is derived entirely from state we already hold — bytes sent
-        and the end timestamps of finalized segments — so it costs
-        nothing and can be consulted *before* deciding how long to wait
-        for a flush, rather than only after a wait has expired.
+        ``tail_gap_sec`` is raw audio past the last finalized segment.
+        ``tail_speech_sec`` is the part of that gap where an interim
+        actually *recognised words*.
+
+        The distinction is the whole point. A user finishes a sentence
+        and then reaches for the stop hotkey, so almost every recording
+        ends with a second or two of streamed silence. Measured by audio
+        alone, that silence reads as "unflushed tail" and triggers the
+        retry path — a 3 s wait, a second Finalize, another 3 s wait —
+        to discover that Deepgram had nothing to send, because there was
+        nothing there. Observed in main.log: a 54.0 s recording whose
+        last final ended at 52.08 s spent 6272 ms at finalize and
+        spliced nothing, twice over in consecutive sessions.
+
+        With ``interim_results`` on, Deepgram emits a hypothesis as it
+        decodes, so a trailing region that produced no interim produced
+        no words — and a Finalize cannot flush words that were never
+        decoded. Speech is therefore the signal that says whether
+        waiting can possibly pay.
+
+        Derived entirely from state we already hold, so it can be
+        consulted *before* deciding how long to wait rather than only
+        after a wait has expired.
         """
         streamed_sec = self.stats.bytes_sent / (
             2 * max(1, int(self._cfg.sample_rate))
@@ -1043,7 +1068,43 @@ class DeepgramLiveSession:
             (float(seg.get("end", 0.0) or 0.0) for seg in self._finalized_segments),
             default=0.0,
         )
-        return streamed_sec, covered_end, streamed_sec - covered_end
+        tail_gap = streamed_sec - covered_end
+        # Recognised speech lying past the last final. Spans are clipped
+        # to the uncovered region and merged, so overlapping interims
+        # (a rolling re-decode emits many) cannot be counted twice.
+        tail_speech = 0.0
+        if tail_gap > 0 and self._interim_speech_spans:
+            clipped = sorted(
+                (max(start, covered_end), min(end, streamed_sec))
+                for start, end in self._interim_speech_spans
+                if end > covered_end
+            )
+            merged_end = covered_end
+            for start, end in clipped:
+                if end <= start:
+                    continue
+                start = max(start, merged_end)
+                if end > start:
+                    tail_speech += end - start
+                    merged_end = end
+        return streamed_sec, covered_end, tail_gap, tail_speech
+
+    def _tail_needs_flush(self, tail_gap: float, tail_speech: float) -> bool:
+        """Is the trailing region worth waiting — and retrying — for?
+
+        Speech decides, not audio. A trailing stretch of silence cannot
+        yield words no matter how long we wait, and treating it as
+        unflushed is what made almost every stop pay the retry path.
+
+        The audio measure remains the answer when interim results are
+        off: without hypotheses there is no speech signal to read, and
+        falling back to the conservative test is the safe direction —
+        it waits when it does not need to, rather than closing on words
+        it could not see.
+        """
+        if not self._cfg.interim_results:
+            return tail_gap >= TAIL_GUARD_MIN_SEC
+        return tail_speech >= TAIL_GUARD_MIN_SEC
 
     def _uncovered_speech_sec(self) -> float:
         """Seconds where an interim heard words but no final ever landed.

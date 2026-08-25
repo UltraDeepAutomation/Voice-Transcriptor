@@ -48,7 +48,19 @@ class FakeUpstreamWs:
         return list(self.sent)
 
 
-def _session(*, streamed_sec: float, covered_end: float) -> DeepgramLiveSession:
+def _session(
+    *,
+    streamed_sec: float,
+    covered_end: float,
+    tail_speech_sec: float = 0.0,
+) -> DeepgramLiveSession:
+    """A session whose tail is either silence or recognised speech.
+
+    ``tail_speech_sec`` seeds an interim speech span running past
+    ``covered_end`` — the difference between "the user was still talking
+    when Stop landed" and "the user finished and then reached for the
+    hotkey", which is what the budget now turns on.
+    """
     session = DeepgramLiveSession(api_key="k")
     session._ws = FakeUpstreamWs()
     session._keepalive_task = None
@@ -57,26 +69,59 @@ def _session(*, streamed_sec: float, covered_end: float) -> DeepgramLiveSession:
     session.stats.bytes_sent = int(streamed_sec * 2 * session._cfg.sample_rate)
     if covered_end > 0:
         session._finalized_segments = [{"start": 0.0, "end": covered_end, "text": "x"}]
+    if tail_speech_sec > 0:
+        session._interim_speech_spans = [
+            (covered_end, covered_end + tail_speech_sec)
+        ]
     return session
 
 
 class TailCoverageTests(unittest.TestCase):
     def test_coverage_is_derived_from_bytes_and_segment_ends(self):
         session = _session(streamed_sec=10.0, covered_end=9.5)
-        streamed, covered, gap = session._tail_coverage()
+        streamed, covered, gap, speech = session._tail_coverage()
         self.assertAlmostEqual(streamed, 10.0, places=2)
         self.assertAlmostEqual(covered, 9.5, places=2)
         self.assertAlmostEqual(gap, 0.5, places=2)
+        self.assertEqual(speech, 0.0)
 
     def test_no_finalized_segments_means_everything_is_uncovered(self):
         session = _session(streamed_sec=4.0, covered_end=0.0)
-        _streamed, covered, gap = session._tail_coverage()
+        _streamed, covered, gap, _speech = session._tail_coverage()
         self.assertEqual(covered, 0.0)
         self.assertAlmostEqual(gap, 4.0, places=2)
 
     def test_a_silent_session_reports_no_gap(self):
         session = _session(streamed_sec=0.0, covered_end=0.0)
-        self.assertEqual(session._tail_coverage(), (0.0, 0.0, 0.0))
+        self.assertEqual(session._tail_coverage(), (0.0, 0.0, 0.0, 0.0))
+
+    def test_trailing_silence_is_a_gap_with_no_speech_in_it(self):
+        # The common shape: the user finished speaking at 52.08 s and
+        # pressed Stop at 54.0 s. Almost every recording ends this way.
+        session = _session(streamed_sec=54.0, covered_end=52.08)
+        _streamed, _covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 1.92, places=2)
+        self.assertEqual(speech, 0.0)
+
+    def test_speech_in_the_tail_is_measured(self):
+        session = _session(streamed_sec=54.0, covered_end=52.0, tail_speech_sec=1.5)
+        _streamed, _covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 2.0, places=2)
+        self.assertAlmostEqual(speech, 1.5, places=2)
+
+    def test_overlapping_interims_are_not_counted_twice(self):
+        # A rolling re-decode emits many hypotheses over the same audio.
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        session._interim_speech_spans = [(52.0, 53.5), (52.4, 53.8), (53.0, 54.0)]
+        _streamed, _covered, _gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(speech, 2.0, places=2)
+
+    def test_speech_before_the_last_final_does_not_count_as_tail(self):
+        # Those words are already in the transcript.
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        session._interim_speech_spans = [(10.0, 40.0)]
+        _streamed, _covered, _gap, speech = session._tail_coverage()
+        self.assertEqual(speech, 0.0)
 
 
 class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
@@ -100,7 +145,7 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncovered_tail_still_gets_the_full_ceiling(self):
         # Real unflushed speech: truncating the wait here would cost the
         # user the clause they just spoke.
-        session = _session(streamed_sec=90.0, covered_end=85.0)
+        session = _session(streamed_sec=90.0, covered_end=85.0, tail_speech_sec=4.0)
         ws = session._ws
         started = time.perf_counter()
         with mock.patch(
@@ -117,7 +162,7 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws.types.count("Finalize"), 2)
 
     async def test_an_early_final_short_circuits_either_budget(self):
-        session = _session(streamed_sec=90.0, covered_end=85.0)
+        session = _session(streamed_sec=90.0, covered_end=85.0, tail_speech_sec=4.0)
 
         async def deliver_now():
             await asyncio.sleep(0.02)
@@ -142,6 +187,64 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         ):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1)
+
+
+class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
+    """The shape almost every recording ends in."""
+
+    async def test_trailing_silence_does_not_trigger_the_retry(self):
+        # Observed in main.log: a 54.0 s recording whose last final ended
+        # at 52.08 s spent 6272 ms at finalize — a 3 s wait, a second
+        # Finalize, another 3 s wait — and spliced nothing, because the
+        # "unflushed tail" was the pause before the user hit Stop.
+        session = _session(streamed_sec=54.0, covered_end=52.08)
+        ws = session._ws
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
+        ), mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+        ):
+            await session.finalize(wait_timeout=0.5)
+        # One Finalize, not two: no retry for silence.
+        self.assertEqual(ws.types.count("Finalize"), 1)
+        self.assertIn("CloseStream", ws.types)
+
+    async def test_speech_in_the_tail_still_triggers_the_retry(self):
+        # The user was mid-clause when Stop landed. This is the case the
+        # guard exists for and it must be unchanged.
+        session = _session(streamed_sec=54.0, covered_end=52.0, tail_speech_sec=1.5)
+        ws = session._ws
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
+        ), mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
+        ):
+            await session.finalize(wait_timeout=0.5)
+        self.assertEqual(ws.types.count("Finalize"), 2)
+
+    async def test_audio_is_the_test_when_interim_results_are_off(self):
+        # Without hypotheses there is no speech signal to read, so the
+        # conservative measure applies: wait when it may not be needed,
+        # rather than close on words we could not see.
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        session._cfg.interim_results = False
+        ws = session._ws
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
+        ), mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
+        ):
+            await session.finalize(wait_timeout=0.5)
+        self.assertEqual(ws.types.count("Finalize"), 2)
+
+    def test_the_predicate_reads_speech_not_audio(self):
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        # 5 s of audio, no speech in it -> nothing to flush.
+        self.assertFalse(session._tail_needs_flush(5.0, 0.0))
+        # A gap barely over the threshold, all of it speech -> flush.
+        self.assertTrue(session._tail_needs_flush(5.0, TAIL_GUARD_MIN_SEC))
+        # Speech below the threshold is a word fragment, not a clause.
+        self.assertFalse(session._tail_needs_flush(5.0, TAIL_GUARD_MIN_SEC - 0.01))
 
 
 class BudgetConstantTests(unittest.TestCase):

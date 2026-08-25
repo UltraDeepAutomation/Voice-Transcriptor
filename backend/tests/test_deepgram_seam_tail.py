@@ -121,16 +121,18 @@ def _session() -> DeepgramLiveSession:
 
 
 class TailGuardTests(unittest.IsolatedAsyncioTestCase):
-    async def test_retry_fires_when_streamed_audio_runs_past_last_final(self):
+    async def test_retry_fires_when_recognised_speech_runs_past_last_final(self):
         session = _session()
         ws = session._ws
         assert ws is not None
-        # 11 s of audio streamed, only 10 s finalized, no response after
-        # Finalize → the trailing second is unflushed upstream.
+        # 11 s of audio streamed, only 10 s finalized, and an interim
+        # heard words through 11 s → the trailing second is real speech
+        # that never reached a final. This is what the guard is for.
         session._finalized_segments = [
             {"start": 0.0, "end": 10.0, "text": "хвост", "is_final": True},
         ]
         session.stats.bytes_sent = int(11.0 * 2 * session._cfg.sample_rate)
+        session._interim_speech_spans = [(10.0, 11.0)]
 
         async def silent():
             await asyncio.sleep(99)
@@ -145,6 +147,37 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
             len(finalize_sends), 2,
             f"tail guard must retry Finalize; frames were {ws.types}",
         )
+
+    async def test_no_retry_when_the_trailing_audio_is_silence(self):
+        # The shape almost every recording ends in: the user finishes a
+        # sentence, then reaches for Stop. Measured by audio alone that
+        # pause reads as an unflushed tail and cost a 3 s wait plus a
+        # second Finalize plus another 3 s wait — to be told, correctly,
+        # that there was nothing there. No interim heard words in it, and
+        # with interim results on, words that were never decoded cannot
+        # be flushed.
+        session = _session()
+        ws = session._ws
+        assert ws is not None
+        session._finalized_segments = [
+            {"start": 0.0, "end": 10.0, "text": "хвост", "is_final": True},
+        ]
+        session.stats.bytes_sent = int(11.0 * 2 * session._cfg.sample_rate)
+        session._interim_speech_spans = []
+
+        async def silent():
+            await asyncio.sleep(99)
+
+        blocker = asyncio.create_task(silent())
+        try:
+            await session.finalize(wait_timeout=0.2)
+        finally:
+            blocker.cancel()
+        self.assertEqual(
+            ws.types.count("Finalize"), 1,
+            f"silence must not trigger the retry; frames were {ws.types}",
+        )
+        self.assertIn("CloseStream", ws.types)
 
     async def test_no_retry_when_stream_fully_covered(self):
         session = _session()
