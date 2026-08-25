@@ -1,0 +1,406 @@
+"""Per-collection recorded-audio retention.
+
+The rule the user asked for, and what these tests pin:
+
+  Live Capsule   — voice notes dictated all day. Keep the audio of the
+                   newest 3 takes; older audio goes.
+  Uploaded Media — the track extracted from a file the user brought in.
+                   Keep it for 7 days regardless of how many there are.
+  Transcripts    — never deleted, at any age or count, anywhere.
+
+That replaced a single global "only the newest recording keeps audio"
+rule which discarded a take's audio the moment the next was saved, and
+applied the same wrong answer to both collections.
+"""
+
+import importlib
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+def _fresh_main_module(data_dir: str):
+    os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
+    os.environ["TRANSCRIPTOR_DATA_DIR"] = data_dir
+    for name in ("backend.main", "backend.config"):
+        sys.modules.pop(name, None)
+    return importlib.import_module("backend.main")
+
+
+NOW = 1_000_000_000.0
+MINUTE = 60.0
+
+
+class AudioRetentionTestBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_home = os.environ.get("HOME")
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["HOME"] = self._home.name
+        self._tmp = tempfile.TemporaryDirectory(dir=self._home.name)
+        self.main = _fresh_main_module(self._tmp.name)
+        self.root = (Path(self._tmp.name) / "recordings").resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        names = self.main.RECORDING_COLLECTION_DIR_NAMES
+        self.live_dir = self.root / names[self.main.RECORDING_COLLECTION_LIVE]
+        self.uploads_dir = self.root / names[self.main.RECORDING_COLLECTION_UPLOADS]
+
+    def tearDown(self) -> None:
+        try:
+            self.main.jobs.shutdown(timeout=0.1)
+        except Exception:
+            pass
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
+        self._tmp.cleanup()
+        self._home.cleanup()
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+
+    def _recording(
+        self,
+        stem: str,
+        *,
+        age_sec: float,
+        directory: Path | None = None,
+        ext: str = ".webm",
+        with_transcript: bool = True,
+    ) -> Path:
+        d = directory or self.root
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = NOW - age_sec
+        if with_transcript:
+            txt = d / f"{stem}.txt"
+            txt.write_text("transcript", encoding="utf-8")
+            os.utime(txt, (stamp, stamp))
+        audio = d / f"{stem}{ext}"
+        audio.write_bytes(b"audio")
+        os.utime(audio, (stamp, stamp))
+        return audio
+
+    def _surviving_audio(self, directory: Path) -> set[str]:
+        return {
+            p.name
+            for p in directory.iterdir()
+            if p.suffix.lower() in self.main._RECORDING_AUDIO_EXTS
+        }
+
+
+class PolicyTableTests(AudioRetentionTestBase):
+    """The declarative SSOT itself."""
+
+    def test_live_keeps_the_newest_three_and_has_no_age_limit(self) -> None:
+        policy = self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_LIVE]
+        self.assertEqual(policy.max_items, 3)
+        self.assertEqual(policy.max_age_sec, 0)
+        self.assertTrue(policy.enabled)
+
+    def test_uploads_age_out_after_seven_days_with_no_count_limit(self) -> None:
+        policy = self.main.AUDIO_RETENTION_POLICIES[
+            self.main.RECORDING_COLLECTION_UPLOADS
+        ]
+        self.assertEqual(policy.max_age_sec, 7 * 24 * 3600)
+        self.assertEqual(policy.max_items, 0)
+        self.assertTrue(policy.enabled)
+
+    def test_a_policy_with_no_limits_is_disabled(self) -> None:
+        self.assertFalse(self.main.AudioRetentionPolicy().enabled)
+
+    def test_collection_folders_resolve_to_their_own_policy(self) -> None:
+        resolve = self.main._audio_retention_policy_for_dir
+        self.assertEqual(
+            resolve(self.live_dir),
+            self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_LIVE],
+        )
+        self.assertEqual(
+            resolve(self.uploads_dir),
+            self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_UPLOADS],
+        )
+
+    def test_archive_root_and_custom_dirs_fall_back_to_the_default(self) -> None:
+        # The root predates the collection folders and held voice
+        # recordings, so it must inherit the Live policy — not silently
+        # become "no retention".
+        resolve = self.main._audio_retention_policy_for_dir
+        self.assertEqual(resolve(self.root), self.main.DEFAULT_AUDIO_RETENTION_POLICY)
+        self.assertEqual(
+            resolve(Path("/somewhere/custom")), self.main.DEFAULT_AUDIO_RETENTION_POLICY
+        )
+        self.assertEqual(
+            self.main.DEFAULT_AUDIO_RETENTION_POLICY,
+            self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_LIVE],
+        )
+
+
+class LiveCollectionCountTests(AudioRetentionTestBase):
+    """Voice notes: keep the newest N audio files."""
+
+    def test_keeps_exactly_the_newest_three(self) -> None:
+        for i in range(1, 8):  # Take1 newest … Take7 oldest
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        deleted = self.main._prune_recording_audio(self.live_dir, now=NOW)
+
+        self.assertEqual(deleted, 4)
+        self.assertEqual(
+            self._surviving_audio(self.live_dir),
+            {"Take1.webm", "Take2.webm", "Take3.webm"},
+        )
+
+    def test_every_transcript_survives_the_count_rule(self) -> None:
+        for i in range(1, 8):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        self.main._prune_recording_audio(self.live_dir, now=NOW)
+
+        for i in range(1, 8):
+            self.assertTrue((self.live_dir / f"Take{i}.txt").exists(), f"Take{i}.txt")
+
+    def test_age_alone_never_collects_a_live_recording(self) -> None:
+        # No age dimension for Live: two very old takes are still the
+        # two newest, so both keep their audio.
+        old_a = self._recording("Ancient", age_sec=3650 * 24 * 3600, directory=self.live_dir)
+        old_b = self._recording("Elder", age_sec=3600 * 24 * 3600, directory=self.live_dir)
+
+        self.assertEqual(self.main._prune_recording_audio(self.live_dir, now=NOW), 0)
+        self.assertTrue(old_a.exists())
+        self.assertTrue(old_b.exists())
+
+    def test_fewer_than_the_limit_deletes_nothing(self) -> None:
+        kept = [
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+            for i in range(1, 4)
+        ]
+
+        self.assertEqual(self.main._prune_recording_audio(self.live_dir, now=NOW), 0)
+        for audio in kept:
+            self.assertTrue(audio.exists(), audio.name)
+
+    def test_just_saved_stem_is_exempt_but_still_occupies_a_slot(self) -> None:
+        # The save path exempts its own stem. It must not thereby widen
+        # the window to four: the fresh take IS one of the newest three.
+        self._recording("Fresh", age_sec=0, directory=self.live_dir)
+        for i in range(1, 5):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        deleted = self.main._prune_recording_audio(
+            self.live_dir, keep_stems=("Fresh",), now=NOW
+        )
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(
+            self._surviving_audio(self.live_dir),
+            {"Fresh.webm", "Take1.webm", "Take2.webm"},
+        )
+
+    def test_exempt_stem_survives_even_when_ranked_out(self) -> None:
+        # A clock skew that dates the new file into the past must never
+        # let a save collect its own audio.
+        skewed = self._recording("Skewed", age_sec=99 * 24 * 3600, directory=self.live_dir)
+        for i in range(1, 5):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        self.main._prune_recording_audio(
+            self.live_dir, keep_stems=("Skewed",), now=NOW
+        )
+
+        self.assertTrue(skewed.exists())
+
+    def test_same_mtime_ties_break_deterministically(self) -> None:
+        for name in ("alpha", "bravo", "charlie", "delta", "echo"):
+            self._recording(name, age_sec=MINUTE, directory=self.live_dir)
+
+        self.main._prune_recording_audio(self.live_dir, now=NOW)
+
+        # Descending name order among equal mtimes → e, d, c survive.
+        self.assertEqual(
+            self._surviving_audio(self.live_dir),
+            {"echo.webm", "delta.webm", "charlie.webm"},
+        )
+
+
+class UploadsCollectionAgeTests(AudioRetentionTestBase):
+    """Uploaded media: keep the extracted track for a week."""
+
+    @property
+    def window(self) -> int:
+        return self.main.AUDIO_RETENTION_POLICIES[
+            self.main.RECORDING_COLLECTION_UPLOADS
+        ].max_age_sec
+
+    def test_track_past_the_window_is_deleted(self) -> None:
+        stale = self._recording(
+            "Lecture", age_sec=self.window + 1, directory=self.uploads_dir, ext=".m4a"
+        )
+
+        self.assertEqual(self.main._prune_recording_audio(self.uploads_dir, now=NOW), 1)
+        self.assertFalse(stale.exists())
+        self.assertTrue((self.uploads_dir / "Lecture.txt").exists())
+
+    def test_track_inside_the_window_survives(self) -> None:
+        fresh = self._recording(
+            "Recent", age_sec=self.window - MINUTE, directory=self.uploads_dir
+        )
+
+        self.assertEqual(self.main._prune_recording_audio(self.uploads_dir, now=NOW), 0)
+        self.assertTrue(fresh.exists())
+
+    def test_boundary_is_inclusive_of_the_window_edge(self) -> None:
+        edge = self._recording("Edge", age_sec=self.window, directory=self.uploads_dir)
+
+        self.assertEqual(self.main._prune_recording_audio(self.uploads_dir, now=NOW), 1)
+        self.assertFalse(edge.exists())
+
+    def test_count_alone_never_collects_an_upload(self) -> None:
+        # No count dimension for uploads: twenty fresh files all stay.
+        for i in range(20):
+            self._recording(f"Clip{i:02d}", age_sec=MINUTE, directory=self.uploads_dir)
+
+        self.assertEqual(self.main._prune_recording_audio(self.uploads_dir, now=NOW), 0)
+        self.assertEqual(len(self._surviving_audio(self.uploads_dir)), 20)
+
+    def test_future_dated_track_is_kept(self) -> None:
+        future = self._recording("Future", age_sec=-3600, directory=self.uploads_dir)
+
+        self.assertEqual(self.main._prune_recording_audio(self.uploads_dir, now=NOW), 0)
+        self.assertTrue(future.exists())
+
+    def test_video_containers_are_retained_like_audio(self) -> None:
+        # _RECORDING_AUDIO_EXTS derives from ALLOWED_AUDIO_EXTS, so an
+        # uploaded .mp4 is a candidate too — otherwise the heaviest
+        # files in the archive would be the only ones exempt.
+        self.assertIn(".mp4", self.main._RECORDING_AUDIO_EXTS)
+        stale = self._recording(
+            "Movie", age_sec=self.window + 1, directory=self.uploads_dir, ext=".mp4"
+        )
+
+        self.assertEqual(self.main._prune_recording_audio(self.uploads_dir, now=NOW), 1)
+        self.assertFalse(stale.exists())
+
+
+class SharedInvariantTests(AudioRetentionTestBase):
+    """Rules that hold for every collection."""
+
+    def test_orphan_audio_without_a_transcript_is_left_alone(self) -> None:
+        # Either a stray file or a save in flight in another process —
+        # neither is retention's to collect.
+        orphans = [
+            self._recording(
+                f"Orphan{i}", age_sec=i * MINUTE, directory=self.live_dir,
+                with_transcript=False,
+            )
+            for i in range(1, 9)
+        ]
+
+        self.assertEqual(self.main._prune_recording_audio(self.live_dir, now=NOW), 0)
+        for audio in orphans:
+            self.assertTrue(audio.exists(), audio.name)
+
+    def test_non_audio_files_are_ignored(self) -> None:
+        note = self.live_dir
+        note.mkdir(parents=True, exist_ok=True)
+        sidecar = note / "notes.md"
+        sidecar.write_text("keep me", encoding="utf-8")
+        os.utime(sidecar, (NOW - 99 * 24 * 3600,) * 2)
+        for i in range(1, 6):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        self.main._prune_recording_audio(self.live_dir, now=NOW)
+
+        self.assertTrue(sidecar.exists())
+
+    def test_disabled_policy_deletes_nothing(self) -> None:
+        for i in range(1, 9):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        deleted = self.main._prune_recording_audio(
+            self.live_dir, now=NOW, policy=self.main.AudioRetentionPolicy()
+        )
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(len(self._surviving_audio(self.live_dir)), 8)
+
+    def test_both_dimensions_compose(self) -> None:
+        # A policy carrying both limits collects a file failing EITHER.
+        both = self.main.AudioRetentionPolicy(max_age_sec=3600, max_items=2)
+        self._recording("New1", age_sec=MINUTE, directory=self.live_dir)
+        self._recording("New2", age_sec=2 * MINUTE, directory=self.live_dir)
+        self._recording("New3", age_sec=3 * MINUTE, directory=self.live_dir)   # over count
+        self._recording("Old1", age_sec=7200, directory=self.live_dir)          # over both
+
+        deleted = self.main._prune_recording_audio(
+            self.live_dir, now=NOW, policy=both
+        )
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(
+            self._surviving_audio(self.live_dir), {"New1.webm", "New2.webm"}
+        )
+
+
+class SweepFanOutTests(AudioRetentionTestBase):
+    """The sweep applies each directory's own policy."""
+
+    def test_sweep_applies_the_matching_policy_per_collection(self) -> None:
+        # Live: 5 recent takes → newest 3 survive.
+        for i in range(1, 6):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+        # Uploads: one stale, one fresh — count is irrelevant here.
+        stale_upload = self._recording(
+            "OldClip", age_sec=8 * 24 * 3600, directory=self.uploads_dir
+        )
+        fresh_upload = self._recording(
+            "NewClip", age_sec=MINUTE, directory=self.uploads_dir
+        )
+
+        removed = self.main._sweep_recording_audio_retention(now=NOW)
+
+        self.assertEqual(removed, 3)  # 2 live over count + 1 stale upload
+        self.assertEqual(
+            self._surviving_audio(self.live_dir),
+            {"Take1.webm", "Take2.webm", "Take3.webm"},
+        )
+        self.assertFalse(stale_upload.exists())
+        self.assertTrue(fresh_upload.exists())
+        # Transcripts in every collection survive the sweep.
+        for i in range(1, 6):
+            self.assertTrue((self.live_dir / f"Take{i}.txt").exists())
+        self.assertTrue((self.uploads_dir / "OldClip.txt").exists())
+
+    def test_sweep_is_idempotent(self) -> None:
+        for i in range(1, 6):
+            self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
+
+        first = self.main._sweep_recording_audio_retention(now=NOW)
+        second = self.main._sweep_recording_audio_retention(now=NOW)
+
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 0)
+
+    def test_sweep_tolerates_a_missing_directory(self) -> None:
+        missing = self.root / "gone"
+
+        self.assertEqual(
+            self.main._sweep_recording_audio_retention(target_dir=missing, now=NOW), 0
+        )
+
+    def test_sweeper_thread_not_started_when_every_policy_is_disabled(self) -> None:
+        disabled = self.main.AudioRetentionPolicy()
+        self.main.AUDIO_RETENTION_POLICIES = {
+            key: disabled for key in self.main.AUDIO_RETENTION_POLICIES
+        }
+        self.main.DEFAULT_AUDIO_RETENTION_POLICY = disabled
+        self.main._audio_retention_sweeper_thread = None
+
+        self.main.start_audio_retention_sweeper()
+
+        self.assertIsNone(self.main._audio_retention_sweeper_thread)
+
+
+if __name__ == "__main__":
+    unittest.main()

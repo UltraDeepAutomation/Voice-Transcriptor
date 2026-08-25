@@ -569,6 +569,11 @@ class RecordingNameTests(unittest.TestCase):
         self.assertFalse(list(root.glob("Locked.webm.tmp-*")))
 
     def test_audio_retention_matches_uppercase_txt_siblings(self):
+        # The sibling-transcript guard must be case-insensitive: a
+        # ``.TXT`` sibling still marks its audio as a real recording and
+        # therefore a retention candidate. Without this, the audio of
+        # every uppercase-suffixed transcript would look like an orphan
+        # and be kept forever.
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
         (root / "Keep.TXT").write_text("keep", encoding="utf-8")
@@ -578,7 +583,18 @@ class RecordingNameTests(unittest.TestCase):
         old_audio = root / "Old.webm"
         old_audio.write_bytes(b"old")
 
-        pruned = self.main._prune_old_recording_audio(root, "Keep")
+        now = 1_000_000_000.0
+        os.utime(keep_audio, (now - 60, now - 60))
+        os.utime(old_audio, (now - 600, now - 600))
+
+        # Explicit single-slot policy so this test asserts the sibling
+        # matching only, independent of the shipped per-collection
+        # numbers (which test_audio_retention.py owns).
+        pruned = self.main._prune_recording_audio(
+            root,
+            now=now,
+            policy=self.main.AudioRetentionPolicy(max_items=1),
+        )
 
         self.assertEqual(pruned, 1)
         self.assertTrue(keep_audio.exists())

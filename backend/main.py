@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unicodedata
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -241,17 +242,21 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     # only thing that ever returns a loaded model's ~700 MB to the OS.
     start_idle_model_sweeper()
 
-    def _run_retroactive_retention() -> None:
+    # Audio retention: one boot sweep to catch whatever aged out while
+    # the app was closed, then a timer so a long-running session keeps
+    # enforcing the window without needing a save or a restart.
+    def _run_boot_audio_retention() -> None:
         try:
-            _retroactive_audio_retention()
+            _sweep_recording_audio_retention()
         except Exception:
-            logger.exception("retroactive audio retention startup task failed")
+            logger.exception("boot audio retention sweep failed")
 
     threading.Thread(
-        target=_run_retroactive_retention,
+        target=_run_boot_audio_retention,
         daemon=True,
-        name="retroactive-audio-retention",
+        name="audio-retention-boot",
     ).start()
+    start_audio_retention_sweeper()
 
     def _run_tmp_sweep() -> None:
         try:
@@ -549,7 +554,7 @@ UPSCALE_MAX_CUSTOM_PRESETS = 3
 
 # Persistent registry of every archive directory ever used for an
 # audio-bearing save.  Written atomically each time a new custom dir
-# is first encountered so ``_retroactive_audio_retention`` can clean
+# is first encountered so ``_sweep_recording_audio_retention`` can clean
 # up *all* archives on the next startup, not just the current default.
 _ARCHIVE_DIR_REGISTRY_PATH = DATA_DIR / "known_archive_dirs.json"
 UPSCALE_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -1185,10 +1190,10 @@ def _promote_live_recovery(
                 raise
             finally:
                 _best_effort_unlink(tmp_audio, context="live recovery tmp cleanup")
-            # Same retention policy as ``save_recording_with_audio``: recovered
-            # sessions are the new "latest", so older audio files in the archive
-            # get pruned.
-            _prune_old_recording_audio(target_dir, stem)
+            # Same retention policy as ``save_recording_with_audio``. The
+            # freshly promoted stem is exempt so a clock skew can never
+            # collect the audio we just recovered.
+            _prune_recording_audio(target_dir, keep_stems=(stem,))
             _invalidate_recordings_cache()
             result = {
                 "name": text_out.name,
@@ -2509,6 +2514,92 @@ _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
 }
 
 
+# ── Recorded-audio retention ────────────────────────────────────────
+#
+# SSOT for how long each collection keeps the audio sitting beside its
+# transcripts. ``.txt`` transcripts are NEVER subject to retention at
+# any age or count — they are the durable record and stay forever.
+#
+# The two collections have genuinely different economics, so the policy
+# is keyed by collection rather than being one global rule:
+#
+#   Live Capsule   — voice notes dictated all day. Dozens accumulate,
+#                    and the user only ever replays the last couple of
+#                    takes, so this is a *count* rule.
+#   Uploaded Media — the audio track extracted from a file the user
+#                    brought in. Worth keeping around while they are
+#                    still working with that material, but not forever,
+#                    so this is an *age* rule.
+#
+# What this replaced: a single global "keep audio only for the newest
+# recording in the archive" rule, written twice (once for the per-save
+# path, once re-derived from the newest transcript for the startup
+# sweep). It discarded a take's audio the moment the next one was
+# saved, and applied the same wrong answer to both collections.
+
+
+@dataclass(frozen=True)
+class AudioRetentionPolicy:
+    """Retention limits for one collection's audio files.
+
+    Two independent dimensions; an audio file is collected when it
+    fails EITHER. ``0`` disables that dimension, so one type expresses
+    "age only", "count only", "both", or "keep everything" without any
+    special-casing at the call sites.
+
+    ``max_items`` counts audio files, newest first — the transcripts
+    they belong to are never part of the count.
+    """
+
+    max_age_sec: int = 0
+    max_items: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_age_sec > 0 or self.max_items > 0
+
+
+AUDIO_RETENTION_POLICIES: dict[str, AudioRetentionPolicy] = {
+    RECORDING_COLLECTION_LIVE: AudioRetentionPolicy(
+        max_items=max(0, _env_int("TRANSCRIPTOR_LIVE_AUDIO_KEEP_COUNT", 3)),
+    ),
+    RECORDING_COLLECTION_UPLOADS: AudioRetentionPolicy(
+        max_age_sec=max(
+            0, _env_int("TRANSCRIPTOR_UPLOAD_AUDIO_RETENTION_SEC", 7 * 24 * 3600)
+        ),
+    ),
+}
+# The archive ROOT predates the collection subfolders: everything saved
+# before they existed landed there, and those were voice recordings.
+# It therefore inherits the Live policy rather than a third, invented one.
+DEFAULT_AUDIO_RETENTION_POLICY = AUDIO_RETENTION_POLICIES[RECORDING_COLLECTION_LIVE]
+
+# A long-running app must not depend on a save or a restart to enforce
+# an AGE limit: without a periodic sweep, a machine left running for a
+# fortnight keeps every file that aged out while it was up. (Count
+# limits are naturally enforced on every save.) Hourly is far finer
+# than a 7-day window needs and costs one directory listing per dir.
+AUDIO_RETENTION_SWEEP_INTERVAL_SEC = max(
+    60, _env_int("TRANSCRIPTOR_AUDIO_RETENTION_SWEEP_SEC", 3600)
+)
+_audio_retention_sweeper_lock = threading.Lock()
+_audio_retention_sweeper_thread: Optional[threading.Thread] = None
+
+
+def _audio_retention_policy_for_dir(directory: Path) -> AudioRetentionPolicy:
+    """Resolve the retention policy governing *directory*.
+
+    Collections live in fixed-name subfolders of an archive root, so the
+    folder name is the key. Anything that is not a known collection
+    folder — the archive root itself, or a user-chosen custom dir — gets
+    the default policy.
+    """
+    key = _RECORDING_COLLECTION_DIR_NAME_TO_KEY.get(directory.name)
+    if key is None:
+        return DEFAULT_AUDIO_RETENTION_POLICY
+    return AUDIO_RETENTION_POLICIES.get(key, DEFAULT_AUDIO_RETENTION_POLICY)
+
+
 def _normalize_recording_collection(value: object) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -2662,7 +2753,7 @@ def _recordings_storage_dirs_for_roots(roots: Iterable[Path]) -> list[Path]:
 # SSOT: audio extensions a saved recording can carry alongside its
 # .txt transcript. Both ``_recording_audio_path`` (retrieval lookup
 # for the History tab's audio player and Re-transcribe path) AND
-# ``_prune_old_recording_audio`` (retention sweeper) AND
+# ``_prune_recording_audio`` (retention sweeper) AND
 # ``delete_all_recordings`` walk this tuple.
 #
 # Derived directly from ``ALLOWED_AUDIO_EXTS`` so video containers
@@ -2722,23 +2813,48 @@ def _recording_audio_path(name: str, target_dir: Optional[Path] = None) -> Optio
     return None
 
 
-def _prune_old_recording_audio(
-    target_dir: Path, keep_stem: str
+def _prune_recording_audio(
+    target_dir: Path,
+    *,
+    keep_stems: Iterable[str] = (),
+    now: Optional[float] = None,
+    policy: Optional[AudioRetentionPolicy] = None,
 ) -> int:
-    """Retention policy: keep audio only for the *latest* recording.
+    """Apply *directory*'s audio-retention policy. Returns files deleted.
 
-    Every recording still keeps its ``.txt`` transcript forever —
-    transcripts are cheap text and the user wants history. Audio files
-    are the expensive part (tens of MB each) and the user only ever
-    wants to re-listen to the MOST RECENT recording. This helper walks
-    the archive directory and deletes any audio whose stem does not
-    match ``keep_stem`` (the stem of the freshly-saved recording).
+    The single implementation of the rule. Every schedule that enforces
+    it — the per-save call and the boot / periodic sweeps — goes through
+    this function, so the policy cannot drift between them, and the
+    policy itself is data (``AUDIO_RETENTION_POLICIES``) rather than
+    branching logic repeated per call site.
 
-    Returns the number of audio files deleted.
+    Invariants, in the order they are decided per entry:
+
+    * ``.txt`` transcripts are never candidates. They are the durable
+      record and are not subject to retention at any age or count.
+    * An audio file with no sibling transcript is left alone: it is
+      either an orphan or a save still in flight in another process,
+      and neither is ours to collect.
+    * ``keep_stems`` is an unconditional exemption, used by the save
+      path for the recording it has just written. Exempt files still
+      occupy a slot in the ``max_items`` ranking — the take the user
+      just made IS one of the N most recent — they simply cannot be
+      deleted. Without the exemption a clock skew could let a save
+      collect its own audio before the user ever played it.
+    * ``max_items``: rank surviving candidates newest-first and collect
+      everything past the Nth. Ties on mtime break on name, descending,
+      so the outcome is deterministic rather than filesystem-order.
+    * ``max_age_sec``: collect anything whose mtime is at or past the
+      cutoff. A file dated in the future (clock moved backwards, or a
+      copy that preserved a future timestamp) yields a negative age and
+      is kept — "not older than the window" is the safe reading.
+
+    ``now`` and ``policy`` are injectable so the rule can be exercised
+    without touching the system clock or the module-level table.
     """
-    if not keep_stem:
+    effective = policy if policy is not None else _audio_retention_policy_for_dir(target_dir)
+    if not effective.enabled:
         return 0
-    deleted = 0
     try:
         entries = list(target_dir.iterdir())
     except OSError as e:
@@ -2751,32 +2867,45 @@ def _prune_old_recording_audio(
     # (and every startup retention sweep) into seconds of blocking I/O,
     # which the user experiences as the app stalling right after Stop.
     text_stems = {p.stem for p in _iter_recording_text_files(target_dir)}
+    candidates: list[tuple[float, str, Path]] = []
     for entry in entries:
         try:
             if not entry.is_file():
                 continue
-            ext = entry.suffix.lower()
-            if ext not in _RECORDING_AUDIO_EXTS:
+            if entry.suffix.lower() not in _RECORDING_AUDIO_EXTS:
                 continue
-            if entry.stem == keep_stem:
-                continue
-            # Only delete if there's a sibling transcript — this guards
-            # against nuking an orphan audio file that might belong to
-            # an in-progress save from another process.
             if entry.stem not in text_stems:
                 continue
-            try:
-                entry.unlink()
-                deleted += 1
-                logger.info(
-                    "audio retention: removed %s (keeping only %s)",
-                    entry.name,
-                    keep_stem,
-                )
-            except OSError as e:
-                logger.warning("audio retention: failed to remove %s: %s", entry, e)
+            candidates.append((entry.stat().st_mtime, entry.name, entry))
         except OSError as e:
             logger.debug("audio retention: skip %s: %s", entry, e)
+    if not candidates:
+        return 0
+
+    # Newest first. Name descending is only a deterministic tiebreak for
+    # files that share an mtime (same-second saves are common).
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    exempt = {stem for stem in keep_stems if stem}
+    stamp = time.time() if now is None else now
+    age_cutoff = stamp - effective.max_age_sec if effective.max_age_sec > 0 else None
+
+    deleted = 0
+    for index, (mtime, _name, entry) in enumerate(candidates):
+        if entry.stem in exempt:
+            continue
+        over_count = effective.max_items > 0 and index >= effective.max_items
+        over_age = age_cutoff is not None and mtime <= age_cutoff
+        if not (over_count or over_age):
+            continue
+        reason = "beyond newest %d" % effective.max_items if over_count else (
+            "older than %d s" % effective.max_age_sec
+        )
+        try:
+            entry.unlink()
+            deleted += 1
+            logger.info("audio retention: removed %s (%s)", entry.name, reason)
+        except OSError as e:
+            logger.warning("audio retention: failed to remove %s: %s", entry, e)
     return deleted
 
 
@@ -2785,7 +2914,7 @@ def _register_archive_dir(path: Path) -> None:
 
     Only custom dirs (those that differ from the current default) need
     to be registered — the default dir is always scanned by
-    ``_retroactive_audio_retention`` without any registry entry.
+    ``_sweep_recording_audio_retention`` without any registry entry.
 
     The registry file is a JSON array of absolute path strings stored
     at ``_ARCHIVE_DIR_REGISTRY_PATH``.  Writes are serialised by
@@ -2887,69 +3016,78 @@ def _get_known_archive_dirs() -> list[Path]:
     return result
 
 
-def _retroactive_audio_retention(target_dir: Optional[Path] = None) -> int:
-    """Enforce the "one audio per archive" rule on an existing archive.
+def _sweep_recording_audio_retention(
+    target_dir: Optional[Path] = None,
+    *,
+    now: Optional[float] = None,
+) -> int:
+    """Apply audio retention across the archive. Returns files deleted.
 
-    The per-save retention policy (_prune_old_recording_audio) only
-    runs when a NEW recording is saved. For users who accumulated
-    audio files from previous app versions, those stay on disk
-    forever. This helper walks the whole archive, finds the newest
-    ``.txt`` transcript, and deletes every audio file that doesn't
-    belong to that newest stem.
+    With no ``target_dir``, sweeps every known archive dir — the default
+    one plus every custom dir persisted via ``_register_archive_dir`` —
+    each expanded into its collection subfolders, and each governed by
+    its own policy. With ``target_dir``, sweeps exactly that directory.
 
-    Called once on backend startup with no argument: scans ALL known
-    archive dirs (default + every custom dir persisted via
-    ``_register_archive_dir``).  Can also be called with a specific
-    ``target_dir`` for single-directory retention (used internally by
-    the multi-dir loop below).
+    This used to re-derive the retention rule for itself: it scanned for
+    the newest ``.txt`` and asked the per-save helper to keep only that
+    stem. That was the same policy expressed a second time, in terms of
+    the wrong thing (which recording is newest) rather than the actual
+    rule. It now just runs the one evaluator; the rule lives in
+    ``AUDIO_RETENTION_POLICIES`` and nowhere else.
 
-    Safe to call repeatedly — it becomes a no-op when there's nothing
-    to prune.
+    ``now`` is threaded through so the whole fan-out — not merely the
+    leaf evaluator — can be tested against an injected clock.
+
+    Safe to call repeatedly — a no-op once nothing is over its limits.
     """
-    # Multi-dir startup sweep: iterate every known archive dir.
-    if target_dir is None:
-        total = 0
-        for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
-            total += _retroactive_audio_retention(target_dir=d)
-        return total
+    if target_dir is not None:
+        return _prune_recording_audio(target_dir, now=now)
+    total = 0
+    for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
+        total += _prune_recording_audio(d, now=now)
+    if total > 0:
+        logger.info("audio retention sweep: removed %d audio file(s)", total)
+    return total
 
-    root = target_dir
-    try:
-        entries = list(root.iterdir())
-    except OSError as e:
-        logger.warning("retroactive audio retention: iterdir failed: %s", e)
-        return 0
 
-    # Pick the newest .txt transcript by mtime; its stem is the one we
-    # keep audio for.
-    newest_txt: Optional[Path] = None
-    newest_mtime: float = -1.0
-    for entry in entries:
-        try:
-            if not entry.is_file():
-                continue
-            if entry.suffix.lower() != ".txt":
-                continue
-            m = entry.stat().st_mtime
-            if m > newest_mtime:
-                newest_mtime = m
-                newest_txt = entry
-        except OSError as e:
-            logger.debug("retroactive audio retention: stat failed for %s: %s", entry, e)
-            continue
+def _any_audio_retention_enabled() -> bool:
+    """True when at least one collection has a limit worth sweeping for."""
+    if DEFAULT_AUDIO_RETENTION_POLICY.enabled:
+        return True
+    return any(policy.enabled for policy in AUDIO_RETENTION_POLICIES.values())
 
-    keep_stem = newest_txt.stem if newest_txt else ""
-    if not keep_stem:
-        # Nothing to keep; don't nuke everything.
-        return 0
-    pruned = _prune_old_recording_audio(root, keep_stem)
-    if pruned > 0:
-        logger.info(
-            "retroactive audio retention: pruned %d old audio files, kept %s",
-            pruned,
-            keep_stem,
+
+def start_audio_retention_sweeper() -> None:
+    """Run the audio-retention sweep on a timer, once per process.
+
+    Boot-time and per-save enforcement alone leave a gap for AGE-based
+    policies: an app left running past the window never revisits files
+    that aged out while it was up. Idempotent — a second call is
+    ignored, so a test harness re-entering the lifespan cannot stack
+    threads.
+    """
+    global _audio_retention_sweeper_thread
+    if not _any_audio_retention_enabled():
+        return
+    with _audio_retention_sweeper_lock:
+        if (
+            _audio_retention_sweeper_thread is not None
+            and _audio_retention_sweeper_thread.is_alive()
+        ):
+            return
+
+        def _loop() -> None:
+            while True:
+                time.sleep(AUDIO_RETENTION_SWEEP_INTERVAL_SEC)
+                try:
+                    _sweep_recording_audio_retention()
+                except Exception:
+                    logger.exception("periodic audio retention sweep failed")
+
+        _audio_retention_sweeper_thread = threading.Thread(
+            target=_loop, daemon=True, name="audio-retention-sweep"
         )
-    return pruned
+        _audio_retention_sweeper_thread.start()
 
 
 def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> dict[str, Any]:
@@ -5837,10 +5975,11 @@ async def _save_recording_audio_source(
     # Persist this dir only after transcript + audio are durable so startup
     # retroactive retention does not learn failed/empty archive targets.
     _register_archive_dir(target_dir)
-    # Audio retention: only the NEWEST recording keeps its audio file.
-    # Delete audio from every older recording in the same archive so
-    # the user never ends up with gigabytes of old takes piling up.
-    pruned = _prune_old_recording_audio(target_dir, stem)
+    # Audio retention, per the collection's own policy (voice notes keep
+    # the newest N, uploaded media ages out); transcripts stay forever.
+    # The stem we just wrote is exempt — a save must never be able to
+    # delete its own audio — but it still counts toward a count limit.
+    pruned = _prune_recording_audio(target_dir, keep_stems=(stem,))
     _invalidate_recordings_cache()
     # Atomically discard the live recovery spool now that the audio is
     # safely on disk. This closes the race window between a successful
