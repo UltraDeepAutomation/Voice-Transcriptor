@@ -133,11 +133,36 @@ def deepgram_transcribe(
 
     Returns {"text": str, "raw": dict}.
 
-    Note: ``smart_format`` is intentionally disabled. It only fully supports
-    English / Spanish / French; for Russian and other languages it applies
-    a "basic formatting" pass that actually strips punctuation. We instead
-    enable the individual features that work across all languages
-    (``punctuate``, ``paragraphs``, ``numerals``).
+    Note: ``smart_format`` is intentionally disabled here. The stated
+    reason is that it only fully supports English / Spanish / French,
+    and that for Russian it applies a "basic formatting" pass which
+    strips punctuation; the individual cross-language features
+    (``punctuate``, ``paragraphs``, ``numerals``) are enabled instead.
+
+    ── UNRESOLVED: this contradicts the live path ──────────────────────
+    ``backend.remote_deepgram_live`` sets ``smart_format=True`` for the
+    same provider and the same languages, documenting the opposite
+    belief ("Nova-3 handles it safely for the multilingual model"). Both
+    cannot be right, and the two are user-visible: the same audio
+    transcribed live versus through this REST fallback is formatted by
+    different rules.
+
+    Measured over one real archive (3084 Russian transcripts, punctuation
+    marks per 1000 letters, median):
+
+        live  smart_format=true    50.7
+        batch smart_format=false   36.6
+
+    i.e. the path that disables it has ~39 % LESS punctuation, which is
+    the reverse of the claim above. That measurement is suggestive, not
+    conclusive — the two corpora are different material (dictation vs
+    uploaded media) and n=32 on the batch side. Settling it needs the
+    same audio through both paths, which costs live API calls against a
+    user's key, so it is recorded here rather than guessed at.
+
+    Do not "fix" either side without running that comparison: flipping
+    this flag on the strength of one module's comment is how the two
+    ended up disagreeing.
     """
     if not api_key:
         raise RemoteError("Deepgram API key is not configured")

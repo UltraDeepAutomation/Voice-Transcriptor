@@ -219,6 +219,13 @@ class DeepgramLiveConfig:
     multilingual auto-detection instead. ``numerals`` is pre-recorded
     only; ``smart_format`` (which Nova-3 handles safely for the
     multilingual model) covers number formatting at live time.
+
+    ── UNRESOLVED: this contradicts the batch path ─────────────────────
+    ``backend.remote_deepgram`` disables ``smart_format`` for the same
+    provider and languages, documenting the opposite belief (that it
+    strips punctuation for Russian). See the note in
+    ``deepgram_transcribe`` for the measurement and why neither side
+    should be changed without a same-audio comparison.
     """
 
     model: str = DEFAULT_DEEPGRAM_AUDIO_MODEL
