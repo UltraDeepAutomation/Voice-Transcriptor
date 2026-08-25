@@ -95,26 +95,35 @@ TAIL_GUARD_MIN_SEC = 0.75
 # nothing is missing used to be computed only INSIDE the timeout
 # handler, so the answer arrived strictly after the cost had been paid.
 #
-# 0.75 → 0.25 s. The 0.75 s was sized from the round trips of sessions
-# that DID receive a post-Finalize transcript (411 of them: median 0.26 s,
-# p95 0.49 s) — but those are uncovered-tail sessions, where Finalize has
-# something to flush. A covered tail is the case where it does not, and
-# every covered stop since the budget split was introduced has confirmed
-# it: 9 of 9 waited out the full window and Deepgram sent nothing, at a
-# measured 962-1011 ms per finalize. The window has never once confirmed
-# anything. 0.25 s still catches a message already on the wire when
-# Finalize went out, and cuts ~500 ms from every stop whose audio was
-# already fully represented in finalized segments.
-#
-# What is risked is bounded by what "covered" means: every streamed second
-# is already in a final, so a late arrival could only re-word text we
-# already hold, never add missing speech. When one does arrive, the
-# "post-Finalize transcript received" line records it with its budget —
-# which is how this number gets revisited rather than assumed.
+# Sized from the round trips of sessions that DID receive a post-Finalize
+# transcript (411 of them: median 0.26 s, p90 0.36 s, p95 0.49 s). It sits
+# above p95 with margin, so a tail whose final IS coming still gets it,
+# while a tail with nothing behind it does not pay the full ceiling.
 #
 # An UNCOVERED tail keeps the full ceiling and the retry — that is the
 # case where a truncated wait would cost the user real words.
-FINALIZE_COVERED_WAIT_SEC = 0.25
+FINALIZE_COVERED_WAIT_SEC = 0.75
+
+# Nothing at all past the last finalized segment — a boundary sliver, not a
+# tail. This is the ONE population where waiting has never once produced
+# anything: 9 of 9 such stops in the log waited out their whole window and
+# Deepgram sent nothing, at 962-1011 ms per finalize. Their measured gaps
+# were 0.06-0.24 s, which is exactly what COVERAGE_GAP_MIN_SEC calls
+# segment-boundary jitter.
+#
+# Applying this window to the whole "no retry needed" band was a mistake,
+# and it cost a user real words. ``_tail_needs_flush`` tolerates up to
+# TAIL_GUARD_MIN_SEC (0.75 s) of uncovered audio before it asks for a
+# RETRY — which is a different question from whether anything is left to
+# flush at all. Production, 2026-08-25 14:33:16: ``gap=0.50s
+# speech_in_gap=0.00``, the stream closed 0.25 s after Finalize, and the
+# sentence arrived ending "…чтобы никуда не не". Half a second of audio past
+# the last final that no interim had decoded either — which is precisely
+# what Finalize exists to force, and the answer takes a round trip this
+# window is too short to receive.
+#
+# Scoped to the population it was measured on, and no wider.
+FINALIZE_EMPTY_TAIL_WAIT_SEC = 0.25
 
 # Seam repair: Deepgram's periodic forced flushes may cut a word in half
 # across two consecutive finals ("…четыре, пя" | "ть. Далее"). When two
@@ -802,10 +811,15 @@ class DeepgramLiveSession:
             # turns "wait 3 s, then discover nothing was missing" into
             # "notice nothing is missing, wait 0.75 s to confirm".
             streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
-            tail_uncovered = self._tail_needs_flush(tail_gap, tail_speech)
-            flush_wait = (
-                FINALIZE_FLUSH_WAIT_SEC if tail_uncovered else FINALIZE_COVERED_WAIT_SEC
-            )
+            # Three cases, not two. "Needs a retry" and "has nothing left to
+            # flush" are different questions, and collapsing them applied a
+            # window measured on empty tails to tails that were merely small.
+            if self._tail_needs_flush(tail_gap, tail_speech):
+                flush_wait = FINALIZE_FLUSH_WAIT_SEC
+            elif tail_gap <= COVERAGE_GAP_MIN_SEC:
+                flush_wait = FINALIZE_EMPTY_TAIL_WAIT_SEC
+            else:
+                flush_wait = FINALIZE_COVERED_WAIT_SEC
             try:
                 await asyncio.wait_for(
                     self._final_arrived.wait(),
@@ -861,15 +875,26 @@ class DeepgramLiveSession:
                                 tail_speech,
                             )
                 else:
+                    # State the measurement, not a conclusion. "Nothing was
+                    # unflushed" was printed for any tail below the retry
+                    # threshold, including half a second of real audio, and
+                    # it read as proof that the tail was complete when it
+                    # was nothing of the kind.
+                    verdict = (
+                        "nothing past the last final"
+                        if tail_gap <= COVERAGE_GAP_MIN_SEC
+                        else "below the retry threshold, but not empty"
+                    )
                     logger.info(
                         "deepgram-live: no post-Finalize transcript within %.2fs "
                         "(streamed=%.2fs covered=%.2fs gap=%.2fs speech_in_gap=%.2fs "
-                        "— nothing was unflushed); closing",
+                        "— %s); closing",
                         flush_wait,
                         streamed_sec,
                         covered_end,
                         tail_gap,
                         tail_speech,
+                        verdict,
                     )
 
             try:

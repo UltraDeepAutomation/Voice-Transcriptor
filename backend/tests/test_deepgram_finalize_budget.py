@@ -26,7 +26,9 @@ import unittest
 from unittest import mock
 
 from backend.remote_deepgram_live import (
+    COVERAGE_GAP_MIN_SEC,
     FINALIZE_COVERED_WAIT_SEC,
+    FINALIZE_EMPTY_TAIL_WAIT_SEC,
     FINALIZE_FLUSH_WAIT_SEC,
     TAIL_GUARD_MIN_SEC,
     DeepgramLiveSession,
@@ -125,16 +127,16 @@ class TailCoverageTests(unittest.TestCase):
 
 
 class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
-    async def test_covered_tail_uses_the_short_confirmation_window(self):
-        # Nothing is unflushed, so the ceiling buys nothing. This is the
-        # 65 % case from the logs.
+    async def test_an_empty_tail_uses_the_short_confirmation_window(self):
+        # 0.1 s past the last final is a segment boundary, not a tail.
+        # Nothing is unflushed, so the ceiling buys nothing.
         session = _session(streamed_sec=90.0, covered_end=89.9)
         ws = session._ws
         started = time.perf_counter()
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
         ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.12
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.12
         ):
             await session.finalize(wait_timeout=0.5)
         elapsed = time.perf_counter() - started
@@ -177,13 +179,42 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertLess(time.perf_counter() - started, 1.0)
 
-    async def test_covered_tail_never_triggers_the_retry(self):
-        # A retry on a covered stream is a round trip that cannot produce
+    async def test_a_small_but_real_tail_is_not_treated_as_jitter(self):
+        """The regression that cost a user the end of a sentence.
+
+        Production 2026-08-25 14:33:16: gap=0.50 s, no interim had
+        decoded it, the stream closed 0.25 s after Finalize and the
+        transcript arrived ending mid-clause. 0.50 s is below the retry
+        threshold but far above boundary jitter — Finalize has real audio
+        to flush there and the answer takes a round trip.
+        """
+        session = _session(streamed_sec=24.36, covered_end=23.86)
+        _streamed, _covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 0.50, places=2)
+        self.assertEqual(speech, 0.0)
+        self.assertGreater(gap, COVERAGE_GAP_MIN_SEC)
+        self.assertLess(gap, TAIL_GUARD_MIN_SEC)
+
+        started = time.perf_counter()
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.01
+        ), mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.30
+        ):
+            await session.finalize(wait_timeout=0.5)
+        elapsed = time.perf_counter() - started
+        self.assertGreaterEqual(
+            elapsed, 0.30,
+            f"a 0.50 s tail was given the jitter window ({elapsed:.2f}s)",
+        )
+
+    async def test_empty_tail_never_triggers_the_retry(self):
+        # A retry on an empty tail is a round trip that cannot produce
         # anything: every streamed second is already in a final.
         session = _session(streamed_sec=90.0, covered_end=89.95)
         ws = session._ws
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.05
         ):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1)
@@ -249,23 +280,21 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BudgetConstantTests(unittest.TestCase):
-    def test_the_covered_window_is_not_sized_from_uncovered_round_trips(self):
-        # The window was 0.75 s, sized to sit above the p95 (0.49 s) of
-        # 411 measured post-Finalize round trips. Those round trips are
-        # all UNCOVERED-tail sessions — the ones where Finalize has
-        # something to flush and therefore answers. Sizing the covered
-        # window from them assumed the covered case behaves the same way.
-        # It does not: every covered stop recorded since the budget split
-        # shipped — 9 of 9 — waited out the whole window and received
-        # nothing, at 962-1011 ms per finalize.
+    def test_the_short_window_covers_only_empty_tails(self):
+        # The 0.25 s window is measured on stops whose gap was 0.06-0.24 s
+        # — nothing past the last final but boundary jitter. It was once
+        # applied to every tail that did not need a RETRY, which is a band
+        # up to TAIL_GUARD_MIN_SEC (0.75 s) wide, and it cost a user real
+        # words: production 2026-08-25 14:33:16, gap=0.50 s, the stream
+        # closed 0.25 s after Finalize and the sentence was delivered
+        # ending mid-clause.
         #
-        # A number that has never once been reached is not a safety
-        # margin, it is a fixed cost. Locked below the old p95 so the
-        # reasoning cannot be reintroduced without this test going red.
-        self.assertLess(FINALIZE_COVERED_WAIT_SEC, 0.49)
-        # Still long enough for a message already on the wire when the
-        # Finalize frame went out.
-        self.assertGreaterEqual(FINALIZE_COVERED_WAIT_SEC, 0.2)
+        # The short window must not reach past what jitter means.
+        self.assertLessEqual(FINALIZE_EMPTY_TAIL_WAIT_SEC, COVERAGE_GAP_MIN_SEC)
+        # And a tail that is small but real gets a window sized from
+        # actual round trips (p95 0.49 s), not from the empty case.
+        self.assertGreater(FINALIZE_COVERED_WAIT_SEC, 0.49)
+        self.assertGreater(FINALIZE_COVERED_WAIT_SEC, FINALIZE_EMPTY_TAIL_WAIT_SEC)
 
     def test_confirmation_window_is_shorter_than_the_full_ceiling(self):
         self.assertLess(FINALIZE_COVERED_WAIT_SEC, FINALIZE_FLUSH_WAIT_SEC)
