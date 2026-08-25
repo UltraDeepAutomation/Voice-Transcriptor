@@ -109,6 +109,30 @@ test("[trace] lines are mirrored only behind the debug flag", () => {
 
 // ── formatting ────────────────────────────────────────────────────────
 
+test("the per-stop summary is always mirrored, flag or no flag", () => {
+  // One line per recording, carrying the per-phase breakdown of the
+  // stop chain. It was computed on every stop and thrown away, which is
+  // why "the transcript took a very long time" had no answer in the log.
+  const line = "[trace stopLive] total=1398ms | flushWorkletPort: 12ms → waitForWorkletDrain: 180ms";
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, false), true);
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, true), true);
+});
+
+test("the high-volume trace stream stays behind the flag", () => {
+  // Thousands of lines per session — the reason the flag exists.
+  const line = '[trace] {"id":"paste-1","scope":"paste","step":1}';
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, false), false);
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, true), true);
+});
+
+test("the always-mirrored list is a prefix match, not a substring one", () => {
+  // A transcript quoting the prefix must not smuggle itself into the log.
+  assert.equal(
+    shouldMirrorConsoleMessage("INFO", "user said [trace stopLive] out loud", false),
+    false,
+  );
+});
+
 test("formats a mirrored line with its level tag", () => {
   assert.equal(
     formatConsoleMirrorLine({ level: "error", message: "kaput" }, undefined, false),

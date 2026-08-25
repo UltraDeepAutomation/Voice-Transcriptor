@@ -6636,7 +6636,28 @@ async function createWindow(options = {}) {
       allowedCapability ||
       perm === "media" ||
       perm === "videoCapture";
-    return { perm, known, allowedCapability };
+    // Why, not just what.
+    //
+    // A recording start produces six permission decisions in ~40 ms,
+    // and some of them are denials BY DESIGN: Chromium probes video
+    // alongside audio, and `selectAudioOutput` asks for a capability
+    // this app does not use. Both were logged as a bare
+    // `perm=media allow=false`, which reads as "the microphone was
+    // refused" — and, worse, is indistinguishable from an actual
+    // microphone refusal. The one line a support reader needs to spot
+    // was camouflaged by 70 identical lines that meant nothing was
+    // wrong.
+    let reason;
+    if (allowedCapability) {
+      reason = "granted";
+    } else if (perm === "media" && mediaTypes.includes("video")) {
+      reason = "video-capture-not-used-by-this-app";
+    } else if (!known) {
+      reason = "capability-not-in-allow-list";
+    } else {
+      reason = "capability-not-granted";
+    }
+    return { perm, known, allowedCapability, reason, mediaTypes };
   };
   const permissionOriginCandidates = (wc, details = {}, requestingOrigin = "") => {
     const values = [
@@ -6674,14 +6695,18 @@ async function createWindow(options = {}) {
     cb(allow);
   });
   win.webContents.session.setPermissionCheckHandler((wc, permission, requestingOrigin, details = {}) => {
-    const { perm, known, allowedCapability } = permissionDecision(permission, details, "check");
+    const { perm, known, allowedCapability, reason, mediaTypes } =
+      permissionDecision(permission, details, "check");
     const fromBackend = permissionFromBackendOrigin(wc, details, requestingOrigin);
     const allow = allowedCapability && fromBackend;
     const logUrl = permissionOriginsLog(wc, details, requestingOrigin);
+    const kinds = mediaTypes.length ? ` types=${mediaTypes.join("+")}` : "";
     if (known && !fromBackend) {
-      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm} origins=${logUrl}`);
+      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm}${kinds} origins=${logUrl}`);
     } else {
-      appendMainLog(`[perm-check] perm=${perm} allow=${allow} origins=${logUrl}`);
+      appendMainLog(
+        `[perm-check] perm=${perm}${kinds} allow=${allow} reason=${allow ? reason : (fromBackend ? reason : "non-backend-origin")} origins=${logUrl}`,
+      );
     }
     return allow;
   });

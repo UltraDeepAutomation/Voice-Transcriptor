@@ -46,6 +46,25 @@
 /** Longest mirrored message. Bounds a runaway console dump. */
 const MAX_MESSAGE_CHARS = 600;
 
+/**
+ * Low-volume per-session summaries that are always mirrored.
+ *
+ * Severity is the right default rule, but it misfiles one thing: a
+ * summary emitted once per recording is not chatter, and putting it
+ * behind the debug flag with the thousands of per-step `[trace]` lines
+ * threw away the single most useful latency record in the app.
+ *
+ * `[trace stopLive]` is computed on every stop — the per-phase
+ * breakdown of the stop chain, `flushWorkletPort → waitForWorkletDrain
+ * → stopMediaRecorderAndFlush → pcmSink.finalize → …` with milliseconds
+ * against each — and then discarded. When a user says "the transcript
+ * took a very long time", that line is the answer, and it existed only
+ * in a devtools console nobody had open.
+ *
+ * One line per recording. Anything added here must stay that cheap.
+ */
+const ALWAYS_MIRRORED_PREFIXES = Object.freeze(["[trace stopLive]"]);
+
 const LEVEL_ERROR = "ERROR";
 const LEVEL_WARN = "WARN";
 const LEVEL_INFO = "INFO";
@@ -105,8 +124,10 @@ function normalizeConsoleMessage(a, b) {
  */
 function shouldMirrorConsoleMessage(level, message, mirrorTraceLogs) {
   if (level === LEVEL_ERROR || level === LEVEL_WARN) return true;
+  const text = String(message || "");
+  if (ALWAYS_MIRRORED_PREFIXES.some((prefix) => text.startsWith(prefix))) return true;
   if (!mirrorTraceLogs) return false;
-  return String(message || "").startsWith("[trace");
+  return text.startsWith("[trace");
 }
 
 /**
@@ -129,6 +150,7 @@ function formatConsoleMirrorLine(a, b, mirrorTraceLogs) {
 }
 
 module.exports = {
+  ALWAYS_MIRRORED_PREFIXES,
   MAX_MESSAGE_CHARS,
   formatConsoleMirrorLine,
   normalizeConsoleMessage,

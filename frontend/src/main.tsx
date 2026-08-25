@@ -9750,6 +9750,13 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: "finalize" }));
+        // Phase marker, not a side effect: the interval between Stop and
+        // this send is time Deepgram does not yet know the recording
+        // ended, and it was invisible. Measured on one real stop: the
+        // user pressed Stop at 05:32:22.691 and the backend logged
+        // "finalize ENTER" at 05:32:24.089 — 1.4 s in which the local
+        // canonical-audio work ran and the upstream flush had not begun.
+        mark("wsFinalizeSent");
         console.log(`[trace stopLive] finalize sent to ws (state=OPEN, neverSent=${wsFramesNeverSent})`);
       } catch (e) {
         console.warn(`[trace stopLive] finalize send threw: ${e instanceof Error ? e.message : String(e)}`);
