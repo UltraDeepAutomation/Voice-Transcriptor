@@ -863,7 +863,12 @@ function setTranscriptionSelection(group: TranscriptionGroupId | "", model?: str
   if (group && model) uiModelByGroup[group] = model;
   renderTranscriptionSelectors();
   queueUiPreferencesSave();
-  if (isLocalGroup(group)) scheduleLocalWarmup();
+  // Unconditional call: ``scheduleLocalWarmup`` is the single gate on
+  // whether a local engine is actually reached. Testing ``isLocalGroup``
+  // here as well was a second, weaker copy of that rule — it missed the
+  // case where a remote group is selected but has no usable key, which
+  // resolves to the local engine and does need the warm.
+  scheduleLocalWarmup();
 }
 
 function readProviderGroup(): TranscriptionGroupId | "" {
@@ -3968,12 +3973,25 @@ function getVisibleLivePreviewText(): string {
 function scheduleLocalWarmup(): void {
   const selectedProvider = readProviderSelection();
   if (!selectedProvider) return;
+  // Warm ONLY when the session will actually run a local engine.
+  //
+  // Root cause this guard fixes: the previous version warmed the
+  // live-preview model for every provider, so a user transcribing
+  // exclusively through Deepgram or OpenRouter still loaded
+  // faster-whisper into the backend — ~700 MB resident and 5-16 s of
+  // CPU per launch for weights that were never asked to transcribe
+  // anything. ``resolveEffectiveProvider`` already collapses to
+  // "local" for the two cases where a local engine IS reached:
+  // no/unusable remote key, and remote unreachable (offline). Both
+  // transitions re-enter this function via ``setTranscriptionSelection``
+  // and ``refreshNetworkState``, so the warm still happens ahead of the
+  // first local window — just not before we know we need it.
+  if (resolveEffectiveProvider(selectedProvider) !== "local") return;
   const sessionModels = resolveSessionLocalModels(selectedProvider);
-  const modelsToWarm = new Set<string>();
-  modelsToWarm.add(sessionModels.assistLocalModel);
-  if (resolveEffectiveProvider(selectedProvider) === "local") {
-    modelsToWarm.add(sessionModels.finalLocalModel);
-  }
+  const modelsToWarm = new Set<string>([
+    sessionModels.assistLocalModel,
+    sessionModels.finalLocalModel,
+  ]);
   modelsToWarm.forEach((model) => {
     warmLocalModel(model).catch((e) => {
       console.warn(`Local model warmup failed for ${model}`, e);
@@ -3982,7 +4000,16 @@ function scheduleLocalWarmup(): void {
 }
 
 function setNetworkState(online: boolean, latencyMs: number | null = null): void {
+  const wasOnline = isNetworkOnline;
   isNetworkOnline = !!online;
+  // Connectivity flip changes which engine the next session reaches:
+  // going offline collapses a remote provider to the local fallback.
+  // Warm on the transition only — this runs on every network poll, and
+  // re-warming on each tick would defeat the point of not loading the
+  // model until it is needed. ``scheduleLocalWarmup`` is a no-op while
+  // the effective provider is still remote, so the online→offline and
+  // offline→online cases both route through the same single gate.
+  if (wasOnline !== isNetworkOnline) scheduleLocalWarmup();
   const dot = $("netDot");
   const text = $("netText");
   dot.className = "net-dot" + (online ? " online" : " offline");
@@ -7583,6 +7610,42 @@ function startScriptProcessorCapture(
   }
 }
 
+/**
+ * Empty the module-level ``ac`` slot, closing any context found there.
+ *
+ * The slot has exactly one owner at a time, and this is the only way to
+ * vacate it. An AudioContext that loses its last reference is NOT
+ * collected while it is running — Chromium keeps the realtime
+ * AudioWorklet thread and its V8 isolate alive — so overwriting the
+ * slot without closing the previous context leaks both for the lifetime
+ * of the renderer.
+ *
+ * Returns true when a context was actually closed, so the start path
+ * can flag a slot that a teardown should already have emptied.
+ */
+async function closeAudioContextSlot(): Promise<boolean> {
+  const current = ac;
+  if (!current) return false;
+  ac = null;
+  try {
+    await current.close();
+  } catch { /* already closed — nothing left to release */ }
+  return true;
+}
+
+/**
+ * Vacate the slot before a new capture session claims it.
+ *
+ * Reaching this with a context still in place means some teardown path
+ * returned early; the warning makes that visible instead of letting it
+ * accumulate silently, one leaked realtime audio thread per session.
+ */
+async function releaseOrphanedAudioContext(reason: string): Promise<void> {
+  if (await closeAudioContextSlot()) {
+    console.warn(`Closed an AudioContext left behind by a previous session (${reason})`);
+  }
+}
+
 async function cleanupCancelledStartCaptureResources(): Promise<void> {
   if (fallbackCaptureTimer) {
     clearTimeout(fallbackCaptureTimer);
@@ -7621,11 +7684,7 @@ async function cleanupCancelledStartCaptureResources(): Promise<void> {
     try { stream.getTracks().forEach((track) => track.stop()); } catch { /* best effort */ }
     stream = null;
   }
-  if (ac) {
-    const closing = ac;
-    ac = null;
-    try { await closing.close(); } catch { /* best effort */ }
-  }
+  await closeAudioContextSlot();
 }
 /**
  * Finalize barrier for the live WebSocket.
@@ -8745,6 +8804,11 @@ async function startLive(): Promise<void> {
         micHealth.observe({ kind: "track-muted", muted: false });
       });
     }
+    // Close whatever still occupies the slot before overwriting it.
+    // Every teardown path is supposed to have emptied it already; this
+    // is the structural guarantee that a path which did not cannot
+    // strand a running AudioContext with no reference left to close it.
+    await releaseOrphanedAudioContext("starting a new capture session");
     ac = new AudioContext();
     if (ac.state !== "running") {
       try {
@@ -8966,7 +9030,19 @@ async function waitForWorkletDrain(
 
 async function stopLive(enhance: boolean): Promise<void> {
   if (stopTransitionInFlight) return;
-  if (!isRecording) return;
+  if (!isRecording) {
+    // A start that failed after ``new AudioContext()`` but before
+    // ``setRecordButton(true)`` flipped ``isRecording`` still owns a
+    // live AudioContext, MediaStream and (usually) an AudioWorklet.
+    // ``startLive``'s catch funnels exactly that case through here, so
+    // returning without releasing them leaked one AudioContext — and
+    // with it a realtime AudioWorklet thread carrying its own V8
+    // isolate — per failed attempt, for the rest of the app's life.
+    // The helper is fully null-guarded, so the ordinary "stop pressed
+    // while already idle" call stays a no-op.
+    await cleanupCancelledStartCaptureResources();
+    return;
+  }
   liveStartAttemptSeq += 1;
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
@@ -9421,14 +9497,10 @@ async function stopLive(enhance: boolean): Promise<void> {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   });
   stream = null;
-  tearDown("ac.close", () => {
-    if (ac) {
-      ac.close().catch((e) => {
-        console.debug("AudioContext close rejected (harmless)", e);
-      });
-    }
-  });
-  ac = null;
+  // Same single close path as every other teardown. Awaiting it (rather
+  // than firing close() and nulling the slot in the same tick) means the
+  // slot is provably empty before the next start can claim it.
+  await closeAudioContextSlot();
   workletNode = null;
   scriptNode = null;
   scriptSinkGain = null;

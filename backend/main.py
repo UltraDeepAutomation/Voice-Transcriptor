@@ -76,7 +76,14 @@ from backend.remote_deepgram_live import (
     DeepgramLiveError,
     DeepgramLiveSession,
 )
-from backend.transcribe import merge_channel_transcripts, transcribe_file, warm_model, warm_state
+from backend.transcribe import (
+    merge_channel_transcripts,
+    model_is_resident,
+    start_idle_model_sweeper,
+    transcribe_file,
+    warm_model,
+    warm_state,
+)
 
 
 UPLOADS_DIR = DATA_DIR / "uploads"
@@ -209,18 +216,30 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     """FastAPI lifespan hook.
 
     Replaces the deprecated ``@app.on_event("startup")`` pattern
-    (removed in an upcoming FastAPI release). Both startup tasks are
-    best-effort and kicked off in background daemon threads so they
+    (removed in an upcoming FastAPI release). Every startup task is
+    best-effort and kicked off in a background daemon thread so it
     cannot block the event loop from serving requests.
 
-    ``_warm_default_local_model`` and ``_retroactive_audio_retention``
-    are defined later in the module — Python resolves the names at
-    call time (when this lifespan enters), by which point the whole
-    module has been imported. No forward-declaration dance required.
+    No local model is warmed here. Provider selection lives in the
+    renderer (Settings → Transcription), so the backend cannot know
+    at boot whether a local engine will be used at all. Warming the
+    default Whisper model unconditionally imported faster-whisper +
+    ctranslate2 + PyAV and pinned ~700 MB resident for the entire
+    session even when the user transcribes exclusively through a
+    remote API — the single largest source of idle memory in the app.
+    ``/api/transcribe/warmup`` remains the one warm entry point, and
+    the renderer calls it only when the effective provider resolves
+    to ``local``.
+
+    The retention/sweep helpers below are defined later in the module
+    — Python resolves the names at call time (when this lifespan
+    enters), by which point the whole module has been imported. No
+    forward-declaration dance required.
     """
-    threading.Thread(
-        target=_warm_default_local_model, daemon=True, name="warm-default-model"
-    ).start()
+    # Idle-unload sweeper for the local model cache. Cheap (one wakeup
+    # per minute over a dict that is empty for API-only users) and the
+    # only thing that ever returns a loaded model's ~700 MB to the OS.
+    start_idle_model_sweeper()
 
     def _run_retroactive_retention() -> None:
         try:
@@ -735,21 +754,6 @@ def _sweep_orphan_tmp_files() -> None:
             continue
     if removed > 0:
         logger.info("tmp-sweep: removed %d orphan *.tmp-* files", removed)
-
-
-def _warm_default_local_model() -> None:
-    try:
-        started = time.perf_counter()
-        state = warm_model(DEFAULT_LOCAL_TRANSCRIPTION_MODEL, probe=True)
-        logger.info(
-            "default local model warmed: model=%s load_ms=%d probe_ms=%d total_ms=%d",
-            DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
-            int(state.get("loaded_ms", 0)),
-            int(state.get("probe_ms", 0)),
-            int((time.perf_counter() - started) * 1000),
-        )
-    except Exception:
-        logger.exception("default local model warmup failed")
 
 
 def _origin_allowed(origin: str, request: Request) -> bool:
@@ -1336,16 +1340,25 @@ async def transcribe_warmup(
     model = _form_text(model, DEFAULT_LOCAL_TRANSCRIPTION_MODEL)
     if model not in ALLOWED_LOCAL_MODELS:
         raise HTTPException(status_code=400, detail="unsupported model")
+    # Already-warm short circuit. ``warm_model(probe=True)`` re-runs two
+    # full transcriptions of synthetic audio on every call; the renderer
+    # fires this endpoint on startup, on provider change AND on every
+    # network-state flip, so without this guard a single session paid
+    # the probe cost repeatedly for a model that was already resident.
+    # ``model_is_resident`` is the authority — a warm-state entry whose
+    # model has since been evicted by the idle sweeper must re-warm.
+    cached = warm_state(model)
+    if cached and model_is_resident(model):
+        return {"ok": True, "model": model, "state": cached, "cached": True}
     loop = asyncio.get_running_loop()
-    # ``probe=True`` matches the startup warm of the default model. Only
-    # loading the weights leaves the lazy VAD load and the first
-    # encoder/decoder pass to be paid by the user's first live window,
-    # which is exactly the stall that makes the assist fall behind and
-    # then have to catch up with an oversized (slower still) window.
-    # Callers fire this in the background, so the extra probe never sits
-    # on an interactive path.
+    # ``probe=True``: only loading the weights leaves the lazy VAD load
+    # and the first encoder/decoder pass to be paid by the user's first
+    # live window, which is exactly the stall that makes the assist fall
+    # behind and then have to catch up with an oversized (slower still)
+    # window. Callers fire this in the background, so the extra probe
+    # never sits on an interactive path.
     state = await loop.run_in_executor(None, lambda: warm_model(model, probe=True))
-    return {"ok": True, "model": model, "state": warm_state(model) or state}
+    return {"ok": True, "model": model, "state": warm_state(model) or state, "cached": False}
 
 
 @app.get("/api/network")

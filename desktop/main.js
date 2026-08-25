@@ -190,6 +190,17 @@ let win = null;
 let recordingStatusWindow = null;
 let recordingStatusWindowLoadPromise = null;
 let recordingStatusWindowReady = false;
+// Grace period between the capsule going idle and its renderer process
+// being torn down. Root cause it fixes: the capsule window was created
+// on the first recording and then lived until app quit — a second,
+// permanently resident renderer process (~64 MB plus its own V8 isolate)
+// that, being created with backgroundThrottling disabled, kept its
+// compositor ticking while hidden and burned ~13% of a CPU core at idle,
+// dragging the shared GPU process along with it. The window now exists
+// only while there is something to show. The delay keeps a rapid
+// stop→start cycle from paying a window re-create.
+const RECORDING_STATUS_CAPSULE_TEARDOWN_MS = 8000;
+let recordingStatusTeardownTimer = null;
 let mainWindowInitialLoadPromise = null;
 let recordingStateMonitor = null;
 let tray = null;
@@ -361,6 +372,11 @@ function recoverOrphanRotatingLogs() {
 // runs once per boot, never during rotation.
 const MAIN_LOG_ARCHIVE_KEEP_COUNT = 10;
 const MAIN_LOG_ARCHIVE_KEEP_BYTES = 50 * 1024 * 1024;
+// Age cap. The count/byte caps alone let a quiet week and a busy week
+// keep the same amount of history, so a heavy-logging stretch could
+// still pin 50 MB of archives that are months old and useless for
+// triage. Support only ever looks at the last few days.
+const MAIN_LOG_ARCHIVE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function pruneMainLogArchives() {
   if (!mainLogFilePath) return;
@@ -377,13 +393,18 @@ function pruneMainLogArchives() {
       archives.push({ full, mtimeMs: st.mtimeMs, size: st.size });
     }
     archives.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const now = Date.now();
     let keptBytes = 0;
     for (let i = 0; i < archives.length; i += 1) {
       const a = archives[i];
       // The newest archive always survives (it holds the freshest
-      // crash evidence); count and byte caps apply to the older tail.
+      // crash evidence); count, byte and age caps apply to the older
+      // tail. A clock that jumped backwards yields a negative age,
+      // which must not read as "expired".
+      const ageMs = now - a.mtimeMs;
       const overCaps = i + 1 > MAIN_LOG_ARCHIVE_KEEP_COUNT
-        || keptBytes + a.size > MAIN_LOG_ARCHIVE_KEEP_BYTES;
+        || keptBytes + a.size > MAIN_LOG_ARCHIVE_KEEP_BYTES
+        || ageMs > MAIN_LOG_ARCHIVE_MAX_AGE_MS;
       if (i > 0 && overCaps) {
         try {
           fs.rmSync(a.full, { force: true });
@@ -1613,6 +1634,10 @@ function recordingStatusCapsuleBounds() {
 
 async function ensureRecordingStatusCapsuleWindow() {
   if (!app.isReady()) return null;
+  // A pending teardown means the capsule is idle but still alive.
+  // Reclaim it rather than letting the timer destroy a window we are
+  // about to show again.
+  cancelRecordingStatusCapsuleTeardown();
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     return recordingStatusWindow;
   }
@@ -1656,6 +1681,7 @@ async function ensureRecordingStatusCapsuleWindow() {
     recordingStatusWindow = null;
     recordingStatusWindowReady = false;
     recordingStatusWindowLoadPromise = null;
+    cancelRecordingStatusCapsuleTeardown();
   });
   recordingStatusWindow.webContents.on("page-title-updated", (event, title) => {
     const raw = String(title || "");
@@ -1743,6 +1769,44 @@ async function updateRecordingStatusCapsule(patch = {}) {
   }
 }
 
+function cancelRecordingStatusCapsuleTeardown() {
+  if (recordingStatusTeardownTimer) {
+    clearTimeout(recordingStatusTeardownTimer);
+    recordingStatusTeardownTimer = null;
+  }
+}
+
+function destroyRecordingStatusCapsuleWindow(reason) {
+  cancelRecordingStatusCapsuleTeardown();
+  const target = recordingStatusWindow;
+  if (!target || target.isDestroyed()) return;
+  // `closable: false` blocks `close()`, so `destroy()` is the only way
+  // out for this window — it is also what the load-failure path already
+  // uses. The "closed" handler nulls the module state.
+  try {
+    target.destroy();
+    appendMainLog(`[recording-capsule] window destroyed (${reason})`);
+  } catch (e) {
+    appendMainLog(`[recording-capsule] destroy failed: ${e?.message || e}`);
+  }
+}
+
+function scheduleRecordingStatusCapsuleTeardown() {
+  cancelRecordingStatusCapsuleTeardown();
+  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
+  recordingStatusTeardownTimer = setTimeout(() => {
+    recordingStatusTeardownTimer = null;
+    // Re-check under the timer: an update that arrived after the hide
+    // cancels the teardown via ensureRecordingStatusCapsuleWindow, but
+    // a status set through some other path must not lose its window.
+    if (String(recordingStatusCapsuleState.status || "").trim()) return;
+    destroyRecordingStatusCapsuleWindow("idle");
+  }, RECORDING_STATUS_CAPSULE_TEARDOWN_MS);
+  // Never hold the event loop open for a teardown that quit would do
+  // anyway — mirrors accessibilityPollTimer / shortcutPollTimer.
+  try { recordingStatusTeardownTimer.unref?.(); } catch { }
+}
+
 function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.status = "";
   recordingStatusCapsuleState.level = 0;
@@ -1763,6 +1827,7 @@ function hideRecordingStatusCapsule() {
       ).catch(() => { });
     }
     try { recordingStatusWindow.hide(); } catch { }
+    scheduleRecordingStatusCapsuleTeardown();
   }
 }
 
@@ -7223,6 +7288,9 @@ app.on("before-quit", () => {
     clearTimeout(mainWindowRevealRequestTimer);
     mainWindowRevealRequestTimer = null;
   }
+  // Same reasoning: a capsule teardown scheduled seconds before quit
+  // must not fire against a window Electron is already tearing down.
+  cancelRecordingStatusCapsuleTeardown();
   globalShortcut.unregisterAll();
   shortcutBridgeHandler = null;
   shortcutCaptureAbortHandler = null;

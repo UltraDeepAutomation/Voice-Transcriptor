@@ -3,6 +3,18 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Performance
+- **Idle memory cut from ~1.4 GB to ~0.5 GB**: the backend loaded faster-whisper (plus ctranslate2, PyAV and the Silero VAD) on *every* launch, regardless of the selected provider — 767 MB resident, 1.3 GB peak, and 5-16 s of startup CPU even for users who transcribe exclusively through Deepgram or OpenRouter. The unconditional startup warm is gone; `scheduleLocalWarmup` now fires only when `resolveEffectiveProvider` actually resolves to `local` (missing/unusable remote key, or offline), and re-fires on the connectivity transition that creates that condition. Measured backend footprint after the change: **60.9 MB** at rest, no `ctranslate2` / `av` / `tokenizers` mapped into the process.
+- **Local models are released after 10 minutes idle** (`TRANSCRIPTOR_WHISPER_IDLE_UNLOAD_SEC`, 0 disables): the LRU cap only ever evicted on *insert*, so a single local transcription pinned its model until quit. Measured: 504 MB → 116 MB after one sweep.
+- **`/api/transcribe/warmup` short-circuits when the model is already resident**: the renderer calls it on startup, on provider change and on every network flip, and each call re-ran two full synthetic transcriptions. Repeat call now costs 15 ms instead of 4.7 s. Residency — not a stale warm record — is the authority, so a model dropped by the idle sweeper still re-warms.
+- **The recording capsule no longer outlives the recording**: its window was created on the first recording and lived until quit — a second permanently resident renderer process (~64 MB and its own V8 isolate) that, created with `backgroundThrottling` disabled, kept compositing while hidden and burned ~13% of a CPU core at idle, dragging the shared GPU process with it. The window is now destroyed 8 s after going idle and re-created on demand.
+
+### Fixed
+- **AudioContext leak, one realtime audio thread per failed recording start**: `stopLive` returned early whenever `isRecording` was false — exactly the state `startLive`'s error path funnels into after the AudioContext exists but before the flag flips — so the context, its MediaStream and its AudioWorklet were never released, and Chromium keeps a running context's realtime thread and V8 isolate alive forever. Every teardown path now vacates the single-owner `ac` slot through one `closeAudioContextSlot`, and a start that finds the slot occupied closes and reports it instead of overwriting.
+- **Log archives are capped at 7 days** in addition to the existing count/byte caps, so a heavy-logging stretch can no longer pin 50 MB of months-old archives.
+
 ## [1.3.9] - 2026-08-25
 
 ### Fixed

@@ -5,6 +5,7 @@ Thread-safe model cache, empty-sequence error handling, stereo channel merge.
 
 import logging
 import os
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -41,6 +42,9 @@ _MODEL_LOCK = threading.Lock()  # Guards name→lock registry + cache mutations.
 _MODEL_NAME_LOCKS: Dict[str, threading.Lock] = {}
 _MODEL_CACHE: "OrderedDict[str, WhisperModel]" = OrderedDict()
 _MODEL_WARM_STATE: Dict[str, Dict[str, float]] = {}
+# monotonic timestamp of the last `_model()` hand-out per model name.
+# Guarded by _MODEL_LOCK together with the cache itself.
+_MODEL_LAST_USED: Dict[str, float] = {}
 _CPU_COUNT = max(1, os.cpu_count() or 1)
 
 
@@ -68,6 +72,17 @@ _DEFAULT_NUM_WORKERS = max(
 # while capping worst-case RSS at ~2 GB (small + medium int8). Bumping
 # past 3 is unsafe on 8 GB hosts.
 _MODEL_CACHE_MAX = max(1, _env_int("TRANSCRIPTOR_WHISPER_CACHE_SIZE", 2))
+# Idle unload. A resident `small` model pins ~700 MB (weights +
+# ctranslate2 arenas + the Silero VAD session) for the whole process
+# lifetime. The LRU cap alone never releases anything when the user
+# stops transcribing, so a single local transcription made the app
+# carry that footprint until quit. Drop a model that has not served a
+# request for this many seconds; the next request pays one reload
+# (~3-9 s for `small`, already off the interactive path via the
+# renderer's warmup call). 0 or negative disables the sweeper.
+_MODEL_IDLE_UNLOAD_SEC = _env_int("TRANSCRIPTOR_WHISPER_IDLE_UNLOAD_SEC", 600)
+_MODEL_IDLE_SWEEP_INTERVAL_SEC = 60
+_idle_sweeper_thread: Optional[threading.Thread] = None
 
 
 def _is_empty_sequence_transcribe_error(exc: Exception) -> bool:
@@ -117,6 +132,7 @@ def _model(model_name: str) -> "WhisperModel":
             # `move_to_end` — the caller still holds a reference, so
             # their transcription succeeds; the next call reloads.
             pass
+        _touch_model(model_name)
         return m
     # Per-name lock registry. The registry dict itself is guarded by
     # _MODEL_LOCK so two callers can't race to create the per-name lock.
@@ -130,6 +146,7 @@ def _model(model_name: str) -> "WhisperModel":
                 _MODEL_CACHE.move_to_end(model_name)
             except KeyError:
                 pass
+            _touch_model(model_name)
             return m
         started = time.perf_counter()
         m = WhisperModel(
@@ -147,6 +164,7 @@ def _model(model_name: str) -> "WhisperModel":
         # load above (that's the per-name lock's job).
         with _MODEL_LOCK:
             _MODEL_CACHE[model_name] = m
+            _MODEL_LAST_USED[model_name] = time.monotonic()
             while len(_MODEL_CACHE) > _MODEL_CACHE_MAX:
                 # Pop from the FRONT (oldest insertion / least-recently
                 # promoted). Dropping the reference frees the
@@ -158,6 +176,7 @@ def _model(model_name: str) -> "WhisperModel":
                 # loads the evicted model again sees stale warm stats
                 # that don't correspond to the fresh instance.
                 _MODEL_WARM_STATE.pop(evicted_name, None)
+                _MODEL_LAST_USED.pop(evicted_name, None)
                 logger.info(
                     "whisper model evicted: model=%s (cache_size=%d, cap=%d)",
                     evicted_name, len(_MODEL_CACHE), _MODEL_CACHE_MAX,
@@ -170,6 +189,103 @@ def _model(model_name: str) -> "WhisperModel":
             int((time.perf_counter() - started) * 1000),
         )
         return m
+
+
+def _touch_model(model_name: str) -> None:
+    """Record that ``model_name`` was just handed to a caller.
+
+    Called on every cache hit and on insert. The idle sweeper reads
+    these timestamps to decide what may be released. Cheap enough for
+    the hot path: one dict store under a lock held for a single
+    statement.
+    """
+    with _MODEL_LOCK:
+        if model_name in _MODEL_CACHE:
+            _MODEL_LAST_USED[model_name] = time.monotonic()
+
+
+def model_is_resident(model_name: str) -> bool:
+    """True when ``model_name`` is loaded right now.
+
+    ``warm_state`` alone is not proof of residency: the idle sweeper
+    drops the model but callers may still hold a stale warm record, so
+    the warmup endpoint must consult this before short-circuiting.
+    """
+    if model_name.startswith(GIGAAM_MODEL_PREFIX):
+        # The GigaAM engine keeps its own cache and is only importable
+        # when the optional stack is installed. Importing it here just
+        # to answer a residency question would defeat the purpose of
+        # lazy loading, so treat "module never imported" as "not
+        # resident" without touching sys.modules ordering.
+        module = sys.modules.get("backend.transcribe_gigaam")
+        if module is None:
+            return False
+        return model_name in getattr(module, "_MODEL_CACHE", {})
+    with _MODEL_LOCK:
+        return model_name in _MODEL_CACHE
+
+
+def release_idle_models(now: Optional[float] = None) -> List[str]:
+    """Drop every cached model idle for longer than the unload window.
+
+    Returns the names released. Dropping the ``OrderedDict`` reference
+    is enough: an in-flight transcription still holds its own reference
+    and finishes normally, and the ctranslate2 allocation is reclaimed
+    once that reference goes away.
+    """
+    if _MODEL_IDLE_UNLOAD_SEC <= 0:
+        return []
+    stamp = time.monotonic() if now is None else now
+    released: List[str] = []
+    with _MODEL_LOCK:
+        for name in list(_MODEL_CACHE.keys()):
+            last = _MODEL_LAST_USED.get(name)
+            if last is None:
+                # No timestamp recorded (model inserted by an older code
+                # path) — stamp it now rather than releasing a model we
+                # cannot age, so the next sweep can decide on real data.
+                _MODEL_LAST_USED[name] = stamp
+                continue
+            if stamp - last < _MODEL_IDLE_UNLOAD_SEC:
+                continue
+            _MODEL_CACHE.pop(name, None)
+            _MODEL_LAST_USED.pop(name, None)
+            _MODEL_WARM_STATE.pop(name, None)
+            released.append(name)
+    for name in released:
+        logger.info(
+            "whisper model released after %ds idle: model=%s",
+            _MODEL_IDLE_UNLOAD_SEC,
+            name,
+        )
+    return released
+
+
+def start_idle_model_sweeper() -> None:
+    """Start the background idle-unload sweeper exactly once.
+
+    Idempotent: repeated calls (test harnesses re-entering the FastAPI
+    lifespan, uvicorn reload) do not stack threads.
+    """
+    global _idle_sweeper_thread
+    if _MODEL_IDLE_UNLOAD_SEC <= 0:
+        return
+    with _MODEL_LOCK:
+        if _idle_sweeper_thread is not None and _idle_sweeper_thread.is_alive():
+            return
+
+        def _sweep() -> None:
+            while True:
+                time.sleep(_MODEL_IDLE_SWEEP_INTERVAL_SEC)
+                try:
+                    release_idle_models()
+                except Exception:
+                    logger.exception("idle model sweep failed")
+
+        _idle_sweeper_thread = threading.Thread(
+            target=_sweep, daemon=True, name="whisper-idle-unload"
+        )
+        _idle_sweeper_thread.start()
 
 
 def _probe_tone(seconds: float = 0.5) -> np.ndarray:
