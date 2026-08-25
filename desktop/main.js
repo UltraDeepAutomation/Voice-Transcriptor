@@ -1039,6 +1039,15 @@ const recordingStatusCapsuleState = {
 };
 
 let recordingStatusCapsuleGeometry = null;
+// Every intent to change what the capsule shows takes the next number.
+// An update that has to wait for its window — a cold create is 110-380 ms
+// — checks the counter again before it paints, so a slow publish can
+// never repaint a state the app has already left, nor re-show a window a
+// later hide has put away. Bumped by both writers: update and hide.
+let recordingStatusCapsuleUpdateSeq = 0;
+// Cost of the last capsule window create, so the log can separate "the
+// capsule was slow to appear" from "the press was slow to arrive".
+let recordingStatusCapsuleLastCreateMs = 0;
 let recordingStatusSuppressActivateUntil = 0;
 let recordingStatusCapsuleLevelUpdateInFlight = false;
 let recordingStatusCapsuleLastLevelSent = -1;
@@ -1663,6 +1672,7 @@ async function ensureRecordingStatusCapsuleWindow() {
   }
 
   recordingStatusWindowReady = false;
+  const createStartedAt = Date.now();
   recordingStatusWindow = new BrowserWindow({
     ...recordingStatusCapsuleBounds(),
     frame: false,
@@ -1724,6 +1734,7 @@ async function ensureRecordingStatusCapsuleWindow() {
     .loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
     .then(() => {
       recordingStatusWindowReady = true;
+      recordingStatusCapsuleLastCreateMs = Date.now() - createStartedAt;
     })
     .catch((e) => {
       appendMainLog(`[recording-capsule] load failed: ${e?.message || e}`);
@@ -1740,6 +1751,8 @@ async function ensureRecordingStatusCapsuleWindow() {
 
 async function updateRecordingStatusCapsule(patch = {}) {
   Object.assign(recordingStatusCapsuleState, patch);
+  const seq = ++recordingStatusCapsuleUpdateSeq;
+  const requestedAt = Date.now();
   const status = String(recordingStatusCapsuleState.status || "").trim();
   if (!status) {
     hideRecordingStatusCapsule();
@@ -1761,6 +1774,8 @@ async function updateRecordingStatusCapsule(patch = {}) {
   }
   const capsuleWindow = await ensureRecordingStatusCapsuleWindow();
   if (!capsuleWindow || capsuleWindow.isDestroyed()) return;
+  // Superseded while this call waited for the window.
+  if (seq !== recordingStatusCapsuleUpdateSeq) return;
   try {
     capsuleWindow.setBounds(recordingStatusCapsuleBounds(), false);
   } catch { }
@@ -1779,7 +1794,14 @@ async function updateRecordingStatusCapsule(patch = {}) {
       `window.__setCapsuleState(${JSON.stringify(payload)})`,
       true,
     );
-    if (!capsuleWindow.isVisible()) capsuleWindow.showInactive();
+    if (!capsuleWindow.isVisible()) {
+      capsuleWindow.showInactive();
+      appendMainLog(
+        `[recording-capsule] visible status="${status}" ms=${Date.now() - requestedAt} ` +
+        `create=${recordingStatusCapsuleLastCreateMs}ms`,
+      );
+      recordingStatusCapsuleLastCreateMs = 0;
+    }
   } catch (e) {
     appendMainLog(`[recording-capsule] update failed: ${e?.message || e}`);
   }
@@ -1824,6 +1846,7 @@ function scheduleRecordingStatusCapsuleTeardown() {
 }
 
 function hideRecordingStatusCapsule() {
+  recordingStatusCapsuleUpdateSeq++;
   recordingStatusCapsuleState.status = "";
   recordingStatusCapsuleState.level = 0;
   recordingStatusCapsuleState.startedAt = 0;
@@ -2063,6 +2086,62 @@ async function waitForRendererUiReady(timeoutMs = 8000) {
   return false;
 }
 
+/**
+ * Is the microphone already ours to open?
+ *
+ * ``getMediaAccessStatus`` is synchronous, so the common case — access
+ * granted long ago — costs nothing and lets the press be dispatched
+ * without a round trip. Anything else routes through
+ * ``requestMacMicrophonePermissionOnce``, which may prompt.
+ */
+function macMicrophoneAccessGranted() {
+  if (process.platform !== "darwin") return true;
+  try {
+    return String(systemPreferences.getMediaAccessStatus("microphone") || "") === "granted";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ask the renderer everything the press needs to know, and act on it, in
+ * one ``executeJavaScript`` round trip.
+ *
+ * ``allowStart`` is the main process's veto: when the renderer is idle
+ * and the main process already knows a start cannot proceed (post-stop
+ * work still holding the single capsule, microphone permission not
+ * granted), nothing is dispatched and the caller decides what to tell
+ * the user. A stop is never vetoed.
+ *
+ * Returns null when the renderer did not answer inside the budget — the
+ * 2 s ceiling that keeps a wedged renderer from turning the hotkey into
+ * a permanent no-op.
+ */
+async function dispatchRendererTogglePress(allowStart) {
+  return execRendererJsWithTimeout(
+    `
+    (() => {
+      const uiReady = typeof window.__transcriptorLiveStatusSnapshot === 'function';
+      const isRec = !!(window.__transcriptorIsRecording);
+      const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
+      const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
+      const liveSnapshot = uiReady ? window.__transcriptorLiveStatusSnapshot() : null;
+      const autoSendEnter = !!liveSnapshot?.autoSendEnter;
+      const timerText = String(liveSnapshot?.timerText || '00:00').trim();
+      const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, auto, autoSendEnter, timerText, recordingId };
+      if (!uiReady) return state;
+      if (!isRec && !${allowStart ? "true" : "false"}) return state;
+      window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
+      state.dispatched = true;
+      state.recording = !isRec;
+      return state;
+    })();
+    `,
+    null,
+    2000,
+  );
+}
+
 async function toggleRecordingFromShortcut() {
   if (shortcutToggleInFlight) return;
   const trace = createTrace("toggle_hotkey", {});
@@ -2080,48 +2159,76 @@ async function toggleRecordingFromShortcut() {
       return;
     }
 
-    const ready = await waitForRendererUiReady();
-    traceStep(trace, "renderer_ready_check", { ready: !!ready });
-    if (!ready) {
+    // One round trip decides the press. The sequential shape asked the
+    // renderer three questions — is the UI ready, are you recording, now
+    // toggle — and the microphone could not open until all three answers
+    // had come back. The toggle handler reads both facts anyway, so
+    // ``dispatchRendererTogglePress`` asks them together and a press
+    // reaches ``startLive`` in one hop.
+    const postStopActive = activePostStopAtPress || hasActivePostStopWork();
+    let result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted());
+    if (result && result.uiReady === false) {
+      // Cold renderer: fall back to the wait loop and ask once more when
+      // it has finished booting.
+      const ready = await waitForRendererUiReady();
+      traceStep(trace, "renderer_ready_wait", { ready: !!ready });
+      if (ready) {
+        result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted());
+      }
+    }
+    if (result === null) {
+      // Renderer didn't respond inside the budget — log, release the
+      // inflight guard via the outer finally, and let the user retry.
+      appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
+      resetRecordingStatusState();
+      traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
+      return;
+    }
+    if (!result?.ok || !result.uiReady) {
+      traceStep(trace, "renderer_not_ready", { result: result || null });
       await setRecordingStatus("App Loading");
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-not-ready" });
       return;
     }
+    traceStep(trace, "renderer_toggle", {
+      dispatched: !!result.dispatched,
+      wasRecording: !!result.wasRecording,
+    });
 
-    const beforeToggleState = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
-    const postStopActive = activePostStopAtPress || hasActivePostStopWork();
-    const transitionStatus = beforeToggleState.recording || postStopActive ? "Transcribing" : "Starting";
-    await publishRecordingStatus(transitionStatus);
-    traceStep(trace, "recording_status_ready", {
+    // Published, not awaited. Creating the capsule window costs 110-380 ms
+    // (it is destroyed 8 s after going idle, so most presses pay a fresh
+    // create) and the microphone has no reason to wait behind it — the
+    // renderer already has the press. A later status supersedes this one
+    // through the capsule's update sequence, so a slow create can never
+    // repaint a state the app has left.
+    const transitionStatus = result.wasRecording || postStopActive ? "Transcribing" : "Starting";
+    void publishRecordingStatus(transitionStatus).catch((e) => {
+      appendMainLog(`[recording-status] transition publish failed: ${e?.message || e}`);
+    });
+    traceStep(trace, "recording_status_published", {
       status: transitionStatus,
-      recording: !!beforeToggleState.recording,
+      recording: !!result.wasRecording,
       postStopActive: !!postStopActive,
     });
-    if (!beforeToggleState.recording && postStopActive) {
-      appendMainLog(
-        `[shortcut] start blocked by single-capsule post-stop work ` +
-        `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
-      );
-      traceStep(trace, "single_capsule_busy", {
-        pending: pendingTranscriptionCount,
-        queue: postStopQueue.length,
-        worker: !!postStopWorkerRunning,
-      });
-      traceEnd(trace, "blocked", { reason: "single-capsule-post-stop-active" });
-      return;
-    }
 
-    let front = { name: "", pid: 0, windowTitle: "" };
-    if (!beforeToggleState.recording) {
-      front = await frontAtHotkeyPromise;
-      traceStep(trace, "front_before", {
-        name: front.name || "",
-        pid: front.pid || 0,
-        windowTitle: compactLogText(front.windowTitle || "", 80),
-        timedOut: !!front.timedOut,
-        source: "hotkey-press",
-      });
+    if (!result.dispatched) {
+      // The renderer was idle and the main process withheld the start.
+      // Two possible reasons, answered in the order the sequential code
+      // checked them.
+      if (postStopActive) {
+        appendMainLog(
+          `[shortcut] start blocked by single-capsule post-stop work ` +
+          `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
+        );
+        traceStep(trace, "single_capsule_busy", {
+          pending: pendingTranscriptionCount,
+          queue: postStopQueue.length,
+          worker: !!postStopWorkerRunning,
+        });
+        traceEnd(trace, "blocked", { reason: "single-capsule-post-stop-active" });
+        return;
+      }
       const micGranted = await requestMacMicrophonePermissionOnce();
       if (!micGranted) {
         traceStep(trace, "mic_permission_denied", {});
@@ -2130,51 +2237,14 @@ async function toggleRecordingFromShortcut() {
         traceEnd(trace, "failed", { reason: "mic-permission-denied" });
         return;
       }
-    }
-
-    // 1.1.25 fix: previously called ``executeJavaScript`` directly with
-    // no timeout, while this function holds ``shortcutToggleInFlight =
-    // true``. A stuck renderer (long synchronous work, blocked event
-    // loop, frozen DOM) made the hotkey a permanent no-op until process
-    // restart — the exact failure mode the dedicated
-    // ``execRendererJsWithTimeout`` helper exists to prevent. 2 s
-    // budget mirrors the helper's default; if the renderer can't
-    // respond in 2 s the recording probably wasn't going to work
-    // anyway, and the hotkey resets cleanly via the inflight finally.
-    const result = await execRendererJsWithTimeout(
-      `
-      (() => {
-        const isRec = !!(window.__transcriptorIsRecording);
-        const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
-        const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-        const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
-          ? window.__transcriptorLiveStatusSnapshot()
-          : null;
-        const autoSendEnter = !!liveSnapshot?.autoSendEnter;
-        const timerText = String(liveSnapshot?.timerText || '00:00').trim();
-        window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
-        return { ok: true, recording: !isRec, auto, autoSendEnter, timerText, recordingId };
-      })();
-      `,
-      null,
-      2000,
-    );
-    if (result === null) {
-      // Renderer didn't respond inside the budget — log, release the
-      // inflight guard via the outer finally, and let the user retry.
-      appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
-      shortcutToggleInFlight = false;
-      resetRecordingStatusState();
-      traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
-      return;
-    }
-
-    if (!result?.ok) {
-      traceStep(trace, "renderer_toggle_failed", { result: result || null });
-      await setRecordingStatus("App Loading");
-      resetRecordingStatusState();
-      traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
-      return;
+      result = await dispatchRendererTogglePress(true);
+      if (!result?.dispatched) {
+        traceStep(trace, "renderer_toggle_failed", { result: result || null });
+        await setRecordingStatus("App Loading");
+        resetRecordingStatusState();
+        traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
+        return;
+      }
     }
 
     if (result.recording) {
@@ -2196,6 +2266,19 @@ async function toggleRecordingFromShortcut() {
         traceEnd(trace, "failed", { reason: "recording-start-not-confirmed" });
         return;
       }
+      // The frontmost-app lookup was fired at the press, so it reports
+      // the app the user was in when they hit the key no matter when it
+      // is read. It is awaited here rather than before the dispatch: it
+      // is an ``osascript`` spawn (60-250 ms measured) and auto-paste
+      // needs its answer at stop, not at start.
+      const front = await frontAtHotkeyPromise;
+      traceStep(trace, "front_before", {
+        name: front.name || "",
+        pid: front.pid || 0,
+        windowTitle: compactLogText(front.windowTitle || "", 80),
+        timedOut: !!front.timedOut,
+        source: "hotkey-press",
+      });
       setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
       keepCapturedTarget = true;
       traceStep(trace, "target_captured", {

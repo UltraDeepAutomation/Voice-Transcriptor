@@ -7885,6 +7885,22 @@ let stopTransitionOwnerToken = "";
 // globals would silently leak the first.
 let startLiveInFlight = false;
 let liveStartAttemptSeq = 0;
+// ── Start-path timing ───────────────────────────────────────────────
+// The stop chain has carried a per-phase breakdown since the latency
+// work; the start chain had nothing, so "the capsule takes about a
+// second to come up" could only be guessed at. The endpoint that
+// matters is the FIRST CAPTURED FRAME — the moment audio is really
+// being recorded, not the moment the function returns — and that
+// arrives after startLive has resolved, so the clock and the phase
+// list live at module scope. One summary line per recording, emitted
+// from pushCapturedFrame.
+let startTimings: Array<[string, number]> = [];
+let startT0 = 0;
+let startFirstFrameSeen = false;
+function markStartPhase(label: string): void {
+  if (startT0 <= 0 || startFirstFrameSeen) return;
+  startTimings.push([label, performance.now() - startT0]);
+}
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
 let liveWsMode: LiveWsMode = "none";
@@ -8667,6 +8683,24 @@ function pushCapturedFrame(input: Float32Array): void {
   if (startAt <= 0) {
     startAt = workletLastFrameAt;
   }
+  if (!startFirstFrameSeen && startT0 > 0) {
+    // First audio of the session. Everything before this is start-up
+    // cost the user experiences as the capsule not doing anything yet.
+    markStartPhase("first-frame");
+    startFirstFrameSeen = true;
+    const totalMs = performance.now() - startT0;
+    const labels = startTimings
+      .map(([label, t], i) => {
+        const prev = i > 0 ? startTimings[i - 1][1] : 0;
+        return `${label}: ${(t - prev).toFixed(0)}ms`;
+      })
+      .join(" → ");
+    console.log(`[trace startLive] total=${totalMs.toFixed(0)}ms to first audio frame | ${labels}`);
+    (window as unknown as { __transcriptorStartTimings?: unknown }).__transcriptorStartTimings = {
+      totalMs,
+      phases: startTimings,
+    };
+  }
   window.__transcriptorLastFrameAt = workletLastFrameAt;
   let sum = 0;
   let peak = 0;
@@ -8824,11 +8858,15 @@ async function startLive(): Promise<void> {
   // Set the in-flight flag synchronously BEFORE any await.
   if (isBusy || stopTransitionInFlight || startLiveInFlight) return;
   startLiveInFlight = true;
+  startT0 = performance.now();
+  startTimings = [];
+  startFirstFrameSeen = false;
   const startAttemptSeq = ++liveStartAttemptSeq;
   try {
   let sessionArchiveDir = "";
   try {
     sessionArchiveDir = await ensureRecordingsArchiveReady();
+    markStartPhase("archiveReady");
   } catch (e) {
     const message = (e as Error).message || "Recordings archive is not ready yet.";
     publishRecordingOutput({
@@ -8886,6 +8924,7 @@ async function startLive(): Promise<void> {
   // old fire-and-forget path dropped frames that arrived before the
   // async OPFS init resolved (~50 ms, but up to 500 ms on slow devices).
   pcmSink = await createPcmSink(sessionUiToken);
+  markStartPhase("pcmSink");
   workletLastFrameAt = 0;
   captureFrameCount = 0;
   captureRmsSqAccum = 0;
@@ -8962,6 +9001,7 @@ async function startLive(): Promise<void> {
       wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
     }
     const sessionSocket = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
+    markStartPhase("wsRequested");
     ws = sessionSocket;
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
@@ -9117,11 +9157,13 @@ async function startLive(): Promise<void> {
     // activation events and can make every recording look like it is
     // asking for access twice.
     await loadMics(false);
+    markStartPhase("loadMics");
     throwIfStartCancelled();
     const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
     // Bounded and retried — see acquireMicStream. The old code awaited a
     // bare getUserMedia, so a busy input device hung the start outright.
     stream = await acquireMicStream(devId);
+    markStartPhase("getUserMedia");
     throwIfStartCancelled();
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");
@@ -9186,6 +9228,7 @@ async function startLive(): Promise<void> {
         console.debug("AudioContext resume rejected (non-fatal)", e);
       }
     }
+    markStartPhase("audioContext");
     throwIfStartCancelled();
     recordedWebmChunks = [];
     try {
@@ -9217,6 +9260,7 @@ async function startLive(): Promise<void> {
         }
       };
       mediaRecorder.start(1000);
+      markStartPhase("mediaRecorder");
     } catch (e) {
       console.warn("MediaRecorder failed, falling back to WAV encoder", e);
       // If ``.start(1000)`` threw AFTER the constructor succeeded we
@@ -9293,6 +9337,7 @@ async function startLive(): Promise<void> {
     if (ac.audioWorklet && typeof AudioWorkletNode === "function") {
       try {
         await ac.audioWorklet.addModule(new URL("./pcm-worklet.js", import.meta.url).href);
+        markStartPhase("workletModule");
         throwIfStartCancelled();
         workletNode = new AudioWorkletNode(ac, "pcm-capture-processor", {
           numberOfInputs: 1,
@@ -9317,6 +9362,7 @@ async function startLive(): Promise<void> {
         };
 
         src.connect(workletNode);
+        markStartPhase("captureConnected");
         workletCaptureStarted = true;
       } catch (e) {
         console.warn("AudioWorklet capture init failed; falling back to ScriptProcessor", e);
@@ -9330,6 +9376,7 @@ async function startLive(): Promise<void> {
         src,
         ac.audioWorklet ? "AudioWorklet init failed" : "AudioWorklet API unavailable",
       );
+      markStartPhase("scriptProcessorCapture");
       if (!fallbackStarted) {
         throw new Error("Microphone capture is unavailable in this browser runtime.");
       }

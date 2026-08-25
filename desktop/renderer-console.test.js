@@ -118,6 +118,15 @@ test("the per-stop summary is always mirrored, flag or no flag", () => {
   assert.equal(shouldMirrorConsoleMessage("INFO", line, true), true);
 });
 
+test("the per-start summary is always mirrored, flag or no flag", () => {
+  // The other end of the session: hotkey → first captured audio frame,
+  // one line per recording. "The capsule waits about a second before it
+  // starts" is answerable only if this reaches the support log.
+  const line = "[trace startLive] total=812ms to first audio frame | loadMics: 96ms → getUserMedia: 402ms";
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, false), true);
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, true), true);
+});
+
 test("the high-volume trace stream stays behind the flag", () => {
   // Thousands of lines per session — the reason the flag exists.
   const line = '[trace] {"id":"paste-1","scope":"paste","step":1}';

@@ -61,9 +61,14 @@ const MAX_MESSAGE_CHARS = 600;
  * took a very long time", that line is the answer, and it existed only
  * in a devtools console nobody had open.
  *
- * One line per recording. Anything added here must stay that cheap.
+ * `[trace startLive]` is the same record for the other end of the
+ * session: the phases between the hotkey reaching the renderer and the
+ * first captured audio frame. Without it "the capsule takes a second to
+ * come up" is unanswerable from a support log.
+ *
+ * One line per recording each. Anything added here must stay that cheap.
  */
-const ALWAYS_MIRRORED_PREFIXES = Object.freeze(["[trace stopLive]"]);
+const ALWAYS_MIRRORED_PREFIXES = Object.freeze(["[trace stopLive]", "[trace startLive]"]);
 
 const LEVEL_ERROR = "ERROR";
 const LEVEL_WARN = "WARN";
