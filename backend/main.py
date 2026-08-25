@@ -1022,6 +1022,53 @@ def _session_id_from_recovery_stem(stem: str) -> str:
     return parts[-1] if parts else ""
 
 
+# ── Live-session registry ───────────────────────────────────────────────────
+#
+# The one authority for "is this session streaming RIGHT NOW". It is
+# in-process state with a process lifetime, which is exactly the claim
+# being made — and exactly why the previous answer was wrong.
+#
+# The promote guard used to read ``status == "recording"`` out of the
+# recovery sidecar on disk. That field is written once when the session
+# opens and rewritten when it closes, so a session interrupted by a
+# crash, a SIGKILL or an installer leaves it saying "recording" forever.
+# The list endpoint offered such a session as recoverable (it has a spool
+# file and enough bytes); the promote endpoint then refused it with
+# 409 "session is still recording". The renderer promotes every listed
+# recovery on startup, so the pair produced a permanent failure loop:
+# "Could not recover 1 interrupted recording. Check the Recordings folder
+# manually." on every single launch, with no way for the user to clear it.
+#
+# A persisted flag cannot express liveness across a process boundary. A
+# set that is empty at startup by construction can: after a crash nothing
+# is registered, so every stale "recording" sidecar is correctly seen as
+# what it is — the crash this whole subsystem exists to recover from.
+#
+# Both endpoints consult this, so the list can no longer offer something
+# the promote will reject.
+_live_sessions_in_flight: set[str] = set()
+_live_sessions_lock = threading.Lock()
+
+
+def _register_live_session(session_id: str) -> None:
+    if not session_id:
+        return
+    with _live_sessions_lock:
+        _live_sessions_in_flight.add(session_id)
+
+
+def _unregister_live_session(session_id: str) -> None:
+    if not session_id:
+        return
+    with _live_sessions_lock:
+        _live_sessions_in_flight.discard(session_id)
+
+
+def _live_session_is_streaming(session_id: str) -> bool:
+    with _live_sessions_lock:
+        return session_id in _live_sessions_in_flight
+
+
 def _list_live_recoveries() -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for pcm_path in sorted(LIVE_RECOVERY_DIR.glob("*.pcm16"), reverse=True):
@@ -1033,6 +1080,12 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                 or _session_id_from_recovery_stem(pcm_path.stem)
             )
             if not LIVE_SESSION_ID_RE.fullmatch(session_id):
+                continue
+            # Never offer a session that is streaming right now: promoting
+            # it would truncate the WAV and unlink the spool from under the
+            # live writer. Same predicate the promote guard uses, so the
+            # two endpoints cannot disagree.
+            if _live_session_is_streaming(session_id):
                 continue
             bytes_count = int(raw.get("bytes") or pcm_path.stat().st_size or 0)
             if bytes_count < LIVE_RECOVERY_MIN_BYTES:
@@ -1174,9 +1227,15 @@ def _promote_live_recovery(
             # would produce a truncated WAV and then unlink the PCM out
             # from under the live WS writer — every subsequent second of
             # the session streams into an unlinked inode and is lost
-            # silently at finalize. The UI only lists crashed sessions,
-            # but the API surface must defend itself too.
-            if str(meta.get("status") or "") == "recording":
+            # silently at finalize.
+            #
+            # The question is asked of the live-session registry, not of
+            # ``meta["status"]``. A sidecar saying "recording" with no
+            # live session behind it is not a session in progress; it is
+            # the crash signature this endpoint exists to recover from,
+            # and refusing it made every such recording permanently
+            # unrecoverable.
+            if _live_session_is_streaming(session_id):
                 raise HTTPException(
                     status_code=409,
                     detail="session is still recording; stop it before promoting",
@@ -3539,6 +3598,10 @@ async def ws_transcribe(websocket: WebSocket):
 
     started_at = datetime.now()
     recovery_ctx: Optional[dict] = None
+    # Registered before anything can fail, released in the finally below,
+    # so the window in which this session counts as "streaming" is exactly
+    # the window in which a writer could be holding the spool open.
+    _register_live_session(session_id)
     try:
         try:
             recovery_ctx = _open_live_recovery(
@@ -3616,6 +3679,7 @@ async def ws_transcribe(websocket: WebSocket):
         else:
             logger.warning("ws/transcribe transient broken pipe: %s", e)
     finally:
+        _unregister_live_session(session_id)
         if recovery_ctx is not None:
             _finalize_live_recovery(recovery_ctx)
 
