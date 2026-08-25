@@ -142,15 +142,22 @@
               <span class="window-view" id="windowViewLabel">Live</span>
             </div>
           </div>
-          <span class="window-status-pill" id="statusPill" title="Application status" aria-live="polite">
+          <!-- All three status chips share ``.status-chip`` for geometry
+               (height, padding, radius, border, background). Only their
+               state colours differ. Before this they were three
+               independent rule blocks and the mic chip had drifted: no
+               min-height, a different radius and its own backdrop-filter,
+               so it rendered visibly shorter and rounder than its
+               neighbours. -->
+          <span class="status-chip window-status-pill" id="statusPill" title="Application status" aria-live="polite">
             <span class="window-status-dot" id="statusDot" aria-hidden="true"></span>
             <span class="window-status-text" id="statusText">Idle</span>
           </span>
-          <span class="net-pill" id="netPill" title="Internet connection status">
+          <span class="status-chip net-pill" id="netPill" title="Internet connection status">
             <span class="net-dot" id="netDot"></span>
             <span class="net-text" id="netText">Offline</span>
           </span>
-          <span class="mic-pill mic-pill-idle" id="micPill" title="Microphone status" aria-live="polite" hidden>
+          <span class="status-chip mic-pill mic-pill-idle" id="micPill" title="Microphone status" aria-live="polite" hidden>
             <span class="mic-dot" id="micDot"></span>
             <span class="mic-text" id="micText">Mic idle</span>
           </span>
@@ -379,7 +386,7 @@
                 <span class="cp-time cp-dur" id="cpDuration">0:00</span>
                 <audio id="currentRecordingAudio" preload="auto" style="display:none"></audio>
               </div>
-              <button class="icon-btn" id="retranscribeBtn" type="button"
+              <button class="icon-btn icon-btn-compact" id="retranscribeBtn" type="button"
                 aria-label="Re-transcribe saved audio via REST API"
                 title="Re-transcribe">
                 <span class="reload-ico" aria-hidden="true"></span>
@@ -392,12 +399,11 @@
                    triggers a download via an off-DOM <a download> with
                    the file's real name + MIME so it works on every
                    platform regardless of player chrome behaviour. -->
-              <button class="icon-btn" id="currentRecordingDownloadBtn" type="button"
+              <button class="icon-btn icon-btn-compact" id="currentRecordingDownloadBtn" type="button"
                 aria-label="Download recording audio"
                 title="Download audio">
                 <span class="download-ico" aria-hidden="true"></span>
               </button>
-              <span class="current-audio-meta" id="currentRecordingAudioMeta"></span>
             </div>
 
             <div class="pane-footer resource-row" id="downloadRow" hidden>

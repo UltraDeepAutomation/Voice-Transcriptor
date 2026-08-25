@@ -44,7 +44,12 @@ from backend.audio_constants import (
     LIVE_RECOVERY_MIN_BYTES,
     LIVE_SAMPLE_RATE_HZ,
 )
-from backend.models_manager import list_local_models, start_download
+from backend.models_manager import (
+    ModelDeleteError,
+    delete_model,
+    list_local_models,
+    start_download,
+)
 from backend.model_catalog import (
     DEFAULT_DEEPGRAM_AUDIO_MODEL,
     DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
@@ -4234,6 +4239,29 @@ def api_model_download(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown local model {model_id}")
     except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"ok": True, "model_id": model_id, **result}
+
+
+@app.delete("/api/models/local/{model_id}")
+def api_model_delete(
+    model_id: str,
+    _auth: None = Depends(_require_api_auth),
+):
+    """Remove a downloaded local model's weights from disk.
+
+    The inverse of the download route, and the only way the user can
+    reclaim the multi-gigabyte cache a model leaves behind without
+    hunting through ~/.cache/huggingface by hand.
+    """
+    try:
+        result = delete_model(model_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown local model {model_id}")
+    except ModelDeleteError as e:
+        # 409: the request is well-formed but the resource is not in a
+        # state that allows deletion (download in flight, engine-managed
+        # model). The message is written to be shown to the user as-is.
         raise HTTPException(status_code=409, detail=str(e))
     return {"ok": True, "model_id": model_id, **result}
 

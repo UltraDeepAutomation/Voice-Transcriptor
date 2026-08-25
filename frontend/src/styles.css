@@ -472,20 +472,27 @@ body.platform-darwin .sidebar {
   width: fit-content;
 }
 
-.window-status-pill {
-  margin-left: auto;
-  min-width: 0;
-  max-width: min(360px, 42vw);
+/* Geometry SSOT for the three topbar status chips (app status, network,
+   microphone). Each chip keeps only its own colours and state rules;
+   height, padding, radius, border and surface live here exactly once so
+   they cannot drift apart the way the mic chip had. */
+.status-chip {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--chip-radius);
   min-height: 28px;
   padding: 0 10px;
+  min-width: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--chip-radius);
   background: var(--glass-chip-bg);
   box-shadow: var(--glass-surface-outline);
   -webkit-app-region: no-drag;
+}
+
+.window-status-pill {
+  margin-left: auto;
+  max-width: min(360px, 42vw);
 }
 
 .window-status-dot {
@@ -529,15 +536,6 @@ body.platform-darwin .sidebar {
 
 .net-pill {
   margin-left: 4px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--chip-radius);
-  min-height: 28px;
-  padding: 0 10px;
-  background: var(--glass-chip-bg);
-  box-shadow: var(--glass-surface-outline);
 }
 
 .net-dot {
@@ -560,17 +558,11 @@ body.platform-darwin .sidebar {
   color: var(--text-2);
 }
 
+/* Geometry comes from .status-chip. The backdrop-filter this rule used
+   to carry was also a per-frame GPU blur pass on a permanently visible
+   element, which the other two chips never paid. */
 .mic-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: var(--glass-surface, rgba(255, 255, 255, 0.04));
-  backdrop-filter: var(--glass-blur, blur(14px));
-  -webkit-backdrop-filter: var(--glass-blur, blur(14px));
-  box-shadow: var(--glass-surface-outline);
-  margin-left: 6px;
+  margin-left: 4px;
 }
 
 .mic-dot {
@@ -1481,13 +1473,18 @@ textarea:focus-visible,
 .current-audio-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  /* Tightened from 12px/10px-14px. The row previously stood ~66px tall
+     for a control strip: 32px buttons inside 7px player padding inside
+     10px row padding, plus a trailing "No recording yet" label that
+     competed with the player for width and pushed the duration read-out
+     outside the player's border. */
+  gap: 8px;
   flex-wrap: nowrap;
   border-top: 1px solid var(--glass-border);
   border-bottom: 0;
   background: var(--glass-bg);
   box-shadow: var(--glass-surface-outline);
-  padding: 10px 14px;
+  padding: 7px 12px;
 }
 
 #currentRecordingAudioRow {
@@ -1545,16 +1542,7 @@ textarea:focus-visible,
   pointer-events: none;
 }
 
-.current-audio-meta {
-  font-size: 11px;
-  color: var(--text-2);
-  line-height: 1.4;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  justify-self: end;
-  min-width: 0;
-}
+
 
 #currentRecordingAudio,
 #recordingAudio {
@@ -2134,6 +2122,14 @@ textarea:focus-visible,
   box-shadow: var(--glass-surface-outline);
 }
 
+/* Compact variant for dense control strips (the player row). The 32px
+   default is sized for pane headers, where it sits alone; next to a
+   26px transport button it reads as oversized. */
+.icon-btn-compact {
+  width: 26px;
+  height: 26px;
+}
+
 .icon-btn:hover {
   border-color: var(--glass-border-strong);
   background: var(--control-bg-hover);
@@ -2397,15 +2393,22 @@ textarea:focus-visible,
   background: var(--danger-bg, rgba(239, 68, 68, 0.12));
 }
 
+/* Masked = "a key is stored", not "this control is dead".
+   ``pointer-events: none`` used to sit here (and again as an inline
+   style from JS) which made a saved key impossible to click, focus or
+   select — the field looked like an input and behaved like a picture.
+   Focus now clears the mask, so clicking and typing replaces the key. */
 .key-row input[data-masked="1"] {
   color: var(--text-3);
-  letter-spacing: 0.25em;
+  /* Loose tracking on a fixed-width dot run overflowed the field and
+     ran under the action button. The dots only have to read as "there
+     is something here". */
+  letter-spacing: 0.14em;
   user-select: none;
   opacity: 0.85;
   overflow: hidden;
   text-overflow: clip;
-  cursor: default;
-  pointer-events: none;
+  cursor: text;
 }
 
 .key-action-btn {
@@ -3850,10 +3853,25 @@ canvas {
 
 /* ── Settings → Local models ─────────────────────────────── */
 .models-table { display: flex; flex-direction: column; gap: 6px; }
+/* Columns, not a flow of inline spans. The size and state read-outs
+   used to sit wherever the preceding name happened to end, so the
+   figures never lined up down the card. A grid gives them one x
+   position each; ``auto`` on the action column keeps rows without a
+   button from reserving its width. */
 .model-row {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 10px; border-radius: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 5.5em 4.5em auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px; border-radius: 10px;
   background: var(--surface-2, rgba(255, 255, 255, 0.04));
+}
+
+/* The empty/loading placeholder is a single message, not a row of
+   columns. */
+.model-row-empty {
+  display: block;
+  color: var(--text-dim, #9aa);
 }
 .model-row.ready { opacity: 0.92; }
 .model-row-empty {
@@ -3862,8 +3880,32 @@ canvas {
   font-size: 12.5px;
 }
 .model-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-size { color: var(--text-dim, #9aa); font-variant-numeric: tabular-nums; }
-.model-state { min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+.model-size {
+  color: var(--text-dim, #9aa);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.model-state {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* Both action buttons share the last grid column, so a row can only
+   ever show one of them (Download when absent, Delete when present). */
+.model-dl,
+.model-del {
+  justify-self: end;
+  white-space: nowrap;
+}
+.model-del {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.model-del:hover {
+  color: var(--danger-text, #f87171);
+  border-color: var(--danger-border, #ef4444);
+}
 .model-state.ok { color: var(--ok, #4ade80); }
 .model-state.err { color: var(--err, #f87171); }
 .settings-note { margin: 0; color: var(--text-dim, #9aa); font-size: 12.5px; }
@@ -3892,19 +3934,25 @@ canvas {
 .custom-player {
   display: flex;
   align-items: center;
-  gap: 12px;
-  flex: 1;
+  gap: 8px;
+  flex: 1 1 auto;
   min-width: 0;
-  padding: 7px 12px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--bg-3);
+  /* Everything the player owns — play, elapsed, seek, duration — stays
+     inside its border. Without this the fixed-width children overflowed
+     a squeezed flex box and the duration rendered past the outline,
+     colliding with the buttons that follow it in the row. The seek bar
+     is the only child allowed to absorb the shortfall (see .cp-seek). */
+  overflow: hidden;
 }
 .custom-player:has(.cp-btn:disabled) { opacity: 0.55; }
 .cp-btn {
   flex: none;
-  width: 32px;
-  height: 32px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   border: 1px solid var(--line);
   background: var(--glass-control-bg);
@@ -3926,14 +3974,19 @@ canvas {
 .cp-time {
   flex: none;
   font-variant-numeric: tabular-nums;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-2);
-  min-width: 36px;
+  /* Tabular figures make "0:00" and "59:59" the same width, so a fixed
+     box is enough and the seek bar never shifts as the clock ticks. */
+  min-width: 32px;
   text-align: center;
+  white-space: nowrap;
 }
 .cp-seek {
-  flex: 1;
-  min-width: 60px;
+  /* The only elastic child: it gives up width first so the play button
+     and both time read-outs keep their size inside the player border. */
+  flex: 1 1 0;
+  min-width: 32px;
   height: 5px;
   appearance: none;
   -webkit-appearance: none;

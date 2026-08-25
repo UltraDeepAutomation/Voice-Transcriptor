@@ -988,17 +988,18 @@ function renderLocalModels(): void {
       card.prepend(name);
     }
     name.textContent = row.id + (row.note ? ` — ${row.note}` : "");
+    // The size column exists on EVERY row, even when the catalog has no
+    // hint for that model. An element that appears and disappears per
+    // row cannot line up into a column — which is exactly what the sizes
+    // failed to do before: each row's figure sat wherever that row's
+    // name happened to end.
     let size = card.querySelector<HTMLElement>(".model-size");
-    if (row.size_hint_bytes) {
-      if (!size) {
-        size = document.createElement("span");
-        size.className = "model-size";
-        name.after(size);
-      }
-      size.textContent = fmtBytes(row.size_hint_bytes);
-    } else {
-      size?.remove();
+    if (!size) {
+      size = document.createElement("span");
+      size.className = "model-size";
+      name.after(size);
     }
+    size.textContent = row.size_hint_bytes ? fmtBytes(row.size_hint_bytes) : "";
     let state = card.querySelector<HTMLElement>(".model-state");
     if (!state) {
       state = document.createElement("span");
@@ -1050,6 +1051,23 @@ function renderLocalModels(): void {
       card.appendChild(btn);
     } else if (!wantButton && btn) {
       btn.remove();
+    }
+    // Delete is the inverse of Download and belongs on the same row.
+    // Offered only for a Whisper model actually on disk with nothing in
+    // flight — GigaAM is an engine the desktop layer installs, and the
+    // backend refuses to "delete" it for the same reason.
+    const wantDelete = row.downloaded && row.engine === "whisper" && row.status !== "downloading";
+    let del = card.querySelector<HTMLButtonElement>(".model-del");
+    if (wantDelete && !del) {
+      del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn btn-ghost model-del";
+      del.textContent = "Delete";
+      del.title = "Remove these weights from disk";
+      del.dataset.delModel = row.id;
+      card.appendChild(del);
+    } else if (!wantDelete && del) {
+      del.remove();
     }
     card.classList.toggle("ready", row.downloaded);
   };
@@ -1151,6 +1169,39 @@ function ensureLocalModelsPolling(): void {
   localModelsPoll.sync();
 }
 
+/**
+ * Delete a downloaded model's weights.
+ *
+ * Confirmation is mandatory: the smallest Whisper model is 75 MB and
+ * large-v3 is 3.1 GB, so an accidental click costs a long re-download on
+ * a connection we know nothing about. The backend's refusal messages
+ * (download in flight, engine-managed model) are written to be shown
+ * verbatim, so they pass straight through to the status line.
+ */
+async function requestModelDelete(id: string): Promise<boolean> {
+  const row = localModelsCache.find((m) => m.id === id);
+  const size = row?.size_hint_bytes ? ` (${fmtBytes(row.size_hint_bytes)})` : "";
+  const confirmed = window.confirm(
+    `Delete the "${id}" model${size} from this machine?\n\n`
+    + "The weights are removed from disk and will have to be downloaded "
+    + "again before this model can transcribe. Your recordings and "
+    + "transcripts are not affected.",
+  );
+  if (!confirmed) return false;
+  try {
+    await apiDelete<{ ok: boolean; freed_bytes?: number }>(
+      `/api/models/local/${encodeURIComponent(id)}`,
+    );
+    setStatus(`Deleted ${id}.`, "info");
+    await refreshLocalModels();
+    return true;
+  } catch (e) {
+    const detail = sanitizeUiErrorMessage(e, "Could not delete the model.");
+    setStatus(`Could not delete ${id}: ${detail}`, "error");
+    return false;
+  }
+}
+
 async function requestModelDownload(id: string): Promise<boolean> {
   try {
     await apiPost<{ ok: boolean }>(`/api/models/local/${encodeURIComponent(id)}/download`, {});
@@ -1229,6 +1280,8 @@ function wireLocalModelsUi(): void {
     const target = ev.target as HTMLElement | null;
     const id = target?.closest?.("[data-dl-model]")?.getAttribute("data-dl-model");
     if (id) void requestModelDownload(id);
+    const deleteId = target?.closest?.("[data-del-model]")?.getAttribute("data-del-model");
+    if (deleteId) void requestModelDelete(deleteId);
     // Engine install (GigaAM): desktop-layer action with explicit user
     // consent — a multi-GB download must never start from a stray click.
     if (target?.closest?.("[data-engine-install]")) {
@@ -1458,7 +1511,11 @@ const remoteModelByProvider: Record<RemoteProvider, string> = {
   openrouter: DEFAULT_OPENROUTER_AUDIO_MODEL,
   deepgram: DEFAULT_DEEPGRAM_AUDIO_MODEL,
 };
-const MASKED_KEY_VALUE = "••••••••••••••••••••••••••••••••••••••••";
+// Placeholder shown for a stored key. Long enough to read as a full
+// secret, short enough not to overflow the field and run under the
+// action button — the value is never sent anywhere, so its length
+// carries no information about the real key.
+const MASKED_KEY_VALUE = "••••••••••••••••••••••••";
 const keySavedState: Record<KeyProvider, boolean> = {
   openrouter: false,
   deepgram: false,
@@ -1702,10 +1759,31 @@ async function fetchSavedAudioFromBackend(
   return new File([audioBlob], filename, { type: mimeType });
 }
 
-function setPlayerEnabled(enabled: boolean): void {
+/**
+ * Enable/disable the transport and say why through the player itself.
+ *
+ * The row used to carry a trailing text label ("No recording yet",
+ * "Audio unavailable", or the file size). It competed with the player
+ * for horizontal space — squeezing the transport until the duration
+ * read-out overflowed the player's border — and two of its three states
+ * were redundant with the disabled styling right next to it.
+ *
+ * The empty state now reads as a disabled player, which is what a
+ * disabled player already means. The one state that carries real
+ * information the user cannot otherwise infer — audio that was expected
+ * but could not be loaded — is a genuine failure, so it goes to the
+ * pane's session notice where every other failure in this pane already
+ * appears, and to the player's own tooltip.
+ */
+function setPlayerEnabled(enabled: boolean, reason = ""): void {
   for (const id of ["cpPlayBtn", "cpSeek"]) {
     const el = document.getElementById(id) as HTMLButtonElement | HTMLInputElement | null;
     if (el) el.disabled = !enabled;
+  }
+  const player = document.getElementById("currentRecordingPlayer");
+  if (player) {
+    if (reason) player.title = reason;
+    else player.removeAttribute("title");
   }
 }
 
@@ -1713,7 +1791,6 @@ async function renderLatestSavedAudio(): Promise<void> {
   const renderSeq = ++currentRecordingAudioRenderSeq;
   const row = $("currentRecordingAudioRow");
   const audioEl = $("currentRecordingAudio") as HTMLAudioElement;
-  const metaEl = $("currentRecordingAudioMeta");
 
   // Compute the new playback URL FIRST. If the desired URL equals the
   // currently-playing one, do nothing — previously we unconditionally
@@ -1746,9 +1823,6 @@ async function renderLatestSavedAudio(): Promise<void> {
     && !!audioEl.getAttribute("src")
   ) {
     row.hidden = false;
-    metaEl.textContent = latestSavedAudioState.sizeBytes
-      ? fmtBytes(latestSavedAudioState.sizeBytes)
-      : latestSavedAudioState.title;
     const retranscribeBtn = document.getElementById("retranscribeBtn");
     if (retranscribeBtn) {
       retranscribeBtn.hidden = !latestSavedAudioState.savedName;
@@ -1767,14 +1841,13 @@ async function renderLatestSavedAudio(): Promise<void> {
     audioEl.pause();
     audioEl.removeAttribute("src");
     audioEl.load();
-    setPlayerEnabled(false);
+    setPlayerEnabled(false, "No recording yet.");
     const seekEl = document.getElementById("cpSeek") as HTMLInputElement | null;
     const curEl = document.getElementById("cpCurrentTime") as HTMLSpanElement | null;
     const durEl = document.getElementById("cpDuration") as HTMLSpanElement | null;
     if (seekEl) seekEl.value = "0";
     if (curEl) curEl.textContent = "0:00";
     if (durEl) durEl.textContent = "0:00";
-    metaEl.textContent = "No recording yet";
     return;
   }
 
@@ -1826,8 +1899,16 @@ async function renderLatestSavedAudio(): Promise<void> {
     audioEl.pause();
     audioEl.removeAttribute("src");
     audioEl.load();
-    setPlayerEnabled(false);
-    metaEl.textContent = "Audio unavailable";
+    // A real failure: audio was expected for this recording and could
+    // not be loaded from the backend or from memory. Surface it where
+    // the pane's other failures appear rather than in a label the user
+    // has to notice.
+    setPlayerEnabled(false, "Audio for this recording could not be loaded.");
+    showRecordSessionNotice(
+      "Audio for this recording could not be loaded.",
+      "warning",
+      6000,
+    );
     return;
   }
   // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
@@ -1838,9 +1919,6 @@ async function renderLatestSavedAudio(): Promise<void> {
   audioEl.src = playbackUrl;
   audioEl.load();
   row.hidden = false;
-  metaEl.textContent = latestSavedAudioState.sizeBytes
-    ? fmtBytes(latestSavedAudioState.sizeBytes)
-    : latestSavedAudioState.title;
   // Show Re-transcribe button when we have a saved audio file
   const retranscribeBtn = document.getElementById("retranscribeBtn");
   if (retranscribeBtn) {
@@ -2675,6 +2753,28 @@ function isMaskedKeyInput(el: HTMLInputElement): boolean {
   return el.dataset.masked === "1";
 }
 
+/**
+ * Reflect "a key is stored for this provider" on the input.
+ *
+ * ``data-masked`` is the single source of truth for the masked state:
+ * JS sets the attribute and the value, the stylesheet decides how a
+ * masked field looks. The previous version also wrote
+ * ``style.cursor`` and ``style.pointerEvents`` inline — the exact two
+ * declarations the ``[data-masked="1"]`` rule already made — so the
+ * same decision lived in two places, and the inline copy won.
+ *
+ * That copy was also what made the field feel broken:
+ * ``pointer-events: none`` plus ``tabIndex = -1`` meant a saved key
+ * could not be clicked, focused or selected at all. The only way to
+ * replace one was to notice that the adjacent button had silently
+ * become a Delete button, press it, and start over. Now the field
+ * accepts focus and clears the mask on the first interaction, so
+ * clicking it and typing replaces the key — what the control looks
+ * like it should do.
+ *
+ * ``readOnly`` stays while masked so the placeholder dots cannot be
+ * partially edited into a corrupt key; the focus handler lifts it.
+ */
 function markKeyMasked(provider: KeyProvider, saved: boolean): void {
   const el = keyInput(provider);
   const isSaved = !!saved;
@@ -2683,24 +2783,25 @@ function markKeyMasked(provider: KeyProvider, saved: boolean): void {
     el.value = MASKED_KEY_VALUE;
     el.dataset.masked = "1";
     el.readOnly = true;
-    el.tabIndex = -1;
-    el.style.cursor = "default";
-    el.style.pointerEvents = "none";
   } else {
     el.value = "";
     delete el.dataset.masked;
     el.readOnly = false;
-    el.tabIndex = 0;
-    el.style.cursor = "";
-    el.style.pointerEvents = "";
   }
 }
 
+/**
+ * Drop the mask so the field is ready to accept a replacement key.
+ *
+ * Idempotent, and safe to call from focus, pointerdown or input — all
+ * three are "the user is about to type here".
+ */
 function clearMaskedKeyOnEdit(provider: KeyProvider): void {
   const el = keyInput(provider);
   if (!isMaskedKeyInput(el)) return;
   el.value = "";
   delete el.dataset.masked;
+  el.readOnly = false;
 }
 
 function syncKeyActionButton(provider: KeyProvider): void {

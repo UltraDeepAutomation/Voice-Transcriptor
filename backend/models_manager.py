@@ -123,6 +123,104 @@ def is_downloaded(model_id: str) -> bool:
     return whisper_downloaded(model_id)
 
 
+class ModelDeleteError(RuntimeError):
+    """Deletion refused for a reason the user can act on."""
+
+
+def delete_model(model_id: str) -> Dict[str, Any]:
+    """Remove a downloaded Whisper model from the Hugging Face cache.
+
+    Deleting weights is the inverse of ``start_download`` and belongs in
+    the same module, keyed off the same ``WHISPER_REPOS`` mapping — the
+    SSOT for where a catalog id actually lives on disk.
+
+    Refused, with a reason the UI can show verbatim, when:
+
+    * the id is unknown (``KeyError``);
+    * the id is a GigaAM model — those are not weights this manager owns
+      but a whole Python engine installed by the desktop layer into
+      ``userData/engine-site``. Removing it is an engine-lifecycle
+      operation, not a cache eviction, and pretending otherwise would
+      leave the engine installed while the UI claims it is gone;
+    * a download for that id is in flight — deleting the cache under a
+      running ``hf_hub_download`` produces a half-written repo that
+      ``whisper_downloaded`` would then report as absent while the worker
+      keeps writing into it.
+
+    Also evicts the model from the in-process transcription cache. Without
+    that, a model deleted from disk keeps serving transcriptions from RAM
+    until the backend restarts, while the UI shows it as not downloaded —
+    two answers to "is this model available", which is exactly the drift
+    this codebase treats as a bug.
+    """
+    from backend.model_catalog import LOCAL_TRANSCRIPTION_MODELS
+
+    if model_id not in LOCAL_TRANSCRIPTION_MODELS:
+        raise KeyError(model_id)
+    if model_id.startswith("gigaam-"):
+        raise ModelDeleteError(
+            "GigaAM is an engine, not a downloadable model. Remove it from "
+            "Settings → Local models → engine controls."
+        )
+    if _get_state(model_id).get("status") == "downloading":
+        raise ModelDeleteError(
+            f"{model_id} is still downloading. Wait for it to finish, then delete."
+        )
+    repo = WHISPER_REPOS.get(model_id)
+    if not repo:
+        raise KeyError(model_id)
+
+    freed_bytes = 0
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        cache = scan_cache_dir()
+        revisions = [
+            revision.commit_hash
+            for cached_repo in cache.repos
+            if cached_repo.repo_id == repo
+            for revision in cached_repo.revisions
+        ]
+        if not revisions:
+            # Nothing on disk. Report success rather than an error: the
+            # user's intent ("this model should not be stored") already
+            # holds, and a failure here would be unactionable.
+            _set_state(model_id, status="idle", progress=0.0, error=None)
+            _evict_from_transcription_cache(model_id)
+            return {"deleted": False, "freed_bytes": 0}
+        strategy = cache.delete_revisions(*revisions)
+        freed_bytes = int(getattr(strategy, "expected_freed_size", 0) or 0)
+        strategy.execute()
+    except ImportError as e:  # huggingface_hub missing — nothing to scan
+        raise ModelDeleteError(f"model cache is unavailable: {e}") from e
+    except OSError as e:
+        raise ModelDeleteError(f"could not remove {model_id} from disk: {e}") from e
+
+    _set_state(model_id, status="idle", progress=0.0, error=None)
+    _evict_from_transcription_cache(model_id)
+    logger.info("models: %s deleted (freed ~%d bytes)", model_id, freed_bytes)
+    return {"deleted": True, "freed_bytes": freed_bytes}
+
+
+def _evict_from_transcription_cache(model_id: str) -> None:
+    """Drop a deleted model from the resident transcription cache.
+
+    Imports ``backend.transcribe`` lazily and only touches it when the
+    module is ALREADY loaded: importing it here would drag faster-whisper
+    into a process that may never transcribe locally, undoing the lazy
+    import that keeps an API-only session at ~60 MB.
+    """
+    import sys
+
+    module = sys.modules.get("backend.transcribe")
+    if module is None:
+        return
+    try:
+        module.release_model(model_id)
+    except Exception:
+        logger.exception("models: could not evict %s from the model cache", model_id)
+
+
 def _repo_file_sizes(repo: str, files: list[str]) -> dict[str, int]:
     """Best-effort byte sizes for *files* in *repo* (BUG-44).
 

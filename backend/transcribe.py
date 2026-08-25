@@ -225,6 +225,22 @@ def model_is_resident(model_name: str) -> bool:
         return model_name in _MODEL_CACHE
 
 
+def release_model(model_name: str) -> bool:
+    """Drop one model from the resident cache. Returns True if it was there.
+
+    Used when the model's weights are removed from disk: leaving the
+    loaded instance in memory would keep serving transcriptions for a
+    model the rest of the app reports as absent.
+    """
+    with _MODEL_LOCK:
+        existed = _MODEL_CACHE.pop(model_name, None) is not None
+        _MODEL_LAST_USED.pop(model_name, None)
+        _MODEL_WARM_STATE.pop(model_name, None)
+    if existed:
+        logger.info("whisper model released on request: model=%s", model_name)
+    return existed
+
+
 def release_idle_models(now: Optional[float] = None) -> List[str]:
     """Drop every cached model idle for longer than the unload window.
 
