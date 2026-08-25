@@ -713,6 +713,22 @@ const UI_TOKENS = {
      * speech. Eight is also the entire population it can affect.
      */
     minRecordingMs: 500,
+    /**
+     * How much longer the microphone stays open after Stop.
+     *
+     * Stop lands while the user is still finishing the last word far more
+     * often than it looks: across 112 measured stops, 39 % left NO
+     * trailing silence at all and 45 % left 100 ms or less. Two saved
+     * recordings analysed directly end with speech at full level in the
+     * final 50 ms frame — the word is not "lost in transcription", it is
+     * not in the audio, and no amount of re-decoding can recover it.
+     * A word also needs its release and a moment of silence before a
+     * recogniser will seal it.
+     *
+     * Fixed, deliberately: no speech detection, no variable window. Stop
+     * means stop, 200 ms later, every time.
+     */
+    stopTailHoldMs: 200,
   },
   finalize: {
     segmentEpsilonSec: 0.08,
@@ -9432,6 +9448,7 @@ async function stopLive(
   // backend's post-CloseStream is_final emission and truncate the
   // tail.
   let _wsToCloseAtEnd: WebSocket | null = null;
+  let tailHoldMs = 0;
   let stopTransitionReleased = false;
   let stoppedRecordingId = 0;
   let stoppedSessionToken = "";
@@ -9456,6 +9473,16 @@ async function stopLive(
       stopTransitionOwnerToken = "";
     }
   };
+  // ── Trailing capture ────────────────────────────────────────────────
+  // The microphone stays open a moment past the press so the last word
+  // is complete in the audio. Everything below — the drain, the sink,
+  // the finalize — then works on a recording that actually contains it.
+  // Skipped for a discarded take: there is nothing to preserve.
+  if (!discarding && stream) {
+    const holdStarted = performance.now();
+    await new Promise((resolve) => window.setTimeout(resolve, UI_TOKENS.capture.stopTailHoldMs));
+    tailHoldMs = performance.now() - holdStarted;
+  }
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
   const recordedSec = recordedMs / 1000;
   // ── transcription-latency timer ───────────────────────────────────
@@ -11327,14 +11354,19 @@ async function stopLive(
     micHealth.observe({ kind: "session-stop" });
     releaseStopTransitionAfterCaptureDetach();
     mark("stopLive:done");
-    const totalMs = performance.now() - stopT0;
+    // The hold runs before this timer starts, so it is added back: the
+    // number that matters is the whole distance from the press.
+    const totalMs = performance.now() - stopT0 + tailHoldMs;
     const labels = stopTimings
       .map(([label, t], i) => {
         const prev = i > 0 ? stopTimings[i - 1][1] : 0;
         return `${label}: ${(t - prev).toFixed(0)}ms`;
       })
       .join(" → ");
-    console.log(`[trace stopLive] total=${totalMs.toFixed(0)}ms | ${labels}`);
+    console.log(
+      `[trace stopLive] total=${totalMs.toFixed(0)}ms | ` +
+      `tailHold: ${tailHoldMs.toFixed(0)}ms → ${labels}`,
+    );
     (window as unknown as { __transcriptorStopTimings?: unknown }).__transcriptorStopTimings = {
       totalMs,
       phases: stopTimings,
