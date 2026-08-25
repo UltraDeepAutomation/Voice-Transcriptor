@@ -299,10 +299,13 @@ class DeepgramLiveConfig:
     # 300 ms matches typical conversational pause length (250–500 ms),
     # so utterance breaks reliably seal ``is_final`` segments DURING
     # streaming. The "broken fragments" concern is unrelated to this
-    # window — ``smart_format=True`` (enabled above) is what handles
-    # sentence assembly + punctuation regardless of how often
-    # individual segments are sealed. The 700 ms bump was solving the
-    # wrong axis.
+    # window — ``punctuate`` handles sentence assembly and punctuation
+    # regardless of how often individual segments are sealed. (This used
+    # to credit ``smart_format``; a same-audio A/B over 280 s of Russian
+    # returned byte-identical text with the flag on and off, so the
+    # credit belonged to ``punctuate`` all along. See
+    # ``backend.deepgram_format``.) The 700 ms bump was solving the wrong
+    # axis.
     endpointing_ms: int = 300
     # Utterance end is the silence threshold that triggers
     # ``speech_final=true`` (end-of-utterance signal used downstream

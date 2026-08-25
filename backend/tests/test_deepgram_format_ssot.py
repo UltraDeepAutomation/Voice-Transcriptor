@@ -62,11 +62,16 @@ class SharedFormattingTests(unittest.TestCase):
 
     def test_smart_formatting_is_on(self):
         # Recorded so a flip is a deliberate edit to this expectation and
-        # not a silent drift. The premise for turning it off — that
-        # Deepgram strips punctuation for Russian — is contradicted by the
-        # live path's own output: 23 sampled transcripts run with it
-        # enabled carry a median of 60.3 punctuation marks per 1000
-        # letters.
+        # not a silent drift.
+        #
+        # The same-audio A/B has been run through this app's REST path
+        # with only this flag changed: three recordings, 280 s of Russian,
+        # six calls, all three pairs byte-identical — same characters,
+        # punctuation, capitalisation and number formatting. The flag is
+        # inert for nova-3 on this content once ``punctuate`` is on, which
+        # falsifies BOTH of the comments that used to disagree about it.
+        # It stays at the provider's default because there is nothing to
+        # optimise here and other content types are not sampled.
         self.assertEqual(shared_format_params()["smart_format"], "true")
 
 

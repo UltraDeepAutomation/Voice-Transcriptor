@@ -21,13 +21,28 @@ strips punctuation does not produce that. An earlier measurement over a
 letters on the live path against 36.6 on the batch path, i.e. the side
 that disabled the flag to protect punctuation had ~39 % less of it.
 
-What remains genuinely unproven is the narrower question of whether
-enabling it makes the BATCH path better, which only a same-audio A/B can
-answer, and that costs live API calls against the user's key. So the
-value is set from the evidence that exists and is overridable without a
-code change: set ``TRANSCRIPTOR_DEEPGRAM_SMART_FORMAT=0`` to disable it
-on both paths, ``=1`` to force it on. The point of this module is not the
-value — it is that there is now one value.
+The A/B that settles it has now been run, on this app's own REST path,
+with only the flag changed: three of the user's recordings (28.8 s,
+77.6 s and 174.7 s — 280 seconds of Russian, six calls), and all three
+pairs came back **byte-identical**. Same characters, same word count,
+same punctuation, same capitalisation, same number formatting.
+
+So the flag is inert for nova-3 on this content once ``punctuate`` is
+already on, and BOTH comments were wrong: it does not strip punctuation,
+and it is not what produces punctuation either. The disagreement was
+never about behaviour that either side could observe.
+
+The value therefore stays at Deepgram's recommended default rather than
+being flipped to match a measurement that shows no difference — there is
+nothing here to optimise, and other languages or content types (English
+dates, currency, phone numbers) are not sampled by this test. What the
+measurement licenses is the opposite of a change: whoever reads this next
+does not need to run the A/B again, and does not need to believe either
+of the old comments.
+
+``TRANSCRIPTOR_DEEPGRAM_SMART_FORMAT=0`` disables it on both paths, ``=1``
+forces it on. The point of this module is not the value — it is that
+there is one value.
 
 Options that only one endpoint accepts (``paragraphs``, ``numerals`` are
 prerecorded-only; ``endpointing``, ``utterance_end_ms`` are live-only)
