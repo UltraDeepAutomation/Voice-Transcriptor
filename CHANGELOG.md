@@ -6,6 +6,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Performance
+- **Paste script walks the target's menu bar once, not twice.** The auto-paste AppleScript asked `exists` for a deep accessibility path and then fetched the same path again — two full traversals of another application's menu bar, the most expensive operation in the script. Measured against a live app: 170–240 ms duplicated and visibly jittery, versus a flat 160 ms evaluated once, over a 40 ms `osascript` baseline. The window-title lookup had the same shape. Semantics are unchanged; a missing element raises, which is exactly what the `exists` test was detecting.
+
 - **Stop latency: the post-Finalize wait now sizes itself from tail coverage.** Measured over 706 real Deepgram sessions in `main.log`: median finalize wait 1205 ms, p90 3220 ms, 1053 s in total — and 267 of 410 traced stops (65 %) ended with the streamed audio *already fully covered* by finalized segments, meaning Finalize had nothing left to flush and Deepgram was never going to answer. The coverage figure that proves nothing is missing was computed only inside the timeout handler, i.e. strictly after the ceiling had been paid. It is now measured first (`_tail_coverage`) and chooses the budget: an uncovered tail keeps the full 3.0 s plus the retry (truncating there would cost the user real words), a covered tail gets a 0.75 s confirmation window — sized from 411 measured round trips whose p95 is 0.49 s and max is 1.49 s.
 - **Deepgram session summaries carry the whole picture** (`streamed_sec`, `text_len` added), and the finalize log lines now print `streamed / covered / gap` so a truncated tail can be diagnosed from the log alone instead of inferred.
 
