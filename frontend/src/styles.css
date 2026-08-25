@@ -328,7 +328,7 @@ body.platform-darwin .sidebar {
 
 .screen-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
   padding: 20px var(--page-gutter-screen) 16px;
@@ -346,6 +346,17 @@ body.platform-darwin .sidebar {
 
 /* Version badge in Settings header. Kept subtle — the number is
  * what support cares about, not the visual weight. */
+/* Right-hand half of the Settings header: version above the update
+   action, both aligned to the right edge and vertically centred against
+   the title. */
+.screen-header-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex: none;
+}
+
 .screen-header-version {
   font-size: 12px;
   color: var(--text-muted, #a0a0a0);
@@ -486,7 +497,12 @@ body.platform-darwin .sidebar {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: var(--h-control);
+  /* `--h-topbar-control` — the token the MIC and LANG selects already
+     use — NOT `--h-control`. The button previously took the latter and
+     stood 40 px tall beside 34 px selects. A row of controls has one
+     height, and this row already had a token that said so. */
+  height: var(--h-topbar-control);
+  min-height: var(--h-topbar-control);
   padding: 0 16px;
   font-weight: 600;
   white-space: nowrap;
@@ -739,10 +755,14 @@ body.platform-darwin .sidebar {
    `margin-left: auto` lives on the wrapper, not on the button, so the
    caption travels with it — putting it on the button would have pushed
    the button right while leaving "Rec" behind at the left edge. */
+/* `align-items` is inherited from `.top-item` (flex-start), so the
+   caption sits at the control's left edge exactly like MIC and LANG.
+   Pinning it to flex-end pushed "Rec" to the right edge of its own
+   wrapper, which read as a different alignment rule from its two
+   neighbours. */
 .top-item-record {
   width: auto;
   margin-left: auto;
-  align-items: flex-end;
 }
 
 .top-item .lbl {
@@ -2472,11 +2492,38 @@ textarea:focus-visible,
   cursor: text;
 }
 
+/* Affordance inside a field, not a control on top of one.
+   It inherited `.icon-btn`'s background, border and inset shadow — the
+   same surface `.key-row` already paints — so the row rendered as a box
+   containing a second, identically-coloured box, which is the "лишнее
+   наложение" in the report. A clear-button inside a search field is the
+   right precedent: flat until hovered. */
 .key-action-btn {
   width: var(--h-control-compact);
   height: var(--h-control-compact);
   min-width: var(--h-control-compact);
   position: relative;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.key-action-btn:hover:not(:disabled) {
+  background: var(--glass-control-bg);
+  border-color: var(--control-border);
+}
+
+.key-action-btn:disabled {
+  opacity: 0.35;
+}
+
+/* The row owns the padding; the input owned a second copy of it and
+   stretched to the row's full height, so the text sat against the
+   row's top inset instead of centred in it. */
+.key-row input {
+  height: 100%;
+  padding: 0;
+  border-radius: 0;
 }
 
 .key-action-btn::before {

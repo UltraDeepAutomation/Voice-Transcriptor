@@ -4567,13 +4567,27 @@ const MIC_PILL_TOOLTIP: Record<MicHealthState, string> = {
   lost: describeMicHealth("lost").statusText,
 };
 
+/** Every state class this pill can carry, so a swap can clear the rest. */
+const MIC_PILL_STATE_CLASSES: readonly string[] = [
+  "idle", "probing", "live", "silent", "muted", "lost",
+].map((state) => `mic-pill-${state}`);
+
 function renderMicHealthPill(snap: MicHealthSnapshot): void {
   const pill = document.getElementById("micPill");
   const text = document.getElementById("micText");
   if (!pill || !text) return;
-  // The class carries the state so the stylesheet owns the colours; the
-  // markup keeps its dot/label children instead of being overwritten.
-  pill.className = `mic-pill mic-pill-${snap.state}`;
+  // Swap ONLY the state class. This used to assign `className`
+  // wholesale, which also wiped `status-chip` — the class that gives
+  // all three topbar chips their shared background, border and radius.
+  // The pill therefore rendered as bare text next to two capsules from
+  // the first state change onward, and no amount of fixing the
+  // stylesheet could show, because the markup had already lost the
+  // class the rules were keyed to. A state writer must not own the
+  // whole class attribute.
+  const nextState = `mic-pill-${snap.state}`;
+  for (const cls of MIC_PILL_STATE_CLASSES) {
+    pill.classList.toggle(cls, cls === nextState);
+  }
   text.textContent = MIC_PILL_LABEL[snap.state];
   pill.setAttribute("title", MIC_PILL_TOOLTIP[snap.state]);
   (pill as HTMLElement).hidden = snap.state === "idle";

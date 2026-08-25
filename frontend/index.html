@@ -567,9 +567,18 @@
 
       <section class="view" data-view="settings" hidden>
         <div class="settings-shell">
+          <!--
+            Title left, version + update action right, on ONE row. The
+            version and the button used to be stacked underneath the
+            heading inside `.screen-header-copy`, which cost two extra
+            rows of vertical space at the top of every visit to Settings
+            while the right half of the header sat empty.
+          -->
           <div class="screen-header">
             <div class="screen-header-copy">
               <h2>Settings</h2>
+            </div>
+            <div class="screen-header-meta">
               <div class="screen-header-version" id="appVersionBadge" aria-live="polite">
                 <!-- ``#appVersionNumber`` text is set by main.tsx on boot
                      from the compile-time-injected ``__APP_VERSION__``
