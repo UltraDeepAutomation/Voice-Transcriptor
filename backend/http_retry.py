@@ -5,6 +5,7 @@ Centralised retry logic with exponential backoff — used by both
 """
 
 import datetime as _dt
+import logging
 import random
 import time
 from email.utils import parsedate_to_datetime
@@ -13,6 +14,48 @@ from typing import Optional, Tuple
 import requests
 from requests import RequestException
 from requests.adapters import HTTPAdapter
+
+logger = logging.getLogger(__name__)
+
+# ── Why this module logs ────────────────────────────────────────────────
+#
+# Every remote transcription and upscale call passes through here, and
+# none of it was recorded. A retry is invisible latency: a user whose
+# upload took eight seconds because the provider returned 429 twice sees
+# only that it was slow, and the support log agreed with them — it had
+# nothing to say about why.
+#
+# Worse, the two paths that give up have real consequences the log never
+# mentioned. A read timeout on a POST is abandoned deliberately, because
+# the provider may already have done (and billed) the work; and a final
+# failure after N attempts becomes a user-facing error whose history —
+# how many attempts, how long, against which status — existed nowhere.
+#
+# Retries are logged at INFO (they are normal, and bounded). Giving up is
+# WARNING, because that is what a support reader is looking for.
+
+
+def _log_target(method: str, url: str) -> str:
+    """``METHOD host/path`` — never the query string.
+
+    Provider URLs carry API keys and signed parameters in the query for
+    some endpoints. The host and path are what identify the call; the
+    query is exactly the part that must not reach a log file.
+    """
+    verb = str(method or "GET").upper()
+    if not isinstance(url, str) or not url:
+        return verb
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        # ``urlsplit`` does not raise on nonsense — it returns empty
+        # components — so an unusable result has to be recognised rather
+        # than caught. A target with no host and no path is not a target.
+        located = f"{parts.netloc}{parts.path}".strip()
+        return f"{verb} {located}" if located else verb
+    except Exception:
+        return verb
 
 
 def _exponential_backoff(attempt: int, base: float) -> float:
@@ -135,6 +178,9 @@ def request_with_retry(
     # never reached the server; read timeouts are terminal for them.
     _http_method = str(method or "GET").upper()
     _idempotent = _http_method in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+    target = _log_target(method, url)
+    started = time.monotonic()
+    retried = 0
     for attempt in range(attempts):
         try:
             resp = _SESSION.request(method, url, timeout=timeout, **kwargs)
@@ -147,10 +193,31 @@ def request_with_retry(
                 # provider, gets throttled harder, and reports a false
                 # hard failure when 5 seconds would have recovered.
                 ra_sec = _parse_retry_after(resp.headers.get("Retry-After"))
+                honoured_retry_after = False
                 if ra_sec > 0:
-                    delay = max(delay, min(ra_sec, _RETRY_AFTER_CAP_SEC))
+                    honoured = max(delay, min(ra_sec, _RETRY_AFTER_CAP_SEC))
+                    honoured_retry_after = honoured > delay
+                    delay = honoured
+                retried += 1
+                # Which of the two clocks won matters: our backoff is a
+                # guess, Retry-After is the provider telling us the
+                # answer. A run of Retry-After-driven waits is a rate
+                # limit, not a flaky network, and they are fixed very
+                # differently.
+                logger.info(
+                    "%s: HTTP %d, retrying in %.2fs (attempt %d/%d, source=%s)",
+                    target, resp.status_code, delay, attempt + 1, attempts,
+                    "retry-after" if honoured_retry_after else "backoff",
+                )
                 time.sleep(delay)
                 continue
+            if retried:
+                logger.info(
+                    "%s: HTTP %d after %d retr%s in %.2fs",
+                    target, resp.status_code, retried,
+                    "y" if retried == 1 else "ies",
+                    time.monotonic() - started,
+                )
             return resp
         except RequestException as e:
             last_err = e
@@ -161,11 +228,35 @@ def request_with_retry(
                 # instead (BUG-53). ConnectTimeout is NOT here: it fires
                 # before the request reaches the server, so a retry is
                 # safe even for POST.
+                #
+                # Deliberately abandoned, and the user is about to see an
+                # error for a request that may in fact have succeeded
+                # upstream. That is worth a line of its own.
+                logger.warning(
+                    "%s: read timeout on a non-idempotent request after %.2fs — "
+                    "not retrying, the provider may already have processed it",
+                    target, time.monotonic() - started,
+                )
                 break
             if attempt == attempts - 1:
                 break
-            time.sleep(_exponential_backoff(attempt, backoff_base))
+            retry_delay = _exponential_backoff(attempt, backoff_base)
+            retried += 1
+            logger.info(
+                "%s: %s, retrying in %.2fs (attempt %d/%d)",
+                target, type(e).__name__, retry_delay, attempt + 1, attempts,
+            )
+            time.sleep(retry_delay)
     if last_err is not None:
+        # The end of the road: the user is about to see an error. Record
+        # what it cost to get here, because "the upload failed" with no
+        # history behind it is the report that cannot be diagnosed.
+        logger.warning(
+            "%s: giving up after %d attempt%s in %.2fs — %s: %s",
+            target, retried + 1, "" if retried == 0 else "s",
+            time.monotonic() - started,
+            type(last_err).__name__, last_err,
+        )
         # Translate common low-level error patterns into actionable
         # messages. The raw form the user previously saw —
         #   "network error after 3 attempts: ('Connection aborted.',
