@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.10] - 2026-08-25
+
+Verified good build: stop latency, memory, idle CPU and the recording tail all measured on
+this tree. See the entries below for the numbers each change was accepted on.
+
 ### Performance
 - **Half a second removed from every stop.** The instrumentation shipped an hour earlier produced its first breakdown: `total=1255ms | stream.getTracks.stop: 1ms → flushWorkletPort: 2ms → waitForWorkletDrain: 467ms → …`. `waitForWorkletDrain` waits for a 120 ms gap with no new frame, bounded at 450 ms — but the microphone track is stopped in step 1 while the worklet node stays connected, so the audio thread keeps calling `process()` and keeps handing over frames of silence. The idle condition can never be satisfied, so the cost was the ceiling, every time. The flush that runs immediately before it already provides a complete barrier: the processor runs `flushPending()` and posts `flush-ack` in the same handler, and a MessagePort preserves order, so every PCM message posted before the ack has been delivered. `flushWorkletPort` now reports whether the ack arrived, and the drain runs only when it did not — which is the ScriptProcessor fallback, where no port exists and the silence heuristic is the only barrier available.
 
