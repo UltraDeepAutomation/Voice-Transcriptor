@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-25
+
+The release that fixed the things that had been quietly costing words and
+seconds on every single recording. Every entry below was accepted on a
+measurement taken from production logs, and the ones that were wrong the first
+time are marked as such — including two regressions introduced and corrected
+inside this release.
+
+Headline numbers, all measured on this tree:
+
+| | before | after |
+|---|---|---|
+| hotkey press → renderer | 110-380 ms | 2-29 ms |
+| press → first captured audio frame | never measured | 182-230 ms |
+| paste | 592 ms (p50) | 235-374 ms |
+| finalize, empty tail | 962-1011 ms | ~460 ms |
+| the last word of a sentence | missing in ~45 % of stops' worth of risk | captured |
+
 ### Performance
 - **A hotkey press reaches the microphone in one round trip.** The press had to survive three sequential `executeJavaScript` calls to the renderer and a capsule-window create before the toggle event was dispatched: `renderer_ready_check` → `queryRendererRecordingState` → `publishRecordingStatus` (110-380 ms, because the capsule is destroyed 8 s after going idle and most presses pay a fresh create) → an awaited `osascript` frontmost-app lookup (60-250 ms). The three questions are one question — the toggle handler reads both facts anyway — so `dispatchRendererTogglePress` asks and acts at once, with `allowStart` carrying the main process's veto (post-stop work holding the single capsule, microphone permission not granted) so a start that could not proceed is still refused. `getMediaAccessStatus` is synchronous, so the granted case costs nothing. The capsule is published, not awaited. The frontmost lookup is fired at the press and read after the start is confirmed — it reports the same app either way, and auto-paste needs it at stop.
 - **The paste stopped waiting on itself: p50 ~590 ms, ~240 ms of it fixed sleeps that nothing observed.** `set frontmost of p to true` followed by `delay 0.08` ran on every paste; the log says the target was already frontmost in **1459 of 1459** of them, because Transcriptor never takes focus (the capsule is a non-focusable window). The activation is now conditional on `frontmost of p is false` — the safety net survives, the delay does not, and the returned reason carries `+activated` when it does fire, so the assumption stays measurable. The `delay 0.16` between clicking the target's Paste menu item and returning was 160 ms added to exactly the moment the user is waiting for: nothing after it observes the paste, the clipboard restore does not run for at least 1.5 s, and the auto-send Enter carries its own settle (220 → 380 ms, so the paste-to-Enter interval is unchanged).
