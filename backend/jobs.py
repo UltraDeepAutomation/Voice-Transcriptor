@@ -1,11 +1,39 @@
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+logger = logging.getLogger(__name__)
 
 TERMINAL_JOB_PRUNE_GRACE = timedelta(minutes=15)
+
+# ── Why the lifecycle is logged HERE ────────────────────────────────────
+#
+# Upload and from-path transcription is the one pipeline that left no
+# trace at all: this module had no logger, and the only record of a job
+# in main.log was the uvicorn access line for the POST that created it.
+# A user reporting "I dropped in a file and nothing came out" produced a
+# support log with nothing to read — not whether the job started, how
+# long it ran, what it produced, or why it stopped.
+#
+# Every job transitions through this store, so one record per transition
+# here covers every caller, present and future, in a uniform shape. The
+# alternative — logging at each call site — is the arrangement that lets
+# a new path ship silent.
+#
+# Fields are snapshotted under the lock and emitted after releasing it:
+# a logging handler writes to stderr, and holding a store-wide mutex
+# across a blocking write would make every other job's state transition
+# wait on the pipe.
+
+
+def _elapsed_ms(since: Optional[datetime], until: Optional[datetime] = None) -> int:
+    if since is None:
+        return -1
+    end = until or datetime.now(timezone.utc)
+    return int((end - since).total_seconds() * 1000)
 
 
 @dataclass
@@ -17,6 +45,10 @@ class Job:
     result: Optional[Dict[str, Any]] = None
     result_files: Dict[str, str] = field(default_factory=dict)  # kind -> path
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Set when the worker picks the job up. The gap from ``created_at``
+    # is queue wait — the difference between "the app is slow" and "the
+    # pool is saturated", which is not recoverable after the fact.
+    started_at: Optional[datetime] = None
     terminal_observed_at: Optional[datetime] = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -97,6 +129,7 @@ class JobStore:
     # already unreachable via the public ``get`` API, so there is nothing
     # to preserve.
     def set_running(self, job_id: str) -> None:
+        queued_ms: Optional[int] = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -105,6 +138,9 @@ class JobStore:
                 return
             job.status = "running"
             job.progress = 0.01
+            job.started_at = datetime.now(timezone.utc)
+            queued_ms = _elapsed_ms(job.created_at, job.started_at)
+        logger.info("job start: id=%s queued_ms=%d", job_id, queued_ms)
 
     def set_progress(self, job_id: str, progress: float) -> None:
         with self._lock:
@@ -121,6 +157,7 @@ class JobStore:
     def set_done(
         self, job_id: str, result: Dict[str, Any], result_files: Dict[str, str]
     ) -> None:
+        snapshot: Optional[tuple] = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -131,8 +168,23 @@ class JobStore:
             job.progress = 1.0
             job.result = result
             job.result_files = result_files
+            snapshot = (
+                _elapsed_ms(job.created_at),
+                _elapsed_ms(job.started_at),
+                len(str((result or {}).get("text") or "")),
+                sorted(result_files or {}),
+            )
+        total_ms, ran_ms, text_len, files = snapshot
+        # A transcription that "succeeded" with an empty text is a
+        # different outcome from one that produced words, and the two
+        # were indistinguishable in the log. text_len separates them.
+        logger.info(
+            "job done: id=%s total_ms=%d ran_ms=%d text_len=%d files=%s",
+            job_id, total_ms, ran_ms, text_len, ",".join(files) or "-",
+        )
 
     def set_error(self, job_id: str, error: str) -> None:
+        snapshot: Optional[tuple] = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -141,8 +193,17 @@ class JobStore:
                 return
             job.status = "error"
             job.error = error
+            snapshot = (_elapsed_ms(job.created_at), _elapsed_ms(job.started_at), job.progress)
+        total_ms, ran_ms, progress = snapshot
+        # WARNING, not INFO: this is the line a support reader is looking
+        # for, and it must stand out from the per-job success records.
+        logger.warning(
+            "job failed: id=%s total_ms=%d ran_ms=%d progress=%.2f error=%s",
+            job_id, total_ms, ran_ms, progress, error,
+        )
 
     def cancel(self, job_id: str) -> Optional[Job]:
+        snapshot: Optional[tuple] = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -152,7 +213,16 @@ class JobStore:
             job.status = "cancelled"
             job.error = None
             job.cancel_event.set()
-            return job
+            snapshot = (_elapsed_ms(job.created_at), _elapsed_ms(job.started_at), job.progress)
+            cancelled = job
+        total_ms, ran_ms, progress = snapshot
+        # How far it got matters: a cancel at 0.02 is a user changing
+        # their mind, one at 0.95 is a user who gave up waiting.
+        logger.info(
+            "job cancelled: id=%s total_ms=%d ran_ms=%d progress=%.2f",
+            job_id, total_ms, ran_ms, progress,
+        )
+        return cancelled
 
     def is_cancelled(self, job_id: str) -> bool:
         with self._lock:

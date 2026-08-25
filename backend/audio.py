@@ -94,6 +94,36 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _ffmpeg_io_paths(cmd: list[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort (input, output) from an ffmpeg argv.
+
+    Every command in this module is built here in the same shape: the
+    input follows ``-i`` and the output is the final argument. Reading
+    them back beats threading two more parameters through six call
+    sites, and a shape this code fully controls cannot surprise us.
+    Returns ``None`` for either side it cannot identify — this only
+    feeds a log line and must never be able to fail a conversion.
+    """
+    src = None
+    try:
+        src = cmd[cmd.index("-i") + 1]
+    except (ValueError, IndexError):
+        src = None
+    dst = cmd[-1] if cmd and not cmd[-1].startswith("-") else None
+    return src, dst
+
+
+def _describe_ffmpeg_file(path: Optional[str]) -> str:
+    """``name(bytes)`` for the log, or ``?`` when it cannot be read."""
+    if not path:
+        return "?"
+    name = os.path.basename(path)
+    try:
+        return f"{name}({os.path.getsize(path)}B)"
+    except OSError:
+        return name
+
+
 def _run_ffmpeg(
     cmd: list[str],
     timeout_sec: int,
@@ -106,8 +136,18 @@ def _run_ffmpeg(
     bounded-memory stderr handling, kill-on-timeout, and AudioError
     surface stay uniform.
 
+    It is also where every conversion is timed. Decoding a source file
+    is the heaviest step in the upload pipeline — a long video can hold
+    the worker for tens of seconds — and it produced no record at all:
+    the module logged only ffmpeg FAILURES, so a slow import was
+    indistinguishable in the log from a fast one, and from no import at
+    all. Being the one runner every call site goes through, this is the
+    only place that can record them uniformly.
+
     Raises AudioError on non-zero return or timeout.
     """
+    started = time.monotonic()
+    src_path, dst_path = _ffmpeg_io_paths(cmd)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -156,17 +196,29 @@ def _run_ffmpeg(
                 proc.stderr.close()
         except Exception:
             pass
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     msg = "".join(collected).strip()
     if proc.returncode != 0:
         msg = msg or f"ffmpeg exited with code {proc.returncode}"
-        logger.warning("ffmpeg failed (rc=%d): %s", proc.returncode, msg)
+        logger.warning(
+            "ffmpeg failed (rc=%d) after %d ms: %s", proc.returncode, elapsed_ms, msg
+        )
         raise AudioError(f"ffmpeg failed to convert audio: {msg[:4000]}")
     if fail_on_decode_error and _ffmpeg_stderr_has_decode_error(msg):
-        logger.warning("ffmpeg reported decode errors despite rc=0: %s", msg)
+        logger.warning(
+            "ffmpeg reported decode errors despite rc=0 after %d ms: %s",
+            elapsed_ms, msg,
+        )
         raise AudioError(
             "ffmpeg decoded only part of the input; the source media appears "
             f"truncated or corrupt: {msg[:4000]}"
         )
+    logger.info(
+        "ffmpeg ok: %d ms in=%s out=%s",
+        elapsed_ms,
+        _describe_ffmpeg_file(src_path),
+        _describe_ffmpeg_file(dst_path),
+    )
 
 
 def _compact_audio_for_remote_cmd(path_in: str, path_out: str) -> list[str]:
