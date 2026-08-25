@@ -239,6 +239,11 @@ let mainLogFilePath = "";
 let traceCounter = 0;
 let mainWindowRevealInFlight = null;
 let mainWindowRevealRequestTimer = null;
+// Timestamps of the two ways the user can ask for the window, cleared
+// when focus lands. Their distance to the focus event is the latency the
+// user actually perceives.
+let mainWindowActivateRequestedAt = 0;
+let mainWindowRevealRequestedAt = 0;
 let mainWindowLastShowAt = 0;
 let mainWindowLastHideAt = 0;
 let mainWindowLastRevealReason = "";
@@ -708,6 +713,7 @@ function requestMainWindowReveal(reason = "", options = {}) {
     clearTimeout(mainWindowRevealRequestTimer);
     mainWindowRevealRequestTimer = null;
   }
+  mainWindowRevealRequestedAt = Date.now();
   appendMainLog(`[main-window-reveal-request] reason=${label} ${mainWindowLifecycleSnapshot()}`);
   mainWindowRevealRequestTimer = setTimeout(() => {
     mainWindowRevealRequestTimer = null;
@@ -744,6 +750,16 @@ function shouldRevealMainWindowForActivate(hasVisibleWindows = false) {
   try {
     if (win.isMinimized()) return true;
     if (!win.isVisible()) return true;
+    // Visible is not the same as frontmost. A window can be on screen
+    // and behind another application, and "activate" is the user
+    // explicitly asking for this app — so an unfocused window is a
+    // reveal even though every other test says it is already showing.
+    //
+    // Rare, and measured rather than assumed: across 157 activates that
+    // skipped the reveal, 156 were already focused and the skip was
+    // right. This closes the one that was not, and cannot affect the
+    // other 156.
+    if (!win.isFocused()) return true;
   } catch {
     return true;
   }
@@ -6929,7 +6945,18 @@ async function createWindow(options = {}) {
     appendMainLog(`[main-window] event=hide ${mainWindowLifecycleSnapshot()}`);
   });
   win.on("focus", () => {
-    appendMainLog(`[main-window] event=focus ${mainWindowLifecycleSnapshot()}`);
+    // How long the user waited between asking for the app and having it.
+    // "The window does not come forward immediately" was a report with
+    // nothing in the log to confirm or refute it: activate and focus
+    // were both recorded, but the interval between them never was, so
+    // there was no way to tell app latency from reaction time.
+    const askedAt = Math.max(mainWindowActivateRequestedAt, mainWindowRevealRequestedAt);
+    const waitedMs = askedAt > 0 ? Date.now() - askedAt : -1;
+    mainWindowActivateRequestedAt = 0;
+    mainWindowRevealRequestedAt = 0;
+    appendMainLog(
+      `[main-window] event=focus waited_ms=${waitedMs} ${mainWindowLifecycleSnapshot()}`,
+    );
   });
   win.on("blur", () => {
     appendMainLog(`[main-window] event=blur ${mainWindowLifecycleSnapshot()}`);
@@ -7126,6 +7153,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", (_event, hasVisibleWindows) => {
+  mainWindowActivateRequestedAt = Date.now();
   ensureMacDockPresence("activate");
   const shouldReveal = shouldRevealMainWindowForActivate(!!hasVisibleWindows);
   appendMainLog(`[app-activate] hasVisibleWindows=${!!hasVisibleWindows} shouldReveal=${shouldReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`);

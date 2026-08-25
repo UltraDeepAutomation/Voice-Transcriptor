@@ -87,8 +87,27 @@ body {
   --danger-bg-hover: #4a2020;
   --danger-border-hover: #8a3a3a;
   --danger-dot: #ff4444;
-  --focus-ring: rgba(108, 144, 198, 0.68);
-  --focus-ring-soft: rgba(108, 144, 198, 0.24);
+  /* ── Focus, as one decision ──────────────────────────────────────
+     Focus was drawn three different ways: `outline` at 2 px with a
+     2 px offset on generic controls, `outline` plus a coloured border
+     on list rows, and a 2-3 px `box-shadow` ring on composite fields.
+     The API-key row inherited two of them at once, so a focused field
+     showed a soft ring on the row AND a hard outline offset outward
+     from the input inside it, painted across the row's own border.
+
+     One mechanism now: a `box-shadow` ring. Unlike `outline-offset` it
+     adds nothing to the control's footprint, so focusing never makes a
+     control look taller than its neighbours.
+
+     Neutral, not accent blue: the ring belongs to the same surface
+     family as the plate it sits on, which is what keeps a focused
+     control looking like the same component it was a moment ago. The
+     forced-colors blocks below still map both tokens to `Highlight`,
+     so high-contrast users keep a system-strength indicator. */
+  --focus-ring: rgba(255, 255, 255, 0.34);
+  --focus-ring-soft: rgba(255, 255, 255, 0.14);
+  --focus-ring-width: 2px;
+  --focus-border: var(--glass-border-strong);
   --state-info-text: #cddfff;
   --state-info-dot: #5aa9ff;
   --state-success-text: #8fd3a4;
@@ -863,8 +882,10 @@ select:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 .recordings-list:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
+  outline: none;
+  border-color: var(--focus-border);
+  box-shadow: var(--glass-surface-outline),
+              0 0 0 var(--focus-ring-width) var(--focus-ring-soft);
 }
 
 /* Toolbar selects (provider, model, lang, upscale) are styled via
@@ -1920,9 +1941,9 @@ textarea:focus-visible,
 }
 
 .recording-item:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-  border-color: var(--focus-ring);
+  outline: none;
+  border-color: var(--focus-border);
+  box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring-soft);
 }
 
 .recording-item.active {
@@ -2444,9 +2465,19 @@ textarea:focus-visible,
   transition: border-color var(--dur-base), box-shadow var(--dur-base), background var(--dur-base);
 }
 
+/* The row IS the control; the input is its text surface. Only the row
+   draws focus, and it draws the same ring as every other control. */
 .key-row:focus-within {
-  border-color: var(--accent-soft-border);
-  box-shadow: 0 0 0 3px var(--focus-ring-soft);
+  border-color: var(--focus-border);
+  box-shadow: var(--glass-surface-outline),
+              0 0 0 var(--focus-ring-width) var(--focus-ring-soft);
+}
+
+.key-row input:focus,
+.key-row input:focus-visible {
+  outline: none;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .key-row input {
@@ -2648,13 +2679,15 @@ textarea:focus-visible,
 }
 
 .shortcut-btn:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
+  outline: none;
+  border-color: var(--focus-border);
+  box-shadow: var(--glass-surface-outline),
+              0 0 0 var(--focus-ring-width) var(--focus-ring-soft);
 }
 
 .shortcut-btn.recording {
-  border-color: var(--accent-soft-border);
-  box-shadow: 0 0 0 2px var(--focus-ring-soft);
+  border-color: var(--focus-border);
+  box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring-soft);
   animation: shortcut-pulse 1.2s ease-in-out infinite;
 }
 

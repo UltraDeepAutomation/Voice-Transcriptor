@@ -6061,6 +6061,21 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
     clearMaskedKeyOnEdit(provider);
     syncKeyActionButton(provider);
   });
+  input.addEventListener("blur", () => {
+    // Restore the mask when the user leaves without typing.
+    //
+    // Focus clears it so a click lands you straight into typing a
+    // replacement. Without this counterpart, clicking the field and
+    // clicking away left it EMPTY — showing the placeholder, so a
+    // provider with a perfectly good stored key looked unconfigured.
+    // Restoring is safe precisely because the mask is a display of
+    // stored state, never the state itself: the real key lives in the
+    // backend config and the field is only ever a view of "one is set".
+    if (keySavedState[provider] && !input.value.trim()) {
+      markKeyMasked(provider, true);
+    }
+    syncKeyActionButton(provider);
+  });
   input.addEventListener("input", () => {
     syncKeyActionButton(provider);
   });
