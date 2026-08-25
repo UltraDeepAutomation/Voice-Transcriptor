@@ -113,6 +113,89 @@ class LiveWordTrimTests(unittest.TestCase):
         self.assertEqual(env["text"], "alpha beta gamma",
                          "cumulative transcript carries each phrase exactly once")
 
+    def test_a_word_re_heard_slightly_later_is_still_the_same_word(self):
+        """The drift the END test cannot survive.
+
+        Production, 2026-08-25: a segment covering 8.96-9.94 was followed
+        by one at 9.52-10.00 carrying the same spoken numbers, re-decoded
+        as digits. The text guard cannot see that — "пять" and "56789"
+        share no token — so the only thing that can is the clock.
+
+        Under the end test the re-decode survives: its end (10.00) is past
+        the watermark (9.94), so the word is "new". Its CENTRE (9.76) is
+        not, and a word whose middle lies inside committed audio is
+        committed audio.
+        """
+        session = self._session()
+        results = []
+
+        def fake_transcribe(audio, *_args, **_kwargs):
+            if not results:
+                seg = {"start": 8.96, "end": 9.94, "text": "пять шесть",
+                       "words": [
+                           {"word": "пять", "start": 8.96, "end": 9.40},
+                           {"word": " шесть", "start": 9.45, "end": 9.94},
+                       ]}
+            else:
+                # Second pass, offset 9.0. The re-decode of the same audio
+                # ends LATER than the watermark but is centred before it;
+                # the trailing word is genuinely new.
+                seg = {"start": 0.52, "end": 1.60, "text": "56789 дальше",
+                       "words": [
+                           {"word": "56789", "start": 0.52, "end": 1.00},   # centre 9.76 < 9.94
+                           {"word": " дальше", "start": 1.05, "end": 1.60},  # centre 10.33 > 9.94
+                       ]}
+            results.append(seg)
+            return {"segments": [seg]}
+
+        async def run():
+            with mock.patch("backend.live.transcribe_audio", fake_transcribe):
+                await _feed(session, 10.0)
+                first = await session.maybe_transcribe()
+                await _feed(session, 1.5)
+                second = await session.maybe_transcribe()
+                return first, second
+
+        first, second = asyncio.run(run())
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second, "the genuinely new word must survive")
+        assert second is not None
+        self.assertEqual(second["segments"][0]["text"], "дальше")
+        self.assertNotIn("56789", session.finalize_envelope()["text"])
+
+    def test_a_word_straddling_the_watermark_is_kept(self):
+        """The mirror image: the centre rule must not eat new speech.
+
+        A word that begins just before the watermark and runs past it is
+        being spoken across the boundary, not re-heard. Its centre lands
+        after the watermark, so it survives.
+        """
+        session = self._session()
+        results = []
+
+        def fake_transcribe(audio, *_args, **_kwargs):
+            if not results:
+                seg = {"start": 8.0, "end": 9.94, "text": "раз",
+                       "words": [{"word": "раз", "start": 8.0, "end": 9.94}]}
+            else:
+                seg = {"start": 0.8, "end": 1.6, "text": "переход",
+                       "words": [{"word": "переход", "start": 0.8, "end": 1.6}]}
+                # global 9.80..10.60, centre 10.20 > 9.94 → kept
+            results.append(seg)
+            return {"segments": [seg]}
+
+        async def run():
+            with mock.patch("backend.live.transcribe_audio", fake_transcribe):
+                await _feed(session, 10.0)
+                await session.maybe_transcribe()
+                await _feed(session, 1.5)
+                return await session.maybe_transcribe()
+
+        second = asyncio.run(run())
+        self.assertIsNotNone(second, "a word spoken across the boundary is new speech")
+        assert second is not None
+        self.assertEqual(second["segments"][0]["text"], "переход")
+
     def test_segment_without_words_still_falls_back_to_end_watermark(self):
         """No word data (alignment unsupported / flag off) → the old
         segment-end heuristic applies unchanged: a re-decoded segment

@@ -64,6 +64,13 @@ class LiveConfig:
 REPEAT_TRIM_MAX_WORDS = 10
 
 
+def _word_centre(offset_sec: float, word: dict) -> float:
+    """Midpoint of a word in global stream seconds."""
+    start = float(word.get("start", 0.0) or 0.0)
+    end = float(word.get("end", 0.0) or 0.0)
+    return offset_sec + (start + end) / 2.0
+
+
 def _comparable_words(text: str) -> list[str]:
     """Lowercased, punctuation-free tokens for overlap comparison."""
     out = []
@@ -425,9 +432,28 @@ class LiveSession:
                 # bug). A segment WITH surviving words is trimmed to its
                 # new tail so the boundary clause is neither duplicated
                 # nor swallowed whole.
+                # A word is already committed when its CENTRE lies at or
+                # before the watermark — not when its END does.
+                #
+                # The end test asks "did this word finish after what we
+                # already said", and a re-decode answers yes for a word it
+                # merely re-heard slightly later. Both engines re-estimate
+                # word times on every pass and drift by more than
+                # ``emit_epsilon_sec``, so the second reading of an already
+                # emitted word kept passing and reaching the transcript
+                # twice. Measured on a real recording: a segment at
+                # 9.52-10.00 emitted after one covering 8.96-9.94 — the same
+                # numbers re-decoded as digits, which the text guard below
+                # cannot recognise because "пять" and "56789" share no token.
+                #
+                # A centre moves half as far as either edge under the same
+                # drift, and a word whose middle is inside committed audio is
+                # committed audio. This is the rule the interim splice in
+                # the Deepgram path already applies to decide the same
+                # question; both now answer it the same way.
                 kept_words = [
                     w for w in words
-                    if offset_sec + float(w.get("end", 0.0) or 0.0) > cutoff
+                    if _word_centre(offset_sec, w) > self._last_emitted_end
                 ]
                 if not kept_words:
                     continue
