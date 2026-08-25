@@ -31,11 +31,7 @@ import {
 } from "./transcription-catalog";
 import {
   countWords,
-  normalizeComparable,
   normalizeTranscriptWhitespace,
-  normalizeWords,
-  stemKey,
-  tokensInOrder,
 } from "./text-match";
 import {
   candidateConfirmsTranscriptCoverage,
@@ -44,6 +40,7 @@ import {
   richerTranscript,
   textFromEnvelope,
 } from "./transcript-merge";
+import { composeCanonicalLiveSourceText } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
 
 declare global {
@@ -8131,83 +8128,6 @@ function ensureLiveTranscriptBuffer(token: string, wsMode: LiveWsMode): LiveTran
   const buffer = createLiveTranscriptBuffer(wsMode);
   liveTranscriptBuffers.set(token, buffer);
   return buffer;
-}
-
-function composeCanonicalLiveSourceText(
-  committedRaw: string,
-  currentInterimRaw: string,
-  snapshotInterimRaw: string,
-): string {
-  const committed = normalizeTranscriptWhitespace(committedRaw);
-  const currentInterim = normalizeTranscriptWhitespace(currentInterimRaw);
-  const snapshotInterim = normalizeTranscriptWhitespace(snapshotInterimRaw);
-
-  const pickRicher = (a: string, b: string): string => {
-    const left = normalizeTranscriptWhitespace(a);
-    const right = normalizeTranscriptWhitespace(b);
-    if (!left) return right;
-    if (!right) return left;
-    const leftWords = countWords(left);
-    const rightWords = countWords(right);
-    if (rightWords > leftWords) return right;
-    if (rightWords === leftWords && right.length > left.length) return right;
-    return left;
-  };
-
-  // Word normalisation comes from ./text-match (SSOT — shared with the
-  // adoption policy and coverage confirmation below).
-  const mergeInterim = (baseRaw: string, interimRaw: string): string => {
-    const base = normalizeTranscriptWhitespace(baseRaw);
-    const interim = normalizeTranscriptWhitespace(interimRaw);
-    if (!interim) return base;
-    if (!base) return interim;
-    if (base.endsWith(interim)) return base;
-    const interimWords = normalizeWords(interim);
-    if (interimWords.length === 0) return base;
-    const baseComparable = normalizeComparable(base);
-    const interimComparable = normalizeComparable(interim);
-    if (interimComparable && baseComparable.includes(interimComparable)) {
-      return base;
-    }
-    const lastBaseWords = base.split(/\s+/).slice(-Math.max(10, interimWords.length + 2)).join(" ");
-    const lastBaseNorm = normalizeWords(lastBaseWords).join(" ");
-    const interimNorm = interimWords.join(" ");
-    if (lastBaseNorm.endsWith(interimNorm)) return base;
-
-    // Re-statement guard: a fresh hypothesis often restates its own span
-    // with different word forms/counts ("…на визуальную часть" →
-    // "…на визуальное"). Exact suffix matching above can never align
-    // those; without this check the hypothesis would be appended as new
-    // content and the phrase duplicated (seen live 2026-08-24, session
-    // 20-32-21). Stem-normalized subsequence containment means "same
-    // words in the same order, different rendering" — the committed
-    // text already covers it.
-    const baseStems = normalizeWords(lastBaseWords).map(stemKey);
-    const interimStems = interimWords.map(stemKey);
-    if (tokensInOrder(baseStems, interimStems)) return base;
-
-    // Interim hypotheses can overlap committed text with a shifted
-    // boundary, e.g. committed="... сказал больше" and interim="больше
-    // завершил". Merge the longest normalized suffix/prefix overlap so
-    // the fast stop path keeps the tail without duplicating the overlap.
-    const baseNormWords = normalizeWords(base);
-    const interimRawWords = interim.split(/\s+/).filter(Boolean);
-    const maxOverlap = Math.min(baseNormWords.length, interimWords.length);
-    for (let n = maxOverlap; n > 0; n--) {
-      const baseSuffix = baseNormWords.slice(-n).join(" ");
-      const interimPrefix = interimWords.slice(0, n).join(" ");
-      if (baseSuffix !== interimPrefix) continue;
-      const remainder = interimRawWords.slice(n).join(" ").trim();
-      return remainder ? `${base} ${remainder}` : base;
-    }
-    return `${base} ${interim}`;
-  };
-
-  const withSnapshot = mergeInterim(committed, snapshotInterim);
-  const withCurrent = mergeInterim(committed, currentInterim);
-  const snapshotThenCurrent = mergeInterim(withSnapshot, currentInterim);
-  return [committed, withSnapshot, withCurrent, snapshotThenCurrent]
-    .reduce((best, candidate) => pickRicher(best, candidate), "");
 }
 
 function canonicalTextFromBuffer(buffer: LiveTranscriptBuffer): string {
