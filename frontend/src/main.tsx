@@ -10922,6 +10922,18 @@ async function stopLive(
             const first = await Promise.race([envelopeCand, recoveryCand]);
             const firstMs = performance.now() - tRace;
             console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} ${traceTextStats("candidate", first.text)}`);
+            // Picked, not united — deliberately, and this is the boundary.
+            //
+            // The envelope is a reading of the SAME stream we already
+            // hold, so aligning the two and keeping every word is right
+            // there. A recovery candidate is an INDEPENDENT decode of the
+            // on-disk audio by a different engine or endpoint; uniting it
+            // would fold one engine's mistakes into the other's output,
+            // and no measured case shows this race losing text the way
+            // the envelope comparison did (8 stops in 69, mid-sentence).
+            // The union is available and its guards would hold — what is
+            // missing is evidence that it is needed here, and every rule
+            // extended past its evidence in this file cost a user words.
             let improvedText = richerTranscript(baseTranscriptForRace, first.text);
             let chose: Cand | null = improvedText !== baseTranscriptForRace
               ? { ...first, text: improvedText, words: wordCountOf(improvedText) }

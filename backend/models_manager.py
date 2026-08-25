@@ -20,27 +20,39 @@ import logging
 import threading
 from typing import Any, Dict, Optional
 
+from backend.model_catalog import GIGAAM_MODELS, WHISPER_LOCAL_MODELS
+
 logger = logging.getLogger(__name__)
 
-# faster-whisper's canonical repos per catalog id (SSOT mapping here —
-# the catalog owns ids, this table owns their upstream homes).
+# Upstream homes for the catalog's whisper ids.
+#
+# DERIVED, not listed. This was a hand-written table beside the catalog's
+# own list, so the two could disagree about which models exist — and did:
+# after the catalog was cut to three sizes, ``tiny`` and ``base`` still
+# had repos here, which left them downloadable through the API while the
+# UI could not offer them. Every Systran repo follows one naming rule, so
+# the rule is the mapping and the catalog stays the only list.
+#
+# A future model that breaks the convention goes in ``_REPO_OVERRIDES``;
+# a model missing from the catalog cannot be reached at all.
+_REPO_OVERRIDES: Dict[str, str] = {}
+
+
+def _whisper_repo(model_id: str) -> str:
+    return _REPO_OVERRIDES.get(model_id, f"Systran/faster-whisper-{model_id}")
+
+
 WHISPER_REPOS: Dict[str, str] = {
-    "tiny": "Systran/faster-whisper-tiny",
-    "base": "Systran/faster-whisper-base",
-    "small": "Systran/faster-whisper-small",
-    "medium": "Systran/faster-whisper-medium",
-    "large-v3": "Systran/faster-whisper-large-v3",
+    model_id: _whisper_repo(model_id) for model_id in WHISPER_LOCAL_MODELS
 }
 
 # Approximate on-disk sizes for the UI (bytes). Hints only — never used
-# for decisions.
+# for decisions. Keyed by catalog id; ``test_models_manager`` asserts the
+# catalog is covered, so a new model cannot ship without one.
 SIZE_HINTS: Dict[str, int] = {
-    "tiny": 75_000_000,
-    "base": 145_000_000,
     "small": 484_000_000,
     "medium": 1_500_000_000,
     "large-v3": 3_100_000_000,
-    "gigaam-v3-rnnt": 900_000_000,
     "gigaam-v3-e2e-rnnt": 950_000_000,
 }
 

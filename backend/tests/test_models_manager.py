@@ -7,7 +7,66 @@ import unittest
 from unittest import mock
 
 from backend import models_manager
-from backend.model_catalog import GIGAAM_MODELS, WHISPER_LOCAL_MODELS
+from backend.model_catalog import (
+    DEFAULT_LIVE_PREVIEW_LOCAL_MODEL,
+    GIGAAM_MODELS,
+    LOCAL_LIVE_PREVIEW_MODELS,
+    WHISPER_LOCAL_MODELS,
+)
+
+
+class CatalogCoverageTests(unittest.TestCase):
+    """The manager's universe of models must equal the catalog's.
+
+    They were two hand-written lists. After the catalog was cut to three
+    Whisper sizes, `tiny` and `base` still had repos in the manager — so
+    a model the UI could not offer was still downloadable through the
+    API, and nothing said the two disagreed.
+    """
+
+    def test_every_catalog_whisper_model_has_a_repo(self):
+        for model_id in WHISPER_LOCAL_MODELS:
+            self.assertIn(model_id, models_manager.WHISPER_REPOS)
+
+    def test_no_repo_exists_outside_the_catalog(self):
+        self.assertEqual(
+            set(models_manager.WHISPER_REPOS),
+            set(WHISPER_LOCAL_MODELS),
+            "a repo for a model the catalog does not offer is reachable by API only",
+        )
+
+    def test_every_catalog_model_has_a_size_hint(self):
+        for model_id in (*WHISPER_LOCAL_MODELS, *GIGAAM_MODELS):
+            self.assertIn(
+                model_id,
+                models_manager.SIZE_HINTS,
+                f"{model_id} would render with no size in Settings",
+            )
+
+    def test_no_size_hint_survives_a_model_the_catalog_dropped(self):
+        self.assertEqual(
+            set(models_manager.SIZE_HINTS),
+            {*WHISPER_LOCAL_MODELS, *GIGAAM_MODELS},
+        )
+
+    def test_whisper_models_are_ordered_cheapest_first(self):
+        """The order is load-bearing, not cosmetic.
+
+        ``LOCAL_LIVE_PREVIEW_MODELS`` is the first entry — the cap on what
+        may decode continuously beside a remote provider. A reorder would
+        silently promote a heavier model into that role, so the order is
+        held against the size hints rather than trusted.
+        """
+        sizes = [models_manager.SIZE_HINTS[m] for m in WHISPER_LOCAL_MODELS]
+        self.assertEqual(sizes, sorted(sizes), "catalog order must be cheapest first")
+
+    def test_the_live_preview_cap_is_the_cheapest_model_shipped(self):
+        self.assertEqual(LOCAL_LIVE_PREVIEW_MODELS, (WHISPER_LOCAL_MODELS[0],))
+        self.assertEqual(DEFAULT_LIVE_PREVIEW_LOCAL_MODEL, WHISPER_LOCAL_MODELS[0])
+
+    def test_a_retired_model_cannot_be_downloaded(self):
+        with self.assertRaises(KeyError):
+            models_manager.start_download("tiny")
 
 
 class ModelsManagerTests(unittest.TestCase):

@@ -21,6 +21,9 @@ def gigaam_available() -> bool:
 # only thing five near-duplicate entries bought was a longer menu.
 # `small` is the default and the floor; `medium` and `large-v3` are the
 # accuracy steps above it.
+# Ordered CHEAPEST FIRST. The order is load-bearing: the live-preview cap
+# below is the first entry, and a test pins the order against the size
+# hints so a reorder cannot silently make the preview heavier.
 WHISPER_LOCAL_MODELS: tuple[str, ...] = (
     "small",
     "medium",
@@ -49,10 +52,23 @@ DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "small"
 # backend/live.py adapts to slow models via the catch-up ring, and the
 # 60 s inference ceiling bounds worst-case latency.
 LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = LOCAL_TRANSCRIPTION_MODELS
-# Follows the catalog: the preview engine has to be a model the app
-# still ships. It was ("tiny", "base") — both now gone — which would have
-# resolved every preview to a model that is no longer offered.
-LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = ("small",)
+# The live preview's ceiling, when transcription itself runs through a
+# REMOTE provider.
+#
+# This is a CAP, not a menu. The preview decodes continuously while the
+# user speaks, next to whatever the remote provider is doing, so it must
+# not be the user's heavy transcription choice: someone who picked
+# ``large-v3`` for final quality should not have it running live for a
+# Deepgram session too.
+#
+# DERIVED from the catalog rather than listed beside it. It used to be
+# ("tiny", "base"); when those two were retired the list pointed at
+# models the app no longer shipped, and nothing failed — the resolver
+# just fell through. ``WHISPER_LOCAL_MODELS`` is ordered cheapest-first
+# and ``test_models_manager`` holds that ordering against the size
+# hints, so "the cheapest model we ship" has exactly one meaning and one
+# place to change.
+LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = (WHISPER_LOCAL_MODELS[0],)
 DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
 REMOTE_TRANSCRIPTION_PROVIDERS: tuple[str, ...] = ("openrouter", "deepgram")
