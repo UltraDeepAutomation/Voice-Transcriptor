@@ -279,6 +279,71 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
+    """The stop's deadline is published before the waiting starts.
+
+    The renderer used to bound its own wait with a constant while this
+    side could legitimately spend nine seconds; 24 % of stops measured on
+    2026-08-25 ran past that constant, and everything the extra wait
+    recovered arrived after the transcript had been delivered. The
+    coverage analysis that decides the budget happens here, so the number
+    is published from here.
+    """
+
+    async def test_an_uncovered_tail_announces_the_ceiling_and_the_retry(self):
+        session = _session(streamed_sec=90.0, covered_end=85.0, tail_speech_sec=4.0)
+        seen: list[tuple[float, bool]] = []
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
+        ):
+            await session.finalize(
+                wait_timeout=0.3,
+                on_budget=lambda budget, more: seen.append((budget, more)),
+            )
+        self.assertEqual(len(seen), 1, "announced exactly once")
+        budget, expects_more = seen[0]
+        self.assertTrue(expects_more, "an uncovered tail expects the wait to add words")
+        # Worst case, not the expected case: the retry pays the ceiling again.
+        self.assertAlmostEqual(budget, 0.10, places=3)
+
+    async def test_an_empty_tail_announces_that_waiting_buys_nothing(self):
+        session = _session(streamed_sec=90.0, covered_end=89.95)
+        seen: list[tuple[float, bool]] = []
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            await session.finalize(
+                wait_timeout=0.3,
+                on_budget=lambda budget, more: seen.append((budget, more)),
+            )
+        self.assertEqual(len(seen), 1)
+        budget, expects_more = seen[0]
+        self.assertFalse(expects_more)
+        self.assertAlmostEqual(budget, 0.02, places=3)
+
+    async def test_a_throwing_consumer_cannot_break_the_stop(self):
+        session = _session(streamed_sec=90.0, covered_end=89.95)
+        ws = session._ws
+
+        def explode(_budget: float, _more: bool) -> None:
+            raise RuntimeError("consumer is broken")
+
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            await session.finalize(wait_timeout=0.3, on_budget=explode)
+        self.assertIn("CloseStream", ws.types, "the stop completed anyway")
+
+    async def test_no_consumer_is_the_default(self):
+        session = _session(streamed_sec=90.0, covered_end=89.95)
+        ws = session._ws   # finalize() releases the socket on its way out
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            await session.finalize(wait_timeout=0.3)
+        self.assertIn("CloseStream", ws.types)
+
+
 class BudgetConstantTests(unittest.TestCase):
     def test_the_short_window_covers_only_empty_tails(self):
         # The 0.25 s window is measured on stops whose gap was 0.06-0.24 s

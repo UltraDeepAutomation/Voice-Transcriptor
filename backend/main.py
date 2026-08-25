@@ -4309,8 +4309,34 @@ async def _run_deepgram_live_session(
 
         final_payload: dict
         finalize_error: Optional[str] = None
+
+        # The stop's deadline is decided once, by the coverage analysis
+        # inside finalize(), and told to the client before the waiting
+        # starts. The renderer used to guess it with a constant while
+        # this side could legitimately spend nine seconds; a quarter of
+        # stops exceeded that constant, and everything the extra wait
+        # recovered arrived after the transcript had already been
+        # delivered. One number, produced where it is decided.
+        # A strong reference until the send completes: asyncio holds only
+        # a weak one, so a fire-and-forget task can be collected mid-flight.
+        budget_sends: set[asyncio.Task] = set()
+
+        def _announce_budget(budget_sec: float, expects_more: bool) -> None:
+            task = asyncio.get_running_loop().create_task(
+                _ws_send_json(
+                    websocket,
+                    {
+                        "type": "finalizing",
+                        "budgetMs": int(round(budget_sec * 1000)),
+                        "expectsMore": bool(expects_more),
+                    },
+                )
+            )
+            budget_sends.add(task)
+            task.add_done_callback(budget_sends.discard)
+
         try:
-            drained = await session.finalize(wait_timeout=3.0)
+            drained = await session.finalize(wait_timeout=3.0, on_budget=_announce_budget)
             final_payload = {
                 "type": "final",
                 "text": drained.get("text", ""),

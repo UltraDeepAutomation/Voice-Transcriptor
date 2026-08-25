@@ -338,7 +338,15 @@ type LiveWsMessage =
       coverage?: LiveCoverage;
       uncoveredSpeechSec?: number;
     }
-  | { type: "error"; error: string; fatal: boolean };
+  | { type: "error"; error: string; fatal: boolean }
+  /**
+   * The backend's stop deadline, sent the moment it is chosen and
+   * before the waiting begins. ``budgetMs`` is the worst case it may
+   * spend flushing the provider; ``expectsMore`` is its coverage
+   * verdict — whether that wait is expected to yield words we do not
+   * already have. One number, decided where the coverage data lives.
+   */
+  | { type: "finalizing"; budgetMs: number; expectsMore: boolean };
 
 function parseLiveWsMessage(raw: string): LiveWsMessage | null {
   let parsed: unknown;
@@ -368,6 +376,15 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
     const segment = normalizeTranscriptSegment(obj.segment);
     if (!segment) return null;
     return { type: "interim", segment };
+  }
+
+  if (type === "finalizing") {
+    const budgetMs = Number(obj.budgetMs);
+    return {
+      type: "finalizing",
+      budgetMs: Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : 0,
+      expectsMore: !!obj.expectsMore,
+    };
   }
 
   if (type === "final") {
@@ -8628,6 +8645,42 @@ function setLiveDraftState(text: string, displayText = text): void {
 // LiveTranscriptBuffer into the active preview state.
 let lastInterimSnapshot = "";
 
+/**
+ * The stop deadline the backend announced for the current session.
+ *
+ * Set from the ``finalizing`` message, which arrives the moment the
+ * backend picks its flush budget and BEFORE it starts waiting. The stop
+ * path used to guess this with a constant 1.5 s while the backend could
+ * legitimately spend nine; 24 % of stops measured on 2026-08-25 ran past
+ * that constant, and every word the extra wait recovered arrived after
+ * the transcript had already been handed over. Keyed by session token so
+ * a late message from a superseded recording cannot move the next one's
+ * deadline.
+ */
+const announcedFinalizeBudget = new Map<string, { budgetMs: number; expectsMore: boolean }>();
+
+/**
+ * Confirmation window when the backend expects its wait to add nothing.
+ *
+ * Sized from the round trips that DO arrive: p50 550 ms on 2026-08-25.
+ * Waiting longer than this for a message the producer says is not coming
+ * is pure latency, which is what the "stop takes 5-7 seconds" complaint
+ * was made of.
+ */
+const LIVE_ENVELOPE_CONFIRM_MS = 1_500;
+
+/** Delivery slack on top of the announced budget: one WS hop plus the backend's own close. */
+const LIVE_ENVELOPE_DELIVERY_MARGIN_MS = 800;
+
+/**
+ * Hard ceiling regardless of what was announced.
+ *
+ * A stop must end. This bounds a backend that announces something
+ * unreasonable, and it is above the worst finalize measured (9.4 s) by
+ * enough to cover it while still terminating.
+ */
+const LIVE_ENVELOPE_MAX_WAIT_MS = 11_000;
+
 function resetOutputs(): void {
   resetRecordSessionNotice();
   setCurrentRecordingSummary(null);
@@ -9099,6 +9152,16 @@ async function startLive(): Promise<void> {
               persistLiveDraft(true);
             }
           }
+          return;
+        }
+        case "finalizing": {
+          announcedFinalizeBudget.set(sessionUiToken, {
+            budgetMs: msg.budgetMs,
+            expectsMore: msg.expectsMore,
+          });
+          console.log(
+            `[trace tail-gap] backend announced finalize budget=${msg.budgetMs}ms expectsMore=${msg.expectsMore ? 1 : 0}`,
+          );
           return;
         }
         case "interim": {
@@ -10804,24 +10867,41 @@ async function stopLive(
           // audio.
           const tailCoveredByInterim = tailHasInterimSpeechEvidence;
           if (tailCoveredByInterim && recordedSec > 1.0 && !liveStreamErrorAtStop) {
-            // ── Short envelope confirmation (the 5-7 s stop fix) ────
-            // The user reported: preview visually complete, yet 5-7 s
-            // before the final transcript. That was the envelope(4 s) ∥
-            // REST(6 s) race firing on interim evidence alone. Post-
-            // CloseStream finals usually land in 1-2 s; race the envelope
-            // against a 1.5 s cap, upgrade if richer, move on.
+            // ── Envelope confirmation, bounded by the backend's own
+            // deadline ─────────────────────────────────────────────────
+            //
+            // The cap used to be a constant 1.5 s, chosen against the
+            // "stop takes 5-7 seconds" complaint on the assumption that
+            // post-CloseStream finals land in 1-2 s. They often do — p50
+            // 550 ms — but the backend pays a 3 s ceiling plus a retry
+            // when the tail is uncovered, and 24 % of stops on
+            // 2026-08-25 ran past 1.5 s, up to 9.4 s. Waiting a constant
+            // shorter than the producer's own deadline means the work it
+            // spent that time on reaches nobody.
+            //
+            // The backend now announces the budget it picked, together
+            // with its verdict on whether waiting will yield anything.
+            // Wait the announced time when it expects to add words; keep
+            // the short confirmation window when it does not, because
+            // then the wait is pure latency. No announcement (older
+            // backend, local assist) keeps the previous constant.
+            const announced = announcedFinalizeBudget.get(sessionUiToken);
+            const envCapMs = announced?.expectsMore
+              ? Math.max(LIVE_ENVELOPE_CONFIRM_MS, Math.min(announced.budgetMs + LIVE_ENVELOPE_DELIVERY_MARGIN_MS, LIVE_ENVELOPE_MAX_WAIT_MS))
+              : LIVE_ENVELOPE_CONFIRM_MS;
             const tEnv = performance.now();
             const env = await Promise.race([
               liveFinalPromise(),
               new Promise<LiveFinalEnvelope | null>((resolve) =>
-                window.setTimeout(() => resolve(null), 1500),
+                window.setTimeout(() => resolve(null), envCapMs),
               ),
             ]);
             const envText = textFromEnvelope(env);
             const better = unionTranscripts(transcriptRaw, envText);
             console.log(
               `[trace tail-gap] interim-covered: envelope ` +
-              `${better !== transcriptRaw ? "upgraded" : "confirmed"} instant transcript ms=${(performance.now() - tEnv).toFixed(0)}`,
+              `${better !== transcriptRaw ? "upgraded" : "confirmed"} instant transcript ` +
+              `ms=${(performance.now() - tEnv).toFixed(0)} cap=${envCapMs}ms announced=${announced?.budgetMs ?? "-"}`,
             );
             if (better !== transcriptRaw) transcriptRaw = better;
           } else if (tailLikelyMissing) {
@@ -11456,6 +11536,10 @@ async function stopLive(
       }
       liveStreamErrors.delete(stoppedSessionToken);
       liveTranscriptBuffers.delete(stoppedSessionToken);
+      // The announced deadline belongs to the stop that just finished;
+      // keeping it would leave one entry per recording for the life of
+      // the process and let a stale budget reach a later session.
+      announcedFinalizeBudget.delete(stoppedSessionToken);
     }
     if (stoppedSessionToken) {
       setBusy(false, stoppedSessionToken);

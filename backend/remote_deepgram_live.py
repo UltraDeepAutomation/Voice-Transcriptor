@@ -48,7 +48,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import AsyncIterator, Iterable, Optional
+from typing import AsyncIterator, Callable, Iterable, Optional
 from urllib.parse import urlencode
 
 import websockets
@@ -717,8 +717,23 @@ class DeepgramLiveSession:
             assert isinstance(item, dict)
             yield item
 
-    async def finalize(self, wait_timeout: float = 3.0) -> dict:
+    async def finalize(
+        self,
+        wait_timeout: float = 3.0,
+        on_budget: "Optional[Callable[[float, bool], None]]" = None,
+    ) -> dict:
         """Flush Deepgram and return the final transcript.
+
+        ``on_budget`` is called once, the moment the wait budget is
+        chosen and before the waiting starts, with ``(budget_sec,
+        expects_more)``. The caller forwards it to the client so both
+        sides of the stop share ONE deadline: the coverage analysis that
+        decides how long this may take happens here, where the data is,
+        and the consumer stops guessing. Without it the renderer waited a
+        constant 1.5 s while this method could legitimately spend 9 s —
+        24 % of stops measured on 2026-08-25 exceeded that constant, and
+        the words the extra wait recovered arrived after nobody was
+        listening.
 
         Sends ``CloseStream`` so Deepgram finalizes any buffered audio,
         waits up to ``wait_timeout`` seconds for the receive loop to drain
@@ -813,12 +828,22 @@ class DeepgramLiveSession:
             # Three cases, not two. "Needs a retry" and "has nothing left to
             # flush" are different questions, and collapsing them applied a
             # window measured on empty tails to tails that were merely small.
-            if self._tail_needs_flush(tail_gap, tail_speech):
+            needs_flush = self._tail_needs_flush(tail_gap, tail_speech)
+            if needs_flush:
                 flush_wait = FINALIZE_FLUSH_WAIT_SEC
             elif tail_gap <= COVERAGE_GAP_MIN_SEC:
                 flush_wait = FINALIZE_EMPTY_TAIL_WAIT_SEC
             else:
                 flush_wait = FINALIZE_COVERED_WAIT_SEC
+            if on_budget is not None:
+                # Worst case, not the expected case: an uncovered tail may
+                # also pay a retry of the same ceiling. The consumer needs
+                # the bound it must respect, not an optimistic estimate.
+                worst_case = flush_wait * (2.0 if needs_flush else 1.0)
+                try:
+                    on_budget(worst_case, needs_flush)
+                except Exception as e:  # never let telemetry break a stop
+                    logger.warning("deepgram-live: finalize budget callback failed: %s", e)
             try:
                 await asyncio.wait_for(
                     self._final_arrived.wait(),
