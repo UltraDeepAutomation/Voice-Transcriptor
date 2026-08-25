@@ -37,9 +37,9 @@ import {
 import {
   candidateConfirmsTranscriptCoverage,
   joinTranscriptSegments,
-  mergeTranscriptTail,
   richerTranscript,
   textFromEnvelope,
+  unionTranscripts,
 } from "./transcript-merge";
 import { composeCanonicalLiveSourceText } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
@@ -10752,12 +10752,14 @@ async function stopLive(
           const wordCountOf = countWords;
           const alreadyResolvedEnvelope = liveFinalSlots.get(sessionUiToken)?.envelope || null;
           const opportunisticEnvelopeText = textFromEnvelope(alreadyResolvedEnvelope);
-          // Merged, not picked. The envelope and the live splice are two
-          // partial views of one utterance — the splice can hold a phrase
-          // no final ever covered, the envelope holds the clause that
-          // arrived after CloseStream — so choosing between them throws
-          // away whichever half the loser owned.
-          const opportunisticTranscript = mergeTranscriptTail(transcriptRaw, opportunisticEnvelopeText);
+          // United, not picked and not grafted. The envelope and the live
+          // splice are two partial readings of one recording: the splice
+          // can hold a phrase no final ever covered, the envelope holds
+          // the clause that arrived after CloseStream AND the phrases a
+          // hole swallowed mid-sentence. Choosing loses whichever half
+          // the loser owned; grafting only the tail keeps the splice's
+          // holes. Aligning them keeps every word of both.
+          const opportunisticTranscript = unionTranscripts(transcriptRaw, opportunisticEnvelopeText);
           if (opportunisticTranscript !== transcriptRaw) {
             transcriptRaw = opportunisticTranscript;
             console.log(`[trace stopLive] opportunistic-envelope used ${traceTextStats("transcript", transcriptRaw)}`);
@@ -10816,7 +10818,7 @@ async function stopLive(
               ),
             ]);
             const envText = textFromEnvelope(env);
-            const better = mergeTranscriptTail(transcriptRaw, envText);
+            const better = unionTranscripts(transcriptRaw, envText);
             console.log(
               `[trace tail-gap] interim-covered: envelope ` +
               `${better !== transcriptRaw ? "upgraded" : "confirmed"} instant transcript ms=${(performance.now() - tEnv).toFixed(0)}`,

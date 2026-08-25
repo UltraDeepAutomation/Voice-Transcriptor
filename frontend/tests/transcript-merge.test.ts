@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import {
   candidateConfirmsTranscriptCoverage,
   joinTranscriptSegments,
-  mergeTranscriptTail,
+  unionTranscripts,
   richerTranscript,
   textFromEnvelope,
 } from "../src/transcript-merge";
@@ -70,65 +70,86 @@ describe("transcript-merge SSOT", () => {
     });
   });
 
-  describe("mergeTranscriptTail — the union of two partial views", () => {
-    // Production, 2026-08-25 13:05. Both texts are 27 words, so the
-    // word-count comparison tied and the length tie-break handed the
-    // user the live splice — which stops mid-thought. Each text holds
-    // something the other lost.
-    const liveSplice =
-      "Так, ну и у меня сейчас в последних влогах несколько слов. Они иногда " +
-      "до самого конца доходят, а иногда я нажимаю кнопку stop и у меня обрываются";
-    const backendFinal =
-      "Так, ну и у меня сейчас в последних влогах до самого конца доходят, " +
-      "а иногда я нажимаю кнопку stop, и у меня обрываются слова. В чём проблема?";
+  describe("unionTranscripts — neither reading is complete", () => {
+    // Measured over 69 stops on 2026-08-25: eight delivered LESS text
+    // than the provider returned, and the loss was mid-sentence. The
+    // tail graft cannot reach it and the pick prefers whichever text has
+    // more words overall.
+    const production = [
+      {
+        name: "a phrase the live splice dropped from the middle",
+        held: "В смысле, старая база данных Я ж тебе скинул. А можно как-то вернуть пароль из истории guitar?",
+        authoritative: "В смысле, старая база данных отклоняет пароли. Я ж тебе скинул. А можно как-то вернуть пароль из истории guitar?",
+        mustContain: ["отклоняет пароли", "Я ж тебе скинул", "из истории guitar"],
+      },
+      {
+        name: "a clause the live splice dropped",
+        held: "Склей пожалуйста два видеоролика вот и отправь мне, я тебе расскажу, что, как.",
+        authoritative: "Склей пожалуйста два видеоролика вот так, чтобы стоял Вот, и отправь мне, я тебе расскажу, что, как.",
+        mustContain: ["так, чтобы стоял", "отправь мне", "расскажу"],
+      },
+      {
+        name: "a single word the live splice dropped",
+        held: "не проверял. Сейчас проверю тоже.",
+        authoritative: "не проверял. Кстати, сейчас проверю тоже.",
+        mustContain: ["Кстати", "проверю тоже"],
+      },
+      {
+        name: "the reverse — a phrase only the live splice heard, and a tail only the final heard",
+        held: "Так, ну и у меня сейчас в последних влогах несколько слов. Они иногда до самого конца доходят, а иногда я нажимаю кнопку stop и у меня обрываются",
+        authoritative: "Так, ну и у меня сейчас в последних влогах до самого конца доходят, а иногда я нажимаю кнопку stop, и у меня обрываются слова. В чём проблема?",
+        mustContain: ["несколько слов", "обрываются слова", "В чём проблема"],
+      },
+    ];
 
-    it("keeps the phrase only the live splice heard AND the clause only the final heard", () => {
-      const merged = mergeTranscriptTail(liveSplice, backendFinal);
-      expect(merged).toContain("несколько слов. Они иногда");
-      expect(merged).toContain("обрываются слова. В чём проблема?");
+    for (const c of production) {
+      it(c.name, () => {
+        const merged = unionTranscripts(c.held, c.authoritative);
+        for (const fragment of c.mustContain) {
+          expect(merged).toContain(fragment);
+        }
+      });
+    }
+
+    it("never repeats a word the two readings share", () => {
+      for (const c of production) {
+        const merged = unionTranscripts(c.held, c.authoritative);
+        const words = merged.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
+        const adjacentRepeats = words.filter((w, i) => i > 0 && w === words[i - 1]);
+        expect(adjacentRepeats).toEqual([]);
+      }
     });
 
-    it("picks a winner where the old policy did, and it lost the tail", () => {
-      // The behaviour being replaced, kept as the reason this exists.
-      expect(richerTranscript(liveSplice, backendFinal)).toBe(liveSplice);
-      expect(richerTranscript(liveSplice, backendFinal)).not.toContain("В чём проблема");
+    it("keeps every word of the authoritative reading", () => {
+      // Both sides normalised the same way: the merged text keeps the
+      // original punctuation, so stripping it from only one side would
+      // look for "както" inside "как-то".
+      const words = (t: string) =>
+        t.toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").split(/\s+/).filter(Boolean);
+      for (const c of production) {
+        const merged = new Set(words(unionTranscripts(c.held, c.authoritative)));
+        for (const w of words(c.authoritative)) {
+          expect(merged.has(w)).toBe(true);
+        }
+      }
     });
 
-    it("appends nothing when the candidate ends where we do", () => {
-      const held = "начало фразы и самый конец";
-      expect(mergeTranscriptTail(held, "фразы и самый конец")).toBe(held);
-    });
-
-    it("anchors on the LAST occurrence of a repeated phrase", () => {
-      const held = "раз два три раз два три";
-      expect(mergeTranscriptTail(held, "раз два три раз два три четыре")).toBe(
-        "раз два три раз два три четыре",
+    it("falls back to the pick when the two texts are not the same speech", () => {
+      const held = "совершенно другая тема без единого общего слова";
+      const authoritative = "one two three four five six seven";
+      expect(unionTranscripts(held, authoritative)).toBe(
+        richerTranscript(held, authoritative),
       );
-    });
-
-    it("aligns across an inflected re-decode of the anchor words", () => {
-      // A later hypothesis re-states the same span with different
-      // endings. Stem keys collide, so the anchor still holds and the
-      // wording the user already saw is the one that is kept.
-      const held = "мы проверили визуальную составляющую";
-      const merged = mergeTranscriptTail(held, "мы проверили визуальное составляющее и цвет");
-      expect(merged).toBe("мы проверили визуальную составляющую и цвет");
-    });
-
-    it("falls back to the pick when the two texts do not continue each other", () => {
-      expect(mergeTranscriptTail("совершенно другой текст", "one two three four five")).toBe(
-        "one two three four five",
-      );
-    });
-
-    it("does not graft a punctuation-only tail", () => {
-      const held = "фраза до самого конца";
-      expect(mergeTranscriptTail(held, "фраза до самого конца .")).toBe(held);
     });
 
     it("returns the other side when one is empty", () => {
-      expect(mergeTranscriptTail("", "候補")).toBe("候補");
-      expect(mergeTranscriptTail("held", "")).toBe("held");
+      expect(unionTranscripts("", "только это")).toBe("только это");
+      expect(unionTranscripts("только это", "")).toBe("только это");
+    });
+
+    it("is a no-op on identical readings", () => {
+      const text = "один и тот же текст полностью";
+      expect(unionTranscripts(text, text)).toBe(text);
     });
   });
 });

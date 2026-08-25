@@ -61,94 +61,6 @@ export function richerTranscript(currentText: string, candidateText: string): st
 }
 
 /**
- * Shortest and longest word anchor used to align two transcripts of the
- * same utterance. Three words is short enough to survive a diverging
- * re-decode and long enough that a common function word cannot anchor on
- * its own; eight is where a longer match stops adding certainty.
- */
-const TAIL_ANCHOR_MIN_WORDS = 3;
-const TAIL_ANCHOR_MAX_WORDS = 8;
-
-interface AnchorToken {
-  /** Stem key — inflection-tolerant, so a re-decode still aligns. */
-  key: string;
-  /** Index of this token in the original whitespace-split array. */
-  index: number;
-}
-
-function anchorTokens(tokens: ReadonlyArray<string>): AnchorToken[] {
-  const out: AnchorToken[] = [];
-  tokens.forEach((token, index) => {
-    const key = stemKey(token);
-    if (key) out.push({ key, index });
-  });
-  return out;
-}
-
-/**
- * Graft a candidate's trailing words onto the transcript we already hold.
- *
- * ``richerTranscript`` picks a winner, and a pick is the wrong operation
- * when both candidates are partial views of the same utterance. Measured
- * in production, 2026-08-25 13:05 — the live splice and the backend
- * final each held 27 words and each was missing what the other had:
- *
- *   live splice:  …в последних влогах несколько слов. Они иногда до
- *                 самого конца доходят … и у меня обрываются
- *   final:        …в последних влогах до самого конца доходят … и у меня
- *                 обрываются слова. В чём проблема?
- *
- * The live splice carried a phrase no final ever covered; the final
- * carried the closing clause the splice never received. On equal word
- * counts the tie-break went to the longer string, so the user was handed
- * a sentence that stopped mid-thought — the reported "I press stop and my
- * words get cut off". Neither text was the answer; their union was.
- *
- * The alignment is the tail of what we hold, matched against the
- * candidate by stem so a re-decode of the same words still anchors, at
- * the LAST place it occurs so a repeated phrase grafts after its final
- * appearance. Everything past the anchor is appended verbatim. When no
- * anchor holds, the two texts are not continuations of each other and
- * the pick is still the safest answer.
- */
-export function mergeTranscriptTail(currentText: string, candidateText: string): string {
-  const current = normalizeTranscriptWhitespace(currentText);
-  const candidate = normalizeTranscriptWhitespace(candidateText);
-  if (!candidate) return current;
-  if (!current) return candidate;
-
-  const currentTokens = current.split(" ");
-  const candidateTokens = candidate.split(" ");
-  const currentAnchors = anchorTokens(currentTokens);
-  const candidateAnchors = anchorTokens(candidateTokens);
-
-  const longestAnchor = Math.min(
-    TAIL_ANCHOR_MAX_WORDS,
-    currentAnchors.length,
-    candidateAnchors.length,
-  );
-  for (let k = longestAnchor; k >= TAIL_ANCHOR_MIN_WORDS; k--) {
-    const anchor = currentAnchors.slice(currentAnchors.length - k).map((t) => t.key);
-    for (let i = candidateAnchors.length - k; i >= 0; i--) {
-      let matched = true;
-      for (let j = 0; j < k; j++) {
-        if (candidateAnchors[i + j].key !== anchor[j]) {
-          matched = false;
-          break;
-        }
-      }
-      if (!matched) continue;
-      const tail = candidateTokens.slice(candidateAnchors[i + k - 1].index + 1);
-      // Nothing past the anchor, or nothing but punctuation: the
-      // candidate ends where we do and has no tail to contribute.
-      if (!tail.some((token) => stemKey(token))) return current;
-      return `${current} ${tail.join(" ")}`.trim();
-    }
-  }
-  return richerTranscript(current, candidate);
-}
-
-/**
  * True when ``candidateText`` plausibly confirms what we already have
  * (same length or a prefix/suffix extension within tolerance) — used
  * to accept cheap confirmations without a full re-transcription.
@@ -179,4 +91,128 @@ function normalizeWordsCompat(s: string): string[] {
     .replace(/[^\p{L}\p{N}\s]/gu, "")
     .split(/\s+/)
     .filter(Boolean);
+}
+
+/**
+ * Longest run of words either side may contribute on its own, and the
+ * smallest share of shared words two texts must have before they are
+ * treated as two readings of the same speech.
+ *
+ * Below the ratio they are not the same utterance in different words —
+ * they are different content — and aligning them would interleave two
+ * unrelated transcripts. The word cap keeps the alignment cost bounded
+ * on very long recordings.
+ */
+const UNION_MIN_SHARED_RATIO = 0.35;
+const UNION_MAX_WORDS = 600;
+
+interface AlignedToken {
+  raw: string;
+  key: string;
+}
+
+function alignedTokens(text: string): AlignedToken[] {
+  return normalizeTranscriptWhitespace(text)
+    .split(" ")
+    .filter(Boolean)
+    .map((raw) => ({ raw, key: stemKey(raw) }))
+    .filter((t) => t.key);
+}
+
+/** Indices of the longest common subsequence of two key arrays. */
+function commonSubsequence(a: ReadonlyArray<string>, b: ReadonlyArray<string>): Array<[number, number]> {
+  const n = a.length;
+  const m = b.length;
+  // Row-by-row DP; only the lengths are needed to walk the path back, so
+  // the full table is kept (n, m are capped by the caller).
+  const table: Uint32Array[] = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      table[i][j] = a[i] === b[j]
+        ? table[i + 1][j + 1] + 1
+        : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  const pairs: Array<[number, number]> = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      pairs.push([i, j]);
+      i += 1;
+      j += 1;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return pairs;
+}
+
+/**
+ * The union of two readings of the same recording.
+ *
+ * Both the live splice and the backend's final envelope are partial, and
+ * each loses something the other keeps. Measured over 69 stops on
+ * 2026-08-25, eight delivered LESS text than the provider had returned,
+ * and the missing part was mid-sentence, not at the tail:
+ *
+ *   final:     …старая база данных отклоняет пароли. Я ж тебе скинул.
+ *   delivered: …старая база данных Я ж тебе скинул.
+ *
+ * `mergeTranscriptTail` cannot help — the loss is not at a seam — and
+ * `richerTranscript` picks the splice because it has more words overall.
+ * Aligning the two by their longest common subsequence puts every word
+ * of both in one order: shared runs keep `authoritative`'s wording (it
+ * decoded the whole recording with full context), and a run only one
+ * side has is inserted where the alignment places it.
+ *
+ * Falls back to the pick when the two texts do not look like the same
+ * speech, or when either is long enough that alignment would cost more
+ * than the stop path can spend.
+ */
+export function unionTranscripts(heldText: string, authoritativeText: string): string {
+  const held = normalizeTranscriptWhitespace(heldText);
+  const authoritative = normalizeTranscriptWhitespace(authoritativeText);
+  if (!held) return authoritative;
+  if (!authoritative) return held;
+
+  const a = alignedTokens(held);
+  const b = alignedTokens(authoritative);
+  if (!a.length || !b.length) return richerTranscript(held, authoritative);
+  if (a.length > UNION_MAX_WORDS || b.length > UNION_MAX_WORDS) {
+    return richerTranscript(held, authoritative);
+  }
+
+  const pairs = commonSubsequence(a.map((t) => t.key), b.map((t) => t.key));
+  const shared = pairs.length / Math.min(a.length, b.length);
+  if (shared < UNION_MIN_SHARED_RATIO) {
+    return richerTranscript(held, authoritative);
+  }
+
+  const out: string[] = [];
+  let ai = 0;
+  let bi = 0;
+  const flushGap = (aEnd: number, bEnd: number): void => {
+    const aRun = a.slice(ai, aEnd);
+    const bRun = b.slice(bi, bEnd);
+    if (aRun.length && bRun.length) {
+      // Both sides decoded this span differently. The authoritative
+      // reading had the whole recording for context; take it.
+      out.push(...bRun.map((t) => t.raw));
+    } else if (aRun.length) {
+      out.push(...aRun.map((t) => t.raw));
+    } else if (bRun.length) {
+      out.push(...bRun.map((t) => t.raw));
+    }
+  };
+  for (const [pa, pb] of pairs) {
+    flushGap(pa, pb);
+    out.push(b[pb].raw);
+    ai = pa + 1;
+    bi = pb + 1;
+  }
+  flushGap(a.length, b.length);
+  return out.join(" ").trim();
 }
