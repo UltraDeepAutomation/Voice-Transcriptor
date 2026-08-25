@@ -3182,6 +3182,20 @@ class OpfsPcmSink implements PcmSink {
   private flushDone: Promise<void> = Promise.resolve();
   private flushScheduled = false;
   private destroyed = false;
+  /**
+   * Set once ``finalize`` has drained and is about to close the stream.
+   *
+   * ``close()`` is awaited, and ``writable`` was only nulled AFTER it
+   * resolved — so for the whole duration of the close a microtask flush
+   * scheduled by a late ``append`` still saw a non-null ``writable`` and
+   * wrote into a closing stream. The stream rejects that with
+   * "Cannot write to a closing writable stream", which landed in the
+   * support log as "disk may be full or permissions revoked": an
+   * internal ordering bug, reported to the user as failing hardware.
+   */
+  private closing = false;
+  /** Samples that arrived after the finalize drain barrier. */
+  private strandedAfterDrain = 0;
   totalSamples = 0;
   readonly isDiskBacked = true;
   lastWriteError: Error | null = null;
@@ -3227,6 +3241,15 @@ class OpfsPcmSink implements PcmSink {
   append(samples: Float32Array): void {
     if (this.destroyed) return;
     if (!samples.length) return;
+    if (this.closing) {
+      // Past the finalize drain barrier. ``stopLive`` flushes the
+      // worklet port and waits for the capture graph to go idle before
+      // finalizing, so reaching here means a straggler outran that
+      // barrier. Counted rather than silently dropped — a rising count
+      // would mean the barrier itself is wrong.
+      this.strandedAfterDrain += samples.length;
+      return;
+    }
     const int16 = floatSamplesToInt16LE(samples);
     this.pendingChunks.push(int16);
     this.pendingBytes += int16.byteLength;
@@ -3237,6 +3260,7 @@ class OpfsPcmSink implements PcmSink {
 
   private scheduleFlush(): void {
     if (this.flushScheduled) return;
+    if (this.closing) return;
     this.flushScheduled = true;
     queueMicrotask(() => {
       this.flushScheduled = false;
@@ -3247,6 +3271,9 @@ class OpfsPcmSink implements PcmSink {
   private async flushPending(): Promise<void> {
     if (this.flushInProgress) return;
     if (this.destroyed) return;
+    // ``writable`` stays non-null for the whole of ``close()``, so it
+    // cannot be the test for "may I still write".
+    if (this.closing) return;
     if (!this.writable) return;
     if (!this.pendingChunks.length) return;
     this.flushInProgress = true;
@@ -3295,6 +3322,17 @@ class OpfsPcmSink implements PcmSink {
     await this.flushPending();
     // Final barrier: wait for that drain to settle too.
     await this.flushDone;
+
+    // From here nothing may reach the stream. Set BEFORE close() is
+    // awaited: that await is the window a scheduled flush used to slip
+    // through, because `writable` is still non-null throughout it.
+    this.closing = true;
+    if (this.strandedAfterDrain > 0) {
+      console.warn(
+        `OpfsPcmSink: ${this.strandedAfterDrain} sample(s) arrived after the `
+        + "finalize drain barrier and were not written",
+      );
+    }
 
     if (this.writable) {
       try {
