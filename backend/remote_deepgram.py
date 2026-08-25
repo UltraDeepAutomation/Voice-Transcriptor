@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 
 from backend.audio_mime import audio_content_type
 from backend.deepgram_words import deepgram_word_text
+from backend.deepgram_format import shared_format_params
 from backend.http_retry import RemoteError, request_with_retry
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 
@@ -133,36 +134,18 @@ def deepgram_transcribe(
 
     Returns {"text": str, "raw": dict}.
 
-    Note: ``smart_format`` is intentionally disabled here. The stated
-    reason is that it only fully supports English / Spanish / French,
-    and that for Russian it applies a "basic formatting" pass which
-    strips punctuation; the individual cross-language features
-    (``punctuate``, ``paragraphs``, ``numerals``) are enabled instead.
+    Formatting options come from ``backend.deepgram_format``, which both
+    Deepgram paths read. They used to be set here and in the live module
+    independently, with opposite values and each carrying a comment
+    asserting the other was wrong; the same recording therefore came back
+    formatted differently depending on which path served it. The premise
+    for disabling smart formatting — that Deepgram strips punctuation for
+    Russian — is contradicted by the live path's own output, and the
+    measurement is recorded in that module.
 
-    ── UNRESOLVED: this contradicts the live path ──────────────────────
-    ``backend.remote_deepgram_live`` sets ``smart_format=True`` for the
-    same provider and the same languages, documenting the opposite
-    belief ("Nova-3 handles it safely for the multilingual model"). Both
-    cannot be right, and the two are user-visible: the same audio
-    transcribed live versus through this REST fallback is formatted by
-    different rules.
-
-    Measured over one real archive (3084 Russian transcripts, punctuation
-    marks per 1000 letters, median):
-
-        live  smart_format=true    50.7
-        batch smart_format=false   36.6
-
-    i.e. the path that disables it has ~39 % LESS punctuation, which is
-    the reverse of the claim above. That measurement is suggestive, not
-    conclusive — the two corpora are different material (dictation vs
-    uploaded media) and n=32 on the batch side. Settling it needs the
-    same audio through both paths, which costs live API calls against a
-    user's key, so it is recorded here rather than guessed at.
-
-    Do not "fix" either side without running that comparison: flipping
-    this flag on the strength of one module's comment is how the two
-    ended up disagreeing.
+    ``paragraphs`` and ``numerals`` stay here: the live endpoint does not
+    accept them, so they are genuinely path-specific rather than a second
+    opinion about a shared question.
     """
     if not api_key:
         raise RemoteError("Deepgram API key is not configured")
@@ -171,10 +154,11 @@ def deepgram_transcribe(
 
     params: Dict[str, str] = {
         "model": model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
-        "punctuate": "true",
+        # Prerecorded-only options; the shared formatting decision below
+        # covers everything both endpoints accept.
         "paragraphs": "true",
         "numerals": "true",
-        "filler_words": "false",
+        **shared_format_params(),
     }
     if diarize:
         # Deepgram REST flag for speaker labelling. The response adds

@@ -245,6 +245,7 @@ INTERIM_WORD_GAP_SPLIT_SEC = 1.0
 # both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
+from backend.deepgram_format import shared_format_params  # noqa: E402
 from backend.deepgram_words import deepgram_word_text  # noqa: E402
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
 
@@ -257,15 +258,13 @@ class DeepgramLiveConfig:
     endpoint actually accepts. ``detect_language`` is a pre-recorded
     endpoint feature — the live endpoint uses ``language=multi`` for
     multilingual auto-detection instead. ``numerals`` is pre-recorded
-    only; ``smart_format`` (which Nova-3 handles safely for the
-    multilingual model) covers number formatting at live time.
+    only; the shared formatting pass covers number formatting at live
+    time.
 
-    ── UNRESOLVED: this contradicts the batch path ─────────────────────
-    ``backend.remote_deepgram`` disables ``smart_format`` for the same
-    provider and languages, documenting the opposite belief (that it
-    strips punctuation for Russian). See the note in
-    ``deepgram_transcribe`` for the measurement and why neither side
-    should be changed without a same-audio comparison.
+    Formatting options are not configured here — see
+    ``backend.deepgram_format``, which both Deepgram paths read so the
+    same recording cannot come back formatted differently depending on
+    which one served it.
     """
 
     model: str = DEFAULT_DEEPGRAM_AUDIO_MODEL
@@ -276,8 +275,11 @@ class DeepgramLiveConfig:
     sample_rate: int = LIVE_SAMPLE_RATE_HZ
     channels: int = 1
     interim_results: bool = True
-    punctuate: bool = True
-    smart_format: bool = True
+    # ``smart_format``, ``punctuate`` and ``filler_words`` are NOT fields
+    # here. They are formatting, both Deepgram paths must format the same
+    # way, and a per-session copy is how the two paths came to disagree.
+    # ``backend.deepgram_format`` owns them; ``to_query_string`` reads
+    # them from there.
     # Endpointing is the silence threshold (in ms) Deepgram uses to
     # decide a chunk is "complete enough" to seal as is_final=true.
     #
@@ -309,7 +311,6 @@ class DeepgramLiveConfig:
     # Deepgram's recommended long-form value and prevents a thought
     # from splitting across two "final" events.
     utterance_end_ms: int = 2000
-    filler_words: bool = False
     diarize: bool = False
 
     def to_query_string(self) -> str:
@@ -319,9 +320,7 @@ class DeepgramLiveConfig:
             "sample_rate": str(int(self.sample_rate)),
             "channels": str(int(self.channels)),
             "interim_results": _bool(self.interim_results),
-            "punctuate": _bool(self.punctuate),
-            "smart_format": _bool(self.smart_format),
-            "filler_words": _bool(self.filler_words),
+            **shared_format_params(),
             "endpointing": str(int(self.endpointing_ms)),
             "utterance_end_ms": str(int(self.utterance_end_ms)),
         }
