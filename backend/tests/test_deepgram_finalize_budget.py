@@ -192,21 +192,21 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
 class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
     """The shape almost every recording ends in."""
 
-    async def test_trailing_silence_does_not_trigger_the_retry(self):
-        # Observed in main.log: a 54.0 s recording whose last final ended
-        # at 52.08 s spent 6272 ms at finalize — a 3 s wait, a second
-        # Finalize, another 3 s wait — and spliced nothing, because the
-        # "unflushed tail" was the pause before the user hit Stop.
+    async def test_uncovered_audio_retries_even_when_no_speech_was_seen(self):
+        # A trailing pause and a provider that stopped emitting interims
+        # look identical to the speech signal, and only the second loses
+        # the user's words. Uncovered audio therefore decides; measured
+        # in production, gating on speech alone cost four seconds of a
+        # real sentence.
         session = _session(streamed_sec=54.0, covered_end=52.08)
         ws = session._ws
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
         ):
             await session.finalize(wait_timeout=0.5)
-        # One Finalize, not two: no retry for silence.
-        self.assertEqual(ws.types.count("Finalize"), 1)
+        self.assertEqual(ws.types.count("Finalize"), 2)
         self.assertIn("CloseStream", ws.types)
 
     async def test_speech_in_the_tail_still_triggers_the_retry(self):
@@ -222,29 +222,30 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 2)
 
-    async def test_audio_is_the_test_when_interim_results_are_off(self):
-        # Without hypotheses there is no speech signal to read, so the
-        # conservative measure applies: wait when it may not be needed,
-        # rather than close on words we could not see.
-        session = _session(streamed_sec=54.0, covered_end=52.0)
-        session._cfg.interim_results = False
+    async def test_the_covered_case_still_closes_fast(self):
+        # The saving that remains and is safe: nothing uncovered at all,
+        # so there is provably nothing to flush.
+        session = _session(streamed_sec=90.0, covered_end=89.9)
         ws = session._ws
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
         ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
         ):
             await session.finalize(wait_timeout=0.5)
-        self.assertEqual(ws.types.count("Finalize"), 2)
+        self.assertEqual(ws.types.count("Finalize"), 1)
 
-    def test_the_predicate_reads_speech_not_audio(self):
+    def test_the_predicate_can_only_add_confidence_never_remove_it(self):
         session = _session(streamed_sec=54.0, covered_end=52.0)
-        # 5 s of audio, no speech in it -> nothing to flush.
-        self.assertFalse(session._tail_needs_flush(5.0, 0.0))
-        # A gap barely over the threshold, all of it speech -> flush.
-        self.assertTrue(session._tail_needs_flush(5.0, TAIL_GUARD_MIN_SEC))
-        # Speech below the threshold is a word fragment, not a clause.
-        self.assertFalse(session._tail_needs_flush(5.0, TAIL_GUARD_MIN_SEC - 0.01))
+        # Uncovered audio alone is enough — this is the case that
+        # regressed when speech was allowed to veto it.
+        self.assertTrue(session._tail_needs_flush(5.0, 0.0))
+        # Speech alone is also enough.
+        self.assertTrue(session._tail_needs_flush(0.0, TAIL_GUARD_MIN_SEC))
+        # Neither signal over the threshold: nothing to wait for.
+        self.assertFalse(
+            session._tail_needs_flush(TAIL_GUARD_MIN_SEC - 0.01, TAIL_GUARD_MIN_SEC - 0.01)
+        )
 
 
 class BudgetConstantTests(unittest.TestCase):

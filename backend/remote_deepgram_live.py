@@ -1092,19 +1092,33 @@ class DeepgramLiveSession:
     def _tail_needs_flush(self, tail_gap: float, tail_speech: float) -> bool:
         """Is the trailing region worth waiting — and retrying — for?
 
-        Speech decides, not audio. A trailing stretch of silence cannot
-        yield words no matter how long we wait, and treating it as
-        unflushed is what made almost every stop pay the retry path.
+        UNCOVERED AUDIO decides. Recognised speech in the gap is an
+        additional reason to retry, never a reason not to.
 
-        The audio measure remains the answer when interim results are
-        off: without hypotheses there is no speech signal to read, and
-        falling back to the conservative test is the safe direction —
-        it waits when it does not need to, rather than closing on words
-        it could not see.
+        This briefly gated on speech alone, on the reasoning that with
+        ``interim_results`` on a region producing no interim produced no
+        words, so a Finalize could not flush what was never decoded.
+        That premise is false in exactly the case the guard exists for.
+        Measured in production, one stop after it shipped:
+
+            streamed=20.08s covered=16.07s gap=4.01s speech_in_gap=0.00s
+
+        Four seconds of the user's speech, and the speech signal read
+        zero — because Deepgram had stopped emitting interims 3.7 s
+        before Stop and then never flushed the final either. A provider
+        that goes quiet and a user who stops talking look identical to
+        this signal, and the first is precisely the failure mode that
+        loses a tail. Absence of interims is not evidence of absence of
+        speech.
+
+        So the signal can only add confidence, never remove it. The cost
+        is that a pause before Stop still pays the retry path; losing
+        the user's closing sentence is not a trade worth three seconds.
+        ``speech_in_gap`` stays measured and logged — it is genuinely
+        useful for telling the two shapes apart after the fact, which is
+        how this was caught.
         """
-        if not self._cfg.interim_results:
-            return tail_gap >= TAIL_GUARD_MIN_SEC
-        return tail_speech >= TAIL_GUARD_MIN_SEC
+        return tail_gap >= TAIL_GUARD_MIN_SEC or tail_speech >= TAIL_GUARD_MIN_SEC
 
     def _uncovered_speech_sec(self) -> float:
         """Seconds where an interim heard words but no final ever landed.
