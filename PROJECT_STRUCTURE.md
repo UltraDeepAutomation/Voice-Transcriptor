@@ -35,12 +35,13 @@ Removed root clutter:
 
 ```text
 backend/
-├── main.py                    # FastAPI app, REST/WS routes, jobs, recordings, config endpoints
+├── main.py                    # FastAPI app, REST/WS routes, jobs, recordings, config endpoints;
+│                              #   audio-retention policy table + recordings-scan caches
 ├── config.py                  # config loading, migration, encrypted provider keys
 ├── audio.py                   # ffmpeg/soundfile conversion and chunking
 ├── audio_constants.py         # shared audio constants
 ├── live.py                    # local live transcription session logic
-├── transcribe.py              # engine dispatch, faster-whisper model cache, local transcription
+├── transcribe.py              # engine dispatch, faster-whisper model cache + idle unload, local transcription
 ├── transcribe_gigaam.py       # optional Sber GigaAM-v3 engine adapter (gigaam-* ids)
 ├── models_manager.py          # local model presence/download manager (Settings → Local models)
 ├── remote_deepgram.py         # Deepgram prerecorded REST provider
@@ -81,6 +82,8 @@ frontend/
     ├── live-coverage.ts              # live-envelope reuse decision SSOT (pure)
     ├── mic-health.ts                 # microphone-health FSM SSOT (clock-injected, pure)
     ├── recordings-list-reconciler.ts # keyed DOM reconciler for the history list (pure)
+    ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
+    ├── list-window.ts                # history-list windowing policy SSOT (pure)
     └── update-check.ts               # GitHub release detection (Level 1), version compare (pure)
 ```
 
