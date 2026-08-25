@@ -10,6 +10,7 @@ import {
   type LiveCoverageReport as LiveCoverage,
 } from "./live-coverage";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
+import { createGatedPoll, type GatedPoll } from "./gated-poll";
 import { reconcileRecordingsList } from "./recordings-list-reconciler";
 import { livePaneDisplayText } from "./live-pane";
 import {
@@ -46,6 +47,38 @@ type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type KeyProvider = "openrouter" | "deepgram";
 type ViewName = "upload" | "record" | "recordings" | "settings";
+
+/**
+ * SSOT for "is this pane on screen right now?".
+ *
+ * `switchView` toggles `.view[data-view=…]`'s `hidden` attribute, so the
+ * DOM is the authority — a mirrored `currentView` variable would be a
+ * second copy that can drift. Every background poll gates on this
+ * rather than re-querying the DOM its own way.
+ */
+function isViewVisible(view: ViewName): boolean {
+  const node = document.querySelector<HTMLElement>(`.view[data-view="${view}"]`);
+  return !!node && !node.hidden;
+}
+
+/** True when the renderer window is actually being displayed. */
+function rendererIsVisible(): boolean {
+  return document.visibilityState !== "hidden";
+}
+
+/**
+ * Re-evaluate every gated poll.
+ *
+ * Called from the two things that move a gate — a view switch and a
+ * window visibility change — so no caller has to know which polls exist
+ * or what each one cares about.
+ */
+const gatedPolls: GatedPoll[] = [];
+
+function syncGatedPolls(): void {
+  for (const poll of gatedPolls) poll.sync();
+}
+
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
 
 interface NetworkStatusResponse {
@@ -450,7 +483,6 @@ declare global {
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
-    __transcriptorPendingShortcuts?: ShortcutPair;
     __transcriptorShortcutStatus?: {
       record?: { active?: string; desired?: string; error?: string };
       paste?: { active?: string; desired?: string; error?: string };
@@ -905,7 +937,6 @@ type LocalModelRow = {
 };
 
 let localModelsCache: LocalModelRow[] = [];
-let localModelsTimer: number | null = null;
 let localModelsFetchFailed = false;
 let pendingModelSelection: string | null = null;
 // Desktop-side GigaAM engine install state machine mirror. Populated via
@@ -1078,18 +1109,39 @@ async function refreshLocalModels(): Promise<void> {
   ensureLocalModelsPolling();
 }
 
+/**
+ * Local-models poll gate.
+ *
+ * Two reasons to run: the Settings pane is on screen (rows must stay
+ * live under the user's eyes), or work is in flight whose progress we
+ * are tracking even if the user navigated away — a model download or an
+ * engine install, both of which the user expects to find finished when
+ * they come back.
+ *
+ * The previous form hand-rolled its own start/stop bookkeeping around a
+ * `setInterval` handle, and its stop branch forgot `engineInstalling`,
+ * so an install with no concurrent download stopped being polled the
+ * moment the user left Settings. Expressing the gate as a predicate
+ * makes that class of asymmetry unrepresentable: there is one condition,
+ * and the scheduler arms or suspends from it.
+ */
+function shouldPollLocalModels(): boolean {
+  if (!rendererIsVisible()) return false;
+  if (isViewVisible("settings")) return true;
+  if (localModelsCache.some((m) => m.status === "downloading")) return true;
+  return engineInstallState.phase === "installing" || engineInstallState.phase === "probing";
+}
+
+const localModelsPoll = createGatedPoll({
+  name: "local-models",
+  intervalMs: 2000,
+  shouldRun: shouldPollLocalModels,
+  tick: () => refreshLocalModels(),
+});
+gatedPolls.push(localModelsPoll);
+
 function ensureLocalModelsPolling(): void {
-  const anyDownloading = localModelsCache.some((m) => m.status === "downloading");
-  const engineInstalling =
-    engineInstallState.phase === "installing" || engineInstallState.phase === "probing";
-  const settingsView = document.querySelector<HTMLElement>('.view[data-view="settings"]');
-  const settingsVisible = !settingsView?.hidden;
-  if ((anyDownloading || engineInstalling || settingsVisible) && localModelsTimer === null) {
-    localModelsTimer = window.setInterval(() => void refreshLocalModels(), 2000);
-  } else if (!anyDownloading && !settingsVisible && localModelsTimer !== null) {
-    window.clearInterval(localModelsTimer);
-    localModelsTimer = null;
-  }
+  localModelsPoll.sync();
 }
 
 async function requestModelDownload(id: string): Promise<boolean> {
@@ -4064,6 +4116,10 @@ function switchView(view: ViewName): void {
       });
     }
   }
+  // Panes just changed visibility: a poll whose surface went off screen
+  // suspends, one whose surface appeared arms. Must run AFTER the
+  // `hidden` flags above, since `isViewVisible` reads them.
+  syncGatedPolls();
 }
 
 function resolveEffectiveProvider(preferred: Provider): Provider {
@@ -4745,10 +4801,12 @@ function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: Shor
 }
 
 function publishShortcutUpdateToMain(): void {
-  window.__transcriptorPendingShortcuts = {
-    record: currentShortcuts.record,
-    paste: currentShortcuts.paste,
-  };
+  // One channel, one fact. This used to ALSO stash the pair on
+  // ``window.__transcriptorPendingShortcuts`` for the main process to
+  // poll every 2 s — a second copy of what the bridge message already
+  // carries, which cost a cross-process executeJavaScript round-trip
+  // for the entire life of the app and delivered the change up to 2 s
+  // later than the event did.
   postShortcutBridgeMessage("update");
 }
 
@@ -4916,14 +4974,18 @@ function refreshShortcutConflictState(): void {
     }
   }
 }
-// 2s polling for the conflict-state badge on Settings → Shortcuts.
-// Capture the handle so a future code path (e.g. shutdown hook,
-// pre-quit IPC) can clear it. Gate the body on document visibility
-// so the poll doesn't waste CPU when the renderer window is hidden.
-const _shortcutConflictPollHandle = window.setInterval(() => {
-  if (document.visibilityState === "hidden") return;
-  refreshShortcutConflictState();
-}, 2000);
+// Conflict-state badge on Settings → Shortcuts. The badge only exists
+// on that pane, so the poll only exists while that pane is on screen —
+// previously it woke every 2 s for the entire life of the app and
+// returned early, which with `backgroundThrottling: false` is a real
+// timer firing forever to decide to do nothing.
+const _shortcutConflictPoll = createGatedPoll({
+  name: "shortcut-conflict",
+  intervalMs: 2000,
+  shouldRun: () => rendererIsVisible() && isViewVisible("settings"),
+  tick: () => { refreshShortcutConflictState(); },
+});
+gatedPolls.push(_shortcutConflictPoll);
 // Symmetric cleanup: a ``pagehide`` event fires before any teardown
 // (Electron renderer reload, dev hot-reload, real navigation away),
 // so clearing here prevents a stale handle from leaking across hot
@@ -4932,12 +4994,14 @@ window.addEventListener("pagehide", () => {
   if (activeShortcutBtn) {
     stopShortcutRecording(true);
   }
-  try { window.clearInterval(_shortcutConflictPollHandle); } catch { /* idempotent */ }
+  _shortcutConflictPoll.stop();
 }, { once: true });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden" && activeShortcutBtn) {
     stopShortcutRecording(true);
   }
+  // The window appearing or disappearing moves every gate.
+  syncGatedPolls();
 });
 
 function startShortcutRecording(btn: HTMLButtonElement): void {
@@ -11108,21 +11172,30 @@ populateUpscaleModelOptions();
 // the helper and never block app startup.
 void cleanupOrphanPcmSpool();
 void refreshNetworkState();
-// Network-state poll. Capture the handle so a teardown path can
-// clear it. Skip the body when the renderer window is hidden — the
-// /api/network probe + /api/health round-trip is wasted work when
-// the user can't see the indicator anyway, and on Electron with the
-// main window hidden the renderer keeps running.
-const _networkPollHandle = window.setInterval(() => {
-  if (document.visibilityState === "hidden") return;
-  void refreshNetworkState();
-}, UI_TOKENS.network.refreshIntervalMs);
-window.addEventListener("online", () => void refreshNetworkState());
-window.addEventListener("offline", () => void refreshNetworkState());
+// Network-state poll. The Online/Offline pill lives in the topbar, so
+// this runs on every view — but not while the window is hidden: the
+// /api/network probe plus the /api/health round-trip is wasted work
+// when nobody can see the indicator, and the main window runs with
+// `backgroundThrottling: false`, so nothing else would slow it down.
+const _networkPoll = createGatedPoll({
+  name: "network-state",
+  intervalMs: UI_TOKENS.network.refreshIntervalMs,
+  shouldRun: rendererIsVisible,
+  tick: () => refreshNetworkState(),
+});
+gatedPolls.push(_networkPoll);
+// Initial arm for every registered poll. The markup has already been
+// laid out by this point, so `isViewVisible` reads the real starting
+// pane rather than guessing — the app opens on Live, so the
+// Settings-only polls correctly stay asleep until the user goes there.
+syncGatedPolls();
+// An OS-level connectivity change is news now, not in ten seconds.
+window.addEventListener("online", () => _networkPoll.refreshNow());
+window.addEventListener("offline", () => _networkPoll.refreshNow());
 // Symmetric cleanup so dev hot-reloads / explicit teardown paths
 // don't leave stale handles behind.
 window.addEventListener("pagehide", () => {
-  try { window.clearInterval(_networkPollHandle); } catch { /* idempotent */ }
+  _networkPoll.stop();
 }, { once: true });
 // Race bootstrap against a 15-second wall-clock timeout so a stalled
 // network mount or slow FS does not hang the boot overlay forever — the

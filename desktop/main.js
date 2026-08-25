@@ -276,7 +276,6 @@ let backendRestartAttempts = 0;
 // Set at app.whenReady, cleared on before-quit so shutdown doesn't
 // produce unhandledRejection noise from executeJavaScript against a
 // destroyed webContents.
-let shortcutPollTimer = null;
 let shortcutBridgeHandler = null;
 let shortcutCaptureAbortHandler = null;
 let shortcutCaptureFailsafeTimer = null;
@@ -1803,7 +1802,7 @@ function scheduleRecordingStatusCapsuleTeardown() {
     destroyRecordingStatusCapsuleWindow("idle");
   }, RECORDING_STATUS_CAPSULE_TEARDOWN_MS);
   // Never hold the event loop open for a teardown that quit would do
-  // anyway — mirrors accessibilityPollTimer / shortcutPollTimer.
+  // anyway — mirrors accessibilityPollTimer.
   try { recordingStatusTeardownTimer.unref?.(); } catch { }
 }
 
@@ -7299,10 +7298,6 @@ app.on("before-quit", () => {
     shortcutCaptureFailsafeTimer = null;
   }
   pendingShortcutBridgeMessages = [];
-  if (shortcutPollTimer) {
-    clearInterval(shortcutPollTimer);
-    shortcutPollTimer = null;
-  }
   if (accessibilityPollTimer) {
     clearInterval(accessibilityPollTimer);
     accessibilityPollTimer = null;
@@ -7641,23 +7636,20 @@ app.whenReady().then(async () => {
     }
     // SSOT for the accelerators we actually bind:
     //   - At startup → readShortcutsFromConfig() (disk-backed, pre-renderer).
-    //   - After a Settings-UI capture → renderer pushes pending values
-    //     via `__transcriptorPendingShortcuts`. Pass them in here as
-    //     `override` so the registration uses the IN-MEMORY values the
-    //     user just typed, NOT the disk config.
+    //   - After a Settings-UI capture → the shortcuts bridge delivers an
+    //     "update" message carrying the accelerators the user just
+    //     typed. Passed in here as `override` so the registration uses
+    //     those IN-MEMORY values, NOT the disk config.
     //
     // Why the override exists (root cause of "не ставятся новые при
     // нажатии клавиш"): the renderer queues a debounced (600 ms) save
-    // to /api/config which the backend writes to disk asynchronously,
-    // while ALSO setting the pending window flag immediately. The main
-    // process polls every 2 s. If the poll fires before the disk write
-    // completes (debounce + apiPost RTT + fs flush often >2 s under
-    // any load), readShortcutsFromConfig returns the OLD shortcut and
-    // we re-register the very accelerator the user just changed away
-    // from. The pending flag is consumed but its payload is discarded.
-    // Result: the displayed shortcut updates in the UI but the actual
-    // global hotkey remains the previous binding. Routing the pending
-    // payload through `override` removes the disk-write dependency
+    // to /api/config which the backend writes to disk asynchronously.
+    // Re-reading disk on an update would therefore often return the OLD
+    // shortcut and re-register the very accelerator the user just
+    // changed away from — the displayed shortcut updates in the UI
+    // while the actual global hotkey stays on the previous binding.
+    // Routing the bridge payload through `override` removes the
+    // disk-write dependency
     // entirely — registration uses exactly what the user pressed.
     //
     // Defensive fallback: if `override` is partial (only `record` or
@@ -7816,35 +7808,17 @@ app.whenReady().then(async () => {
     }
   }
 
-  // Poll for live shortcut changes from the renderer settings UI.
-  // Skip when the window is hidden — users edit shortcuts only with
-  // the Settings pane visible. Handle is cleared in before-quit so a
-  // late tick can never executeJavaScript against a torn-down
-  // webContents (which otherwise produces [unhandledRejection] noise
-  // in the shutdown log).
-  shortcutPollTimer = setInterval(async () => {
-    if (!win || win.isDestroyed() || !win.webContents || !win.isVisible()) return;
-    try {
-      const pending = await win.webContents.executeJavaScript(
-        `(() => { const p = window.__transcriptorPendingShortcuts; if (p) { delete window.__transcriptorPendingShortcuts; return p; } return null; })()`,
-        true
-      );
-      if (pending && (pending.record || pending.paste)) {
-        appendMainLog(`[shortcuts] live reload: record=${pending.record} paste=${pending.paste}`);
-        // Pass the in-memory payload directly. registerGlobalShortcuts
-        // will NOT re-read disk for these values, eliminating the
-        // pending-vs-disk-write race that silently rebound users to
-        // the OLD accelerator after Settings → Shortcuts capture.
-        shortcutsSuspendedForCapture = false;
-        clearShortcutCaptureFailsafe();
-        registerGlobalShortcuts({ record: pending.record, paste: pending.paste });
-      }
-    } catch { }
-  // Match accessibilityPollTimer: `.unref` so this refed timer
-  // doesn't block clean event-loop shutdown by up to 2 s. Cleared
-  // explicitly in `before-quit` (line ~5491) for the same reason.
-  }, 2000);
-  try { shortcutPollTimer.unref?.(); } catch { }
+  // No poll for shortcut changes: ``handleShortcutBridgeMessage`` above
+  // already receives every capture-start / capture-cancel / update the
+  // Settings UI emits, and the "update" payload carries the very
+  // accelerators the poll used to fetch. Publishing the same fact on
+  // two channels meant a 2 s ``executeJavaScript`` round-trip into the
+  // renderer for the entire life of the app — cross-process work, V8
+  // compile and result serialisation, forever, to learn something the
+  // event had already delivered. The event bridge is also strictly
+  // better: it fires the instant the user finishes a capture instead of
+  // up to 2 s later, and it is the only channel that can express the
+  // capture lifecycle at all.
 
   // Startup must not summon macOS permission prompts. Permission prompts
   // are tied to user actions: recording asks for microphone when the
