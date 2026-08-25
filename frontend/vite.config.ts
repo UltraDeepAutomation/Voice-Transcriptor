@@ -56,6 +56,33 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // Never inline an AudioWorklet module.
+    //
+    // Vite inlines any asset under 4 KB as a `data:` URL. `pcm-worklet.js`
+    // is 2.3 KB, so every production build emitted the PCM capture
+    // processor as `data:text/javascript;base64,…` — and the page CSP is
+    // `script-src 'self' 'unsafe-inline'`, which quite correctly refuses
+    // to load a script from a `data:` URL.
+    //
+    // `audioWorklet.addModule()` therefore rejected on EVERY recording,
+    // and the catch fell back to ScriptProcessor: the deprecated API that
+    // runs capture on the main thread and drops frames under load, rather
+    // than on a dedicated realtime audio thread. Silent, permanent
+    // capture-quality loss on every single take. Measured after the
+    // renderer console mirror was repaired: 5 fallbacks in 5 capture
+    // attempts, i.e. 100 %.
+    //
+    // The CSP is not the thing to relax — `script-src data:` is a
+    // standard XSS vector, and the policy was refusing an artifact the
+    // build should never have produced. Emitting the worklet as a real
+    // file, served from 'self' like every other script, is the fix.
+    //
+    // The callback form is deliberately narrow: it returns false only for
+    // worklets, so every other asset keeps Vite's default sizing rule.
+    assetsInlineLimit: (filePath: string) =>
+      filePath.endsWith("-worklet.js") || filePath.endsWith("pcm-worklet.js")
+        ? false
+        : undefined,
     // Electron ships Chromium; keep CSS output aligned with that runtime
     // so production builds preserve unprefixed properties like backdrop-filter.
     cssTarget: "chrome142",

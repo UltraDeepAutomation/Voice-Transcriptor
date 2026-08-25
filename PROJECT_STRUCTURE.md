@@ -84,6 +84,7 @@ frontend/
     ├── mic-health.ts                 # microphone-health FSM SSOT (clock-injected, pure)
     ├── recordings-list-reconciler.ts # keyed DOM reconciler for the history list (pure)
     ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
+    ├── error-text.ts                 # readable text for thrown values SSOT (pure)
     ├── list-window.ts                # history-list windowing policy SSOT (pure)
     └── update-check.ts               # GitHub release detection (Level 1), version compare (pure)
 ```

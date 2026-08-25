@@ -11,6 +11,7 @@ import {
 } from "./live-coverage";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
+import { installErrorAwareConsole } from "./error-text";
 import {
   RECORDINGS_WINDOW_MINIMUM,
   grownWindowSize,
@@ -53,6 +54,11 @@ declare global {
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type KeyProvider = "openrouter" | "deepgram";
+// Installed before any other module-level code can throw or log: a
+// failure during startup is exactly the one you cannot reproduce, and it
+// must not be recorded as "[object DOMException]".
+installErrorAwareConsole(console);
+
 type ViewName = "upload" | "record" | "recordings" | "settings";
 
 /**
