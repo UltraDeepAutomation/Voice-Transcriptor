@@ -290,6 +290,24 @@
                 <option value="en">EN</option>
               </select>
             </label>
+            <!--
+              In-window recording control. Until this existed the ONLY way
+              to start or stop a recording was the global hotkey, so a
+              hotkey the OS or another app had claimed left the user with
+              no way to record at all — and no way to discover that was
+              the problem.
+
+              It does not start recording itself: it asks the main process
+              to run the same toggle the hotkey runs, so the capsule, the
+              microphone-permission prompt, the frontmost-window capture
+              used by auto-paste, the single-capsule busy guard and the
+              trace all behave identically whichever way the user asked.
+            -->
+            <button class="btn record-toggle-btn" id="recordToggleBtn" type="button"
+              aria-pressed="false" title="Start recording">
+              <span class="record-toggle-dot" aria-hidden="true"></span>
+              <span class="record-toggle-label" id="recordToggleLabel">Record</span>
+            </button>
           </div>
         </div>
 

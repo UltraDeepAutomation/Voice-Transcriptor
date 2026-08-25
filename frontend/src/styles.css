@@ -476,6 +476,50 @@ body.platform-darwin .sidebar {
    microphone). Each chip keeps only its own colours and state rules;
    height, padding, radius, border and surface live here exactly once so
    they cannot drift apart the way the mic chip had. */
+/* In-window Record / Stop control (Live topbar). Sits at the end of the
+   MIC / LANG row so the recording control is where the recording setup
+   is. The dot carries the state; the label says what the click will do,
+   not what is happening — a button labelled "Recording" reads as a
+   status, and users press it expecting to start. */
+.record-toggle-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--h-control);
+  padding: 0 16px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.record-toggle-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--danger-text, #ef4444);
+  flex: none;
+}
+
+.record-toggle-btn.is-recording {
+  border-color: var(--danger-border, #ef4444);
+  color: var(--danger-text, #f87171);
+}
+
+/* The pulse marks the one state where something is actively happening.
+   Reduced-motion users get the same colour without the animation. */
+.record-toggle-btn.is-recording .record-toggle-dot {
+  animation: record-toggle-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes record-toggle-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .record-toggle-btn.is-recording .record-toggle-dot { animation: none; }
+}
+
 .status-chip {
   display: inline-flex;
   align-items: center;

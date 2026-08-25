@@ -6438,6 +6438,19 @@ async function createWindow(options = {}) {
       }
       return;
     }
+    if (raw.startsWith("__app_record_toggle__")) {
+      // The in-window Record/Stop button. Routed to the very same
+      // function the global hotkey calls so there is one recording
+      // toggle, not two: same microphone-permission prompt, same
+      // frontmost-window capture for auto-paste, same capsule, same
+      // single-capsule busy guard, same trace. The renderer deliberately
+      // does NOT dispatch its own toggle event for this.
+      appendMainLog("[record-toggle] requested from the in-window button");
+      toggleRecordingFromShortcut().catch((e) => {
+        appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
+      });
+      return;
+    }
     if (raw.startsWith("__app_reveal_recording__")) {
       let payload;
       try {

@@ -2641,14 +2641,26 @@ function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): voi
   setStatus(st, kind);
 }
 
+/**
+ * Single writer for the recording flag, and for the control that shows it.
+ *
+ * Every start/stop path flows through here — the in-window button, the
+ * global hotkey, and the main-process status sync — so the button's
+ * label and the live pane's preview-off status line change exactly once
+ * per transition regardless of which path caused it, and the button
+ * cannot drift out of step with a recording the hotkey started.
+ */
 function setRecordButton(recording: boolean): void {
   const was = isRecording;
   isRecording = !!recording;
-  // State transition ⇒ repaint. This is the single choke point every
-  // start/stop path flows through (UI button, hotkey toggle, main-
-  // process status sync), so the live pane's preview-off recording
-  // status line appears and clears exactly once per transition —
-  // regardless of which exit path a stop took.
+  const btn = document.getElementById("recordToggleBtn");
+  const label = document.getElementById("recordToggleLabel");
+  if (btn) {
+    btn.classList.toggle("is-recording", isRecording);
+    btn.setAttribute("aria-pressed", isRecording ? "true" : "false");
+    btn.title = isRecording ? "Stop recording" : "Start recording";
+  }
+  if (label) label.textContent = isRecording ? "Stop" : "Record";
   if (was !== isRecording) {
     syncLiveOutputFromState();
   }
@@ -11220,8 +11232,21 @@ async function stopLive(enhance: boolean): Promise<void> {
   }
 }
 
-// User-facing recording is controlled by global hotkey events that the
-// Electron main process dispatches into this renderer.
+// Recording is toggled in the main process. The global hotkey and the
+// in-window button are two ways to ask for the same thing; both land on
+// ``toggleRecordingFromShortcut`` there, which owns the microphone
+// permission prompt, the frontmost-window capture that auto-paste needs,
+// the recording capsule and the busy guard. Dispatching the renderer
+// event directly from the button would skip all of that and create a
+// second, weaker recording path.
+document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
+  const prevTitle = document.title;
+  document.title = "__app_record_toggle__" + Date.now();
+  // main.js consumes the sentinel through page-title-updated and
+  // preventDefault()s the real title change. Restored defensively for
+  // browser dev preview and any future non-Electron surface.
+  setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+});
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
   if (isRecording) {
