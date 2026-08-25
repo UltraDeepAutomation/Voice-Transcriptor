@@ -28,6 +28,20 @@ from backend.remote_deepgram_live import (
 )
 
 
+def _interim(start: float, end: float, text: str, words: list[tuple[str, float, float]] | None = None) -> dict:
+    alt: dict = {"transcript": text}
+    if words is not None:
+        alt["words"] = [{"word": w, "start": a, "end": b} for w, a, b in words]
+    return {
+        "type": "Results",
+        "is_final": False,
+        "speech_final": False,
+        "start": start,
+        "duration": end - start,
+        "channel": {"alternatives": [alt]},
+    }
+
+
 def _session(finals, speech_spans) -> DeepgramLiveSession:
     s = DeepgramLiveSession(api_key="k")
     s._finalized_segments = [{"start": a, "end": b} for a, b in finals]
@@ -84,3 +98,50 @@ class UncoveredSpeechTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpeechSpanSourceTests(unittest.TestCase):
+    """What counts as "the service heard words here"."""
+
+    def test_the_re_decode_window_is_not_charged_as_speech(self):
+        # A rolling interim spans five seconds and carries two words at
+        # its end. Charging the window made this message report ~4 s of
+        # recognised speech that was never spoken — and every such
+        # message inflated the hole warning shown to the user.
+        s = DeepgramLiveSession(api_key="k")
+        s._process_deepgram_message(
+            _interim(10.0, 15.0, "последнее слово", [("последнее", 14.2, 14.6), ("слово", 14.6, 15.0)])
+        )
+        self.assertEqual(s._interim_speech_spans, [(14.2, 15.0)])
+        s._finalized_segments = [{"start": 0.0, "end": 10.0}]
+        self.assertAlmostEqual(s._uncovered_speech_sec(), 0.8, places=6)
+
+    def test_breath_between_words_is_not_a_hole(self):
+        # Words closer together than the boundary threshold are one run
+        # of speech; the silence between them is not measurable loss.
+        s = DeepgramLiveSession(api_key="k")
+        s._process_deepgram_message(
+            _interim(0.0, 3.0, "раз два три", [("раз", 0.0, 0.4), ("два", 0.6, 1.0), ("три", 1.1, 1.5)])
+        )
+        self.assertEqual(s._interim_speech_spans, [(0.0, 1.5)])
+
+    def test_a_real_pause_inside_the_window_splits_the_span(self):
+        s = DeepgramLiveSession(api_key="k")
+        s._process_deepgram_message(
+            _interim(0.0, 9.0, "начало и конец", [("начало", 0.0, 0.5), ("и", 0.6, 0.8), ("конец", 8.0, 8.6)])
+        )
+        self.assertEqual(s._interim_speech_spans, [(0.0, 0.8), (8.0, 8.6)])
+
+    def test_a_hypothesis_without_word_timings_still_reports_its_span(self):
+        # Fallback: no word list means the message span is all we know,
+        # and going blind would be worse than over-reporting.
+        s = DeepgramLiveSession(api_key="k")
+        s._process_deepgram_message(_interim(4.0, 6.0, "без таймингов слов"))
+        self.assertEqual(s._interim_speech_spans, [(4.0, 6.0)])
+
+    def test_noise_hypotheses_are_still_excluded(self):
+        s = DeepgramLiveSession(api_key="k")
+        short = "ой"
+        self.assertLess(len(short), INTERIM_SPEECH_MIN_CHARS)
+        s._process_deepgram_message(_interim(1.0, 2.0, short, [("ой", 1.0, 1.2)]))
+        self.assertEqual(s._interim_speech_spans, [])

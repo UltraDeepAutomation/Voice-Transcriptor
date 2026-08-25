@@ -95,16 +95,26 @@ TAIL_GUARD_MIN_SEC = 0.75
 # nothing is missing used to be computed only INSIDE the timeout
 # handler, so the answer arrived strictly after the cost had been paid.
 #
-# Sizing, from the same logs (411 post-Finalize round trips): median
-# 0.26 s, p90 0.36 s, p95 0.49 s, p99 1.15 s, max 1.49 s. 0.75 s sits
-# above p95 with margin, so a covered session whose final IS coming
-# still gets it. On the rare late (>0.75 s) final for a covered stream
-# there is nothing to lose: every streamed second is already represented
-# in a finalized segment, which is what "covered" means.
+# 0.75 → 0.25 s. The 0.75 s was sized from the round trips of sessions
+# that DID receive a post-Finalize transcript (411 of them: median 0.26 s,
+# p95 0.49 s) — but those are uncovered-tail sessions, where Finalize has
+# something to flush. A covered tail is the case where it does not, and
+# every covered stop since the budget split was introduced has confirmed
+# it: 9 of 9 waited out the full window and Deepgram sent nothing, at a
+# measured 962-1011 ms per finalize. The window has never once confirmed
+# anything. 0.25 s still catches a message already on the wire when
+# Finalize went out, and cuts ~500 ms from every stop whose audio was
+# already fully represented in finalized segments.
+#
+# What is risked is bounded by what "covered" means: every streamed second
+# is already in a final, so a late arrival could only re-word text we
+# already hold, never add missing speech. When one does arrive, the
+# "post-Finalize transcript received" line records it with its budget —
+# which is how this number gets revisited rather than assumed.
 #
 # An UNCOVERED tail keeps the full ceiling and the retry — that is the
 # case where a truncated wait would cost the user real words.
-FINALIZE_COVERED_WAIT_SEC = 0.75
+FINALIZE_COVERED_WAIT_SEC = 0.25
 
 # Seam repair: Deepgram's periodic forced flushes may cut a word in half
 # across two consecutive finals ("…четыре, пя" | "ть. Далее"). When two
@@ -114,6 +124,27 @@ FINALIZE_COVERED_WAIT_SEC = 0.75
 # join them instead of shipping both halves to the transcript.
 SEAM_MERGE_MAX_GAP_SEC = 0.05
 _SEAM_VOWELS = set("аеёиоуыэюяaeiouy")
+
+
+def _word_speech_spans(words: Iterable[dict]) -> list[tuple[float, float]]:
+    """Speech spans covering ``words``, with inter-word silence bridged.
+
+    Consecutive words closer together than ``COVERAGE_GAP_MIN_SEC`` belong
+    to one run of speech; the breath between them is not a hole and must
+    not be measured as one. Anything wider starts a new span, so a real
+    pause inside a re-decode window stays outside the measurement.
+    """
+    spans: list[tuple[float, float]] = []
+    for word in sorted(words, key=lambda w: (float(w["start"]), float(w["end"]))):
+        start = float(word["start"])
+        end = float(word["end"])
+        if end <= start:
+            continue
+        if spans and start - spans[-1][1] <= COVERAGE_GAP_MIN_SEC:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        else:
+            spans.append((start, end))
+    return spans
 
 
 def _token_alpha_core(token: str) -> str:
@@ -462,6 +493,12 @@ class DeepgramLiveSession:
             raise DeepgramLiveError("session is closed")
         url = f"{DEEPGRAM_LIVE_URL}?{self._cfg.to_query_string()}"
         headers = [("Authorization", f"Token {self._api_key}")]
+        # The full query string, not a summary: endpointing,
+        # utterance_end_ms, smart_format and punctuate all change what the
+        # transcript looks like, and a session whose parameters are not in
+        # the log cannot be compared against one recorded before they were
+        # changed. No secret is involved — the key travels in a header.
+        logger.info("deepgram-live: params %s", self._cfg.to_query_string())
         logger.info(
             "deepgram-live: connecting model=%s language=%s sr=%s timeout=%.1fs",
             self._cfg.model,
@@ -1583,18 +1620,14 @@ class DeepgramLiveSession:
             }
 
         self.stats.segments_interim += 1
-        # Record where the service actually heard words. The threshold
-        # keeps single-character noise hypotheses out of the measurement.
-        if len(text) >= INTERIM_SPEECH_MIN_CHARS and end > start:
-            self._interim_speech_spans.append((start, end))
         # Retain this hypothesis's words for hole-splicing at finalize.
         # An interim is a ROLLING re-decode of recent audio, so each new
         # one supersedes every stored word that overlaps its range —
         # without that, the same spoken word would pile up once per
         # interim message and the splice would duplicate it.
         raw_words = alt.get("words")
+        new_words: list[dict] = []
         if isinstance(raw_words, list):
-            new_words: list[dict] = []
             for w in raw_words:
                 if not isinstance(w, dict):
                     continue
@@ -1608,35 +1641,50 @@ class DeepgramLiveSession:
                 new_words.append(
                     {"word": token, "start": round(w_start, 3), "end": round(w_end, 3)}
                 )
+        # Record where the service actually heard WORDS. The message span
+        # is the re-decode window, not the speech in it: a rolling interim
+        # can span five seconds and carry two words near its end, and
+        # charging the whole window as "recognised speech" made every such
+        # message report seconds of loss that were never spoken. Word
+        # timings are the honest measure; the message span is the fallback
+        # for a hypothesis that arrives without them. The length threshold
+        # keeps single-character noise hypotheses out either way.
+        if len(text) >= INTERIM_SPEECH_MIN_CHARS:
             if new_words:
-                def _overlaps_range(w: dict) -> bool:
-                    return not (w["end"] <= start or w["start"] >= end)
+                self._interim_speech_spans.extend(_word_speech_spans(new_words))
+            elif end > start:
+                self._interim_speech_spans.append((start, end))
+        # ``new_words`` is non-empty only when the hypothesis carried a
+        # word list, so this is the same guard the parse above applied.
+        if new_words:
+            def _overlaps_range(w: dict) -> bool:
+                return not (w["end"] <= start or w["start"] >= end)
 
-                displaced = [w for w in self._interim_words if _overlaps_range(w)]
-                self._interim_words = [
-                    w for w in self._interim_words if not _overlaps_range(w)
-                ]
-                # Displaced ≠ wrong: the newer hypothesis merely did not
-                # confirm them YET. Park them as orphans unless the NEWEST
-                # words actually cover the same ground (newest wins).
-                seen = {
-                    (o["word"], o["start"], o["end"])
-                    for o in self._orphan_interim_words
-                }
-                for w in displaced:
-                    key = (w["word"], w["start"], w["end"])
-                    if key not in seen:
-                        seen.add(key)
-                        self._orphan_interim_words.append(dict(w))
-                self._orphan_interim_words = [
-                    o
-                    for o in self._orphan_interim_words
-                    if not any(
-                        not (o["end"] <= n["start"] or o["start"] >= n["end"])
-                        for n in new_words
-                    )
-                ]
-                self._interim_words.extend(new_words)
+            displaced = [w for w in self._interim_words if _overlaps_range(w)]
+            self._interim_words = [
+                w for w in self._interim_words if not _overlaps_range(w)
+            ]
+            # Displaced ≠ wrong: the newer hypothesis merely did not
+            # confirm them YET. Park them as orphans unless the NEWEST
+            # words actually cover the same ground (newest wins).
+            seen = {
+                (o["word"], o["start"], o["end"])
+                for o in self._orphan_interim_words
+            }
+            for w in displaced:
+                key = (w["word"], w["start"], w["end"])
+                if key not in seen:
+                    seen.add(key)
+                    self._orphan_interim_words.append(dict(w))
+            self._orphan_interim_words = [
+                o
+                for o in self._orphan_interim_words
+                if not any(
+                    not (o["end"] <= n["start"] or o["start"] >= n["end"])
+                    for n in new_words
+                )
+            ]
+            self._interim_words.extend(new_words)
         if self.stats.segments_interim % 5 == 1:
             # Sample 1-in-5 interim emissions to keep log volume bounded
             # while still proving Deepgram is producing output.

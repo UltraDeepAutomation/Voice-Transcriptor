@@ -3868,8 +3868,22 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       -- Fast path: bring target to front and send physical Cmd+V keycode.
       -- Avoid AXFocusedUIElement probing here because some apps block this call
       -- for several seconds and makes the recording status look stuck on transcribing.
-      set frontmost of p to true
-      delay 0.08
+      --
+      -- The activation and its settle delay are conditional. Transcriptor
+      -- never takes focus — the capsule is a non-focusable window — so the
+      -- app the user dictated into is still frontmost when the transcript
+      -- comes back: 1459 of 1459 pastes in the log recorded
+      -- ``target_activation_skipped reason=already-frontmost``. Raising an
+      -- app that is already raised is free; the 80 ms delay after it was
+      -- not, and it was paid on every one of them. Reading ``frontmost``
+      -- is a single attribute fetch, and the activation still happens
+      -- whenever focus really did move.
+      set activationTag to ""
+      if frontmost of p is false then
+        set frontmost of p to true
+        set activationTag to "+activated"
+        delay 0.08
+      end if
       if targetWindowTitle is not "" then
         try
           -- Resolve the window ONCE. "if exists X then set w to X" runs
@@ -3916,8 +3930,14 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
           end if
           try
             click pasteMenuItem
-            delay 0.16
-            return "OK:menu-paste-primary"
+            -- No settle delay before returning. ``click`` performs the
+            -- app's own paste action; nothing this script does afterwards
+            -- observes the result, and the two things that DO care about
+            -- the paste having landed carry their own waits: the clipboard
+            -- restore does not run for at least 1.5 s, and the auto-send
+            -- Enter sleeps before it fires. A delay here was 160 ms added
+            -- to the moment the user is waiting for.
+            return "OK:menu-paste-primary" & activationTag
           end try
         end if
       end try
@@ -3928,8 +3948,9 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
         key code 9 using {command down}
       end tell
       
-      delay 0.10
-      return "OK:robust-paste"
+      -- Same reasoning as the menu path: the settle allowance lives with
+      -- the caller that needs it, not in front of the return.
+      return "OK:robust-paste" & activationTag
     end tell
   `;
 
@@ -4870,7 +4891,12 @@ async function processPostStopTask(task) {
     }
     let autoSendResult = null;
     if (pasted.ok && task.autoSendEnter) {
-      await sleep(220);
+      // Settle before Enter. 220 → 380 ms because the paste script no
+      // longer holds its own 160 ms delay after clicking Paste: the time
+      // between the paste landing and Enter firing is what this protects,
+      // and it is unchanged. Enter into a field that has not received the
+      // text yet sends an empty message.
+      await sleep(380);
       const sent = await sendCommandEnterToFocusedApp(effectiveTarget);
       autoSendResult = sent;
       traceStep(trace, "cmd_enter_result", {

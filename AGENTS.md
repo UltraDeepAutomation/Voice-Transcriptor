@@ -23,6 +23,14 @@ CI runs these on every push):
 python3 -m unittest discover -s backend/tests
 ```
 
+The whole suite (368 tests) runs offline in a throwaway venv — worth doing
+rather than deferring to CI, because the modules with the most behaviour
+per line (Deepgram live, coverage, splice) need only pure-Python deps:
+
+```bash
+python3 -m venv /tmp/vt-tests && /tmp/vt-tests/bin/pip -q install websockets requests numpy soundfile fastapi huggingface_hub cryptography python-multipart && /tmp/vt-tests/bin/python -m unittest discover -s backend/tests
+```
+
 Frontend:
 
 ```bash

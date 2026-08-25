@@ -249,11 +249,23 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BudgetConstantTests(unittest.TestCase):
-    def test_confirmation_window_sits_above_the_observed_p95_round_trip(self):
-        # 411 measured post-Finalize round trips: median 0.26 s,
-        # p90 0.36 s, p95 0.49 s. A budget below p95 would start
-        # truncating finals that were genuinely on their way.
-        self.assertGreater(FINALIZE_COVERED_WAIT_SEC, 0.49)
+    def test_the_covered_window_is_not_sized_from_uncovered_round_trips(self):
+        # The window was 0.75 s, sized to sit above the p95 (0.49 s) of
+        # 411 measured post-Finalize round trips. Those round trips are
+        # all UNCOVERED-tail sessions — the ones where Finalize has
+        # something to flush and therefore answers. Sizing the covered
+        # window from them assumed the covered case behaves the same way.
+        # It does not: every covered stop recorded since the budget split
+        # shipped — 9 of 9 — waited out the whole window and received
+        # nothing, at 962-1011 ms per finalize.
+        #
+        # A number that has never once been reached is not a safety
+        # margin, it is a fixed cost. Locked below the old p95 so the
+        # reasoning cannot be reintroduced without this test going red.
+        self.assertLess(FINALIZE_COVERED_WAIT_SEC, 0.49)
+        # Still long enough for a message already on the wire when the
+        # Finalize frame went out.
+        self.assertGreaterEqual(FINALIZE_COVERED_WAIT_SEC, 0.2)
 
     def test_confirmation_window_is_shorter_than_the_full_ceiling(self):
         self.assertLess(FINALIZE_COVERED_WAIT_SEC, FINALIZE_FLUSH_WAIT_SEC)
