@@ -144,6 +144,72 @@ if not any(
 _backend_logger.propagate = False
 
 
+# ── Access-log noise floor ──────────────────────────────────────────────────
+#
+# main.log is the support log: the one artefact available when a user says
+# "the transcript lost its ending" or "recording did not start". It has to
+# be readable.
+#
+# Measured on a real 42 833-line archive, before this filter:
+#
+#     GET /api/health          12 624 lines   29.5 %
+#     GET /api/network         12 621 lines   29.5 %
+#     PUT /api/ui/live-draft    6 659 lines   15.5 %
+#     ------------------------------------------------
+#     poll/autosave noise                     ~75 %
+#     recordings actually saved   135 lines    0.3 %
+#
+# Three-quarters of the record was the renderer confirming, every few
+# seconds, that nothing had changed — while the 135 events a human would
+# ever search for made up a third of one percent. It also drove rotation:
+# 5 MB every ~1.5 days, so genuinely useful history aged out fast.
+#
+# What is muted is deliberately narrow: a SUCCESSFUL (2xx) request to a
+# path the UI polls on a timer. A non-2xx on those same paths is exactly
+# the signal you want — a failing /api/health is the difference between
+# "the backend is up" and "the backend is wedged" — so those still print,
+# as does every other endpoint, including every save, transcription,
+# recovery and model operation.
+_ACCESS_LOG_POLLED_PATHS: frozenset[str] = frozenset({
+    "/api/health",        # renderer network pill, ~1 per 10 s
+    "/api/network",       # same poll's second leg
+    "/api/ui/live-draft", # live-draft autosave, ~1 per 1.2 s while recording
+    "/api/models/local",  # Settings → Local models list
+})
+
+
+class _MutedPollingAccessFilter(logging.Filter):
+    """Drop access-log records for successful polls of the paths above.
+
+    uvicorn emits access records with
+    ``args = (client_addr, method, full_path, http_version, status)``.
+    Anything that does not match that shape is passed through untouched —
+    a filter must never be the reason a log line disappears.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        raw_path, status = args[2], args[4]
+        if not isinstance(raw_path, str):
+            return True
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return True
+        if not (200 <= code < 300):
+            return True  # a failing poll is signal, not noise
+        return raw_path.split("?", 1)[0] not in _ACCESS_LOG_POLLED_PATHS
+
+
+_uvicorn_access_logger = logging.getLogger("uvicorn.access")
+if not any(
+    isinstance(f, _MutedPollingAccessFilter) for f in _uvicorn_access_logger.filters
+):
+    _uvicorn_access_logger.addFilter(_MutedPollingAccessFilter())
+
+
 # ── Parent-death watchdog ───────────────────────────────────────────────────
 #
 # The Electron shell is our parent. When it quits cleanly it sends SIGTERM
@@ -2584,6 +2650,11 @@ DEFAULT_AUDIO_RETENTION_POLICY = AUDIO_RETENTION_POLICIES[RECORDING_COLLECTION_L
 # fortnight keeps every file that aged out while it was up. (Count
 # limits are naturally enforced on every save.) Hourly is far finer
 # than a 7-day window needs and costs one directory listing per dir.
+# Below this much streamed audio, "no final segments" is an ordinary
+# outcome — a hotkey pressed and released, a moment of silence — not a
+# failure worth a warning.
+LIVE_EMPTY_RESULT_MIN_SEC = 2.0
+
 AUDIO_RETENTION_SWEEP_INTERVAL_SEC = max(
     60, _env_int("TRANSCRIPTOR_AUDIO_RETENTION_SWEEP_SEC", 3600)
 )
@@ -4204,15 +4275,48 @@ async def _run_deepgram_live_session(
                 except (asyncio.CancelledError, Exception):
                     pass
 
+        streamed_sec = session.stats.bytes_sent / float(2 * LIVE_SAMPLE_RATE_HZ)
         logger.info(
-            "ws deepgram session complete: bytes=%d chunks=%d final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s",
+            "ws deepgram session complete: bytes=%d streamed_sec=%.1f chunks=%d "
+            "final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s text_len=%d",
             session.stats.bytes_sent,
+            streamed_sec,
             session.stats.chunks_sent,
             session.stats.segments_final,
             session.stats.segments_interim,
             f"{session.stats.connect_ms:.0f}" if session.stats.connect_ms else "?",
             f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
+            len(final_payload.get("text") or ""),
         )
+        # A session that streamed real audio and produced no final segment
+        # is a silently lost transcription: the recording exists, the user
+        # spoke into it, and the live path returned nothing. The renderer
+        # then falls back to the REST endpoint, so the user usually still
+        # gets their text — but the live path having failed is invisible
+        # in the log unless we say so, and it was: measured at 29 of 706
+        # sessions (4.1 %), 21 of them with more than 2 s of audio, none
+        # of which left any trace above INFO.
+        #
+        # Logged at WARNING so it stands out from the per-session INFO
+        # summary, and carries the two facts that separate the causes:
+        # ``interim_segs=0`` means Deepgram never recognised anything at
+        # all (dead microphone input, wrong language, upstream refusal),
+        # while interims without finals means recognition worked and only
+        # the flush failed.
+        if (
+            session.stats.segments_final == 0
+            and streamed_sec >= LIVE_EMPTY_RESULT_MIN_SEC
+        ):
+            logger.warning(
+                "ws deepgram produced NO final segments for %.1fs of audio "
+                "(interim_segs=%d connect_ms=%s finalize_ms=%s error=%s) — "
+                "renderer will fall back to REST",
+                streamed_sec,
+                session.stats.segments_interim,
+                f"{session.stats.connect_ms:.0f}" if session.stats.connect_ms else "?",
+                f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
+                _safe_error_text(session.last_error) if session.last_error else "none",
+            )
 
         await _ws_send_json(websocket, final_payload)
         await session.close()
