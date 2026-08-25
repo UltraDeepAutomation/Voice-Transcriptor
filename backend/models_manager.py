@@ -115,14 +115,6 @@ def list_local_models() -> list[dict[str, Any]]:
     return rows
 
 
-def is_downloaded(model_id: str) -> bool:
-    if model_id.startswith("gigaam-"):
-        from backend.model_catalog import gigaam_available
-
-        return gigaam_available()
-    return whisper_downloaded(model_id)
-
-
 class ModelDeleteError(RuntimeError):
     """Deletion refused for a reason the user can act on."""
 

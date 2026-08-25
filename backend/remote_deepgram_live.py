@@ -936,7 +936,9 @@ class DeepgramLiveSession:
 
         await self.close()
 
-        recovered_words = self._splice_uncovered_interim_words()
+        # The splice logs what it recovered; the count has no other
+        # consumer, so it is not bound to a name that would suggest one.
+        self._splice_uncovered_interim_words()
         self.stats.finalize_ms = (time.perf_counter() - started) * 1000.0
         final_text = self.final_text()
         duration_sec = 0.0
