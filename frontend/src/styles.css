@@ -168,6 +168,7 @@ body {
   --vu-low: #b3b3b3;
   --vu-mid: #949494;
   --vu-high: #757575;
+  --radius-xs: 6px;
   --radius-sm: 8px;
   --radius-md: 10px;
   --radius: 12px;
@@ -731,7 +732,7 @@ body.platform-darwin .sidebar {
   max-width: min(100%, 240px);
   padding: 0 10px;
   border: 1px solid var(--glass-border);
-  border-radius: 999px;
+  border-radius: var(--chip-radius);
   background:
     linear-gradient(180deg, var(--glass-highlight), rgba(255, 255, 255, 0)),
     var(--glass-chip-bg);
@@ -1393,7 +1394,7 @@ textarea:focus-visible,
   flex-shrink: 0;
   width: 34px;
   height: 18px;
-  border-radius: 999px;
+  border-radius: var(--chip-radius);
   border: 1px solid var(--toggle-track-border);
   background: var(--toggle-track);
   position: relative;
@@ -2742,7 +2743,7 @@ textarea:focus-visible,
   height: 28px;
   padding: 0 10px;
   border: 1px solid var(--glass-border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background:
     linear-gradient(180deg, var(--glass-highlight), rgba(255, 255, 255, 0.015)),
     var(--glass-chip-bg);
@@ -3475,7 +3476,7 @@ canvas {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   line-height: 1.5;
   padding: 10px 14px;
-  border-radius: 6px;
+  border-radius: var(--radius-xs);
   background: rgba(0, 0, 0, 0.3);
   border: 1px solid rgba(255, 255, 255, 0.04);
   /* Monospace output (tracebacks, python paths) MUST be left-aligned —
@@ -3573,7 +3574,7 @@ canvas {
   color: var(--text-1);
   background: var(--surface-2);
   border: 1px solid var(--surface-border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -3593,7 +3594,7 @@ canvas {
   color: var(--text-2);
   background: var(--surface-3, rgba(255,255,255,0.03));
   border: 1px solid var(--surface-border);
-  border-radius: 6px;
+  border-radius: var(--radius-xs);
   display: flex;
   flex-wrap: wrap;
   gap: 6px 14px;
@@ -3634,7 +3635,7 @@ canvas {
   text-align: center;
   padding: 36px 24px;
   border: 1.5px dashed var(--surface-3, #3a3a3a);
-  border-radius: 12px;
+  border-radius: var(--radius);
   background: var(--surface-2, #1a1a1a);
   color: var(--text-2, #a0a0a0);
   cursor: pointer;
@@ -3696,7 +3697,7 @@ canvas {
   color: var(--text-2, #a0a0a0);
   background: var(--surface-3, rgba(255, 255, 255, 0.04));
   border: 1px solid var(--surface-3, #2a2a2a);
-  border-radius: 6px;
+  border-radius: var(--radius-xs);
   max-width: 420px;
   line-height: 1.45;
 }
@@ -3721,7 +3722,7 @@ canvas {
 .upload-queue-item {
   background: var(--surface-1, #1a1a1a);
   border: 1px solid var(--surface-3, #2a2a2a);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   transition: border-color 150ms ease;
 }
@@ -3751,7 +3752,7 @@ canvas {
 .upload-queue-status-dot {
   width: 8px;
   height: 8px;
-  border-radius: 999px;
+  border-radius: var(--chip-radius);
   flex: 0 0 auto;
   margin-top: 5px;
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
@@ -3796,7 +3797,7 @@ canvas {
   font-size: 11px;
   font-weight: 500;
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: var(--control-radius);
   background: var(--surface-3, #2a2a2a);
   color: var(--text-2, #a0a0a0);
   white-space: nowrap;
@@ -3896,7 +3897,7 @@ canvas {
   font-size: 11px;
   font-weight: 500;
   padding: 3px 10px;
-  border-radius: 10px;
+  border-radius: var(--control-radius);
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
@@ -3916,7 +3917,7 @@ canvas {
   font-size: 11px;
   font-weight: 600;
   padding: 3px 10px;
-  border-radius: 10px;
+  border-radius: var(--control-radius);
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease, opacity 120ms ease;
 }
@@ -3938,7 +3939,7 @@ canvas {
   color: var(--text-1, #e6e6e6);
   background: var(--surface-2, #1a1a1a);
   padding: 10px 12px;
-  border-radius: 6px;
+  border-radius: var(--radius-xs);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 240px;
@@ -4028,7 +4029,7 @@ canvas {
   display: grid;
   grid-template-columns: subgrid;
   align-items: center;
-  padding: 7px 10px; border-radius: 10px;
+  padding: 7px 10px; border-radius: var(--control-radius);
   background: var(--surface-2, rgba(255, 255, 255, 0.04));
 }
 
@@ -4169,7 +4170,7 @@ canvas {
   height: 5px;
   appearance: none;
   -webkit-appearance: none;
-  border-radius: 999px;
+  border-radius: var(--chip-radius);
   background: var(--line);
   outline: none;
   cursor: pointer;
