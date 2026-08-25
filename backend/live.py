@@ -57,6 +57,63 @@ class LiveConfig:
     word_timestamps: bool = True
 
 
+# Longest head of a fresh window that may be recognised as a repeat of what
+# was already emitted. Each window re-feeds ``overlap_sec`` (1 s) of committed
+# audio, which carries at most a handful of words; anything past this is real
+# speech that happens to echo an earlier phrase.
+REPEAT_TRIM_MAX_WORDS = 10
+
+
+def _comparable_words(text: str) -> list[str]:
+    """Lowercased, punctuation-free tokens for overlap comparison."""
+    out = []
+    for token in str(text or "").split():
+        core = "".join(ch for ch in token.lower() if ch.isalnum())
+        if core:
+            out.append(core)
+    return out
+
+
+def trim_repeated_prefix(previous_text: str, new_text: str) -> str:
+    """Drop the head of ``new_text`` that repeats the tail of ``previous_text``.
+
+    The time-based guard above this is not enough on its own. Every window
+    re-decodes ``overlap_sec`` of already-committed audio, and the SAME word
+    comes back with different timestamps on each pass — RNNT and Whisper both
+    drift by more than ``emit_epsilon_sec`` across passes. A word whose
+    re-decoded end lands past the watermark survives the trim and is emitted a
+    second time, which is what reaches the user as "хорошо. хорошо работает"
+    and "проблемы. проблемы".
+
+    Timestamps cannot settle this because both readings are equally plausible;
+    the text can. The longest suffix of what we already said that equals the
+    prefix of what we are about to say is the re-decoded overlap, and it is
+    dropped. Bounded by ``REPEAT_TRIM_MAX_WORDS`` so a genuine repetition
+    further back in the sentence is never touched, and anchored at the head:
+    a repeat that starts mid-way through the new text is real speech.
+    """
+    new_tokens = str(new_text or "").split()
+    if not new_tokens:
+        return ""
+    prev_words = _comparable_words(previous_text)
+    new_words = [_comparable_words(t) for t in new_tokens]
+    # Map raw-token index -> comparable words it contributes.
+    flat: list[tuple[int, str]] = []
+    for idx, words in enumerate(new_words):
+        for w in words:
+            flat.append((idx, w))
+    if not flat or not prev_words:
+        return str(new_text or "").strip()
+    limit = min(REPEAT_TRIM_MAX_WORDS, len(prev_words), len(flat))
+    for k in range(limit, 0, -1):
+        if prev_words[-k:] != [w for _idx, w in flat[:k]]:
+            continue
+        # Every raw token up to and including the last matched one is
+        # consumed — punctuation-only tokens inside the run included.
+        return " ".join(new_tokens[flat[k - 1][0] + 1:]).strip()
+    return str(new_text or "").strip()
+
+
 # Consecutive transcribe failures before we escalate to a fatal error.
 # Single transient errors (audio glitch, model hiccup) should not kill
 # the live session — but an unrecoverable failure (model unload, OOM,
@@ -105,6 +162,13 @@ class LiveSession:
         # the session as "no text" and triggered an unnecessary
         # recovery REST round-trip.
         self._emitted_segments: list[dict] = []
+
+    def _emitted_tail_text(self) -> str:
+        """The last few emitted segments, for overlap comparison."""
+        if not self._emitted_segments:
+            return ""
+        tail = self._emitted_segments[-3:]
+        return " ".join(str(s.get("text") or "") for s in tail).strip()
 
     def _get_last_samples(self, n: int) -> np.ndarray:
         if n <= 0 or self._ring_samples <= 0:
@@ -395,6 +459,21 @@ class LiveSession:
                 if g_end <= cutoff:
                     continue
                 g_start = offset_sec + float(s.get("start", 0.0) or 0.0)
+            # Text-level overlap guard. The timestamp trim above cannot
+            # see a word whose re-decode drifted past the watermark; the
+            # words themselves can.
+            trimmed = trim_repeated_prefix(self._emitted_tail_text(), text)
+            if not trimmed:
+                # The whole segment re-states committed speech.
+                self._last_emitted_end = max(self._last_emitted_end, g_end)
+                continue
+            if trimmed != text:
+                logger.info(
+                    "trimmed a re-decoded overlap from a live segment: %r -> %r",
+                    text[:60],
+                    trimmed[:60],
+                )
+                text = trimmed
             new_segments.append({"start": g_start, "end": g_end, "text": text})
             self._last_emitted_end = max(self._last_emitted_end, g_end)
 

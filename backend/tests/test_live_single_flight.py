@@ -40,17 +40,23 @@ class LiveSingleFlightTests(unittest.IsolatedAsyncioTestCase):
         session = self._session()
         await _feed(session, 3.0)
 
-        state = {"active": 0, "max_active": 0}
+        state = {"active": 0, "max_active": 0, "calls": 0}
         lock = threading.Lock()
 
         def fake_transcribe(audio, model, **kwargs):
             with lock:
                 state["active"] += 1
                 state["max_active"] = max(state["max_active"], state["active"])
+                state["calls"] += 1
+                call = state["calls"]
             threading.Event().wait(0.15)  # slow inference, executor thread
             with lock:
                 state["active"] -= 1
-            return {"segments": [{"start": 0.0, "end": 2.5, "text": "привет"}]}
+            # Distinct text per pass. Returning the SAME words twice is a
+            # re-decoded overlap, which the emit path now drops on purpose
+            # — a fixture that repeats itself would be asserting the
+            # duplication this session removed.
+            return {"segments": [{"start": 0.0, "end": 2.5, "text": f"привет {call}"}]}
 
         with mock.patch("backend.live.transcribe_audio", side_effect=fake_transcribe):
             first = asyncio.create_task(session.maybe_transcribe())

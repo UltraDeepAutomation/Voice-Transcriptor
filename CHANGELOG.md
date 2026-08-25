@@ -5,6 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Local engines repeated the window overlap into the transcript.** Reported against both faster-whisper and GigaAM, and visible verbatim in the reports themselves: `насколько он хорошо. хорошо работает`, `какие-то проблемы. проблемы, может быть`, `у этих чуваков чуваков еще Чанкова`. The local live path decodes a rolling 8 s window and re-feeds 1 s of already-committed audio at its head so a word on a boundary is decoded with context — the head of every pass is therefore a second reading of speech already emitted. It was removed by timestamp alone: a word whose end fell at or before the watermark plus `emit_epsilon_sec` (50 ms) was dropped. But both engines re-estimate word times on every pass and drift by more than that, so the second reading survived the trim and was emitted again. Timestamps cannot settle it — both readings are equally plausible. The text can: the longest run of words at the head of a new segment that repeats the tail of what was already said is the overlap, and it is now dropped, bounded to ten words so a genuine repetition further along is never touched. `trim_repeated_prefix` is pure and unit-tested against the reported transcripts. One existing single-flight test had a stub returning the *same* words on both passes and asserted that the second was still emitted — it now returns distinct text per pass, because a fixture that repeats itself was asserting the duplication.
+
 ## [1.4.0] - 2026-08-25
 
 The release that fixed the things that had been quietly costing words and
