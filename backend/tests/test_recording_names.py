@@ -1095,6 +1095,32 @@ class RecordingNameTests(unittest.TestCase):
         self.assertTrue(pcm_path.exists())
         self.assertTrue(meta_path.exists())
 
+    def test_delete_live_recovery_removes_an_orphan_sidecar(self):
+        # ``_live_recovery_paths`` resolves the pair by globbing for the
+        # ``.pcm16``, so once the spool is gone it answered "no such
+        # recovery" and the delete returned immediately — leaving the
+        # ``.json`` behind with nothing that could ever name it again.
+        # Measured on a real machine: 207 orphan sidecars against a
+        # single live spool. Deleting a session's remains must not depend
+        # on which half of it still happens to exist.
+        session_id = "orphansidecar"
+        meta_path = (
+            self.main.LIVE_RECOVERY_DIR / f"20260101_000000_{session_id}.json"
+        )
+        meta_path.write_text('{"session_id":"orphansidecar"}', encoding="utf-8")
+
+        self.assertTrue(self.main._delete_live_recovery(session_id))
+        self.assertFalse(meta_path.exists())
+
+    def test_delete_live_recovery_reports_false_when_nothing_exists(self):
+        self.assertFalse(self.main._delete_live_recovery("nothinghere"))
+
+    def test_delete_live_recovery_rejects_a_malformed_session_id(self):
+        # The glob is built from the id, so a path-ish id must never
+        # reach it.
+        self.assertFalse(self.main._delete_live_recovery("../../etc"))
+        self.assertFalse(self.main._delete_live_recovery(""))
+
     def test_discard_live_recovery_uses_safe_delete_path(self):
         with mock.patch.object(
             self.main,

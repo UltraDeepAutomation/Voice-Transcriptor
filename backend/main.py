@@ -987,13 +987,34 @@ def _live_recovery_paths(session_id: str) -> tuple[Optional[Path], Optional[Path
 
 
 def _delete_live_recovery(session_id: str) -> bool:
-    pcm_path, meta_path = _live_recovery_paths(session_id)
-    if pcm_path is None:
+    """Remove a session's spool AND its sidecar. Returns True if anything went.
+
+    Both halves are deleted independently. ``_live_recovery_paths``
+    resolves the pair by globbing for the ``.pcm16``, so once the spool
+    is gone it answers "no such recovery" and the previous form returned
+    immediately — leaving the ``.json`` sidecar behind with nothing that
+    could ever name it again. Measured on this machine: 207 orphan
+    sidecars against a single live spool, one per recording of the past
+    day, cleared only by the 24 h retention sweep long after they stopped
+    meaning anything.
+
+    Deleting a session's remains must not depend on which half of it
+    still happens to exist.
+    """
+    stem_glob = f"*_{session_id}" if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
+    if not stem_glob:
         return False
-    if meta_path is not None:
-        meta_path.unlink(missing_ok=True)
-    pcm_path.unlink(missing_ok=True)
-    return True
+    removed = False
+    # Sidecar BEFORE spool, and the order is load-bearing. If the sidecar
+    # cannot be removed we must not have removed the audio either: an
+    # orphan ``.json`` still advertising a recovery whose PCM is gone is
+    # worse than leaving both in place for the retention sweep. Deleting
+    # the spool first would break that on any locked-sidecar failure.
+    for suffix in (".json", ".pcm16"):
+        for path in LIVE_RECOVERY_DIR.glob(f"{stem_glob}{suffix}"):
+            path.unlink(missing_ok=True)
+            removed = True
+    return removed
 
 
 def _safe_delete_live_recovery(session_id: str) -> bool:
