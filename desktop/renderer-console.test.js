@@ -1,0 +1,159 @@
+"use strict";
+
+// Unit tests for the renderer-console mirror policy (renderer-console.js).
+// Pure node:test — no Electron, mirrors accelerator.test.js.
+//
+// The regression these pin: NOTHING the renderer logged had ever reached
+// main.log. Zero `[renderer …]` lines across the whole archive set. Two
+// independent causes — a development-only gate, and a handler reading
+// Electron's pre-36 `console-message` signature on Electron 42, where
+// the message argument is undefined.
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const {
+  MAX_MESSAGE_CHARS,
+  formatConsoleMirrorLine,
+  normalizeConsoleMessage,
+  shouldMirrorConsoleMessage,
+} = require("./renderer-console");
+
+// ── signature normalisation ───────────────────────────────────────────
+
+test("normalises the Electron >= 36 details-object signature", () => {
+  // The shape the bundled Electron 42 actually emits. The old handler
+  // read argument 3 here, got undefined, and dropped every message.
+  const out = normalizeConsoleMessage(
+    { level: "warning", message: "Recovery promote failed", lineNumber: 12 },
+    undefined,
+  );
+  assert.deepEqual(out, { level: "WARN", message: "Recovery promote failed" });
+});
+
+test("normalises the Electron < 36 positional signature", () => {
+  assert.deepEqual(normalizeConsoleMessage(3, "boom"), {
+    level: "ERROR",
+    message: "boom",
+  });
+  assert.deepEqual(normalizeConsoleMessage(2, "careful"), {
+    level: "WARN",
+    message: "careful",
+  });
+  assert.deepEqual(normalizeConsoleMessage(1, "fyi"), {
+    level: "INFO",
+    message: "fyi",
+  });
+  assert.deepEqual(normalizeConsoleMessage(0, "chatter"), {
+    level: "DEBUG",
+    message: "chatter",
+  });
+});
+
+test("maps every string level Electron can emit", () => {
+  for (const [raw, expected] of [
+    ["error", "ERROR"],
+    ["warning", "WARN"],
+    ["warn", "WARN"],
+    ["info", "INFO"],
+    ["log", "INFO"],
+    ["debug", "DEBUG"],
+    ["verbose", "DEBUG"],
+  ]) {
+    assert.equal(
+      normalizeConsoleMessage({ level: raw, message: "m" }, undefined).level,
+      expected,
+      `level ${raw}`,
+    );
+  }
+});
+
+test("an unknown shape degrades to INFO instead of throwing", () => {
+  // A logger must never be able to break the thing it observes.
+  assert.deepEqual(normalizeConsoleMessage(undefined, undefined), {
+    level: "INFO",
+    message: "",
+  });
+  assert.deepEqual(normalizeConsoleMessage(null, 42), {
+    level: "INFO",
+    message: "",
+  });
+  assert.equal(
+    normalizeConsoleMessage({ level: "nonsense", message: "m" }, undefined).level,
+    "INFO",
+  );
+});
+
+// ── what gets mirrored ────────────────────────────────────────────────
+
+test("warnings and errors are mirrored without the debug flag", () => {
+  // The whole point: the renderer reports its failures at these levels,
+  // and a support log that omits them is the bug being fixed.
+  assert.equal(shouldMirrorConsoleMessage("ERROR", "anything", false), true);
+  assert.equal(shouldMirrorConsoleMessage("WARN", "anything", false), true);
+});
+
+test("routine info and debug chatter is dropped", () => {
+  assert.equal(shouldMirrorConsoleMessage("INFO", "hello", false), false);
+  assert.equal(shouldMirrorConsoleMessage("DEBUG", "hello", false), false);
+  assert.equal(shouldMirrorConsoleMessage("INFO", "hello", true), false);
+});
+
+test("[trace] lines are mirrored only behind the debug flag", () => {
+  // High volume — thousands of lines per session — which is why the
+  // flag exists at all.
+  assert.equal(shouldMirrorConsoleMessage("INFO", "[trace] step", false), false);
+  assert.equal(shouldMirrorConsoleMessage("INFO", "[trace] step", true), true);
+  assert.equal(shouldMirrorConsoleMessage("DEBUG", "[trace-end] x", true), true);
+});
+
+// ── formatting ────────────────────────────────────────────────────────
+
+test("formats a mirrored line with its level tag", () => {
+  assert.equal(
+    formatConsoleMirrorLine({ level: "error", message: "kaput" }, undefined, false),
+    "[renderer ERROR] kaput",
+  );
+});
+
+test("returns an empty string for anything not mirrored", () => {
+  assert.equal(formatConsoleMirrorLine({ level: "info", message: "hi" }, undefined, false), "");
+  assert.equal(formatConsoleMirrorLine({ level: "error", message: "" }, undefined, false), "");
+  assert.equal(formatConsoleMirrorLine(undefined, undefined, true), "");
+});
+
+test("folds newlines so one console entry stays one log line", () => {
+  // A multi-line stack trace must not fragment into records that read
+  // as separate events.
+  const line = formatConsoleMirrorLine(
+    { level: "error", message: "Error: x\n  at a()\n  at b()" },
+    undefined,
+    false,
+  );
+  assert.equal(line.includes("\n"), false);
+  assert.equal(line, "[renderer ERROR] Error: x ⏎ at a() ⏎ at b()");
+});
+
+test("clips a runaway message and says how much was dropped", () => {
+  const huge = "x".repeat(MAX_MESSAGE_CHARS + 250);
+  const line = formatConsoleMirrorLine({ level: "error", message: huge }, undefined, false);
+  assert.equal(line.length < huge.length, true);
+  assert.equal(line.includes("(+250 chars)"), true);
+});
+
+test("a message exactly at the cap is not clipped", () => {
+  const exact = "y".repeat(MAX_MESSAGE_CHARS);
+  const line = formatConsoleMirrorLine({ level: "warning", message: exact }, undefined, false);
+  assert.equal(line, `[renderer WARN] ${exact}`);
+});
+
+test("the real failure that went unlogged now produces a line", () => {
+  // Reported by the user as "Could not recover 1 interrupted recording";
+  // the renderer logged it with console.warn and it reached nothing.
+  const line = formatConsoleMirrorLine(
+    { level: "warning", message: "Recovery promote failed for cd98fa10: HTTP 409" },
+    undefined,
+    /* mirrorTraceLogs */ false,
+  );
+  assert.equal(line, "[renderer WARN] Recovery promote failed for cd98fa10: HTTP 409");
+});

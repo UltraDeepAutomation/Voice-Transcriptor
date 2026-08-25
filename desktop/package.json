@@ -45,6 +45,7 @@
       "main.js",
       "accelerator.js",
       "engine-deps.js",
+      "renderer-console.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",

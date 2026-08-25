@@ -9,6 +9,7 @@ const shortcutDefaultsManifest = require("./shortcut-defaults.json");
 // SSOT for cross-platform accelerator canonicalisation — required by
 // main.js and unit-tested directly (desktop/accelerator.test.js).
 const { canonicalAcceleratorForPlatform } = require("./accelerator");
+const { formatConsoleMirrorLine } = require("./renderer-console");
 
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
@@ -6660,12 +6661,13 @@ async function createWindow(options = {}) {
   //
   // Args: (event, level, message, line, sourceId)
   //   level: 0=verbose, 1=info, 2=warning, 3=error
-  win.webContents.on("console-message", (_event, level, message) => {
-    if (!MIRROR_RENDERER_TRACE_LOGS) return;
-    const text = String(message || "");
-    if (!text.startsWith("[trace")) return;
-    const levelTag = level === 3 ? "ERROR" : level === 2 ? "WARN" : "INFO";
-    appendMainLog(`[renderer ${levelTag}] ${text}`);
+  // Renderer console → support log. Policy and both Electron call
+  // signatures live in ./renderer-console.js (pure, unit-tested); this
+  // handler only forwards. See that module for why nothing the renderer
+  // logged had ever reached main.log.
+  win.webContents.on("console-message", (a, b) => {
+    const line = formatConsoleMirrorLine(a, b, MIRROR_RENDERER_TRACE_LOGS);
+    if (line) appendMainLog(line);
   });
   win.webContents.on("render-process-gone", (_event, details) => {
     const reason = String(details?.reason || "unknown");

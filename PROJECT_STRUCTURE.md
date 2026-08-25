@@ -103,6 +103,7 @@ desktop/
 ├── main.js                         # Electron main process, backend lifecycle, recording monitor, hotkeys
 ├── accelerator.js                  # accelerator canonicalisation SSOT (pure, node --test)
 ├── engine-deps.js                  # GigaAM engine dependency-policy SSOT (pure, node --test)
+├── renderer-console.js             # renderer console → support-log policy SSOT (pure, node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only)
 ├── package.json                    # electron-builder config and desktop scripts
 ├── shortcut-defaults.json          # per-platform default hotkey manifest
