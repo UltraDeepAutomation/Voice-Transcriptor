@@ -3873,9 +3873,9 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       -- never takes focus — the capsule is a non-focusable window — so the
       -- app the user dictated into is still frontmost when the transcript
       -- comes back: 1459 of 1459 pastes in the log recorded
-      -- ``target_activation_skipped reason=already-frontmost``. Raising an
+      -- "target_activation_skipped reason=already-frontmost". Raising an
       -- app that is already raised is free; the 80 ms delay after it was
-      -- not, and it was paid on every one of them. Reading ``frontmost``
+      -- not, and it was paid on every one of them. Reading "frontmost"
       -- is a single attribute fetch, and the activation still happens
       -- whenever focus really did move.
       set activationTag to ""
@@ -3930,7 +3930,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
           end if
           try
             click pasteMenuItem
-            -- No settle delay before returning. ``click`` performs the
+            -- No settle delay before returning. "click" performs the
             -- app's own paste action; nothing this script does afterwards
             -- observes the result, and the two things that DO care about
             -- the paste having landed carry their own waits: the clipboard
