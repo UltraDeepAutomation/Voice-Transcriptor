@@ -127,6 +127,13 @@ test("the per-start summary is always mirrored, flag or no flag", () => {
   assert.equal(shouldMirrorConsoleMessage("INFO", line, true), true);
 });
 
+test("the tail-gap verdict is always mirrored, flag or no flag", () => {
+  // Why a stop did or did not chase a missing ending. Without it, a
+  // report of a cut-off transcript has no evidence behind it at all.
+  const line = "[trace tail-gap] recordedSec=11.30 lastSpeechEnd=11.25 tailGapSec=0.05 decision=skip";
+  assert.equal(shouldMirrorConsoleMessage("INFO", line, false), true);
+});
+
 test("the high-volume trace stream stays behind the flag", () => {
   // Thousands of lines per session — the reason the flag exists.
   const line = '[trace] {"id":"paste-1","scope":"paste","step":1}';

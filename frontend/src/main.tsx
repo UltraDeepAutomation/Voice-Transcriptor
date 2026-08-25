@@ -40,6 +40,7 @@ import {
 import {
   candidateConfirmsTranscriptCoverage,
   joinTranscriptSegments,
+  mergeTranscriptTail,
   richerTranscript,
   textFromEnvelope,
 } from "./transcript-merge";
@@ -10705,7 +10706,12 @@ async function stopLive(enhance: boolean): Promise<void> {
           const wordCountOf = countWords;
           const alreadyResolvedEnvelope = liveFinalSlots.get(sessionUiToken)?.envelope || null;
           const opportunisticEnvelopeText = textFromEnvelope(alreadyResolvedEnvelope);
-          const opportunisticTranscript = richerTranscript(transcriptRaw, opportunisticEnvelopeText);
+          // Merged, not picked. The envelope and the live splice are two
+          // partial views of one utterance — the splice can hold a phrase
+          // no final ever covered, the envelope holds the clause that
+          // arrived after CloseStream — so choosing between them throws
+          // away whichever half the loser owned.
+          const opportunisticTranscript = mergeTranscriptTail(transcriptRaw, opportunisticEnvelopeText);
           if (opportunisticTranscript !== transcriptRaw) {
             transcriptRaw = opportunisticTranscript;
             console.log(`[trace stopLive] opportunistic-envelope used ${traceTextStats("transcript", transcriptRaw)}`);
@@ -10764,7 +10770,7 @@ async function stopLive(enhance: boolean): Promise<void> {
               ),
             ]);
             const envText = textFromEnvelope(env);
-            const better = richerTranscript(transcriptRaw, envText);
+            const better = mergeTranscriptTail(transcriptRaw, envText);
             console.log(
               `[trace tail-gap] interim-covered: envelope ` +
               `${better !== transcriptRaw ? "upgraded" : "confirmed"} instant transcript ms=${(performance.now() - tEnv).toFixed(0)}`,

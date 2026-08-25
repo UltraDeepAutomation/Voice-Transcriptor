@@ -66,9 +66,20 @@ const MAX_MESSAGE_CHARS = 600;
  * first captured audio frame. Without it "the capsule takes a second to
  * come up" is unanswerable from a support log.
  *
- * One line per recording each. Anything added here must stay that cheap.
+ * `[trace tail-gap]` is the decision that follows: whether the stop path
+ * believed the transcript's tail was complete, and what it did about it.
+ * When a user reports a cut-off ending, that verdict is the whole
+ * diagnosis, and it was written only to a devtools console nobody had
+ * open — two or three lines per stop.
+ *
+ * A handful of lines per recording. Anything added here must stay that
+ * cheap.
  */
-const ALWAYS_MIRRORED_PREFIXES = Object.freeze(["[trace stopLive]", "[trace startLive]"]);
+const ALWAYS_MIRRORED_PREFIXES = Object.freeze([
+  "[trace stopLive]",
+  "[trace startLive]",
+  "[trace tail-gap]",
+]);
 
 const LEVEL_ERROR = "ERROR";
 const LEVEL_WARN = "WARN";
