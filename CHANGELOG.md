@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-04
+
 ### Fixed
 - **A word Deepgram only ever said once, in an interim that no final agreed with, was gone by the time the recording stopped.** Coverage was decided by whether a final's TIME WINDOW contained a word's centre, not by whether the final's own words said anything about it: a final reading "три на или если это" over 4.91-9.70 s deleted "субагента" (heard in interim at 5.5-6.1 s) purely because the span covered it, and the same shape cost a 99 s recording roughly a third of its words (`BUGS_AUDIT_2026-09-03.md` §3.1-§3.4). `word_accounted_for` / `final_words_cover` (`backend/remote_deepgram_live.py`) now answer from each final's own parsed `words` list, kept for every final and interim alike; the orphan pool that used to hold displaced hypotheses is purged by the same word-identity rule instead of by any time overlap (§3.2, `test_deepgram_orphan_pool.py`); and at finalize, every interim/orphan word no final's words ever covered is spliced back into the committed transcript at its time position — inside the final it belongs in the middle of when there is one, as its own segment otherwise. The finalize log now names each hole span next to the interim hypotheses that overlapped it (§3.9), so a report of missing words can be checked against what Deepgram actually heard there instead of only a length.
 
