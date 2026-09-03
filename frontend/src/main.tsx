@@ -21,6 +21,12 @@ import {
   computeEnvelopeDeadlineMs,
   type FinalizeBudgetAnnouncement,
 } from "./envelope-deadline";
+import {
+  captureElapsedMs,
+  decidePreRoll,
+  decideWarmHold,
+  decideWarmReuse,
+} from "./capture-warm";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
 import { installErrorAwareConsole } from "./error-text";
@@ -819,6 +825,60 @@ const UI_TOKENS = {
      */
     preArmScriptProcessorFallback: true,
     vuAmplify: 4,
+    /**
+     * How long the capture graph — MediaStream, AudioContext, capture
+     * worklet — stays alive after Stop, waiting for the next press.
+     *
+     * A cold start costs `getUserMedia: 82 ms → audioContext: 33 ms →
+     * first-frame: 172 ms` (measured 2026-09-03, §4.7), and seconds when
+     * the input device is busy. None of it is paid again inside this
+     * window: the next start adopts the graph that is already running,
+     * and the worklet has been keeping `preRollMs` of audio in a ring the
+     * whole time, so the recording begins before the press instead of
+     * ~310 ms after it.
+     *
+     * THE VISIBLE COST: the operating system's microphone indicator — the
+     * orange dot on macOS, the tray icon on Windows — stays lit for these
+     * 30 s after every recording, and other applications see the input as
+     * in use. That is the honest price of not clipping the first word,
+     * and it is bounded exactly by this number. 0 disables the hold
+     * entirely and restores the pre-§4.7 behaviour (release at Stop);
+     * there is deliberately no UI for it yet.
+     *
+     * 30 s matches Handy's "lazy stream close" option. It is long enough
+     * to cover a dictate-paste-dictate cycle (the case where the clipping
+     * is most noticeable, because the user is already mid-thought) and
+     * short enough that a walk away from the machine ends with the
+     * microphone released. Bluetooth inputs never take the hold at all —
+     * see ./capture-warm.
+     */
+    warmHoldMs: 30_000,
+    /**
+     * How much audio from BEFORE the hotkey the recording starts with.
+     *
+     * The worklet keeps this much in a ring while the graph is held warm
+     * and hands it over on the next start. 500 ms is what whisper-local
+     * trims its idle deque to and sits between Hex's 450 ms pre-roll and
+     * its 1 s ring; it comfortably covers the ~310 ms the cold path used
+     * to lose plus the gap between deciding to speak and pressing.
+     *
+     * Only reachable on the warm path: a graph that has just been created
+     * has no past to offer.
+     */
+    preRollMs: 500,
+    /**
+     * Oldest pre-roll sample that may still be prepended to a recording.
+     *
+     * While the context is rendering, the ring is rewritten every 2.7 ms
+     * and its oldest sample is exactly `preRollMs` old. A ring that
+     * stopped being written — suspended context, a machine that slept
+     * between two presses — holds audio from some earlier minute, and
+     * prepending that would put words the user did not just say at the
+     * front of the transcript. Past this age the ring is dropped whole
+     * and the recording simply starts at the press. Mirrors OpenWhispr's
+     * `PRE_ROLL_MAX_AGE_MS`.
+     */
+    preRollMaxAgeMs: 2_000,
     /**
      * Shortest recording that is kept. Below it the press is treated as
      * a double-tap on the hotkey and nothing is produced at all.
@@ -8129,24 +8189,30 @@ let startAt = 0;
  * When the renderer was ASKED to record — the hotkey press or the
  * toggle, as received, before any device is opened.
  *
- * Distinct from ``startAt`` (the first captured frame) on purpose:
+ * Distinct from ``startAt`` (the first captured SAMPLE) on purpose. On
+ * a cold start the two are ~310 ms apart the wrong way round —
  * ``getUserMedia`` + AudioContext + first frame measured 82 + 33 + 172
- * ms on 2026-09-03, so the two clocks are ~310 ms apart
- * (BUGS_AUDIT_2026-09-03 §4.7/§4.9). ``startAt`` remains the clock for
- * everything the user is shown — the elapsed timer, the saved
- * ``started_at``, the duration of the audio that exists — because that
- * is what the recording actually contains.
+ * ms on 2026-09-03 (BUGS_AUDIT_2026-09-03 §4.7/§4.9). On a warm start
+ * they are apart the other way: the worklet's pre-roll ring hands over
+ * audio from before the press, and ``startAt`` is set back by its
+ * duration. ``startAt`` remains the clock for everything the user is
+ * shown — the elapsed timer, the saved ``started_at``, the duration of
+ * the audio that exists — because that is what the recording actually
+ * contains.
  */
 let startRequestedAt = 0;
 
 /**
  * Is the recording in progress too short to be one?
  *
- * The clock is the moment the renderer was asked to record, not the
- * first captured frame. Measuring from the first frame silently added
- * the ~310 ms of device start-up to the threshold: a 500 ms minimum
- * became ~810 ms of held hotkey, and a one-word dictation ("да",
- * "стоп") was discarded as a mis-press (§4.9).
+ * The clock is the earlier of "when we were asked" and "when the audio
+ * we hold begins" — see ``captureElapsedMs``. Measuring from the first
+ * frame alone silently added the ~310 ms of device start-up to the
+ * threshold: a 500 ms minimum became ~810 ms of held hotkey, and a
+ * one-word dictation ("да", "стоп") was discarded as a mis-press
+ * (§4.9). Measuring from the press alone would now under-count the
+ * other way, because a warm start hands over half a second of audio
+ * captured before the press ever happened (§4.7).
  *
  * Exported on ``window`` because the main process asks the same question
  * before it queues any post-stop work: one clock, one threshold, one
@@ -8156,8 +8222,11 @@ let startRequestedAt = 0;
  */
 function recordingIsTooShortToKeep(): boolean {
   if (!isRecording) return false;
-  const clock = startRequestedAt > 0 ? startRequestedAt : startAt;
-  const elapsedMs = clock > 0 ? Date.now() - clock : 0;
+  const elapsedMs = captureElapsedMs({
+    now: Date.now(),
+    startRequestedAt,
+    startAt,
+  });
   return elapsedMs < UI_TOKENS.capture.minRecordingMs;
 }
 window.__transcriptorRecordingTooShort = recordingIsTooShortToKeep;
@@ -8422,6 +8491,271 @@ async function releaseOrphanedAudioContext(reason: string): Promise<void> {
   if (await closeAudioContextSlot()) {
     console.warn(`Closed an AudioContext left behind by a previous session (${reason})`);
   }
+}
+
+// ── Warm capture ────────────────────────────────────────────────────
+//
+// The capture graph that outlives a recording (BUGS_AUDIT_2026-09-03
+// §4.7). Exactly one of three things is true of it at any moment:
+//
+//   • a session owns it — the module slots (``ac``/``stream``/``src``/
+//     ``workletNode``) hold it and ``warmCapture`` is null;
+//   • it is held idle — ``warmCapture`` holds it and the module slots
+//     are null;
+//   • it does not exist.
+//
+// Ownership MOVES, it is never shared: ``holdWarmCapture`` empties the
+// module slots as it fills the hold, ``takeWarmCapture`` empties the
+// hold as the next session fills the slots. That is what keeps a
+// failed start from closing a context the hold still points at, and a
+// TTL from stopping the tracks of a recording in progress.
+
+interface WarmCapture {
+  ac: AudioContext;
+  stream: MediaStream;
+  src: MediaStreamAudioSourceNode;
+  workletNode: AudioWorkletNode;
+  /** ``deviceId`` the held track reports, for the "same mic?" check. */
+  deviceId: string;
+  /** Track label, kept for the trace line. */
+  deviceLabel: string;
+  heldSince: number;
+  expiryTimer: number | null;
+}
+
+let warmCapture: WarmCapture | null = null;
+/**
+ * Did the running session adopt a warm graph, and how much pre-roll did
+ * it actually accept? Both are read once, by the start trace line, so
+ * the support log says whether the mechanism did anything on this host.
+ */
+let sessionStartedWarm = false;
+let sessionPreRollMs = 0;
+
+function streamHasLiveAudio(s: MediaStream | null): boolean {
+  if (!s) return false;
+  try {
+    return s.getAudioTracks().some((t) => t.readyState === "live");
+  } catch {
+    // A stream whose tracks cannot be read is not one we can record from.
+    return false;
+  }
+}
+
+function micTrackLabel(s: MediaStream | null): string {
+  if (!s) return "";
+  try {
+    return s.getAudioTracks()[0]?.label || "";
+  } catch {
+    // Same as above: unreadable means "cannot vouch for this device".
+    return "";
+  }
+}
+
+function micTrackDeviceId(s: MediaStream | null): string {
+  if (!s) return "";
+  try {
+    return String(s.getAudioTracks()[0]?.getSettings?.()?.deviceId || "");
+  } catch {
+    // Settings are advisory; an unreadable one just fails the match.
+    return "";
+  }
+}
+
+/**
+ * Tear down the held graph. The ONLY way the hold is vacated other than
+ * a session adopting it, and therefore the only place the microphone is
+ * actually released once a recording has ended.
+ */
+function releaseWarmCapture(reason: string): void {
+  const held = warmCapture;
+  if (!held) return;
+  warmCapture = null;
+  if (held.expiryTimer !== null) window.clearTimeout(held.expiryTimer);
+  const heldMs = Date.now() - held.heldSince;
+  try { held.workletNode.port.onmessage = null; } catch { /* port already dead */ }
+  try { held.workletNode.disconnect(); } catch { /* already disconnected */ }
+  try { held.src.disconnect(); } catch { /* already disconnected */ }
+  try { held.stream.getTracks().forEach((t) => t.stop()); } catch { /* already stopped */ }
+  void held.ac.close().catch(() => { /* already closing — nothing to release */ });
+  console.log(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);
+}
+
+/**
+ * Keep the capture graph of the session that is ending, if it may be
+ * kept, and hand the pre-roll ring to the worklet on the way out.
+ *
+ * Called from the stop teardown BEFORE the unconditional disconnects:
+ * on a "yes" the module slots are emptied here, so every teardown step
+ * that follows finds a null and does nothing, and the graph is left
+ * running with its worklet armed. On a "no" nothing moves and the
+ * ordinary teardown releases everything exactly as it did before.
+ */
+function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string } {
+  const deviceLabel = micTrackLabel(stream);
+  const decision = decideWarmHold({
+    warmHoldMs: UI_TOKENS.capture.warmHoldMs,
+    deviceLabel,
+    trackLive: streamHasLiveAudio(stream),
+    contextState: ac?.state || "closed",
+    // The pre-roll ring lives in the worklet; a session that fell back
+    // to the ScriptProcessor has nothing to hold that would pay for the
+    // microphone staying open.
+    workletCapture: !!workletNode && scriptFallbackState !== "committed",
+  });
+  if (!decision.hold) return { ...decision, deviceLabel };
+  const heldAc = ac;
+  const heldStream = stream;
+  const heldSrc = src;
+  const heldNode = workletNode;
+  if (!heldAc || !heldStream || !heldSrc || !heldNode) {
+    return { hold: false, reason: "incomplete-graph", deviceLabel };
+  }
+  try {
+    heldNode.port.postMessage({ type: "arm", preRollMs: UI_TOKENS.capture.preRollMs });
+  } catch (e) {
+    // The port is gone, so the ring can never be filled and the hold
+    // would buy nothing but a lit microphone indicator.
+    console.debug("warm capture: arming the pre-roll ring failed", e);
+    return { hold: false, reason: "arm-failed", deviceLabel };
+  }
+  warmCapture = {
+    ac: heldAc,
+    stream: heldStream,
+    src: heldSrc,
+    workletNode: heldNode,
+    deviceId: micTrackDeviceId(heldStream),
+    deviceLabel,
+    heldSince: Date.now(),
+    expiryTimer: window.setTimeout(
+      () => releaseWarmCapture("ttl"),
+      UI_TOKENS.capture.warmHoldMs,
+    ),
+  };
+  // Ownership has moved. Everything below in the teardown chain now
+  // finds empty slots, which is precisely the intent.
+  ac = null;
+  stream = null;
+  src = null;
+  workletNode = null;
+  return { ...decision, deviceLabel };
+}
+
+/**
+ * Adopt the held graph for the recording that is starting, or release
+ * it and let the caller take the cold path.
+ *
+ * Every "no" releases rather than leaves the hold in place: whatever
+ * made it unusable for this press — an expired TTL, a device the user
+ * has since changed, a track that ended while we were idle — makes it
+ * unusable for the next one too, and holding a microphone open for a
+ * graph nobody can use is the worst of both designs.
+ */
+function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
+  const held = warmCapture;
+  if (!held) return null;
+  const decision = decideWarmReuse({
+    now: Date.now(),
+    heldSince: held.heldSince,
+    warmHoldMs: UI_TOKENS.capture.warmHoldMs,
+    heldDeviceId: held.deviceId,
+    requestedDeviceId,
+    trackLive: streamHasLiveAudio(held.stream),
+    contextState: held.ac.state,
+  });
+  if (!decision.reuse) {
+    releaseWarmCapture(decision.reason);
+    return null;
+  }
+  warmCapture = null;
+  if (held.expiryTimer !== null) window.clearTimeout(held.expiryTimer);
+  return held;
+}
+
+// The hold survives an idle window, not a change of circumstances. A
+// device list that changed underneath us invalidates the "same mic"
+// premise outright; the window going away means the user has left the
+// app, and a microphone held open by an app that is not on screen is
+// the one case where the indicator has nothing at all to show for
+// itself. Both release immediately rather than waiting out the TTL.
+//
+// Note what is NOT here: "hidden" is not tested at Stop. Dictation by
+// global hotkey routinely happens with the main window hidden, so a
+// hold refused whenever the document is hidden would be a hold that
+// never once applied to the case it was built for. It is the
+// TRANSITION to hidden that releases.
+try {
+  navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+    releaseWarmCapture("devicechange");
+  });
+} catch (e) {
+  // Older shells expose mediaDevices without EventTarget semantics; the
+  // TTL still bounds the hold.
+  console.debug("warm capture: devicechange listener unavailable", e);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") releaseWarmCapture("window-hidden");
+});
+window.addEventListener("pagehide", () => releaseWarmCapture("pagehide"));
+
+/**
+ * The capture worklet's single message handler.
+ *
+ * Installed both when the node is created and when a held node is
+ * adopted, so a warm start and a cold start deliver audio through
+ * exactly the same path.
+ */
+function handleWorkletMessage(ev: MessageEvent): void {
+  const msg = ev.data as unknown;
+  if (msg instanceof Float32Array) {
+    // The worklet works. Whatever the pre-armed fallback has captured
+    // is this same audio; committing both would double every sample,
+    // so it goes away here and now (§4.5).
+    disarmPreArmedFallback();
+    pushCapturedFrame(msg);
+    return;
+  }
+  if (!msg || typeof msg !== "object") return;
+  const data = msg as { type?: unknown; token?: unknown; samples?: unknown; lastWriteTime?: unknown };
+  if (data.type === "flush-ack") {
+    const token = String(data.token || "");
+    const resolve = pendingWorkletFlushes.get(token);
+    if (resolve) resolve();
+    return;
+  }
+  if (data.type === "pre-roll") acceptPreRoll(data.samples, Number(data.lastWriteTime));
+}
+
+/**
+ * The audio from before the press.
+ *
+ * It arrives ahead of every live frame (a MessagePort preserves order),
+ * so pushing it through the ordinary capture path is all that is needed
+ * to put it at the front of the WAV, at the front of the live socket's
+ * stream, and in front of the recording's own clock — ``startAt`` moves
+ * back by its duration, in the one place that sets it.
+ */
+function acceptPreRoll(samples: unknown, lastWriteTime: number): void {
+  if (!(samples instanceof Float32Array) || !ac) return;
+  const staleMs = Number.isFinite(lastWriteTime)
+    ? (ac.currentTime - lastWriteTime) * 1000
+    : Number.POSITIVE_INFINITY;
+  const verdict = decidePreRoll({
+    sampleCount: samples.length,
+    sampleRate: ac.sampleRate,
+    staleMs,
+    maxAgeMs: UI_TOKENS.capture.preRollMaxAgeMs,
+  });
+  if (!verdict.accept) {
+    console.warn(
+      `[trace startLive] pre-roll discarded reason=${verdict.reason} ` +
+      `ageMs=${verdict.ageMs.toFixed(0)} durationMs=${verdict.durationMs.toFixed(0)}`,
+    );
+    return;
+  }
+  sessionPreRollMs = verdict.durationMs;
+  disarmPreArmedFallback();
+  pushCapturedFrame(samples, verdict.durationMs);
 }
 
 async function cleanupCancelledStartCaptureResources(): Promise<void> {
@@ -9258,11 +9592,22 @@ function resetOutputs(): void {
 let captureRmsEma = 0;
 const CAPTURE_RMS_EMA_ALPHA = 0.06;
 
-function pushCapturedFrame(input: Float32Array): void {
+/**
+ * Take one frame of captured audio.
+ *
+ * ``preRollMs`` is non-zero only for the single frame the worklet's ring
+ * hands over at a warm start, and it says how much of the audio in that
+ * frame was captured BEFORE this frame was delivered. It exists so the
+ * recording's clock can be set from the audio rather than from the
+ * delivery: ``startAt`` is the moment the first sample was taken, which
+ * on a warm start is half a second before the hotkey.
+ */
+function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   if (!(input instanceof Float32Array) || !input.length) return;
   workletLastFrameAt = Date.now();
   if (startAt <= 0) {
-    startAt = workletLastFrameAt;
+    // The one place the recording's clock is set, for both paths.
+    startAt = workletLastFrameAt - Math.max(0, Math.round(preRollMs));
   }
   if (!startFirstFrameSeen && startT0 > 0) {
     // First audio of the session. Everything before this is start-up
@@ -9276,14 +9621,21 @@ function pushCapturedFrame(input: Float32Array): void {
         return `${label}: ${(t - prev).toFixed(0)}ms`;
       })
       .join(" → ");
-    console.log(`[trace startLive] total=${totalMs.toFixed(0)}ms to first audio frame | ${labels}`);
+    console.log(
+      `[trace startLive] total=${totalMs.toFixed(0)}ms to first audio frame ` +
+      `warm=${sessionStartedWarm ? 1 : 0} preRollMs=${sessionPreRollMs.toFixed(0)} | ${labels}`,
+    );
     (window as unknown as { __transcriptorStartTimings?: unknown }).__transcriptorStartTimings = {
       totalMs,
       phases: startTimings,
     };
   }
   window.__transcriptorLastFrameAt = workletLastFrameAt;
-  if (ac && ac.sampleRate > 0) {
+  // The pre-roll frame is half a second of audio delivered in one go and
+  // says nothing about how much the capture node can be holding back —
+  // which is the only question this measurement answers (see
+  // ``waitForCaptureDrain``). Only live frames define the period.
+  if (!preRollMs && ac && ac.sampleRate > 0) {
     captureBufferPeriodMs = (input.length / ac.sampleRate) * 1000;
   }
   let sum = 0;
@@ -9763,26 +10115,44 @@ async function startLive(): Promise<void> {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }
-    // Do not force a preflight getUserMedia here. startLive is about
-    // to request the actual recording stream below; opening a second
-    // throwaway stream first causes duplicate macOS media permission /
-    // activation events and can make every recording look like it is
-    // asking for access twice.
-    await loadMics(false);
-    markStartPhase("loadMics");
-    throwIfStartCancelled();
-    const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
-    // Bounded and retried — see acquireMicStream. The old code awaited a
-    // bare getUserMedia, so a busy input device hung the start outright.
-    stream = await acquireMicStream(devId);
-    markStartPhase("getUserMedia");
-    throwIfStartCancelled();
+    const selectedDeviceId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+    // The graph the previous recording left running, if it is still the
+    // right one (§4.7). Adopting it skips getUserMedia, the AudioContext
+    // and the worklet module — the whole ~310 ms — and its ring has been
+    // holding the last half-second of audio the entire time.
+    const warm = takeWarmCapture(selectedDeviceId);
+    sessionStartedWarm = !!warm;
+    sessionPreRollMs = 0;
+    if (warm) {
+      ac = warm.ac;
+      stream = warm.stream;
+      src = warm.src;
+      workletNode = warm.workletNode;
+      markStartPhase("warmCapture");
+    } else {
+      // Do not force a preflight getUserMedia here. startLive is about
+      // to request the actual recording stream below; opening a second
+      // throwaway stream first causes duplicate macOS media permission /
+      // activation events and can make every recording look like it is
+      // asking for access twice.
+      await loadMics(false);
+      markStartPhase("loadMics");
+      throwIfStartCancelled();
+      const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+      // Bounded and retried — see acquireMicStream. The old code awaited a
+      // bare getUserMedia, so a busy input device hung the start outright.
+      stream = await acquireMicStream(devId);
+      markStartPhase("getUserMedia");
+      throwIfStartCancelled();
+    }
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");
     }
     // Permission is now granted and the real capture stream is live.
     // Refresh labels/device ids without another permission request.
-    void loadMics(false);
+    // Skipped on the warm path: the device list is already loaded, and
+    // the point of that path is to touch no device APIs at all.
+    if (!warm) void loadMics(false);
     // Reset the mic-health tracker for this session so the previous
     // session's terminal state does not leak into the new run.
     micHealth.reset();
@@ -9805,37 +10175,24 @@ async function startLive(): Promise<void> {
     // WAV — the UI flips to a "Mic muted" warning and the post-stop
     // recovery surfaces the right message instead of "No speech
     // captured".
-    const capturedSessionToken = sessionUiToken;
-    for (const track of stream.getAudioTracks()) {
-      track.addEventListener("ended", () => {
-        if (!isRecording) return;
-        if (activeUiSessionToken !== capturedSessionToken) return;
-        console.warn("Audio track ended (device disconnect) — auto-stopping");
-        micHealth.observe({ kind: "track-ended" });
-        patchCurrentRecordingSummary(
-          { status: "Microphone disconnected. Saving what was captured.", tone: "warning" },
-          capturedSessionToken,
-        );
-        void stopLive(shouldAutoTranscribe());
-      }, { once: true });
-      track.addEventListener("mute", () => {
-        if (activeUiSessionToken !== capturedSessionToken) return;
-        micHealth.observe({ kind: "track-muted", muted: true });
-      });
-      track.addEventListener("unmute", () => {
-        if (activeUiSessionToken !== capturedSessionToken) return;
-        micHealth.observe({ kind: "track-muted", muted: false });
-      });
+    attachMicTrackWatchers(stream);
+    if (!warm) {
+      // Close whatever still occupies the slot before overwriting it.
+      // Every teardown path is supposed to have emptied it already; this
+      // is the structural guarantee that a path which did not cannot
+      // strand a running AudioContext with no reference left to close it.
+      await releaseOrphanedAudioContext("starting a new capture session");
+      ac = new AudioContext();
     }
-    // Close whatever still occupies the slot before overwriting it.
-    // Every teardown path is supposed to have emptied it already; this
-    // is the structural guarantee that a path which did not cannot
-    // strand a running AudioContext with no reference left to close it.
-    await releaseOrphanedAudioContext("starting a new capture session");
-    ac = new AudioContext();
-    if (ac.state !== "running") {
+    // One non-null reference for the rest of the start path. The module
+    // slot is reassigned by the teardown helpers, so narrowing it once
+    // here is what lets every node below be built against a context that
+    // provably exists.
+    const sessionAc = ac;
+    if (!sessionAc) throw new Error("Audio capture context is unavailable.");
+    if (sessionAc.state !== "running") {
       try {
-        await ac.resume();
+        await sessionAc.resume();
       } catch (e) {
         console.debug("AudioContext resume rejected (non-fatal)", e);
       }
@@ -9888,10 +10245,14 @@ async function startLive(): Promise<void> {
         mediaRecorder = null;
       }
     }
-    src = ac.createMediaStreamSource(stream);
-    analyser = ac.createAnalyser();
+    // The source node is part of the held graph and is NOT rebuilt on a
+    // warm start: a second MediaStreamAudioSourceNode over the same
+    // stream would be a second tap on the same device for no gain.
+    if (!src) src = sessionAc.createMediaStreamSource(stream);
+    const sessionSrc = src;
+    analyser = sessionAc.createAnalyser();
     analyser.fftSize = 2048;
-    src.connect(analyser);
+    sessionSrc.connect(analyser);
     const buf = new Float32Array(analyser.fftSize);
     // Use setInterval instead of requestAnimationFrame.
     // rAF throttles to ~0 fps when the Electron window is hidden. setInterval
