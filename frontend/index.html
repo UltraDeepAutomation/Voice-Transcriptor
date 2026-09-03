@@ -319,6 +319,25 @@
               </button>
             </div>
           </div>
+          <!--
+            Measured 2026-09-03 (BUGS_AUDIT_2026-09-03.md §1): Auto maps
+            to Deepgram's language=multi, which on Russian dictation
+            silently dropped whole clauses and was non-deterministic run
+            to run; a fixed language (e.g. RU) kept every clause. The
+            trade-off is that a fixed language transliterates English
+            product names, which Key terms (Nova-3, Settings > API Keys)
+            exists to fix. #language is rendered in this one place only
+            — this paragraph is the single source of the hint text.
+            Placed as a full-width sibling of .topbar-row (not inside
+            it) because .topbar-row is a max-content grid — a sentence
+            squeezed into the 92px LANG column would either overflow or
+            force the whole row wider than the window.
+          -->
+          <p class="hint topbar-hint" id="languageAutoHint">
+            Auto uses Deepgram's multi-language mode. Measured
+            2026-09-03 on Russian dictation: it dropped whole phrases.
+            Pick your language; add English names under Key terms.
+          </p>
         </div>
 
         <div class="split">
@@ -630,6 +649,16 @@
                     aria-label="Save Deepgram key" title="Save key"></button>
                 </span>
               </label>
+              <label class="field">
+                <span class="lbl">Key terms (Nova-3)</span>
+                <textarea id="deepgramKeytermsInput" rows="4"
+                  placeholder="Sonnet, Opus, Claude, Deepgram, MacBook"></textarea>
+              </label>
+              <p class="settings-note" id="deepgramKeytermsNote">
+                Names and jargon Deepgram should spell exactly — product
+                names, people, project words. One per line or
+                comma-separated. Nova-3 only.
+              </p>
               <label class="field">
                 <span class="lbl">OpenRouter</span>
                 <span class="key-row">

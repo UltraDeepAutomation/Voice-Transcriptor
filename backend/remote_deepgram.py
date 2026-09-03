@@ -12,9 +12,10 @@ Accepts raw audio bytes (WAV/MP3/etc.) as the request body.
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from backend.audio_mime import audio_content_type
+from backend.deepgram_keyterms import keyterm_query_pairs
 from backend.deepgram_words import deepgram_word_text
 from backend.deepgram_format import shared_format_params
 from backend.http_retry import RemoteError, request_with_retry
@@ -129,6 +130,7 @@ def deepgram_transcribe(
     language: Optional[str] = None,
     diarize: bool = False,
     num_speakers: Optional[str] = None,
+    keyterms: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Transcribe audio using Deepgram's pre-recorded API.
 
@@ -146,13 +148,20 @@ def deepgram_transcribe(
     ``paragraphs`` and ``numerals`` stay here: the live endpoint does not
     accept them, so they are genuinely path-specific rather than a second
     opinion about a shared question.
+
+    ``keyterms`` should already be normalised (see
+    ``backend.deepgram_keyterms.normalize_keyterms``) — this function
+    only decides whether *model* supports Keyterm Prompting and, if so,
+    sends every term as a repeated ``keyterm`` parameter (``requests``
+    repeats a query key for a list-valued param entry; a plain
+    comma-joined string would send ONE term, not several).
     """
     if not api_key:
         raise RemoteError("Deepgram API key is not configured")
 
     url = f"{DEEPGRAM_API_BASE}/listen"
 
-    params: Dict[str, str] = {
+    params: Dict[str, Any] = {
         "model": model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
         # Prerecorded-only options; the shared formatting decision below
         # covers everything both endpoints accept.
@@ -174,6 +183,11 @@ def deepgram_transcribe(
             if speakers < 1 or speakers > 10:
                 raise RemoteError("Deepgram num_speakers must be between 1 and 10")
             params["num_speakers"] = str(speakers)
+    kt_pairs = keyterm_query_pairs(keyterms, params["model"])
+    if kt_pairs:
+        # List-valued entry: ``requests`` encodes it as one repeated
+        # ``keyterm=`` per element rather than a single joined value.
+        params["keyterm"] = [term for _, term in kt_pairs]
     if language and language.lower() not in ("auto", ""):
         params["language"] = language
     else:
@@ -188,11 +202,12 @@ def deepgram_transcribe(
 
     timeout, upload_retries = _deepgram_http_policy(len(audio_bytes))
     logger.info(
-        "deepgram_transcribe: model=%s, audio=%d bytes timeout=%s attempts=%d",
+        "deepgram_transcribe: model=%s, audio=%d bytes timeout=%s attempts=%d keyterms=%d",
         model,
         len(audio_bytes),
         timeout,
         upload_retries,
+        len(kt_pairs),
     )
     # Adaptive timeout for Deepgram REST uploads.
     #

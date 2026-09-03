@@ -17,6 +17,7 @@ Voice Transcriptor/
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
 ├── BUGS_AUDIT.md                  # running audit ledger (2026-08-23 wave)
 ├── BUGS_AUDIT_2026-08-24.md       # dated audit waves + fix statuses (root per audit charter)
+├── BUGS_AUDIT_2026-09-03.md       # dated audit waves + fix statuses (root per audit charter)
 ├── .env.example                   # user-facing environment-variable SSOT
 ├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
@@ -49,9 +50,11 @@ backend/
 ├── remote_openrouter.py       # OpenRouter audio transcription and text upscale
 ├── deepgram_endpoints.py      # Deepgram endpoint SSOT
 ├── deepgram_words.py          # Deepgram word-spelling SSOT (punctuated vs raw)
+├── deepgram_keyterms.py       # Deepgram Nova-3 Keyterm Prompting SSOT (parse/limit/query pairs)
 ├── http_retry.py              # remote request retry handling
 ├── jobs.py                    # in-memory job store and cancellation
 ├── storage.py                 # atomic write helpers
+├── tools/                     # operator scripts (not imported by the app), e.g. deepgram_live_ab.py A/B tool
 └── tests/                     # backend unit/regression tests
 ```
 

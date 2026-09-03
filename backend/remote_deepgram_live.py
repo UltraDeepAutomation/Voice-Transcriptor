@@ -246,6 +246,7 @@ INTERIM_WORD_GAP_SPLIT_SEC = 1.0
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
 from backend.deepgram_format import shared_format_params  # noqa: E402
+from backend.deepgram_keyterms import keyterm_query_pairs  # noqa: E402
 from backend.deepgram_words import deepgram_word_text  # noqa: E402
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
 
@@ -265,6 +266,10 @@ class DeepgramLiveConfig:
     ``backend.deepgram_format``, which both Deepgram paths read so the
     same recording cannot come back formatted differently depending on
     which one served it.
+
+    Keyterm Prompting (``keyterms``) similarly comes from one shared
+    parser — ``backend.deepgram_keyterms`` — for the same reason:
+    both Deepgram paths must bias toward the same vocabulary.
     """
 
     model: str = DEFAULT_DEEPGRAM_AUDIO_MODEL
@@ -315,29 +320,62 @@ class DeepgramLiveConfig:
     # from splitting across two "final" events.
     utterance_end_ms: int = 2000
     diarize: bool = False
+    # Nova-3 Keyterm Prompting terms, already normalised (see
+    # ``backend.deepgram_keyterms.normalize_keyterms`` — this field
+    # holds the parsed tuple, never the user's raw config string).
+    # Emitted as repeated ``keyterm=`` query parameters by
+    # ``to_query_string``; silently dropped for a non-Nova-3 model via
+    # ``keyterm_query_pairs``.
+    keyterms: tuple[str, ...] = ()
 
     def to_query_string(self) -> str:
-        params: dict[str, str] = {
-            "model": self.model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
-            "encoding": "linear16",
-            "sample_rate": str(int(self.sample_rate)),
-            "channels": str(int(self.channels)),
-            "interim_results": _bool(self.interim_results),
-            **shared_format_params(),
-            "endpointing": str(int(self.endpointing_ms)),
-            "utterance_end_ms": str(int(self.utterance_end_ms)),
-        }
+        model = self.model or DEFAULT_DEEPGRAM_AUDIO_MODEL
+        # A list of pairs, not a dict: ``keyterm`` must be repeated once
+        # per term (Deepgram's documented shape for Keyterm Prompting),
+        # and a dict can hold only one value per key. ``urlencode``
+        # accepts a sequence of 2-tuples directly and preserves order,
+        # so every existing key stays exactly where it was.
+        params: list[tuple[str, str]] = [
+            ("model", model),
+            ("encoding", "linear16"),
+            ("sample_rate", str(int(self.sample_rate))),
+            ("channels", str(int(self.channels))),
+            ("interim_results", _bool(self.interim_results)),
+            *shared_format_params().items(),
+            ("endpointing", str(int(self.endpointing_ms))),
+            ("utterance_end_ms", str(int(self.utterance_end_ms))),
+        ]
         if self.diarize:
-            params["diarize"] = "true"
+            params.append(("diarize", "true"))
         lang = (self.language or "").strip().lower()
         if not lang or lang in ("auto", "multi"):
             # Nova-3 multilingual mode — the model auto-detects the
             # active language per utterance across 10 supported
             # languages including Russian, Spanish, French, German,
             # Hindi, Portuguese, Italian, Dutch, Japanese, English.
-            params["language"] = "multi"
+            #
+            # 2026-09-03 measurement (BUGS_AUDIT_2026-09-03.md §1;
+            # reproducible with ``backend/tools/deepgram_live_ab.py``):
+            # on this app's own saved Russian recordings, ``multi``
+            # dropped ~35% of a 99 s dictation and whole clauses in two
+            # short ones (8.6 s, 12 s), and was non-deterministic
+            # between repeat runs on the SAME audio. ``language=ru`` on
+            # the identical files kept every clause, byte-identical
+            # across repeats. Lowering the level by 14 dB to match the
+            # clean June recording did not change the result. A 173 s
+            # June recording, made without clipping, showed no
+            # difference between the two modes — the failure
+            # is specific to this kind of content, not universal. This
+            # does NOT change what "auto" maps to here — that mapping
+            # is a UI-level choice (see ``frontend``) — it only records
+            # the measured fact where the mapping lives, and points at
+            # Keyterm Prompting (``keyterms`` above) as the mitigation
+            # for the transliteration cost of choosing a monolingual
+            # language instead.
+            params.append(("language", "multi"))
         else:
-            params["language"] = lang
+            params.append(("language", lang))
+        params.extend(keyterm_query_pairs(self.keyterms, model))
         return urlencode(params)
 
 
@@ -509,7 +547,11 @@ class DeepgramLiveSession:
         # transcript looks like, and a session whose parameters are not in
         # the log cannot be compared against one recorded before they were
         # changed. No secret is involved — the key travels in a header.
-        logger.info("deepgram-live: params %s", self._cfg.to_query_string())
+        logger.info(
+            "deepgram-live: params %s keyterms=%d",
+            self._cfg.to_query_string(),
+            len(self._cfg.keyterms),
+        )
         logger.info(
             "deepgram-live: connecting model=%s language=%s sr=%s timeout=%.1fs",
             self._cfg.model,

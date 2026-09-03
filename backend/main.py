@@ -76,6 +76,7 @@ from backend.live import LiveSession
 from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
+from backend.deepgram_keyterms import configured_keyterms
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
 from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
@@ -3667,12 +3668,14 @@ async def ws_transcribe(websocket: WebSocket):
                 )
                 _mark_recovery_error(recovery_ctx)
                 return
+            dg_keyterms = configured_keyterms(dg_cfg)
             await _run_deepgram_live_session(
                 websocket=websocket,
                 api_key=dg_key,
                 model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
                 language=language,
                 diarize=diarize,
+                keyterms=dg_keyterms,
                 recovery=recovery_ctx,
             )
         else:
@@ -4141,6 +4144,7 @@ async def _run_deepgram_live_session(
     model: str,
     language: str,
     diarize: bool,
+    keyterms: tuple[str, ...] = (),
     recovery: Optional[dict],
 ) -> None:
     """Drive the Deepgram live streaming proxy for one recording.
@@ -4159,6 +4163,7 @@ async def _run_deepgram_live_session(
         sample_rate=LIVE_SAMPLE_RATE_HZ,
         interim_results=True,
         diarize=bool(diarize),
+        keyterms=tuple(keyterms or ()),
     )
     session = DeepgramLiveSession(api_key=api_key, config=dg_cfg)
     try:
@@ -4710,6 +4715,7 @@ def _run_remote_transcribe_once(
     elif prov == "deepgram":
         dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
         model = (explicit_model or DEFAULT_DEEPGRAM_AUDIO_MODEL).strip()
+        dg_keyterms = configured_keyterms(cfg)
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
             out = deepgram_transcribe(
@@ -4720,6 +4726,7 @@ def _run_remote_transcribe_once(
                 language=language,
                 diarize=bool(diarize),
                 num_speakers=num_speakers,
+                keyterms=dg_keyterms,
             )
             return {
                 "provider": "deepgram",

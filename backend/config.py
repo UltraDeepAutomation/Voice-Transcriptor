@@ -494,6 +494,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "openrouter": {
             "model": DEFAULT_OPENROUTER_AUDIO_MODEL,
         },
+        # Raw text, exactly as the user typed it — comma- or
+        # newline-separated. Parsed into a normalised term tuple by
+        # ``backend.deepgram_keyterms.normalize_keyterms`` at the point
+        # each Deepgram request is built, so the config always holds
+        # what the user wrote rather than a lossy pre-parsed form.
+        "deepgram": {
+            "keyterms": "",
+        },
     },
 }
 
@@ -598,6 +606,21 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
             preferences = dict(preferences)
             preferences["remote_provider"] = DEFAULT_CONFIG["preferences"]["remote_provider"]
             out["preferences"] = preferences
+        dg_prefs = preferences.get("deepgram")
+        if dg_prefs is not None and not isinstance(dg_prefs, dict):
+            logger.warning("config.preferences.deepgram must be an object; resetting")
+            preferences = dict(preferences)
+            preferences["deepgram"] = dict(DEFAULT_CONFIG["preferences"]["deepgram"])
+            out["preferences"] = preferences
+        elif isinstance(dg_prefs, dict):
+            keyterms_raw = dg_prefs.get("keyterms")
+            if keyterms_raw is not None and not isinstance(keyterms_raw, str):
+                logger.warning("config.preferences.deepgram.keyterms must be a string; resetting")
+                preferences = dict(preferences)
+                dg_prefs = dict(dg_prefs)
+                dg_prefs["keyterms"] = ""
+                preferences["deepgram"] = dg_prefs
+                out["preferences"] = preferences
     # schema_version: must be a positive int if present.
     sv = out.get("schema_version")
     if sv is not None and not (isinstance(sv, int) and sv > 0 and not isinstance(sv, bool)):

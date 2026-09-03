@@ -111,6 +111,11 @@ interface AppConfig {
     remote_provider?: string;
     recordings_dir?: string;
     openrouter?: { model?: string };
+    // Deepgram Nova-3 Keyterm Prompting (BUGS_AUDIT_2026-09-03.md §1):
+    // a single raw string exactly as the user typed it (comma- or
+    // newline-separated) — the backend owns normalisation into the
+    // Deepgram ``keyterm`` query params. The frontend never parses it.
+    deepgram?: { keyterms?: string };
     ui?: {
       provider?: string;
       language?: string;
@@ -4983,6 +4988,17 @@ async function recoverLiveDraftIfAny(): Promise<void> {
   }
 }
 
+// Deepgram Nova-3 Keyterm Prompting field. Reads the raw textarea value
+// as typed — no splitting/normalizing here, the backend owns that (see
+// the AppConfig.preferences.deepgram doc comment). Trim only strips
+// accidental leading/trailing whitespace from the whole field, the same
+// treatment every other free-text preference gets (recordings_dir,
+// mic_id) — internal newlines/commas the user typed are preserved.
+function readDeepgramKeyterms(): string {
+  const el = document.getElementById("deepgramKeytermsInput") as HTMLTextAreaElement | null;
+  return (el?.value || "").trim();
+}
+
 function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
   const silence = getAutoStopSilenceConfig();
   return {
@@ -5792,6 +5808,12 @@ function buildUiPreferencesSavePlan() {
         // version bump (e.g. gemini-2.6-flash) flows through; the prior
         // hardcoded literal would silently keep stuck on 2.5-flash.
         openrouter: { model: openrouterModel || DEFAULT_OPENROUTER_AUDIO_MODEL },
+        // Raw, unparsed string — see the AppConfig.preferences.deepgram
+        // doc comment. Sent through the same debounced/serialized save
+        // as every other preference, so a stale backend that doesn't
+        // yet know this key still round-trips it via config.py's
+        // deep-merge (unvalidated keys pass through untouched).
+        deepgram: { keyterms: readDeepgramKeyterms() },
         ui: collectUiPreferences(),
       },
     },
@@ -5891,6 +5913,9 @@ async function loadCfg(): Promise<void> {
     const cfgOpenrouterModel = (cfg.preferences || {}).openrouter?.model || DEFAULT_OPENROUTER_AUDIO_MODEL;
     configuredRecordingsDir = (cfg.preferences || {}).recordings_dir || "";
     ($("recordingsDirInput") as HTMLInputElement).value = configuredRecordingsDir;
+    const deepgramPrefs = (cfg.preferences || {}).deepgram || {};
+    const keytermsEl = document.getElementById("deepgramKeytermsInput") as HTMLTextAreaElement | null;
+    if (keytermsEl) keytermsEl.value = String(deepgramPrefs.keyterms || "");
     const ui = (cfg.preferences || {}).ui || {};
     remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEFAULT_DEEPGRAM_AUDIO_MODEL || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
@@ -5898,6 +5923,7 @@ async function loadCfg(): Promise<void> {
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
     }
+    syncLanguageAutoHint();
     // Restore the unified selection from persisted wire values
     // (provider + local_model + per-provider remote models). The UI
     // group is DERIVED (gigaam-* local model ⇒ gigaam group), never
@@ -6131,6 +6157,7 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
 }
 
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("deepgramKeytermsInput") as HTMLTextAreaElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("autoStopSilenceEnabled") as HTMLInputElement).addEventListener("change", () => {
   queueUiPreferencesSave();
 });
@@ -7838,7 +7865,19 @@ function shouldLivePreview(): boolean {
   setTranscriptionSelection(readProviderGroup(), v || undefined);
 });
 
+// #languageAutoHint (frontend/index.html) explains that Auto maps to
+// Deepgram's multi-language mode and what that costs (BUGS_AUDIT_2026-09-03.md
+// §1) — relevant only while Auto is actually selected. One function
+// decides visibility so load and change can never disagree about it.
+function syncLanguageAutoHint(): void {
+  const hint = document.getElementById("languageAutoHint");
+  if (!hint) return;
+  const lang = (($("language") as HTMLSelectElement).value || "auto").trim().toLowerCase();
+  hint.hidden = lang !== "auto";
+}
+
 ($("language") as HTMLSelectElement).addEventListener("change", () => {
+  syncLanguageAutoHint();
   queueUiPreferencesSave();
 });
 ($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
