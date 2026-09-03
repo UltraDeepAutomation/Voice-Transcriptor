@@ -318,6 +318,8 @@ Desktop: см. §6, последний абзац.
 
 ## Кто на чём остановился — 2026-09-04 ~05:00 (сессия закрыта по лимиту токенов)
 
+Полные ТЗ для продолжения: `docs/NEXT_SESSION_2026-09-04.md`. Транскрипты всех агентов и рабочие скрипты: `~/Library/Application Support/transcriptor/evidence-2026-09-03/session-2026-09-03-04/`. WIP-ветки запушены на origin.
+
 ### Установлено и работает
 `/Applications/Transcriptor.app` **1.5.0** (сборка из `bd3faef`, подпись та же, разрешения не переспрашивались), keyterms в конфиге: Sonnet, Opus, Claude, Deepgram, MacBook, Windows, Transcriptor, субагент(ы), single source of truth, SSOT, Electron, worktree, коммит, транскрипция. Язык — Auto (по решению пользователя).
 
