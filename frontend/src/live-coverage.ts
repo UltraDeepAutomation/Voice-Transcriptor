@@ -29,6 +29,26 @@
  * trace log instead of being an unexplained branch.
  */
 
+/**
+ * True when this session dropped captured audio on the client side —
+ * discarded at the pending-buffer cap, lost to a failed ``send``, or
+ * still queued when the socket went away. This is the client half of
+ * the coverage contract (see module doc); the server cannot see this
+ * loss, so it must gate adoption independently of whatever the server
+ * reports.
+ *
+ * PROTOCOL CONTRACT R4 (BUGS_AUDIT_2026-09-03 §4.6): this predicate used
+ * to be checked only on the local-assist path (``decideLiveTranscriptAdoption``
+ * below); the Deepgram streaming path never read it at all, so a cold
+ * backend start that silently dropped the renderer's opening frames left
+ * Deepgram's live transcript looking "complete" when it was missing
+ * audio the server was never given a chance to hear. One definition,
+ * used by both paths.
+ */
+export function hasUnsentFrames(framesNeverSent: number): boolean {
+  return framesNeverSent > 0;
+}
+
 export type AdoptionRejection =
   | "no-envelope"
   | "envelope-error"
@@ -83,7 +103,7 @@ export function decideLiveTranscriptAdoption(input: AdoptionInput): AdoptionDeci
   if (envelope.source !== "local-assist") {
     return { adopt: false, reason: "not-local-assist" };
   }
-  if (input.framesNeverSent > 0) {
+  if (hasUnsentFrames(input.framesNeverSent)) {
     return { adopt: false, reason: "frames-never-sent" };
   }
   const coverage = envelope.coverage;
@@ -99,4 +119,103 @@ export function decideLiveTranscriptAdoption(input: AdoptionInput): AdoptionDeci
     return { adopt: false, reason: "empty-transcript" };
   }
   return { adopt: true, coverage };
+}
+
+/**
+ * Dead-stream / low-coverage rule for the Deepgram streaming path.
+ *
+ * PROTOCOL CONTRACT R2 (BUGS_AUDIT_2026-09-03, catastrophic-stop class:
+ * 2026-08-27 12:09, 2026-09-02 17:52). The Deepgram socket died mid-
+ * recording, the instant transcript was 2-12 characters of an 81s
+ * recording, and the old code pasted that fragment because it decided
+ * from the PRESENCE of a non-empty instant transcript rather than from
+ * proof that the transcript is complete. Both existing recovery
+ * branches were gated on ``!liveStreamErrorAtStop``, so the one signal
+ * that most strongly proves the transcript is unreliable — a fatal
+ * stream error — was exactly the signal that disabled recovery.
+ *
+ * This function decides from data, never from whether the transcript
+ * happens to be non-empty:
+ *
+ *  - a fatal stream error at stop (the strongest signal — the provider
+ *    connection is gone, nothing more will ever arrive on it);
+ *  - the socket was not OPEN at the moment of stop (same failure, seen
+ *    from the transport instead of from an error event);
+ *  - captured audio the client never managed to hand to the socket
+ *    (``hasUnsentFrames`` — the R4 predicate, shared with the
+ *    local-assist adoption policy above so a cold-start frame drop is
+ *    caught on both providers, not just one);
+ *  - the envelope itself proves a hole (``uncoveredSpeechSec > 0`` —
+ *    the backend's own interims recognised speech that no final segment
+ *    covers; only knowable once the envelope has arrived, so callers
+ *    that learn this after already deciding must re-run the check);
+ *  - the tail-gap arithmetic used everywhere else in the stop path
+ *    (recorded audio with captured activity extending past the last
+ *    committed/interim speech end) says the tail was never processed.
+ *
+ * Any one of these is sufficient. When it fires, the caller MUST run
+ * the full-audio decode of the saved recording (the existing
+ * transcribe-on-disk path) and deliver the union/richer result — the
+ * instant fragment must never be pasted on its own.
+ */
+export type LowCoverageReason =
+  | "stream-error"
+  | "socket-not-open"
+  | "frames-never-sent"
+  | "uncovered-speech"
+  | "tail-gap"
+  | "none";
+
+export interface LowCoverageInput {
+  /** The live-stream error snapshot taken at stop, if any (fatal). */
+  liveStreamErrorAtStop: boolean;
+  /** Was the WebSocket in the OPEN state at the moment of stop? */
+  wsOpenAtStop: boolean;
+  /** Captured frames that never reached the backend (the R4 predicate's input). */
+  framesNeverSent: number;
+  /**
+   * Seconds of recognised speech no final segment covers. Pass 0 (not
+   * yet known) before the envelope has arrived — this alone will never
+   * trigger recovery; re-run the check once the envelope's real value
+   * is known so a hole discovered mid-wait still escalates.
+   */
+  uncoveredSpeechSec: number;
+  recordedSec: number;
+  /** True once at least one committed/interim segment has a timestamp — the tail-gap arithmetic is meaningless without one. */
+  hasTimestampedLiveCoverage: boolean;
+  /** Recording duration minus the last committed/interim speech end. */
+  tailGapSec: number;
+  /** Captured PCM activity extends past the last speech end by a meaningful margin. */
+  tailHasCapturedActivity: boolean;
+  /** An interim (uncommitted) segment holds speech at the tail. */
+  tailHasInterimSpeechEvidence: boolean;
+}
+
+export interface LowCoverageDecision {
+  recover: boolean;
+  reason: LowCoverageReason;
+}
+
+/**
+ * Below this, a gap between the recording's end and the last
+ * recognised speech is ordinary trailing silence (endpointing latency,
+ * the pause before the user hit Stop), not evidence of missing words.
+ * Matches the threshold the tail-gap trace log has used since it was
+ * introduced — kept as one constant rather than a second copy so the
+ * two never drift.
+ */
+export const TAIL_GAP_THRESHOLD_SEC = 0.6;
+
+export function decideDeadStreamRecovery(input: LowCoverageInput): LowCoverageDecision {
+  if (input.liveStreamErrorAtStop) return { recover: true, reason: "stream-error" };
+  if (!input.wsOpenAtStop) return { recover: true, reason: "socket-not-open" };
+  if (hasUnsentFrames(input.framesNeverSent)) return { recover: true, reason: "frames-never-sent" };
+  if (input.uncoveredSpeechSec > 0) return { recover: true, reason: "uncovered-speech" };
+  const tailLikelyMissing =
+    input.recordedSec > 1.0 &&
+    input.hasTimestampedLiveCoverage &&
+    input.tailGapSec > TAIL_GAP_THRESHOLD_SEC &&
+    (input.tailHasCapturedActivity || input.tailHasInterimSpeechEvidence);
+  if (tailLikelyMissing) return { recover: true, reason: "tail-gap" };
+  return { recover: false, reason: "none" };
 }

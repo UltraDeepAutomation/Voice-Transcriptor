@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from unittest import mock
 
 from backend.remote_deepgram_live import (
     DeepgramLiveSession,
@@ -206,6 +207,40 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             finalize_count, 1,
             f"fully-covered stream must not pay the retry; frames {ws.types}",
+        )
+
+
+class EnvelopeTextSegmentsAgreeTests(unittest.IsolatedAsyncioTestCase):
+    """C6 (audit §3.8): ``text`` and ``segments`` in the envelope must
+    describe the same transcript — seams merged exactly once, both
+    fields derived from that one merged list.
+    """
+
+    async def test_seam_merged_word_appears_whole_in_both_fields(self):
+        session = _session()
+        session._finalized_segments = [
+            {"start": 5.94, "end": 17.76, "text": "раз, два, четыре, пя"},
+            {"start": 17.76, "end": 22.22, "text": "ть. Некоторые слова"},
+        ]
+        session.stats.bytes_sent = int(22.22 * 2 * session._cfg.sample_rate)
+        session.stats.bytes_offered = session.stats.bytes_sent
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            result = await session.drain_transcript()
+
+        self.assertIn("пять.", result["text"])
+        self.assertNotIn("пя ть", result["text"])
+        seg_texts = [seg["text"] for seg in result["segments"]]
+        self.assertTrue(
+            any("пять." in t for t in seg_texts),
+            f"segments must carry the same merge as text; got {seg_texts}",
+        )
+        # The joined segment texts, in order, must equal `text` exactly —
+        # the two fields are the same transcript, not independently
+        # derived approximations of it.
+        self.assertEqual(
+            " ".join(t for t in seg_texts if t).strip(), result["text"],
         )
 
 

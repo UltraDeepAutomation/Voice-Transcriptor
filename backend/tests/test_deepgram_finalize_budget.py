@@ -27,6 +27,7 @@ from unittest import mock
 
 from backend.remote_deepgram_live import (
     COVERAGE_GAP_MIN_SEC,
+    FINALIZE_ASSEMBLY_ALLOWANCE_SEC,
     FINALIZE_COVERED_WAIT_SEC,
     FINALIZE_EMPTY_TAIL_WAIT_SEC,
     FINALIZE_FLUSH_WAIT_SEC,
@@ -124,6 +125,71 @@ class TailCoverageTests(unittest.TestCase):
         session._interim_speech_spans = [(10.0, 40.0)]
         _streamed, _covered, _gap, speech = session._tail_coverage()
         self.assertEqual(speech, 0.0)
+
+    def test_a_dropped_send_does_not_shrink_the_gap(self):
+        # B1 (audit §3.6): a mid-stream send timeout drops the chunk from
+        # bytes_sent, but the mic still captured it. bytes_offered is the
+        # honest total; tail_gap must be measured from whichever count is
+        # larger, so a drop can only ever widen the gap, never hide it.
+        session = _session(streamed_sec=10.0, covered_end=9.5)
+        sr = session._cfg.sample_rate
+        session.stats.bytes_sent = int(9.6 * 2 * sr)  # one chunk lost
+        session.stats.bytes_offered = int(10.0 * 2 * sr)  # captured in full
+        streamed, _covered, gap, _speech = session._tail_coverage()
+        self.assertAlmostEqual(streamed, 10.0, places=2)
+        self.assertAlmostEqual(gap, 0.5, places=2)
+
+    def test_send_pcm_tracks_offered_separately_from_sent(self):
+        async def run():
+            session = _session(streamed_sec=0.0, covered_end=0.0)
+
+            class TimingOutWs:
+                # Raises the same exception a wedged 5s send would
+                # eventually produce via asyncio.wait_for, without
+                # actually waiting 5 real seconds in the test.
+                async def send(self, _payload):
+                    raise asyncio.TimeoutError()
+
+                async def close(self):
+                    return None
+
+            session._ws = TimingOutWs()
+            chunk = b"\x00\x01" * 100
+            await session.send_pcm(chunk)
+            self.assertEqual(session.stats.bytes_offered, len(chunk))
+            self.assertEqual(session.stats.bytes_sent, 0)
+
+        asyncio.run(run())
+
+    def test_utterance_end_shrinks_a_confirmed_silent_tail(self):
+        # C7 (audit §3.5): Deepgram's own "the utterance ended here"
+        # signal is stronger evidence than "no recent interim" — it
+        # confirms the tail past last_word_end is silence, not merely
+        # unproven. A 4 s raw gap that Deepgram itself closed at +0.3 s
+        # must not be treated as a 4 s unflushed tail.
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        session._last_utterance_end = 52.3
+        _streamed, _covered, gap, _speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 0.3, places=2)
+
+    def test_utterance_end_is_ignored_if_speech_resumed_after_it(self):
+        # The utterance ended, then the user started a new one — a later
+        # interim carrying speech past last_word_end must veto the
+        # shrink; that region is not confirmed silence after all.
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        session._last_utterance_end = 52.3
+        session._interim_speech_spans = [(53.0, 53.8)]
+        _streamed, _covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 2.0, places=2)
+        self.assertAlmostEqual(speech, 0.8, places=2)
+
+    def test_utterance_end_before_the_last_final_is_irrelevant(self):
+        # A stale UtteranceEnd from earlier in the stream must not affect
+        # a tail that opened up after it.
+        session = _session(streamed_sec=54.0, covered_end=52.0)
+        session._last_utterance_end = 10.0
+        _streamed, _covered, gap, _speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 2.0, places=2)
 
 
 class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
@@ -303,8 +369,12 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1, "announced exactly once")
         budget, expects_more = seen[0]
         self.assertTrue(expects_more, "an uncovered tail expects the wait to add words")
-        # Worst case, not the expected case: the retry pays the ceiling again.
-        self.assertAlmostEqual(budget, 0.10, places=3)
+        # Worst case, not the expected case: the retry pays the ceiling
+        # again, plus the fixed post-wait assembly cost (C3) — the budget
+        # bounds time to the envelope, not just the flush wait.
+        self.assertAlmostEqual(
+            budget, 0.10 + FINALIZE_ASSEMBLY_ALLOWANCE_SEC, places=3
+        )
 
     async def test_an_empty_tail_announces_that_waiting_buys_nothing(self):
         session = _session(streamed_sec=90.0, covered_end=89.95)
@@ -319,7 +389,9 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1)
         budget, expects_more = seen[0]
         self.assertFalse(expects_more)
-        self.assertAlmostEqual(budget, 0.02, places=3)
+        self.assertAlmostEqual(
+            budget, 0.02 + FINALIZE_ASSEMBLY_ALLOWANCE_SEC, places=3
+        )
 
     async def test_a_throwing_consumer_cannot_break_the_stop(self):
         session = _session(streamed_sec=90.0, covered_end=89.95)
@@ -342,6 +414,62 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         ):
             await session.finalize(wait_timeout=0.3)
         self.assertIn("CloseStream", ws.types)
+
+
+class BudgetIsAnHonestEnvelopeBoundTests(unittest.IsolatedAsyncioTestCase):
+    """C3: ``budgetMs`` must bound wall time to the ENVELOPE, not just the
+    flush wait.
+
+    ``drain_transcript()`` is the method that now produces the envelope
+    (C4 — CloseStream/recv-drain/close happen afterwards in
+    ``shutdown()``), so the announced budget is checked against ITS
+    wall-clock duration, in all three tail shapes: fully covered, an
+    empty tail (nothing to flush) and an uncovered tail (retry paid).
+    """
+
+    async def _measure(self, *, streamed_sec, covered_end, tail_speech_sec=0.0):
+        session = _session(
+            streamed_sec=streamed_sec,
+            covered_end=covered_end,
+            tail_speech_sec=tail_speech_sec,
+        )
+        announced: list[float] = []
+
+        def on_budget(budget_sec: float, _expects_more: bool) -> None:
+            announced.append(budget_sec)
+
+        started = time.perf_counter()
+        await session.drain_transcript(on_budget=on_budget)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(len(announced), 1, "budget announced exactly once")
+        return announced[0], elapsed
+
+    async def test_covered_tail_budget_covers_the_wall_time(self):
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+        ):
+            budget, elapsed = await self._measure(
+                streamed_sec=90.0, covered_end=89.5,
+            )
+        self.assertGreaterEqual(budget, elapsed)
+
+    async def test_empty_tail_budget_covers_the_wall_time(self):
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            budget, elapsed = await self._measure(
+                streamed_sec=90.0, covered_end=89.95,
+            )
+        self.assertGreaterEqual(budget, elapsed)
+
+    async def test_uncovered_tail_budget_covers_the_wall_time_including_the_retry(self):
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
+        ):
+            budget, elapsed = await self._measure(
+                streamed_sec=90.0, covered_end=85.0, tail_speech_sec=4.0,
+            )
+        self.assertGreaterEqual(budget, elapsed)
 
 
 class BudgetConstantTests(unittest.TestCase):

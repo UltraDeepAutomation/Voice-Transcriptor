@@ -125,6 +125,17 @@ FINALIZE_COVERED_WAIT_SEC = 0.75
 # Scoped to the population it was measured on, and no wider.
 FINALIZE_EMPTY_TAIL_WAIT_SEC = 0.25
 
+# C3 (audit §2.5): the announced budget used to describe only the flush
+# wait, leaving out everything drain_transcript() still does after the
+# wait resolves — the tail-guard re-measure, the interim-word splice,
+# building the merged transcript. That work is CPU-bound and small, but
+# a budget that omits it is not an honest upper bound on "time until the
+# envelope is sent", which is the promise made to the renderer. Sized
+# generously above what splice + seam-merge + dict-building take on a
+# session with a few hundred segments (single-digit milliseconds) so it
+# never needs revisiting for a slow machine.
+FINALIZE_ASSEMBLY_ALLOWANCE_SEC = 0.15
+
 # Seam repair: Deepgram's periodic forced flushes may cut a word in half
 # across two consecutive finals ("…четыре, пя" | "ть. Далее"). When two
 # finals touch within SEAM_MERGE_MAX_GAP seconds, neither side ends the
@@ -392,6 +403,13 @@ class DeepgramLiveStats:
     """Telemetry for a single live session."""
 
     bytes_sent: int = 0
+    # Bytes handed to send_pcm() for this connection, whether or not the
+    # send actually reached Deepgram. ``bytes_sent`` only counts what
+    # succeeded, so a mid-stream send timeout (BUG audit §3.6) silently
+    # shrank it — and with it ``_tail_coverage``'s streamed_sec, which
+    # made a genuinely unflushed tail look shorter than it was. This
+    # field is the honest total; see ``_tail_coverage``.
+    bytes_offered: int = 0
     chunks_sent: int = 0
     segments_final: int = 0
     segments_interim: int = 0
@@ -404,6 +422,7 @@ class DeepgramLiveStats:
     def as_dict(self) -> dict:
         return {
             "bytes_sent": self.bytes_sent,
+            "bytes_offered": self.bytes_offered,
             "chunks_sent": self.chunks_sent,
             "segments_final": self.segments_final,
             "segments_interim": self.segments_interim,
@@ -499,11 +518,24 @@ class DeepgramLiveSession:
         # (never cancelled). TCP FIN-WAITs piled up until OS reclaim.
         self._close_ran = False
         self._finalize_sent = False
+        # Set once drain_transcript() actually enters the Finalize dance
+        # (ws present, Finalize not already sent). shutdown() reads this
+        # to decide whether CloseStream is its job to send — it must
+        # mirror the entry condition exactly, not re-derive it from
+        # ``_finalize_sent`` alone, because a Finalize send that timed
+        # out leaves that flag False even though CloseStream still needs
+        # to go out (see drain_transcript()/shutdown()).
+        self._needs_close_stream = False
         # Set by the receive loop whenever an ``is_final`` arrives. The
         # finalize path waits on it after sending ``Finalize`` so the
         # flushed trailing transcript has a chance to come back before
         # the stream is closed. See ``FINALIZE_FLUSH_WAIT_SEC``.
         self._final_arrived = asyncio.Event()
+        # ``last_word_end`` from the most recent Deepgram ``UtteranceEnd``
+        # message (C7, audit §3.5) — an affirmative "the utterance ended
+        # here" signal, fed into ``_tail_coverage`` as evidence distinct
+        # from (and stronger than) mere interim silence.
+        self._last_utterance_end: Optional[float] = None
         self._last_error: Optional[str] = None
         self._last_fatal: bool = False
         self.stats = DeepgramLiveStats()
@@ -714,6 +746,13 @@ class DeepgramLiveSession:
             return
         if not chunk:
             return
+        # Counted BEFORE the send is attempted (B1, audit §3.6): this is
+        # audio the caller captured and offered to Deepgram, regardless
+        # of whether the send below succeeds. ``bytes_sent`` below stays
+        # "actually delivered" for the connect/telemetry logs; coverage
+        # math needs the honest total captured, not just what got
+        # through — see ``_tail_coverage``.
+        self.stats.bytes_offered += len(chunk)
         try:
             # Hard 5-second send timeout. Without it, a half-open TCP
             # socket (kernel-level hung sendq, network partition with
@@ -762,29 +801,45 @@ class DeepgramLiveSession:
             assert isinstance(item, dict)
             yield item
 
-    async def finalize(
+    async def drain_transcript(
         self,
-        wait_timeout: float = 3.0,
         on_budget: "Optional[Callable[[float, bool], None]]" = None,
     ) -> dict:
-        """Flush Deepgram and return the final transcript.
+        """Flush Deepgram and return the final transcript — nothing else.
+
+        This is the half of the old ``finalize()`` that produces the
+        transcript: send ``Finalize``, decide and announce the wait
+        budget, wait for the flush (with the tail-guard retry), splice
+        uncovered interim words, merge seams once. It deliberately stops
+        the moment the transcript is known complete — CloseStream,
+        keepalive teardown and the recv-loop drain are ``shutdown()``'s
+        job (C4, audit §2.4/§2.5).
+
+        Splitting this out matters because those belong to DIFFERENT
+        deadlines. Median post-Finalize round trip is a few hundred ms;
+        median time from CloseStream to the socket actually closing was
+        270 ms but ran as long as 5 s, spent waiting for Deepgram to tear
+        down a connection whose transcript was already sitting in memory.
+        A caller can now send the ``final`` envelope right after this
+        returns and let ``shutdown()`` run after — the user stops paying
+        for teardown, because the last thing that reaches the frontend no
+        longer depends on it.
 
         ``on_budget`` is called once, the moment the wait budget is
         chosen and before the waiting starts, with ``(budget_sec,
         expects_more)``. The caller forwards it to the client so both
         sides of the stop share ONE deadline: the coverage analysis that
         decides how long this may take happens here, where the data is,
-        and the consumer stops guessing. Without it the renderer waited a
-        constant 1.5 s while this method could legitimately spend 9 s —
-        24 % of stops measured on 2026-08-25 exceeded that constant, and
-        the words the extra wait recovered arrived after nobody was
-        listening.
+        and the consumer stops guessing. ``budget_sec`` is an honest upper
+        bound on the time until THIS method returns (C3) — it is what the
+        client should wait, not an optimistic estimate.
 
-        Sends ``CloseStream`` so Deepgram finalizes any buffered audio,
-        waits up to ``wait_timeout`` seconds for the receive loop to drain
-        the remaining events, then closes the upstream connection.
+        Sets ``stats.finalize_ms`` to this method's own duration — the
+        cost the budget promises to bound.
 
-        Returns a dict with ``text``, ``segments`` and ``durationSec``.
+        Returns a dict with ``text``, ``segments``, ``durationSec``,
+        ``stats``, ``uncoveredSpeechSec``, ``streamedSec`` and
+        ``coveredEndSec``.
         """
         started = time.perf_counter()
         logger.info(
@@ -792,6 +847,12 @@ class DeepgramLiveSession:
             self.stats.segments_final, self.stats.segments_interim, self.stats.bytes_sent,
         )
         if self._ws is not None and not self._finalize_sent:
+            # CloseStream is shutdown()'s responsibility, but whether it
+            # is owed at all is decided by THIS entry condition — record
+            # it now so shutdown() (which may run well after this method
+            # returns, or not know if Finalize send itself failed) does
+            # not have to re-derive it. See ``_needs_close_stream``.
+            self._needs_close_stream = True
             # 1.1.25: idempotency flag is set AFTER the Finalize send
             # succeeds, NOT before. Previously a CancelledError fired
             # between the flag-set and the actual ``ws.send`` would
@@ -884,7 +945,16 @@ class DeepgramLiveSession:
                 # Worst case, not the expected case: an uncovered tail may
                 # also pay a retry of the same ceiling. The consumer needs
                 # the bound it must respect, not an optimistic estimate.
-                worst_case = flush_wait * (2.0 if needs_flush else 1.0)
+                # C3: the budget must bound the time to the ENVELOPE being
+                # sent, not just the flush wait — add the fixed cost of
+                # what still runs after the wait resolves (tail-guard
+                # re-measure, splice, seam-merge) so the number the
+                # renderer is told to trust actually covers what this
+                # method obeys.
+                worst_case = (
+                    flush_wait * (2.0 if needs_flush else 1.0)
+                    + FINALIZE_ASSEMBLY_ALLOWANCE_SEC
+                )
                 try:
                     on_budget(worst_case, needs_flush)
                 except Exception as e:  # never let telemetry break a stop
@@ -965,10 +1035,93 @@ class DeepgramLiveSession:
                         tail_speech,
                         verdict,
                     )
+            # CloseStream, keepalive teardown, the recv-loop drain and
+            # close() no longer happen here — they are shutdown()'s job,
+            # run by the caller AFTER the envelope below has been sent.
+            # See this method's docstring and C4.
 
+        # The splice logs what it recovered; the count has no other
+        # consumer, so it is not bound to a name that would suggest one.
+        self._splice_uncovered_interim_words()
+        # C6 (audit §3.8): merge seams exactly once and derive BOTH
+        # ``text`` and ``segments`` from the same merged list. Previously
+        # ``text`` went through ``final_text()`` (which merges) while
+        # ``segments`` was the raw, unmerged list — the two fields
+        # described different transcripts.
+        merged_segments = merge_seam_fragments(list(self._finalized_segments))
+        final_text = self._join_segment_texts(merged_segments)
+        duration_sec = 0.0
+        if merged_segments:
+            duration_sec = float(
+                max(s.get("end", 0.0) for s in merged_segments)
+            )
+        self.stats.finalize_ms = (time.perf_counter() - started) * 1000.0
+        # 1.1.19: explicit DELTA logging — segments_final at ENTER vs
+        # EXIT shows whether the Finalize sequence actually produced
+        # trailing is_final segments. If segments_final didn't increase
+        # between ENTER and EXIT, we know the flush is ineffective for
+        # this session (likely region/network) and recovery is the only
+        # path to the trailing words. "EXIT" now marks the transcript
+        # being complete and ready to send, not the socket being closed
+        # (C4) — that is logged separately by shutdown().
+        logger.info(
+            "deepgram-live: finalize EXIT %.0f ms text_len=%d segments_final=%d (delta from ENTER) duration_sec=%.2f bytes_sent=%d",
+            self.stats.finalize_ms,
+            len(final_text),
+            self.stats.segments_final,
+            duration_sec,
+            self.stats.bytes_sent,
+        )
+        uncovered_speech_sec = self._uncovered_speech_sec()
+        if uncovered_speech_sec > 0:
+            logger.warning(
+                "deepgram-live: %.2fs of recognised speech is not covered by any "
+                "final segment — the committed transcript has holes",
+                uncovered_speech_sec,
+            )
+        streamed_sec = self.stats.bytes_sent / float(
+            2 * max(1, int(self._cfg.sample_rate))
+        )
+        return {
+            "text": final_text,
+            "segments": merged_segments,
+            "durationSec": round(duration_sec, 3),
+            "stats": self.stats.as_dict(),
+            # Seconds where Deepgram's own interims recognised words that
+            # no final segment ever covered — see the WS handler's field
+            # documentation next to this envelope key.
+            "uncoveredSpeechSec": round(uncovered_speech_sec, 3),
+            # C5: bytes actually delivered to Deepgram (not merely
+            # captured — see ``bytes_offered``/``_tail_coverage`` for
+            # that distinction), so the renderer can tell "the mic
+            # captured N seconds" from "Deepgram actually processed N
+            # seconds" without guessing from ``durationSec`` alone.
+            "streamedSec": round(streamed_sec, 3),
+            # End of the last finalized segment (post seam-merge) — the
+            # point up to which the transcript is a committed final, as
+            # opposed to spliced interim fallback or nothing at all.
+            "coveredEndSec": round(duration_sec, 3),
+        }
+
+    async def shutdown(self, wait_timeout: float = 3.0) -> None:
+        """Release the upstream connection after drain_transcript().
+
+        Sends ``CloseStream`` (if drain_transcript() actually entered the
+        Finalize dance — see ``_needs_close_stream``), cancels the
+        keepalive task, waits up to ``wait_timeout`` for the recv loop to
+        drain, then calls ``close()``. Every step is best-effort and
+        independently guarded (matching ``close()``'s own idempotency),
+        so this is safe to call even if drain_transcript() raised, or
+        was never called at all.
+
+        Deliberately does not touch anything drain_transcript() already
+        produced — the transcript is done and, by the time a caller
+        invokes this, likely already on the wire to the client (C4).
+        """
+        if self._ws is not None and self._needs_close_stream:
             try:
                 # Same 5-second bound as send_pcm — a wedged TCP socket
-                # mustn't hang finalize indefinitely. The CloseStream
+                # mustn't hang shutdown indefinitely. The CloseStream
                 # frame is tiny so the timeout only fires when the
                 # underlying socket is genuinely stuck.
                 await asyncio.wait_for(
@@ -1005,45 +1158,22 @@ class DeepgramLiveSession:
 
         await self.close()
 
-        # The splice logs what it recovered; the count has no other
-        # consumer, so it is not bound to a name that would suggest one.
-        self._splice_uncovered_interim_words()
-        self.stats.finalize_ms = (time.perf_counter() - started) * 1000.0
-        final_text = self.final_text()
-        duration_sec = 0.0
-        if self._finalized_segments:
-            duration_sec = float(
-                max(s.get("end", 0.0) for s in self._finalized_segments)
-            )
-        # 1.1.19: explicit DELTA logging — segments_final at ENTER vs
-        # EXIT shows whether the Finalize+CloseStream sequence
-        # actually produced trailing is_final segments. If
-        # segments_final didn't increase between ENTER and EXIT, we
-        # know the post-CloseStream flush is ineffective for this
-        # session (likely region/network) and recovery is the only
-        # path to the trailing words.
-        logger.info(
-            "deepgram-live: finalize EXIT %.0f ms text_len=%d segments_final=%d (delta from ENTER) duration_sec=%.2f bytes_sent=%d",
-            self.stats.finalize_ms,
-            len(final_text),
-            self.stats.segments_final,
-            duration_sec,
-            self.stats.bytes_sent,
-        )
-        uncovered_speech_sec = self._uncovered_speech_sec()
-        if uncovered_speech_sec > 0:
-            logger.warning(
-                "deepgram-live: %.2fs of recognised speech is not covered by any "
-                "final segment — the committed transcript has holes",
-                uncovered_speech_sec,
-            )
-        return {
-            "text": final_text,
-            "segments": list(self._finalized_segments),
-            "durationSec": round(duration_sec, 3),
-            "stats": self.stats.as_dict(),
-            "uncoveredSpeechSec": round(uncovered_speech_sec, 3),
-        }
+    async def finalize(
+        self,
+        wait_timeout: float = 3.0,
+        on_budget: "Optional[Callable[[float, bool], None]]" = None,
+    ) -> dict:
+        """Back-compat convenience: ``drain_transcript()`` then ``shutdown()``.
+
+        Existing callers that want "give me the transcript and clean
+        everything up, in one call" still get exactly that behaviour.
+        The WS handler calls the two halves separately so it can send the
+        ``final`` envelope in between — see ``drain_transcript()``'s
+        docstring and C4.
+        """
+        result = await self.drain_transcript(on_budget=on_budget)
+        await self.shutdown(wait_timeout=wait_timeout)
+        return result
 
     def _splice_uncovered_interim_words(self) -> int:
         """Fold interim-recognised words no final ever covered into the
@@ -1193,8 +1323,16 @@ class DeepgramLiveSession:
         Derived entirely from state we already hold, so it can be
         consulted *before* deciding how long to wait rather than only
         after a wait has expired.
+
+        ``streamed_sec`` is deliberately ``max(bytes_offered, bytes_sent)``
+        rather than ``bytes_sent`` alone (B1, audit §3.6): a mid-stream
+        send timeout drops the chunk from ``bytes_sent`` but the audio
+        was still captured, so using the smaller, "actually delivered"
+        count would shrink ``tail_gap`` and could hide a real hole. A
+        session that never drops a send has ``bytes_offered ==
+        bytes_sent`` and this is a no-op.
         """
-        streamed_sec = self.stats.bytes_sent / (
+        streamed_sec = max(self.stats.bytes_offered, self.stats.bytes_sent) / (
             2 * max(1, int(self._cfg.sample_rate))
         )
         covered_end = max(
@@ -1220,6 +1358,25 @@ class DeepgramLiveSession:
                 if end > start:
                     tail_speech += end - start
                     merged_end = end
+        # UtteranceEnd evidence (C7, audit §3.5): Deepgram's own signal
+        # that the utterance ended at ``last_word_end``, distinct from
+        # (and stronger than) "no interim has spoken up recently" — the
+        # absence of interims is ambiguous (a quiet provider looks the
+        # same as a quiet user), but an UtteranceEnd is an affirmative
+        # claim. When it falls inside the current tail AND nothing since
+        # has recognised speech past it, the audio beyond it is confirmed
+        # silence, not an unflushed tail — shrink the gap to only the
+        # confirmed-uncertain span. A later interim carrying speech past
+        # the UtteranceEnd (the utterance resumed) leaves tail_gap alone.
+        utterance_end = self._last_utterance_end
+        if (
+            utterance_end is not None
+            and covered_end <= utterance_end < streamed_sec
+            and not any(
+                sp_end > utterance_end for _sp_start, sp_end in self._interim_speech_spans
+            )
+        ):
+            tail_gap = max(0.0, utterance_end - covered_end)
         return streamed_sec, covered_end, tail_gap, tail_speech
 
     def _tail_needs_flush(self, tail_gap: float, tail_speech: float) -> bool:
@@ -1367,14 +1524,29 @@ class DeepgramLiveSession:
     def last_fatal(self) -> bool:
         return self._last_fatal
 
+    @staticmethod
+    def _join_segment_texts(segments: Iterable[dict]) -> str:
+        """SSOT join: the ONE place seam-merged segments become ``text``.
+
+        ``final_text()`` and ``drain_transcript()`` both go through this
+        so ``text`` and ``segments`` in the envelope can never describe
+        different transcripts (C6, audit §3.8) — they are built from
+        exactly the same merged list.
+        """
+        parts = [str(seg.get("text") or "").strip() for seg in segments]
+        return " ".join(p for p in parts if p).strip()
+
     def final_text(self) -> str:
-        merged = merge_seam_fragments(list(self._finalized_segments))
-        parts: list[str] = []
-        for seg in merged:
-            text = str(seg.get("text") or "").strip()
-            if text:
-                parts.append(text)
-        return " ".join(parts).strip()
+        """Best-effort transcript text independent of drain_transcript().
+
+        Used on the error path where ``drain_transcript()`` itself raised
+        and there is no merged-segment list to reuse (see the WS
+        handler's exception branch) — recomputes the seam merge on
+        demand. The normal path computes the merge once inside
+        ``drain_transcript()`` and reuses it for both ``text`` and
+        ``segments`` rather than calling this method.
+        """
+        return self._join_segment_texts(merge_seam_fragments(list(self._finalized_segments)))
 
     # ----- Internals --------------------------------------------------------
 
@@ -1617,7 +1789,24 @@ class DeepgramLiveSession:
             )
             return None
 
-        if mtype in ("SpeechStarted", "UtteranceEnd"):
+        if mtype == "SpeechStarted":
+            return None
+
+        if mtype == "UtteranceEnd":
+            # C7 (audit §3.5): Deepgram's own "the utterance ended here"
+            # signal — record it so ``_tail_coverage`` can tell confirmed
+            # trailing silence apart from a tail that merely has no
+            # recent interim (ambiguous: a quiet provider looks the same).
+            last_word_end = msg.get("last_word_end")
+            try:
+                value = float(last_word_end) if last_word_end is not None else None
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                self._last_utterance_end = value
+                logger.debug(
+                    "deepgram-live: UtteranceEnd last_word_end=%.2f", value,
+                )
             return None
 
         if mtype == "Error":

@@ -4137,6 +4137,26 @@ async def _run_local_live_session(
         )
 
 
+# B2 (audit §3.7): frames buffered while ``session.connect()`` is still
+# in flight, so they can be replayed into Deepgram once it succeeds.
+# Every such frame is ALSO recorded into the recovery spool unconditio-
+# nally as it arrives — this cap only bounds the in-memory replay queue
+# against a pathologically slow/hung connect, it never bounds what the
+# spool retains. At 16 kHz/16-bit mono a live renderer chunk is small
+# (observed: tens to low hundreds of ms of audio per frame), so this
+# comfortably covers the observed 1-12 s connect window.
+_PRECONNECT_FRAME_BUFFER_MAX = 4096
+
+# C2: the tail-preserving drain after ``finalize`` — 250 ms was always
+# spent in full because the mic is already stopped by the time the
+# control message arrives, so there is usually nothing left to wait
+# for. When the renderer's ``finalize`` carries the counts it actually
+# sent (C1), the drain instead stops the moment those counts are
+# matched, still bounded by the same ceiling for older renderers or a
+# genuinely stalled connection.
+_FINALIZE_DRAIN_CEILING_SEC = 0.25
+
+
 async def _run_deepgram_live_session(
     *,
     websocket: WebSocket,
@@ -4156,6 +4176,24 @@ async def _run_deepgram_live_session(
     the Deepgram REST endpoint on the saved canonical WAV. This gives
     us two independent paths into Deepgram (WS + REST) without coupling
     the server state machine to either one.
+
+    Stop-chain wire protocol (wave 2, audit §2/§3.5-3.7):
+
+    * The renderer's ``finalize`` control message may carry
+      ``framesSent``/``bytesSent`` — the count of binary frames/bytes it
+      has sent on THIS connection, tail-hold frames included. When
+      present, the post-finalize drain waits for exactly the frames
+      still in flight instead of a blind 250 ms; an older renderer that
+      omits them gets the previous behaviour unchanged (C1/C2).
+    * ``finalizing`` is announced (unchanged shape) the instant the wait
+      budget is chosen, before any waiting starts (C3) — see
+      ``DeepgramLiveSession.drain_transcript``.
+    * The ``final`` envelope is sent as soon as the transcript is known
+      complete, BEFORE ``CloseStream``/the recv drain/``close()`` (C4) —
+      those no longer gate delivery.
+    * The envelope carries ``uncoveredSpeechSec``, ``streamedSec`` and
+      ``coveredEndSec`` (C5) — see
+      ``DeepgramLiveSession.drain_transcript`` for their definitions.
     """
     dg_cfg = DeepgramLiveConfig(
         model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
@@ -4166,9 +4204,66 @@ async def _run_deepgram_live_session(
         keyterms=tuple(keyterms or ()),
     )
     session = DeepgramLiveSession(api_key=api_key, config=dg_cfg)
+
+    # C1/C2 shared state: total binary frames/bytes received on this
+    # connection, from before connect() even starts, so the finalize
+    # drain always has an honest baseline to match the renderer's counts
+    # against — a frame buffered during connect() and later replayed
+    # still counts toward what the renderer says it sent.
+    frames_received = 0
+    bytes_received = 0
+
+    # B2 (audit §3.7): consume renderer frames into the recovery spool
+    # WHILE session.connect() is still running, instead of only starting
+    # once it returns. The renderer streams audio the moment its mic
+    # opens, independent of how long connect() takes (measured up to
+    # 12 s) — without a reader running here, that audio sits unconsumed,
+    # and on a connect FAILURE (the return path right below) it was
+    # never recorded anywhere: the recovery spool held 0 bytes for a
+    # session the user spoke 126 s into. Bytes are recorded to recovery
+    # unconditionally as they arrive; the bounded queue is only for
+    # replaying them into Deepgram once (if) connect succeeds.
+    pending_frames: "deque[bytes]" = deque(maxlen=_PRECONNECT_FRAME_BUFFER_MAX)
+    preconnect_finalize_payload: Optional[dict] = None
+    preconnect_disconnected = False
+
+    async def _preconnect_reader() -> None:
+        nonlocal frames_received, bytes_received
+        nonlocal preconnect_finalize_payload, preconnect_disconnected
+        while True:
+            msg = await _ws_recv_next(websocket)
+            kind = msg["kind"]
+            if kind == "disconnect":
+                preconnect_disconnected = True
+                return
+            if kind == "bytes":
+                data = msg["data"]
+                frames_received += 1
+                bytes_received += len(data)
+                _record_recovery_chunk(recovery, data)
+                pending_frames.append(data)
+                continue
+            if kind == "control" and msg["payload"].get("type") == "finalize":
+                # Rare (Stop pressed before connect() even resolved), but
+                # must not be lost: receiver() below checks this and
+                # replays it through the same drain path as normal.
+                preconnect_finalize_payload = msg["payload"]
+                return
+            # Any other control/text frame arriving before connect() is
+            # unexpected from this renderer and is ignored; audio and
+            # finalize are the only pre-connect traffic it sends.
+
+    pre_task = asyncio.create_task(
+        _preconnect_reader(), name="ws-dg-preconnect-rx",
+    )
     try:
         await session.connect()
     except DeepgramLiveError as e:
+        pre_task.cancel()
+        try:
+            await pre_task
+        except (asyncio.CancelledError, Exception):
+            pass
         logger.warning("ws deepgram connect failed: %s", e)
         await _ws_send_json(
             websocket,
@@ -4197,11 +4292,108 @@ async def _run_deepgram_live_session(
         _mark_recovery_error(recovery)
         return
 
+    pre_task.cancel()
+    try:
+        await pre_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # Replay everything captured while connecting, IN ORDER, before any
+    # newly arriving frame is forwarded — Deepgram must see this audio
+    # first or the transcript's word timings would be shifted.
+    for _chunk in pending_frames:
+        await session.send_pcm(_chunk)
+    pending_frames.clear()
+
     stop = asyncio.Event()
     upstream_fatal = False
+    if preconnect_disconnected:
+        stop.set()
+
+    async def _drain_finalize_tail(payload: dict) -> None:
+        """C1/C2: drain in-flight binary frames on ``finalize``.
+
+        The frontend stops the microphone BEFORE sending ``finalize``,
+        so on a healthy connection there should be no more bytes in
+        flight — but the wire still has in-transit frames, and if we
+        returned immediately any bytes that arrived AFTER the finalize
+        text frame but BEFORE we drained the receive buffer would be
+        silently dropped.
+
+        ``payload`` may carry ``framesSent``/``bytesSent`` — the exact
+        count of binary frames/bytes the renderer sent on this
+        connection (C1). When both are present, the drain stops the
+        moment ``frames_received``/``bytes_received`` reach them instead
+        of always spending the full ceiling — which used to run to
+        completion on EVERY stop, because the mic is already stopped and
+        nothing more is coming. An older renderer that omits the counts
+        gets the previous unconditional timed drain, unchanged.
+        """
+        nonlocal frames_received, bytes_received
+        target_frames = payload.get("framesSent")
+        target_bytes = payload.get("bytesSent")
+        has_counts = isinstance(target_frames, int) and isinstance(target_bytes, int)
+
+        def _matched() -> bool:
+            return (
+                has_counts
+                and frames_received >= target_frames
+                and bytes_received >= target_bytes
+            )
+
+        drain_start = time.monotonic()
+        drain_deadline = drain_start + _FINALIZE_DRAIN_CEILING_SEC
+        while time.monotonic() < drain_deadline and not _matched():
+            try:
+                tail_msg = await asyncio.wait_for(
+                    _ws_recv_next(websocket),
+                    timeout=max(0.0, drain_deadline - time.monotonic()),
+                )
+            except asyncio.TimeoutError:
+                break
+            tail_kind = tail_msg["kind"]
+            if tail_kind == "bytes":
+                tail_data = tail_msg["data"]
+                frames_received += 1
+                bytes_received += len(tail_data)
+                if session.is_closed:
+                    _record_recovery_chunk(recovery, tail_data)
+                    continue
+                _record_recovery_chunk(recovery, tail_data)
+                await session.send_pcm(tail_data)
+                continue
+            if tail_kind == "disconnect":
+                break
+            # Any non-bytes non-disconnect frame (stray control msg,
+            # text, etc.) ends the drain.
+            break
+        elapsed_ms = (time.monotonic() - drain_start) * 1000.0
+        if has_counts:
+            logger.info(
+                "finalize drain: %s after %.0f ms (frames %d/%d)",
+                "matched" if _matched() else "timed out",
+                elapsed_ms,
+                frames_received,
+                target_frames,
+            )
+        else:
+            logger.info(
+                "finalize drain: timed out after %.0f ms (no counts; frames=%d)",
+                elapsed_ms,
+                frames_received,
+            )
 
     async def receiver() -> None:
+        nonlocal frames_received, bytes_received
         try:
+            if preconnect_finalize_payload is not None:
+                # Stop was pressed before connect() even resolved (rare)
+                # — the finalize control frame was consumed by the
+                # preconnect reader, so replay it through the same drain
+                # path a normally-timed finalize takes.
+                await _drain_finalize_tail(preconnect_finalize_payload)
+                stop.set()
+                return
             while not stop.is_set():
                 msg = await _ws_recv_next(websocket)
                 kind = msg["kind"]
@@ -4209,60 +4401,21 @@ async def _run_deepgram_live_session(
                     stop.set()
                     return
                 if kind == "bytes":
+                    data = msg["data"]
+                    frames_received += 1
+                    bytes_received += len(data)
                     if session.is_closed:
                         # Upstream already died; keep recording the
                         # PCM locally so the REST fallback has the full
                         # audio but don't waste cycles pushing it.
-                        _record_recovery_chunk(recovery, msg["data"])
+                        _record_recovery_chunk(recovery, data)
                         continue
-                    data = msg["data"]
                     _record_recovery_chunk(recovery, data)
                     await session.send_pcm(data)
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
-                        # Tail-preserving drain: the frontend stops the
-                        # microphone BEFORE sending ``finalize``, so on a
-                        # healthy connection there should be no more
-                        # bytes in flight. But the wire still has in-
-                        # transit frames — WebSocket MessageEvent delivery
-                        # is async, and if we ``return`` immediately any
-                        # bytes that arrived AFTER the finalize text
-                        # frame but BEFORE we drained the receive buffer
-                        # would be silently dropped. A short non-blocking
-                        # drain forwards those frames to Deepgram first;
-                        # finalize then happens with the full audio
-                        # already upstream. 250 ms covers the wire RTT
-                        # and any queued fragments; anything longer is a
-                        # network stall and not worth waiting for.
-                        drain_deadline = time.monotonic() + 0.25
-                        while time.monotonic() < drain_deadline:
-                            try:
-                                tail_msg = await asyncio.wait_for(
-                                    _ws_recv_next(websocket),
-                                    timeout=max(
-                                        0.0,
-                                        drain_deadline - time.monotonic(),
-                                    ),
-                                )
-                            except asyncio.TimeoutError:
-                                break
-                            tail_kind = tail_msg["kind"]
-                            if tail_kind == "bytes":
-                                if session.is_closed:
-                                    _record_recovery_chunk(
-                                        recovery, tail_msg["data"],
-                                    )
-                                    continue
-                                tail_data = tail_msg["data"]
-                                _record_recovery_chunk(recovery, tail_data)
-                                await session.send_pcm(tail_data)
-                                continue
-                            if tail_kind == "disconnect":
-                                break
-                            # Any non-bytes non-disconnect frame (stray
-                            # control msg, text, etc.) ends the drain.
-                            break
+                        await _drain_finalize_tail(msg["payload"])
                         stop.set()
                         return
         except Exception as e:
@@ -4341,7 +4494,13 @@ async def _run_deepgram_live_session(
             task.add_done_callback(budget_sends.discard)
 
         try:
-            drained = await session.finalize(wait_timeout=3.0, on_budget=_announce_budget)
+            # C4: drain_transcript() produces the transcript and returns —
+            # it does NOT touch CloseStream, the recv drain, or close().
+            # Those are shutdown()'s job, run AFTER the envelope below is
+            # already on the wire, so the socket teardown (median 270 ms,
+            # observed up to 5 s waiting for Deepgram to close) no longer
+            # sits between the user and their transcript.
+            drained = await session.drain_transcript(on_budget=_announce_budget)
             final_payload = {
                 "type": "final",
                 "text": drained.get("text", ""),
@@ -4357,6 +4516,19 @@ async def _run_deepgram_live_session(
                 # than deliver it. See
                 # ``DeepgramLiveSession._uncovered_speech_sec``.
                 "uncoveredSpeechSec": drained.get("uncoveredSpeechSec", 0.0),
+                # C5: bytes actually delivered to Deepgram, in seconds —
+                # lets the renderer tell "the mic captured N seconds"
+                # from "Deepgram actually processed N seconds" without
+                # guessing from durationSec alone (a session with a
+                # completely uncovered tail has durationSec short of
+                # what was streamed).
+                "streamedSec": drained.get("streamedSec", 0.0),
+                # End of the last finalized segment (post seam-merge) —
+                # the point up to which the transcript is a committed
+                # final, as opposed to spliced interim fallback or
+                # nothing. Paired with uncoveredSpeechSec/streamedSec so
+                # the renderer can judge coverage without re-deriving it.
+                "coveredEndSec": drained.get("coveredEndSec", 0.0),
             }
         except Exception as e:
             # ``str(e)`` can carry the upstream provider's raw error body
@@ -4376,10 +4548,34 @@ async def _run_deepgram_live_session(
                 "durationSec": 0.0,
                 "source": "deepgram-live",
                 "error": finalize_error,
+                "streamedSec": round(
+                    session.stats.bytes_sent / float(2 * LIVE_SAMPLE_RATE_HZ), 3,
+                ),
+                "coveredEndSec": 0.0,
             }
 
         if upstream_fatal and session.last_error:
             final_payload["error"] = _safe_error_text(session.last_error)
+
+        # Envelope out FIRST (C4) — everything below is teardown the
+        # client no longer waits on.
+        await _ws_send_json(websocket, final_payload)
+
+        try:
+            await session.shutdown(wait_timeout=3.0)
+        except Exception as e:
+            # The envelope is already delivered; a teardown failure here
+            # cannot un-deliver it, only leak the socket if it goes
+            # unnoticed. Log and move on — close() below is the backstop.
+            logger.error(
+                "deepgram shutdown failed (envelope already sent): %s",
+                e, exc_info=True,
+            )
+        # Idempotent backstop: shutdown() calls close() on every path it
+        # takes, but if shutdown() itself raised before reaching it (see
+        # above), this guarantees the socket and background tasks are
+        # still released.
+        await session.close()
 
         if not fw.done():
             try:
@@ -4433,9 +4629,6 @@ async def _run_deepgram_live_session(
                 f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
                 _safe_error_text(session.last_error) if session.last_error else "none",
             )
-
-        await _ws_send_json(websocket, final_payload)
-        await session.close()
 
 
 @app.get("/api/live/recoveries")

@@ -5,8 +5,10 @@ import importlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 from unittest import mock
 
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
@@ -217,8 +219,24 @@ class DeepgramLiveSessionTailTests(IsolatedBackendMainImportMixin, unittest.Isol
                     yield {}
                 return
 
+            async def drain_transcript(self, on_budget=None):
+                return {
+                    "text": "partial",
+                    "segments": [],
+                    "durationSec": 0.0,
+                    "stats": {},
+                    "uncoveredSpeechSec": 0.0,
+                    "streamedSec": 0.0,
+                    "coveredEndSec": 0.0,
+                }
+
+            async def shutdown(self, wait_timeout=3.0):
+                self._closed = True
+
             async def finalize(self, wait_timeout=3.0):
-                return {"text": "partial", "segments": [], "durationSec": 0.0, "stats": {}}
+                result = await self.drain_transcript()
+                await self.shutdown(wait_timeout=wait_timeout)
+                return result
 
             def final_text(self):
                 return "partial"
@@ -268,6 +286,352 @@ class DeepgramLiveSessionTailTests(IsolatedBackendMainImportMixin, unittest.Isol
         self.assertEqual(recovery["bytes"], len(b"tail-pcm"))
         self.assertEqual(recovery["chunks"], 1)
         self.assertEqual(recovery["pcm_file"].getvalue(), b"tail-pcm")
+
+
+class _FakeWebSocket:
+    def __init__(self):
+        self.messages: "asyncio.Queue[dict]" = asyncio.Queue()
+        self.sent: list[dict] = []
+
+    async def receive(self):
+        return await self.messages.get()
+
+    async def send_text(self, text):
+        self.sent.append(json.loads(text))
+
+
+class _FakeStats:
+    bytes_sent = 0
+    chunks_sent = 0
+    segments_final = 0
+    segments_interim = 0
+    connect_ms = None
+    finalize_ms = None
+
+    def as_dict(self):
+        return {}
+
+
+class DeepgramLivePreconnectBufferTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):
+    """B2 (audit §3.7): frames that arrive while ``connect()`` is still
+    in flight must reach the recovery spool even if connect() then
+    fails — previously the receiver task did not exist yet, so a slow
+    or failing connect (observed up to 12s) meant the spool held 0
+    bytes for a session the user spoke real audio into.
+    """
+
+    async def test_frames_arriving_during_a_failed_connect_reach_the_recovery_spool(self):
+        main = self.main
+        release_connect = asyncio.Event()
+
+        class FailingConnectSession:
+            def __init__(self, *_a, **_kw):
+                self.stats = _FakeStats()
+
+            async def connect(self):
+                # Simulates a slow connect: frames arrive on the wire
+                # before this resolves, and here it resolves to failure.
+                await release_connect.wait()
+                raise main.DeepgramLiveError("simulated connect failure")
+
+        ws = _FakeWebSocket()
+        recovery = {
+            "pcm_file": io.BytesIO(),
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+        with mock.patch.object(main, "DeepgramLiveSession", FailingConnectSession):
+            task = asyncio.create_task(main._run_deepgram_live_session(
+                websocket=ws,
+                api_key="dg",
+                model="nova-3",
+                language="auto",
+                diarize=False,
+                recovery=recovery,
+            ))
+            await asyncio.sleep(0.01)
+            self.assertFalse(task.done())
+            # Three frames land on the wire while connect() is still
+            # pending. Before this fix nothing was reading them yet.
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"AAAA"})
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"BBBB"})
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"CCCC"})
+            await asyncio.sleep(0.01)
+            release_connect.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertTrue(recovery["had_error"])
+        self.assertEqual(recovery["bytes"], 12)
+        self.assertEqual(recovery["chunks"], 3)
+        self.assertEqual(recovery["pcm_file"].getvalue(), b"AAAABBBBCCCC")
+        # The renderer still gets its error + final envelope.
+        self.assertEqual([m["type"] for m in ws.sent], ["error", "final"])
+
+    async def test_frames_buffered_during_connect_are_replayed_in_order_on_success(self):
+        main = self.main
+        release_connect = asyncio.Event()
+        created_sessions: list["SlowConnectSession"] = []
+
+        class SlowConnectSession:
+            def __init__(self, *_a, **_kw):
+                self.stats = _FakeStats()
+                self.stats.segments_final = 1
+                self._closed = False
+                self.last_error = None
+                self.last_fatal = False
+                self.sent_pcm: list[bytes] = []
+                created_sessions.append(self)
+
+            async def connect(self):
+                await release_connect.wait()
+
+            async def send_pcm(self, chunk):
+                self.sent_pcm.append(chunk)
+
+            async def events(self):
+                # A real session's events() only completes once close()
+                # enqueues its sentinel. Returning immediately here (as
+                # if Deepgram produced nothing at all and hung up) makes
+                # the WS handler's ``asyncio.wait(..., FIRST_COMPLETED)``
+                # treat the forwarder as "done first" and short-circuit
+                # the whole session before the test can feed it any
+                # frames — block instead, like the real thing does.
+                await asyncio.Event().wait()
+                if False:
+                    yield {}
+
+            async def drain_transcript(self, on_budget=None):
+                if on_budget:
+                    on_budget(0.05, False)
+                return {
+                    "text": "ok", "segments": [], "durationSec": 0.0,
+                    "stats": {}, "uncoveredSpeechSec": 0.0,
+                    "streamedSec": 0.0, "coveredEndSec": 0.0,
+                }
+
+            async def shutdown(self, wait_timeout=3.0):
+                self._closed = True
+
+            async def close(self):
+                self._closed = True
+
+            @property
+            def is_closed(self):
+                return self._closed
+
+        ws = _FakeWebSocket()
+        recovery = {
+            "pcm_file": io.BytesIO(),
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+        with mock.patch.object(main, "DeepgramLiveSession", SlowConnectSession):
+            task = asyncio.create_task(main._run_deepgram_live_session(
+                websocket=ws,
+                api_key="dg",
+                model="nova-3",
+                language="auto",
+                diarize=False,
+                recovery=recovery,
+            ))
+            await asyncio.sleep(0.01)
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"AAAA"})
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"BBBB"})
+            await asyncio.sleep(0.01)
+            release_connect.set()
+            await asyncio.sleep(0.01)
+            await ws.messages.put({
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "finalize"}),
+            })
+            await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(recovery["pcm_file"].getvalue(), b"AAAABBBB")
+        self.assertEqual(len(created_sessions), 1)
+        # Buffered-during-connect frames must reach Deepgram in the same
+        # order the renderer sent them — replaying out of order would
+        # shift every word timing that follows.
+        self.assertEqual(created_sessions[0].sent_pcm, [b"AAAA", b"BBBB"])
+
+
+class DeepgramLiveFinalizeDrainTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):
+    """C1/C2: the post-``finalize`` drain waits for the renderer's own
+    frame/byte counts instead of always spending the full 250ms ceiling.
+    """
+
+    def _fake_session_class(self):
+        class FakeSession:
+            def __init__(self, *_a, **_kw):
+                self.stats = _FakeStats()
+                self.stats.segments_final = 1
+                self._closed = False
+                self.last_error = None
+                self.last_fatal = False
+                self.sent_pcm: list[bytes] = []
+
+            async def connect(self):
+                return None
+
+            async def send_pcm(self, chunk):
+                self.sent_pcm.append(chunk)
+
+            async def events(self):
+                # A real session's events() only completes once close()
+                # enqueues its sentinel. Returning immediately here (as
+                # if Deepgram produced nothing at all and hung up) makes
+                # the WS handler's ``asyncio.wait(..., FIRST_COMPLETED)``
+                # treat the forwarder as "done first" and short-circuit
+                # the whole session before the test can feed it any
+                # frames — block instead, like the real thing does.
+                await asyncio.Event().wait()
+                if False:
+                    yield {}
+
+            async def drain_transcript(self, on_budget=None):
+                if on_budget:
+                    on_budget(0.05, False)
+                return {
+                    "text": "ok", "segments": [], "durationSec": 0.0,
+                    "stats": {}, "uncoveredSpeechSec": 0.0,
+                    "streamedSec": 0.0, "coveredEndSec": 0.0,
+                }
+
+            async def shutdown(self, wait_timeout=3.0):
+                self._closed = True
+
+            async def close(self):
+                self._closed = True
+
+            @property
+            def is_closed(self):
+                return self._closed
+
+        return FakeSession
+
+    async def test_finalize_with_matched_counts_does_not_pay_the_full_ceiling(self):
+        main = self.main
+        FakeSession = self._fake_session_class()
+        ws = _FakeWebSocket()
+        recovery = {
+            "pcm_file": io.BytesIO(),
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+        # Measured directly off the "finalize drain: ..." log line (C2)
+        # rather than end-to-end task wall time: the task also pays a
+        # fixed ~250ms forwarder-cleanup wait unrelated to the drain
+        # itself (this fake session's events() blocks like a real idle
+        # connection would), which would swamp a wall-clock assertion.
+        with self.assertLogs("backend.main", level="INFO") as log_ctx:
+            with mock.patch.object(main, "DeepgramLiveSession", FakeSession):
+                task = asyncio.create_task(main._run_deepgram_live_session(
+                    websocket=ws,
+                    api_key="dg",
+                    model="nova-3",
+                    language="auto",
+                    diarize=False,
+                    recovery=recovery,
+                ))
+                await asyncio.sleep(0.005)
+                await ws.messages.put({"type": "websocket.receive", "bytes": b"AAAA"})
+                await ws.messages.put({"type": "websocket.receive", "bytes": b"BBBB"})
+                await asyncio.sleep(0.02)
+                # The renderer reports exactly what it already sent — the
+                # backend has already received all of it, so the drain
+                # must resolve immediately rather than waiting the 250ms
+                # ceiling.
+                await ws.messages.put({
+                    "type": "websocket.receive",
+                    "text": json.dumps({"type": "finalize", "framesSent": 2, "bytesSent": 8}),
+                })
+                await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(recovery["bytes"], 8)
+        self.assertEqual(recovery["chunks"], 2)
+        drain_lines = [m for m in log_ctx.output if "finalize drain:" in m]
+        self.assertEqual(len(drain_lines), 1)
+        match = re.search(r"matched after (\d+) ms", drain_lines[0])
+        self.assertIsNotNone(match, drain_lines[0])
+        self.assertLess(
+            int(match.group(1)), 200,
+            f"drain took too long despite counts already matching: {drain_lines[0]}",
+        )
+
+    async def test_finalize_waits_for_one_more_frame_the_counts_promise(self):
+        main = self.main
+        FakeSession = self._fake_session_class()
+        ws = _FakeWebSocket()
+        recovery = {
+            "pcm_file": io.BytesIO(),
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+        with mock.patch.object(main, "DeepgramLiveSession", FakeSession):
+            task = asyncio.create_task(main._run_deepgram_live_session(
+                websocket=ws,
+                api_key="dg",
+                model="nova-3",
+                language="auto",
+                diarize=False,
+                recovery=recovery,
+            ))
+            await asyncio.sleep(0.005)
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"AAAA"})
+            await asyncio.sleep(0.005)
+            # finalize declares 2 frames/8 bytes total — one more frame
+            # (e.g. the 200ms tail-hold) is still in flight.
+            await ws.messages.put({
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "finalize", "framesSent": 2, "bytesSent": 8}),
+            })
+            await asyncio.sleep(0.02)
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"BBBB"})
+            await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(recovery["bytes"], 8)
+        self.assertEqual(recovery["chunks"], 2)
+
+    async def test_finalize_without_counts_keeps_the_old_timed_drain(self):
+        """Backward compatibility: an older renderer's bare
+        ``{"type":"finalize"}`` still gets the unconditional timed
+        drain, unchanged."""
+        main = self.main
+        FakeSession = self._fake_session_class()
+        ws = _FakeWebSocket()
+        recovery = {
+            "pcm_file": io.BytesIO(),
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+        with mock.patch.object(main, "DeepgramLiveSession", FakeSession):
+            task = asyncio.create_task(main._run_deepgram_live_session(
+                websocket=ws,
+                api_key="dg",
+                model="nova-3",
+                language="auto",
+                diarize=False,
+                recovery=recovery,
+            ))
+            await asyncio.sleep(0.005)
+            started = time.perf_counter()
+            await ws.messages.put({
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "finalize"}),
+            })
+            await asyncio.wait_for(task, timeout=1.0)
+            elapsed = time.perf_counter() - started
+
+        self.assertGreaterEqual(elapsed, 0.24)
 
 
 if __name__ == "__main__":

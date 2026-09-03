@@ -122,5 +122,109 @@ class FinalizeFlushOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(time.perf_counter() - started, 0.15)
 
 
+class DrainTranscriptShutdownSplitTests(unittest.IsolatedAsyncioTestCase):
+    """C4: the transcript-producing half and the socket-teardown half are
+    two methods now, and the WS handler is meant to send the envelope
+    between them. These tests pin the split itself, independent of the
+    WS handler in backend/main.py.
+    """
+
+    async def test_drain_transcript_does_not_touch_the_socket_at_all(self):
+        """CloseStream — and everything after it — is shutdown()'s job.
+
+        A caller that only calls drain_transcript() must be able to
+        build and send the envelope with the socket still fully alive;
+        nothing about producing the transcript should have written to
+        it beyond the Finalize frame itself.
+        """
+        session = _session()
+        ws = session._ws
+        assert ws is not None
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            result = await session.drain_transcript()
+        self.assertEqual(ws.types, ["Finalize"], "CloseStream must not be sent yet")
+        self.assertFalse(session.is_closed, "the session must still be usable")
+        self.assertIn("streamedSec", result)
+        self.assertIn("coveredEndSec", result)
+
+        await session.shutdown(wait_timeout=0.3)
+        self.assertIn("CloseStream", ws.types)
+        self.assertTrue(session.is_closed)
+
+    async def test_a_wedged_upstream_does_not_delay_the_envelope(self):
+        """The whole point of the split (audit §2.4): a socket that never
+        closes must not hold up the transcript. drain_transcript() must
+        return within the flush budget, not the much larger
+        ``wait_timeout`` that only bounds shutdown()'s recv drain.
+        """
+        session = _session()
+        # A recv loop stuck forever — e.g. Deepgram accepted CloseStream
+        # but never actually closed the TCP connection.
+        session._recv_task = asyncio.create_task(asyncio.sleep(999))
+        try:
+            started = time.perf_counter()
+            with mock.patch(
+                "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.05
+            ):
+                await session.drain_transcript()
+            elapsed = time.perf_counter() - started
+            # Well under the 3s wait_timeout a stuck recv task would cost
+            # if drain_transcript() waited on it.
+            self.assertLess(elapsed, 0.5, f"envelope delayed by {elapsed:.2f}s")
+
+            # shutdown() still resolves, bounded by its own wait_timeout,
+            # by cancelling the stuck task rather than hanging forever.
+            shutdown_started = time.perf_counter()
+            await session.shutdown(wait_timeout=0.2)
+            shutdown_elapsed = time.perf_counter() - shutdown_started
+            self.assertLess(shutdown_elapsed, 1.0)
+            self.assertTrue(session._recv_task.cancelled() or session._recv_task.done())
+        finally:
+            if not session._recv_task.done():
+                session._recv_task.cancel()
+
+    async def test_shutdown_awaits_a_real_recv_drain(self):
+        """All three existing finalize test files set ``_recv_task =
+        None`` — this exercises the drain for real: a background task
+        that is still finishing up (simulating in-flight Deepgram
+        messages still being processed) must be awaited, not skipped,
+        and shutdown() must not return before it completes.
+        """
+        session = _session()
+        drained_at: dict[str, float] = {}
+
+        async def real_recv_drain():
+            await asyncio.sleep(0.08)
+            drained_at["t"] = time.perf_counter()
+
+        session._recv_task = asyncio.create_task(real_recv_drain())
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            await session.drain_transcript()
+        await session.shutdown(wait_timeout=1.0)
+        shutdown_returned_at = time.perf_counter()
+        self.assertIn("t", drained_at, "recv task must have been awaited to completion")
+        # shutdown() must not return before the drain it awaited finished.
+        self.assertGreaterEqual(shutdown_returned_at, drained_at["t"])
+        self.assertTrue(session._recv_task.done())
+        self.assertFalse(session._recv_task.cancelled())
+
+    async def test_finalize_thin_wrapper_still_does_both_in_order(self):
+        """Back-compat: finalize() == drain_transcript() then shutdown()."""
+        session = _session()
+        ws = session._ws
+        assert ws is not None
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+        ):
+            result = await session.finalize(wait_timeout=0.3)
+        self.assertIn("CloseStream", ws.types)
+        self.assertTrue(session.is_closed)
+        self.assertIn("text", result)
+
+
 if __name__ == "__main__":
     unittest.main()

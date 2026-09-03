@@ -46,6 +46,7 @@
       "accelerator.js",
       "engine-deps.js",
       "renderer-console.js",
+      "paste-result.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",

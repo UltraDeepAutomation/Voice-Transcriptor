@@ -10,6 +10,10 @@ const shortcutDefaultsManifest = require("./shortcut-defaults.json");
 // main.js and unit-tested directly (desktop/accelerator.test.js).
 const { canonicalAcceleratorForPlatform } = require("./accelerator");
 const { formatConsoleMirrorLine } = require("./renderer-console");
+// SSOT for "did this paste attempt actually succeed, and is it verified
+// enough to trust restoring the clipboard afterward" (BUGS_AUDIT
+// 2026-09-03 §6.1/§6.4/§6.6) — unit-tested by desktop/paste-result.test.js.
+const { evaluatePasteOutcome } = require("./paste-result");
 
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
@@ -3125,52 +3129,189 @@ async function getFrontmostAppIdentityFast() {
   }
 }
 
+// ── Windows persistent front-window helper (BUGS_AUDIT §6.3) ──────────
+//
+// getFrontmostAppInfo()'s Windows branch used to spawn a fresh
+// ``powershell -Command`` with an inline ``Add-Type @"...C#..."@`` on
+// EVERY call. Add-Type compiles that P/Invoke class via csc.exe under
+// the hood — 700-2000 ms cold, worse under Defender real-time scanning —
+// against the 1200 ms budget most callers apply
+// (getFrontmostAppInfoWithTimeout), so it frequently timed out and
+// produced an empty paste target ("no-target") even though a perfectly
+// good foreground window existed the whole time.
+//
+// Fix: compile the helper class ONCE, in a PowerShell child process kept
+// alive for the app's lifetime (started lazily, on first need), and ask
+// it questions over its stdin/stdout instead of spawning + compiling per
+// call. All three Windows front-window lookups named in the audit —
+// hotkey-press capture (toggleRecordingFromShortcut, via
+// getFrontmostAppInfoWithTimeout), resolvePasteDestination, and
+// tryPasteToFocusedField — already funnel through this one function
+// (getFrontmostAppInfo), so fixing it here fixes every call site with a
+// single change, the same way macOS's fast path centralises on
+// lsappinfo in getFrontmostAppIdentityFast.
+//
+// Protocol: the helper reads one line, "FRONT", per request and writes
+// back one line, "RESULT:<json>". Requests are answered strictly FIFO,
+// which is safe for concurrent callers because each request's push onto
+// the pending queue and its stdin write happen synchronously together
+// (no ``await`` between them), so two overlapping calls can never
+// interleave their queue position and their wire order.
+let winFrontHelper = null; // { child, buf, pending: [{resolve}] } | null
+let winFrontHelperStarting = null; // Promise<helper|null> while (re)starting
+
+const WIN_FRONT_HELPER_SCRIPT = `
+$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class TWindow {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+}
+"@
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($line -eq $null) { break }
+  if ($line -ne "FRONT") { continue }
+  try {
+    $hwnd = [TWindow]::GetForegroundWindow()
+    # NOT $pid — that is a READ-ONLY automatic variable holding the
+    # id of this PowerShell process itself (see the identical note
+    # this script replaced, previously inline in getFrontmostAppInfo).
+    $procId = 0
+    [TWindow]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    $titleSb = New-Object System.Text.StringBuilder 4096
+    [TWindow]::GetWindowText($hwnd, $titleSb, $titleSb.Capacity) | Out-Null
+    $classSb = New-Object System.Text.StringBuilder 512
+    [TWindow]::GetClassName($hwnd, $classSb, $classSb.Capacity) | Out-Null
+    $result = @{
+      name = if ($proc) { $proc.Name } else { "" }
+      pid = if ($proc) { $procId } else { 0 }
+      hwnd = if ($hwnd -ne [IntPtr]::Zero) { ('0x{0:X}' -f ([Int64]$hwnd)) } else { "" }
+      windowTitle = $titleSb.ToString()
+      className = $classSb.ToString()
+    }
+    Write-Output ("RESULT:" + ($result | ConvertTo-Json -Compress))
+  } catch {
+    Write-Output "RESULT:{}"
+  }
+}
+`;
+
+/** Kill the persistent helper (if any) and fail out any in-flight requests. Restarted lazily on next use. */
+function stopWinFrontHelper() {
+  const helper = winFrontHelper;
+  winFrontHelper = null;
+  winFrontHelperStarting = null;
+  if (!helper) return;
+  try { helper.child.kill("SIGKILL"); } catch { }
+  for (const pending of helper.pending.splice(0)) {
+    try { pending.resolve(null); } catch { }
+  }
+}
+
+function ensureWinFrontHelper() {
+  if (winFrontHelper) return Promise.resolve(winFrontHelper);
+  if (winFrontHelperStarting) return winFrontHelperStarting;
+  winFrontHelperStarting = new Promise((resolve) => {
+    let child;
+    try {
+      // "-Command -" makes PowerShell read the script body from stdin
+      // instead of taking it as a one-shot -Command argument, which is
+      // what keeps the process (and its already-compiled TWindow class)
+      // alive across requests instead of exiting after one answer.
+      child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+      });
+    } catch {
+      winFrontHelperStarting = null;
+      resolve(null);
+      return;
+    }
+    // Same live-children registry runCommand() uses (BUG-61) — a quit
+    // while this helper is running must SIGKILL it too, not orphan it.
+    trackedChildren.add(child);
+    const helper = { child, buf: "", pending: [] };
+    try { child.stdout.setEncoding("utf8"); } catch { }
+    try { child.stderr.setEncoding("utf8"); } catch { }
+    child.stdout.on("data", (d) => {
+      helper.buf += String(d || "");
+      let idx;
+      while ((idx = helper.buf.indexOf("\n")) >= 0) {
+        const line = helper.buf.slice(0, idx).trim();
+        helper.buf = helper.buf.slice(idx + 1);
+        if (line.startsWith("RESULT:")) {
+          const pending = helper.pending.shift();
+          if (pending) pending.resolve(line.slice("RESULT:".length));
+        }
+      }
+    });
+    const onDead = () => {
+      trackedChildren.delete(child);
+      for (const pending of helper.pending.splice(0)) {
+        try { pending.resolve(null); } catch { }
+      }
+      if (winFrontHelper === helper) winFrontHelper = null;
+    };
+    child.once("error", onDead);
+    child.once("close", onDead);
+    try {
+      child.stdin.write(WIN_FRONT_HELPER_SCRIPT + "\n");
+    } catch { }
+    winFrontHelper = helper;
+    winFrontHelperStarting = null;
+    resolve(helper);
+  });
+  return winFrontHelperStarting;
+}
+
+/**
+ * Ask the persistent helper who is in the foreground. Returns the raw
+ * JSON string from its "RESULT:" line, or null on timeout/failure — in
+ * which case the helper is torn down and restarted on the next call, so
+ * a late answer can never be matched to a future, unrelated request.
+ */
+async function getWindowsFrontmostInfoRaw(timeoutMs = 4000) {
+  const helper = await ensureWinFrontHelper();
+  if (!helper) return null;
+  return new Promise((resolve) => {
+    let settled = false;
+    const settleOnce = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      stopWinFrontHelper();
+      settleOnce(null);
+    }, Math.max(200, Number(timeoutMs) || 4000));
+    helper.pending.push({
+      resolve: (raw) => {
+        clearTimeout(timer);
+        settleOnce(raw);
+      },
+    });
+    try {
+      helper.child.stdin.write("FRONT\n");
+    } catch {
+      clearTimeout(timer);
+      settleOnce(null);
+    }
+  });
+}
+
 async function getFrontmostAppInfo() {
   if (process.platform === "win32") {
-    const pwsh = `
-      Add-Type @"
-        using System;
-        using System.Runtime.InteropServices;
-        using System.Text;
-        public class Window {
-          [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-          [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
-          [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-          [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
-        }
-"@
-      $hwnd = [Window]::GetForegroundWindow()
-      # NOT $pid — that is a READ-ONLY automatic variable holding this
-      # PowerShell process's own id. Assigning to it raises "Cannot
-      # overwrite variable PID because it is read-only or constant",
-      # which is NON-terminating, so the script kept running with
-      # $pid still pointing at PowerShell itself. The [ref] write-back
-      # from GetWindowThreadProcessId failed for the same reason.
-      # Net effect on Windows: every captured paste target reported
-      # name="powershell" and PowerShell's own pid instead of the app
-      # the user was recording from — wrong app in the status capsule
-      # and in main.log, and a pid-based activation fallback that
-      # focused a dead console instead of the real window.
-      $procId = 0
-      [Window]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
-      $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-      $titleSb = New-Object System.Text.StringBuilder 4096
-      [Window]::GetWindowText($hwnd, $titleSb, $titleSb.Capacity) | Out-Null
-      $classSb = New-Object System.Text.StringBuilder 512
-      [Window]::GetClassName($hwnd, $classSb, $classSb.Capacity) | Out-Null
-      $result = @{
-        name = if ($proc) { $proc.Name } else { "" }
-        pid = if ($proc) { $procId } else { 0 }
-        hwnd = if ($hwnd -ne [IntPtr]::Zero) { ('0x{0:X}' -f ([Int64]$hwnd)) } else { "" }
-        windowTitle = $titleSb.ToString()
-        className = $classSb.ToString()
-      }
-      $result | ConvertTo-Json -Compress
-    `;
-    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
-    if (!res.ok) return { name: "", pid: 0 };
+    const raw = await getWindowsFrontmostInfoRaw();
+    if (raw == null) return { name: "", pid: 0 };
     try {
-      const parsed = JSON.parse(String(res.stdout || "").trim() || "{}");
+      const parsed = JSON.parse(raw.trim() || "{}");
       return {
         name: String(parsed?.name || "").trim(),
         pid: Number.parseInt(String(parsed?.pid || "0").trim(), 10) || 0,
@@ -3330,8 +3471,16 @@ async function activateWindowsWindowByHwnd(hwnd) {
     $hwnd = [IntPtr]::new([Int64]::Parse('${hex}', [System.Globalization.NumberStyles]::AllowHexSpecifier))
     if ([Window]::IsWindow($hwnd)) {
       [Window]::ShowWindowAsync($hwnd, 5) | Out-Null
-      [Window]::SetForegroundWindow($hwnd) | Out-Null
-      Write-Output "1"
+      # BUGS_AUDIT §6.2: this used to be "| Out-Null" — the actual
+      # SetForegroundWindow result was discarded and "1" was written
+      # unconditionally whenever the hwnd merely still existed. Win32
+      # refuses SetForegroundWindow calls from a process that does not
+      # own the current foreground lock (which a spawned PowerShell
+      # child never does), so that "1" was reporting "the window is
+      # still a window", not "activation worked". Capture and report
+      # the real return value so callers can tell the two apart.
+      $activated = [Window]::SetForegroundWindow($hwnd)
+      if ($activated) { Write-Output "1" } else { Write-Output "0" }
     } else {
       Write-Output "0"
     }
@@ -3672,8 +3821,25 @@ function releaseClipboardSnapshot() {
  * Note on rich clipboards: ``readText`` returns "" for image-only
  * clipboards, so Cmd+C on an image during the window → "" !==
  * writtenText → correctly aborts restore (user's image survives).
+ *
+ * ``verified`` (BUGS_AUDIT 2026-09-03 §6.1/§6.4/§6.6) is the single gate
+ * that decides whether restoring is even attempted: every paste method
+ * used to call this unconditionally on any ok:true result, but "ok:true"
+ * only ever meant "the OS-level paste command was sent", never "the
+ * target actually received the text". A silently-failed Windows paste
+ * (§6.1) or a macOS target that reads the pasteboard slower than the
+ * fixed 1.5 s window (§6.4) both then had their clipboard overwritten
+ * back to the OLD content — destroying the only remaining copy of the
+ * transcript. When ``verified`` is not literally ``true`` the transcript
+ * is left on the clipboard on purpose: the user can still paste it by
+ * hand, whereas a silent restore gives them nothing.
  */
-function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipboardRestore") {
+function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
+  if (verified !== true) {
+    appendMainLog(`[${logCtx}] paste not verified; leaving transcript on the clipboard instead of restoring`);
+    releaseClipboardSnapshot();
+    return;
+  }
   const INITIAL_DELAY_MS = 400;
   const POLL_INTERVAL_MS = 200;
   const MAX_WAIT_MS = 1500;
@@ -3895,33 +4061,44 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
   // Defense-in-depth: reject any value that is not a safe non-negative integer
   // before interpolating it into the AppleScript source string.
   const pid = (Number.isFinite(rawPid) && rawPid >= 0 && rawPid < 2 ** 31) ? Math.trunc(rawPid) : 0;
+  // Needed inside the script below (as a plain integer, never as
+  // interpolated text) to decide whether the focused element's value
+  // grew by exactly the pasted length — see the verification block.
+  const pastedTextLen = String(text || "").length;
   const robustPasteScript = `
     set targetApp to "${escapedApp}"
     set targetPid to ${pid}
     set targetWindowTitle to "${escapedWindowTitle}"
+    set pastedTextLen to ${pastedTextLen}
     tell application "System Events"
       if UI elements enabled is false then return "ERR:no-accessibility"
       set p to missing value
-      
+
       -- Priority 1: Target by exact Unix PID
       if targetPid > 0 then
         if exists (first process whose unix id is targetPid) then
           set p to first process whose unix id is targetPid
         end if
       end if
-      
+
       -- Priority 2: Target by exact App Name
       if p is missing value and targetApp is not "" then
         if exists process targetApp then
           set p to process targetApp
         end if
       end if
-      
+
       if p is missing value then return "ERR:no-process"
-      
+
       -- Fast path: bring target to front and send physical Cmd+V keycode.
-      -- Avoid AXFocusedUIElement probing here because some apps block this call
-      -- for several seconds and makes the recording status look stuck on transcribing.
+      -- Avoid AXFocusedUIElement probing HERE (before even deciding how
+      -- to paste) because some apps block this call for several seconds
+      -- and make the recording status look stuck on transcribing —
+      -- measured against the Finder process AXFocusedUIElement itself,
+      -- a probe with no bound blocked for 40+ seconds. The verification
+      -- read below (axFocusedValueLength) is bounded to 1 s per call via
+      -- "with timeout of 1 second" specifically so it can be taken
+      -- right around the paste itself without reintroducing that hang.
       --
       -- The activation and its settle delay are conditional. Transcriptor
       -- never takes focus — the capsule is a non-focusable window — so the
@@ -3960,6 +4137,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
         end try
       end if
 
+      -- Snapshot the focused element text length right before the
+      -- paste fires, so the same length read after it fires (at either
+      -- return point below) can tell a genuine paste from a click/keycode
+      -- that was sent but never received by anything.
+      set beforeLen to my axFocusedValueLength(p)
+
       -- If the target exposes a standard Edit > Paste command, prefer
       -- executing that command directly over synthesising Cmd+V. A
       -- keycode only proves the keyboard event was delivered; the menu
@@ -3991,24 +4174,62 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
             -- restore does not run for at least 1.5 s, and the auto-send
             -- Enter sleeps before it fires. A delay here was 160 ms added
             -- to the moment the user is waiting for.
-            return "OK:menu-paste-primary" & activationTag
+            set afterLen to my axFocusedValueLength(p)
+            set verifiedTag to ":unverified"
+            if beforeLen is not -1 and afterLen is not -1 and (afterLen - beforeLen) is equal to pastedTextLen then
+              set verifiedTag to ":verified"
+            end if
+            return "OK:menu-paste-primary" & activationTag & verifiedTag
           end try
         end if
       end try
-      
+
       -- Perform physical V key press (key code 9) + Cmd
       -- This bypasses keyboard layout issues (like Russian "м") where keystroke "v" fails
       tell p
         key code 9 using {command down}
       end tell
-      
+
       -- Same reasoning as the menu path: the settle allowance lives with
       -- the caller that needs it, not in front of the return.
-      return "OK:robust-paste" & activationTag
+      set afterLen to my axFocusedValueLength(p)
+      set verifiedTag to ":unverified"
+      if beforeLen is not -1 and afterLen is not -1 and (afterLen - beforeLen) is equal to pastedTextLen then
+        set verifiedTag to ":verified"
+      end if
+      return "OK:robust-paste" & activationTag & verifiedTag
     end tell
-  `;
 
-  const textLen = String(text || "").length;
+    -- Length of the focused UI element text value, or -1 when it is
+    -- unavailable/unreadable/times out. Bounded to 0.5 s per attribute
+    -- read ("with timeout of 0.5 second") — an UNBOUNDED
+    -- AXFocusedUIElement read measured 40+ seconds against Finder in
+    -- testing, which is exactly the "some apps block this call for
+    -- several seconds" risk the fast path above avoids. Falls back from
+    -- AXValue (works for standard text fields) to AXNumberOfCharacters
+    -- (some custom text views expose only this) before giving up. This
+    -- function is called twice per paste (before and after), so its
+    -- bound is half of what the caller's own osascript timeout budgets
+    -- for the pair — see the 4200 ms comment below.
+    on axFocusedValueLength(p)
+      tell application "System Events"
+        try
+          with timeout of 0.5 second
+            set axElem to (value of attribute "AXFocusedUIElement" of p)
+          end timeout
+        on error
+          return -1
+        end try
+        try
+          return (count of (value of attribute "AXValue" of axElem))
+        end try
+        try
+          return (value of attribute "AXNumberOfCharacters" of axElem)
+        end try
+        return -1
+      end tell
+    end axFocusedValueLength
+  `;
 
   let lastReason = "paste-no-attempt";
 
@@ -4058,12 +4279,26 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
         const vbsLines = [
           'Set WshShell = CreateObject("WScript.Shell")',
         ];
-        // Activate target window by PID/name only when we do not have an
-        // exact HWND-level restore already performed above.
-        if (!effectiveTarget.hwnd && effectiveTarget.pid > 0) {
-          vbsLines.push(`WshShell.AppActivate ${Math.trunc(effectiveTarget.pid)}`);
+        // Activate the target UNCONDITIONALLY (BUGS_AUDIT §6.2) — this
+        // used to be gated on ``!effectiveTarget.hwnd``, but Windows
+        // front-window capture (getFrontmostAppInfo) always returns an
+        // hwnd, so that condition was always false and this AppActivate
+        // never ran. It matters because it is the one activation call in
+        // the whole ladder that is actually reliable: WSH's AppActivate
+        // does its own AttachThreadInput dance internally and is exempt
+        // from the same-thread-input restriction that makes a plain
+        // SetForegroundWindow from an unrelated PowerShell child fail
+        // (see activateWindowsWindowByHwnd below). Its result is checked
+        // — a target that failed to activate must not have SendKeys
+        // fired at it, since that would type into whatever else happens
+        // to be foreground (often Transcriptor itself).
+        if (effectiveTarget.pid > 0) {
+          vbsLines.push(`If Not WshShell.AppActivate(${Math.trunc(effectiveTarget.pid)}) Then`);
+          vbsLines.push('  WScript.Echo "ERR:activate"');
+          vbsLines.push('  WScript.Quit 2');
+          vbsLines.push('End If');
           vbsLines.push('WScript.Sleep 80');
-        } else if (!effectiveTarget.hwnd && effectiveTarget.appName) {
+        } else if (effectiveTarget.appName) {
           // VBS string literals are terminated by CR/LF — a target name
           // that contains a newline would break out of the quoted string
           // and inject arbitrary VBS into the script. Doubling the ``"``
@@ -4075,7 +4310,10 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
           const sanitizedName = effectiveTarget.appName
             .replace(/[\x00-\x1f\x7f]/g, "")
             .replace(/"/g, '""');
-          vbsLines.push(`WshShell.AppActivate "${sanitizedName}"`);
+          vbsLines.push(`If Not WshShell.AppActivate("${sanitizedName}") Then`);
+          vbsLines.push('  WScript.Echo "ERR:activate"');
+          vbsLines.push('  WScript.Quit 2');
+          vbsLines.push('End If');
           vbsLines.push('WScript.Sleep 80');
         }
         vbsLines.push('WScript.Sleep 30');
@@ -4095,22 +4333,28 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
           Buffer.from(vbsSource, "utf16le"),
         ]);
         fs.writeFileSync(vbsPath, vbsBuf);
-        // 5000 ms (was 2500): on Windows 11 with Defender real-time
-        // scanning, cscript launch can spend 1–3 s in AV scan before
-        // the script body executes. The previous 2.5 s budget made
-        // VBS paste fail on these machines and fall through to the
-        // slower PowerShell path with no functional benefit.
-        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], { timeoutMs: 5000 });
+        // 3500 ms (BUGS_AUDIT §6.4/§6.5, was 5000, before that 2500):
+        // the comment this budget has always cited is that on Windows
+        // 11 with Defender real-time scanning, cscript launch can spend
+        // 1–3 s in AV scan before the script body executes. 3500 ms is
+        // the smallest budget that still covers that documented 1-3 s
+        // worst case with headroom for the script's own body (two
+        // AppActivate calls + two short Sleeps, well under 500 ms). The
+        // previous 5000 ms budget let every failing attempt burn a full
+        // 5 s before the PowerShell fallback (below) even started,
+        // which is what let the retry ladder reach ~30 s end to end.
+        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], { timeoutMs: 3500 });
 
         // Clean up temp file
         try { fs.unlinkSync(vbsPath); } catch { }
 
-        if (check.ok) {
-          traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: "vbs_success", verified: false });
-          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:vbs");
-          return { ok: true, reason: "OK:vbs_paste", method: "vbs_paste", verified: false };
+        const vbsOutcome = evaluatePasteOutcome({ method: "vbs_paste", ok: check.ok, stdout: check.stdout });
+        if (vbsOutcome.success) {
+          traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: vbsOutcome.reason, verified: vbsOutcome.verified });
+          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
+          return { ok: true, reason: vbsOutcome.reason || "OK:vbs-paste", method: "vbs_paste", verified: vbsOutcome.verified };
         }
-        lastReason = (check.stderr || check.stdout || "vbs-failed").trim();
+        lastReason = (check.stderr || vbsOutcome.reason || "vbs-failed").trim();
       } catch (e) {
         try { fs.unlinkSync(vbsPath); } catch { }
         lastReason = `vbs-error: ${e?.message || e}`;
@@ -4121,7 +4365,13 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       // — otherwise SendKeys fires at whatever has focus when the
       // hotkey was pressed (often Transcriptor itself), and the
       // text lands in the wrong window.
-      if (attempt === 2) {
+      //
+      // Runs right after EVERY VBS failure now (BUGS_AUDIT §6.4), not
+      // only when attempt === 2. Gating it to the last attempt meant a
+      // VBS failure on attempt 0 paid for two more full VBS timeouts
+      // before this — the actually-different fallback method — ever
+      // ran, which is most of how the retry ladder reached ~30 s.
+      {
         const pidNum = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
         const safePid = (Number.isFinite(pidNum) && pidNum > 0 && pidNum < 2 ** 31) ? Math.trunc(pidNum) : 0;
         const safeHwnd = normalizeWindowsHwnd(effectiveTarget.hwnd || "");
@@ -4150,12 +4400,13 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
         ) : "";
         const pwshSimple = `${activateBlock}Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
         const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], { timeoutMs: 3000 });
-        if (fallback.ok && (fallback.stdout || "").includes("OK:")) {
-          traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1 });
-          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:pwsh_fallback");
-          return { ok: true, reason: "OK:pwsh_paste_fallback", method: "pwsh_paste_fallback", verified: false };
+        const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
+        if (pwshOutcome.success) {
+          traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
+          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
+          return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
         }
-        lastReason = (fallback.stderr || fallback.stdout || "pwsh-fallback-failed").trim();
+        lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
       }
     }
   } else if (process.platform === "linux") {
@@ -4257,11 +4508,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
           code: res.code,
           stderr: compactLogText(res.stderr),
         });
-        if (res.ok) {
+        const linuxOutcome = evaluatePasteOutcome({ method: a.method, ok: res.ok, stdout: res.stdout });
+        if (linuxOutcome.success) {
           methodOk = true;
-          traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: false });
-          scheduleSmartClipboardRestore(savedClipboard, text, `paste:clipboardRestore:${a.method}`);
-          return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: false };
+          traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: linuxOutcome.verified });
+          scheduleSmartClipboardRestore(savedClipboard, text, `paste:clipboardRestore:${a.method}`, linuxOutcome.verified);
+          return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: linuxOutcome.verified };
         }
         lastPasteErr = (res.stderr || res.stdout || `${a.method}-failed`).trim();
       }
@@ -4280,7 +4532,15 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     traceStep(trace, "method_begin", { method: "robust_paste", attempt: attempt + 1 });
 
     const cmdStarted = Date.now();
-    const check = await runCommand("osascript", ["-e", robustPasteScript], { timeoutMs: 3200 });
+    // 4200 ms (was 3200): the script now takes up to two AX-verification
+    // reads (axFocusedValueLength, before and after the paste), each
+    // individually bounded to 0.5 s via ``with timeout of 0.5 second``.
+    // The extra 1000 ms (2 x 0.5 s) covers that worst case on top of the
+    // previous budget; the reads themselves are typically single-digit
+    // ms, so a paste that used to take ~270 ms is not pushed toward a
+    // multi-second wait by this bound — only a genuinely hung AX read
+    // (the measured Finder hang the timeout guards against) is.
+    const check = await runCommand("osascript", ["-e", robustPasteScript], { timeoutMs: 4200 });
 
     traceStep(trace, "method_result", {
       method: "robust_paste",
@@ -4301,12 +4561,14 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
 
     if (check.ok) {
       const out = (check.stdout || "").trim();
-      if (out.startsWith("OK:")) {
-        logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out });
-        traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: false });
-        // Restore previous clipboard cleanly since paste was successful
-        scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste");
-        return { ok: true, reason: out, method: "robust_paste", verified: false };
+      const macOutcome = evaluatePasteOutcome({ method: "robust_paste", ok: check.ok, stdout: check.stdout });
+      if (macOutcome.success) {
+        logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified });
+        traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified });
+        // Restore previous clipboard only when the paste was verified —
+        // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
+        scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
+        return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
       }
       if (out === "ERR:secure-field") {
         traceEnd(trace, "failed", { reason: "secure-field" });
@@ -4388,10 +4650,15 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
   });
   if (menuRes.ok) {
     const out = String(menuRes.stdout || "").trim();
-    if (out.startsWith("OK:")) {
-      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:menu");
-      traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: false });
-      return { ok: true, reason: out, method: "menu-paste", verified: false };
+    const menuOutcome = evaluatePasteOutcome({ method: "menu-paste", ok: menuRes.ok, stdout: menuRes.stdout });
+    if (menuOutcome.success) {
+      // This fallback script has no AX-verification suffix (unlike
+      // robust_paste's menu-paste-primary/robust-paste branches), so
+      // verified is always false here — the restore gate correctly
+      // leaves the transcript on the clipboard rather than restoring.
+      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:menu", menuOutcome.verified);
+      traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: menuOutcome.verified });
+      return { ok: true, reason: out, method: "menu-paste", verified: menuOutcome.verified };
     }
     if (out === "ERR:no-accessibility") {
       lastReason = out;
@@ -4983,7 +5250,18 @@ async function processPostStopTask(task) {
     if (terminalWithoutPasteStatus) {
       recordingStatusText = terminalWithoutPasteStatus;
     } else {
+      // BUGS_AUDIT §6.9: the poll deadline expired with no ready signal
+      // at all — previously this branch did nothing (no clipboard write,
+      // no last_transcript.json, no status naming a way out), so a slow
+      // recovery that finished moments later was invisible: the user's
+      // only feedback was "Saved To App" with nothing actually pasted or
+      // copied, and no way to tell that pressing the paste-last hotkey
+      // would help. Recover whatever text the renderer or disk already
+      // has through the same lookup the paste-last hotkey itself uses
+      // (getLatestTranscriptText), so a transcript that exists is never
+      // silently dropped just because this poll gave up on it.
       traceStep(trace, "transcript_missing", { reason: "no-final-or-live-text-before-deadline" });
+      recordingStatusText = await handlePostStopTranscriptTimeout(trace);
     }
   }
 
@@ -4995,6 +5273,42 @@ async function processPostStopTask(task) {
   return {
     dwellMs: isRecNow ? 0 : RECORDING_STATUS_TERMINAL_DWELL_MS,
   };
+}
+
+/**
+ * BUGS_AUDIT §6.9 recovery path: called only when processPostStopTask's
+ * poll deadline expired without any ready signal — no finished record,
+ * no ui-final transcript, nothing terminal to report. Reuses
+ * getLatestTranscriptText (the same lookup pasteLatestTranscriptFromShortcut
+ * uses for the paste-last hotkey — finishedText, then a ui-final
+ * transcript, then the in-memory/disk fallback) so recovery here can
+ * never drift out of sync with what that hotkey would find.
+ *
+ * If something is found: write it to the clipboard (getLatestTranscriptText
+ * already persists it to last_transcript.json) and return a status that
+ * names the paste-last accelerator, so the user has a concrete next
+ * action instead of a dead-end "Saved To App".
+ *
+ * If nothing is found: there is nothing to recover — the recording
+ * genuinely produced no text before the deadline — so the status says
+ * that plainly instead of pointing at a hotkey that would also find
+ * nothing.
+ */
+async function handlePostStopTranscriptTimeout(trace) {
+  const recovered = await getLatestTranscriptText();
+  const pasteAccel = lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "";
+  if (isMeaningfulTranscriptText(recovered)) {
+    try { clipboard.writeText(recovered); } catch { }
+    traceStep(trace, "transcript_recovered_after_timeout", {
+      len: recovered.length,
+      digest: textDigest(recovered),
+    });
+    return pasteAccel
+      ? `Timed out, but transcript is on your clipboard — press ${pasteAccel} to paste it.`
+      : "Timed out, but transcript is on your clipboard.";
+  }
+  traceStep(trace, "transcript_unrecoverable_after_timeout", {});
+  return "Timed out with no transcript to recover.";
 }
 
 async function getLatestTranscriptText() {
@@ -7763,6 +8077,7 @@ app.whenReady().then(async () => {
     const defaults = shortcutDefaultsForPlatform();
     const legacy = shortcutDefaultsManifest?.legacy || {};
     const legacyMacPair = legacy.macFunctionPair || {};
+    const legacyWinLinuxPair = legacy.winLinuxFunctionPair || {};
     try {
       const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
       const cfgPath = path.join(dataDir, "config.json");
@@ -7796,6 +8111,24 @@ app.whenReady().then(async () => {
         if (paste === String(legacy.unpressablePaste || "")) {
           paste = defaults.paste;
           appendMainLog(`[shortcuts] migrated stale ${legacy.unpressablePaste} → ${paste}`);
+        }
+        // Migration 3 (BUGS_AUDIT §6.10): a Windows/Linux config still
+        // carrying the old F9/F10 default. F10 is the Win32
+        // menu-mnemonic-activation key and F9/F10 are debugger run/step
+        // keys in Visual Studio, VS Code and JetBrains IDEs — the OS or
+        // the focused app can act on the keypress even though
+        // globalShortcut.register("F9") itself returns true, so the
+        // hotkey looks registered but does something else (or nothing
+        // Transcriptor-related) when pressed. Same shape as migration 1,
+        // mirrored for the non-Mac default.
+        if (
+          process.platform !== "darwin" &&
+          record === String(legacyWinLinuxPair.record || "") &&
+          paste === String(legacyWinLinuxPair.paste || "")
+        ) {
+          record = defaults.record;
+          paste = defaults.paste;
+          appendMainLog(`[shortcuts] migrated stale ${legacyWinLinuxPair.record}/${legacyWinLinuxPair.paste} → ${record}/${paste} on ${process.platform}`);
         }
         return { record, paste };
       }
@@ -7930,8 +8263,13 @@ app.whenReady().then(async () => {
     if (recordResult.ok) {
       registeredRecordHotkey = shortcuts.record;
     } else {
+      // WARN: a failed registration is silent otherwise — the app
+      // looks like it started fine and the hotkey simply never fires.
+      // The status object built below (and replayed via did-finish-load,
+      // see the comment at its declaration) is what actually surfaces
+      // this to the renderer/Settings UI.
       appendMainLog(
-        `[app] failed to register recording shortcut: ${shortcuts.record} (${recordResult.error})`,
+        `[shortcuts] WARN: failed to register recording shortcut: ${shortcuts.record} (${recordResult.error})`,
       );
     }
 
@@ -7945,7 +8283,7 @@ app.whenReady().then(async () => {
       registeredPasteHotkey = shortcuts.paste;
     } else {
       appendMainLog(
-        `[app] failed to register paste-last shortcut: ${shortcuts.paste} (${pasteResult.error})`,
+        `[shortcuts] WARN: failed to register paste-last shortcut: ${shortcuts.paste} (${pasteResult.error})`,
       );
     }
 
