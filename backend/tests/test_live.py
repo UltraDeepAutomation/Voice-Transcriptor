@@ -454,8 +454,11 @@ class DeepgramLivePreconnectBufferTests(IsolatedBackendMainImportMixin, unittest
         self.assertEqual(len(created_sessions), 1)
         # Buffered-during-connect frames must reach Deepgram in the same
         # order the renderer sent them — replaying out of order would
-        # shift every word timing that follows.
-        self.assertEqual(created_sessions[0].sent_pcm, [b"AAAA", b"BBBB"])
+        # shift every word timing that follows. The sender batches
+        # frames into ~50 ms writes (audit §3.6), so what is pinned is
+        # the byte stream, not the framing: a stream this short goes out
+        # as one partial batch.
+        self.assertEqual(b"".join(created_sessions[0].sent_pcm), b"AAAABBBB")
 
 
 class DeepgramLiveFinalizeDrainTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):

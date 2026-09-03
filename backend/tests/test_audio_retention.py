@@ -3,7 +3,9 @@
 The rule the user asked for, and what these tests pin:
 
   Live Capsule   — voice notes dictated all day. Keep the audio of the
-                   newest 3 takes; older audio goes.
+                   newest 100 takes; older audio goes. (Was 3, which
+                   deleted a day's evidence within hours — see the
+                   policy table in backend/main.py.)
   Uploaded Media — the track extracted from a file the user brought in.
                    Keep it for 7 days regardless of how many there are.
   Transcripts    — never deleted, at any age or count, anywhere.
@@ -83,6 +85,28 @@ class AudioRetentionTestBase(unittest.TestCase):
         os.utime(audio, (stamp, stamp))
         return audio
 
+    def _set_live_keep(self, count: int) -> None:
+        """Point the LIVE policy at a small count for a sweep test.
+
+        The sweep reads the policy TABLE (that is the thing under test
+        here), so a mechanism test bends the table rather than creating
+        a hundred files. Each test imports its own module instance, so
+        this cannot leak.
+        """
+        self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_LIVE] = (
+            self._keep(count)
+        )
+
+    def _keep(self, count: int):
+        """A count-only policy, for tests about the count MECHANISM.
+
+        The default count lives in one assertion (PolicyTableTests); the
+        rules that operate on it are exercised with a small explicit
+        value so a change to the default does not need dozens of files
+        created to observe them.
+        """
+        return self.main.AudioRetentionPolicy(max_items=count)
+
     def _surviving_audio(self, directory: Path) -> set[str]:
         return {
             p.name
@@ -94,9 +118,9 @@ class AudioRetentionTestBase(unittest.TestCase):
 class PolicyTableTests(AudioRetentionTestBase):
     """The declarative SSOT itself."""
 
-    def test_live_keeps_the_newest_three_and_has_no_age_limit(self) -> None:
+    def test_live_keeps_the_newest_hundred_and_has_no_age_limit(self) -> None:
         policy = self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_LIVE]
-        self.assertEqual(policy.max_items, 3)
+        self.assertEqual(policy.max_items, 100)
         self.assertEqual(policy.max_age_sec, 0)
         self.assertTrue(policy.enabled)
 
@@ -140,11 +164,17 @@ class PolicyTableTests(AudioRetentionTestBase):
 class LiveCollectionCountTests(AudioRetentionTestBase):
     """Voice notes: keep the newest N audio files."""
 
-    def test_keeps_exactly_the_newest_three(self) -> None:
+    def test_keeps_exactly_the_newest_n(self) -> None:
+        # The count rule itself, exercised with an explicit policy: the
+        # DEFAULT count is asserted once, in PolicyTableTests, so raising
+        # it does not need every mechanism test rewritten around the new
+        # number.
         for i in range(1, 8):  # Take1 newest … Take7 oldest
             self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
 
-        deleted = self.main._prune_recording_audio(self.live_dir, now=NOW)
+        deleted = self.main._prune_recording_audio(
+            self.live_dir, now=NOW, policy=self._keep(3)
+        )
 
         self.assertEqual(deleted, 4)
         self.assertEqual(
@@ -156,7 +186,7 @@ class LiveCollectionCountTests(AudioRetentionTestBase):
         for i in range(1, 8):
             self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
 
-        self.main._prune_recording_audio(self.live_dir, now=NOW)
+        self.main._prune_recording_audio(self.live_dir, now=NOW, policy=self._keep(3))
 
         for i in range(1, 8):
             self.assertTrue((self.live_dir / f"Take{i}.txt").exists(), f"Take{i}.txt")
@@ -189,7 +219,7 @@ class LiveCollectionCountTests(AudioRetentionTestBase):
             self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
 
         deleted = self.main._prune_recording_audio(
-            self.live_dir, keep_stems=("Fresh",), now=NOW
+            self.live_dir, keep_stems=("Fresh",), now=NOW, policy=self._keep(3)
         )
 
         self.assertEqual(deleted, 2)
@@ -206,7 +236,7 @@ class LiveCollectionCountTests(AudioRetentionTestBase):
             self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
 
         self.main._prune_recording_audio(
-            self.live_dir, keep_stems=("Skewed",), now=NOW
+            self.live_dir, keep_stems=("Skewed",), now=NOW, policy=self._keep(3)
         )
 
         self.assertTrue(skewed.exists())
@@ -215,7 +245,7 @@ class LiveCollectionCountTests(AudioRetentionTestBase):
         for name in ("alpha", "bravo", "charlie", "delta", "echo"):
             self._recording(name, age_sec=MINUTE, directory=self.live_dir)
 
-        self.main._prune_recording_audio(self.live_dir, now=NOW)
+        self.main._prune_recording_audio(self.live_dir, now=NOW, policy=self._keep(3))
 
         # Descending name order among equal mtimes → e, d, c survive.
         self.assertEqual(
@@ -348,6 +378,7 @@ class SweepFanOutTests(AudioRetentionTestBase):
 
     def test_sweep_applies_the_matching_policy_per_collection(self) -> None:
         # Live: 5 recent takes → newest 3 survive.
+        self._set_live_keep(3)
         for i in range(1, 6):
             self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
         # Uploads: one stale, one fresh — count is irrelevant here.
@@ -373,6 +404,7 @@ class SweepFanOutTests(AudioRetentionTestBase):
         self.assertTrue((self.uploads_dir / "OldClip.txt").exists())
 
     def test_sweep_is_idempotent(self) -> None:
+        self._set_live_keep(3)
         for i in range(1, 6):
             self._recording(f"Take{i}", age_sec=i * MINUTE, directory=self.live_dir)
 

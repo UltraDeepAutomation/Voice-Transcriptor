@@ -6,6 +6,7 @@ import {
   countWords,
   stemKey,
   tokensInOrder,
+  tokensInOrderAtTail,
 } from "../src/text-match";
 
 describe("text-match SSOT primitives", () => {
@@ -75,5 +76,42 @@ describe("stemKey + tokensInOrder — interim re-statement guard", () => {
     const base = normalizeWords("один два").map(stemKey);
     expect(tokensInOrder(base, [])).toBe(true);
     expect(tokensInOrder(base, ["один", "два", "три"])).toBe(false);
+  });
+
+  describe("tokensInOrderAtTail", () => {
+    const stems = (text: string): string[] => normalizeWords(text).map(stemKey);
+
+    it("matches a re-statement of the haystack's own tail", () => {
+      expect(
+        tokensInOrderAtTail(
+          stems("именно обратил внимание на визуальную часть"),
+          stems("обратил внимание на визуальное"),
+          2,
+        ),
+      ).toBe(true);
+    });
+
+    it("refuses a match that ends too far from the tail", () => {
+      // Same words, but four haystack words follow them: the speaker
+      // moved on, so this is a repeat, not a re-decode of the seam.
+      expect(
+        tokensInOrderAtTail(
+          stems("сначала повтори это ещё раз потом сделай это снова"),
+          stems("повтори это ещё раз"),
+          2,
+        ),
+      ).toBe(false);
+    });
+
+    it("tolerates the allowed number of trailing words", () => {
+      expect(tokensInOrderAtTail(stems("один два три четыре"), stems("один два"), 2)).toBe(true);
+      expect(tokensInOrderAtTail(stems("один два три четыре"), stems("один два"), 1)).toBe(false);
+    });
+
+    it("still requires order and full containment", () => {
+      expect(tokensInOrderAtTail(stems("первый второй третий"), stems("третий первый"), 5)).toBe(false);
+      expect(tokensInOrderAtTail(stems("один два"), stems("один два три"), 5)).toBe(false);
+      expect(tokensInOrderAtTail(stems("один два"), [], 0)).toBe(true);
+    });
   });
 });

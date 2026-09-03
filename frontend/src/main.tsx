@@ -6,6 +6,11 @@ import {
   type MicHealthState,
 } from "./mic-health";
 import {
+  createCaptureLevel,
+  observeCaptureFrame,
+  summarizeCaptureLevel,
+} from "./audio-levels";
+import {
   decideDeadStreamRecovery,
   decideLiveTranscriptAdoption,
   type LiveCoverageReport as LiveCoverage,
@@ -46,7 +51,12 @@ import {
   textFromEnvelope,
   unionTranscripts,
 } from "./transcript-merge";
-import { composeCanonicalLiveSourceText } from "./live-source";
+import {
+  boundRecoveredTail,
+  composeCanonicalLiveSourceText,
+  mergeInterim,
+  uncoveredInterimTail,
+} from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
 
 declare global {
@@ -583,6 +593,34 @@ declare global {
       getStatus: () => Promise<EngineInstallStatus>;
       install: () => Promise<EngineInstallStatus & { ok?: boolean; status?: string }>;
     };
+    /**
+     * Recording-output bridge (Electron preload → main). Absent in
+     * browser dev preview — every consumer must feature-check.
+     *
+     * The main process used to learn that a transcript was ready by
+     * injecting ``executeJavaScript`` into this renderer every 30 ms for
+     * up to 32 s — up to a thousand synchronous evaluations landing
+     * exactly while the renderer finalizes Deepgram, runs the paste
+     * upscale and serialises audio (BUGS_AUDIT_2026-09-03 §6.7). This
+     * says it once, when it happens.
+     *
+     * ``final`` is the explicit finality flag §6.8 asked for: the same
+     * recording publishes provisional text (pre-upscale, a status, an
+     * error) and then, if it produces one, the paste-ready transcript.
+     * Only the latter carries ``final: true``. Without the flag the
+     * main process could not tell them apart and pasted whichever
+     * arrived before its deadline — one recording, two possible
+     * results. ``source`` is a free-form label for the main process's
+     * trace log and carries the publishing phase.
+     */
+    transcriptor?: {
+      recordingFinal?: (payload: {
+        recordingId: number;
+        text: string;
+        final: boolean;
+        source: string;
+      }) => boolean;
+    };
   }
 }
 
@@ -757,7 +795,25 @@ const UI_TOKENS = {
     livePasteReadyTimeoutMs: 3_000,
   },
   capture: {
-    fallbackInitDelayMs: 1_300,
+    /**
+     * Start the ScriptProcessor fallback ALONGSIDE the worklet, held
+     * back, instead of waiting to find out whether the worklet works.
+     *
+     * The watchdog this replaces armed nothing for 1.3 s and only then
+     * asked whether any frame had arrived: on the one host where it
+     * fired (2026-08-31 21:12) the first 1.3 s of the recording did not
+     * exist, and for a moment both capture paths were connected and
+     * every sample was captured twice (BUGS_AUDIT_2026-09-03 §4.5). The
+     * pre-armed fallback buffers from the first buffer period and
+     * commits only if the worklet has produced nothing by then; the
+     * worklet's first frame disposes of it. Exactly one path is ever
+     * committed, and neither window exists.
+     *
+     * Off: the fallback is only constructed when the worklet cannot be,
+     * and a worklet that connects but never delivers is left to the
+     * pipeline failsafe. A kill switch, not a second behaviour.
+     */
+    preArmScriptProcessorFallback: true,
     vuAmplify: 4,
     /**
      * Shortest recording that is kept. Below it the press is treated as
@@ -794,7 +850,6 @@ const UI_TOKENS = {
   },
   drain: {
     maxWaitMs: 450,
-    idleMs: 120,
     pollStepMs: 30,
   },
 } as const;
@@ -4121,12 +4176,28 @@ async function transcribeCanonicalAudioLocally(
   });
 }
 
+/**
+ * Ask the backend to load a local model before it is needed.
+ *
+ * A warm that cannot happen is not a failure. The backend answers
+ * ``200 {ok:false, state:"offline"}`` when the weights are not on disk
+ * and the network cannot fetch them — the exact situation the offline
+ * transition creates, since going offline is what makes the local
+ * engine the effective one in the first place. That is an answer, not
+ * an error: it returns quietly, and the caller neither retries nor
+ * logs (BUGS_AUDIT_2026-09-03 §7, where the same case arrived five
+ * times as a 500 with an httpx traceback).
+ */
 async function warmLocalModel(model: string): Promise<void> {
   const resolvedModel = (model || "").trim() || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
   const fd = new FormData();
   fd.set("model", resolvedModel);
   const r = await fetch("/api/transcribe/warmup", { method: "POST", body: fd, headers: authHeaders() });
   if (!r.ok) throw new Error(await parseError(r));
+  const body = await r.json().catch(() => null) as { ok?: unknown; state?: unknown } | null;
+  if (body && body.ok === false && body.state !== "offline") {
+    throw new Error(String(body.state || "local model warmup declined"));
+  }
 }
 
 async function discardLiveRecovery(sessionId: string): Promise<void> {
@@ -4227,9 +4298,10 @@ function resolveLivePreviewLocalModel(model: string): string {
 function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalModel: string; finalLocalModel: string } {
   const configuredLocalModel = selectedLocalModel();
   const finalLocalModel = configuredLocalModel || DEFAULT_LOCAL_TRANSCRIPTION_MODEL;
-  const effectiveProvider = resolveEffectiveProvider(selectedProvider);
   return {
-    assistLocalModel: effectiveProvider === "local" ? resolveFastLiveLocalModel(configuredLocalModel) : resolveLivePreviewLocalModel(configuredLocalModel),
+    assistLocalModel: localEngineInUse(selectedProvider)
+      ? resolveFastLiveLocalModel(configuredLocalModel)
+      : resolveLivePreviewLocalModel(configuredLocalModel),
     finalLocalModel,
   };
 }
@@ -4268,17 +4340,22 @@ function getCanonicalLiveSourceText(): string {
   // the time stopLive reads this function, the tail word is gone.
   //
   // ``lastInterimSnapshot`` preserves the interim text from just
-  // before the last clear. We merge BOTH:
+  // before the last clear. We merge ALL THREE:
   //   1. Current ``liveInterimText`` (if Deepgram sent a fresh interim
   //      after the last is_final)
   //   2. ``lastInterimSnapshot`` (the interim just before the last
   //      is_final wiped it)
+  //   3. ``recoveredTailSnapshot`` — the same reconciliation done for
+  //      EVERY earlier final, not just the last one. Both snapshots
+  //      above describe one commit; a word dropped by final N is gone
+  //      from them the moment final N+1 lands (§4.1).
   //
   // Deduplication: if an interim is already represented in committed
   // text, skip it; if it overlaps at the boundary, append only the new
   // tail words.
   return composeCanonicalLiveSourceText(
     liveDraftText,
+    recoveredTailSnapshot,
     liveInterimText,
     lastInterimSnapshot,
   );
@@ -4301,13 +4378,14 @@ function scheduleLocalWarmup(): void {
   // exclusively through Deepgram or OpenRouter still loaded
   // faster-whisper into the backend — ~700 MB resident and 5-16 s of
   // CPU per launch for weights that were never asked to transcribe
-  // anything. ``resolveEffectiveProvider`` already collapses to
+  // anything. ``localEngineInUse`` — the same predicate the session,
+  // the upload path and the model resolver read — already collapses to
   // "local" for the two cases where a local engine IS reached:
   // no/unusable remote key, and remote unreachable (offline). Both
   // transitions re-enter this function via ``setTranscriptionSelection``
   // and ``refreshNetworkState``, so the warm still happens ahead of the
   // first local window — just not before we know we need it.
-  if (resolveEffectiveProvider(selectedProvider) !== "local") return;
+  if (!localEngineInUse(selectedProvider)) return;
   const sessionModels = resolveSessionLocalModels(selectedProvider);
   const modelsToWarm = new Set<string>([
     sessionModels.assistLocalModel,
@@ -4398,6 +4476,22 @@ function resolveEffectiveProvider(preferred: Provider): Provider {
   if (!isProviderKeyConfigured(preferred)) return "local";
   if (isRemoteProviderReachable(preferred)) return preferred;
   return "local";
+}
+
+/**
+ * The one predicate for "this selection reaches the local engine".
+ *
+ * Every place that has to know — whether to warm faster-whisper, which
+ * model a session will load, which engine an upload will run on — asks
+ * this. It used to be re-derived: ``resolveEffectiveUploadProvider``
+ * was a second copy of ``resolveEffectiveProvider`` with the same four
+ * rules in the same order, and the warmup asked its own version of the
+ * question. Two copies of "is the local engine in use" is how a user
+ * transcribing exclusively through an API ends up loading a 700 MB
+ * model (BUGS_AUDIT_2026-09-03 §7).
+ */
+function localEngineInUse(preferred: Provider): boolean {
+  return !!preferred && resolveEffectiveProvider(preferred) === "local";
 }
 
 function localFallbackReason(preferred: Provider): string {
@@ -4582,13 +4676,29 @@ const PIPELINE_FAILSAFE_MS = 10_000;
  * noise suppression are tuned for conferencing: both attenuate a quiet
  * source and gate low-energy speech, which shows up as "the recording is
  * too quiet" and as clipped words at the start and end of a phrase.
- * Automatic gain control is kept enabled because it lifts a quiet source
- * rather than cutting it.
+ *
+ * Automatic gain control is off for the same reason, and the reason is
+ * measured, not assumed (BUGS_AUDIT_2026-09-03 §4.3): all three
+ * recordings captured on 2026-09-03 start at a peak of 0 dBFS — 1.00 in
+ * consecutive 100 ms windows — with an RMS of −7 dB. A crest factor of
+ * 7 dB where speech normally shows 12–18 dB is a signal held in a
+ * limiter: the AGC opens at maximum gain, the first words are recorded
+ * in clip, and over the next five to ten seconds the gain slides back
+ * 10–15 dB and never returns. A recording made in June, before the same
+ * code path was reached, sat at −24 dB throughout. Nothing in the
+ * renderer applies gain of its own — ``pushCapturedFrame``,
+ * ``downsample`` and the worklet were checked — so the level the file
+ * carries is the level the browser chose.
+ *
+ * There is no normaliser in its place. The PCM the WAV and the live
+ * socket carry stays exactly what the device delivered; the code that
+ * has to tell speech from silence measures the session's own level
+ * instead of comparing it against a constant (see ./audio-levels).
  */
 const DICTATION_AUDIO_PROCESSING = {
   echoCancellation: false,
   noiseSuppression: false,
-  autoGainControl: true,
+  autoGainControl: false,
 } as const;
 
 function micCaptureConstraints(deviceId: string): MediaStreamConstraints {
@@ -8011,13 +8121,28 @@ let timer: number | null = null;
 let vuIntervalId: ReturnType<typeof setInterval> | null = null;
 let pipelineFailsafeId: ReturnType<typeof setTimeout> | null = null;
 let startAt = 0;
+/**
+ * When the renderer was ASKED to record — the hotkey press or the
+ * toggle, as received, before any device is opened.
+ *
+ * Distinct from ``startAt`` (the first captured frame) on purpose:
+ * ``getUserMedia`` + AudioContext + first frame measured 82 + 33 + 172
+ * ms on 2026-09-03, so the two clocks are ~310 ms apart
+ * (BUGS_AUDIT_2026-09-03 §4.7/§4.9). ``startAt`` remains the clock for
+ * everything the user is shown — the elapsed timer, the saved
+ * ``started_at``, the duration of the audio that exists — because that
+ * is what the recording actually contains.
+ */
+let startRequestedAt = 0;
 
 /**
  * Is the recording in progress too short to be one?
  *
- * The clock is ``startAt`` — the first captured audio frame — so this is
- * the duration of AUDIO, not of the hotkey being held, and a session
- * that never produced a frame answers true.
+ * The clock is the moment the renderer was asked to record, not the
+ * first captured frame. Measuring from the first frame silently added
+ * the ~310 ms of device start-up to the threshold: a 500 ms minimum
+ * became ~810 ms of held hotkey, and a one-word dictation ("да",
+ * "стоп") was discarded as a mis-press (§4.9).
  *
  * Exported on ``window`` because the main process asks the same question
  * before it queues any post-stop work: one clock, one threshold, one
@@ -8027,7 +8152,8 @@ let startAt = 0;
  */
 function recordingIsTooShortToKeep(): boolean {
   if (!isRecording) return false;
-  const elapsedMs = startAt > 0 ? Date.now() - startAt : 0;
+  const clock = startRequestedAt > 0 ? startRequestedAt : startAt;
+  const elapsedMs = clock > 0 ? Date.now() - clock : 0;
   return elapsedMs < UI_TOKENS.capture.minRecordingMs;
 }
 window.__transcriptorRecordingTooShort = recordingIsTooShortToKeep;
@@ -8041,14 +8167,43 @@ window.__transcriptorRecordingTooShort = recordingIsTooShortToKeep;
 let pcmSink: PcmSink | null = null;
 let draftSaveTimer: number | null = null;
 let workletLastFrameAt = 0;
-let fallbackCaptureTimer: number | null = null;
-let captureFrameCount = 0;
-// Running sum of squared per-frame RMS. Average RMS over a session is
-// the square root of the mean of the SQUARED sample-level RMS — not the
-// mean of the per-frame RMS (which systematically underestimates energy
-// in dynamic audio and inflates false-silence classification).
-let captureRmsSqAccum = 0;
-let capturePeakMax = 0;
+/**
+ * Frames the pre-armed ScriptProcessor has captured while the worklet
+ * was still being given the chance to prove itself, and which of the
+ * three states that fallback is in.
+ *
+ * "armed"     — connected, capturing into ``scriptFallbackPending``,
+ *               delivering nothing;
+ * "committed" — this IS the capture path; frames go straight through;
+ * "off"       — not connected, or disposed of because the worklet
+ *               delivered first.
+ */
+type ScriptFallbackState = "off" | "armed" | "committed";
+let scriptFallbackState: ScriptFallbackState = "off";
+let scriptFallbackPending: Float32Array[] = [];
+/**
+ * One buffer period of whichever capture node is delivering, in ms.
+ *
+ * Measured from the frames themselves rather than assumed, so it is
+ * right for the worklet's batch size and for the ScriptProcessor's
+ * buffer without either having to declare it. This is the unit the stop
+ * barrier is expressed in: "everything the device had handed us has
+ * been handed on" is one buffer period plus one delivered frame, not a
+ * guess about how long silence takes to appear.
+ */
+let captureBufferPeriodMs = 0;
+/**
+ * ScriptProcessor buffer size. 4096 samples is ~85 ms at 48 kHz: long
+ * enough that main-thread jitter cannot drop audio, short enough that
+ * the arbitration between it and the worklet happens within a tenth of
+ * a second of the recording starting.
+ */
+const SCRIPT_PROCESSOR_BUFFER_SAMPLES = 4096;
+// The session's own measured level. Every "is this speech or silence?"
+// question the capture path asks is answered against it and never
+// against a constant amplitude (./audio-levels, BUGS_AUDIT_2026-09-03
+// §4.3).
+let captureLevel = createCaptureLevel();
 let capturePcmSampleCount = 0;
 let captureLastActivePcmSample = 0;
 let liveDraftText = "";
@@ -8125,42 +8280,106 @@ function detachWorkletCapture(reason: string): void {
   resolvePendingWorkletFlushes();
 }
 
+function teardownScriptProcessorCapture(): void {
+  try {
+    if (src && scriptNode) src.disconnect(scriptNode);
+  } catch { /* best effort */ }
+  try { scriptNode?.disconnect(); } catch { /* best effort */ }
+  try { scriptSinkGain?.disconnect(); } catch { /* best effort */ }
+  if (scriptNode) scriptNode.onaudioprocess = null;
+  scriptNode = null;
+  scriptSinkGain = null;
+  scriptFallbackState = "off";
+  scriptFallbackPending = [];
+}
+
+/**
+ * The worklet has delivered. Throw the pre-armed fallback away —
+ * including everything it captured, which is the same audio the worklet
+ * already delivered, and which double-counts if it is committed too.
+ */
+function disarmPreArmedFallback(): void {
+  if (scriptFallbackState !== "armed") return;
+  teardownScriptProcessorCapture();
+}
+
+/**
+ * The worklet has not delivered by the time the fallback's first buffer
+ * arrived, so the fallback becomes the capture path — including
+ * everything it captured while it was waiting to find out. That is the
+ * blind window closing: the audio from the start of the recording is
+ * still here.
+ */
+function commitPreArmedFallback(): void {
+  if (scriptFallbackState !== "armed") return;
+  scriptFallbackState = "committed";
+  detachWorkletCapture("AudioWorklet connected but delivered no frames");
+  const buffered = scriptFallbackPending;
+  scriptFallbackPending = [];
+  console.warn(
+    `ScriptProcessor fallback committed: AudioWorklet delivered no frames (${buffered.length} buffered frames replayed)`,
+  );
+  showMicFallbackNotice();
+  for (const frame of buffered) pushCapturedFrame(frame);
+}
+
+function showMicFallbackNotice(): void {
+  if (!shouldLivePreview()) return;
+  const cur = liveDraftDisplayText || "";
+  if (cur.includes("[Mic fallback engaged]")) return;
+  setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
+}
+
+/**
+ * Connect the ScriptProcessor capture path.
+ *
+ * ``armed`` connects it as the STANDBY path: it captures into
+ * ``scriptFallbackPending`` and delivers nothing until the first of its
+ * own buffers arrives, at which point exactly one of two things is
+ * true — the worklet has delivered frames (dispose of this) or it has
+ * not (commit this, replaying what it holds). Not armed, it is the
+ * capture path from the first buffer, which is the case where the
+ * worklet could not be constructed at all.
+ */
 function startScriptProcessorCapture(
   localAc: AudioContext,
   localSrc: MediaStreamAudioSourceNode,
   reason: string,
+  armed: boolean,
 ): boolean {
   if (scriptNode) return true;
   try {
-    scriptNode = localAc.createScriptProcessor(4096, 1, 1);
+    scriptNode = localAc.createScriptProcessor(SCRIPT_PROCESSOR_BUFFER_SAMPLES, 1, 1);
     scriptSinkGain = localAc.createGain();
     scriptSinkGain.gain.value = 0;
+    scriptFallbackState = armed ? "armed" : "committed";
+    scriptFallbackPending = [];
     scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
       const ch = ev.inputBuffer.getChannelData(0);
       if (!ch || !ch.length) return;
-      pushCapturedFrame(new Float32Array(ch));
+      const frame = new Float32Array(ch);
+      if (scriptFallbackState !== "armed") {
+        pushCapturedFrame(frame);
+        return;
+      }
+      scriptFallbackPending.push(frame);
+      // Arbitration, decided by evidence rather than by a clock: a
+      // working worklet posts its first batch within a few ms, long
+      // before this buffer completed.
+      if (captureLevel.frames > 0) disarmPreArmedFallback();
+      else commitPreArmedFallback();
     };
     localSrc.connect(scriptNode);
     scriptNode.connect(scriptSinkGain);
     scriptSinkGain.connect(localAc.destination);
-    if (shouldLivePreview()) {
-      const cur = liveDraftDisplayText || "";
-      if (!cur.includes("[Mic fallback engaged]")) {
-        setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
-      }
+    if (!armed) {
+      showMicFallbackNotice();
+      console.warn(`ScriptProcessor fallback engaged: ${reason}`);
     }
-    console.warn(`ScriptProcessor fallback engaged: ${reason}`);
     return true;
   } catch (e) {
     console.warn("ScriptProcessor fallback init failed", e);
-    try {
-      if (scriptNode) localSrc.disconnect(scriptNode);
-    } catch { /* best effort */ }
-    try { scriptNode?.disconnect(); } catch { /* best effort */ }
-    try { scriptSinkGain?.disconnect(); } catch { /* best effort */ }
-    if (scriptNode) scriptNode.onaudioprocess = null;
-    scriptNode = null;
-    scriptSinkGain = null;
+    teardownScriptProcessorCapture();
     return false;
   }
 }
@@ -8202,10 +8421,6 @@ async function releaseOrphanedAudioContext(reason: string): Promise<void> {
 }
 
 async function cleanupCancelledStartCaptureResources(): Promise<void> {
-  if (fallbackCaptureTimer) {
-    clearTimeout(fallbackCaptureTimer);
-    fallbackCaptureTimer = null;
-  }
   if (vuIntervalId) {
     clearInterval(vuIntervalId);
     vuIntervalId = null;
@@ -8215,14 +8430,7 @@ async function cleanupCancelledStartCaptureResources(): Promise<void> {
     pipelineFailsafeId = null;
   }
   detachWorkletCapture("cancelled live start");
-  try {
-    if (src && scriptNode) src.disconnect(scriptNode);
-  } catch { /* best effort */ }
-  try { scriptNode?.disconnect(); } catch { /* best effort */ }
-  try { scriptSinkGain?.disconnect(); } catch { /* best effort */ }
-  if (scriptNode) scriptNode.onaudioprocess = null;
-  scriptNode = null;
-  scriptSinkGain = null;
+  teardownScriptProcessorCapture();
   try { analyser?.disconnect(); } catch { /* best effort */ }
   analyser = null;
   try { src?.disconnect(); } catch { /* best effort */ }
@@ -8259,6 +8467,20 @@ interface LiveTranscriptBuffer {
   segments: TranscriptSegment[];
   committedText: string;
   committedDisplayText: string;
+  /**
+   * What earlier finals did not carry over from their own interims.
+   *
+   * ``lastInterimText`` is a one-slot register: a word heard by interim
+   * N and dropped by final N survives only until final N+1 overwrites
+   * it, and the stop path — which reads this buffer minutes later —
+   * never sees it (BUGS_AUDIT_2026-09-03 §4.1; measured on the 12 s
+   * recording of 2026-09-03, where "субагента" stood in an interim
+   * before the first final and was overwritten twice). Reconciling at
+   * the moment of each commit and keeping the residue here makes it
+   * durable. Bounded by the same window that bounds every other seam
+   * decision (``boundRecoveredTail``).
+   */
+  recoveredTailText: string;
   interimText: string;
   interimSegment: TranscriptSegment | null;
   lastInterimText: string;
@@ -8292,6 +8514,7 @@ function createLiveTranscriptBuffer(wsMode: LiveWsMode): LiveTranscriptBuffer {
     segments: [],
     committedText: "",
     committedDisplayText: "",
+    recoveredTailText: "",
     interimText: "",
     interimSegment: null,
     lastInterimText: "",
@@ -8317,6 +8540,7 @@ function ensureLiveTranscriptBuffer(token: string, wsMode: LiveWsMode): LiveTran
 function canonicalTextFromBuffer(buffer: LiveTranscriptBuffer): string {
   return composeCanonicalLiveSourceText(
     buffer.committedText,
+    buffer.recoveredTailText,
     buffer.interimText,
     buffer.lastInterimText,
   );
@@ -8383,8 +8607,9 @@ function appendSegmentsToBuffer(
     merged.slice(0, prevLen).every((seg, i) => seg === buffer.segments[i]);
 
   buffer.segments = merged;
-  if (buffer.interimText) {
-    buffer.lastInterimText = buffer.interimText;
+  const retiringInterim = buffer.interimText;
+  if (retiringInterim) {
+    buffer.lastInterimText = retiringInterim;
   }
   if (buffer.interimSegment) {
     buffer.lastInterimSegment = buffer.interimSegment;
@@ -8418,6 +8643,21 @@ function appendSegmentsToBuffer(
   }
   buffer.committedText = joinTranscriptSegments(buffer.segments);
   buffer.committedDisplayText = buffer.committedDisplayCache || buffer.committedText;
+
+  // Reconcile the retiring hypothesis against the final that retired it
+  // — with the committed text as it is NOW, which is why this runs last
+  // (BUGS_AUDIT_2026-09-03 §4.1). Whatever this final did not carry
+  // over joins the durable tail; whatever a LATER final has since
+  // covered leaves it, so the field holds exactly the words no
+  // committed segment accounts for and cannot accumulate duplicates of
+  // text that arrived properly a moment later.
+  const carried = uncoveredInterimTail(buffer.committedText, buffer.recoveredTailText);
+  const fresh = retiringInterim
+    ? uncoveredInterimTail(buffer.committedText, retiringInterim)
+    : "";
+  buffer.recoveredTailText = boundRecoveredTail(
+    fresh ? mergeInterim(carried, fresh) : carried,
+  );
 }
 
 function maxSegmentEnd(segments: TranscriptSegment[]): number {
@@ -8439,7 +8679,8 @@ function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
     buffer.segments.length > 0 ||
     !!buffer.committedText.trim() ||
     !!buffer.interimText.trim() ||
-    !!buffer.lastInterimText.trim()
+    !!buffer.lastInterimText.trim() ||
+    !!buffer.recoveredTailText.trim()
   );
 }
 
@@ -8447,6 +8688,7 @@ function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer):
   liveTranscriptSegments = buffer.segments;
   liveInterimText = buffer.interimText;
   lastInterimSnapshot = buffer.lastInterimText;
+  recoveredTailSnapshot = buffer.recoveredTailText;
   setLiveDraftState(buffer.committedText, buffer.committedDisplayText);
 }
 
@@ -8564,6 +8806,12 @@ interface RecordingOutputSignal {
   domText?: string;
   /** Classification of this event for the recording state machine. */
   kind?: RecordingFinalSignalKind;
+  /**
+   * What the renderer is doing at this publish ("upscaling",
+   * "no-speech", …). Rides along in the IPC signal's ``source`` label
+   * so the desktop side can show a phase it used to derive by polling.
+   */
+  phase?: string;
   sessionToken?: string;
 }
 
@@ -8590,7 +8838,8 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   const hasUiFinal = !!kind && !!uiFinalText;
 
   // Channel 1: paste-ready history (only for valid transcripts).
-  if (pasteText && !recordingOutputIsInvalidTranscript(pasteText)) {
+  const isPasteReady = !!pasteText && !recordingOutputIsInvalidTranscript(pasteText);
+  if (isPasteReady) {
     window.__transcriptorLastFinishedText = pasteText;
     window.__transcriptorLastFinishedAt = now;
     window.__transcriptorLastFinishedRecordingId = rid;
@@ -8602,6 +8851,23 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
       next.push({ recordingId: rid, finishedAt: now, text: pasteText });
       window.__transcriptorFinishedRecords = next.slice(-30);
     }
+  }
+
+  // Channel 1b: the same fact, pushed to the Electron main process
+  // instead of waiting to be polled for it (§6.7). Every publish for a
+  // real recording emits one signal — a recording that ends without a
+  // transcript at all still says so, which is how the main process
+  // learns it is terminal without waiting out its deadline. The text on
+  // a non-final signal is whatever the UI is showing; judging it is the
+  // main process's job (it owns the paste decision), and a second
+  // opinion here would be a second policy.
+  if (rid > 0) {
+    window.transcriptor?.recordingFinal?.({
+      recordingId: rid,
+      text: isPasteReady ? pasteText : domText,
+      final: isPasteReady,
+      source: signal.phase ? `${kind || "status"}:${signal.phase}` : (kind || "status"),
+    });
   }
 
   // Channel 2: UI-final signal (always updated so Electron main can track
@@ -8670,6 +8936,7 @@ function publishRecordingFinalSignal(opts: {
   signalText?: string;
   domText?: string;
   kind?: RecordingFinalSignalKind;
+  phase?: string;
   sessionToken?: string;
 }): void {
   publishRecordingOutput({
@@ -8677,6 +8944,7 @@ function publishRecordingFinalSignal(opts: {
     pasteText: opts.signalText,
     domText: opts.domText,
     kind: opts.kind,
+    phase: opts.phase,
     sessionToken: opts.sessionToken,
   });
 }
@@ -8777,6 +9045,12 @@ function setLiveDraftState(text: string, displayText = text): void {
 // and updated when committed segments are projected from that session's
 // LiveTranscriptBuffer into the active preview state.
 let lastInterimSnapshot = "";
+
+// Mirror of the active session buffer's ``recoveredTailText`` — the
+// words earlier finals cut from their own interims. Projected together
+// with the interim snapshot so the active-state view and the session
+// buffer answer the composition question with the same four inputs.
+let recoveredTailSnapshot = "";
 
 /**
  * The stop deadline the backend announced for the current session.
@@ -8952,8 +9226,6 @@ function resetOutputs(): void {
 // gaps without dropping to zero.
 let captureRmsEma = 0;
 const CAPTURE_RMS_EMA_ALPHA = 0.06;
-const CAPTURE_TAIL_ACTIVITY_RMS = 0.003;
-const CAPTURE_TAIL_ACTIVITY_PEAK = 0.045;
 
 function pushCapturedFrame(input: Float32Array): void {
   if (!(input instanceof Float32Array) || !input.length) return;
@@ -8980,6 +9252,9 @@ function pushCapturedFrame(input: Float32Array): void {
     };
   }
   window.__transcriptorLastFrameAt = workletLastFrameAt;
+  if (ac && ac.sampleRate > 0) {
+    captureBufferPeriodMs = (input.length / ac.sampleRate) * 1000;
+  }
   let sum = 0;
   let peak = 0;
   for (let i = 0; i < input.length; i++) {
@@ -8989,9 +9264,7 @@ function pushCapturedFrame(input: Float32Array): void {
     if (a > peak) peak = a;
   }
   const rms = Math.sqrt(sum / input.length);
-  captureFrameCount += 1;
-  captureRmsSqAccum += rms * rms;
-  if (peak > capturePeakMax) capturePeakMax = peak;
+  const frameCarriesSpeech = observeCaptureFrame(captureLevel, rms, peak);
   // Smooth RMS via EMA so the main-process silence detector sees the
   // energy trend over ~120 ms, not a single 2.67 ms micro-window
   // that might happen to land on an inter-syllable gap.
@@ -9005,7 +9278,7 @@ function pushCapturedFrame(input: Float32Array): void {
   const ds = downsample(input, ac.sampleRate, LIVE_SAMPLE_RATE_HZ);
   const frameStartSample = capturePcmSampleCount;
   capturePcmSampleCount += ds.length;
-  if (rms >= CAPTURE_TAIL_ACTIVITY_RMS || peak >= CAPTURE_TAIL_ACTIVITY_PEAK) {
+  if (frameCarriesSpeech) {
     captureLastActivePcmSample = frameStartSample + ds.length;
   }
 
@@ -9137,6 +9410,10 @@ async function startLive(): Promise<void> {
   // Set the in-flight flag synchronously BEFORE any await.
   if (isBusy || stopTransitionInFlight || startLiveInFlight) return;
   startLiveInFlight = true;
+  // The request clock (§4.9). Set before anything can await, so it is
+  // the moment the renderer received the toggle, not the moment the
+  // microphone answered.
+  startRequestedAt = Date.now();
   startT0 = performance.now();
   startTimings = [];
   startFirstFrameSeen = false;
@@ -9205,9 +9482,7 @@ async function startLive(): Promise<void> {
   pcmSink = await createPcmSink(sessionUiToken);
   markStartPhase("pcmSink");
   workletLastFrameAt = 0;
-  captureFrameCount = 0;
-  captureRmsSqAccum = 0;
-  capturePeakMax = 0;
+  captureLevel = createCaptureLevel();
   capturePcmSampleCount = 0;
   captureLastActivePcmSample = 0;
   captureRmsEma = 0;
@@ -9215,6 +9490,8 @@ async function startLive(): Promise<void> {
   // audio; clear it so a new recording never starts with a stale frame.
   resetDownsampleState();
   lastInterimSnapshot = "";
+  recoveredTailSnapshot = "";
+
   wsPendingFrames = [];
   wsPendingFrameSamples = 0;
   wsFramesNeverSent = 0;
@@ -9384,10 +9661,14 @@ async function startLive(): Promise<void> {
           console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
           appendSegmentsToBuffer(sessionBuffer, msg.segments);
           if (isActiveSession) {
+            // No draft write here. Deepgram commits segments several
+            // times a second and this handler runs on the main thread —
+            // the same thread the ScriptProcessor fallback captures on,
+            // where a full text composition plus an IPC write per commit
+            // is exactly what drops audio (BUGS_AUDIT_2026-09-03 §4.5).
+            // The 1.2 s autosave interval started in startLive already
+            // persists the same text from the same buffer.
             projectLiveTranscriptBufferToActiveState(sessionBuffer);
-            if (liveDraftText) {
-              persistLiveDraft(true);
-            }
           }
           return;
         }
@@ -9648,6 +9929,10 @@ async function startLive(): Promise<void> {
         workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
           const msg = ev.data as unknown;
           if (msg instanceof Float32Array) {
+            // The worklet works. Whatever the pre-armed fallback has
+            // captured is this same audio; committing both would double
+            // every sample, so it goes away here and now (§4.5).
+            disarmPreArmedFallback();
             pushCapturedFrame(msg);
             return;
           }
@@ -9675,41 +9960,19 @@ async function startLive(): Promise<void> {
         ac,
         src,
         ac.audioWorklet ? "AudioWorklet init failed" : "AudioWorklet API unavailable",
+        false,
       );
       markStartPhase("scriptProcessorCapture");
       if (!fallbackStarted) {
         throw new Error("Microphone capture is unavailable in this browser runtime.");
       }
-    } else {
-      // Enterprise fallback: if AudioWorklet path is silent/stalled on this host,
-      // switch to ScriptProcessor capture so recording still works.
-      if (fallbackCaptureTimer) {
-        clearTimeout(fallbackCaptureTimer);
-        fallbackCaptureTimer = null;
-      }
-      fallbackCaptureTimer = window.setTimeout(() => {
-        // Capture mutable globals into locals so the compiler (and the
-        // reader) can be sure nothing reassigns them between the null
-        // guard and the dereference. Previously this callback read ``ac``
-        // and ``src`` directly; they are module-level ``let`` variables
-        // that stopLive() nulls out during cleanup, so in principle a
-        // race could crash with a null-dereference. In practice it was
-        // safe because everything below runs synchronously, but making
-        // the snapshot explicit eliminates the class of bug entirely.
-        const localAc = ac;
-        const localSrc = src;
-        if (!localAc || !localSrc || !isRecording) return;
-        const noFrames = captureFrameCount < 3;
-        if (!noFrames) return;
-        const fallbackStarted = startScriptProcessorCapture(
-          localAc,
-          localSrc,
-          "AudioWorklet produced no initial frames",
-        );
-        if (fallbackStarted) {
-          detachWorkletCapture("AudioWorklet no-frame fallback");
-        }
-      }, UI_TOKENS.capture.fallbackInitDelayMs);
+    } else if (UI_TOKENS.capture.preArmScriptProcessorFallback) {
+      // The worklet is connected but has proved nothing yet. Connect the
+      // fallback alongside it, held back: it captures from now — there
+      // is no window in which nothing is capturing — and its own first
+      // buffer decides which of the two is the capture path (§4.5).
+      startScriptProcessorCapture(ac, src, "pre-armed alongside AudioWorklet", true);
+      markStartPhase("scriptProcessorPreArmed");
     }
 
   } catch (e) {
@@ -9732,14 +9995,19 @@ async function startLive(): Promise<void> {
   }
 }
 
-async function waitForWorkletDrain(
+async function waitForCaptureDrain(
+  framesAtStop: number,
   maxWaitMs = UI_TOKENS.drain.maxWaitMs,
-  idleMs = UI_TOKENS.drain.idleMs
 ): Promise<void> {
   const started = Date.now();
+  // One buffer period is how long the capture node can be holding audio
+  // it has not handed over yet; one delivered frame is the proof that
+  // it has. Both are required: the frame alone could be one that was
+  // already in flight when the track stopped, and the period alone
+  // proves nothing about delivery.
+  const periodEndsAt = started + Math.max(1, Math.ceil(captureBufferPeriodMs));
   while (Date.now() - started < maxWaitMs) {
-    const last = workletLastFrameAt || 0;
-    if (!last || Date.now() - last >= idleMs) return;
+    if (captureLevel.frames > framesAtStop && Date.now() >= periodEndsAt) return;
     await new Promise((r) => setTimeout(r, UI_TOKENS.drain.pollStepMs));
   }
 }
@@ -9881,16 +10149,22 @@ async function stopLive(
     likelySilenceWithoutPreview: boolean;
     silentCapture: boolean;
   } => {
-    // True session-level RMS is sqrt(mean of per-frame squared RMS),
-    // not mean of per-frame RMS. Compute this only at decision time:
-    // stopLive drains the worklet after entry, so an early snapshot can
-    // miss the final frames and misclassify a short spoken clip as silence.
-    const avgCaptureRms = captureFrameCount > 0
-      ? Math.sqrt(captureRmsSqAccum / captureFrameCount)
-      : 0;
+    // Summarised only at decision time: stopLive drains the worklet
+    // after entry, so an early snapshot can miss the final frames and
+    // misclassify a short spoken clip as silence.
+    //
+    // Neither verdict compares against a fixed amplitude any more
+    // (BUGS_AUDIT_2026-09-03 §4.3). ``hardSilence`` is digital silence —
+    // a capture pipeline that delivered no signal at all, which is the
+    // only thing a level cannot fake. ``likelySilenceWithoutPreview`` is
+    // "nothing in this session ever rose above the room this session
+    // recorded", which is what the old ``avgRms < 0.003`` was trying to
+    // say and could not, because 0.003 is loud speech in one session and
+    // below the noise floor in the next.
+    const level = summarizeCaptureLevel(captureLevel);
     const noLiveText = !String(liveText || "").trim();
-    const hardSilence = avgCaptureRms < 0.0009 && capturePeakMax < 0.012;
-    const likelySilenceWithoutPreview = noLiveText && avgCaptureRms < 0.003 && capturePeakMax < 0.045;
+    const hardSilence = level.digitalSilence;
+    const likelySilenceWithoutPreview = noLiveText && !level.carriedSpeech;
     const tooShortToTrust = recordedSec < 1.25;
     return {
       hardSilence,
@@ -9996,7 +10270,7 @@ async function stopLive(
   //      microphone — no new AudioWorklet render quanta will ever be
   //      produced after this returns.
   //
-  //   2. flushWorkletPort + waitForWorkletDrain. The worklet has a
+  //   2. flushWorkletPort + waitForCaptureDrain. The worklet has a
   //      MessagePort queue; anything posted BEFORE step 1 returned is
   //      still in flight. We barrier on it so every ``pushCapturedFrame``
   //      callback that the worklet already scheduled runs before we
@@ -10019,7 +10293,7 @@ async function stopLive(
   //      audio — including the trailing clause the user was still
   //      speaking.
   //
-  // The old order was: flushWorkletPort → waitForWorkletDrain →
+  // The old order was: flush → drain →
   // stopMediaRecorderAndFlush (up to 3s!) → stream.stop() → finalize.
   // That left the mic live for up to 3 seconds while MediaRecorder was
   // being flushed, and those trailing frames could arrive at Deepgram
@@ -10059,15 +10333,22 @@ async function stopLive(
   // post-stop silence and holds nothing back.
   //
   // The ScriptProcessor fallback has no port and no ack, so it still
-  // drains: there the silence heuristic is the only barrier available,
-  // and paying for it is correct.
+  // drains — but on a real barrier, not on the absence of one. The
+  // heuristic that used to stand here waited for a 120 ms gap with no
+  // new frame, and the node it was waiting on keeps delivering frames
+  // of silence after the track is stopped, so the condition could never
+  // be satisfied and every stop paid the 450 ms ceiling. What actually
+  // has to be true is that the node has handed over what it was holding
+  // when the track stopped: one buffer period, and one frame delivered
+  // after it (§4.5).
+  const framesAtTrackStop = captureLevel.frames;
   const workletAcked = await flushWorkletPort();
   mark("flushWorkletPort");
   const flushDur = performance.now() - t0Drain;
   if (!workletAcked) {
-    await waitForWorkletDrain();
+    await waitForCaptureDrain(framesAtTrackStop);
   }
-  mark("waitForWorkletDrain");
+  mark("waitForCaptureDrain");
   const drainDur = performance.now() - t0Drain - flushDur;
   // R3 (BUGS_AUDIT_2026-09-03 §2.4/§4.4): stopMediaRecorderAndFlush is an
   // INDEPENDENT WebM sink (up to MEDIA_RECORDER_STOP_FALLBACK_MS = 500ms)
@@ -10250,10 +10531,6 @@ async function stopLive(
     draftSaveTimer = null;
   }
   persistLiveDraft(false);
-  if (fallbackCaptureTimer) {
-    clearTimeout(fallbackCaptureTimer);
-    fallbackCaptureTimer = null;
-  }
   // Web Audio node teardown. These ``disconnect()`` / ``close()`` calls
   // throw InvalidStateError when a node was already disconnected in a
   // previous error path. That is the only exception class expected here
@@ -10297,8 +10574,7 @@ async function stopLive(
   // slot is provably empty before the next start can claim it.
   await closeAudioContextSlot();
   workletNode = null;
-  scriptNode = null;
-  scriptSinkGain = null;
+  teardownScriptProcessorCapture();
   src = null;
   analyser = null;
   // ── 1.1.22: defer ws.close until envelope arrived ──
@@ -10485,7 +10761,7 @@ async function stopLive(
     void deferredSinkDestroy.destroy();
   }
 
-  if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureFrameCount === 0) {
+  if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
@@ -11159,21 +11435,29 @@ async function stopLive(
               Math.min(RECOVERY_HARD_TIMEOUT_MS, LIVE_TAIL_RECOVERY_TIMEOUT_MS),
             );
             const beforeRecovery = transcriptRaw;
-            // Pending §4.8: ``recovered`` is an INDEPENDENT full-audio
-            // REST decode of the on-disk recording, not a partial
-            // reading of the live stream the way the envelope is.
-            // ``unionTranscripts`` (what ``composeStopTranscript``
-            // aligns through) has a confirmed defect on two-sided gaps
-            // — it can drop the held run, and it duplicated a phrase at
-            // a seam on a real stop the day this was found — so an
-            // independent decode is not folded in through alignment
-            // yet. The live reading is still assembled by
-            // ``composeStopTranscript`` (floor united with whatever the
-            // session buffer has grown to since), and that assembled
-            // text then competes with the independent decode by the
-            // old ``richerTranscript`` word-count/prefix rule. Revert
-            // to a plain ``composeStopTranscript`` union once §4.8 is
-            // fixed.
+            // §4.8, decided rather than pending: ``recovered`` is an
+            // INDEPENDENT full-audio decode of the on-disk recording,
+            // not a partial reading of the live stream the way the
+            // envelope is. The three alignment defects §4.8 recorded
+            // are fixed and under test — a two-sided gap keeps the
+            // longer of the two readings instead of discarding the held
+            // one, the similarity gate is measured against the larger
+            // side with an absolute floor under it, and the seam
+            // duplication of 2026-09-03 23:49 has a regression test
+            // built from that recording's own two texts.
+            //
+            // Every one of those decisions was validated against pairs
+            // from the SAME stream, which is what the envelope is. No
+            // captured pair of a live splice and a full-audio decode
+            // exists to validate alignment ACROSS engines, and the cost
+            // of the gates being wrong there is a hybrid sentence in
+            // the user's paste buffer. So the live reading is assembled
+            // by ``composeStopTranscript`` (floor united with whatever
+            // the session buffer has grown to since) and that assembled
+            // text competes with the independent decode by
+            // ``richerTranscript``'s word-count/prefix rule. Switch to
+            // a plain ``composeStopTranscript`` union once a recovery
+            // pair from a real session has been measured.
             transcriptRaw = richerTranscript(composeStopTranscript(transcriptRaw, sessionUiToken, ""), recovered);
             patchCurrentRecordingSummary({
               title: provisionalTitle,
@@ -11285,19 +11569,18 @@ async function stopLive(
           const first = await Promise.race([envelopeCand, recoveryCand]);
           const firstMs = performance.now() - tRace;
           console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} ${traceTextStats("candidate", first.text)}`);
-          // Pending §4.8: picked, not united. A race candidate here is
-          // EITHER the envelope (a partial reading of the same live
-          // stream, fine to align) OR an independent full-audio REST
-          // decode (not fine to align yet — see the comment at the
-          // ``recovered`` site above). This call site sees both labels
-          // through the same code path, so it cannot tell which one it
-          // has; until ``unionTranscripts``' two-sided-gap defect (§4.8)
-          // is fixed, both are handled the conservative way: the live
-          // reading is assembled by ``composeStopTranscript`` alone
-          // (floor united with the current session buffer, no third
-          // text), and the candidate then competes with that assembled
-          // text by the old ``richerTranscript`` word-count/prefix
-          // rule rather than by alignment.
+          // §4.8: picked, not united — same decision as the
+          // ``recovered`` site above, and for the same reason. A race
+          // candidate here is EITHER the envelope (a partial reading of
+          // the same live stream, which the alignment was validated on)
+          // OR an independent full-audio decode (which it was not).
+          // This call site sees both labels through one code path and
+          // cannot tell which it has, so both take the conservative
+          // route: the live reading is assembled by
+          // ``composeStopTranscript`` alone (floor united with the
+          // current session buffer, no third text), and the candidate
+          // competes with that assembled text by ``richerTranscript``
+          // rather than by alignment.
           let improvedText = richerTranscript(composeStopTranscript(baseTranscriptForRace, sessionUiToken, ""), first.text);
           let chose: Cand | null = improvedText !== baseTranscriptForRace
             ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
@@ -11333,9 +11616,9 @@ async function stopLive(
             const otherMs = performance.now() - tRace;
             if (other) {
               console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} ${traceTextStats("candidate", other.text)}`);
-              // Pending §4.8, same as the ``first`` candidate above: picked
-              // by ``richerTranscript``, not united, until the two-sided-gap
-              // defect in ``unionTranscripts`` is fixed.
+              // §4.8, same as the ``first`` candidate above: picked by
+              // ``richerTranscript``, not united, because this path
+              // cannot tell an envelope from an independent decode.
               improvedText = richerTranscript(composeStopTranscript(baseTranscriptForRace, sessionUiToken, ""), other.text);
               if (improvedText !== baseTranscriptForRace) {
                 chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
@@ -11649,6 +11932,10 @@ async function stopLive(
       signalText: "",
       domText: finalUiText,
       kind: "status",
+      // The provisional publish §6.8 is about: this text is what the
+      // recording has BEFORE the paste upscale runs, and it must never
+      // be what gets pasted.
+      phase: transcriptRaw ? "upscaling" : "no-speech",
       sessionToken: sessionUiToken,
     });
     if (isCurrentUiSession(sessionUiToken)) {
@@ -12438,14 +12725,6 @@ function normalizeUploadProvider(value: unknown): Provider {
     : "deepgram";
 }
 
-function resolveEffectiveUploadProvider(preferred: Provider): Provider {
-  if (preferred === "local") return "local";
-  if (!isRemoteProvider(preferred)) return "local";
-  if (!isProviderKeyConfigured(preferred)) return "local";
-  if (!isRemoteProviderReachable(preferred)) return "local";
-  return preferred;
-}
-
 function currentUploadTranscriptionOptions(): {
   provider: Provider;
   language: string;
@@ -13123,7 +13402,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   // Upload is a batch workflow: if the selected remote provider is
   // unavailable or has no key, keep the file moving through Local
   // Whisper instead of failing every queued item.
-  const provider = resolveEffectiveUploadProvider(selectedProvider);
+  const provider = resolveEffectiveProvider(selectedProvider);
   const language = String(item.requestedLanguage || item.language || "auto").trim() || "auto";
   const diarize = item.requestedDiarize === true;
   item.provider = provider;

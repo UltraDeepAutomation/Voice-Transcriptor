@@ -82,3 +82,44 @@ export function tokensInOrder(haystack: string[], needle: string[]): boolean {
   }
   return false;
 }
+
+/**
+ * `tokensInOrder`, anchored at the END of the haystack.
+ *
+ * True when every element of `needle` occurs in `haystack` in order AND
+ * the match reaches the haystack's tail: at most `maxTrailingSlack`
+ * haystack tokens may follow the last matched one.
+ *
+ * Why the anchor matters: an interim hypothesis re-decodes the SEAM —
+ * the span the committed text has just ended with. "These words appear
+ * somewhere in what we already hold" is a different, much weaker claim,
+ * and it is the one that made a deliberately repeated clause disappear
+ * (BUGS_AUDIT_2026-09-03 §4.2): the speaker said a phrase again, the
+ * words were found scattered earlier in the text, and the repeat was
+ * discarded as "already covered". The slack exists because the
+ * committed text may end with a word or two the hypothesis re-heard
+ * differently — that is a re-decode, not new speech.
+ *
+ * Inputs should be pre-stemmed via stemKey(normalizeWords(...)).
+ * Pure; O(len(haystack)).
+ */
+export function tokensInOrderAtTail(
+  haystack: ReadonlyArray<string>,
+  needle: ReadonlyArray<string>,
+  maxTrailingSlack: number,
+): boolean {
+  if (needle.length === 0) return true;
+  if (haystack.length < needle.length) return false;
+  let n = needle.length - 1;
+  let trailing = 0;
+  for (let h = haystack.length - 1; h >= 0; h--) {
+    if (haystack[h] === needle[n]) {
+      n -= 1;
+      if (n < 0) return true;
+    } else if (n === needle.length - 1) {
+      trailing += 1;
+      if (trailing > maxTrailingSlack) return false;
+    }
+  }
+  return false;
+}

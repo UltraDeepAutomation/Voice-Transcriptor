@@ -6,6 +6,8 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import importlib
+import socket
 import uuid
 import re
 import secrets
@@ -1489,6 +1491,61 @@ def delete_live_draft_state(session_id: str = "", _auth: None = Depends(_require
     return {"ok": True, **state}
 
 
+def _hub_offline_error_types() -> tuple[type[BaseException], ...]:
+    """Exception types that mean "the model host is unreachable".
+
+    Collected by import rather than by matching message text: the type
+    is the fact, the message is prose. Each import is optional because
+    the runtime that ships with the app is not the only one this backend
+    runs under (a dev venv may lack ``requests``); a missing module
+    simply contributes no types.
+    """
+    types: list[type[BaseException]] = []
+    for module_name, names in (
+        # httpx.TransportError covers ConnectError/ConnectTimeout/
+        # ReadTimeout/ProxyError — every way its transport can fail to
+        # reach the host, and the class in the 2026-09-01 tracebacks.
+        ("httpx", ("TransportError",)),
+        ("httpcore", ("NetworkError", "TimeoutException", "ProxyError")),
+        ("requests.exceptions", ("ConnectionError", "Timeout")),
+        # The hub's own way of saying "not cached and I cannot reach the
+        # network to fetch it".
+        ("huggingface_hub.errors", ("LocalEntryNotFoundError", "OfflineModeIsEnabled")),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # pragma: no cover - depends on the environment
+            continue
+        for name in names:
+            candidate = getattr(module, name, None)
+            if isinstance(candidate, type) and issubclass(candidate, BaseException):
+                types.append(candidate)
+    # DNS failure below every client library.
+    types.append(socket.gaierror)
+    return tuple(types)
+
+
+_HUB_OFFLINE_ERRORS = _hub_offline_error_types()
+_hub_offline_warned = False
+
+
+def _is_hub_offline_error(exc: BaseException) -> bool:
+    """Is this failure "the network is not there" rather than a bug?
+
+    Walks the cause/context chain because ``huggingface_hub`` re-raises
+    transport errors wrapped in its own, the same way
+    ``_is_broken_pipe_error`` walks it for ASGI disconnects.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _HUB_OFFLINE_ERRORS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @app.post("/api/transcribe/warmup")
 async def transcribe_warmup(
     _auth: None = Depends(_require_api_auth),
@@ -1514,7 +1571,32 @@ async def transcribe_warmup(
     # behind and then have to catch up with an oversized (slower still)
     # window. Callers fire this in the background, so the extra probe
     # never sits on an interactive path.
-    state = await loop.run_in_executor(None, lambda: warm_model(model, probe=True))
+    try:
+        state = await loop.run_in_executor(None, lambda: warm_model(model, probe=True))
+    except Exception as e:
+        # Loading weights goes through the Hugging Face hub even for a
+        # model already in the local cache, so a machine with no network
+        # — or a user who works entirely through an API provider and
+        # never needs the local model — made this endpoint answer 500
+        # (five times on 2026-09-01, httpx connection errors in every
+        # traceback; audit §7). An unreachable host is a STATE of the
+        # environment, not a server fault: the renderer fires this on
+        # startup, on provider change and on every network-state flip,
+        # and a 500 there is noise it cannot act on. Anything that is
+        # NOT a transport failure still raises — a genuinely broken
+        # loader must not hide behind "offline".
+        if not _is_hub_offline_error(e):
+            raise
+        global _hub_offline_warned
+        detail = _safe_error_text(e)
+        if not _hub_offline_warned:
+            _hub_offline_warned = True
+            logger.warning(
+                "model warmup: model host unreachable (%s) — reporting state=offline; "
+                "local transcription will need the network on first use",
+                detail,
+            )
+        return {"ok": False, "model": model, "state": "offline", "detail": detail}
     return {"ok": True, "model": model, "state": warm_state(model) or state, "cached": False}
 
 
@@ -2713,7 +2795,20 @@ class AudioRetentionPolicy:
 
 AUDIO_RETENTION_POLICIES: dict[str, AudioRetentionPolicy] = {
     RECORDING_COLLECTION_LIVE: AudioRetentionPolicy(
-        max_items=max(0, _env_int("TRANSCRIPTOR_LIVE_AUDIO_KEEP_COUNT", 3)),
+        # 3 → 100. A keep-count of three meant the audio behind a
+        # transcript was gone within hours of a working day: the four
+        # recordings the 2026-09-03 word-loss audit was built on were
+        # deleted while it was being written, and the comparison could
+        # only be reproduced because copies had been taken by hand
+        # (BUGS_AUDIT_2026-09-03.md, addendum (a)). The audio IS the
+        # evidence — without it a report of missing words cannot be
+        # checked against what was said.
+        #
+        # The cost is bounded and small: live capture is 16 kHz mono
+        # PCM16, ~1.9 MB per minute, so 100 takes of a minute each is
+        # under 200 MB. The count is still a limit, not "keep
+        # everything", and the env var below still overrides it.
+        max_items=max(0, _env_int("TRANSCRIPTOR_LIVE_AUDIO_KEEP_COUNT", 100)),
     ),
     RECORDING_COLLECTION_UPLOADS: AudioRetentionPolicy(
         max_age_sec=max(
@@ -4156,6 +4251,60 @@ _PRECONNECT_FRAME_BUFFER_MAX = 4096
 # genuinely stalled connection.
 _FINALIZE_DRAIN_CEILING_SEC = 0.25
 
+# ---- Send path (audit §3.6) ------------------------------------------
+#
+# The renderer's frames used to be pushed to Deepgram from inside the
+# receive loop: ``await session.send_pcm(data)`` between two
+# ``websocket.receive()`` calls. One slow send therefore stopped the
+# app reading its own socket, and a wedged one stopped it for the whole
+# 5 s timeout — four times in a row in one recorded session, 20 s of a
+# user's dictation with nothing being read, their ``finalize`` queued
+# behind hundreds of binary frames. The timeout itself made it worse:
+# cancelling ``ws.send`` mid-frame leaves a ``websockets`` connection in
+# an undefined state, which is the most plausible explanation for those
+# hangs arriving in runs.
+#
+# So: the receiver hands frames to a queue and returns to reading; one
+# sender task owns the upstream socket, batches frames and never has its
+# send cancelled; a watchdog decides the upstream is wedged from the AGE
+# of the audio waiting to go out, and answers by closing the socket
+# (which makes the pending send raise) instead of cancelling the write.
+
+# 1600 bytes = 50 ms at 16 kHz mono PCM16. The renderer emits frames far
+# smaller than this (observed ~85 bytes at ~375 frames/s); one WebSocket
+# message per frame is 375 sends per second of syscalls, framing and
+# TLS records for 32 kB/s of audio. Deepgram's own guidance is 20-250 ms
+# per message.
+_SEND_BATCH_BYTES = 1600
+# How long a partial batch may wait for more audio before going out
+# anyway. Bounds the latency this batching can add to the live
+# transcript; a talking user fills 50 ms of audio in 50 ms, so this only
+# fires at the trailing edge of speech.
+_SEND_BATCH_MAX_WAIT_SEC = 0.05
+# Hard cap on the queue. Both bounds exist: the frame count keeps a
+# pathological renderer from making the queue itself the leak, and the
+# byte count is the meaningful one — 320 kB is 10 s of audio, twice the
+# wedge deadline below, so a healthy session never comes close and a
+# wedged one is detected long before the bound bites.
+_SEND_QUEUE_MAX_FRAMES = 8192
+_SEND_QUEUE_MAX_BYTES = 320_000
+# Audio still waiting this long after it was captured means the upstream
+# is not accepting writes. Sized well above any plausible network hiccup
+# (a 1600-byte write on a live socket completes in microseconds) and at
+# the same 5 s the old per-send timeout used, so the failure is reported
+# no later than it used to be — but by closing the socket rather than by
+# cancelling a write.
+_SEND_WEDGE_TIMEOUT_SEC = 5.0
+_SEND_WEDGE_POLL_SEC = 0.5
+# At stop: how long the queued audio may take to drain before Finalize
+# goes out anyway. A wedged upstream is detected at
+# _SEND_WEDGE_TIMEOUT_SEC and releases this wait early, so the full
+# budget is only ever spent by a stream that is slow rather than dead.
+_SEND_FLUSH_DEADLINE_SEC = _SEND_WEDGE_TIMEOUT_SEC + 1.0
+# Rides the same queue as the audio, so "Finalize is applied after every
+# byte already captured" holds by construction rather than by a sleep.
+_SEND_FINALIZE_SENTINEL = object()
+
 
 async def _run_deepgram_live_session(
     *,
@@ -4298,15 +4447,143 @@ async def _run_deepgram_live_session(
     except (asyncio.CancelledError, Exception):
         pass
 
-    # Replay everything captured while connecting, IN ORDER, before any
-    # newly arriving frame is forwarded — Deepgram must see this audio
-    # first or the transcript's word timings would be shifted.
-    for _chunk in pending_frames:
-        await session.send_pcm(_chunk)
-    pending_frames.clear()
-
     stop = asyncio.Event()
     upstream_fatal = False
+
+    # ---- Send path: queue, sender task, wedge watchdog (audit §3.6) ---
+    send_queue: "asyncio.Queue[object]" = asyncio.Queue(
+        maxsize=_SEND_QUEUE_MAX_FRAMES
+    )
+    queued_bytes = 0
+    # Capture time of the oldest byte that has not yet been handed to
+    # Deepgram — the age the watchdog judges. ``None`` means everything
+    # captured has been written.
+    pending_since: Optional[float] = None
+    send_dropped_warned = False
+
+    def _offer_pcm(data: bytes) -> None:
+        """Hand captured audio to the sender. Never awaits, never blocks.
+
+        Dropping is the correct behaviour at the bound: the queue only
+        fills when the upstream has stopped accepting writes, the audio
+        is already in the recovery spool by the time this is called, and
+        a blocking put here would put the renderer's socket right back
+        behind Deepgram — the thing this queue exists to prevent. Every
+        dropped byte is declared to the session so coverage math still
+        sees the honest length of the recording.
+        """
+        nonlocal queued_bytes, send_dropped_warned
+        if not data:
+            return
+        if queued_bytes + len(data) > _SEND_QUEUE_MAX_BYTES:
+            dropped = True
+        else:
+            try:
+                send_queue.put_nowait((time.monotonic(), data))
+                queued_bytes += len(data)
+                dropped = False
+            except asyncio.QueueFull:
+                dropped = True
+        if not dropped:
+            return
+        session.note_undelivered_audio(len(data))
+        if not send_dropped_warned:
+            send_dropped_warned = True
+            logger.warning(
+                "deepgram send queue full (%d bytes queued); dropping audio "
+                "— upstream is not accepting writes",
+                queued_bytes,
+            )
+
+    async def _flush_frame(buf: bytearray, size: int) -> None:
+        nonlocal pending_since
+        frame = bytes(buf[:size])
+        del buf[:size]
+        # NOT wrapped in wait_for: cancelling a websockets send mid-frame
+        # leaves the connection undefined. The watchdog closes the socket
+        # instead, which makes this raise inside send_pcm's own handler.
+        await session.send_pcm(frame)
+        pending_since = time.monotonic() if buf else None
+
+    async def sender() -> None:
+        """Own the upstream socket: batch queued audio, write it, stop
+        at the finalize sentinel."""
+        nonlocal queued_bytes, pending_since
+        buf = bytearray()
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        send_queue.get(), timeout=_SEND_BATCH_MAX_WAIT_SEC
+                    )
+                except asyncio.TimeoutError:
+                    # Trailing edge of speech: send the partial batch
+                    # rather than hold it for audio that isn't coming.
+                    if buf:
+                        await _flush_frame(buf, len(buf))
+                    continue
+                if item is _SEND_FINALIZE_SENTINEL:
+                    if buf:
+                        await _flush_frame(buf, len(buf))
+                    pending_since = None
+                    return
+                enqueued_at, data = item  # type: ignore[misc]
+                queued_bytes -= len(data)
+                if pending_since is None:
+                    pending_since = enqueued_at
+                buf.extend(data)
+                while len(buf) >= _SEND_BATCH_BYTES:
+                    await _flush_frame(buf, _SEND_BATCH_BYTES)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("deepgram sender failed: %s", e, exc_info=True)
+
+    async def send_watchdog() -> None:
+        """Declare the upstream wedged from the age of unsent audio."""
+        nonlocal upstream_fatal
+        while True:
+            await asyncio.sleep(_SEND_WEDGE_POLL_SEC)
+            since = pending_since
+            if since is None:
+                continue
+            age = time.monotonic() - since
+            if age < _SEND_WEDGE_TIMEOUT_SEC:
+                continue
+            logger.error(
+                "deepgram upstream wedged: audio captured %.1fs ago has not "
+                "been accepted (%d bytes queued); closing the stream",
+                age,
+                queued_bytes,
+            )
+            # Reported through the session so ``events()``, ``last_error``
+            # and the final envelope all tell the same story.
+            session.report_fatal(
+                f"Deepgram upstream wedged: audio queued {age:.1f}s ago was "
+                "never accepted"
+            )
+            upstream_fatal = True
+            stop.set()
+            try:
+                # Closing is what unblocks the pending write — the write
+                # itself is never cancelled. Bounded because this is the
+                # one path where the socket is known to be sick.
+                await asyncio.wait_for(session.close(), timeout=3.0)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("deepgram wedge close failed: %s", e)
+            return
+
+    snd = asyncio.create_task(sender(), name="ws-dg-send")
+    wd = asyncio.create_task(send_watchdog(), name="ws-dg-send-watchdog")
+
+    # Replay everything captured while connecting, IN ORDER, before any
+    # newly arriving frame is forwarded — Deepgram must see this audio
+    # first or the transcript's word timings would be shifted. The queue
+    # is FIFO, so enqueueing here preserves that order by construction.
+    for _chunk in pending_frames:
+        _offer_pcm(_chunk)
+    pending_frames.clear()
+
     if preconnect_disconnected:
         stop.set()
 
@@ -4360,7 +4637,7 @@ async def _run_deepgram_live_session(
                     _record_recovery_chunk(recovery, tail_data)
                     continue
                 _record_recovery_chunk(recovery, tail_data)
-                await session.send_pcm(tail_data)
+                _offer_pcm(tail_data)
                 continue
             if tail_kind == "disconnect":
                 break
@@ -4411,7 +4688,9 @@ async def _run_deepgram_live_session(
                         _record_recovery_chunk(recovery, data)
                         continue
                     _record_recovery_chunk(recovery, data)
-                    await session.send_pcm(data)
+                    # Hand off and go straight back to reading the
+                    # renderer's socket — the whole point of the queue.
+                    _offer_pcm(data)
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
@@ -4462,6 +4741,36 @@ async def _run_deepgram_live_session(
             rx.cancel()
         try:
             await rx
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        # Finalize must reach Deepgram AFTER every byte the renderer
+        # sent (audit §3.6). The receiver has now stopped, so everything
+        # it captured is already in the queue; the sentinel goes in
+        # behind it and the sender returns only once it has been
+        # reached, which makes the ordering a property of the queue
+        # rather than of a timer.
+        try:
+            send_queue.put_nowait(_SEND_FINALIZE_SENTINEL)
+        except asyncio.QueueFull:
+            # Only reachable with a wedged upstream and a full queue;
+            # the audio behind the bound is already accounted for as
+            # undelivered, and the sender is cancelled below.
+            logger.warning("deepgram send queue full at finalize; sentinel dropped")
+        # Deliberately not ``wait_for``: that cancels the task, and the
+        # task may be inside ``ws.send``.
+        _done, _still = await asyncio.wait({snd}, timeout=_SEND_FLUSH_DEADLINE_SEC)
+        if _still:
+            logger.warning(
+                "deepgram send queue did not drain within %.1fs "
+                "(%d bytes still queued); finalizing anyway",
+                _SEND_FLUSH_DEADLINE_SEC,
+                queued_bytes,
+            )
+        if not wd.done():
+            wd.cancel()
+        try:
+            await wd
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -4576,6 +4885,17 @@ async def _run_deepgram_live_session(
         # above), this guarantees the socket and background tasks are
         # still released.
         await session.close()
+
+        # The sender only outlives the drain when the upstream never
+        # took the last frame. The socket is closed by now, so the
+        # pending write has already raised inside ``send_pcm`` and this
+        # cancel cannot land mid-frame.
+        if not snd.done():
+            snd.cancel()
+        try:
+            await snd
+        except (asyncio.CancelledError, Exception):
+            pass
 
         if not fw.done():
             try:

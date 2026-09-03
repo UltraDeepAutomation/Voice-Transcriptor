@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -303,6 +304,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Deepgram model id (default {DEFAULT_DEEPGRAM_AUDIO_MODEL}).",
     )
     parser.add_argument(
+        "--log-level", default="WARNING",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        help="Backend log level to print to stderr. INFO shows the live "
+             "session's own per-final and coverage-hole reporting, which "
+             "is what a hole investigation reads.",
+    )
+    parser.add_argument(
         "--full", action="store_true",
         help=f"Print the full transcript text instead of truncating to "
              f"{_TEXT_TRUNCATE_CHARS} chars.",
@@ -313,6 +321,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: "list[str] | None" = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     try:
         return asyncio.run(_main_async(args))
     except KeyboardInterrupt:

@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Leo Erdman",
   "license": "MIT",
@@ -47,6 +47,7 @@
       "engine-deps.js",
       "renderer-console.js",
       "paste-result.js",
+      "recording-final-slot.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",

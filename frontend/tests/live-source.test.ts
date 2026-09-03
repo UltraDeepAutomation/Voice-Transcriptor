@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 
-import { composeCanonicalLiveSourceText, mergeInterim } from "../src/live-source";
+import {
+  boundRecoveredTail,
+  composeCanonicalLiveSourceText,
+  mergeInterim,
+  uncoveredInterimTail,
+} from "../src/live-source";
 
 describe("live-source composition", () => {
   describe("the re-decoded seam — production 2026-08-25 14:19:55", () => {
@@ -78,21 +83,96 @@ describe("live-source composition", () => {
     });
   });
 
+
+  describe("seam-anchored guards (BUGS_AUDIT_2026-09-03 §4.2)", () => {
+    it("keeps a word the speaker says again much later", () => {
+      // The containment guard used to search the WHOLE committed text:
+      // "нужно" had occurred half a minute earlier, so the hypothesis
+      // that carried it again was discarded in full.
+      const base = "нужно сделать всё это а потом мы поговорим о том что случилось вчера вечером после работы";
+      expect(mergeInterim(base, "нужно")).toBe(`${base} нужно`);
+    });
+
+    it("keeps a clause the speaker deliberately repeats", () => {
+      const base = "сначала повтори это ещё раз потом сделай это";
+      const merged = mergeInterim(base, "повтори это ещё раз");
+      expect((merged.match(/повтори это ещё раз/g) || []).length).toBe(2);
+    });
+
+    it("still collapses a re-decode of the clause immediately before it", () => {
+      // Same words, arriving as a re-statement of the seam rather than
+      // as new speech: one copy, not two.
+      const base = "сначала я сказал повтори это ещё раз";
+      expect(mergeInterim(base, "повтори это ещё разок")).toBe(
+        "сначала я сказал повтори это ещё разок",
+      );
+    });
+
+    it("never drops more committed words than a mis-heard seam can explain", () => {
+      // The share rule alone let a 70%-matched window supersede the
+      // rest: four committed words vanish with nothing said in their
+      // place. The absolute bound is what stops that.
+      const base = "раз два три четыре пять шесть семь восемь девять десять";
+      // Neither dropped nor duplicated: the alignment still says where
+      // the hypothesis stops restating, so only its continuation is
+      // appended.
+      expect(mergeInterim(base, "раз два три четыре пять шесть семь и дальше")).toBe(
+        `${base} и дальше`,
+      );
+    });
+  });
+
+  describe("commit-time reconciliation (BUGS_AUDIT_2026-09-03 §4.1)", () => {
+    it("reports the words a final did not carry over from its own interim", () => {
+      expect(uncoveredInterimTail("это были последние", "последние слова")).toBe("слова");
+    });
+
+    it("reports nothing when the final covered the whole hypothesis", () => {
+      expect(uncoveredInterimTail("это были последние слова", "последние слова")).toBe("");
+    });
+
+    it("keeps both words when two consecutive finals each cut one from their interim", () => {
+      // Final 1 commits "это были последние" out of the interim
+      // "последние слова"; final 2 commits "а потом ещё" out of the
+      // interim "ещё пара". Before the recovered tail existed, the
+      // register holding "слова" was overwritten by final 2 and the
+      // word was gone by the time the stop path read the session.
+      let committed = "это были последние";
+      let recoveredTail = boundRecoveredTail(uncoveredInterimTail(committed, "последние слова"));
+      committed = "это были последние а потом ещё";
+      recoveredTail = boundRecoveredTail(
+        [uncoveredInterimTail(committed, recoveredTail), uncoveredInterimTail(committed, "ещё пара")]
+          .filter(Boolean)
+          .join(" "),
+      );
+      const composed = composeCanonicalLiveSourceText(committed, recoveredTail, "", "ещё пара");
+      expect(composed).toContain("слова");
+      expect(composed).toContain("пара");
+    });
+
+    it("bounds the recovered tail by the re-decode window", () => {
+      const words = Array.from({ length: 60 }, (_, i) => `w${i}`);
+      const bounded = boundRecoveredTail(words.join(" ")).split(" ");
+      expect(bounded.length).toBe(40);
+      expect(bounded[bounded.length - 1]).toBe("w59");
+    });
+  });
+
   describe("composeCanonicalLiveSourceText", () => {
     it("returns committed text when there is no hypothesis at all", () => {
-      expect(composeCanonicalLiveSourceText("готовый текст", "", "")).toBe("готовый текст");
+      expect(composeCanonicalLiveSourceText("готовый текст", "", "", "")).toBe("готовый текст");
     });
 
     it("recovers the tail a partial final cut off", () => {
       // The reason the snapshot is kept: the final committed "последние"
       // out of "последние слова" and the interim that held the rest was
       // cleared by that very final.
-      const merged = composeCanonicalLiveSourceText("это были последние", "", "последние слова");
+      const merged = composeCanonicalLiveSourceText("это были последние", "", "", "последние слова");
       expect(merged).toBe("это были последние слова");
     });
 
     it("uses the current hypothesis for the tail past the last final", () => {
-      expect(composeCanonicalLiveSourceText("первая часть", "и вторая часть", "")).toBe(
+      expect(composeCanonicalLiveSourceText("первая часть", "", "и вторая часть", "")).toBe(
         "первая часть и вторая часть",
       );
     });

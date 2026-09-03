@@ -42,6 +42,24 @@ def _interim(start: float, end: float, text: str, words: list[tuple[str, float, 
     }
 
 
+def _final(start: float, end: float, text: str, words: list[tuple[str, float, float]]) -> dict:
+    return {
+        "type": "Results",
+        "is_final": True,
+        "speech_final": True,
+        "start": start,
+        "duration": end - start,
+        "channel": {
+            "alternatives": [
+                {
+                    "transcript": text,
+                    "words": [{"word": w, "start": a, "end": b} for w, a, b in words],
+                }
+            ]
+        },
+    }
+
+
 def _session(finals, speech_spans) -> DeepgramLiveSession:
     s = DeepgramLiveSession(api_key="k")
     s._finalized_segments = [{"start": a, "end": b} for a, b in finals]
@@ -145,3 +163,104 @@ class SpeechSpanSourceTests(unittest.TestCase):
         self.assertLess(len(short), INTERIM_SPEECH_MIN_CHARS)
         s._process_deepgram_message(_interim(1.0, 2.0, short, [("ой", 1.0, 1.2)]))
         self.assertEqual(s._interim_speech_spans, [])
+
+
+def _session_with_the_measured_hole() -> DeepgramLiveSession:
+    """The 12 s recording of audit §3.4: three contiguous finals, and
+    one word ("субагента", 5.5-6.1 s) that the interim heard and no
+    final ever carried."""
+    s = DeepgramLiveSession(api_key="k")
+    s._process_deepgram_message(
+        _interim(
+            4.90, 9.70, "три субагента на или если это",
+            [
+                ("три", 4.91, 5.30),
+                ("субагента", 5.50, 6.10),
+                ("на", 6.30, 6.55),
+                ("или", 6.60, 6.90),
+            ],
+        )
+    )
+    s._process_deepgram_message(
+        _final(0.0, 4.91, "можешь взять себе в одну два и",
+               [("одну", 4.10, 4.50), ("два", 4.55, 4.91)])
+    )
+    s._process_deepgram_message(
+        _final(4.91, 9.70, "три на или если это",
+               [("три", 4.91, 5.30), ("на", 6.30, 6.55), ("или", 6.60, 6.90)])
+    )
+    s._process_deepgram_message(
+        _final(9.70, 12.11, "будет нужно.", [("будет", 9.80, 10.2), ("нужно.", 10.2, 10.8)])
+    )
+    return s
+
+
+class WordLevelHoleTests(unittest.TestCase):
+    """§3.4: a lost WORD inside contiguous finals is a hole too.
+
+    The time-difference measure cannot see it — the finals run
+    0-4.91-9.70-12.11 with no gap at all — so the envelope reported
+    ``uncoveredSpeechSec=0`` for a transcript that was provably missing
+    a word, and every consumer downstream was told the reading was
+    complete.
+    """
+
+    def test_a_single_missing_word_is_reported(self):
+        s = _session_with_the_measured_hole()
+        self.assertEqual([w["word"] for w in s._interim_words], ["субагента"])
+        self.assertAlmostEqual(s._uncovered_speech_sec(), 0.6, places=3)
+
+    def test_the_word_level_measure_has_no_quarter_second_floor(self):
+        # One word is a few hundred milliseconds; the floor that keeps
+        # segment-boundary jitter out of the SPAN measure would discard
+        # every word-level hole there is.
+        s = _session_with_the_measured_hole()
+        self.assertLess(0.6, COVERAGE_GAP_MIN_SEC * 3)
+        self.assertGreater(s._uncovered_speech_sec(), 0.0)
+
+    def test_a_word_the_finals_do_carry_is_not_a_hole(self):
+        s = _session_with_the_measured_hole()
+        # Give the middle final the word it had omitted: nothing is
+        # missing any more.
+        s._process_deepgram_message(
+            _final(4.91, 9.70, "три субагента на",
+                   [("три", 4.91, 5.30), ("субагента", 5.50, 6.10)])
+        )
+        self.assertEqual(s._interim_words, [])
+        self.assertEqual(s._uncovered_speech_sec(), 0.0)
+
+    def test_the_splice_closes_the_measured_hole(self):
+        s = _session_with_the_measured_hole()
+        self.assertEqual(s._splice_uncovered_interim_words(), 1)
+        self.assertEqual(s._uncovered_speech_sec(), 0.0)
+        self.assertIn(
+            "три субагента на или если это",
+            " ".join(str(seg.get("text") or "") for seg in s._finalized_segments),
+        )
+
+
+class HoleReportTests(unittest.IsolatedAsyncioTestCase):
+    """§3.9: when a hole is found, the log must say what was heard there."""
+
+    async def test_finalize_logs_the_hole_spans_and_the_interim_texts(self):
+        s = _session_with_the_measured_hole()
+        s.stats.bytes_offered = int(12.11 * 2 * s._cfg.sample_rate)
+        with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
+            await s.drain_transcript()
+        block = next(
+            (m for m in logs.output if "coverage holes at finalize" in m), "",
+        )
+        self.assertTrue(block, f"no hole block logged; got {logs.output}")
+        self.assertIn("hole 5.50-6.10s", block)
+        self.assertIn("три субагента на или если это", block)
+        self.assertIn("spliced_words=1", block)
+
+    async def test_a_clean_session_logs_no_hole_block(self):
+        s = DeepgramLiveSession(api_key="k")
+        s._process_deepgram_message(
+            _final(0.0, 2.0, "всё на месте", [("всё", 0.1, 0.5), ("на", 0.5, 0.7)])
+        )
+        s.stats.bytes_offered = int(2.0 * 2 * s._cfg.sample_rate)
+        with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
+            await s.drain_transcript()
+        self.assertFalse([m for m in logs.output if "coverage holes at finalize" in m])

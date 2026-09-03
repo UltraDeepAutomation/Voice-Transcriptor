@@ -84,7 +84,9 @@ frontend/
     ├── text-match.ts                 # transcript word-normalisation SSOT (pure)
     ├── transcript-merge.ts           # transcript adoption policy SSOT (pure)
     ├── live-coverage.ts              # live-envelope reuse decision SSOT (pure)
+    ├── envelope-deadline.ts          # re-armable stop-envelope deadline SSOT (pure)
     ├── mic-health.ts                 # microphone-health FSM SSOT (clock-injected, pure)
+    ├── audio-levels.ts               # capture-level SSOT: session noise floor, relative speech threshold (pure)
     ├── recordings-list-reconciler.ts # keyed DOM reconciler for the history list (pure)
     ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
     ├── error-text.ts                 # readable text for thrown values SSOT (pure)
@@ -109,7 +111,9 @@ desktop/
 ├── accelerator.js                  # accelerator canonicalisation SSOT (pure, node --test)
 ├── engine-deps.js                  # GigaAM engine dependency-policy SSOT (pure, node --test)
 ├── renderer-console.js             # renderer console → support-log policy SSOT (pure, node --test)
-├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only)
+├── paste-result.js                 # auto-paste success/verification decision SSOT (pure, node --test)
+├── recording-final-slot.js         # renderer→main transcript hand-off payload + mailbox SSOT (pure, node --test)
+├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only)
 ├── package.json                    # electron-builder config and desktop scripts
 ├── shortcut-defaults.json          # per-platform default hotkey manifest
 ├── afterPack.js                    # macOS bundle signing/runtime fixups
