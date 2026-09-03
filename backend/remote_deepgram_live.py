@@ -835,6 +835,15 @@ class DeepgramLiveStats:
     finalize_ms: Optional[float] = None
     last_send_at: Optional[float] = None
     last_recv_at: Optional[float] = None
+    # ``time.monotonic()`` of the last KeepAlive frame that actually
+    # reached the wire. A socket held open with nothing but KeepAlives
+    # (``backend.deepgram_warm``) has no other evidence that its send
+    # path still works: a half-open TCP connection accepts writes into a
+    # black hole, and Deepgram never answers a KeepAlive. This is the age
+    # the warm pool reads before adopting a socket. Deliberately NOT in
+    # ``as_dict`` — that dict is the ``stats`` field of the renderer's
+    # final envelope, and this is backend liveness bookkeeping.
+    last_keepalive_at: Optional[float] = None
 
     def as_dict(self) -> dict:
         return {
@@ -954,6 +963,9 @@ class DeepgramLiveSession:
         # socket (never sent the WS close frame) and the keepalive task
         # (never cancelled). TCP FIN-WAITs piled up until OS reclaim.
         self._close_ran = False
+        # Set by ``discard()``: this socket is being replaced on purpose,
+        # so its teardown must not reach the consumer as an error event.
+        self._discarded = False
         self._finalize_sent = False
         # Set once drain_transcript() actually enters the Finalize dance
         # (ws present, Finalize not already sent). shutdown() reads this
@@ -2479,6 +2491,27 @@ class DeepgramLiveSession:
         span_total = sum(end - start for start, end in self._span_level_holes())
         return word_total + span_total
 
+    async def discard(self) -> None:
+        """Close a session the CALLER has decided to replace.
+
+        Identical to ``close()`` except that the teardown is not
+        reported as an error. A caller that swaps one upstream socket
+        for another mid-recording (the warm-socket liveness path in
+        ``backend.main``, audit §3.7) is performing the recovery, not
+        suffering a failure: routing the resulting ``ConnectionClosed``
+        through ``_report_error`` would push ``{"fatal": true}`` at the
+        renderer and abort a recording that is about to continue on the
+        replacement socket.
+
+        Flipping ``_closed`` first also makes every in-flight
+        ``send_pcm`` a silent no-op, so audio still in the caller's send
+        queue is not written into a socket that is going away — it is
+        replayed into the new one instead.
+        """
+        self._discarded = True
+        self._closed = True
+        await self.close()
+
     async def close(self) -> None:
         """Idempotently release the upstream socket and background tasks."""
         if self._close_ran:
@@ -2663,6 +2696,14 @@ class DeepgramLiveSession:
 
     def _report_error(self, message: str, *, fatal: bool) -> None:
         """Record an error and push a normalized error event to the queue."""
+        if self._discarded:
+            # The caller replaced this socket deliberately (``discard()``).
+            # Everything the teardown raises from here on is the expected
+            # consequence of that decision, not a failure the user needs
+            # to see — and emitting it would abort the recording that is
+            # already continuing on the replacement socket.
+            logger.debug("deepgram-live: error on discarded session: %s", message)
+            return
         self._last_error = message
         self._last_fatal = fatal or self._last_fatal
         logger.warning(
@@ -2758,6 +2799,13 @@ class DeepgramLiveSession:
         threshold that keeps Deepgram happy. Emitting an explicit
         KeepAlive control message costs nothing and prevents unexpected
         disconnects.
+
+        This is also the whole mechanism keeping a PRE-WARMED socket
+        open, where no audio flows at all — Deepgram documents the
+        10 s idle timeout as reset by "audio data or ``KeepAlive``
+        messages", so no silence-frame trickle is needed. See
+        ``backend.deepgram_warm`` for the cited sentences and for the
+        4 s cadence a warm socket is constructed with.
         """
         try:
             while not self._closed and self._ws is not None:
@@ -2779,6 +2827,7 @@ class DeepgramLiveSession:
                 try:
                     await ws.send(json.dumps({"type": "KeepAlive"}))
                     self.stats.keepalives_sent += 1
+                    self.stats.last_keepalive_at = time.monotonic()
                     logger.debug(
                         "deepgram-live: sent KeepAlive after %.1fs idle",
                         idle_for,

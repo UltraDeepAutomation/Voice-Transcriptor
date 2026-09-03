@@ -80,6 +80,11 @@ from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
 from backend.deepgram_keyterms import configured_keyterms
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
+from backend.deepgram_warm import (
+    WARM_KEEPALIVE_INTERVAL_SEC,
+    DeepgramWarmPool,
+    pcm_has_voice,
+)
 from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveError,
@@ -344,7 +349,29 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
         name="tmp-sweep",
     ).start()
 
+    # Deepgram warm socket (audit §2.4/§3.7). The pool is bound to the
+    # app lifetime rather than created on demand: it holds a real
+    # upstream connection, so there must be exactly one owner and one
+    # guaranteed release. Un-armed it retains nothing, which is why
+    # importing this module — or driving the WS handler directly from a
+    # test — never leaves a socket open.
+    DEEPGRAM_WARM_POOL.start()
+    warm_boot = asyncio.get_running_loop().create_task(
+        _prewarm_deepgram_at_boot(), name="deepgram-warm-boot"
+    )
+
     yield
+
+    if not warm_boot.done():
+        warm_boot.cancel()
+    try:
+        await warm_boot
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await DEEPGRAM_WARM_POOL.close_all()
+    except Exception:
+        logger.exception("deepgram warm pool shutdown failed (non-fatal)")
     # Shutdown: drain in-flight transcription jobs before the process
     # exits so Electron's SIGTERM (killBackendHard, 1500 ms hard deadline)
     # doesn't interrupt mid-write result files. Without this, the worker
@@ -3740,7 +3767,7 @@ async def ws_transcribe(websocket: WebSocket):
             )
         if provider == "deepgram":
             dg_cfg = load_config()
-            dg_key = (((dg_cfg.get("providers") or {}).get("deepgram") or {}).get("key") or "").strip()
+            dg_key = _configured_deepgram_key(dg_cfg)
             if not dg_key:
                 await _ws_send_json(
                     websocket,
@@ -4305,6 +4332,123 @@ _SEND_FLUSH_DEADLINE_SEC = _SEND_WEDGE_TIMEOUT_SEC + 1.0
 # byte already captured" holds by construction rather than by a sleep.
 _SEND_FINALIZE_SENTINEL = object()
 
+# ---- Warm upstream socket (audit §2.4 / §3.7) -------------------------
+#
+# Connecting to Deepgram cost p50 880 ms / p90 1.2 s / max 9.7 s at the
+# start of every recording, plus one 12 s timeout that swallowed 126 s of
+# dictation. ``backend.deepgram_warm`` keeps one socket open ahead of the
+# hotkey so that cost is paid before the user starts speaking; see that
+# module for the KeepAlive-vs-silence decision, the timestamp invariant
+# and the billing bound.
+
+# How long an ADOPTED warm socket has to prove it is alive. A socket can
+# die silently — a half-open TCP connection accepts writes into a black
+# hole and Deepgram never answers a KeepAlive — and the only positive
+# evidence is a message coming back. Measured against the first frame
+# that actually carries speech, not the first frame: a user who presses
+# the hotkey and pauses to think sends only silence, which Deepgram is
+# entitled to answer with nothing.
+_WARM_PROBE_TIMEOUT_SEC = 2.5
+_WARM_PROBE_POLL_SEC = 0.1
+# Audio kept for replay while the probe is unresolved: everything
+# already written to the adopted socket, so a replacement starts from
+# the true beginning of the recording rather than from the moment the
+# swap completed. Bounded at 8 s of 16 kHz PCM16 — the probe window plus
+# a worst-case connect, with room to spare.
+_WARM_REPLAY_MAX_BYTES = 8 * 2 * LIVE_SAMPLE_RATE_HZ
+
+
+def _live_config(
+    *,
+    model: str,
+    language: str,
+    diarize: bool,
+    keyterms: tuple[str, ...],
+) -> DeepgramLiveConfig:
+    """Build the live config — the ONE place backend.main constructs one.
+
+    The warm pool keys its socket on ``to_query_string()``, so a second
+    construction site that forgot a field would silently hand a
+    recording a socket opened with different parameters. One builder
+    makes that impossible: the boot pre-warm and the WebSocket handler
+    produce the same string for the same inputs by construction.
+    """
+    return DeepgramLiveConfig(
+        model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
+        language=language or "auto",
+        sample_rate=LIVE_SAMPLE_RATE_HZ,
+        interim_results=True,
+        diarize=bool(diarize),
+        keyterms=tuple(keyterms or ()),
+    )
+
+
+def _new_live_session(
+    api_key: str, cfg: DeepgramLiveConfig
+) -> DeepgramLiveSession:
+    """Construct a live session — the ONE place backend.main makes one.
+
+    Both the warm pool and the mid-stream replacement go through here,
+    so the KeepAlive cadence a warm socket needs is configured once, and
+    a test that patches ``DeepgramLiveSession`` still sees every session
+    the WebSocket handler uses. Resolved through the module global on
+    purpose (not captured at import time) for exactly that reason.
+    """
+    return DeepgramLiveSession(
+        api_key=api_key,
+        config=cfg,
+        keepalive_interval_sec=WARM_KEEPALIVE_INTERVAL_SEC,
+    )
+
+
+# Armed by the app lifespan and released there; un-armed it retains
+# nothing and ``acquire()`` is a plain connect, so importing this module
+# never leaves a socket open.
+DEEPGRAM_WARM_POOL = DeepgramWarmPool(session_factory=_new_live_session)
+
+
+def _configured_deepgram_key(cfg: Any) -> str:
+    """Read the Deepgram API key out of the app config, or ``""``.
+
+    One expression for the config path both Deepgram live entry points
+    read — the WebSocket handler and the boot pre-warm — matching what
+    ``configured_keyterms`` already does for the other half of the same
+    settings block.
+    """
+    providers = cfg.get("providers") if isinstance(cfg, dict) else None
+    deepgram = providers.get("deepgram") if isinstance(providers, dict) else None
+    key = deepgram.get("key") if isinstance(deepgram, dict) else None
+    return str(key or "").strip()
+
+
+async def _prewarm_deepgram_at_boot() -> None:
+    """Open the first warm socket at backend start, if a key is set.
+
+    The live model and language are renderer settings that arrive as
+    query parameters, so at boot the only honest guess is the default
+    the renderer sends when the user has not chosen otherwise. A wrong
+    guess is self-correcting and cheap: ``acquire()`` discards the
+    mismatched socket with a logged reason and connects fresh, and the
+    re-warm after that recording uses the configuration actually used.
+    """
+    try:
+        cfg = await asyncio.to_thread(load_config)
+    except Exception:
+        logger.exception("boot deepgram pre-warm: config read failed")
+        return
+    api_key = _configured_deepgram_key(cfg)
+    if not api_key:
+        return
+    DEEPGRAM_WARM_POOL.rewarm(
+        api_key,
+        _live_config(
+            model=DEFAULT_DEEPGRAM_AUDIO_MODEL,
+            language="auto",
+            diarize=False,
+            keyterms=configured_keyterms(cfg),
+        ),
+    )
+
 
 async def _run_deepgram_live_session(
     *,
@@ -4344,15 +4488,16 @@ async def _run_deepgram_live_session(
       ``coveredEndSec`` (C5) — see
       ``DeepgramLiveSession.drain_transcript`` for their definitions.
     """
-    dg_cfg = DeepgramLiveConfig(
-        model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
-        language=language or "auto",
-        sample_rate=LIVE_SAMPLE_RATE_HZ,
-        interim_results=True,
-        diarize=bool(diarize),
-        keyterms=tuple(keyterms or ()),
+    dg_cfg = _live_config(
+        model=model,
+        language=language,
+        diarize=diarize,
+        keyterms=keyterms,
     )
-    session = DeepgramLiveSession(api_key=api_key, config=dg_cfg)
+    # Rebound (once, by ``_swap_warm_socket``) if an adopted warm socket
+    # turns out to be dead. Every closure below reads this name rather
+    # than capturing the object, so the swap is invisible to them.
+    session: DeepgramLiveSession
 
     # C1/C2 shared state: total binary frames/bytes received on this
     # connection, from before connect() even starts, so the finalize
@@ -4406,7 +4551,11 @@ async def _run_deepgram_live_session(
         _preconnect_reader(), name="ws-dg-preconnect-rx",
     )
     try:
-        await session.connect()
+        # Adopts the pre-opened socket when one matches this exact
+        # configuration and is healthy; otherwise this is the same
+        # connect() the handler always did, with the same failure mode.
+        acquisition = await DEEPGRAM_WARM_POOL.acquire(api_key, dg_cfg)
+        session = acquisition.session
     except DeepgramLiveError as e:
         pre_task.cancel()
         try:
@@ -4450,6 +4599,24 @@ async def _run_deepgram_live_session(
     stop = asyncio.Event()
     upstream_fatal = False
 
+    # ---- Warm-socket liveness (audit §3.7) ---------------------------
+    #
+    # A socket that was opened minutes ago can be dead without anything
+    # having raised: writes into a half-open TCP connection succeed, and
+    # Deepgram never answers a KeepAlive, so the pool's pre-adoption
+    # checks cannot prove liveness — only a message coming back can. The
+    # clock starts at the first frame carrying actual speech; if nothing
+    # has arrived by then, the socket is replaced and every byte already
+    # written to it is replayed into the replacement.
+    #
+    # Armed only for an adopted socket: a connect that just completed its
+    # handshake has proven the path end to end.
+    warm_probe_active = acquisition.adopted
+    warm_probe_deadline: Optional[float] = None
+    warm_swap_requested = False
+    warm_swap_in_progress = False
+    warm_replay = bytearray()
+
     # ---- Send path: queue, sender task, wedge watchdog (audit §3.6) ---
     send_queue: "asyncio.Queue[object]" = asyncio.Queue(
         maxsize=_SEND_QUEUE_MAX_FRAMES
@@ -4472,9 +4639,15 @@ async def _run_deepgram_live_session(
         dropped byte is declared to the session so coverage math still
         sees the honest length of the recording.
         """
-        nonlocal queued_bytes, send_dropped_warned
+        nonlocal queued_bytes, send_dropped_warned, warm_probe_deadline
         if not data:
             return
+        if (
+            warm_probe_active
+            and warm_probe_deadline is None
+            and pcm_has_voice(data)
+        ):
+            warm_probe_deadline = time.monotonic() + _WARM_PROBE_TIMEOUT_SEC
         if queued_bytes + len(data) > _SEND_QUEUE_MAX_BYTES:
             dropped = True
         else:
@@ -4499,11 +4672,64 @@ async def _run_deepgram_live_session(
         nonlocal pending_since
         frame = bytes(buf[:size])
         del buf[:size]
+        if warm_probe_active:
+            # Kept until the adopted socket has proven itself, so a
+            # replacement can start from the true beginning of the
+            # recording instead of from the moment the swap finished.
+            if len(warm_replay) + len(frame) <= _WARM_REPLAY_MAX_BYTES:
+                warm_replay.extend(frame)
         # NOT wrapped in wait_for: cancelling a websockets send mid-frame
         # leaves the connection undefined. The watchdog closes the socket
         # instead, which makes this raise inside send_pcm's own handler.
         await session.send_pcm(frame)
         pending_since = time.monotonic() if buf else None
+
+    async def _swap_warm_socket() -> None:
+        """Replace a silent adopted socket and replay what it swallowed.
+
+        Runs inside the sender, which is the only writer to the upstream
+        socket — so the old session is never being written to while it
+        is torn down, and the replayed bytes reach the new one before
+        anything still sitting in the send queue. ``discard()`` keeps the
+        teardown from reaching the renderer as a fatal error: the swap IS
+        the recovery.
+        """
+        nonlocal session, warm_probe_active
+        nonlocal warm_swap_requested, warm_swap_in_progress
+        warm_swap_requested = False
+        warm_swap_in_progress = True
+        old = session
+        replay = bytes(warm_replay)
+        logger.warning(
+            "deepgram-live: discarded warm socket after adoption reason=no "
+            "results within %.1fs of the first voiced audio; reconnecting "
+            "and replaying %d bytes",
+            _WARM_PROBE_TIMEOUT_SEC,
+            len(replay),
+        )
+        try:
+            fresh = _new_live_session(api_key, dg_cfg)
+            await fresh.connect()
+        except Exception as e:
+            # The recording continues on the old socket. It is probably
+            # dead, but keeping it can only do better than guaranteeing
+            # failure, and the local recovery spool already holds every
+            # byte for the REST fallback.
+            logger.error(
+                "deepgram-live: warm socket replacement failed, staying on "
+                "the adopted socket: %s", e,
+            )
+            warm_probe_active = False
+            warm_replay.clear()
+            warm_swap_in_progress = False
+            return
+        session = fresh
+        await old.discard()
+        warm_probe_active = False
+        warm_replay.clear()
+        for offset in range(0, len(replay), _SEND_BATCH_BYTES):
+            await fresh.send_pcm(replay[offset:offset + _SEND_BATCH_BYTES])
+        warm_swap_in_progress = False
 
     async def sender() -> None:
         """Own the upstream socket: batch queued audio, write it, stop
@@ -4512,6 +4738,8 @@ async def _run_deepgram_live_session(
         buf = bytearray()
         try:
             while True:
+                if warm_swap_requested:
+                    await _swap_warm_socket()
                 try:
                     item = await asyncio.wait_for(
                         send_queue.get(), timeout=_SEND_BATCH_MAX_WAIT_SEC
@@ -4544,6 +4772,12 @@ async def _run_deepgram_live_session(
         nonlocal upstream_fatal
         while True:
             await asyncio.sleep(_SEND_WEDGE_POLL_SEC)
+            if warm_swap_in_progress:
+                # The upstream is being replaced on purpose. Audio waits
+                # in the queue for the length of one connect, which is
+                # not evidence of a wedge — and declaring one here would
+                # kill the recording the swap is rescuing.
+                continue
             since = pending_since
             if since is None:
                 continue
