@@ -249,6 +249,7 @@ def deepgram_transcribe(
     # with proper sentence grouping. We join paragraphs with double newlines
     # to produce clean, WhisperFlow-quality formatted output.
     text = ""
+    alternative: dict = {}
     try:
         channel = result["results"]["channels"][0]
         alternatives = channel.get("alternatives", [])
@@ -306,9 +307,20 @@ def deepgram_transcribe(
         except (TypeError, ValueError):
             duration = 0.0
 
+    # ``words`` for the same reason as ``duration``: the adapter knows
+    # this provider's payload shape and its callers must not have to.
+    # ``deepgram_recovery`` reached into
+    # ``raw["results"]["channels"][0]["alternatives"][0]["words"]`` to
+    # place re-decoded words — this module's private knowledge, spelled
+    # out in another file. Handed over RAW: normalising them is the
+    # live module's rule (``normalize_words``) and importing it here
+    # would make the pre-recorded adapter depend on the streaming one.
+    raw_words = alternative.get("words")
+
     logger.info("deepgram_transcribe: success, %d chars", len(text))
     return {
         "text": str(text).strip(),
         "duration": duration,
+        "words": list(raw_words) if isinstance(raw_words, list) else [],
         "raw": result,
     }

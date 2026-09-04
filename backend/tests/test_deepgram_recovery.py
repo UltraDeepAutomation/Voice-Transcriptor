@@ -69,9 +69,20 @@ def _segment(start: float, end: float, words: list[tuple[str, float, float]]) ->
 
 
 def _rest_result(words: list[tuple[str, float, float]]) -> dict:
-    """A Deepgram pre-recorded response carrying exactly these words."""
+    """A Deepgram pre-recorded response carrying exactly these words.
+
+    Shaped like what ``backend.remote_deepgram.deepgram_transcribe``
+    RETURNS — text, duration, words and the raw payload — rather than
+    like the raw payload alone. Placing the recovered words is this
+    module's job; knowing where Deepgram puts them in its JSON is the
+    adapter's, and it used to be spelled out on both sides.
+    """
     return {
         "text": " ".join(w for w, _s, _e in words),
+        "duration": max((e for _w, _s, e in words), default=0.0),
+        "words": [
+            {"word": w, "start": s, "end": e} for w, s, e in words
+        ],
         "raw": {
             "results": {
                 "channels": [
@@ -861,6 +872,132 @@ class RecoveryReportWireShapeTests(unittest.TestCase):
         # renderer's parser accepts, so it must hold by construction.
         self.assertEqual(RecoveryReport(spans=[(4.0, 3.0)]).spans_sec(), 0.0)
 
+
+class RepairedEnvelopeFieldsTests(unittest.IsolatedAsyncioTestCase):
+    """A repaired envelope's numbers mean what an unrepaired one's do.
+
+    ``deepgram_recovery`` was not in the audit's discovery snapshot;
+    these are its own findings. ``run_recovery`` set ``durationSec`` and
+    ``coveredEndSec`` to the same merged end, which put the pair back in
+    lockstep on every repaired stop — the state B-006 fixed for the
+    un-repaired one, and the pair the renderer compares to decide
+    whether the envelope covers the recording.
+    """
+
+    async def test_a_spliced_interim_extends_duration_but_not_coverage(self):
+        payload = {
+            "type": "final",
+            "text": "committed guessed",
+            "segments": [
+                _segment(0.0, 1.0, [("committed", 0.0, 1.0)]),
+                {
+                    "start": 7.0,
+                    "end": 8.0,
+                    "text": "guessed",
+                    "source": "interim-fallback",
+                    "words": [{"word": "guessed", "start": 7.0, "end": 8.0}],
+                },
+            ],
+            "streamedSec": 10.0,
+            "stats": {},
+        }
+
+        def fake_rest(**kwargs):
+            return _rest_result([("восстановлено", 0.1, 0.6)])
+
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(hole_spans=((3.0, 3.6),)),
+            stream_death_sec=None,
+            pcm=_pcm(10.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertEqual(out["durationSec"], 8.0)
+        self.assertLess(
+            out["coveredEndSec"],
+            out["durationSec"],
+            "a spliced interim was reported as decoded coverage",
+        )
+
+    async def test_a_recovered_word_inside_a_wordless_final_is_dropped(self):
+        # The other half of the coverage rule, which the live splice
+        # applies and this one did not: a final that arrived WITHOUT a
+        # word list accounts for its whole span, and there is no
+        # covering WORD to name. Spans are padded before decoding, so a
+        # re-decode reaches into ground such a final owns.
+        payload = {
+            "type": "final",
+            "text": "это весь мой текст",
+            "segments": [
+                _segment(0.0, 2.0, [("начало", 0.0, 2.0)]),
+                # No word list — only a span.
+                {"start": 4.0, "end": 6.0, "text": "это весь мой текст"},
+            ],
+            "streamedSec": 8.0,
+            "stats": {},
+        }
+
+        def fake_rest(**kwargs):
+            # The span handed over is the padded hole (2.2-3.5 s); the
+            # decoder places this word past its end, which is exactly
+            # what padding plus decoder drift produces — squarely inside
+            # the wordless final at 4.0-6.0 s.
+            return _rest_result([("дубликат", 1.9, 2.3)])
+
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(hole_spans=((2.5, 3.2),)),
+            stream_death_sec=None,
+            pcm=_pcm(8.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertNotIn("дубликат", out["text"])
+        self.assertEqual(out["stats"]["recovery"]["words"], 0)
+
+
+class DecodedEndRuleTests(unittest.TestCase):
+    def test_an_interim_hypothesis_is_not_a_decode(self):
+        from backend.deepgram_recovery import decoded_end_sec
+
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "final"},
+            {"start": 5.0, "end": 6.0, "text": "rest", "source": "recovery"},
+            {"start": 7.0, "end": 8.0, "text": "guess", "source": "interim-fallback"},
+        ]
+        self.assertEqual(decoded_end_sec(segments), 6.0)
+
+    def test_no_segments_is_zero(self):
+        from backend.deepgram_recovery import decoded_end_sec
+
+        self.assertEqual(decoded_end_sec([]), 0.0)
+        self.assertEqual(decoded_end_sec(None), 0.0)
+
+
+class RestWordSourceTests(unittest.TestCase):
+    def test_words_come_from_the_adapter_key_not_the_payload_shape(self):
+        # ``backend.remote_deepgram`` owns where Deepgram puts words in
+        # its JSON. This module reached into
+        # ``raw["results"]["channels"][0]["alternatives"][0]``, which is
+        # that knowledge written out a second time.
+        from backend.deepgram_recovery import _words_from_rest_result
+
+        out = _words_from_rest_result(
+            {"words": [{"word": "слово", "start": 0.2, "end": 0.6}]}, 5.0
+        )
+        self.assertEqual(
+            out,
+            [{"word": "слово", "start": 5.2, "end": 5.6, "source": RECOVERY_SOURCE}],
+        )
+
+    def test_a_response_without_words_yields_none(self):
+        from backend.deepgram_recovery import _words_from_rest_result
+
+        self.assertEqual(_words_from_rest_result({"text": "x"}, 0.0), [])
+        self.assertEqual(_words_from_rest_result(None, 0.0), [])
 
 if __name__ == "__main__":
     unittest.main()

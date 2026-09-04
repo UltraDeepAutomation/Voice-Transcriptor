@@ -207,12 +207,31 @@ class CoveredEndSecTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(session.partial_result()["coveredEndSec"], 0.0)
 
-    def test_a_recovered_segment_is_not_committed_coverage_either(self):
-        # ``deepgram_recovery`` stamps what it splices with its own
-        # source; the rule is "a provider final", not "not interim".
+    def test_a_recovered_segment_does_count_as_coverage(self):
+        # The rule is "a DECODER reported here", not "a live final".
+        # ``deepgram_recovery`` splices real REST decodes and stamps them
+        # with its own source; those are coverage, and the recovery pass
+        # reports ``coveredEndSec`` by the same rule
+        # (``decoded_end_sec``) so a stop and a repaired stop cannot
+        # mean different things by the field. Only an interim hypothesis
+        # is excluded.
         session = self._session()
         session._finalized_segments = [
             {"start": 0.0, "end": 1.0, "text": "committed"},
             {"start": 5.0, "end": 6.0, "text": "re-decoded", "source": "recovery"},
+            {
+                "start": 7.0,
+                "end": 8.0,
+                "text": "guessed",
+                "source": INTERIM_FALLBACK_SOURCE,
+            },
         ]
-        self.assertEqual(session.partial_result()["coveredEndSec"], 1.0)
+        envelope = session.partial_result()
+        self.assertEqual(envelope["durationSec"], 8.0)
+        self.assertEqual(envelope["coveredEndSec"], 6.0)
+
+    def test_the_rule_is_shared_with_the_recovery_pass(self):
+        from backend.deepgram_recovery import decoded_end_sec as recovery_rule
+        from backend.remote_deepgram_live import decoded_end_sec
+
+        self.assertIs(recovery_rule, decoded_end_sec)

@@ -361,6 +361,68 @@ def word_accounted_for(word: dict, others: Iterable[dict]) -> bool:
     return any(_same_spoken_word(word, other) for other in others)
 
 
+# What a segment created by the interim splice is stamped with. Read
+# back by ``decoded_end_sec``: a spliced hypothesis extends the
+# transcript but is not a decode, so it must never raise
+# ``coveredEndSec``.
+INTERIM_FALLBACK_SOURCE = "interim-fallback"
+
+
+def decoded_end_sec(segments: Iterable[dict]) -> float:
+    """How far a DECODER has reported on this transcript, in seconds.
+
+    Provider finals and REST re-decodes count; interim hypotheses the
+    live splice folded in (``INTERIM_FALLBACK_SOURCE``) do not — an
+    interim is a guess, and this is what the envelope's
+    ``coveredEndSec`` carries and the renderer reads to decide whether
+    the envelope covers the recording. ``durationSec`` is the other
+    number: how long the transcript IS, everything included.
+
+    One rule, asked by the live session about its own finals and by
+    ``backend.deepgram_recovery`` about the repaired transcript, so a
+    stop and a repaired stop cannot mean different things by the field.
+    """
+    return max(
+        (
+            as_float(seg.get("end"))
+            for seg in (segments or [])
+            if seg.get("source") != INTERIM_FALLBACK_SOURCE
+        ),
+        default=0.0,
+    )
+
+
+def spanless_coverage_spans(segments: Iterable[dict]) -> list[tuple[float, float]]:
+    """The merged spans of finals that arrived WITHOUT a word list.
+
+    Their span is the only thing knowable about what they contain, so
+    it is the coverage test for them — and only for them. Merged first,
+    because two adjacent such finals meeting at 10.0 s cover a word
+    centred exactly on the boundary that neither covers alone.
+    """
+    return union_spans(
+        (record["start"], record["end"])
+        for seg in (segments or [])
+        for record in segment_word_records(seg)
+        if record.get(SPANLESS_WORD_FLAG)
+    )
+
+
+def word_inside_spanless_final(word: dict, segments: Iterable[dict]) -> bool:
+    """Is this word's CENTRE inside a final that carried no word list?
+
+    Shared with ``backend.deepgram_recovery``: a re-decoded word landing
+    inside a wordless final is already accounted for, and there is no
+    covering WORD to name it — only a span. Placing it anyway would put
+    the same speech in the transcript twice.
+    """
+    center = (as_float(word.get("start")) + as_float(word.get("end"))) / 2.0
+    return any(
+        c_start < center < c_end
+        for c_start, c_end in spanless_coverage_spans(segments)
+    )
+
+
 def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dict]:
     """Which final word answers for ``word`` — or ``None`` if none does.
 
@@ -900,12 +962,6 @@ class SpliceOutcome:
     @property
     def total(self) -> int:
         return self.inserted + self.appended
-
-
-# What a segment created by the interim splice is stamped with. Read
-# back by ``_committed_end_sec``: a spliced hypothesis extends the
-# transcript but must never be reported as committed coverage.
-INTERIM_FALLBACK_SOURCE = "interim-fallback"
 
 
 def splice_words_into_segments(
@@ -2441,10 +2497,7 @@ class DeepgramLiveSession:
         which neither of them covers on its own. There is no covering
         WORD to name in this case, only a span.
         """
-        center = (as_float(word.get("start")) + as_float(word.get("end"))) / 2.0
-        return any(
-            c_start < center < c_end for c_start, c_end in self._spanless_coverage()
-        )
+        return word_inside_spanless_final(word, self._finalized_segments)
 
     def _note_overruled_word(self, word: dict, owner: dict) -> None:
         """Record an interim word a DIFFERENTLY-SPELLED final answered for.
@@ -2504,12 +2557,7 @@ class DeepgramLiveSession:
         a final accounts for, so this module, the dual merge and the
         recovery pass cannot answer that question differently.
         """
-        return self._union(
-            (record["start"], record["end"])
-            for seg in self._finalized_segments
-            for record in segment_word_records(seg)
-            if record.get(SPANLESS_WORD_FLAG)
-        )
+        return spanless_coverage_spans(self._finalized_segments)
 
     def _host_final_for(self, word: dict) -> Optional[dict]:
         """This session's finals asked ``host_segment_for``."""
@@ -3231,14 +3279,7 @@ class DeepgramLiveSession:
         the hole. ``durationSec`` still counts everything, because the
         transcript genuinely is that long.
         """
-        return max(
-            (
-                float(seg.get("end") or 0.0)
-                for seg in self._finalized_segments
-                if not seg.get("source")
-            ),
-            default=0.0,
-        )
+        return decoded_end_sec(self._finalized_segments)
 
     def partial_result(self) -> dict:
         """Best-effort envelope from whatever is finalized RIGHT NOW.
@@ -3857,12 +3898,15 @@ __all__ = [
     # and when a final already accounts for one.
     "as_float",
     "covering_final_word",
+    "decoded_end_sec",
     "drop_repeated_seam_ngrams",
     "final_words_cover",
     "merge_seam_fragments",
     "normalize_words",
     "segment_word_records",
     "segment_words",
+    "spanless_coverage_spans",
+    "word_inside_spanless_final",
     "time_overlap",
     "token_stem",
     "word_accounted_for",

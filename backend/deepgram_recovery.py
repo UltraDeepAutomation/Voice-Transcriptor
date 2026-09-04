@@ -67,6 +67,7 @@ from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 from backend.remote_deepgram import deepgram_transcribe
 from backend.remote_deepgram_live import (
+    INTERIM_FALLBACK_SOURCE,
     DeepgramLiveConfig,
     as_float,
     confirmed_silence_gap,
@@ -79,8 +80,10 @@ from backend.remote_deepgram_live import (
     segment_words,
     splice_words_into_segments,
     subtract_spans,
+    decoded_end_sec,
     tail_needs_recovery,
     union_spans,
+    word_inside_spanless_final,
 )
 
 logger = logging.getLogger(__name__)
@@ -389,13 +392,15 @@ def _words_from_rest_result(result: Any, offset_sec: float) -> list[dict]:
     ``offset_sec`` early. Applied here, in the one place a REST word
     becomes an internal word record, exactly as ``audio_offset_sec``
     does for a socket that took over mid-recording.
+
+    The words come off the ADAPTER's ``words`` key, not out of
+    ``raw["results"]["channels"][0]["alternatives"][0]`` — that path is
+    the provider's payload shape, which is ``backend.remote_deepgram``'s
+    business and was spelled out here as well. Normalising them is this
+    side's rule, so the adapter hands them over raw.
     """
     raw = result if isinstance(result, dict) else {}
-    try:
-        alternative = raw["raw"]["results"]["channels"][0]["alternatives"][0]
-    except (KeyError, IndexError, TypeError):
-        return []
-    words = normalize_words(alternative.get("words"))
+    words = normalize_words(raw.get("words"))
     out: list[dict] = []
     for word in words:
         out.append(
@@ -473,6 +478,14 @@ async def recover_spans(
     except asyncio.TimeoutError:
         for task in tasks:
             task.cancel()
+        # Collected, so a decode that raised inside its thread after the
+        # deadline is not an unretrieved task exception on the loop.
+        # ``asyncio.to_thread`` cannot interrupt a running thread, so
+        # these settle when their HTTP call returns; nothing waits for
+        # them and their words are not used.
+        asyncio.ensure_future(
+            asyncio.gather(*tasks, return_exceptions=True)
+        )
         logger.warning(
             "recovery: %d span(s) did not decode within %.2fs; the envelope "
             "reports them as uncovered",
@@ -523,16 +536,24 @@ def splice_recovered_words(
     fresh = [
         word for word in words
         if covering_final_word(word, committed) is None
+        # And the other half of the coverage rule, the one the live
+        # splice also applies: a final that arrived WITHOUT a word list
+        # accounts for its whole span, and there is no covering word to
+        # name. Spans are padded before decoding, so a re-decode reaches
+        # into ground such a final owns — and without this the same
+        # speech went into the transcript twice.
+        and not word_inside_spanless_final(word, segments)
     ]
     # Said out loud, both times. A recovery that decodes ten words and
     # ships none is either working exactly as intended (the padding
     # returned words the transcript already had) or misfiring, and the
     # difference is invisible unless the two reasons are counted apart.
     if len(fresh) != len(words):
+        kept = {id(w) for w in fresh}
         logger.info(
             "recovery: %d decoded word(s) already owned by the transcript: %s",
             len(words) - len(fresh),
-            [str(w.get("word")) for w in words if w not in fresh][:12],
+            [str(w.get("word")) for w in words if id(w) not in kept][:12],
         )
     if not fresh:
         return list(segments), 0
@@ -614,9 +635,13 @@ async def run_recovery(
     costs nothing. Passing the bytes directly is equivalent and is what
     a caller that already holds the audio does.
 
-    Never raises: a recovery that cannot run leaves the envelope exactly
-    as it arrived, with the spans it could not cover still counted in
-    ``uncoveredSpeechSec``.
+    Failures INSIDE the pass are absorbed here — a span that will not
+    decode, a budget that runs out — and cost only the spans they
+    touched. Failures of the pass itself are not: the guarantee that a
+    broken recovery still ships the envelope unrepaired belongs to the
+    caller, and ``backend.main._apply_live_recovery`` is where it is
+    implemented and stated. Saying "never raises" here as well described
+    a try/except this function does not have.
     """
     started = time.perf_counter()
     segments = list(payload.get("segments") or [])
@@ -676,10 +701,18 @@ async def run_recovery(
     out = dict(payload)
     out["segments"] = segments
     out["text"] = join_segment_texts(segments)
-    covered = covered_spans(segments)
-    covered_end = max((end for _s, end in covered), default=0.0)
-    out["durationSec"] = round(covered_end, 3)
-    out["coveredEndSec"] = round(covered_end, 3)
+    # ``durationSec`` is how long the transcript IS — every segment,
+    # including the interim hypotheses the live splice folded in.
+    out["durationSec"] = round(
+        max((as_float(seg.get("end")) for seg in segments), default=0.0), 3
+    )
+    # ``coveredEndSec`` is how far a DECODER reported: provider finals
+    # and the REST re-decodes this pass just spliced, never an interim
+    # hypothesis. Taking the merged end for both put them back in
+    # lockstep on every repaired stop, which is the state B-006 fixed
+    # for the un-repaired one — and the renderer compares exactly this
+    # pair to decide whether the envelope covers the recording.
+    out["coveredEndSec"] = round(decoded_end_sec(segments), 3)
     # Re-asked, not adjusted: whatever this function would still call
     # uncovered IS what is still uncovered, so the number the envelope
     # reports and the decision the recovery made can never drift apart.
@@ -704,6 +737,7 @@ __all__ = [
     "InterimEvidence",
     "RecoveryReport",
     "covered_spans",
+    "decoded_end_sec",
     "evidence_from_session",
     "missing_spans",
     "pcm_span_wav",
