@@ -26,6 +26,8 @@ import {
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
+  freezeCaptureForStop,
+  handOverHeldCapture,
   type WarmHoldLifecycleRelease,
 } from "./capture-warm";
 import {
@@ -3868,15 +3870,19 @@ async function selectCanonicalCapturedAudio(opts: {
 // Hardwired local timeout for ``stopMediaRecorderAndFlush``.
 //
 // The old code reused ``UI_TOKENS.polling.remoteChunkSettleTimeoutMs``
-// (3000 ms) as a safety ceiling. That was sized for the old stop
-// order where MediaRecorder had to fully flush WHILE the mic stream
-// was still live — the recorder's ``stop`` event could take up to a
-// second on some platforms. After the tail-fix reorder, stream.stop()
-// runs BEFORE this function, so the MediaRecorder has no more data
-// coming and fires its ``stop`` event within a handful of
-// milliseconds. 500 ms is plenty of safety margin for any platform
-// hiccup and saves up to 2.5 seconds on the stop path in the worst
-// case.
+// (3000 ms) as a safety ceiling, and it was awaited in the middle of the
+// stop path, so every stop paid for it. It is now started at step 1 of
+// the stop sequence and awaited only where ``recordedWebmChunks`` is
+// read, which makes the ceiling a bound on lateness rather than on
+// latency.
+//
+// What a hit ceiling can cost is the container's final sub-second chunk
+// — and only the container's. The canonical audio is the PCM spool,
+// whose completeness is proven by the worklet flush ack, so a WebM that
+// comes up short simply loses the coverage comparison in
+// ``selectCanonicalCapturedAudio`` instead of shortening the recording.
+// 500 ms is therefore ample even on the warm-hold branch, where the
+// microphone is deliberately still open while the recorder stops.
 const MEDIA_RECORDER_STOP_FALLBACK_MS = 500;
 
 async function stopMediaRecorderAndFlush(): Promise<void> {
@@ -8770,16 +8776,66 @@ function releaseWarmCapture(reason: string): void {
 }
 
 /**
- * Keep the capture graph of the session that is ending, if it may be
- * kept, and hand the pre-roll ring to the worklet on the way out.
+ * Release the microphone held in the module slot.
  *
- * Called from the stop teardown BEFORE the unconditional disconnects:
- * on a "yes" the module slots are emptied here, so every teardown step
- * that follows finds a null and does nothing, and the graph is left
- * running with its worklet armed. On a "no" nothing moves and the
- * ordinary teardown releases everything exactly as it did before.
+ * One helper, because the stop path now has two places that must stop
+ * the same track — step 1 when the hold is refused, and the handover
+ * when a planned hold does not complete — and "the microphone is
+ * released on every path" is not a property you want spelled out twice.
  */
-function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string } {
+function stopCaptureTracks(): void {
+  try {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+  } catch (e) {
+    console.debug("MediaStream stop failed (non-fatal)", e);
+  }
+}
+
+/**
+ * The outcome of the hold decision, taken at the top of the stop
+ * sequence and acted on in the teardown.
+ *
+ * The decision and the ownership move are two steps for one reason:
+ * ``decideWarmHold`` asks whether the track is ``readyState === "live"``,
+ * and the first thing the stop sequence used to do was stop it. Asking
+ * afterwards can only ever answer "track-ended" — which is exactly what
+ * production logs showed, 15 stops out of 15, with every start cold.
+ * So the question is asked first, while the answer still means
+ * something, and the graph is handed over later, at the point in the
+ * teardown where the module slots are given up anyway.
+ */
+interface WarmHoldPlan {
+  hold: boolean;
+  reason: string;
+  deviceLabel: string;
+  /** The graph this plan promised to keep. Null unless ``hold``. */
+  ac: AudioContext | null;
+  stream: MediaStream | null;
+  src: MediaStreamAudioSourceNode | null;
+  workletNode: AudioWorkletNode | null;
+}
+
+function refusedWarmHold(reason: string, deviceLabel: string): WarmHoldPlan {
+  return { hold: false, reason, deviceLabel, ac: null, stream: null, src: null, workletNode: null };
+}
+
+/**
+ * Decide whether the capture graph of the ending session may be kept,
+ * and — on a "yes" — arm the worklet's pre-roll ring.
+ *
+ * Called as step 1 of the stop sequence, in place of stopping the
+ * microphone track. Arming gives the same guarantee that
+ * ``track.stop()`` gave: the worklet flushes what it was holding and
+ * then delivers nothing further, so no frame captured after this point
+ * can reach ``pcmSink.append`` or the live socket. The difference is
+ * that the microphone itself stays open, which is the entire point of
+ * the mechanism.
+ *
+ * Module slots are deliberately LEFT IN PLACE here — the flush barrier
+ * that follows reads ``workletNode``. Ownership moves in
+ * ``commitWarmCaptureHold``.
+ */
+function planWarmCaptureHold(): WarmHoldPlan {
   const deviceLabel = micTrackLabel(stream);
   const decision = decideWarmHold({
     warmHoldMs: UI_TOKENS.capture.warmHoldMs,
@@ -8791,14 +8847,58 @@ function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string
     // microphone staying open.
     workletCapture: !!workletNode && scriptFallbackState !== "committed",
   });
-  if (!decision.hold) return { ...decision, deviceLabel };
+  if (!decision.hold) return refusedWarmHold(decision.reason, deviceLabel);
   const heldAc = ac;
   const heldStream = stream;
   const heldSrc = src;
   const heldNode = workletNode;
   if (!heldAc || !heldStream || !heldSrc || !heldNode) {
-    return { hold: false, reason: "incomplete-graph", deviceLabel };
+    return refusedWarmHold("incomplete-graph", deviceLabel);
   }
+  try {
+    heldNode.port.postMessage({ type: "arm", preRollMs: UI_TOKENS.capture.preRollMs });
+  } catch (e) {
+    // The port is gone, so the ring can never be filled and the hold
+    // would buy nothing but a lit microphone indicator.
+    console.debug("warm capture: arming the pre-roll ring failed", e);
+    return refusedWarmHold("arm-failed", deviceLabel);
+  }
+  return {
+    hold: true,
+    reason: decision.reason,
+    deviceLabel,
+    ac: heldAc,
+    stream: heldStream,
+    src: heldSrc,
+    workletNode: heldNode,
+  };
+}
+
+/**
+ * Move the planned graph out of the module slots and into the hold.
+ *
+ * Called from the stop teardown BEFORE the unconditional disconnects:
+ * on a "yes" the module slots are emptied here, so every teardown step
+ * that follows finds a null and does nothing, and the graph is left
+ * running with its worklet armed. On a "no" nothing moves and the
+ * ordinary teardown releases everything exactly as it did before.
+ *
+ * Returns whether the hold actually took, which is not the same as
+ * whether it was planned: anything that replaced a module slot between
+ * the two steps invalidates the plan, and a graph we can no longer
+ * account for is released rather than held.
+ */
+function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
+  if (!plan.hold) return false;
+  if (ac !== plan.ac || stream !== plan.stream || src !== plan.src || workletNode !== plan.workletNode) {
+    console.warn("warm capture: graph changed between the hold decision and the handover; releasing");
+    return false;
+  }
+  const heldAc = plan.ac;
+  const heldStream = plan.stream;
+  const heldSrc = plan.src;
+  const heldNode = plan.workletNode;
+  if (!heldAc || !heldStream || !heldSrc || !heldNode) return false;
   // Per-session edges come off HERE, while ``src`` is still in the
   // module slot: the teardown steps that follow all read that slot, and
   // this function is about to empty it. The analyser and the pre-armed
@@ -8810,21 +8910,13 @@ function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string
     try { heldSrc.disconnect(analyser); } catch { /* never connected */ }
   }
   teardownScriptProcessorCapture();
-  try {
-    heldNode.port.postMessage({ type: "arm", preRollMs: UI_TOKENS.capture.preRollMs });
-  } catch (e) {
-    // The port is gone, so the ring can never be filled and the hold
-    // would buy nothing but a lit microphone indicator.
-    console.debug("warm capture: arming the pre-roll ring failed", e);
-    return { hold: false, reason: "arm-failed", deviceLabel };
-  }
   warmCapture = {
     ac: heldAc,
     stream: heldStream,
     src: heldSrc,
     workletNode: heldNode,
     deviceId: micTrackDeviceId(heldStream),
-    deviceLabel,
+    deviceLabel: plan.deviceLabel,
     heldSince: Date.now(),
     expiryTimer: window.setTimeout(
       () => releaseWarmCaptureOnLifecycle("ttl"),
@@ -8837,7 +8929,7 @@ function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string
   stream = null;
   src = null;
   workletNode = null;
-  return { ...decision, deviceLabel };
+  return true;
 }
 
 /**
@@ -10788,9 +10880,14 @@ async function stopLive(
   //
   // The enforced ordering is:
   //
-  //   1. Stop the MediaStream tracks. This synchronously freezes the
-  //      microphone — no new AudioWorklet render quanta will ever be
-  //      produced after this returns.
+  //   1. Freeze the capture pipeline. Either the MediaStream tracks are
+  //      stopped, or — when the graph is being kept warm for the next
+  //      press — the worklet is armed, which flushes what it holds and
+  //      then delivers nothing further. Both make the same guarantee:
+  //      no frame captured after this point can reach ``pcmSink.append``
+  //      or the live socket. The hold decision has to be taken HERE
+  //      rather than in the teardown, because it asks whether the track
+  //      is still ``live`` and stopping it answers that question for it.
   //
   //   2. flushWorkletPort + waitForCaptureDrain. The worklet has a
   //      MessagePort queue; anything posted BEFORE step 1 returned is
@@ -10819,16 +10916,39 @@ async function stopLive(
   // stopMediaRecorderAndFlush (up to 3s!) → stream.stop() → finalize.
   // That left the mic live for up to 3 seconds while MediaRecorder was
   // being flushed, and those trailing frames could arrive at Deepgram
-  // AFTER CloseStream and get dropped. Reordering stream.stop() to
+  // AFTER CloseStream and get dropped. Reordering the pipeline freeze to
   // step 1 fixes this at the root.
   const stopEntryBuffer = getLiveTranscriptBuffer(sessionUiToken);
   console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? liveTranscriptSegments.length} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length}`);
-  try {
-    if (stream) stream.getTracks().forEach((t) => t.stop());
-  } catch (e) {
-    console.debug("MediaStream stop failed (non-fatal)", e);
-  }
-  mark("stream.getTracks.stop");
+  // §4.7: the graph outlives the recording when it may, and the question
+  // "may it?" is asked while the track is still live. The ordering lives
+  // in ./capture-warm with the rest of the warm-capture policy, so it is
+  // a unit test rather than a claim about a 2000-line function.
+  const warmHoldPlan = freezeCaptureForStop({
+    planHold: planWarmCaptureHold,
+    stopTracks: stopCaptureTracks,
+  });
+  console.log(
+    `[trace stopLive] warm hold=${warmHoldPlan.hold ? 1 : 0} reason=${warmHoldPlan.reason} ` +
+    `ttlMs=${UI_TOKENS.capture.warmHoldMs} device="${warmHoldPlan.deviceLabel}"`,
+  );
+  mark("captureFreeze");
+  // The WebM container is an INDEPENDENT sink fed by the MediaStream,
+  // not by the worklet, so arming the worklet does not stop it — only
+  // ``recorder.stop()`` does. It is kicked off here, in the same breath
+  // as the freeze above, so a warm hold (which deliberately leaves the
+  // microphone open) cannot keep writing post-stop audio into the
+  // container that ``selectCanonicalCapturedAudio`` later weighs.
+  //
+  // R3 (BUGS_AUDIT_2026-09-03 §2.4/§4.4): it is not AWAITED here. The
+  // ordering invariant — every audio frame sent before the finalize
+  // frame — is the worklet barrier below, not this flush, and blocking
+  // on it added up to MEDIA_RECORDER_STOP_FALLBACK_MS of pure latency
+  // before the backend even learned the recording had ended. It is
+  // awaited only where its output (``recordedWebmChunks``) is read.
+  const recorderFlushPromise = stopMediaRecorderAndFlush().then(() => {
+    mark("stopMediaRecorderAndFlush");
+  });
 
   const t0Drain = performance.now();
   // The ack IS the barrier. `waitForWorkletDrain` is the fallback for
@@ -10867,20 +10987,6 @@ async function stopLive(
   }
   mark("waitForCaptureDrain");
   const drainDur = performance.now() - t0Drain - flushDur;
-  // R3 (BUGS_AUDIT_2026-09-03 §2.4/§4.4): stopMediaRecorderAndFlush is an
-  // INDEPENDENT WebM sink (up to MEDIA_RECORDER_STOP_FALLBACK_MS = 500ms)
-  // with no bearing on whether every PCM sample has reached the live
-  // socket — the worklet barrier above already proves that. Blocking the
-  // {type:"finalize"} send on this recorder flush added up to 500ms of
-  // pure latency before the backend even learned the recording had
-  // ended. It now runs CONCURRENTLY with the finalize send below and is
-  // only awaited where its output (``recordedWebmChunks``) is actually
-  // read, at ``selectCanonicalCapturedAudio``. The ordering invariant —
-  // every audio frame sent before the finalize frame — is unaffected:
-  // that barrier is the worklet drain above, not this WebM flush.
-  const recorderFlushPromise = stopMediaRecorderAndFlush().then(() => {
-    mark("stopMediaRecorderAndFlush");
-  });
   console.log(`[trace stopLive] drained ackBarrier=${workletAcked ? 1 : 0} flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? liveTranscriptSegments.length}`);
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
@@ -11061,17 +11167,19 @@ async function stopLive(
       console.warn(`live teardown step failed: ${step}`, e);
     }
   };
-  // §4.7: the graph outlives the recording when it may. This runs
-  // BEFORE the disconnect chain and, on a "yes", empties every module
-  // slot it takes ownership of — so each step below finds a null and
-  // does nothing, and the mic, context and armed worklet stay alive for
-  // the next press. On a "no" nothing moves and the teardown releases
-  // everything exactly as it always did.
-  const warmHold = holdWarmCapture();
-  console.log(
-    `[trace stopLive] warm hold=${warmHold.hold ? 1 : 0} reason=${warmHold.reason} ` +
-    `ttlMs=${UI_TOKENS.capture.warmHoldMs} device="${warmHold.deviceLabel}"`,
-  );
+  // §4.7: the handover of the graph decided at step 1 of the stop
+  // sequence. This runs BEFORE the disconnect chain and, on a "yes",
+  // empties every module slot it takes ownership of — so each step below
+  // finds a null and does nothing, and the mic, context and armed
+  // worklet stay alive for the next press. On a "no" nothing moves and
+  // the teardown releases everything exactly as it always did.
+  handOverHeldCapture({
+    plan: warmHoldPlan,
+    commit: commitWarmCaptureHold,
+    // Planned but not taken: the microphone was never stopped at step 1
+    // on the strength of that plan, so it has to be stopped here.
+    stopTracks: stopCaptureTracks,
+  });
   tearDown("workletNode.disconnect", () => {
     detachWorkletCapture("live teardown");
   });

@@ -307,3 +307,78 @@ export function captureElapsedMs(input: CaptureElapsedInput): number {
   if (clocks.length === 0) return 0;
   return Math.max(0, input.now - Math.min(...clocks));
 }
+
+/**
+ * The two-step cooperation that freezes capture at Stop.
+ *
+ * Everything above answers a question. These two sequence the answers,
+ * and they exist because the sequence is where the mechanism was broken
+ * for its entire life: ``decideWarmHold`` asks whether the capture track
+ * is ``readyState === "live"``, and the stop path stopped that track two
+ * hundred lines before it asked. ``MediaStreamTrack.stop()`` moves the
+ * track to ``"ended"`` synchronously, so the answer was "track-ended"
+ * every time — 15 stops out of 15 in the production log, with all 14
+ * starts cold and ``preRollMs=0``. The predicate was tested to its last
+ * branch; the order it runs in was not testable at all, so it was not
+ * tested, and that is precisely the seam that failed.
+ *
+ * They are written with injected dependencies for the same reason the
+ * predicates are pure: so the ORDER is a unit test rather than a claim.
+ */
+export interface CaptureFreezeDeps<P extends { hold: boolean }> {
+  /**
+   * Take the hold decision. Must run while the capture track is still
+   * live, which is the whole point of it being called first.
+   */
+  planHold: () => P;
+  /** Stop the microphone track. */
+  stopTracks: () => void;
+}
+
+/**
+ * Step 1 of the stop sequence: freeze the capture pipeline.
+ *
+ * On a refused hold the track is stopped, exactly as before. On an
+ * accepted one it is left running and the pipeline is frozen by the
+ * armed worklet instead — which flushes what it holds and then delivers
+ * nothing further, so the guarantee the stop path depends on ("no frame
+ * captured after this point reaches the sink or the socket") is
+ * unchanged, while the microphone stays open for the next press.
+ */
+export function freezeCaptureForStop<P extends { hold: boolean }>(
+  deps: CaptureFreezeDeps<P>,
+): P {
+  const plan = deps.planHold();
+  if (!plan.hold) deps.stopTracks();
+  return plan;
+}
+
+export interface CaptureHandOverDeps<P extends { hold: boolean }> {
+  /** The plan returned by {@link freezeCaptureForStop}. */
+  plan: P;
+  /**
+   * Move the graph out of the renderer's module slots and into the
+   * hold. Returns false when the graph is no longer the one that was
+   * planned for and therefore cannot be accounted for.
+   */
+  commit: (plan: P) => boolean;
+  /** Stop the microphone track. */
+  stopTracks: () => void;
+}
+
+/**
+ * Step N of the teardown: hand the planned graph over, or release it.
+ *
+ * The microphone was NOT stopped at step 1 on the strength of the plan,
+ * so a plan that does not complete has to stop it here. Without this the
+ * one failure mode of the reorder would be the worst one available: a
+ * microphone left open with nothing holding it, until the page goes away.
+ */
+export function handOverHeldCapture<P extends { hold: boolean }>(
+  deps: CaptureHandOverDeps<P>,
+): boolean {
+  if (!deps.plan.hold) return false;
+  const held = deps.commit(deps.plan);
+  if (!held) deps.stopTracks();
+  return held;
+}

@@ -7,6 +7,8 @@ import {
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
+  freezeCaptureForStop,
+  handOverHeldCapture,
   isBluetoothInputLabel,
   type WarmHoldInput,
   type WarmReuseInput,
@@ -240,5 +242,115 @@ describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
     // powerMonitor event is.
     const sleep: WarmHoldLifecycleRelease = "system-suspend";
     expect(WARM_HOLD_LIFECYCLE_RELEASES).toContain(sleep);
+  });
+});
+
+describe("the stop-sequence ordering (F-001)", () => {
+  /**
+   * Records the order in which the injected steps ran. The defect this
+   * guards against was not a wrong answer, it was a right answer to a
+   * question asked too late: the microphone track was stopped before
+   * anyone asked whether it should be kept, so ``decideWarmHold`` saw
+   * ``trackLive: false`` and returned "track-ended" on every stop the
+   * product ever performed.
+   */
+  function trace(): { calls: string[]; note: (name: string) => void } {
+    const calls: string[] = [];
+    return { calls, note: (name: string) => { calls.push(name); } };
+  }
+
+  it("takes the hold decision BEFORE the microphone track is stopped", () => {
+    const { calls, note } = trace();
+    freezeCaptureForStop({
+      planHold: () => {
+        note("planHold");
+        return { hold: false, reason: "bluetooth" };
+      },
+      stopTracks: () => note("stopTracks"),
+    });
+    expect(calls).toEqual(["planHold", "stopTracks"]);
+  });
+
+  it("leaves the microphone open when the hold was accepted", () => {
+    const { calls, note } = trace();
+    const plan = freezeCaptureForStop({
+      planHold: () => {
+        note("planHold");
+        return { hold: true, reason: "held" };
+      },
+      stopTracks: () => note("stopTracks"),
+    });
+    expect(calls).toEqual(["planHold"]);
+    expect(plan).toEqual({ hold: true, reason: "held" });
+  });
+
+  it("returns the plan verbatim so the trace line reports the real reason", () => {
+    const plan = freezeCaptureForStop({
+      planHold: () => ({ hold: false, reason: "script-fallback", deviceLabel: "USB Mic" }),
+      stopTracks: () => { /* refused hold */ },
+    });
+    expect(plan.reason).toBe("script-fallback");
+    expect(plan.deviceLabel).toBe("USB Mic");
+  });
+
+  it("hands the graph over when the plan still holds at teardown", () => {
+    const { calls, note } = trace();
+    const plan = { hold: true, reason: "held" };
+    const held = handOverHeldCapture({
+      plan,
+      commit: (p) => {
+        note("commit");
+        expect(p).toBe(plan);
+        return true;
+      },
+      stopTracks: () => note("stopTracks"),
+    });
+    expect(held).toBe(true);
+    expect(calls).toEqual(["commit"]);
+  });
+
+  it("stops the microphone when a planned hold does not complete", () => {
+    // The one failure mode the reorder could introduce is the worst one
+    // available: step 1 declined to stop the track because a hold was
+    // planned, and then the hold did not take.
+    const { calls, note } = trace();
+    const held = handOverHeldCapture({
+      plan: { hold: true, reason: "held" },
+      commit: () => {
+        note("commit");
+        return false;
+      },
+      stopTracks: () => note("stopTracks"),
+    });
+    expect(held).toBe(false);
+    expect(calls).toEqual(["commit", "stopTracks"]);
+  });
+
+  it("does not try to hand over a hold that was never planned", () => {
+    const { calls, note } = trace();
+    const held = handOverHeldCapture({
+      plan: { hold: false, reason: "track-ended" },
+      commit: () => {
+        note("commit");
+        return true;
+      },
+      stopTracks: () => note("stopTracks"),
+    });
+    expect(held).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("end to end: a live track is held, and the same graph refused once it has ended", () => {
+    // The predicate and the ordering together. With the old order the
+    // second case was the ONLY reachable one.
+    const live = decideWarmHold({ ...holdInput, trackLive: true });
+    expect(freezeCaptureForStop({ planHold: () => live, stopTracks: () => { /* unused */ } }))
+      .toEqual({ hold: true, reason: "held" });
+
+    const ended = decideWarmHold({ ...holdInput, trackLive: false });
+    let stopped = 0;
+    expect(freezeCaptureForStop({ planHold: () => ended, stopTracks: () => { stopped += 1; } }))
+      .toEqual({ hold: false, reason: "track-ended" });
+    expect(stopped).toBe(1);
   });
 });
