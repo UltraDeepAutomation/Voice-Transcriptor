@@ -167,4 +167,6 @@ Desktop owns:
 - Packaged resources: `desktop/package.json` `build.extraResources`.
 
 - `docs/NEXT_SESSION_2026-09-04.md` — точка входа следующей сессии: ТЗ трёх хотфиксов и трёх worktree-веток.
+- `docs/NEXT_SESSION_2026-09-04b.md` — хендофф вечера 2026-09-04: единый владелец текста, Ultra-Audit, кто на чём остановился.
+- `docs/audit-2026-09-04/` — разделы находок и журналы правок Ultra-Audit; сводка — `BUGSAUDIT-2026-09-04.md` в корне.
 - `docs/COMPARISON_2026-09-04.md` — сравнение с лучшими open-source/коммерческими реализациями диктовки: ранжированная таблица по 11 пунктам дизайна, что уже не хуже, что сознательно не берём.
