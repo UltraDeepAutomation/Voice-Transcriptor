@@ -877,11 +877,27 @@ class DeepgramLiveSession:
         *,
         keepalive_interval_sec: float = 7.0,
         keepalive_idle_threshold_sec: float = 3.5,
+        audio_offset_sec: float = 0.0,
     ):
         if not api_key:
             raise DeepgramLiveError("Deepgram API key is required")
         self._api_key = api_key
         self._cfg = config or DeepgramLiveConfig()
+        # Where this SOCKET's audio starts on the RECORDING's timeline
+        # (B1). Deepgram times its results from the audio a connection
+        # has received — "Word timings in streaming transcription
+        # results are based on the audio stream itself, not the lifetime
+        # of the WebSocket connection" — so a socket that is handed the
+        # recording from its first byte needs no offset, and one that
+        # takes over mid-recording (the warm-socket replacement in
+        # ``backend.main``, which replays a bounded ring and therefore
+        # starts after whatever the ring dropped) needs exactly this
+        # one. Applied in ``_process_deepgram_message`` and
+        # ``_streamed_seconds`` — the two points where provider numbers
+        # and byte counts become session seconds — and nowhere else, so
+        # segments, interim words, coverage, ``coveredEndSec`` and
+        # ``streamedSec`` are all on one timeline by construction.
+        self._audio_offset_sec = max(0.0, float(audio_offset_sec))
         self._keepalive_interval_sec = max(1.0, float(keepalive_interval_sec))
         self._keepalive_idle_threshold_sec = max(
             0.5, float(keepalive_idle_threshold_sec)
@@ -1641,9 +1657,7 @@ class DeepgramLiveSession:
             self._log_coverage_holes(
                 holes_before_splice, spliced_words, uncovered_speech_sec
             )
-        streamed_sec = self.stats.bytes_sent / float(
-            2 * max(1, int(self._cfg.sample_rate))
-        )
+        streamed_sec = self._streamed_seconds(self.stats.bytes_sent)
         return {
             "text": final_text,
             "segments": merged_segments,
@@ -2196,6 +2210,22 @@ class DeepgramLiveSession:
                 lines.append(f"    … {not_shown} more not shown")
         logger.info("\n".join(lines))
 
+    def _streamed_seconds(self, byte_count: int) -> float:
+        """PCM bytes as a position on the RECORDING's timeline.
+
+        The byte-count half of the one offset (see
+        ``audio_offset_sec``): a socket that took over mid-recording has
+        only its own bytes, so without the shift its "streamed" seconds
+        would be measured from its own start while every timestamp it
+        reports is measured from the recording's — and the tail-gap
+        between the two would be pure fiction. One conversion, used by
+        both the coverage measurement and the envelope's
+        ``streamedSec``, so they cannot drift apart.
+        """
+        return self._audio_offset_sec + byte_count / float(
+            2 * max(1, int(self._cfg.sample_rate))
+        )
+
     def _tail_coverage(self) -> tuple[float, float, float, float]:
         """What is unflushed at the end of the stream.
 
@@ -2234,8 +2264,8 @@ class DeepgramLiveSession:
         session that never drops a send has ``bytes_offered ==
         bytes_sent`` and this is a no-op.
         """
-        streamed_sec = max(self.stats.bytes_offered, self.stats.bytes_sent) / (
-            2 * max(1, int(self._cfg.sample_rate))
+        streamed_sec = self._streamed_seconds(
+            max(self.stats.bytes_offered, self.stats.bytes_sent)
         )
         covered_end = max(
             (float(seg.get("end", 0.0) or 0.0) for seg in self._finalized_segments),
@@ -2868,6 +2898,9 @@ class DeepgramLiveSession:
             except (TypeError, ValueError):
                 value = None
             if value is not None:
+                # Also a provider timestamp, so it takes the same shift
+                # as every other one (see the Results branch below).
+                value += self._audio_offset_sec
                 self._last_utterance_end = value
                 logger.debug(
                     "deepgram-live: UtteranceEnd last_word_end=%.2f", value,
@@ -2902,7 +2935,7 @@ class DeepgramLiveSession:
         # recv loop, because that would terminate the whole recording
         # session over a single stray frame. Invalid numerics degrade to
         # 0.0 and the segment still renders.
-        start = _as_float(msg.get("start"))
+        start = _as_float(msg.get("start")) + self._audio_offset_sec
         duration = _as_float(msg.get("duration"))
         end = start + duration
         is_final = bool(msg.get("is_final"))
@@ -2924,6 +2957,17 @@ class DeepgramLiveSession:
         # treating the window as the content is what evicted words the
         # final never carried.
         message_words = normalize_words(raw_words)
+        # THE normalisation point (B1). Every consumer downstream —
+        # segments, retained interim words, the coverage measurements,
+        # the splice, ``coveredEndSec`` — reads the numbers produced
+        # here and none of them re-derives anything from the raw
+        # message, so shifting a socket that began mid-recording onto
+        # the recording's own timeline happens once, here, or not at
+        # all. ``_streamed_seconds`` is the same shift for byte counts.
+        if self._audio_offset_sec:
+            for w in message_words:
+                w["start"] = round(w["start"] + self._audio_offset_sec, 3)
+                w["end"] = round(w["end"] + self._audio_offset_sec, 3)
 
         segment = {
             "start": round(start, 3),
@@ -2979,6 +3023,18 @@ class DeepgramLiveSession:
                 "end": segment["end"],
                 "text": segment["text"],
             }
+            if message_words:
+                # The renderer merges two readings of the same recording
+                # by word time (``transcript-merge.ts``), and a segment
+                # frame stripped of its word list left it with nothing
+                # finer than the segment span to merge on. The words are
+                # already in hand — the same list the envelope carries
+                # and the same list coverage is computed from, offset
+                # included — so this is the one shape, forwarded, not a
+                # second one. Omitted entirely when the provider sent no
+                # word list, which is the only honest way to say "not
+                # known" (an empty list reads as "no words here").
+                out_segment["words"] = [dict(w) for w in message_words]
             if speaker is not None:
                 out_segment["speaker"] = speaker
             return {

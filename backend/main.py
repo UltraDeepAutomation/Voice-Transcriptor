@@ -368,10 +368,6 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
         await warm_boot
     except (asyncio.CancelledError, Exception):
         pass
-    try:
-        await DEEPGRAM_WARM_POOL.close_all()
-    except Exception:
-        logger.exception("deepgram warm pool shutdown failed (non-fatal)")
     # Shutdown: drain in-flight transcription jobs before the process
     # exits so Electron's SIGTERM (killBackendHard, 1500 ms hard deadline)
     # doesn't interrupt mid-write result files. Without this, the worker
@@ -392,6 +388,16 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
         await asyncio.to_thread(jobs.shutdown, 1.5)
     except Exception:
         logger.exception("jobs pool shutdown failed (non-fatal)")
+
+    # LAST, and bounded: releasing the warm socket is politeness, not
+    # correctness. It must not eat into the SIGTERM budget above, where
+    # the cost of running out of time is a half-written result file;
+    # here the cost is a connection Deepgram tears down itself when the
+    # process exits a moment later.
+    try:
+        await asyncio.wait_for(DEEPGRAM_WARM_POOL.close_all(), timeout=1.0)
+    except (asyncio.TimeoutError, Exception):
+        logger.warning("deepgram warm pool shutdown did not finish (non-fatal)")
 
 
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
@@ -4384,7 +4390,7 @@ def _live_config(
 
 
 def _new_live_session(
-    api_key: str, cfg: DeepgramLiveConfig
+    api_key: str, cfg: DeepgramLiveConfig, *, audio_offset_sec: float = 0.0
 ) -> DeepgramLiveSession:
     """Construct a live session — the ONE place backend.main makes one.
 
@@ -4398,6 +4404,7 @@ def _new_live_session(
         api_key=api_key,
         config=cfg,
         keepalive_interval_sec=WARM_KEEPALIVE_INTERVAL_SEC,
+        audio_offset_sec=audio_offset_sec,
     )
 
 
@@ -4612,10 +4619,20 @@ async def _run_deepgram_live_session(
     # Armed only for an adopted socket: a connect that just completed its
     # handshake has proven the path end to end.
     warm_probe_active = acquisition.adopted
-    warm_probe_deadline: Optional[float] = None
+    # ``time.monotonic()`` of the first frame that carried speech — the
+    # moment the socket owes an answer. ``None`` until then.
+    warm_probe_armed_at: Optional[float] = None
     warm_swap_requested = False
     warm_swap_in_progress = False
+    # Audio already written to the adopted socket, kept so a replacement
+    # can be given it. A RING, not a growing buffer: a user who opens
+    # the microphone and thinks for a minute streams a minute of silence
+    # before the probe can even arm, and the bytes worth replaying are
+    # the recent ones. What the ring drops off the front is counted, and
+    # becomes the replacement session's ``audio_offset_sec`` so its
+    # timestamps still land on the recording's timeline.
     warm_replay = bytearray()
+    warm_replay_dropped = 0
 
     # ---- Send path: queue, sender task, wedge watchdog (audit §3.6) ---
     send_queue: "asyncio.Queue[object]" = asyncio.Queue(
@@ -4639,15 +4656,15 @@ async def _run_deepgram_live_session(
         dropped byte is declared to the session so coverage math still
         sees the honest length of the recording.
         """
-        nonlocal queued_bytes, send_dropped_warned, warm_probe_deadline
+        nonlocal queued_bytes, send_dropped_warned, warm_probe_armed_at
         if not data:
             return
         if (
             warm_probe_active
-            and warm_probe_deadline is None
+            and warm_probe_armed_at is None
             and pcm_has_voice(data)
         ):
-            warm_probe_deadline = time.monotonic() + _WARM_PROBE_TIMEOUT_SEC
+            warm_probe_armed_at = time.monotonic()
         if queued_bytes + len(data) > _SEND_QUEUE_MAX_BYTES:
             dropped = True
         else:
@@ -4669,15 +4686,23 @@ async def _run_deepgram_live_session(
             )
 
     async def _flush_frame(buf: bytearray, size: int) -> None:
-        nonlocal pending_since
+        nonlocal pending_since, warm_replay_dropped
         frame = bytes(buf[:size])
         del buf[:size]
         if warm_probe_active:
             # Kept until the adopted socket has proven itself, so a
-            # replacement can start from the true beginning of the
-            # recording instead of from the moment the swap finished.
-            if len(warm_replay) + len(frame) <= _WARM_REPLAY_MAX_BYTES:
-                warm_replay.extend(frame)
+            # replacement can be handed the audio the dead one
+            # swallowed. Oldest bytes fall off the front rather than
+            # newest being refused: the probe fires 2.5 s after the
+            # first VOICED frame, so the ring is always long enough to
+            # hold every voiced byte, and what it drops is leading
+            # silence — which the offset then accounts for exactly.
+            warm_replay.extend(frame)
+            if len(warm_replay) > _WARM_REPLAY_MAX_BYTES:
+                excess = len(warm_replay) - _WARM_REPLAY_MAX_BYTES
+                excess += excess % 2  # never split a 16-bit sample
+                del warm_replay[:excess]
+                warm_replay_dropped += excess
         # NOT wrapped in wait_for: cancelling a websockets send mid-frame
         # leaves the connection undefined. The watchdog closes the socket
         # instead, which makes this raise inside send_pcm's own handler.
@@ -4693,6 +4718,12 @@ async def _run_deepgram_live_session(
         anything still sitting in the send queue. ``discard()`` keeps the
         teardown from reaching the renderer as a fatal error: the swap IS
         the recovery.
+
+        The replacement is constructed with ``audio_offset_sec`` equal to
+        the audio the replay ring dropped, so everything it reports —
+        segments, interim words, coverage, ``coveredEndSec``,
+        ``streamedSec`` — is measured from the start of the RECORDING
+        and not from the start of this second socket.
         """
         nonlocal session, warm_probe_active
         nonlocal warm_swap_requested, warm_swap_in_progress
@@ -4700,15 +4731,19 @@ async def _run_deepgram_live_session(
         warm_swap_in_progress = True
         old = session
         replay = bytes(warm_replay)
+        offset_sec = warm_replay_dropped / float(2 * LIVE_SAMPLE_RATE_HZ)
         logger.warning(
             "deepgram-live: discarded warm socket after adoption reason=no "
             "results within %.1fs of the first voiced audio; reconnecting "
-            "and replaying %d bytes",
+            "and replaying %d bytes (offset=%.2fs)",
             _WARM_PROBE_TIMEOUT_SEC,
             len(replay),
+            offset_sec,
         )
         try:
-            fresh = _new_live_session(api_key, dg_cfg)
+            fresh = _new_live_session(
+                api_key, dg_cfg, audio_offset_sec=offset_sec
+            )
             await fresh.connect()
         except Exception as e:
             # The recording continues on the old socket. It is probably
@@ -4727,9 +4762,49 @@ async def _run_deepgram_live_session(
         await old.discard()
         warm_probe_active = False
         warm_replay.clear()
-        for offset in range(0, len(replay), _SEND_BATCH_BYTES):
-            await fresh.send_pcm(replay[offset:offset + _SEND_BATCH_BYTES])
+        for pos in range(0, len(replay), _SEND_BATCH_BYTES):
+            await fresh.send_pcm(replay[pos:pos + _SEND_BATCH_BYTES])
+        logger.info(
+            "deepgram-live: warm socket replaced; %d bytes replayed into a "
+            "fresh connection (connect=%sms)",
+            len(replay),
+            f"{fresh.stats.connect_ms:.0f}" if fresh.stats.connect_ms else "?",
+        )
         warm_swap_in_progress = False
+
+    async def warm_probe_watchdog() -> None:
+        """Give an adopted socket 2.5 s to answer, then ask for a swap.
+
+        An adopted socket has never carried audio, so nothing about it
+        has been proven end to end: a half-open TCP connection accepts
+        writes silently and Deepgram never answers a ``KeepAlive``. The
+        only positive evidence is a message coming back, and the only
+        moment one is owed is after audio that actually contains speech
+        — Deepgram is entitled to answer silence with nothing.
+
+        The swap itself is performed by the SENDER (the single writer to
+        the upstream socket); this task only asks for it, so the
+        replacement can never race a send in flight.
+        """
+        nonlocal warm_probe_active, warm_swap_requested
+        while warm_probe_active:
+            await asyncio.sleep(_WARM_PROBE_POLL_SEC)
+            armed_at = warm_probe_armed_at
+            if not warm_probe_active or armed_at is None:
+                continue
+            last_recv = session.stats.last_recv_at
+            if last_recv is not None and last_recv >= armed_at:
+                warm_probe_active = False
+                warm_replay.clear()
+                logger.info(
+                    "deepgram-live: adopted warm socket answered %.0fms "
+                    "after the first voiced audio",
+                    (last_recv - armed_at) * 1000.0,
+                )
+                return
+            if time.monotonic() - armed_at >= _WARM_PROBE_TIMEOUT_SEC:
+                warm_swap_requested = True
+                return
 
     async def sender() -> None:
         """Own the upstream socket: batch queued audio, write it, stop
@@ -4809,6 +4884,13 @@ async def _run_deepgram_live_session(
 
     snd = asyncio.create_task(sender(), name="ws-dg-send")
     wd = asyncio.create_task(send_watchdog(), name="ws-dg-send-watchdog")
+    # Only an ADOPTED socket needs proving: a connect that just
+    # completed its handshake has already demonstrated the path.
+    warm_probe: Optional[asyncio.Task] = (
+        asyncio.create_task(warm_probe_watchdog(), name="ws-dg-warm-probe")
+        if warm_probe_active
+        else None
+    )
 
     # Replay everything captured while connecting, IN ORDER, before any
     # newly arriving frame is forwarded — Deepgram must see this audio
@@ -4940,18 +5022,33 @@ async def _run_deepgram_live_session(
             stop.set()
 
     async def forwarder() -> None:
+        """Pump upstream events to the renderer, across a socket swap.
+
+        The event stream belongs to a SESSION, and the warm-socket
+        liveness path replaces the session mid-recording. Iterating one
+        stream and returning when it ends would make the swap look like
+        the upstream ending: this task completing is what the join below
+        reads as "the session is over", so a recovery would have killed
+        the recording it was recovering. The outer loop follows the
+        recording onto its replacement instead, and still returns the
+        moment a stream ends without one.
+        """
         nonlocal upstream_fatal
         try:
-            async for event in session.events():
-                if not await _ws_send_json(websocket, event):
-                    stop.set()
-                    return
-                if event.get("type") == "error":
-                    _mark_recovery_error(recovery)
-                    if event.get("fatal"):
-                        upstream_fatal = True
+            while True:
+                current = session
+                async for event in current.events():
+                    if not await _ws_send_json(websocket, event):
                         stop.set()
                         return
+                    if event.get("type") == "error":
+                        _mark_recovery_error(recovery)
+                        if event.get("fatal"):
+                            upstream_fatal = True
+                            stop.set()
+                            return
+                if session is current or stop.is_set():
+                    return
         except Exception as e:
             if not _is_broken_pipe_error(e):
                 _mark_recovery_error(recovery)
@@ -5007,6 +5104,13 @@ async def _run_deepgram_live_session(
             await wd
         except (asyncio.CancelledError, Exception):
             pass
+        if warm_probe is not None:
+            if not warm_probe.done():
+                warm_probe.cancel()
+            try:
+                await warm_probe
+            except (asyncio.CancelledError, Exception):
+                pass
 
         final_payload: dict
         finalize_error: Optional[str] = None
@@ -5120,6 +5224,15 @@ async def _run_deepgram_live_session(
         # still released.
         await session.close()
 
+        # Open the next warm socket now, with the configuration this
+        # recording actually used — the strongest available guess at
+        # what the next one will use, and the moment with the most time
+        # before it (a user reads the transcript they just dictated
+        # before starting another). Fire-and-forget by contract: a
+        # failed pre-warm must never be visible on the path of the
+        # recording that triggered it.
+        DEEPGRAM_WARM_POOL.rewarm(api_key, dg_cfg)
+
         # The sender only outlives the drain when the upstream never
         # took the last frame. The socket is closed by now, so the
         # pending write has already raised inside ``send_pcm`` and this
@@ -5183,6 +5296,25 @@ async def _run_deepgram_live_session(
                 f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
                 _safe_error_text(session.last_error) if session.last_error else "none",
             )
+
+
+@app.get("/api/live/warm")
+def get_live_warm_state(_auth: None = Depends(_require_api_auth)):
+    """What the Deepgram warm socket is doing right now.
+
+    Diagnostic, not control: there is no way to force a warm socket
+    open or closed from here, because the two moments worth warming at
+    (backend boot and the end of a recording) are the two the backend
+    already knows about, and a third trigger would be a second source
+    of truth for the same decision.
+
+    Answers the questions a stop-latency investigation actually asks —
+    is a socket warm, how old is it, would it be adopted right now and
+    if not why not — without exposing anything about the key or the
+    audio. The configuration key is the query string the socket was
+    opened with, which is what makes a mismatch legible.
+    """
+    return {"ok": True, "warm": DEEPGRAM_WARM_POOL.status()}
 
 
 @app.get("/api/live/recoveries")

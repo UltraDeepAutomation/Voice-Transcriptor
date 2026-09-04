@@ -1,7 +1,9 @@
 """Deepgram live A/B tool — reproduce the 2026-09-03 multi-vs-ru measurement.
 
-Streams saved WAV recordings through
-``backend.remote_deepgram_live.DeepgramLiveSession`` at real-time
+Streams saved WAV recordings through a
+``backend.remote_deepgram_live.DeepgramLiveSession`` (opened by
+``DeepgramWarmPool.acquire``, the same entry point the app uses) at
+real-time
 pacing, for one or more ``--language`` values and an optional shared
 keyterms list, ``--runs`` times each, and prints one row per run: file,
 language, keyterms count, connect ms, finalize ms, final segment count,
@@ -60,11 +62,21 @@ from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.config import load_config  # noqa: E402
 from backend.deepgram_keyterms import normalize_keyterms  # noqa: E402
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
+from backend.deepgram_warm import DeepgramWarmPool  # noqa: E402
 from backend.remote_deepgram_live import (  # noqa: E402
     DeepgramLiveConfig,
     DeepgramLiveError,
-    DeepgramLiveSession,
 )
+
+# One code path for opening a live session, in the app and here alike:
+# ``acquire()`` adopts a warm socket when the pool is armed and connects
+# a fresh one when it is not. This pool is deliberately NOT armed — a
+# measurement tool must not hold a Deepgram connection open between
+# runs, and each run is meant to pay and REPORT its own connect time —
+# so every run here takes the un-armed branch, which is exactly the
+# plain ``connect()`` this tool did before the pool existed. Going
+# through it anyway is what keeps the measured path the shipped path.
+_POOL = DeepgramWarmPool()
 
 DEFAULT_CHUNK_MS = 100
 _TEXT_TRUNCATE_CHARS = 200
@@ -129,9 +141,8 @@ async def _run_one(
     run_index: int,
 ) -> RunResult:
     cfg = DeepgramLiveConfig(model=model, language=language, keyterms=keyterms)
-    session = DeepgramLiveSession(api_key, cfg)
     try:
-        await session.connect()
+        session = (await _POOL.acquire(api_key, cfg)).session
     except DeepgramLiveError as e:
         return RunResult(
             file=file_label, language=language, run=run_index,

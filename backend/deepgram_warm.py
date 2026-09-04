@@ -39,21 +39,35 @@ it is opened with ``WARM_KEEPALIVE_INTERVAL_SEC`` (4 s, inside the
 documented 3-5 s window) rather than the 7 s that suffices for a session
 with audio already flowing.
 
-Timestamps: why there is no warm-time offset
---------------------------------------------
-Deepgram's ``Results`` carry ``start``/``duration`` as offsets into the
-**audio it has received**, not into the lifetime of the socket. Choosing
-``KeepAlive`` over silence frames means a warm socket receives zero
-audio bytes before it is adopted, so the adopted recording still starts
-at t=0 and ``_process_deepgram_message`` — the single normaliser that
-turns those numbers into segments, interim words, ``coveredEndSec`` and
-``streamedSec`` — needs no offset subtraction at all.
+Timestamps: why warming costs no offset, and where an offset is real
+--------------------------------------------------------------------
+The same page settles the timestamp question outright:
 
-That is enforced rather than assumed: ``acquire()`` refuses to adopt a
-socket whose ``stats.bytes_sent`` is non-zero. If a future change ever
-starts warming with audio, every session on that socket would be shifted
-by the warm duration; the guard turns that into a loud discard and a
-fresh connect instead of a silent, whole-transcript timing error.
+    "Word timings in streaming transcription results are based on the
+    audio stream itself, not the lifetime of the WebSocket connection."
+
+    "If you send ``KeepAlive`` messages without any audio payloads for a
+    period of time, then resume sending audio, the timestamps will
+    continue from where the audio left off—not from when the
+    ``KeepAlive`` messages were sent."
+
+So choosing ``KeepAlive`` over silence frames is also what makes
+adoption free of timestamp arithmetic: a warm socket has received zero
+audio bytes, so the recording that adopts it still starts at t=0.
+
+That is enforced rather than assumed — ``acquire()`` refuses to adopt a
+socket whose ``stats.bytes_sent`` is non-zero. Had we kept it warm with
+silence frames instead, every adopted recording would have been shifted
+by the warm duration, and the shift would have been invisible: a
+transcript is just as readable at the wrong times.
+
+The offset that IS real belongs to the other half of the design. When an
+adopted socket turns out to be dead (``backend.main``'s liveness probe),
+the recording moves to a fresh connection which is replayed a BOUNDED
+ring of the audio the dead one swallowed. That session starts wherever
+the ring starts, which is why ``DeepgramLiveSession`` takes
+``audio_offset_sec`` and applies it in exactly one place. See its
+docstring.
 
 Cost
 ----
@@ -273,7 +287,7 @@ class DeepgramWarmPool:
                 session=session,
                 adopted=False,
                 warm_age_sec=0.0,
-                connect_ms=getattr(session.stats, "connect_ms", None),
+                connect_ms=session.stats.connect_ms,
             )
 
     def _adopt(
@@ -285,7 +299,7 @@ class DeepgramWarmPool:
         from_pending: bool,
     ) -> WarmAcquisition:
         age = max(0.0, self._clock() - self._warmed_at) if not from_pending else 0.0
-        connect_ms = getattr(session.stats, "connect_ms", None)
+        connect_ms = session.stats.connect_ms
         logger.info(
             "deepgram-live: adopted warm socket age=%.1fs (saved ~%sms connect)",
             age,
@@ -366,7 +380,7 @@ class DeepgramWarmPool:
         self._warm_key = key
         self._warm_api_key = api_key
         self._warmed_at = self._clock()
-        connect_ms = getattr(session.stats, "connect_ms", None)
+        connect_ms = session.stats.connect_ms
         logger.info(
             "deepgram-live: warm socket ready in %sms (ttl=%.0fs)",
             f"{connect_ms:.0f}" if connect_ms is not None else "?",
@@ -409,7 +423,7 @@ class DeepgramWarmPool:
             return "socket already closed"
         if session.last_fatal:
             return f"socket reported a fatal error ({session.last_error})"
-        if getattr(session.stats, "bytes_sent", 0):
+        if session.stats.bytes_sent:
             # The invariant that makes a warm socket timestamp-safe:
             # Deepgram counts from the audio it has received, so a warm
             # socket that carried audio would shift every timestamp of
@@ -419,7 +433,7 @@ class DeepgramWarmPool:
         age = now - self._warmed_at
         if age > self._idle_ttl_sec:
             return f"warm for {age:.0f}s, past the {self._idle_ttl_sec:.0f}s bound"
-        last_ka = getattr(session.stats, "last_keepalive_at", None)
+        last_ka = session.stats.last_keepalive_at
         if last_ka is None:
             if age > self._keepalive_stale_sec:
                 return f"no KeepAlive has landed in {age:.0f}s"
@@ -518,13 +532,13 @@ class DeepgramWarmPool:
             "healthy": healthy,
             "unfitReason": reason,
             "connectMs": (
-                getattr(session.stats, "connect_ms", None)
+                session.stats.connect_ms
                 if session is not None
                 else None
             ),
             "idleTtlSec": self._idle_ttl_sec,
             "keepalivesSent": (
-                getattr(session.stats, "keepalives_sent", 0)
+                session.stats.keepalives_sent
                 if session is not None
                 else None
             ),
@@ -534,11 +548,10 @@ class DeepgramWarmPool:
 async def _quiet_close(session: DeepgramLiveSession) -> None:
     """Close a session nobody is listening to, swallowing teardown noise."""
     try:
-        discard = getattr(session, "discard", None)
-        if discard is not None:
-            await discard()
-        else:
-            await session.close()
+        # ``discard`` rather than ``close``: nobody is consuming this
+        # session's events, and the teardown of a socket the pool is
+        # retiring on purpose is not an error anyone needs to hear about.
+        await session.discard()
     except Exception as e:  # pragma: no cover - teardown is best-effort
         logger.debug("deepgram-live: warm socket close ignored: %s", e)
 
