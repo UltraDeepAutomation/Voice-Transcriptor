@@ -22,3 +22,13 @@ cryptography>=49.0.0
 # transitively, but we pin it directly so production installs cannot
 # silently lose the dependency.
 websockets>=13.0
+
+# Imported DIRECTLY by backend/models_manager.py (try_to_load_from_cache,
+# scan_cache_dir, HfApi, hf_hub_download, list_repo_files) and by
+# backend/main.py (the offline error taxonomy). It also arrives
+# transitively through faster-whisper, but that bound is ">=0.13" with
+# no upper limit — so a non-locked `pip install -r requirements.txt` is
+# free to resolve a 2.x that breaks listing, downloading and deleting
+# local models. requirements.runtime-lock.txt says this file is the
+# direct-dependency SSOT; six imported symbols are not transitive.
+huggingface_hub>=0.23,<2

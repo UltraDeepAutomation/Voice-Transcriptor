@@ -493,5 +493,122 @@ class DataDirFallbackTests(unittest.TestCase):
         self.assertTrue(mod.DATA_DIR.is_dir())
 
 
+class EnvExampleContractTests(unittest.TestCase):
+    """``.env.example`` is the SSOT for release environment variables.
+
+    AGENTS.md paragraph 4 says so, and the file itself ends with an
+    explicit list of the variables it deliberately omits — which makes
+    everything else in it a claim of completeness. Four backend
+    variables were read by code and named nowhere (B-029), and the file
+    opened by telling the user to copy it to ``.env``, a mechanism this
+    project does not have anywhere (B-023).
+    """
+
+    @staticmethod
+    def _repo_root():
+        from pathlib import Path
+
+        return Path(__file__).resolve().parents[2]
+
+    def _env_example(self) -> str:
+        return (self._repo_root() / ".env.example").read_text(encoding="utf-8")
+
+    def test_every_backend_variable_is_documented_or_declared_internal(self):
+        import re
+        from pathlib import Path
+
+        backend_dir = self._repo_root() / "backend"
+        used = set()
+        for path in list(backend_dir.glob("*.py")) + list(
+            (backend_dir / "tools").glob("*.py")
+        ):
+            # Every quoted TRANSCRIPTOR_* name, not just the ones passed
+            # straight to ``os.environ``: three of the four missing
+            # variables reached the environment through ``_env_flag``,
+            # so a narrower scan would have reported the file complete.
+            used.update(
+                re.findall(
+                    r'["\'](TRANSCRIPTOR_[A-Z0-9_]+)["\']',
+                    path.read_text(encoding="utf-8"),
+                )
+            )
+        text = self._env_example()
+        undocumented = sorted(n for n in used if n not in text)
+        self.assertEqual(
+            undocumented,
+            [],
+            "the backend reads these and .env.example names none of them",
+        )
+
+    def test_the_file_does_not_promise_a_dotenv_mechanism(self):
+        # Nothing loads a .env: no python-dotenv in either requirements
+        # file, no load_dotenv() in the backend, and desktop/main.js
+        # reads process.env directly. A user following the old first
+        # line got no effect from any of the ~43 variables, silently.
+        root = self._repo_root()
+        for name in ("requirements.txt", "requirements.runtime-lock.txt"):
+            path = root / name
+            if path.exists():
+                self.assertNotIn(
+                    "dotenv", path.read_text(encoding="utf-8").lower(), name
+                )
+        backend_sources = "".join(
+            p.read_text(encoding="utf-8") for p in (root / "backend").glob("*.py")
+        )
+        self.assertNotIn("load_dotenv", backend_sources)
+        self.assertNotIn(
+            "Copy to .env",
+            self._env_example()[:400],
+            ".env.example still tells the user to copy it to .env",
+        )
+
+    def test_the_clamped_whisper_settings_state_their_range(self):
+        # A value outside the range is silently pulled into it, so a
+        # user setting 16 threads and measuring no change has no way to
+        # find out why.
+        text = self._env_example()
+        for marker in ("Clamped to 4-8", "Clamped to 1-3"):
+            self.assertIn(marker, text)
+
+
+class DirectDependencyTests(unittest.TestCase):
+    """``requirements.txt`` is the direct-dependency SSOT (B-022).
+
+    ``requirements.runtime-lock.txt`` states that rule in its own
+    header. ``huggingface_hub`` is imported for six symbols by
+    ``models_manager`` and ``main`` and was declared in neither file as
+    a direct dependency — it arrived through faster-whisper, whose bound
+    is ">=0.13" with no upper limit.
+    """
+
+    def test_every_third_party_module_the_backend_imports_is_declared(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[2]
+        declared = (root / "requirements.txt").read_text(encoding="utf-8")
+        declared_names = {
+            re.split(r"[<>=!\[]", line, 1)[0].strip().replace("-", "_").lower()
+            for line in declared.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        # Third-party modules this backend imports by name. Kept
+        # explicit rather than inferred: an inferred list would have to
+        # decide what is stdlib, and getting that wrong turns this test
+        # into noise.
+        third_party = {
+            "fastapi",
+            "uvicorn",
+            "faster_whisper",
+            "soundfile",
+            "numpy",
+            "requests",
+            "cryptography",
+            "websockets",
+            "huggingface_hub",
+        }
+        missing = sorted(third_party - declared_names)
+        self.assertEqual(missing, [], "imported directly, declared nowhere")
+
 if __name__ == "__main__":
     unittest.main()

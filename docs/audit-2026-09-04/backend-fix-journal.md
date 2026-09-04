@@ -367,3 +367,50 @@ OK
 * **B-037.** `_LOCAL_CONVERT_TIMEOUT_SEC = 300` рядом с `_REMOTE_COMPACT_TIMEOUT_SEC`; тест запрещает литерал в обеих функциях.
 
 **Не сделано:** вторая половина B-037 («локальные конверсии не принимают `cancel_event`») — это не дефект, а отсутствующая функция: у локального пути нет вызывающего, который умеет отменять. Записано в долг.
+
+---
+
+## Коммит 9 — зависимости и переменные окружения
+
+**Заголовок:** «The env reference stops describing a mechanism that does not exist, and the package six symbols are imported from is declared»
+
+**ID:** B-022 (P1), B-023 (P1), B-029 (P2), B-044 (P2), B-058 (P2).
+
+**Файлы:** `.env.example`, `requirements.txt`, `backend/transcribe_gigaam.py`, `backend/tests/test_config.py`.
+
+**Верификация.** Новые тесты на файлах ДО правки:
+```
+FAIL: test_every_backend_variable_is_documented_or_declared_internal
+  ['TRANSCRIPTOR_DEEPGRAM_FILLER_WORDS', 'TRANSCRIPTOR_DEEPGRAM_PUNCTUATE',
+   'TRANSCRIPTOR_DEEPGRAM_SMART_FORMAT', 'TRANSCRIPTOR_GIGAAM_CACHE_SIZE'] != []
+FAIL: test_the_file_does_not_promise_a_dotenv_mechanism
+  'Copy to .env' unexpectedly found
+FAIL: test_the_clamped_whisper_settings_state_their_range
+FAIL: test_every_third_party_module_the_backend_imports_is_declared
+  ['huggingface_hub'] != []
+```
+B-044:
+```
+$ TRANSCRIPTOR_GIGAAM_CACHE_SIZE=oops python3 -c "import backend.transcribe_gigaam"
+ДО:    ValueError: invalid literal for int() with base 10: 'oops'   (движок недоступен)
+ПОСЛЕ: invalid integer env TRANSCRIPTOR_GIGAAM_CACHE_SIZE='oops'; using default=1
+```
+Полный набор:
+```
+Ran 708 tests in 37.134s
+OK
+```
+(704 → 708.)
+
+**Решения.**
+
+* **B-023.** *Выбрано:* сказать правду в шапке `.env.example` — «reference only, ничего не читает `.env`, экспортируйте в оболочке/CI».
+  *Отвергнуто:* добавить `python-dotenv` и `load_dotenv()`. Это новая зависимость и новый порядок разрешения настроек (файл против окружения) на пути старта приложения — продуктовое решение, а не починка расхождения. Записано в долг.
+  *Не сделано здесь:* `README.md:127` («`cp .env.example .env`») — README вне периметра бэкенд-агента. В долг.
+* **B-022.** *Выбрано:* `huggingface_hub>=0.23,<2` в `requirements.txt` с обоснованием прямо в файле. Нижняя граница — из фактически используемого API, верхняя — потому что мажорная смена ломает листинг/скачивание/удаление локальных моделей, а faster-whisper объявляет только `>=0.13`.
+  *Тест* держит список прямых сторонних импортов бэкенда против объявленного, явным перечнем: выведенный автоматически список требовал бы решать, что тут stdlib, и превратил бы тест в шум.
+* **B-029.** Четыре переменные добавлены в `.env.example`; сканер в тесте ищет ЛЮБОЙ строковый литерал `"TRANSCRIPTOR_*"` в `backend/**`, а не только аргументы `os.environ`, — три из четырёх пропущенных шли через `_env_flag`, и узкий скан объявил бы файл полным.
+* **B-058.** У двух Whisper-настроек указаны их реальные клампы (4–8 и 1–3); тест это фиксирует. Значение вне диапазона молча подтягивается, и пользователь, выставивший 16 потоков, не имеет способа узнать почему ничего не изменилось.
+* **B-044.** `int(os.environ...)` → `_env_int` (политика пакета), импортирован из `backend.transcribe`; цикла нет — обратные импорты gigaam там ленивые.
+
+**Не сделано:** —

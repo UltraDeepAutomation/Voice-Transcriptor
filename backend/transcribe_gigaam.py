@@ -34,6 +34,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 import soundfile as sf
 
+from backend.transcribe import _env_int
+
 logger = logging.getLogger(__name__)
 
 # Upstream hard limit is 25 s; stay clear of it so encoder padding and
@@ -59,7 +61,13 @@ _MODEL_LOCKS: "dict[str, threading.Lock]" = {}
 # (~1 GB each); a user who tried both catalog entries must not keep both
 # resident forever — mirror the whisper-side LRU policy
 # (backend/transcribe.py ``_MODEL_CACHE_MAX``) with a tighter default.
-_GIGAAM_CACHE_MAX = max(1, int(os.environ.get("TRANSCRIPTOR_GIGAAM_CACHE_SIZE", "1")))
+# ``_env_int``, not a bare ``int()``: the house policy for bad
+# environment input is "warn and use the documented default", and it is
+# already implemented once, next to the whisper cache bound this one
+# mirrors. A bare int() made a typo in this variable a ValueError at
+# import — i.e. the GigaAM engine unavailable, reported as an import
+# failure with no mention of the variable.
+_GIGAAM_CACHE_MAX = max(1, _env_int("TRANSCRIPTOR_GIGAAM_CACHE_SIZE", 1))
 
 _LAST_LOAD_ERROR: Optional[str] = None
 
