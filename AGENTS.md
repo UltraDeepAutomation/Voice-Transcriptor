@@ -27,7 +27,7 @@ without the deps is fine to skip — CI runs these on every push):
 python3 -m unittest discover -s backend/tests
 ```
 
-The whole suite (368 tests) runs offline in a throwaway venv — worth doing
+The whole backend suite runs offline in a throwaway venv — worth doing
 rather than deferring to CI, because the modules with the most behaviour
 per line (Deepgram live, coverage, splice) need only pure-Python deps:
 

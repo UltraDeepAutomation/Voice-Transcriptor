@@ -17,6 +17,7 @@ const {
   classifyPastePermissionFailure,
   pasteActivationTimeoutMs,
   pasteAutoSendTimeoutMs,
+  pasteAutoSendSettleMs,
   SILENT_FAILURES_BEFORE_BROKEN,
   initialPasteCapability,
   applyProbeResult,
@@ -495,4 +496,22 @@ test("the budget table is the ladder's real clock, not a model of it", () => {
   ]) {
     assert.ok(source.includes(`${accessor}(`), `main.js must spend its clock through ${accessor}`);
   }
+});
+
+test("the auto-send settle is in the table too, not a literal at its call site", () => {
+  // D-047 moved the auto-send TIMEOUTS into the table and left the settle
+  // sleep behind — a wall-clock number on the paste path that the table did
+  // not know about, which is the same shape the finding was about.
+  for (const platform of Object.keys(PASTE_BUDGET)) {
+    assert.equal(typeof pasteBudgetFor(platform).autoSendSettleMs, "number", platform);
+    assert.ok(pasteAutoSendSettleMs(platform) > 0, platform);
+  }
+  // It protects the same thing everywhere, so it is the same everywhere.
+  const values = new Set(Object.keys(PASTE_BUDGET).map(pasteAutoSendSettleMs));
+  assert.equal(values.size, 1);
+
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(source, /await sleep\(pasteAutoSendSettleMs\(process\.platform\)\)/);
 });

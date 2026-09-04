@@ -54,10 +54,12 @@ Desktop speech-to-text app: record from the microphone, transcribe your own file
 
 ## Install
 
-> There are no GitHub releases yet: builds are ad-hoc signed, and without a
-> Developer ID signature and notarisation macOS blocks a downloaded app. For
-> now the app is built from source — see [Development](#development). The
-> steps below describe installing a kit you have already built.
+> There are no GitHub releases yet. `./BUILD.command` signs with a real
+> identity (`TRANSCRIPTOR_SIGNING_IDENTITY`; ad-hoc is the separate
+> `dist:adhoc` target), but without a Developer ID signature and
+> notarisation macOS still blocks a downloaded app. For now the app is built
+> from source — see [Development](#development). The steps below describe
+> installing a kit you have already built.
 
 ### macOS (Apple Silicon)
 

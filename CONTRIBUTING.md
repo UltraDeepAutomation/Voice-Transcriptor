@@ -133,9 +133,10 @@ frontend/      # Vanilla TypeScript + Vite UI
 | Линт frontend | `npm --prefix frontend run lint` |
 | Типы frontend | `npm --prefix frontend run typecheck` |
 | Тесты frontend | `npm --prefix frontend test` |
-| Тесты desktop (хоткеи, упаковка) | `npm --prefix desktop test` |
+| Тесты desktop (весь `node --test` сьют) | `npm --prefix desktop test` |
 | Тесты бэкенда (интерпретатор из `.python-version`) | `python -m unittest discover -s backend/tests -p "test_*.py"` — сначала `npm --prefix frontend ci`, иначе кросс-тесты live-coverage тихо скипаются (нужен node + tsc) |
-| Сборка DMG (macOS arm64) | `npm --prefix desktop run dist:dir` |
+| Сборка `.app` без DMG (macOS arm64) | `npm --prefix desktop run dist:dir` |
+| Сборка DMG (macOS arm64) | `npm --prefix desktop run dist` |
 | Полная проверка как в CI | три команды выше + `npm --prefix frontend run build` |
 
 ## Лицензия

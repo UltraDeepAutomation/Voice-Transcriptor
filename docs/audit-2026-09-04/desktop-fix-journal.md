@@ -1122,3 +1122,68 @@ imported by nothing but its own test.
   second subscription in one page lifetime. The reason is corrected and the
   renderer change is in "долг".
 
+---
+## Commit 19 — the numbers get names, and the documentation stops describing a different build
+
+**IDs:** D-050 (P2), D-072 (P2, the parts in this scope), D-073 (P2), and the
+last stray of D-047 (the auto-send settle).
+
+**Files:** `desktop/main.js`, `desktop/paste-capability.js`,
+`desktop/paste-capability.test.js`, `desktop/packaging.test.js`,
+`README.md`, `README.en.md`, `AGENTS.md`, `CONTRIBUTING.md`.
+
+**Re-verified on current code before fixing:** yes. Of D-050's twelve
+literals, six had already gone with earlier commits (`sleep(180)` ×3,
+`sleep(350)` ×2, `sleep(110)`); six were live.
+
+**Verification**
+- The six live ones are now named: `RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS`
+  (700), `RECORDING_AUTOSTOP_CONFIG_REFRESH_MS` (1200),
+  `RECORDING_AUTOSTOP_WARMUP_MS` (1500), `RECORDING_DEAD_PIPELINE_MS` (8000),
+  `RENDERER_FINISHED_RECORDS_LIMIT` (30) and `AUTO_SEND_SETTLE_MS` (380).
+- `RENDERER_FINISHED_RECORDS_LIMIT` is interpolated into an
+  `executeJavaScript` template, so the rendering was checked by evaluating
+  the real template out of the source:
+  ```
+  template contains the interpolation: true
+  renders to: .slice(-30)
+  ```
+- `RECORDING_DEAD_PIPELINE_MS` also feeds the log line, which said
+  "dead for 8s" as a second literal — the D-043 shape, in a message a user
+  sends to support.
+- The auto-send settle joins `PASTE_BUDGET` next to `autoSendTimeoutMs`,
+  where D-047 put the timeouts and left the sleep behind; the new test
+  asserts all three platforms declare it, that it is the same everywhere
+  (it protects the same thing everywhere) and that main.js spends it through
+  the accessor.
+- D-072 / D-073, measured against the tree:
+  ```
+  OLD README says the default build is ad-hoc signed: true
+  OLD AGENTS.md claims 368 backend tests; the tree has 554 in 46 files
+  OLD CONTRIBUTING lists 3 desktop suites; the tree has 19
+  ```
+  `afterPack.js` has refused to sign ad-hoc without
+  `TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1` since `1d9fda2`, and only `dist:adhoc`
+  and `dist:dir:adhoc` set it — so the default `./BUILD.command` path has
+  not been ad-hoc for as long as the sentence has been wrong. A new test
+  asserts the opt-in stays opt-in, enumerates the two targets that set it,
+  and fails if either README describes the default build as ad-hoc again.
+- `npm --prefix desktop test` -> `tests 255 / pass 255 / fail 0` (was 253).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *Chosen:* remove the test COUNT from AGENTS.md rather than update it to
+  554. A number in prose that no test asserts goes stale the moment anyone
+  writes a test; the command is the fact worth documenting.
+- *Chosen:* CONTRIBUTING's DMG row split in two. It named `dist:dir` as
+  "Сборка DMG", and `dist:dir` produces an unpacked `.app` — `dist` is the
+  one that produces a DMG.
+- *Chosen:* the README rewrite says what the default build actually does
+  (a real identity from `TRANSCRIPTOR_SIGNING_IDENTITY`) AND keeps the
+  conclusion the reader needs (macOS still blocks it without notarisation).
+  The old sentence reached the right conclusion from a false premise.
+
+**Not done**
+- `PROJECT_STRUCTURE.md`, the other half of D-072, is outside this agent's
+  scope by the charter.
+

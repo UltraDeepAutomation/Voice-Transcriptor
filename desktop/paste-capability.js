@@ -421,6 +421,14 @@ const MODIFIER_SPAWN_ALLOWANCE_MS = 600;
 
 const PASTE_MAX_ATTEMPTS = 5;
 
+// The pause between the paste landing and the auto-send Enter. It is the
+// same on every platform because it protects the same thing everywhere: the
+// target application applying the pasted text before Enter is delivered.
+// Enter into a field that has not received the text yet sends an empty
+// message. Declared here rather than as a literal at the call site so it
+// sits with every other wall-clock number the paste path spends.
+const AUTO_SEND_SETTLE_MS = 380;
+
 const PASTE_BUDGET = Object.freeze({
   darwin: Object.freeze({
     maxAttempts: 3,
@@ -442,6 +450,7 @@ const PASTE_BUDGET = Object.freeze({
     activationTimeoutMs: 1500,
     activationLadderSteps: 0,
     autoSendTimeoutMs: 5000,
+    autoSendSettleMs: AUTO_SEND_SETTLE_MS,
   }),
   win32: Object.freeze({
     // Two, not three. With the target-activation ladder finally counted
@@ -468,6 +477,7 @@ const PASTE_BUDGET = Object.freeze({
     activationTimeoutMs: 2500,
     activationLadderSteps: 3,
     autoSendTimeoutMs: 2000,
+    autoSendSettleMs: AUTO_SEND_SETTLE_MS,
   }),
   linux: Object.freeze({
     maxAttempts: 3,
@@ -485,6 +495,7 @@ const PASTE_BUDGET = Object.freeze({
     activationTimeoutMs: 1200,
     activationLadderSteps: 3,
     autoSendTimeoutMs: 2000,
+    autoSendSettleMs: AUTO_SEND_SETTLE_MS,
   }),
 });
 
@@ -554,6 +565,11 @@ function pasteActivationTimeoutMs(platform) {
 /** Bound for the one auto-send (Cmd+Enter / Ctrl+Enter) child. */
 function pasteAutoSendTimeoutMs(platform) {
   return pasteBudgetFor(platform).autoSendTimeoutMs;
+}
+
+/** Pause between the paste landing and the auto-send Enter. */
+function pasteAutoSendSettleMs(platform) {
+  return pasteBudgetFor(platform).autoSendSettleMs;
 }
 
 // ── Marking the transcript as transient ────────────────────────────────
@@ -728,6 +744,7 @@ module.exports = {
   PASTE_PERMISSION_ROUTE,
   pasteActivationTimeoutMs,
   pasteAutoSendTimeoutMs,
+  pasteAutoSendSettleMs,
   classifyPastePermissionFailure,
   PASTE_CAPABILITY,
   PASTE_PROBE_ACTIVE_TTL_MS,

@@ -60,6 +60,7 @@ const {
   classifyPastePermissionFailure,
   pasteActivationTimeoutMs,
   pasteAutoSendTimeoutMs,
+  pasteAutoSendSettleMs,
   PASTE_PROBE_COMMAND,
   PASTE_POST_STOP_DEADLINE_MS,
   initialPasteCapability,
@@ -356,6 +357,35 @@ const MAIN_WINDOW_EXPECTED_HIDE_DWELL_MS = 2500;
 const MAIN_WINDOW_REVEAL_PROTECTION_MS = 2500;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
 const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
+
+// ── Recording-monitor bounds ──────────────────────────────────────────
+//
+// The four numbers the 1 Hz recording-state monitor and the capsule spend.
+// They were bare literals inside the monitor body, which is where a product
+// parameter goes to stop being one: nothing named them, nothing could state
+// them, and one of them was retyped into the message the user reads.
+
+/** How long a click on the capsule suppresses the app-activate that
+ *  would otherwise raise the main window behind it. */
+const RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS = 700;
+
+/** How often the monitor re-reads the renderer's auto-stop settings. The
+ *  user can change them mid-recording from Settings. */
+const RECORDING_AUTOSTOP_CONFIG_REFRESH_MS = 1200;
+
+/** Silence before this much of a recording has elapsed is the microphone
+ *  warming up, not the user having stopped talking. */
+const RECORDING_AUTOSTOP_WARMUP_MS = 1500;
+
+/** No audio frame for this long, after frames HAVE been seen, means the
+ *  capture pipeline died; the recording is force-stopped rather than left
+ *  running with no way out but quitting. */
+const RECORDING_DEAD_PIPELINE_MS = 8000;
+
+/** How many finished recordings the renderer snapshot carries back. It is
+ *  a hand-off buffer, not a history: the post-stop task looks for ONE id
+ *  in it, and the renderer owns the real list. */
+const RENDERER_FINISHED_RECORDS_LIMIT = 30;
 let recordingSilenceStartedAt = 0;
 let recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
 let recordingAutoStopConfigRefreshAt = 0;
@@ -1207,7 +1237,7 @@ function getRecordingStatusCapsuleFallbackWindowSize() {
 }
 
 function noteRecordingStatusCapsuleInteraction() {
-  recordingStatusSuppressActivateUntil = Date.now() + 700;
+  recordingStatusSuppressActivateUntil = Date.now() + RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS;
 }
 
 function shouldSuppressActivateForRecordingStatusCapsule() {
@@ -2040,7 +2070,7 @@ function startRecordingStateMonitor() {
         }
         const cfg = recordingAutoStopConfig || DEFAULT_RECORDING_AUTO_STOP_CONFIG;
         if (safeLastFrameAt > 0) recordingSeenAudioFrames = true;
-        if (now - recordingAutoStopConfigRefreshAt > 1200) {
+        if (now - recordingAutoStopConfigRefreshAt > RECORDING_AUTOSTOP_CONFIG_REFRESH_MS) {
           recordingAutoStopConfigRefreshAt = now;
           const gen = ++recordingAutoStopConfigGen;
           getRendererAutoStopSilenceConfig().then((nextCfg) => {
@@ -2054,7 +2084,7 @@ function startRecordingStateMonitor() {
           }).catch(() => { });
         }
         const silenceDetectionActive = isRec && cfg.enabled && !recordingStopInFlight;
-        const pastWarmup = !recordingStartedAt || (now - recordingStartedAt) >= 1500;
+        const pastWarmup = !recordingStartedAt || (now - recordingStartedAt) >= RECORDING_AUTOSTOP_WARMUP_MS;
         if (!silenceDetectionActive || !pastWarmup) {
           recordingSilenceStartedAt = 0;
         } else {
@@ -2108,11 +2138,11 @@ function startRecordingStateMonitor() {
           !recordingStopInFlight &&
           recordingSeenAudioFrames &&
           safeLastFrameAt > 0 &&
-          (now - safeLastFrameAt) > 8000;
+          (now - safeLastFrameAt) > RECORDING_DEAD_PIPELINE_MS;
         if (staleAudioFrames) {
           recordingStopInFlight = true;
           stopRecordingStateMonitor();
-          appendMainLog(`[recording-autostop-stale] audio pipeline dead for 8s, forcing stop`);
+          appendMainLog(`[recording-autostop-stale] audio pipeline dead for ${Math.round(RECORDING_DEAD_PIPELINE_MS / 1000)}s, forcing stop`);
           guardedStopFromRecordingStatus("autostop-stale");
         }
       })
@@ -2659,7 +2689,7 @@ async function queryRendererState() {
             text: String((x && x.text) || '').trim(),
           }))
           .filter((x) => x.recordingId > 0 && x.finishedAt > 0 && x.text.length > 0)
-          .slice(-30)
+          .slice(-${RENDERER_FINISHED_RECORDS_LIMIT})
         : [];
       const isRec = !!(window.__transcriptorIsRecording);
       const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
@@ -5760,12 +5790,12 @@ async function processPostStopTask(task) {
     }
     let autoSendResult = null;
     if (pasted.ok && task.autoSendEnter) {
-      // Settle before Enter. 220 → 380 ms because the paste script no
-      // longer holds its own 160 ms delay after clicking Paste: the time
-      // between the paste landing and Enter firing is what this protects,
-      // and it is unchanged. Enter into a field that has not received the
-      // text yet sends an empty message.
-      await sleep(380);
+      // Settle before Enter, from the budget table with every other
+      // wall-clock number the paste path spends. It was raised 220 -> 380
+      // when the paste script stopped holding its own 160 ms delay after
+      // clicking Paste: the time between the paste landing and Enter firing
+      // is what this protects, and it is unchanged.
+      await sleep(pasteAutoSendSettleMs(process.platform));
       const sent = await sendCommandEnterToFocusedApp(effectiveTarget);
       autoSendResult = sent;
       traceStep(trace, "cmd_enter_result", {

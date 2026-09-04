@@ -418,3 +418,27 @@ test("a later ! pattern excludes what an earlier one included — matching honou
     assert.equal(coveredByWhitelist(entry), true, `${entry} is listed but does not match`);
   }
 });
+
+test("the READMEs do not promise a signing mode the default build no longer uses", () => {
+  // Both READMEs said "builds are ad-hoc signed". Since the signing work
+  // landed, afterPack REFUSES to sign ad-hoc unless TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1,
+  // which only the dist:adhoc target sets — so the default `./BUILD.command`
+  // path is not ad-hoc at all, and a reader deciding whether to trust a
+  // build was reading a description of a different build.
+  const root = path.join(__dirname, "..");
+  const afterPack = fs.readFileSync(path.join(__dirname, "afterPack.js"), "utf8");
+  assert.match(afterPack, /TRANSCRIPTOR_ALLOW_ADHOC_SIGN/, "ad-hoc must stay opt-in");
+  const adhocTargets = Object.entries(pkg.scripts)
+    .filter(([, body]) => body.includes("TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1"))
+    .map(([name]) => name);
+  assert.deepEqual(adhocTargets.sort(), ["dist:adhoc", "dist:dir:adhoc"]);
+
+  for (const name of ["README.md", "README.en.md"]) {
+    const source = fs.readFileSync(path.join(root, name), "utf8");
+    const install = source.slice(0, source.indexOf("###"));
+    assert.ok(
+      !/ad-hoc signed|подписываются ad-hoc/.test(install),
+      `${name} still describes the default build as ad-hoc signed`,
+    );
+  }
+});
