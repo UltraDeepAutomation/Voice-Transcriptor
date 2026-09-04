@@ -742,3 +742,81 @@ mechanism rather than reading it.
 
 **Not done in this commit:** nothing from this group.
 
+---
+## Commit 14 — the last two P1s: a half-built surface, and one migration rule
+
+**IDs:** D-009 (P1), D-015 (P1, the desktop half).
+
+**Files:** `desktop/main.js`, `desktop/shortcut-migration.js` (new),
+`desktop/shortcut-migration.test.js` (new), `desktop/package.json`.
+
+**Re-verified on current code before fixing:** yes.
+
+**Verification — D-009**
+```
+OLD main.js injected __transcriptorAccessibilityStatus: 2 site(s)
+OLD main.js 30s poll: true
+NEW main.js injections: 0
+NEW main.js 30s poll: false
+refreshMacAccessibilityTrustState call sites kept: 4
+readers of the global anywhere in frontend/: none
+```
+The four surviving call sites are the ones that matter: boot,
+`probePasteCapability` (which every consult of `pasteCapability` funnels
+through — window focus, pre-paste, and after a paste fails the way a dead
+grant fails), and `whenReady`. So the trust bit is re-read on exactly the
+paths that act on it; what is gone is a 30-second interval and a
+cross-process `executeJavaScript` feeding a global nothing has ever read.
+
+**Verification — D-015**
+- 10 new cases in `shortcut-migration.test.js`, including the ones the
+  inlined `if` blocks had no coverage for at all: the retired pair on each
+  platform, half a retired pair (left alone — a user's own choice), the
+  current defaults as a fixed point, idempotence, and non-mutation of the
+  input.
+- A source-level assertion fails if `main.js` starts reading `legacy.<key>`
+  again, i.e. if the rule grows a second copy inside the 9k-line file.
+- A data/rule assertion fails if a `legacy` entry is added to
+  `shortcut-defaults.json` that nothing migrates — the precise shape of the
+  original bug.
+- `npm --prefix desktop test` -> `tests 231 / pass 231 / fail 0` (was 221).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *D-009, chosen:* the report's option 2 (collapse the unreachable), not
+  option 1 (build the badge). Option 1 is a `frontend/` change and another
+  agent owns that tree; shipping the main-process half alone is what created
+  the finding. *Rejected:* replacing the injection with an `invoke` channel —
+  that is a new surface with no consumer, which is precisely what D-030
+  deleted for `engine:status`.
+- *D-009, chosen:* the boot read stays. It is what makes
+  `[accessibility] trusted=` appear in the log before the first paste, and it
+  is free.
+- *D-015, chosen:* extract the rule into a pure module driven by
+  `shortcut-defaults.json` rather than add a fourth `if`. The bug is not a
+  missing branch, it is that the rule had two hand-written homes and one of
+  them fell behind; a fourth branch would leave that shape intact.
+- *D-015, rejected:* having the main process WRITE the migrated pair back to
+  `config.json`. That would converge the two sides, but the backend owns
+  writes to that file — main only ever reads it — and a second writer racing
+  the renderer's debounced autosave is a worse defect than the one being
+  fixed.
+- *D-015, rejected:* migrating the `override` path (accelerators arriving
+  from a Settings capture). A pair that arrives there is what the user just
+  pressed; rewriting it would mean Settings could not express a choice the
+  migration disagrees with.
+
+**Not done**
+- **D-015, the renderer half.** `frontend/src/main.tsx`'s `loadCfg`
+  implements migrations 1 and 2 and not 3, so Settings still displays `F9`
+  on a Windows/Linux config carrying the retired pair while the registered
+  hotkey is `Control+Alt+Shift+R`. The fix is for the renderer to call the
+  same rule instead of re-deriving it; `shortcut-defaults.json` already
+  reaches the renderer through `frontend/vite.config.ts`
+  (`__SHORTCUT_DEFAULTS__`), so the data is shared and only the rule is not.
+  `frontend/` is another agent's tree. Recorded in "долг" with the exact
+  shape.
+- **D-009, the badge.** `paste-capability` can already distinguish "never
+  granted" from "grant is dead"; what is missing is a renderer surface for
+  it. Recorded in "долг".
+

@@ -57,6 +57,7 @@
       "child-io.js",
       "paste-protocol.js",
       "recording-status.js",
+      "shortcut-migration.js",
       "python-version.js",
       "preload.js",
       "shortcut-defaults.json",

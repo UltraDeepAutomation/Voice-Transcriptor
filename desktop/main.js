@@ -9,6 +9,9 @@ const shortcutDefaultsManifest = require("./shortcut-defaults.json");
 // SSOT for cross-platform accelerator canonicalisation — required by
 // main.js and unit-tested directly (desktop/accelerator.test.js).
 const { canonicalAcceleratorForPlatform } = require("./accelerator");
+// One declaration of "this stored hotkey pair is retired" — see
+// desktop/shortcut-migration.js.
+const { migrateShortcutPair } = require("./shortcut-migration");
 const { formatConsoleMirrorLine } = require("./renderer-console");
 // SSOT for "did this paste attempt actually succeed, and is it verified
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
@@ -299,15 +302,20 @@ let backendBootError = "";
 // with no awareness that its F9 hotkey is unclaimed. Cached here,
 // replayed from `did-finish-load`.
 let lastShortcutStatus = null;
-// Cached macOS Accessibility-trust state. Updated by the
-// `checkAccessibility` poll inside app.whenReady; replayed to every
-// renderer load via did-finish-load so a closed-and-reopened window
-// (tray click after `win.close` on darwin) doesn't have to wait the
-// full 30 s poll cycle to learn the current trust state.
+// Cached macOS Accessibility-trust state, main-process only: it is what
+// makes the `[accessibility] trusted=` log line report CHANGES rather than
+// repeat the current value on every probe.
+//
+// It used to be pushed into the renderer as
+// `window.__transcriptorAccessibilityStatus` on every change and replayed
+// on every window load, for a badge that was never built — nothing in
+// frontend/ has ever read the global, and a 30-second interval was kept
+// running for the life of the process to feed it. The state that DOES
+// drive behaviour is `pasteCapability`, and every probe of it
+// (`probePasteCapability`: boot, window focus, pre-paste, and after a
+// failed paste) refreshes this value on the way through. Surfacing it to
+// the user is a renderer change; see the debt ledger.
 let lastAccessibilityTrusted = null;
-// Accessibility-poll timer handle — see `app.whenReady` for setup.
-// Stored module-scope so `before-quit` can clear it cleanly.
-let accessibilityPollTimer = null;
 // Ring buffer of the last ~4 KB of backend stderr. When the fallback
 // HTML fires "Backend did not start in time" / "exited with code N
 // after 8 restart attempts", we include the tail of stderr so the user
@@ -1942,7 +1950,7 @@ function scheduleRecordingStatusCapsuleTeardown() {
     destroyRecordingStatusCapsuleWindow("idle");
   }, RECORDING_STATUS_CAPSULE_TEARDOWN_MS);
   // Never hold the event loop open for a teardown that quit would do
-  // anyway — mirrors accessibilityPollTimer.
+  // anyway.
   try { recordingStatusTeardownTimer.unref?.(); } catch { }
 }
 
@@ -3791,14 +3799,6 @@ function setCachedAccessibilityTrusted(trusted) {
   if (lastAccessibilityTrusted === next) return;
   lastAccessibilityTrusted = next;
   appendMainLog(`[accessibility] trusted=${next}`);
-  if (win && !win.isDestroyed() && win.webContents) {
-    win.webContents
-      .executeJavaScript(
-        `window.__transcriptorAccessibilityStatus = ${JSON.stringify({ trusted: next })};`,
-        true,
-      )
-      .catch(() => { });
-  }
 }
 
 function refreshMacAccessibilityTrustState({ prompt = false } = {}) {
@@ -8111,21 +8111,6 @@ async function createWindow(options = {}) {
         appendMainLog(`[did-finish-load] shortcut replay failed: ${e?.message || e}`);
       }
     }
-    // Replay cached accessibility-trust state. A window closed
-    // (tray) and reopened would otherwise wait up to 30 s (the
-    // poll interval) before the renderer learns whether
-    // accessibility is granted, leaving the F9-collision badge
-    // and other dependent UI in a stale state.
-    if (lastAccessibilityTrusted !== null && win && !win.isDestroyed() && win.webContents) {
-      try {
-        await win.webContents.executeJavaScript(
-          `window.__transcriptorAccessibilityStatus = ${JSON.stringify({ trusted: lastAccessibilityTrusted })};`,
-          true,
-        );
-      } catch (e) {
-        appendMainLog(`[did-finish-load] accessibility replay failed: ${e?.message || e}`);
-      }
-    }
     // Replay backendBootError if set — a window that was closed-
     // and-reopened after a failed boot attempt would otherwise
     // render its boot overlay in a "no error" state, hiding the
@@ -8617,10 +8602,6 @@ app.on("before-quit", () => {
     shortcutCaptureFailsafeTimer = null;
   }
   pendingShortcutBridgeMessages = [];
-  if (accessibilityPollTimer) {
-    clearInterval(accessibilityPollTimer);
-    accessibilityPollTimer = null;
-  }
   stopRecordingStateMonitor();
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     try {
@@ -8746,33 +8727,29 @@ app.whenReady().then(async () => {
   if (process.platform === "darwin") {
     ensureMacDockPresence("ready");
   }
-  // macOS-only: poll Accessibility permission. Users who recorded
-  // successfully once, then revoked the permission via System Settings
-  // would otherwise see their F9 become a silent no-op on the next
-  // session. `globalShortcut.register` returns true even when the
-  // handler has been made non-functional by revocation — there is no
-  // event to listen for, so we poll at 30 s intervals and surface the
-  // state to the renderer. Non-Darwin platforms no-op.
+  // macOS-only: read Accessibility permission once at boot. Users who
+  // recorded successfully, then revoked the permission via System
+  // Settings, would otherwise see the hotkey become a silent no-op —
+  // `globalShortcut.register` returns true even when revocation has made
+  // the handler non-functional, and there is no event to listen for.
+  //
+  // A 30-second interval used to re-read it for the lifetime of the
+  // process. It answered no question: the state that decides whether a
+  // paste is attempted is `pasteCapability`, and `probePasteCapability`
+  // re-reads the trust bit itself on every path that consults it —
+  // window focus, pre-paste, and after a paste fails the way a dead
+  // grant fails. The poll's only other effect was feeding a renderer
+  // global nothing has ever read.
   if (process.platform === "darwin") {
-    const checkAccessibility = () => {
-      try {
-        refreshMacAccessibilityTrustState();
-      } catch { }
-    };
-    checkAccessibility();
+    try {
+      refreshMacAccessibilityTrustState();
+    } catch { }
     // One real probe at boot, so a grant that survived the re-signed
     // install but no longer works is known BEFORE the first recording
     // ends with a paste that silently goes nowhere. It is skipped
     // entirely when Accessibility is not granted (see
     // probePasteCapability), so a fresh install spawns nothing.
     probePasteCapability("boot").catch(() => { });
-    // Capture the handle so we can clear it on before-quit (otherwise
-    // repeated dev-reload leaks intervals, and on production the
-    // refed timer can delay clean shutdown by up to 30 s). `.unref`
-    // also lets the event loop exit naturally if this were the last
-    // pending handle.
-    accessibilityPollTimer = setInterval(checkAccessibility, 30000);
-    try { accessibilityPollTimer.unref?.(); } catch { }
   }
   if (process.platform === "darwin") {
     // Resolve microphone TCC up front. Recording can be started from the
@@ -8881,62 +8858,34 @@ app.whenReady().then(async () => {
 
   function readShortcutsFromConfig() {
     const defaults = shortcutDefaultsForPlatform();
-    const legacy = shortcutDefaultsManifest?.legacy || {};
-    const legacyMacPair = legacy.macFunctionPair || {};
-    const legacyWinLinuxPair = legacy.winLinuxFunctionPair || {};
     try {
       const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
       const cfgPath = path.join(dataDir, "config.json");
       if (fs.existsSync(cfgPath)) {
         const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
         const ui = raw?.preferences?.ui || {};
-        let record = String(ui.shortcut_record || defaults.record).trim() || defaults.record;
-        let paste = String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste;
-        // Mirror the renderer's loadCfg one-time migration:
-        // a Mac user's config still carries pass-15's stale F9/F10
-        // cross-platform default. F9 = Mission Control on macOS, so
-        // registering it here means the OS hijacks every press and
-        // the user reports "shortcut doesn't work". The renderer
-        // ALSO migrates and queues a pending re-register on its 2 s
-        // poll, but the main process registers FIRST at startup —
-        // for those 2+ seconds (and any earlier F9 press), the
-        // shortcut is a black hole. Mirror the migration here so
-        // the FIRST register call uses the correct platform default.
-        if (
-          process.platform === "darwin" &&
-          record === String(legacyMacPair.record || "") &&
-          paste === String(legacyMacPair.paste || "")
-        ) {
-          record = defaults.record;
-          paste = defaults.paste;
-          appendMainLog(`[shortcuts] migrated stale ${legacyMacPair.record}/${legacyMacPair.paste} → ${record}/${paste} on Mac`);
+        const stored = {
+          record: String(ui.shortcut_record || defaults.record).trim() || defaults.record,
+          paste: String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste,
+        };
+        // Retired accelerator pairs are rewritten to the platform default by
+        // ONE rule, declared in desktop/shortcut-migration.js and driven by
+        // shortcut-defaults.json. The main process registers FIRST at
+        // startup, before the renderer has read anything, so this first
+        // `globalShortcut.register` must already use the migrated
+        // accelerator — otherwise the retired key is a black hole until the
+        // renderer catches up, and on the platforms where the OS itself
+        // claims that key (F9 = Mission Control on macOS, F10 = Win32 menu
+        // mnemonics) for as long as it stays bound.
+        const migrated = migrateShortcutPair(stored, {
+          manifest: shortcutDefaultsManifest,
+          defaults,
+          platform: process.platform,
+        });
+        for (const step of migrated.applied) {
+          appendMainLog(`[shortcuts] migrated stale ${step.from} → ${step.to} (${step.id}) on ${process.platform}`);
         }
-        // Migration 2: legacy `Alt+Shift+7` was unpressable on
-        // US/UK layouts (Shift+7 = `&`). Always rewrite to the
-        // platform default's paste accelerator.
-        if (paste === String(legacy.unpressablePaste || "")) {
-          paste = defaults.paste;
-          appendMainLog(`[shortcuts] migrated stale ${legacy.unpressablePaste} → ${paste}`);
-        }
-        // Migration 3 (BUGS_AUDIT §6.10): a Windows/Linux config still
-        // carrying the old F9/F10 default. F10 is the Win32
-        // menu-mnemonic-activation key and F9/F10 are debugger run/step
-        // keys in Visual Studio, VS Code and JetBrains IDEs — the OS or
-        // the focused app can act on the keypress even though
-        // globalShortcut.register("F9") itself returns true, so the
-        // hotkey looks registered but does something else (or nothing
-        // Transcriptor-related) when pressed. Same shape as migration 1,
-        // mirrored for the non-Mac default.
-        if (
-          process.platform !== "darwin" &&
-          record === String(legacyWinLinuxPair.record || "") &&
-          paste === String(legacyWinLinuxPair.paste || "")
-        ) {
-          record = defaults.record;
-          paste = defaults.paste;
-          appendMainLog(`[shortcuts] migrated stale ${legacyWinLinuxPair.record}/${legacyWinLinuxPair.paste} → ${record}/${paste} on ${process.platform}`);
-        }
-        return { record, paste };
+        return { record: migrated.record, paste: migrated.paste };
       }
     } catch (e) {
       appendMainLog(`[shortcuts] config read error: ${e?.message || e}`);
