@@ -791,6 +791,110 @@ function tokenText(tokens: ReadonlyArray<TimedToken>): string {
  * holds that its own segments do not account for (the interim tail, the
  * durable recovered tail) is emitted either way.
  */
+// ── Stop-time transcript selection ───────────────────────────────────
+//
+// D2 (support log 2026-09-04, sessions 8c12d76e / ed79f04a / 521f9788):
+// the renderer pasted duplicated text — the whole first half of a
+// recording twice, or its last sentence twice — whenever the Deepgram
+// final envelope already accounted for the entire recording. The prior
+// stop path (``composeStopTranscript`` in main.tsx, deleted by this
+// change) always TEXT-MERGED the held live reading into the envelope,
+// even when the envelope was already complete and needed no help from
+// it. A complete second pass is supposed to REPLACE the preview, the
+// way every published two-pass streaming system does it (whisper_
+// streaming, WhisperX) — it never gets stitched onto the preview.
+// Doing so anyway is what caused the duplication: the live buffer's
+// un-worded segments only ever have their word times SPREAD evenly
+// across the segment's span (see ``timedTokens`` above), an
+// approximation of position good enough for a seam cut but not exact
+// enough for two full readings to align on cleanly, so a run the
+// alignment could not match precisely "survived on both sides".
+//
+// The fix: when the envelope covers the recording
+// (``envelopeCoversRecording`` — the coverage predicate lives in
+// ./live-coverage, next to the C5 fields it reads), the delivered
+// transcript IS the envelope text, verbatim, and the held reading is
+// display/fallback only. Merging remains for exactly the cases where
+// it is still earning its keep — no envelope arrived, or the envelope
+// is proven partial — where the held reading is the floor and the
+// envelope/recovery may only ADD to it, through the existing seam-
+// time / text-union machinery above.
+//
+// ``chooseStopTranscript`` is the ONE decision function for this,
+// called at every delivery site (the opportunistic envelope check, the
+// envelope-confirm wait, and the envelope-vs-recovery race) so none of
+// them can drift back into ad hoc composition. It is pure — every input
+// is a plain value the caller resolves (including a fresh read of the
+// live session buffer, which only the caller has access to); nothing
+// here reaches into session state.
+
+export type StopTranscriptSource = "envelope" | "merged" | "held" | "recovery";
+
+export interface ChooseStopTranscriptInput {
+  /** The final envelope's own text. Empty when no envelope has arrived yet. */
+  envelopeText: string;
+  /** The envelope's timed segments — used for a seam-time merge only when it does not cover the recording. */
+  envelopeSegments?: ReadonlyArray<TimedSegmentLike> | null;
+  /** Does the envelope account for the whole recording? See ``envelopeCoversRecording`` in ./live-coverage. */
+  envelopeCovers: boolean;
+  /** The held live reading: committed + interim text (display/fallback floor). */
+  heldText: string;
+  heldSegments?: ReadonlyArray<TimedSegmentLike> | null;
+  /** An independent full-audio decode (REST/local recovery), when one ran. */
+  recoveredText?: string;
+}
+
+export interface StopTranscriptResult {
+  text: string;
+  source: StopTranscriptSource;
+}
+
+export function chooseStopTranscript(input: ChooseStopTranscriptInput): StopTranscriptResult {
+  const envelopeText = normalizeTranscriptWhitespace(input.envelopeText || "");
+  const heldText = normalizeTranscriptWhitespace(input.heldText || "");
+  const recoveredText = normalizeTranscriptWhitespace(input.recoveredText || "");
+
+  // A complete envelope IS the transcript. No merge, no union — a
+  // second pass that saw the whole recording replaces the preview
+  // outright, which is the only way to guarantee zero duplication.
+  if (envelopeText && input.envelopeCovers) {
+    return { text: envelopeText, source: "envelope" };
+  }
+
+  // No envelope, or a proven-partial one: the held reading is the
+  // floor. The envelope (if any) and the recovery decode (if any) may
+  // only ADD to it.
+  let text = heldText;
+  let source: StopTranscriptSource = "held";
+  if (envelopeText) {
+    if (!heldText) {
+      text = envelopeText;
+      source = "envelope";
+    } else {
+      const merged = mergeReadings(
+        { text: heldText, segments: input.heldSegments },
+        { text: envelopeText, segments: input.envelopeSegments },
+      );
+      if (merged && merged !== text) {
+        text = merged;
+        source = "merged";
+      }
+    }
+  }
+  if (recoveredText) {
+    const withRecovery = richerTranscript(text, recoveredText);
+    if (withRecovery !== text) {
+      text = withRecovery;
+      source = "recovery";
+    }
+  }
+  if (!text) {
+    text = recoveredText || envelopeText || heldText;
+    source = recoveredText ? "recovery" : envelopeText ? "envelope" : "held";
+  }
+  return { text, source };
+}
+
 export function mergeReadings(held: Reading, authoritative: Reading): string {
   const heldText = readingText(held);
   const authoritativeText = readingText(authoritative);

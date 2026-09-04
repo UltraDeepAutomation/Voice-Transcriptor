@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   candidateConfirmsTranscriptCoverage,
+  chooseStopTranscript,
   joinTranscriptSegments,
   mergeReadings,
   unionTranscripts,
@@ -482,5 +483,136 @@ describe("mergeReadings — the held reading's uncommitted tail always survives"
     expect(mergeReadings(held, authoritative)).toBe(
       "первая часть и вторая часть плюс незакрытый хвост",
     );
+  });
+});
+
+// ── chooseStopTranscript (D2) ─────────────────────────────────────────
+//
+// Support log 2026-09-04, three sessions where the renderer duplicated
+// text on stop. The saved evidence files (copied to
+// ``evidence-2026-09-03/`` in the app's userData directory, per the
+// session's own timestamp) hold ``Original:`` / ``Transcription:``
+// fields for each recording; the fixtures below reconstruct the exact
+// candidate texts the stop path had in hand, verified byte-for-byte
+// against the numbers ``main.log`` printed for the same stop
+// (``candidateLen``/``candidateWords``, ``instantWords``, the final
+// ``transcriptLen``/``transcriptWords``).
+describe("chooseStopTranscript — complete envelope replaces the held reading (D2, session 521f9788)", () => {
+  // Single-stream recording, one Deepgram final spanning the whole
+  // 33.35 s (0.00–33.35, gap=0) — ``envelopeCoversRecording`` is true.
+  // ``ENVELOPE`` is the exact 76-word/395-char final the backend log
+  // reported (``race-first envelope ms=177 words=76 ... candidateLen=395
+  // candidateWords=76``) and is also, byte for byte, the leading run of
+  // the delivered (buggy) 189-word/966-char paste — the rest of that
+  // paste is the live buffer's own reading of the same speech, unioned
+  // in by the deleted ``composeStopTranscript`` even though the
+  // envelope already had it all.
+  const ENVELOPE =
+    "Скажи, пожалуйста, мы все устройства движения и так далее, Которые Были У Автора, Построили У Нас Я " +
+    "тебе давал такую задачу и говорил, что она есть в Все устройства, которые у него есть, вот, в его " +
+    "картах, там, да, то, что он там четыре папки в два. Там есть очень много чего у нас нет и что у нас " +
+    "сделано хуже. Именно по по движениям, по анимациям и далее. Далее. Это всё нужно перевести к нам.";
+  // The live buffer's own reading of the same speech (real text — the
+  // remainder of the delivered paste once ``ENVELOPE`` is stripped off
+  // its front). It restates most of the same clauses with a different
+  // ending ("Это все нужно" instead of "Это всё нужно перевести к
+  // нам.") — exactly the kind of near-duplicate an alignment-based
+  // union used to graft on rather than recognise as already covered.
+  const HELD =
+    "вот, в его картах, там, да, то, что он там четыре папки в два. Там есть очень много чего у нас нет " +
+    "и что у нас сделано хуже. Именно по по движениям, по анимациям и далее. Далее. Это все нужно Скажи, " +
+    "пожалуйста, мы все устройства движения и так далее, Которые Были У Автора, Построили У Нас Я тебе " +
+    "давал такую задачу и говорил, что она есть в Все устройства, которые у него есть, вот, в его картах, " +
+    "там, да, то, что он там четыре папки в два. Там есть очень много чего у нас нет и что у нас сделано " +
+    "хуже. Именно по по движениям, по анимациям и далее. Далее. Это все нужно";
+
+  it("delivers the envelope text exactly, no duplication, regardless of what the held reading contains", () => {
+    const result = chooseStopTranscript({
+      envelopeText: ENVELOPE,
+      envelopeCovers: true,
+      heldText: HELD,
+    });
+    expect(result.text).toBe(ENVELOPE);
+    expect(result.source).toBe("envelope");
+    // The defect this regresses: the held reading's own restatement of
+    // "движениям, по анимациям и далее" must not survive a second time.
+    expect((result.text.match(/движениям, по анимациям и далее/g) || []).length).toBe(1);
+  });
+
+  it("still replaces outright even when the held reading is empty or identical", () => {
+    expect(chooseStopTranscript({ envelopeText: ENVELOPE, envelopeCovers: true, heldText: "" }))
+      .toEqual({ text: ENVELOPE, source: "envelope" });
+    expect(chooseStopTranscript({ envelopeText: ENVELOPE, envelopeCovers: true, heldText: ENVELOPE }))
+      .toEqual({ text: ENVELOPE, source: "envelope" });
+  });
+});
+
+describe("chooseStopTranscript — incomplete envelope still merges, held tail included (D2, session 8c12d76e)", () => {
+  // Dual-stream recording; the merged envelope covered 23.35 s of a
+  // 24.53 s recording (gap 1.18 s > TAIL_GAP_THRESHOLD_SEC) —
+  // ``envelopeCoversRecording`` is false. Both texts below are
+  // reconstructed from the evidence file and verified byte-for-byte
+  // against ``main.log``'s own numbers for this stop: ``HELD`` matches
+  // ``instantWords=37`` exactly (255 chars/37 words) and ``ENVELOPE``
+  // matches ``race-first envelope ... words=38 candidateLen=268
+  // candidateWords=38`` exactly. The actual delivered 75-word/524-char
+  // paste is what the deleted ``composeStopTranscript`` produced from
+  // these same two readings — each of the two clauses (the "Смотри…"
+  // opener and the "Вот, Такая Тема…" closer) worded twice, once per
+  // reading — which is the defect this test guards against.
+  const HELD =
+    "Смотри, какие-то куски повторяются. Посмотри, последнюю запись, вот. Самое первое сообщение это " +
+    "запись получается, и сейчас то, что я записываю это, до Вот, Такая Тема. Может Быть, Какие-то Ещё " +
+    "Найдёшь Баги, Ошибки. Повторение кусков это довольно странно.";
+  const ENVELOPE =
+    "Смотри, какие-то куски повторяются. Посмотри, последнюю запись, вот. Самое 1-ое сообщение это " +
+    "предпоследнее. запись получается, и сейчас то, что я записываю это, до Вот, Такая Тема. Может Быть, " +
+    "Какие-то еще найдешь Баги, Ошибки. Повторение кусков это довольно странно.";
+
+  it("does not concatenate both readings' wording of the same two clauses", () => {
+    const result = chooseStopTranscript({
+      envelopeText: ENVELOPE,
+      envelopeCovers: false,
+      heldText: HELD,
+    });
+    expect(result.source).toBe("merged");
+    // The actual 2026-09-04 defect: both wordings of the opener and of
+    // the closing sentence, back to back.
+    expect(result.text).not.toBe(`${HELD} ${ENVELOPE}`);
+    expect((result.text.match(/куски повторяются/g) || []).length).toBe(1);
+    expect((result.text.match(/довольно странно/g) || []).length).toBe(1);
+    // Well below the naive union's 75 words — this is two clauses
+    // merged, not four clauses appended.
+    expect(result.text.split(/\s+/).length).toBeLessThan(50);
+  });
+});
+
+describe("chooseStopTranscript — no envelope: held union recovery, as before (D2)", () => {
+  it("unions the recovery decode into the held floor when it adds words", () => {
+    const held = "старая база данных Я ж тебе скинул";
+    const recovered = "старая база данных отклоняет пароли. Я ж тебе скинул.";
+    const result = chooseStopTranscript({
+      envelopeText: "",
+      envelopeCovers: false,
+      heldText: held,
+      recoveredText: recovered,
+    });
+    expect(result).toEqual({ text: recovered, source: "recovery" });
+  });
+
+  it("keeps the held reading when recovery adds nothing", () => {
+    const held = "старая база данных отклоняет пароли. Я ж тебе скинул.";
+    const result = chooseStopTranscript({
+      envelopeText: "",
+      envelopeCovers: false,
+      heldText: held,
+      recoveredText: "старая база данных",
+    });
+    expect(result).toEqual({ text: held, source: "held" });
+  });
+
+  it("returns empty when nothing is available", () => {
+    expect(chooseStopTranscript({ envelopeText: "", envelopeCovers: false, heldText: "" }))
+      .toEqual({ text: "", source: "held" });
   });
 });

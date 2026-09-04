@@ -60,11 +60,13 @@ import {
 } from "./text-match";
 import {
   candidateConfirmsTranscriptCoverage,
+  chooseStopTranscript,
   joinTranscriptSegments,
-  mergeReadings,
   richerTranscript,
   textFromEnvelope,
-  type Reading,
+  type StopTranscriptResult,
+  type StopTranscriptSource,
+  type TimedSegmentLike,
 } from "./transcript-merge";
 import {
   boundRecoveredTail,
@@ -9230,58 +9232,37 @@ function getSessionCanonicalLiveSourceText(token: string): string {
 }
 
 /**
- * PROTOCOL CONTRACT R1 (BUGS_AUDIT_2026-09-03 §2.2): the ONE place the
- * Deepgram stop path combines every reading of the recording available
- * at a given moment — the frozen floor, the CURRENT canonical session
- * buffer, and a third reading (the final envelope's text, or an
- * independent full-audio decode).
+ * The held live reading, refreshed from the session's live buffer.
  *
- * Before this, the same combination existed in three divergent forms:
- * ``unionTranscripts(transcriptRaw, envText)`` at the opportunistic and
- * post-wait sites, ``richerTranscript(...)`` in the race, and a raw
- * assignment (no combination at all) in the envelope fallback. The
- * post-wait sites also had a specific bug: after any ``await`` (an
- * envelope wait, a recovery race), new ``segments`` messages can have
- * landed in the session buffer — the buffer is live, ``floor`` is a
- * snapshot taken before the wait started. Re-reading the buffer here,
- * not just once at fast-path entry, is what stops those segments from
- * being silently dropped.
+ * ``floor`` is a snapshot of ``getSessionCanonicalLiveSourceText`` taken
+ * before some ``await`` (an envelope wait, a recovery race). By the time
+ * this runs, a ``segments`` WS message may have promoted an interim into
+ * a committed final, and the canonical text is re-read here so growth
+ * during the wait is not silently dropped.
  *
- * Re-unioning ``floor`` with the live buffer even when nothing changed
- * (no ``await`` happened) is a harmless no-op — ``unionTranscripts``
- * degrades to returning the unchanged side when the two are identical.
- *
- * ``third`` is deliberately generic: it might be the same-stream final
- * envelope (aligns cleanly with the splice, and carries per-word times)
- * or an independent full-audio decode from a different engine
- * (recovery), which arrives as a bare string. Combining those is still
- * correct — ``mergeReadings`` chooses its strategy from the data and
- * falls back to the text union, which itself falls back to picking
- * whichever text is richer when the two don't look like the same
- * speech. This helper is therefore safe to use uniformly; it does not
- * silently interleave two unrelated decodes.
- *
- * Debt item (d): the combination goes through ``mergeReadings`` rather
- * than ``unionTranscripts`` so that the one case where BOTH readings are
- * timed — the live buffer's committed segments against the envelope's
- * segments and their words — is decided at a seam in time instead of by
- * text similarity. Everything else takes the same union it always did.
+ * ``floor`` and the fresh read are two snapshots of the SAME reading,
+ * not two independent ones to reconcile — a later read differs only
+ * because a final ADDED to it, never because it decoded the audio a
+ * different way. Picking the richer of the two, instead of aligning
+ * them with ``mergeReadings``/``unionTranscripts`` the way this used to
+ * (inside the deleted ``composeStopTranscript``), is what stops two
+ * near-identical snapshots — worded slightly differently at the edge of
+ * a newly-promoted segment — from being unioned into a duplicate. That
+ * was a real defect (support log 2026-09-04): composing the floor
+ * against a fresh buffer read, with no envelope involved at all,
+ * inflated a clean 24-word transcript to 36 words (session
+ * ``ed79f04a``) and a 73-word one to 189 (session ``521f9788``), both by
+ * duplicating a clause the two snapshots merely worded differently.
  */
-function composeStopTranscript(
-  floor: string,
-  sessionToken: string,
-  third: string | Reading,
-): string {
-  // The buffer's committed segments are the held reading's time axis.
-  // They are read here, not passed in, for the same reason the text is:
-  // the buffer is live and may have grown during an await.
-  const heldSegments = getLiveTranscriptBuffer(sessionToken)?.segments;
-  const withCurrentBuffer = mergeReadings(
-    { text: floor },
-    { text: getSessionCanonicalLiveSourceText(sessionToken), segments: heldSegments },
-  );
-  const thirdReading: Reading = typeof third === "string" ? { text: third } : third;
-  return mergeReadings({ text: withCurrentBuffer, segments: heldSegments }, thirdReading);
+interface HeldReading {
+  text: string;
+  segments?: ReadonlyArray<TimedSegmentLike> | null;
+}
+
+function currentHeldReading(floor: string, sessionToken: string): HeldReading {
+  const buffer = getLiveTranscriptBuffer(sessionToken);
+  const fresh = getSessionCanonicalLiveSourceText(sessionToken);
+  return { text: richerTranscript(floor, fresh), segments: buffer?.segments };
 }
 
 function appendSegmentsToBuffer(
@@ -11977,6 +11958,12 @@ async function stopLive(
     let transcriptRaw = "";
     let transcriptForPaste = "";
     let finalSaveConflict = false;
+    // Provenance of ``transcriptRaw`` for the ``[trace stopLive] FINAL``
+    // line — which of ``chooseStopTranscript``'s buckets (or the
+    // equivalent decision on a non-Deepgram path) produced the delivered
+    // text. Defaults to "held" (the live/preview reading, untouched);
+    // every site that changes ``transcriptRaw`` updates it alongside.
+    let transcriptSource: StopTranscriptSource = "held";
 
     if (provider === "local") {
       if (isCurrentUiSession(sessionUiToken)) {
@@ -12013,10 +12000,12 @@ async function stopLive(
           `of ${decision.coverage.totalSec.toFixed(2)}s) — skipping full re-transcription`,
         );
         transcriptRaw = normalizeTranscriptWhitespace(String(liveEnvelope?.text || "")).trim();
+        transcriptSource = "envelope";
       } else {
         console.log(`[trace stopLive] full local pass (adoption rejected: ${decision.reason})`);
         const syncOut = await runLocalFinalPass();
         transcriptRaw = String(syncOut.text || "").trim();
+        transcriptSource = "recovery";
       }
     } else if (provider === "deepgram") {
       // Deepgram already streamed the transcript in real time. We
@@ -12137,22 +12126,23 @@ async function stopLive(
 
         const alreadyResolvedEnvelope = liveFinalSlots.get(sessionUiToken)?.envelope || null;
         const opportunisticEnvelopeText = textFromEnvelope(alreadyResolvedEnvelope);
-        // United, not picked and not grafted (R1). The envelope and the
-        // live splice are two partial readings of one recording: the
-        // splice can hold a phrase no final ever covered, the envelope
-        // holds the clause that arrived after CloseStream AND the
-        // phrases a hole swallowed mid-sentence. Choosing loses
-        // whichever half the loser owned; grafting only the tail keeps
-        // the splice's holes. ``composeStopTranscript`` aligns them and
-        // also re-reads the live session buffer, which may have grown
-        // since ``instantTranscript`` was captured above.
-        const opportunisticTranscript = composeStopTranscript(transcriptRaw, sessionUiToken, {
-          text: opportunisticEnvelopeText,
-          segments: alreadyResolvedEnvelope?.segments,
+        // D2 / ``chooseStopTranscript`` (./transcript-merge): a complete
+        // envelope REPLACES the splice outright — no union, no grafting.
+        // An incomplete one still contributes through the seam-time
+        // merge, and the held reading is re-read fresh here (it may have
+        // grown since ``instantTranscript`` was captured above).
+        const opportunisticHeld = currentHeldReading(transcriptRaw, sessionUiToken);
+        const opportunisticChoice = chooseStopTranscript({
+          envelopeText: opportunisticEnvelopeText,
+          envelopeSegments: alreadyResolvedEnvelope?.segments,
+          envelopeCovers: envelopeCoversRecording(envelopeCoverageOf(alreadyResolvedEnvelope)),
+          heldText: opportunisticHeld.text,
+          heldSegments: opportunisticHeld.segments,
         });
-        if (opportunisticTranscript !== transcriptRaw) {
-          transcriptRaw = opportunisticTranscript;
-          console.log(`[trace stopLive] opportunistic-envelope used ${traceTextStats("transcript", transcriptRaw)}`);
+        if (opportunisticChoice.text !== transcriptRaw) {
+          transcriptRaw = opportunisticChoice.text;
+          transcriptSource = opportunisticChoice.source;
+          console.log(`[trace stopLive] opportunistic-envelope used source=${opportunisticChoice.source} ${traceTextStats("transcript", transcriptRaw)}`);
         }
 
         // Interim words are ALREADY part of the canonical instant
@@ -12183,14 +12173,25 @@ async function stopLive(
           const env = await waitForLiveEnvelopeWithAnnouncedBudget(sessionUiToken);
           const envText = textFromEnvelope(env);
           const before = transcriptRaw;
-          transcriptRaw = composeStopTranscript(transcriptRaw, sessionUiToken, {
-            text: envText,
-            segments: env?.segments,
+          // D1: whether the envelope covers the recording is needed
+          // BEFORE composing, not after — a complete envelope replaces
+          // the splice outright (D2 / ``chooseStopTranscript``), it does
+          // not get unioned with it.
+          const envelopeIsComplete = envelopeCoversRecording(envelopeCoverageOf(env));
+          const confirmHeld = currentHeldReading(transcriptRaw, sessionUiToken);
+          const confirmChoice = chooseStopTranscript({
+            envelopeText: envText,
+            envelopeSegments: env?.segments,
+            envelopeCovers: envelopeIsComplete,
+            heldText: confirmHeld.text,
+            heldSegments: confirmHeld.segments,
           });
+          transcriptRaw = confirmChoice.text;
+          transcriptSource = confirmChoice.source;
           console.log(
             `[trace tail-gap] interim-covered: envelope ` +
             `${transcriptRaw !== before ? "upgraded" : "confirmed"} instant transcript ` +
-            `ms=${(performance.now() - tEnv).toFixed(0)}`,
+            `source=${confirmChoice.source} ms=${(performance.now() - tEnv).toFixed(0)}`,
           );
           // R2: uncoveredSpeechSec is only knowable once the envelope
           // has actually arrived. Re-run the decision with the real
@@ -12202,12 +12203,11 @@ async function stopLive(
           // its last final ending seconds before the audio does, with no
           // hole to report because the words simply had not arrived yet
           // (session ``62115e77``: 10.85 s of final against 14.26 s of
-          // stream). ``envelopeCoversRecording`` is that check, the same
-          // one the race below applies; an envelope that does not cover
-          // the recording turns recovery on exactly as a proven hole
-          // does.
+          // stream). ``envelopeCoversRecording`` (computed above, before
+          // the compose) is that check, the same one the race below
+          // applies; an envelope that does not cover the recording turns
+          // recovery on exactly as a proven hole does.
           const uncoveredSpeechSec = env?.uncoveredSpeechSec ?? 0;
-          const envelopeIsComplete = envelopeCoversRecording(envelopeCoverageOf(env));
           const postEnvelopeDecision = decideDeadStreamRecovery({ ...lowCoverageInputBase, uncoveredSpeechSec });
           if (postEnvelopeDecision.recover || !envelopeIsComplete) {
             const recoverReason = postEnvelopeDecision.recover
@@ -12245,13 +12245,23 @@ async function stopLive(
             // exists to validate alignment ACROSS engines, and the cost
             // of the gates being wrong there is a hybrid sentence in
             // the user's paste buffer. So the live reading is assembled
-            // by ``composeStopTranscript`` (floor united with whatever
-            // the session buffer has grown to since) and that assembled
-            // text competes with the independent decode by
-            // ``richerTranscript``'s word-count/prefix rule. Switch to
-            // a plain ``composeStopTranscript`` union once a recovery
-            // pair from a real session has been measured.
-            transcriptRaw = richerTranscript(composeStopTranscript(transcriptRaw, sessionUiToken, ""), recovered);
+            // fresh (floor united with whatever the session buffer has
+            // grown to since — no envelope text here, the envelope
+            // already lost this round) and that assembled text competes
+            // with the independent decode by ``richerTranscript``'s
+            // word-count/prefix rule, via ``chooseStopTranscript``'s
+            // ``recoveredText`` input. Switch to a plain merge once a
+            // recovery pair from a real session has been measured.
+            const recoveryHeld = currentHeldReading(transcriptRaw, sessionUiToken);
+            const recoveryChoice = chooseStopTranscript({
+              envelopeText: "",
+              envelopeCovers: false,
+              heldText: recoveryHeld.text,
+              heldSegments: recoveryHeld.segments,
+              recoveredText: recovered,
+            });
+            transcriptRaw = recoveryChoice.text;
+            transcriptSource = recoveryChoice.source;
             patchCurrentRecordingSummary({
               title: provisionalTitle,
               status: transcriptRaw !== beforeRecovery
@@ -12361,6 +12371,8 @@ async function stopLive(
             /** D1: only the envelope can answer this; recovery leaves it undefined. */
             coversRecording?: boolean;
             coverageTrace?: string;
+            /** Only the envelope carries timed segments; recovery is a bare string. */
+            segments?: ReadonlyArray<TimedSegmentLike> | null;
           };
           const baseTranscriptForRace = transcriptRaw;
           const wcInstant = wordCountOf(baseTranscriptForRace);
@@ -12373,6 +12385,7 @@ async function stopLive(
               uncovered: env?.uncoveredSpeechSec,
               coversRecording: envelopeCoversRecording(envelopeCoverageOf(env)),
               coverageTrace: traceEnvelopeCoverage(env),
+              segments: env?.segments,
             };
           });
           const recoveryCand: Promise<Cand> = recoveryPromise.then((text) => ({
@@ -12381,22 +12394,35 @@ async function stopLive(
           const first = await Promise.race([envelopeCand, recoveryCand]);
           const firstMs = performance.now() - tRace;
           console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} ${traceTextStats("candidate", first.text)}`);
-          // §4.8: picked, not united — same decision as the
-          // ``recovered`` site above, and for the same reason. A race
-          // candidate here is EITHER the envelope (a partial reading of
-          // the same live stream, which the alignment was validated on)
-          // OR an independent full-audio decode (which it was not).
-          // This call site sees both labels through one code path and
-          // cannot tell which it has, so both take the conservative
-          // route: the live reading is assembled by
-          // ``composeStopTranscript`` alone (floor united with the
-          // current session buffer, no third text), and the candidate
-          // competes with that assembled text by ``richerTranscript``
-          // rather than by alignment.
-          let improvedText = richerTranscript(composeStopTranscript(baseTranscriptForRace, sessionUiToken, ""), first.text);
-          let chose: Cand | null = improvedText !== baseTranscriptForRace
-            ? { ...first, text: improvedText, words: wordCountOf(improvedText) }
+          // D2 / ``chooseStopTranscript`` (./transcript-merge): the ONE
+          // decision function used at every delivery site, here too. A
+          // candidate labelled "envelope" that covers the recording
+          // replaces the held reading outright (no union — that used to
+          // duplicate whole clauses, see the fixtures cited on
+          // ``chooseStopTranscript``); an incomplete envelope still
+          // contributes through the seam-time merge, using the segments
+          // it carries; a "recovery" candidate — an independent full-
+          // audio decode this call site never aligns, only compares by
+          // word count — competes with the held reading through
+          // ``richerTranscript``. One call handles all three labels, so
+          // this site no longer has to guess which composition a given
+          // label deserves.
+          const composeCandidate = (floorText: string, cand: Cand): StopTranscriptResult => {
+            const held = currentHeldReading(floorText, sessionUiToken);
+            return chooseStopTranscript({
+              envelopeText: cand.label === "envelope" ? cand.text : "",
+              envelopeSegments: cand.label === "envelope" ? cand.segments : null,
+              envelopeCovers: cand.label === "envelope" ? !!cand.coversRecording : false,
+              heldText: held.text,
+              heldSegments: held.segments,
+              recoveredText: cand.label === "recovery" ? cand.text : "",
+            });
+          };
+          const firstOutcome = composeCandidate(baseTranscriptForRace, first);
+          let chose: Cand | null = firstOutcome.text !== baseTranscriptForRace
+            ? { ...first, text: firstOutcome.text, words: wordCountOf(firstOutcome.text) }
             : null;
+          if (chose) transcriptSource = firstOutcome.source;
           const firstConfirmsInstant = candidateConfirmsTranscriptCoverage(
             baseTranscriptForRace,
             first.text,
@@ -12446,9 +12472,10 @@ async function stopLive(
             const otherMs = performance.now() - tRace;
             if (other) {
               console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} ${traceTextStats("candidate", other.text)}`);
-              // §4.8, same as the ``first`` candidate above: picked by
-              // ``richerTranscript``, not united, because this path
-              // cannot tell an envelope from an independent decode.
+              // Same ``composeCandidate`` as the ``first`` candidate
+              // above — envelope-covers replaces outright, an incomplete
+              // envelope merges by seam, a recovery decode competes by
+              // word count.
               //
               // D1: the floor is whatever we already chose — on the
               // incomplete-envelope path the envelope may have added
@@ -12456,9 +12483,10 @@ async function stopLive(
               // comparison from the untouched base would throw them away
               // whenever the recovery decode is the thinner reading.
               const floorForOther = chose?.text ?? baseTranscriptForRace;
-              improvedText = richerTranscript(composeStopTranscript(floorForOther, sessionUiToken, ""), other.text);
-              if (improvedText !== floorForOther) {
-                chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
+              const otherOutcome = composeCandidate(floorForOther, other);
+              if (otherOutcome.text !== floorForOther) {
+                chose = { ...other, text: otherOutcome.text, words: wordCountOf(otherOutcome.text) };
+                transcriptSource = otherOutcome.source;
               }
             } else {
               console.log(`[trace tail-gap] race-second timeout ms=${otherMs.toFixed(0)} first=${first.label} words=${wcInstant}`);
@@ -12470,7 +12498,7 @@ async function stopLive(
           const totalRaceMs = performance.now() - tRace;
           if (chose) {
             transcriptRaw = chose.text;
-            console.log(`[trace tail-gap] decision=USE_${chose.label.toUpperCase()} (+${chose.words - wcInstant} words) totalMs=${totalRaceMs.toFixed(0)}`);
+            console.log(`[trace tail-gap] decision=USE_${chose.label.toUpperCase()} source=${transcriptSource} (+${chose.words - wcInstant} words) totalMs=${totalRaceMs.toFixed(0)}`);
             if (chose.label === "recovery") {
               patchCurrentRecordingSummary({
                 title: provisionalTitle,
@@ -12529,6 +12557,7 @@ async function stopLive(
               const restText = String(restResult.text || "").trim();
               if (restText && wordCountOf(restText) > wordCount) {
                 transcriptRaw = restText;
+                transcriptSource = "recovery";
                 patchCurrentRecordingSummary({
                   title: provisionalTitle,
                   status: "REST re-transcribe recovered full text.",
@@ -12606,11 +12635,13 @@ async function stopLive(
           console.log(`[trace no-final] first=${first.label} ms=${(performance.now() - tNoFinal).toFixed(0)} words=${first.words} error="${first.error}"`);
           if (first.text) {
             transcriptRaw = first.text;
+            transcriptSource = first.label;
           } else {
             const other = await (first.label === "envelope" ? recoveryCand : envelopeCand);
             console.log(`[trace no-final] second=${other.label} ms=${(performance.now() - tNoFinal).toFixed(0)} words=${other.words} error="${other.error}"`);
             if (other.text) {
               transcriptRaw = other.text;
+              transcriptSource = other.label;
             } else if (first.error || other.error) {
               console.log(`[trace no-final] no transcript recovered; envelopeError="${first.error || other.error}"`);
             }
@@ -12687,6 +12718,7 @@ async function stopLive(
               ? "Live stream returned no text, but microphone audio was captured."
               : "Live stream returned no text.",
           );
+          transcriptSource = "recovery";
         }
       }
     } else {
@@ -12757,7 +12789,7 @@ async function stopLive(
     // log has to state it next to the coverage numbers it explains.
     // Non-Deepgram stops have no envelope and read 0.
     const finalEnvelopeStats = liveFinalSlots.get(sessionUiToken)?.envelope?.stats;
-    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} wsFramesNeverSent=${wsFramesNeverSent} dual=${finalEnvelopeStats?.dualStream ? 1 : 0}`);
+    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} dual=${finalEnvelopeStats?.dualStream ? 1 : 0}`);
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
     const noSpeechFinalStatus = "Recording completed, no speech detected.";
     const finalUiText = transcriptRaw || noSpeechFinalStatus;
