@@ -119,3 +119,57 @@ OK
   *Почему:* переименование на этой стороне не роняло ни одного теста — рендерер просто переставал показывать два числа; ровно этот класс дефекта и создал расхождение.
 
 **Не сделано:** —
+
+---
+
+## Коммит 4 — тёплый пул × dual-stream
+
+**Заголовок:** «A dual-stream recording pays one connect before its first byte instead of two, and the second reading is warmed like the first»
+
+**ID:** B-003 (P1), B-004 (P1), B-013 (P1, частично — см. «решения»), B-087 (P2).
+
+**Файлы:** `backend/deepgram_warm.py`, `backend/main.py`, `backend/tests/test_deepgram_warm.py`, `backend/tests/test_deepgram_coverage_holes.py`.
+
+**Верификация.**
+
+Новые тесты на коде ДО правки (`git show HEAD:backend/deepgram_warm.py`, `…:backend/main.py`):
+```
+FAIL: test_two_configurations_connect_at_the_same_time
+AssertionError: 1 != 2 : the second acquire never reached connect
+ERROR: test_a_stalled_connect_does_not_block_an_adoption  (TimeoutError)
+FAIL: test_boot_warms_both_configurations_when_dual_is_on
+  '…language=ru' not found in ['…language=multi'] : boot warmed only the primary reading
+FAIL: test_both_configurations_are_warmed_when_the_recording_ends
+  '…language=ru' not found in ['…language=multi'] : the second reading's configuration was never warmed
+```
+
+B-087 — прямой запуск тестовых модулей (`if __name__ == "__main__"` посреди файла):
+```
+ДО:   python3 backend/tests/test_deepgram_warm.py           Ran 39 tests
+      python3 backend/tests/test_deepgram_coverage_holes.py Ran  8 tests
+ПОСЛЕ: …test_deepgram_warm.py            Ran 54 tests   OK
+       …test_deepgram_coverage_holes.py  Ran 29 tests   OK
+```
+
+Полный набор:
+```
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 -m unittest discover -s backend/tests
+Ran 662 tests in 33.481s
+OK
+```
+(656 → 662.)
+
+**Решения.**
+
+* **B-003.** *Выбрано:* под `self._lock` остаётся только бухгалтерия пула; `connect()` ждётся снаружи через задачу. Та же `_pending`-машинерия схлопывает одновременные коннекты одной конфигурации, поэтому отдельная защита не нужна. `_await_pending` удалён — его роль (снять запись и подождать) теперь разложена по двум сторонам lock'а.
+  *Дополнительно:* вызывающий (`_run_deepgram_live_session`) запускает второй `acquire` задачей ДО первого — без этого снятие lock'а само по себе ничего не ускоряет.
+  *Отвергнуто:* «оставить lock, но взять для второго чтения отдельный lock по ключу» — два лока вместо одного и та же сериализация для любого третьего потребителя (boot-прогрев, `GET /api/live/warm`).
+* **B-003, отмена.** Ждать задачу снаружи lock'а открывает новую дыру: вызывающего могут отменить, пока коннект уже вернул сокет. `_await_connect` вешает `done_callback`, который закрывает такой сокет на луупе. Это единственный реально достижимый случай «cancel проиграл гонку» (см. ниже).
+* **B-004.** *Выбрано:* обе точки `rewarm` греют весь набор конфигураций, который использует эта запись/этот boot. На boot решение берётся из того же `dual_stream_enabled(cfg, "auto")`, что и в WS-обработчике, — одно правило, не второе.
+* **B-013.** *Выбрано:* `_cancel_pending` больше не глотает собственную отмену пула (`except (CancelledError, Exception): pass` → разбор `task.cancelled()`), и закрывает сессию, если задача всё же вернула её.
+  *Уточнение к находке:* описанная в отчёте утечка через `_cancel_pending` **не достижима** на текущем коде, и это измерено: тест `test_a_warm_connect_cancelled_by_a_key_change_closes_its_socket` проходит и ДО правки. Причина — `_warm_connect` ловит `CancelledError` вокруг `connect()` и закрывает сессию, а CPython при `_must_cancel` доставляет отмену именно в эту точку. Достижима **другая** половина того же класса — отменённый `acquire` поверх уже завершившегося коннекта; она закрыта `_await_connect` и закреплена вторым тестом (`test_an_acquire_cancelled_after_its_connect_returned_closes_it`), который ДО правки падает.
+* **B-087.** *Выбрано:* охранник `if __name__ == "__main__"` перенесён в конец обоих файлов. *Почему:* `unittest discover` собирал всё и раньше, но прямой запуск модуля (как в этом журнале) молча выполнял треть тестов — то есть инструмент проверки врал.
+* *Попутно:* `_WarmFakeUpstream` отвечает на четыре вопроса, которые задаёт `deepgram_recovery.evidence_from_session`. До этого каждый тест обработчика печатал `AttributeError`-трейсбек, а путь восстановления в них не исполнялся вовсе — фейк был не тем, что он изображал.
+* *Попутно:* провал первичного коннекта теперь закрывает уже открытый сокет второго чтения (`_discard_secondary_acquire`) — раньше его просто не существовало, потому что второй `acquire` начинался после успеха первого.
+
+**Не сделано:** —

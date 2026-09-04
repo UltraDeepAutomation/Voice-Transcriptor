@@ -114,10 +114,6 @@ class UncoveredSpeechTests(unittest.TestCase):
         self.assertEqual(s._uncovered_speech_sec(), 0.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SpeechSpanSourceTests(unittest.TestCase):
     """What counts as "the service heard words here"."""
 
@@ -450,3 +446,7 @@ class OverruledWordReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s._overruled_total, 1)
         word, owner = list(s._overruled_words)[0]
         self.assertEqual((word["word"], owner["word"]), ("трёх", "одном"))
+
+
+if __name__ == "__main__":
+    unittest.main()

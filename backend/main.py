@@ -4636,6 +4636,36 @@ def _configured_deepgram_key(cfg: Any) -> str:
     return str(key or "").strip()
 
 
+async def _discard_secondary_acquire(task: "Optional[asyncio.Task]") -> None:
+    """Release a second-reading acquire the recording no longer needs.
+
+    The two acquires of a dual-stream recording are started together, so
+    the second one can still be connecting — or already connected — when
+    the first one fails. Cancelling is not enough on either side of that
+    race: a cancel that arrives after ``connect()`` returned leaves a
+    live, billed socket holding a slot against the account's
+    concurrency limit, which is the same hole the warm pool's
+    ``_cancel_pending`` had.
+    """
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        acquisition = await task
+    except asyncio.CancelledError:
+        if not task.cancelled():
+            raise
+        return
+    except Exception as e:
+        logger.info("dual-stream: second reading discarded after %s", e)
+        return
+    try:
+        await acquisition.session.discard()
+    except Exception as e:  # pragma: no cover - teardown is best-effort
+        logger.debug("dual-stream: second reading close ignored: %s", e)
+
+
 async def _prewarm_deepgram_at_boot() -> None:
     """Open the first warm socket at backend start, if a key is set.
 
@@ -4654,15 +4684,23 @@ async def _prewarm_deepgram_at_boot() -> None:
     api_key = _configured_deepgram_key(cfg)
     if not api_key:
         return
-    DEEPGRAM_WARM_POOL.rewarm(
-        api_key,
-        _live_config(
-            model=DEFAULT_DEEPGRAM_AUDIO_MODEL,
-            language="auto",
-            diarize=False,
-            keyterms=configured_keyterms(cfg),
-        ),
+    primary_cfg = _live_config(
+        model=DEFAULT_DEEPGRAM_AUDIO_MODEL,
+        language="auto",
+        diarize=False,
+        keyterms=configured_keyterms(cfg),
     )
+    DEEPGRAM_WARM_POOL.rewarm(api_key, primary_cfg)
+    # Both readings, when this configuration runs two. The second one is
+    # a different query string and therefore a different pool key, so
+    # warming only the primary left ``WARM_MAX_SOCKETS = 2`` — a bound
+    # introduced for exactly this case — describing a pool that never
+    # held more than one socket, and the second reading paying a cold
+    # connect on every single recording.
+    if dual_stream_enabled(cfg, "auto"):
+        DEEPGRAM_WARM_POOL.rewarm(
+            api_key, secondary_config(primary_cfg, dual_secondary_language(cfg))
+        )
 
 
 async def _run_deepgram_live_session(
@@ -4791,6 +4829,19 @@ async def _run_deepgram_live_session(
         budget_sends.add(task)
         task.add_done_callback(budget_sends.discard)
 
+    # Both readings are asked for at once. The pool no longer holds its
+    # lock across a connect, so two cold connects for a dual-stream
+    # recording overlap instead of running back to back — the difference
+    # between one connect budget before the first byte and two.
+    secondary_task: Optional[asyncio.Task] = None
+    if dual_language:
+        secondary_task = asyncio.get_running_loop().create_task(
+            DEEPGRAM_WARM_POOL.acquire(
+                api_key, secondary_config(dg_cfg, dual_language)
+            ),
+            name="deepgram-secondary-acquire",
+        )
+
     try:
         # Adopts the pre-opened socket when one matches this exact
         # configuration and is healthy; otherwise this is the same
@@ -4828,6 +4879,11 @@ async def _run_deepgram_live_session(
             raise
         except Exception:
             pass
+        # The primary never opened, so the second reading has nothing to
+        # read alongside. Its socket is a billed connection against the
+        # account's concurrency limit, so it is disposed of rather than
+        # abandoned.
+        await _discard_secondary_acquire(secondary_task)
         connect_error = _safe_error_text(e)
         final_payload = {
             "type": "final",
@@ -4860,11 +4916,9 @@ async def _run_deepgram_live_session(
     # is not the recording's: everything it would have added is what the
     # user got before this feature existed, so it degrades to one
     # reading with a warning and never to an aborted recording.
-    if dual_language:
+    if secondary_task is not None:
         try:
-            secondary = await DEEPGRAM_WARM_POOL.acquire(
-                api_key, secondary_config(dg_cfg, dual_language)
-            )
+            secondary = await secondary_task
             primary_language = resolve_live_language(language)
             session = DualLiveSession(
                 primary=session,
@@ -5576,6 +5630,10 @@ async def _run_deepgram_live_session(
         # failed pre-warm must never be visible on the path of the
         # recording that triggered it.
         DEEPGRAM_WARM_POOL.rewarm(api_key, dg_cfg)
+        if dual_language:
+            DEEPGRAM_WARM_POOL.rewarm(
+                api_key, secondary_config(dg_cfg, dual_language)
+            )
 
         # The sender only outlives the drain when the upstream never
         # took the last frame. The socket is closed by now, so the

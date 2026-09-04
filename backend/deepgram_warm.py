@@ -277,42 +277,100 @@ class DeepgramWarmPool:
         path is unchanged.
         """
         key = cfg.to_query_string()
+        # Under the lock: pool BOOKKEEPING only. The connect itself — up
+        # to ``DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC`` plus one retry, so 12 s
+        # of network wait — is awaited outside it. Held across the
+        # connect, this lock serialised the two acquires of a
+        # dual-stream recording, which is precisely the case
+        # ``WARM_MAX_SOCKETS = 2`` exists for: the second reading paid a
+        # full connect AFTER the first one's, back to back, and no
+        # amount of concurrency in the caller could change that.
         async with self._lock:
             pending = self._pending.get(key)
-            if pending is not None:
-                if pending[1] == api_key:
-                    # A re-warm for exactly this configuration is already
-                    # in flight and is, at worst, as far along as a fresh
-                    # connect started now. Awaiting it also keeps the
-                    # worst case at ONE connect budget: a failure is
-                    # raised, not retried behind a second 12 s attempt.
-                    session = await self._await_pending(key)
-                    if session is not None:
-                        return self._adopt(session, age=0.0)
-                    raise DeepgramLiveError(
-                        "Deepgram connect failed (warm connect in flight)"
-                    )
-                await self._cancel_pending(key)
+            if pending is not None and pending[1] == api_key:
+                # A re-warm for exactly this configuration is already in
+                # flight and is, at worst, as far along as a fresh
+                # connect started now. Taking it over also keeps the
+                # worst case at ONE connect budget: a failure is raised,
+                # not retried behind a second 12 s attempt.
+                #
+                # Popped here, so ``_warm_connect`` sees the entry gone
+                # and hands the session to this caller instead of
+                # storing it in a slot.
+                task = self._pending.pop(key)[0]
+                in_flight = True
+            else:
+                if pending is not None:
+                    await self._cancel_pending(key)
 
-            slot = self._slots.get(key)
-            if slot is not None:
-                reason = self._unfit_reason(slot, api_key)
-                if reason is None:
-                    self._release_slot(key)
-                    return self._adopt(
-                        slot.session,
-                        age=max(0.0, self._clock() - slot.warmed_at),
-                    )
-                await self._drop_slot(key, reason)
+                slot = self._slots.get(key)
+                if slot is not None:
+                    reason = self._unfit_reason(slot, api_key)
+                    if reason is None:
+                        self._release_slot(key)
+                        return self._adopt(
+                            slot.session,
+                            age=max(0.0, self._clock() - slot.warmed_at),
+                        )
+                    await self._drop_slot(key, reason)
 
-            session = self._factory(api_key, cfg)
+                task = asyncio.get_running_loop().create_task(
+                    self._connect_only(self._factory(api_key, cfg)),
+                    name="deepgram-acquire-connect",
+                )
+                in_flight = False
+
+        session = await self._await_connect(task)
+        if in_flight:
+            if session is None:
+                raise DeepgramLiveError(
+                    "Deepgram connect failed (warm connect in flight)"
+                )
+            return self._adopt(session, age=0.0)
+        # ``_connect_only`` re-raises what ``connect()`` raised, so this
+        # caller's failure path is exactly what it was before the pool
+        # existed; ``session is None`` cannot happen on this branch.
+        return WarmAcquisition(
+            session=session,
+            adopted=False,
+            warm_age_sec=0.0,
+            connect_ms=session.stats.connect_ms,
+        )
+
+    @staticmethod
+    async def _connect_only(session: DeepgramLiveSession) -> DeepgramLiveSession:
+        """Connect one session and return it, closing it if cancelled."""
+        try:
             await session.connect()
-            return WarmAcquisition(
-                session=session,
-                adopted=False,
-                warm_age_sec=0.0,
-                connect_ms=session.stats.connect_ms,
-            )
+        except asyncio.CancelledError:
+            await _quiet_close(session)
+            raise
+        return session
+
+    async def _await_connect(
+        self, task: "asyncio.Task"
+    ) -> Optional[DeepgramLiveSession]:
+        """Await a connect task without leaving a live socket behind.
+
+        The task runs outside the pool lock, so a caller cancelled while
+        waiting on it (uvicorn shutdown, the renderer disconnecting)
+        would otherwise abandon a task that may be about to return a
+        real, billed connection. Cancelling it is not enough on its own:
+        ``cancel()`` loses the race whenever the connect has already
+        returned, which is the same hole ``_cancel_pending`` had
+        (B-013). So the socket is closed from a done-callback, on the
+        loop, after this coroutine is gone.
+        """
+        try:
+            return await task
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(_close_orphaned_connect)
+            raise
+        except DeepgramLiveError:
+            raise
+        except Exception:
+            return None
 
     def _adopt(
         self, session: DeepgramLiveSession, *, age: float
@@ -369,9 +427,9 @@ class DeepgramWarmPool:
             await _quiet_close(session)
             self._pending.pop(key, None)
             return None
-        # ``acquire()`` may already have taken this task's result
-        # (``_await_pending`` pops the entry first), in which case the
-        # session belongs to that caller and must not be stored.
+        # ``acquire()`` may already have taken this task over (it pops
+        # the pending entry before awaiting), in which case the session
+        # belongs to that caller and must not be stored.
         if key in self._pending:
             self._pending.pop(key, None)
             await self._store_warm(session, key, api_key)
@@ -383,7 +441,7 @@ class DeepgramWarmPool:
         # Every mutation happens before the first await, so a concurrent
         # ``acquire()`` can never observe a half-swapped slot. This runs
         # WITHOUT the pool lock on purpose: ``acquire()`` may be awaiting
-        # this very task (``_await_pending``) while holding it.
+        # this very task, and it releases the lock before it does.
         previous = self._slots.pop(key, None)
         if previous is not None:
             self._cancel_reaper(previous)
@@ -487,17 +545,6 @@ class DeepgramWarmPool:
             slot.reaper.cancel()
         slot.reaper = None
 
-    async def _await_pending(self, key: str) -> Optional[DeepgramLiveSession]:
-        entry = self._pending.pop(key, None)
-        if entry is None:
-            return None
-        try:
-            return await entry[0]
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return None
-
     async def _cancel_pending(self, key: str) -> None:
         entry = self._pending.pop(key, None)
         if entry is None:
@@ -513,10 +560,23 @@ class DeepgramWarmPool:
                 await _quiet_close(session)
             return
         task.cancel()
+        session = None
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            session = await task
+        except asyncio.CancelledError:
+            # Only the cancellation OF THAT TASK is expected here. Our
+            # own — the pool being closed with the app — must propagate.
+            if not task.cancelled():
+                raise
+        except Exception as e:
+            logger.debug("deepgram-live: cancelled warm connect ended with %s", e)
+        if session is not None:
+            # ``cancel()`` lost the race: the connect had already
+            # returned past its last await, so this is a live, billed
+            # socket holding a slot against the concurrency limit. The
+            # ``task.done()`` branch above closes it; this one used to
+            # drop it on the floor for the lifetime of the process.
+            await _quiet_close(session)
 
     # ----- Introspection ----------------------------------------------
 
@@ -561,6 +621,21 @@ class DeepgramWarmPool:
             "maxSockets": self._max_sockets,
             "sockets": sockets,
         }
+
+
+def _close_orphaned_connect(task: "asyncio.Task") -> None:
+    """Close a connect whose awaiter was cancelled out from under it."""
+    if task.cancelled():
+        return
+    try:
+        session = task.result()
+    except Exception:
+        return
+    if session is None:
+        return
+    asyncio.get_running_loop().create_task(
+        _quiet_close(session), name="deepgram-orphaned-connect-close"
+    )
 
 
 async def _quiet_close(session: DeepgramLiveSession) -> None:

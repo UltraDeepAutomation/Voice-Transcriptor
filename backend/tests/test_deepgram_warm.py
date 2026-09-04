@@ -58,8 +58,10 @@ class FakeSession:
     connects: int = 0
     discarded: bool = False
     connect_gate: Optional[asyncio.Event] = None
+    connect_entered: bool = False
 
     async def connect(self) -> None:
+        self.connect_entered = True
         if self.connect_gate is not None:
             await self.connect_gate.wait()
         self.connects += 1
@@ -98,6 +100,9 @@ class _PoolCase(unittest.IsolatedAsyncioTestCase):
         # make one connect fail or stall without reaching into the pool.
         self.next_connect_error: Optional[Exception] = None
         self.next_connect_gate: Optional[asyncio.Event] = None
+        # Applied to EVERY session, for the cases that need two connects
+        # held open at the same time.
+        self.connect_gate_all: Optional[asyncio.Event] = None
         self.pool = DeepgramWarmPool(
             session_factory=self._factory, clock=self.clock,
         )
@@ -107,7 +112,7 @@ class _PoolCase(unittest.IsolatedAsyncioTestCase):
             api_key=api_key,
             cfg=cfg,
             connect_error=self.next_connect_error,
-            connect_gate=self.next_connect_gate,
+            connect_gate=self.next_connect_gate or self.connect_gate_all,
         )
         self.next_connect_error = None
         self.next_connect_gate = None
@@ -495,6 +500,109 @@ class AudioOffsetTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(drained["streamedSec"], 2.0, places=3)
 
 
+class ConcurrentAcquireTests(_PoolCase):
+    """The pool lock guards bookkeeping, never a connect (B-003).
+
+    A dual-stream recording acquires two configurations. Held across
+    ``connect()``, the pool's own lock made those two connects run back
+    to back — up to 12 s each — so the feature ``WARM_MAX_SOCKETS = 2``
+    was written for paid double the latency the pool exists to remove,
+    and no amount of concurrency in the caller could change it.
+    """
+
+    async def test_two_configurations_connect_at_the_same_time(self):
+        gate = asyncio.Event()
+        self.connect_gate_all = gate
+        first = asyncio.ensure_future(self.pool.acquire("k", _cfg()))
+        second = asyncio.ensure_future(
+            self.pool.acquire("k", _cfg(language="en"))
+        )
+        for _ in range(6):
+            await asyncio.sleep(0)
+        try:
+            self.assertEqual(
+                len(self.created), 2, "the second acquire never reached connect"
+            )
+            self.assertTrue(
+                all(session.connect_entered for session in self.created),
+                "one connect was still queued behind the other",
+            )
+        finally:
+            gate.set()
+            results = await asyncio.gather(first, second)
+        self.assertEqual([r.adopted for r in results], [False, False])
+
+    async def test_a_stalled_connect_does_not_block_an_adoption(self):
+        # The other half of the same defect: a warm socket that is ready
+        # to be adopted was unreachable while an unrelated configuration
+        # was connecting.
+        warm = await self._warm()
+        gate = asyncio.Event()
+        self.connect_gate_all = gate
+        stalled = asyncio.ensure_future(
+            self.pool.acquire("k", _cfg(language="en"))
+        )
+        for _ in range(4):
+            await asyncio.sleep(0)
+        acquisition = await asyncio.wait_for(
+            self.pool.acquire("k", _cfg()), timeout=1.0
+        )
+        self.assertIs(acquisition.session, warm)
+        self.assertTrue(acquisition.adopted)
+        gate.set()
+        await stalled
+
+
+class CancelledConnectTests(_PoolCase):
+    """No cancellation may leave a live, billed socket behind (B-013).
+
+    Every warm socket is a real connection the user is billed for and
+    which holds a slot against the account's concurrency limit, so a
+    connect that is abandoned has to be closed rather than dropped. Two
+    shapes: a warm connect cancelled by a key change, and an
+    ``acquire()`` whose CALLER is cancelled while the connect runs.
+    """
+
+    async def test_a_warm_connect_cancelled_by_a_key_change_closes_its_socket(self):
+        gate = asyncio.Event()
+        self.next_connect_gate = gate
+        self.pool.start()
+        self.pool.rewarm("old-key", _cfg())
+        await asyncio.sleep(0)
+        warming = self.created[-1]
+        gate.set()
+
+        acquisition = await self.pool.acquire("new-key", _cfg())
+
+        self.assertTrue(
+            warming.discarded,
+            "the socket of the cancelled warm connect leaked",
+        )
+        self.assertIsNot(acquisition.session, warming)
+        self.assertEqual(acquisition.session.api_key, "new-key")
+
+    async def test_an_acquire_cancelled_after_its_connect_returned_closes_it(self):
+        # The reachable half: ``cancel()`` cannot unwind a connect that
+        # has already returned, so the caller going away — uvicorn
+        # shutting down, the renderer disconnecting — used to abandon a
+        # connected socket for the lifetime of the process.
+        gate = asyncio.Event()
+        self.connect_gate_all = gate
+        task = asyncio.ensure_future(self.pool.acquire("k", _cfg()))
+        await asyncio.sleep(0)
+        opened = self.created[-1]
+        gate.set()
+        # The connect completes; the awaiting acquire is cancelled
+        # before it is resumed with the result.
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertTrue(opened.discarded, "the connected socket was abandoned")
+
+
 class KeepAliveCadenceTests(unittest.TestCase):
     """The cadence the warm socket is opened with, per Deepgram's docs.
 
@@ -527,10 +635,6 @@ class DiscardTests(unittest.IsolatedAsyncioTestCase):
         session = DeepgramLiveSession(api_key="k")
         await session.discard()
         self.assertTrue(session.is_closed)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ---------------------------------------------------------------------
@@ -611,6 +715,33 @@ class _WarmFakeUpstream:
             "uncoveredSpeechSec": 0.0, "streamedSec": 0.0, "coveredEndSec": 0.0,
         }
 
+    # The four coverage questions ``deepgram_recovery`` asks of any
+    # session it is handed. Answered as "this reading covered
+    # everything", which is what these tests are about — without them
+    # every case here logged an AttributeError traceback and the
+    # recovery pass was never actually exercised.
+    def coverage_hole_spans(self) -> list:
+        return []
+
+    def interim_speech_spans(self) -> list:
+        return []
+
+    @property
+    def interim_window_end(self) -> float:
+        return 0.0
+
+    @property
+    def endpointing_sec(self) -> float:
+        return 0.3
+
+    @property
+    def last_utterance_end(self):
+        return None
+
+    @property
+    def utterance_end_sec(self) -> float:
+        return 2.0
+
     async def shutdown(self, wait_timeout: float = 3.0) -> None:
         await self.close()
 
@@ -655,15 +786,9 @@ def _silence(nbytes: int) -> bytes:
     return b"\x00\x00" * (nbytes // 2)
 
 
-class WarmSessionLivenessTests(unittest.IsolatedAsyncioTestCase):
-    """§3.7: an adopted socket has proven nothing until it answers.
-
-    A socket opened four minutes ago can be dead with nothing having
-    raised — writes into a half-open TCP connection succeed and Deepgram
-    never answers a ``KeepAlive``. The only positive evidence is a
-    message coming back, and the only moment one is owed is after audio
-    that actually contains speech.
-    """
+class _WarmHandlerCase(unittest.IsolatedAsyncioTestCase):
+    """A ``backend.main`` imported against a scratch data dir, and the
+    plumbing to drive one WebSocket recording through it."""
 
     def setUp(self) -> None:
         import importlib
@@ -702,7 +827,7 @@ class WarmSessionLivenessTests(unittest.IsolatedAsyncioTestCase):
 
         return {"pcm_file": io.BytesIO(), "bytes": 0, "chunks": 0, "had_error": False}
 
-    def _run(self, ws, recovery):
+    def _run(self, ws, recovery, dual_language: str = ""):
         return asyncio.create_task(
             self.main._run_deepgram_live_session(
                 websocket=ws,
@@ -711,6 +836,7 @@ class WarmSessionLivenessTests(unittest.IsolatedAsyncioTestCase):
                 language="auto",
                 diarize=False,
                 recovery=recovery,
+                dual_language=dual_language,
             )
         )
 
@@ -733,6 +859,16 @@ class WarmSessionLivenessTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(len(_WarmFakeUpstream.instances), 1)
         return pool
+
+class WarmSessionLivenessTests(_WarmHandlerCase):
+    """§3.7: an adopted socket has proven nothing until it answers.
+
+    A socket opened four minutes ago can be dead with nothing having
+    raised — writes into a half-open TCP connection succeed and Deepgram
+    never answers a ``KeepAlive``. The only positive evidence is a
+    message coming back, and the only moment one is owed is after audio
+    that actually contains speech.
+    """
 
     async def test_a_warm_socket_that_answers_is_kept(self):
         from unittest import mock as _mock
@@ -891,6 +1027,75 @@ class WarmSessionLivenessTests(unittest.IsolatedAsyncioTestCase):
             await pool.close_all()
 
 
+class DualStreamWarmingTests(_WarmHandlerCase):
+    """Both readings of a dual-stream recording are warmed (B-004).
+
+    ``WARM_MAX_SOCKETS = 2`` was introduced with a comment naming this
+    exact case — two languages, two query strings, therefore two pool
+    keys. Both ``rewarm`` call sites passed only the primary
+    configuration, so the pool never held more than one socket, the
+    bound and its eviction logic were unreachable, and the second
+    reading paid a cold connect on every recording.
+    """
+
+    async def test_both_configurations_are_warmed_when_the_recording_ends(self):
+        from unittest import mock as _mock
+
+        ws = _WarmFakeWebSocket()
+        with _mock.patch.object(self.main, "DeepgramLiveSession", _WarmFakeUpstream):
+            pool = self.main.DEEPGRAM_WARM_POOL
+            pool.start()
+            task = self._run(ws, self._recovery(), dual_language="ru")
+            await asyncio.sleep(0.02)
+            await self._finish(ws, task)
+            for _ in range(4):
+                await asyncio.sleep(0)
+            primary = self.main._live_config(
+                model="nova-3", language="auto", diarize=False, keyterms=(),
+            )
+            keys = [row["configKey"] for row in pool.status()["sockets"]]
+            self.assertIn(primary.to_query_string(), keys)
+            self.assertIn(
+                self.main.secondary_config(primary, "ru").to_query_string(),
+                keys,
+                "the second reading's configuration was never warmed",
+            )
+            await pool.close_all()
+
+
+    async def test_boot_warms_both_configurations_when_dual_is_on(self):
+        from unittest import mock as _mock
+
+        cfg = {
+            "providers": {"deepgram": {"key": "dg"}},
+            "preferences": {
+                "deepgram": {
+                    "keyterms": [],
+                    "dual_stream": True,
+                    "dual_secondary_language": "ru",
+                }
+            },
+        }
+        with _mock.patch.object(self.main, "DeepgramLiveSession", _WarmFakeUpstream), \
+                _mock.patch.object(self.main, "load_config", lambda: cfg):
+            pool = self.main.DEEPGRAM_WARM_POOL
+            pool.start()
+            await self.main._prewarm_deepgram_at_boot()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            primary = self.main._live_config(
+                model="nova-3", language="auto", diarize=False, keyterms=(),
+            )
+            keys = [row["configKey"] for row in pool.status()["sockets"]]
+            self.assertIn(primary.to_query_string(), keys)
+            self.assertIn(
+                self.main.secondary_config(primary, "ru").to_query_string(),
+                keys,
+                "boot warmed only the primary reading",
+            )
+            await pool.close_all()
+
+
 class WarmStatusEndpointTests(unittest.TestCase):
     """``GET /api/live/warm`` is a diagnostic, behind the standard auth."""
 
@@ -947,3 +1152,7 @@ class WarmStatusEndpointTests(unittest.TestCase):
     def test_the_boot_prewarm_does_nothing_without_a_key(self):
         asyncio.run(self.main._prewarm_deepgram_at_boot())
         self.assertEqual(self.main.DEEPGRAM_WARM_POOL.status()["sockets"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
