@@ -68,6 +68,7 @@ import {
 import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
 import { mayAutosaveUiPreferences } from "./settings-autosave";
+import { smartRecordingTitle } from "./recording-title";
 import {
   UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
   decideUploadQueueRestore,
@@ -1029,9 +1030,67 @@ const UI_TOKENS = {
      * means stop, 200 ms later, every time.
      */
     stopTailHoldMs: 200,
+    /**
+     * Below this length, "the session was silent" is not a conclusion
+     * worth drawing.
+     *
+     * A recording this short may contain no speech simply because the
+     * user has not started yet, and the level summary has too few frames
+     * to say anything about the room. Sits between ``minRecordingMs``
+     * (the double-tap floor) and the shortest dictation worth keeping.
+     */
+    silenceTrustMinSec: 1.25,
+    /**
+     * Ceiling on the audio each fallback sink holds in memory, as a
+     * recording length.
+     *
+     * Both fallbacks are bounded by it: the WebM container (one chunk
+     * per second, so the window is a chunk count) and the in-memory PCM
+     * sink used when OPFS is unavailable (a sample count — 16 kHz Int16
+     * is ~32 KB/s, so two hours is ~230 MB, and it used to have no
+     * bound at all while the comment beside it claimed the sink was
+     * "bounded by definition"). One number, because it is one decision
+     * about how much of a very long dictation a machine without a disk
+     * spool can keep.
+     */
+    fallbackWindowSec: 60 * 120,
   },
   finalize: {
     segmentEpsilonSec: 0.08,
+    /**
+     * How long the stop waits for the backend's ``final`` envelope
+     * after ``{type:"finalize"}`` is sent.
+     *
+     * Covers Deepgram's 700 ms endpointing threshold, its server-side
+     * finalize (~500-1500 ms), the network round trip and the backend
+     * forward. Raised 2000 → 4000 in 1.1.13 after tail-truncation
+     * reports on slow cross-region links (RU → us-east): 500 ms pause
+     * + 700 ms endpointing + 1500 ms finalize + 600 ms RTT is a 3300 ms
+     * round trip that only barely beat the old budget, and the user's
+     * last utterance was dropped from the transcript and the paste
+     * whenever it did not.
+     *
+     * It lived as a bare ``4000`` at the call site while its three
+     * neighbours below were named and argued for.
+     */
+    envelopeWaitMs: 4_000,
+    /**
+     * Recovery budgets. Named and reasoned about since they were
+     * written, but they lived outside UI_TOKENS while every other stop
+     * timing lived inside it, so "all the budgets of a stop" was not
+     * something you could read in one place.
+     *
+     *   smallAudioUiMs      — Deepgram REST on a payload under
+     *                         ``REMOTE_SMALL_AUDIO_BYTES``; the UI gives
+     *                         up before the request does.
+     *   shortEmptyRecoveryMs — an empty transcript on a short recording:
+     *                         there is little audio to re-decode, so
+     *                         waiting long buys nothing.
+     *   defaultEmptyRecoveryMs — the same for a recording of any length.
+     */
+    smallAudioUiMs: 13_000,
+    shortEmptyRecoveryMs: 8_000,
+    defaultEmptyRecoveryMs: 20_000,
   },
   drain: {
     maxWaitMs: 450,
@@ -2566,9 +2625,9 @@ function normalizeProviderSelection(value: unknown, fallback: Provider = "local"
 }
 
 const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
-const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = 13_000;
-const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = 8_000;
-const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = 20_000;
+const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = UI_TOKENS.finalize.smallAudioUiMs;
+const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.shortEmptyRecoveryMs;
+const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.defaultEmptyRecoveryMs;
 function isRemoteProvider(provider: Provider): provider is RemoteProvider {
   return provider === "openrouter" || provider === "deepgram";
 }
@@ -3917,8 +3976,20 @@ class OpfsPcmSink implements PcmSink {
   }
 }
 
+/**
+ * PCM sink for hosts where OPFS is unavailable.
+ *
+ * Bounded by the same window as the WebM fallback. It used to grow
+ * without any limit — 16 kHz Int16 is ~32 KB/s, so ~115 MB an hour of
+ * renderer memory — while the comment at ``createPcmSink`` asserted that
+ * "the 2h rotating-window dance is gone, the sink is bounded by
+ * definition". That was true of the OPFS sink, which spools to disk, and
+ * false of this one, which is the only sink a machine without OPFS gets.
+ */
 class MemoryPcmSink implements PcmSink {
   private chunks: Int16Array[] = [];
+  private bufferedSamples = 0;
+  private truncationWarned = false;
   private destroyed = false;
   totalSamples = 0;
   readonly isDiskBacked = false;
@@ -3929,7 +4000,23 @@ class MemoryPcmSink implements PcmSink {
     if (!samples.length) return;
     const int16 = floatSamplesToInt16LE(samples);
     this.chunks.push(int16);
+    this.bufferedSamples += int16.length;
     this.totalSamples += int16.length;
+    const cap = UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ;
+    while (this.bufferedSamples > cap && this.chunks.length > 1) {
+      const dropped = this.chunks.shift();
+      this.bufferedSamples -= dropped ? dropped.length : 0;
+      if (!this.truncationWarned) {
+        this.truncationWarned = true;
+        // Once per session, and said out loud: silently dropping the
+        // start of a recording reads as data loss, which is what it is.
+        showRecordSessionNotice(
+          "Recording exceeds 2 hours and this system has no disk spool — only the last 2 h of audio is kept.",
+          "warning",
+          9000,
+        );
+      }
+    }
   }
 
   async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
@@ -3948,6 +4035,7 @@ class MemoryPcmSink implements PcmSink {
   async destroy(): Promise<void> {
     this.destroyed = true;
     this.chunks = [];
+    this.bufferedSamples = 0;
     this.totalSamples = 0;
   }
 }
@@ -3986,6 +4074,37 @@ async function probeAudioFileDuration(file: File): Promise<number | null> {
   }
 }
 
+/**
+ * Weights for the choice of canonical audio.
+ *
+ * Which file the user's recording IS — the WAV the PCM sink produced or
+ * the WebM the MediaRecorder produced — was decided by five bare numbers
+ * inside the scoring expression. They are a product decision, not
+ * arithmetic, so they are named here with what each is for. The score is
+ * in seconds throughout: a candidate's distance from the expected
+ * duration, plus penalties expressed as the number of seconds of error
+ * they are considered equivalent to.
+ */
+/** PCM coverage above which the WebM probe is not worth its cost. */
+const CANONICAL_AUDIO_PCM_FAST_PATH_COVERAGE = 0.95;
+/**
+ * Tie-break against the container when both candidates fit equally well.
+ * The PCM spool is the higher-fidelity path (no lossy re-encode, exact
+ * sample count), so the container has to be measurably better, not
+ * merely equal, to win.
+ */
+const CANONICAL_AUDIO_CONTAINER_BIAS_SEC = 0.08;
+/** The same, doubled, for a container whose duration could not be probed at all. */
+const CANONICAL_AUDIO_UNPROBED_CONTAINER_BIAS_SEC = 0.16;
+/** Shortfall tolerated before a candidate counts as having missed audio. */
+const CANONICAL_AUDIO_UNDER_CAPTURE_TOLERANCE_SEC = 0.35;
+/**
+ * Penalty for missing audio. Larger than the tolerance it follows,
+ * because a recording that is short is missing something the user said,
+ * while one that runs long merely has silence on the end.
+ */
+const CANONICAL_AUDIO_UNDER_CAPTURE_PENALTY_SEC = 0.45;
+
 async function selectCanonicalCapturedAudio(opts: {
   /** Pre-built WAV file returned by ``PcmSink.finalize``. The file
    *  is either a Blob backed by an OPFS spool entry (disk-spilled)
@@ -4009,13 +4128,13 @@ async function selectCanonicalCapturedAudio(opts: {
   if (opts.pcmFile && opts.pcmFile.size > 44 && opts.pcmSampleCount > 0) {
     const pcmDurationSec = opts.pcmSampleCount / opts.pcmSampleRate;
     const pcmFile = opts.pcmFile;
-    // FAST PATH: if the PCM capture is complete (covers >= 95% of
-    // the expected duration), skip the slow WebM probing step
-    // altogether — the sink already produced a ready-to-play WAV
-    // and we know the exact sample count.
+    // FAST PATH: a PCM capture that covers essentially all of the
+    // expected duration skips the slow WebM probe altogether — the sink
+    // already produced a ready-to-play WAV and the exact sample count is
+    // known.
     const pcmCoverage =
       expectedDurationSec > 0 ? pcmDurationSec / expectedDurationSec : 1;
-    if (pcmCoverage >= 0.95) {
+    if (pcmCoverage >= CANONICAL_AUDIO_PCM_FAST_PATH_COVERAGE) {
       return { file: pcmFile, durationSec: pcmDurationSec, kind: "pcm" };
     }
     candidates.push({ file: pcmFile, durationSec: pcmDurationSec, kind: "pcm", fidelityBias: 0 });
@@ -4026,9 +4145,19 @@ async function selectCanonicalCapturedAudio(opts: {
     const webmFile = new File([webmBlob], `live-${Date.now()}.webm`, { type: webmBlob.type || "audio/webm" });
     const webmDurationSec = await probeAudioFileDuration(webmFile);
     if (webmDurationSec && webmDurationSec > 0) {
-      candidates.push({ file: webmFile, durationSec: webmDurationSec, kind: "container", fidelityBias: 0.08 });
+      candidates.push({
+        file: webmFile,
+        durationSec: webmDurationSec,
+        kind: "container",
+        fidelityBias: CANONICAL_AUDIO_CONTAINER_BIAS_SEC,
+      });
     } else if (!candidates.length) {
-      candidates.push({ file: webmFile, durationSec: 0, kind: "container", fidelityBias: 0.16 });
+      candidates.push({
+        file: webmFile,
+        durationSec: 0,
+        kind: "container",
+        fidelityBias: CANONICAL_AUDIO_UNPROBED_CONTAINER_BIAS_SEC,
+      });
     }
   }
 
@@ -4041,7 +4170,10 @@ async function selectCanonicalCapturedAudio(opts: {
   const scored = candidates
     .map((candidate) => {
       const diff = Math.abs(expectedDurationSec - candidate.durationSec);
-      const underCapturePenalty = candidate.durationSec + 0.35 < expectedDurationSec ? 0.45 : 0;
+      const underCapturePenalty =
+        candidate.durationSec + CANONICAL_AUDIO_UNDER_CAPTURE_TOLERANCE_SEC < expectedDurationSec
+          ? CANONICAL_AUDIO_UNDER_CAPTURE_PENALTY_SEC
+          : 0;
       return {
         ...candidate,
         score: diff + underCapturePenalty + candidate.fidelityBias,
@@ -8265,7 +8397,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
           name: audioState.savedName,
           archiveDir: audioState.archiveDir || "",
           requireExisting: true,
-          title: text.split(/\s+/).slice(0, 8).join(" "),
+          title: smartRecordingTitle(text, audioState.savedName || "Recording"),
           sourceText: text,
           transcriptText: text,
           provider: usedProvider,
@@ -8514,6 +8646,29 @@ function shouldLivePreview(): boolean {
  * stream exists precisely to be monolingual, and an Auto secondary would
  * be the multi stream twice.
  */
+/**
+ * Copy ``#language``'s options onto ``#uploadLanguage``.
+ *
+ * The comment on the live language wiring states the rule outright —
+ * "the language list is written out once, in index.html, on #language;
+ * copying it into a second markup block would be a second source that
+ * drifts" — and the Upload tab was that second markup block. Same
+ * mechanism as ``fillDualSecondaryLanguageOptions`` below, which already
+ * derives its list this way.
+ */
+function fillUploadLanguageOptions(): void {
+  const target = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
+  if (!target || target.options.length) return;
+  const source = document.getElementById("language") as HTMLSelectElement | null;
+  if (!source) return;
+  for (const option of Array.from(source.options)) {
+    const copy = document.createElement("option");
+    copy.value = option.value;
+    copy.textContent = option.textContent || option.value;
+    target.appendChild(copy);
+  }
+}
+
 function fillDualSecondaryLanguageOptions(): void {
   const target = dualSecondaryLanguageSelect();
   if (!target || target.options.length) return;
@@ -9679,15 +9834,23 @@ function waitForLiveFinalEnvelope(
   }
   return new Promise((resolve) => {
     let settled = false;
+    // The timeout handle is kept so an envelope that arrives in the
+    // first second does not leave a timer to wake up four seconds later
+    // for nothing. ``settled`` makes that harmless, not free — and the
+    // two neighbouring waits in this file
+    // (``waitForLiveEnvelopeWithAnnouncedBudget``, ``flushWorkletPort``)
+    // both clear theirs.
+    let timerId: number | null = null;
     const done = (value: LiveFinalEnvelope | null): void => {
       if (settled) return;
       settled = true;
+      if (timerId !== null) window.clearTimeout(timerId);
       slot.waiters = slot.waiters.filter((w) => w !== handler);
       resolve(value);
     };
     const handler = (envelope: LiveFinalEnvelope | null): void => done(envelope);
     slot.waiters.push(handler);
-    window.setTimeout(
+    timerId = window.setTimeout(
       () => done(slot.envelope),
       Math.max(0, timeoutMs)
     );
@@ -9719,6 +9882,17 @@ function logger_warn_client(message: string): void {
  * session token) or ``publishRecordingOutput`` directly. One call = one
  * atomic update of both channels plus the DOM.
  */
+/**
+ * How many finished recordings stay on ``window.__transcriptorFinishedRecords``.
+ *
+ * Both sides of this contract trim to the same depth — the renderer here
+ * and ``desktop/main.js`` again when it reads — and the number was
+ * written out in both. This is the renderer's side of it; the main
+ * process cannot import from here, so the two are pinned by a test
+ * instead.
+ */
+const FINISHED_RECORDS_KEPT = 30;
+
 interface RecordingOutputSignal {
   recordingId: number;
   /** The canonical, paste-ready text (post-upscale if upscaling was used).
@@ -9772,7 +9946,7 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
         : [];
       const next = list.filter((entry) => Number(entry?.recordingId || 0) !== rid);
       next.push({ recordingId: rid, finishedAt: now, text: pasteText });
-      window.__transcriptorFinishedRecords = next.slice(-30);
+      window.__transcriptorFinishedRecords = next.slice(-FINISHED_RECORDS_KEPT);
     }
   }
 
@@ -9804,20 +9978,14 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   // stale async handler from a previous recording cannot clobber the
   // current display.
   if (isCurrentUiSession(signal.sessionToken || "")) {
+    // The live preview pane is deliberately NOT cleared here: the user
+    // compares the streamed reading against the final transcript
+    // (Deepgram sometimes swallows words, and the pane is the evidence).
+    // It clears when the NEXT recording starts, in
+    // ``resetLiveDraftState``. This used to be written as an ``if`` with
+    // a comment for a body, which hides the intent rather than stating
+    // it — a reader had to prove to themselves that nothing was missing.
     $("finalOutput").textContent = domText;
-    // Channel 4: when a real transcript lands in the Transcribe pane,
-    // the Live Preview pane must no longer show the same text — two
-    // panes with identical content is the "перекрывающиеся транскрипции"
-    // bug the user reported. Clearing only happens for the
-    // ``transcript`` kind so status/error messages (which are
-    // intermediate) keep the live preview visible for context.
-    if (kind === "transcript" && pasteText) {
-      // KEEP the live preview text after stop: the user compares the
-      // streamed preview against the final transcript (Deepgram
-      // sometimes swallows words — the pane is the evidence). The pane
-      // clears when the NEXT recording starts (resetLiveDraftState),
-      // not when the current one ends.
-    }
   }
 }
 
@@ -10736,7 +10904,9 @@ async function startLive(): Promise<void> {
       // below). The same 2h recording-window limit applies: if a
       // session grows beyond that, rotate out the oldest chunks so
       // we never end up holding tens of thousands of Blob references.
-      const WEBM_WINDOW_CHUNKS = 60 * 120; // 2 hours @ 1 chunk/s
+      // One chunk per second (see ``start(1000)`` below), so the shared
+      // window in seconds is a chunk count here.
+      const WEBM_WINDOW_CHUNKS = UI_TOKENS.capture.fallbackWindowSec;
       let webmTruncationWarned = false;
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
@@ -10771,7 +10941,7 @@ async function startLive(): Promise<void> {
       if (mediaRecorder) {
         try {
           mediaRecorder.ondataavailable = null;
-        } catch { }
+        } catch { /* property setter unavailable on a broken recorder */ }
         mediaRecorder = null;
       }
     }
@@ -11022,12 +11192,7 @@ async function stopLive(
   // pass), and every short-circuit return below.
   const transcribeStartedAt = performance.now();
   let title = "Recording " + new Date().toLocaleString();
-  const _smartTitle = (text: string): string => {
-    const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
-    if (words.length === 0) return title;
-    const preview = words.slice(0, 8).join(" ");
-    return preview.length > 80 ? preview.slice(0, 77) + "..." : preview;
-  };
+  const _smartTitle = (text: string): string => smartRecordingTitle(text, title);
   const currentProviderSelection = readProviderSelection();
   const currentSessionModels = resolveSessionLocalModels(currentProviderSelection);
   const currentEffectiveProvider = resolveEffectiveProvider(currentProviderSelection);
@@ -11085,7 +11250,7 @@ async function stopLive(
     const noLiveText = !String(liveText || "").trim();
     const hardSilence = level.digitalSilence;
     const likelySilenceWithoutPreview = noLiveText && !level.carriedSpeech;
-    const tooShortToTrust = recordedSec < 1.25;
+    const tooShortToTrust = recordedSec < UI_TOKENS.capture.silenceTrustMinSec;
     return {
       hardSilence,
       likelySilenceWithoutPreview,
@@ -11338,23 +11503,14 @@ async function stopLive(
   const liveFinalPromise = (): Promise<LiveFinalEnvelope | null> => {
     if (!liveFinalWaiterArmed) return Promise.resolve(null);
     if (!_liveFinalPromise) {
-      _liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, 4000);
+      _liveFinalPromise = waitForLiveFinalEnvelope(sessionUiToken, UI_TOKENS.finalize.envelopeWaitMs);
     }
     return _liveFinalPromise;
   };
   if (ws) {
-    // 4000 ms budget for the full round-trip after CloseStream.
-    // Covers the 700 ms endpointing threshold + Deepgram's server-
-    // side finalize (~500–1500 ms) + network RTT + backend forward.
-    //
-    // Bumped 2000 → 4000 ms (1.1.13) after user reports of TAIL
-    // TRUNCATION on slow / cross-region networks (RU → us-east
-    // Deepgram). With 2000 ms, a 500 ms-pause-at-end + 700 ms
-    // endpointing + 1500 ms server-finalize + 600 ms RTT = 3300 ms
-    // round-trip that BARELY beat the timeout — the very last
-    // utterance landed AFTER the deadline and was dropped. The
-    // visible symptom: the user's last words missing from the
-    // committed transcript and from the auto-paste output.
+    // The round-trip budget after CloseStream is
+    // ``UI_TOKENS.finalize.envelopeWaitMs``, where its size is argued
+    // for alongside the other stop budgets.
     //
     // The FAST PATH in the Deepgram branch below still short-
     // circuits this ceiling when committed segments already cover
@@ -13676,6 +13832,9 @@ function enqueueUploadFiles(files: File[]): void {
 function setupUploadView(): void {
   const dropZone = document.getElementById("uploadLargeDrop");
   const fileInput = document.getElementById("uploadLargeFileInput") as HTMLInputElement | null;
+  // Before the element is read: the markup ships it empty, so its options
+  // come from ``#language`` — one list, one place.
+  fillUploadLanguageOptions();
   const language = document.getElementById("uploadLanguage") as HTMLSelectElement | null;
   const diarize = document.getElementById("uploadDiarize") as HTMLInputElement | null;
   if (!dropZone || !fileInput || !language) return;
@@ -13804,10 +13963,17 @@ function setupUploadView(): void {
   // even when the user's saved/default provider is Deepgram.
   // Mirror language preference from the global #language so users who
   // already pinned RU/EN don't have to re-pick it on every tab.
-  try {
-    const globalLang = (document.getElementById("language") as HTMLSelectElement | null)?.value;
-    if (globalLang && ["auto", "ru", "en"].includes(globalLang)) language.value = globalLang;
-  } catch { }
+  // Offered by ``#language`` itself, not by a literal list: the codes
+  // were written out a third time here, so adding a language meant
+  // remembering this line. Optional chaining already covers the missing
+  // element, so the try/catch that used to wrap this — with no reason
+  // comment, against the policy in eslint.config.js — was guarding
+  // against nothing.
+  const globalLangSelect = document.getElementById("language") as HTMLSelectElement | null;
+  const globalLang = (globalLangSelect?.value || "").trim();
+  if (globalLang && Array.from(language.options).some((o) => o.value === globalLang)) {
+    language.value = globalLang;
+  }
   updateUploadProviderHint();
   renderUploadQueue();
 }

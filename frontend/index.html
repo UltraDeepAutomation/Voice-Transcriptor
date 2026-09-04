@@ -191,11 +191,13 @@
             </label>
             <label class="top-item top-item-lang">
               <span class="lbl">Lang</span>
-              <select id="uploadLanguage">
-                <option value="auto">Auto</option>
-                <option value="ru">RU</option>
-                <option value="en">EN</option>
-              </select>
+              <!--
+                Deliberately empty: filled from #language's own options by
+                fillUploadLanguageOptions(), the same way
+                #deepgramDualSecondaryLang is. The language list is
+                written out once, and this used to be the second copy.
+              -->
+              <select id="uploadLanguage"></select>
             </label>
             <div class="top-item top-item-toggle upload-diarize-item">
               <span class="lbl">Diarize</span>
