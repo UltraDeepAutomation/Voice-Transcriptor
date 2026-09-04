@@ -13,7 +13,7 @@ const { formatConsoleMirrorLine } = require("./renderer-console");
 // SSOT for "did this paste attempt actually succeed, and is it verified
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
 // 2026-09-03 §6.1/§6.4/§6.6) — unit-tested by desktop/paste-result.test.js.
-const { evaluatePasteOutcome } = require("./paste-result");
+const { MAC_VERIFICATION, evaluatePasteOutcome } = require("./paste-result");
 // SSOT for the AppleScript the macOS paste runs, in both its verifying
 // and non-verifying shape, and for escaping anything interpolated into
 // an AppleScript — unit-tested by desktop/paste-script.test.js.
@@ -32,6 +32,17 @@ const {
   createPasteVerificationPolicy,
   summarizeAxReadTrace,
 } = require("./paste-verification-policy");
+
+// What the script's verification suffix teaches the policy. Only
+// ":unreadable" — a read that returned nothing at all — is evidence that
+// this app cannot be verified; ":unverified" (reads landed, growth did
+// not match) is inconclusive and changes nothing.
+const MAC_VERIFICATION_TO_POLICY_OUTCOME = Object.freeze({
+  [MAC_VERIFICATION.VERIFIED]: PASTE_VERIFICATION_OUTCOME.VERIFIED,
+  [MAC_VERIFICATION.UNREADABLE]: PASTE_VERIFICATION_OUTCOME.UNREADABLE,
+  [MAC_VERIFICATION.UNVERIFIED]: PASTE_VERIFICATION_OUTCOME.INCONCLUSIVE,
+  [MAC_VERIFICATION.NONE]: PASTE_VERIFICATION_OUTCOME.ERROR,
+});
 // SSOT for "can this machine paste at all right now" (the stale
 // post-update Accessibility grant that AXIsProcessTrusted still reports
 // as trusted), for the retry/timeout budget the paste ladder spends, and
@@ -4433,7 +4444,12 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
   // Passed to the paste script as a plain integer, never as interpolated
   // text: it is what the verification reads compare the focused element
   // growth against.
-  const pastedTextLen = String(text || "").length;
+  // Code POINTS, not UTF-16 code units: AppleScript's `count of <text>`
+  // counts characters, so a single emoji is 1 there and 2 to
+  // String.length. A transcript containing one would make the verified
+  // comparison miss by exactly that difference, and the paste report
+  // ":unverified" for a reason that has nothing to do with the paste.
+  const pastedTextLen = [...String(text || "")].length;
   let lastReason = "paste-no-attempt";
 
   // ── Enterprise Paste Logic ──
@@ -4838,12 +4854,13 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     // feeding either back would switch the app off on evidence the
     // policy manufactured itself.
     if (verifyPaste) {
+      // Only "the reads returned nothing at all" (:unreadable) says this
+      // app cannot be verified. ":unverified" — reads landed, growth did
+      // not match — is inconclusive and must not switch anything off.
       pasteVerificationPolicy.recordOutcome(
         verificationKey,
         check.ok && macOutcome.success
-          ? (macOutcome.verified
-            ? PASTE_VERIFICATION_OUTCOME.VERIFIED
-            : PASTE_VERIFICATION_OUTCOME.UNVERIFIED)
+          ? MAC_VERIFICATION_TO_POLICY_OUTCOME[macOutcome.verification] || PASTE_VERIFICATION_OUTCOME.ERROR
           : PASTE_VERIFICATION_OUTCOME.ERROR,
       );
     }

@@ -16,10 +16,17 @@
 // verification, they are an IMPOSSIBLE one, and repeating them on every
 // paste for the rest of the process buys nothing.
 //
-// So: remember per target. Two consecutive unverified outcomes for one
-// app and verification for that app is off for the lifetime of the
-// process. A verified outcome resets the memory — an app that CAN be
-// verified keeps being verified, which is the case worth paying for.
+// So: remember per target. Two consecutive UNREADABLE outcomes for one
+// app — reads that returned nothing at all — and verification for that
+// app is off for the lifetime of the process. A verified outcome resets
+// the memory: an app that CAN be verified keeps being verified, which is
+// the case worth paying for.
+//
+// An inconclusive outcome (the reads worked, the length simply did not
+// grow by what we predicted) is deliberately NOT evidence of anything.
+// It used to be counted, and while the after-read was being taken before
+// the paste had landed that meant every app, without exception, had
+// verification switched off after two pastes.
 //
 // ── Why the memory is not persisted ───────────────────────────────────
 //
@@ -34,15 +41,31 @@
 // owns the single process-wide instance and does the logging through the
 // onDisable callback. See desktop/paste-verification-policy.test.js.
 
-/** Consecutive "unverified" outcomes before verification is switched off. */
+/** Consecutive UNREADABLE outcomes before verification is switched off. */
 const UNVERIFIED_STREAK_LIMIT = 2;
 
-/** The three things a verification attempt can tell us. */
+/** What a verification attempt can tell us about a target. */
 const PASTE_VERIFICATION_OUTCOME = Object.freeze({
   /** The reads landed and the focused element grew by the pasted length. */
   VERIFIED: "verified",
-  /** The paste succeeded but the reads could not confirm it. */
-  UNVERIFIED: "unverified",
+  /**
+   * A read returned nothing at all: this target exposes no inspectable
+   * value, so verifying it is IMPOSSIBLE rather than failed. This is the
+   * only outcome that counts towards switching the reads off.
+   */
+  UNREADABLE: "unreadable",
+  /**
+   * The reads landed but the growth did not match — the target rewrote
+   * the text, focus moved, the poll bound expired. Inconclusive: it says
+   * nothing about whether this app CAN be verified, so it neither counts
+   * towards disabling nor clears a streak.
+   *
+   * This distinction is the difference between a policy that learns and
+   * one that switches itself off everywhere: while the after-read was
+   * taken before the paste had landed, EVERY app produced this outcome
+   * and every app had verification disabled after two pastes.
+   */
+  INCONCLUSIVE: "inconclusive",
   /** The paste itself failed, so the attempt says nothing about the app. */
   ERROR: "error",
 });
@@ -118,7 +141,7 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
         entry.disabled = false;
         return snapshot(key, entry);
       }
-      if (outcome === PASTE_VERIFICATION_OUTCOME.UNVERIFIED) {
+      if (outcome === PASTE_VERIFICATION_OUTCOME.UNREADABLE) {
         entry.unverifiedStreak += 1;
         if (!entry.disabled && entry.unverifiedStreak >= effectiveLimit) {
           entry.disabled = true;
@@ -132,8 +155,9 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
         }
         return snapshot(key, entry);
       }
-      // ERROR (and anything unrecognised): the paste did not complete,
-      // so nothing was learned about whether this app is verifiable.
+      // INCONCLUSIVE / ERROR (and anything unrecognised): the paste
+      // either did not complete or completed without telling us whether
+      // this app is verifiable. Nothing is learned, so nothing changes.
       // Deliberately NOT a reset either — a run of failures must not
       // erase a streak that is one step from switching the reads off.
       return snapshot(key, entry);

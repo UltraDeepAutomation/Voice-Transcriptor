@@ -71,6 +71,23 @@ function escapeAppleScriptString(s) {
  */
 const AX_READ_TIMEOUT_SEC = 0.25;
 
+/**
+ * How the "after" read waits for an asynchronously delivered paste.
+ *
+ * `key code` and `click` post an event and return; the target applies it
+ * on its own run loop. Reading the length on the very next line measured
+ * the element BEFORE the paste, so every paste came back ":unverified".
+ *
+ * Measured against a scratch TextEdit document (8 trials, corrected
+ * counting): the change was visible after ONE 50 ms poll every time. So
+ * the common case pays 50 ms — less than the fixed 160 ms sleep that
+ * used to sit here — and a slower target gets up to 4 tries, at most
+ * 4 x (50 ms + one bounded AXValue read), which is what
+ * PASTE_BUDGET.verificationAllowanceMs is sized for.
+ */
+const AX_VERIFY_POLLS = 4;
+const AX_VERIFY_POLL_INTERVAL_SEC = 0.05;
+
 // The markers this script PRINTS and the parsers READ are one fact, and
 // they live in ./paste-protocol. They used to be typed here and again in
 // paste-result.js's regex, paste-verification-policy.js's line matcher
@@ -106,8 +123,8 @@ function safeInt(value, max = 2 ** 31) {
  * @returns {string} AppleScript source for `osascript -e`
  *
  * Returns, on stdout:
- *   OK:menu-paste-primary[+activated][:verified|:unverified]
- *   OK:robust-paste[+activated][:verified|:unverified]
+ *   OK:menu-paste-primary[+activated][:verified|:unverified|:unreadable]
+ *   OK:robust-paste[+activated][:verified|:unverified|:unreadable]
  *   ERR:no-accessibility | ERR:no-process | ERR:no-focus
  * The `:verified`/`:unverified` suffix is present ONLY when verify is
  * true; with verify false the result is the plain form, which
@@ -137,8 +154,20 @@ function robustPasteScript({
   // comparison of the two, so a missing "before" makes "after"
   // unusable — and it halves the worst-case cost against an app whose
   // accessibility reads hang.
+  // The paste chord is delivered ASYNCHRONOUSLY: `key code` / `click`
+  // post an event and return, and the target may not have processed it
+  // by the next line. Reading the length immediately after therefore
+  // measured the element BEFORE the paste, `afterLen - beforeLen` was 0,
+  // and the verdict was `:unverified` for every paste — which is why the
+  // policy went on to disable verification for every app after two
+  // pastes, and why the user's previous clipboard was never restored
+  // (scheduleSmartClipboardRestore only opens that gate for a verified
+  // paste). Measured against a scratch TextEdit document: one 50 ms poll
+  // sufficed in 8 of 8 trials, so the common case pays 50 ms — less than
+  // the fixed 160 ms sleep that used to sit here — and a slower target
+  // gets up to AX_VERIFY_POLLS attempts instead of a wrong answer.
   const afterRead = wantVerify
-    ? 'if beforeLen is not -1 then set afterLen to my axFocusedValueLength(p, "after")'
+    ? 'if beforeLen is not -1 then set afterLen to my axAwaitPasteGrowth(p, beforeLen, pastedTextLen)'
     : "";
   const verifiedTagExpr = wantVerify
     ? "my pasteVerifiedTag(beforeLen, afterLen, pastedTextLen)"
@@ -286,39 +315,51 @@ function robustPasteScript({
  */
 function axVerificationHandlers() {
   return `
-    -- Length of the focused UI element text value, or -1 when it is
-    -- unavailable/unreadable/times out. Every read is wrapped by its own
-    -- "with timeout of ${AX_READ_TIMEOUT_SEC} second" placed AROUND the tell block --
-    -- inside the block the statement bounds nothing, which is how an
-    -- unbounded AXFocusedUIElement read against Finder was measured
-    -- blocking for 20+ seconds under a timeout that looked like it was
-    -- there. Worst case for one call is three bounded reads.
-    on axFocusedValueLength(p, label)
-      log "${AX_TRACE_PREFIX}" & label & ":begin"
-      set axElem to missing value
+    -- Resolve the focused UI element ONCE, bounded. This is the
+    -- expensive read: measured on macOS 27, an unbounded
+    -- AXFocusedUIElement fetch against Finder blocked for 20+ seconds.
+    -- Every poll below reuses the element instead of re-resolving it.
+    on axFocusedElement(p)
       try
         with timeout of ${AX_READ_TIMEOUT_SEC} second
           tell application "System Events"
-            set axElem to (value of attribute "AXFocusedUIElement" of p)
+            return (value of attribute "AXFocusedUIElement" of p)
           end tell
         end timeout
       on error
-        log "${AX_TRACE_PREFIX}" & label & ":end"
-        return -1
+        return missing value
       end try
+    end axFocusedElement
+
+    -- Character length of an element's text value, or -1 when it is
+    -- unavailable/unreadable/times out.
+    --
+    -- The value is fetched into a variable and only THEN counted. The
+    -- previous form, "count of (value of attribute \"AXValue\" of axElem)"
+    -- inside the System Events tell block, counted the ELEMENTS of an
+    -- object specifier rather than the characters of the string, and so
+    -- returned 1 for every readable value regardless of its length.
+    -- Measured against a scratch TextEdit document holding "abcde":
+    --
+    --   inline_count=1        value_first_count=5
+    --
+    -- That is why no paste was ever verified even when the target did
+    -- expose its value: beforeLen and afterLen were both 1, their
+    -- difference 0, never equal to the pasted length. AXNumberOfCharacters
+    -- (which reported 5 correctly) was unreachable, because it is only
+    -- consulted when the first read returns -1 and this one returned 1.
+    on axValueLengthOf(axElem)
       set axLen to -1
-      -- AXValue works for standard text fields; AXNumberOfCharacters is
-      -- what some custom text views expose instead. Measured against the
-      -- Claude desktop app, both fail instantly with -1728, which is the
-      -- case the verification policy exists to stop paying for.
       try
         with timeout of ${AX_READ_TIMEOUT_SEC} second
           tell application "System Events"
-            set axLen to (count of (value of attribute "AXValue" of axElem))
+            set axValue to (value of attribute "AXValue" of axElem)
           end tell
         end timeout
+        set axLen to (count of (axValue as text))
       end try
       if axLen is -1 then
+        -- What some custom text views expose instead of AXValue.
         try
           with timeout of ${AX_READ_TIMEOUT_SEC} second
             tell application "System Events"
@@ -327,18 +368,70 @@ function axVerificationHandlers() {
           end timeout
         end try
       end if
+      return axLen
+    end axValueLengthOf
+
+    -- The "before" read: one element resolve plus one value read.
+    on axFocusedValueLength(p, label)
+      log "${AX_TRACE_PREFIX}" & label & ":begin"
+      set axElem to my axFocusedElement(p)
+      if axElem is missing value then
+        log "${AX_TRACE_PREFIX}" & label & ":end"
+        return -1
+      end if
+      set axLen to my axValueLengthOf(axElem)
       log "${AX_TRACE_PREFIX}" & label & ":end"
       return axLen
     end axFocusedValueLength
 
-    -- ":verified" only when both reads landed and the focused element
-    -- grew by exactly the pasted length; ":unverified" otherwise, which
-    -- includes "this target does not expose a readable value" -- an
-    -- unverifiable paste, not a failed one.
-    on pasteVerifiedTag(beforeLen, afterLen, pastedTextLen)
-      if beforeLen is not -1 and afterLen is not -1 and (afterLen - beforeLen) is equal to pastedTextLen then
-        return ":verified"
+    -- The "after" read: a key code or a menu click is delivered
+    -- asynchronously, so the target may not have applied it yet. Poll
+    -- the SAME element up to ${AX_VERIFY_POLLS} times, ${AX_VERIFY_POLL_INTERVAL_SEC} s
+    -- apart, stopping the moment the length has grown by exactly the
+    -- pasted length. Measured against a scratch TextEdit document, one
+    -- poll sufficed in 8 of 8 trials; the bound is what keeps a target
+    -- that never updates from costing more than the budget allows.
+    on axAwaitPasteGrowth(p, beforeLen, expectedLen)
+      log "${AX_TRACE_PREFIX}after:begin"
+      set axElem to my axFocusedElement(p)
+      if axElem is missing value then
+        log "${AX_TRACE_PREFIX}after:end"
+        return -1
       end if
+      set axLen to -1
+      repeat ${AX_VERIFY_POLLS} times
+        delay ${AX_VERIFY_POLL_INTERVAL_SEC}
+        set axLen to my axValueLengthOf(axElem)
+        if axLen is -1 then exit repeat
+        if (axLen - beforeLen) is equal to expectedLen then exit repeat
+      end repeat
+      log "${AX_TRACE_PREFIX}after:end"
+      return axLen
+    end axAwaitPasteGrowth
+
+    -- Three distinguishable answers, because they mean different things
+    -- to desktop/paste-verification-policy.js:
+    --
+    --   :verified    both reads landed and the element grew by exactly
+    --                the pasted length.
+    --   :unreadable  a read returned -1 — this target does not expose an
+    --                inspectable value at all (measured: the Claude
+    --                desktop app fails both AXValue and
+    --                AXNumberOfCharacters with -1728). Verification here
+    --                is IMPOSSIBLE, not failed, and repeating it is pure
+    --                cost — this is the outcome that may switch the
+    --                reads off for the app.
+    --   :unverified  both reads landed but the growth did not match. The
+    --                paste happened (the ladder has its own verdict for
+    --                whether it did not); the element simply did not end
+    --                up the length we predicted — the target rewrote the
+    --                text, the poll bound expired, focus moved. That is
+    --                inconclusive, and it must NOT count towards
+    --                switching verification off, or a target that is
+    --                merely slow gets treated like one that is mute.
+    on pasteVerifiedTag(beforeLen, afterLen, pastedTextLen)
+      if beforeLen is -1 or afterLen is -1 then return ":unreadable"
+      if (afterLen - beforeLen) is equal to pastedTextLen then return ":verified"
       return ":unverified"
     end pasteVerifiedTag
   `;
@@ -346,6 +439,8 @@ function axVerificationHandlers() {
 
 module.exports = {
   AX_READ_TIMEOUT_SEC,
+  AX_VERIFY_POLLS,
+  AX_VERIFY_POLL_INTERVAL_SEC,
   AX_TRACE_PREFIX,
   PASTE_SENT_PREFIX,
   escapeAppleScriptString,

@@ -10,6 +10,8 @@ const { StringDecoder } = require("node:string_decoder");
 
 const { childStreamEncoding, stripBom } = require("./child-io");
 const {
+  MAC_VERIFICATION,
+  macVerificationOf,
   lastLineOf,
   pasteSentReceipt,
   isVbsPasteSuccess,
@@ -218,13 +220,45 @@ test("evaluatePasteOutcome dispatches each linux method by ok alone", () => {
 
 test("evaluatePasteOutcome dispatches mac methods through parseMacPasteOutcome", () => {
   const r = evaluatePasteOutcome({ method: "robust_paste", ok: true, stdout: "OK:robust-paste:verified" });
-  assert.deepEqual(r, { success: true, verified: true, sent: false, reason: "OK:robust-paste:verified" });
+  assert.deepEqual(r, {
+    success: true,
+    verified: true,
+    verification: MAC_VERIFICATION.VERIFIED,
+    sent: false,
+    reason: "OK:robust-paste:verified",
+  });
   const r2 = evaluatePasteOutcome({ method: "menu-paste-primary", ok: true, stdout: "OK:menu-paste-primary:unverified" });
   assert.equal(r2.success, true);
   assert.equal(r2.verified, false);
   const r3 = evaluatePasteOutcome({ method: "menu-paste", ok: true, stdout: "OK:menu-paste" });
   assert.equal(r3.success, true);
   assert.equal(r3.verified, false);
+});
+
+test("mac: :unreadable and :unverified are different facts, not one", () => {
+  // ":unreadable" — a read returned nothing at all — says this target
+  // exposes no inspectable value, and is what may switch verification
+  // off for it. ":unverified" — the reads landed, the growth did not
+  // match — is inconclusive. Collapsing the two is what let a merely
+  // slow target be treated like a mute one, which (while the after-read
+  // was taken before the paste landed) meant EVERY app.
+  const unreadable = parseMacPasteOutcome({ ok: true, stdout: "OK:robust-paste:unreadable" });
+  assert.equal(unreadable.success, true, "an unverifiable paste is not a failed one");
+  assert.equal(unreadable.verified, false);
+  assert.equal(unreadable.verification, MAC_VERIFICATION.UNREADABLE);
+
+  const inconclusive = parseMacPasteOutcome({ ok: true, stdout: "OK:robust-paste:unverified" });
+  assert.equal(inconclusive.success, true);
+  assert.equal(inconclusive.verified, false);
+  assert.equal(inconclusive.verification, MAC_VERIFICATION.UNVERIFIED);
+
+  // A script that carried no reads at all reports neither.
+  assert.equal(
+    parseMacPasteOutcome({ ok: true, stdout: "OK:robust-paste+activated" }).verification,
+    MAC_VERIFICATION.NONE,
+  );
+  assert.equal(macVerificationOf("OK:robust-paste+activated:verified"), MAC_VERIFICATION.VERIFIED);
+  assert.equal(macVerificationOf(""), MAC_VERIFICATION.NONE);
 });
 
 test("evaluatePasteOutcome falls back to ok-only for an unknown method", () => {

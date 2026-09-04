@@ -328,9 +328,19 @@ function pasteCapabilityMessage(state) {
 //                        Windows runs cscript then the PowerShell
 //                        fallback; Linux walks its CLI cascade.
 //   verificationAllowanceMs — added to a macOS attempt when the script
-//                        carries the AX verification reads: two
-//                        axFocusedValueLength calls, each up to three
-//                        Apple Events bounded at AX_READ_TIMEOUT_SEC.
+//                        carries the AX verification reads. Worst case:
+//                        the "before" read (focused element + AXValue +
+//                        AXNumberOfCharacters, each an Apple Event
+//                        bounded at AX_READ_TIMEOUT_SEC = 0.25 s) plus
+//                        the "after" read, which resolves the element
+//                        once and then polls its value up to
+//                        AX_VERIFY_POLLS times, AX_VERIFY_POLL_INTERVAL_SEC
+//                        apart, because a key code is delivered
+//                        asynchronously and reading immediately measured
+//                        the element BEFORE the paste. Measured against a
+//                        scratch TextEdit document, one poll sufficed in
+//                        8 of 8 trials, so the typical cost is ~50 ms;
+//                        the allowance covers the bound, not the typical.
 //   activationSettleMs — sleep after re-activating the target INSIDE an
 //                        attempt (Windows/Linux do this every attempt).
 //   preflightSettleMs  — the same sleep paid ONCE before the ladder
@@ -347,7 +357,10 @@ const PASTE_BUDGET = Object.freeze({
     maxAttempts: 3,
     attemptDelaysMs: Object.freeze([45, 85, 125]),
     methodTimeoutsMs: Object.freeze([3200]),
-    verificationAllowanceMs: 1500,
+    // 0.75 s "before" + 0.25 s element resolve
+    // + AX_VERIFY_POLLS x (interval + 2 bounded reads) = 0.25 + 4 x 0.55
+    // -> 3.2 s, rounded up.
+    verificationAllowanceMs: 3300,
     activationSettleMs: 0,
     preflightSettleMs: 80,
     tailFallbackTimeoutMs: 4500,

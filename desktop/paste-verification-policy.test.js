@@ -22,29 +22,29 @@ test("the key prefers a bundle id and falls back to the app name", () => {
   assert.equal(pasteVerificationKey(), "");
 });
 
-test("verification is attempted until two consecutive unverified outcomes", () => {
+test("verification is attempted until two consecutive unreadable outcomes", () => {
   const policy = createPasteVerificationPolicy();
   assert.equal(UNVERIFIED_STREAK_LIMIT, 2);
   assert.equal(policy.shouldAttemptVerification("claude"), true);
-  policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification("claude"), true, "one is not a pattern");
-  policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification("claude"), false, "two in a row is");
 });
 
 test("switching off is per target, not global", () => {
   const policy = createPasteVerificationPolicy();
-  policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
-  policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification("claude"), false);
   assert.equal(policy.shouldAttemptVerification("textedit"), true);
 });
 
 test("a verified outcome resets the memory", () => {
   const policy = createPasteVerificationPolicy();
-  policy.recordOutcome("notes", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("notes", OUTCOME.UNREADABLE);
   policy.recordOutcome("notes", OUTCOME.VERIFIED);
-  policy.recordOutcome("notes", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("notes", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification("notes"), true, "the streak restarted");
   assert.equal(policy.stateFor("notes").unverifiedStreak, 1);
 });
@@ -53,18 +53,18 @@ test("a failed paste neither counts toward the streak nor clears it", () => {
   // The ladder failed before anything could be read. That is a fact
   // about the paste, not about whether this app is verifiable.
   const policy = createPasteVerificationPolicy();
-  policy.recordOutcome("mail", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("mail", OUTCOME.UNREADABLE);
   policy.recordOutcome("mail", OUTCOME.ERROR);
   assert.equal(policy.stateFor("mail").unverifiedStreak, 1);
   assert.equal(policy.shouldAttemptVerification("mail"), true);
-  policy.recordOutcome("mail", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("mail", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification("mail"), false);
 });
 
 test("the switch-off is announced exactly once per target", () => {
   const disabled = [];
   const policy = createPasteVerificationPolicy({ onDisable: (state) => disabled.push(state) });
-  for (let i = 0; i < 6; i += 1) policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
+  for (let i = 0; i < 6; i += 1) policy.recordOutcome("claude", OUTCOME.UNREADABLE);
   assert.equal(disabled.length, 1, "one log line, not one per paste");
   assert.equal(disabled[0].key, "claude");
   assert.equal(disabled[0].limit, 2);
@@ -77,24 +77,47 @@ test("a throwing onDisable can never break a paste", () => {
       throw new Error("log volume full");
     },
   });
-  policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
-  policy.recordOutcome("claude", OUTCOME.UNVERIFIED);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification("claude"), false);
 });
 
 test("an unattributable outcome disables nothing", () => {
   const policy = createPasteVerificationPolicy();
-  assert.equal(policy.recordOutcome("", OUTCOME.UNVERIFIED), null);
-  policy.recordOutcome("", OUTCOME.UNVERIFIED);
+  assert.equal(policy.recordOutcome("", OUTCOME.UNREADABLE), null);
+  policy.recordOutcome("", OUTCOME.UNREADABLE);
   assert.equal(policy.shouldAttemptVerification(""), true);
 });
 
 test("the limit is configurable and never below one", () => {
   const one = createPasteVerificationPolicy({ limit: 1 });
-  one.recordOutcome("claude", OUTCOME.UNVERIFIED);
+  one.recordOutcome("claude", OUTCOME.UNREADABLE);
   assert.equal(one.shouldAttemptVerification("claude"), false);
   const zero = createPasteVerificationPolicy({ limit: 0 });
   assert.equal(zero.stateFor("claude").limit, UNVERIFIED_STREAK_LIMIT);
+});
+
+test("an inconclusive outcome is not evidence and never switches anything off", () => {
+  // The reads landed; the length simply did not grow by what we
+  // predicted (the target rewrote the text, focus moved, the poll bound
+  // expired). While the after-read was being taken BEFORE the paste had
+  // landed this was the outcome for every paste into every app, and it
+  // switched verification off everywhere after two pastes — taking the
+  // user's clipboard restore with it, because that gate only opens for a
+  // verified paste.
+  const policy = createPasteVerificationPolicy();
+  for (let i = 0; i < 10; i += 1) policy.recordOutcome("slack", OUTCOME.INCONCLUSIVE);
+  assert.equal(policy.shouldAttemptVerification("slack"), true);
+  assert.equal(policy.stateFor("slack").unverifiedStreak, 0);
+
+  // It does not clear a streak either: an app that has already gone
+  // silent twice stays switched off.
+  const other = createPasteVerificationPolicy();
+  other.recordOutcome("claude", OUTCOME.UNREADABLE);
+  other.recordOutcome("claude", OUTCOME.INCONCLUSIVE);
+  assert.equal(other.stateFor("claude").unverifiedStreak, 1);
+  other.recordOutcome("claude", OUTCOME.UNREADABLE);
+  assert.equal(other.shouldAttemptVerification("claude"), false);
 });
 
 test("stateFor reports a target nothing is known about", () => {

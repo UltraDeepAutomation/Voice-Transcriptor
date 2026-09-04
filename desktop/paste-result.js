@@ -124,6 +124,34 @@ function isLinuxPasteSuccess({ ok }) {
 }
 
 /**
+ * What the macOS script's verification suffix says. Three answers, not
+ * two, because "this app exposes no readable value" and "the reads
+ * landed but the growth did not match" mean opposite things to
+ * paste-verification-policy.js: the first is a permanent property of the
+ * target and may switch the reads off; the second is inconclusive and
+ * must not.
+ */
+const MAC_VERIFICATION = Object.freeze({
+  /** The element grew by exactly the pasted length. */
+  VERIFIED: "verified",
+  /** Reads landed, growth did not match — inconclusive. */
+  UNVERIFIED: "unverified",
+  /** A read returned -1: this target exposes nothing to verify against. */
+  UNREADABLE: "unreadable",
+  /** The script carried no verification reads at all. */
+  NONE: "none",
+});
+
+/** The suffix of an "OK:..." verdict line, as a MAC_VERIFICATION value. */
+function macVerificationOf(outcomeLine) {
+  const out = String(outcomeLine || "");
+  if (/:verified$/.test(out)) return MAC_VERIFICATION.VERIFIED;
+  if (/:unverified$/.test(out)) return MAC_VERIFICATION.UNVERIFIED;
+  if (/:unreadable$/.test(out)) return MAC_VERIFICATION.UNREADABLE;
+  return MAC_VERIFICATION.NONE;
+}
+
+/**
  * macOS AppleScript paste — both the primary robust_paste script
  * (methods "robust_paste" and "menu-paste-primary", returned as
  * "OK:robust-paste…" / "OK:menu-paste-primary…") and the secondary
@@ -141,12 +169,18 @@ function parseMacPasteOutcome({ ok, stdout, stderr }) {
   // outranks any receipt — the script only logs a receipt after the
   // paste is out, and it never returns ERR: afterwards.
   if (out.startsWith(PASTE_ERR_PREFIX)) {
-    return { success: false, verified: false, sent: false, reason: out };
+    return { success: false, verified: false, verification: MAC_VERIFICATION.NONE, sent: false, reason: out };
   }
   const receipt = pasteSentReceipt({ stdout, stderr });
   if (ok && out.startsWith(PASTE_OK_PREFIX)) {
-    const verified = /:verified$/.test(out);
-    return { success: true, verified, sent: !!receipt, reason: out };
+    const verification = macVerificationOf(out);
+    return {
+      success: true,
+      verified: verification === MAC_VERIFICATION.VERIFIED,
+      verification,
+      sent: !!receipt,
+      reason: out,
+    };
   }
   if (receipt) {
     // Killed (or otherwise cut short) AFTER the paste was dispatched:
@@ -154,10 +188,10 @@ function parseMacPasteOutcome({ ok, stdout, stderr }) {
     // success that is NOT verified — that stops the ladder from pasting
     // a second time, and leaves the transcript on the clipboard because
     // the restore gate only opens for verified pastes.
-    return { success: true, verified: false, sent: true, reason: receipt };
+    return { success: true, verified: false, verification: MAC_VERIFICATION.NONE, sent: true, reason: receipt };
   }
-  if (!ok) return { success: false, verified: false, sent: false, reason: out };
-  return { success: false, verified: false, sent: false, reason: out || "paste-return-unknown" };
+  if (!ok) return { success: false, verified: false, verification: MAC_VERIFICATION.NONE, sent: false, reason: out };
+  return { success: false, verified: false, verification: MAC_VERIFICATION.NONE, sent: false, reason: out || "paste-return-unknown" };
 }
 
 /**
@@ -186,6 +220,8 @@ function evaluatePasteOutcome({ method, ok, stdout, stderr }) {
 }
 
 module.exports = {
+  MAC_VERIFICATION,
+  macVerificationOf,
   lastLineOf,
   pasteSentReceipt,
   isVbsPasteSuccess,
