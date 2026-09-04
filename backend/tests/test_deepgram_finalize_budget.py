@@ -79,6 +79,36 @@ def _session(
     return session
 
 
+def _deliver_final(
+    session: DeepgramLiveSession,
+    start: float,
+    end: float,
+    text: str,
+    *,
+    speech_final: bool = True,
+) -> None:
+    """Land an ``is_final`` exactly as the recv loop does.
+
+    Appending the segment BEFORE setting the event is the ordering the
+    recv loop uses, and the flush wait depends on it: it re-measures
+    coverage the moment the event fires, so a test that only sets the
+    event describes a message that carried no transcript.
+    """
+    session._finalized_segments.append(
+        {
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+            "confidence": 0.9,
+            "is_final": True,
+            "speech_final": speech_final,
+            "words": [],
+        }
+    )
+    session.stats.segments_final += 1
+    session._final_arrived.set()
+
+
 class TailCoverageTests(unittest.TestCase):
     def test_coverage_is_derived_from_bytes_and_segment_ends(self):
         session = _session(streamed_sec=10.0, covered_end=9.5)
@@ -229,12 +259,20 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         # The retry Finalize must actually have been sent.
         self.assertEqual(ws.types.count("Finalize"), 2)
 
-    async def test_an_early_final_short_circuits_either_budget(self):
+    async def test_an_early_COVERING_final_short_circuits_either_budget(self):
+        """A final that reaches the end of the streamed audio ends the wait.
+
+        It used to be enough for a final to ARRIVE. That is the bug in
+        §A1: the first final of a flush can cover a fraction of the tail
+        (session 62115e77: 0.00-10.85 s of 14.26 s), and ending the wait
+        on its arrival threw away the rest. The wait ends on coverage,
+        so this test delivers a final that actually covers.
+        """
         session = _session(streamed_sec=90.0, covered_end=85.0, tail_speech_sec=4.0)
 
         async def deliver_now():
             await asyncio.sleep(0.02)
-            session._final_arrived.set()
+            _deliver_final(session, 85.0, 90.0, "the rest of it.")
 
         started = time.perf_counter()
         task = asyncio.create_task(deliver_now())
@@ -472,6 +510,210 @@ class BudgetIsAnHonestEnvelopeBoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(budget, elapsed)
 
 
+class MultiFinalFlushTests(unittest.IsolatedAsyncioTestCase):
+    """§A1: the flush wait ends on COVERAGE, not on the first arrival.
+
+    Production 2026-09-03T21:42:09Z, session 62115e77. 14.26 s streamed,
+    nothing finalized yet at Stop. 130 ms after ``Finalize`` the first
+    final landed covering 0.00-10.85 s — the wait ended there, the
+    envelope went out at ``finalize EXIT 405 ms``, and 2.7 s later
+    Deepgram sent the rest of the same flush: ``10.85-14.26 'Напиши, на
+    чем кто вас поверил.'``. The user lost a whole sentence to a wait
+    that had a 3 s budget and spent 0.4 s of it.
+
+    Wall-clock waits are scaled 1:10 against the real constants (0.30 s
+    ceiling, second final at 0.27 s) so the suite does not sleep for
+    three seconds; the audio times are the measured ones, and
+    ``BudgetConstantTests`` pins that the real ceiling covers the real
+    2.7 s.
+    """
+
+    FIRST_TEXT = "Слушай, я тебе скажу одну вещь."
+    SECOND_TEXT = "Напиши, на чем кто вас поверил."
+
+    def _evidence_session(self) -> DeepgramLiveSession:
+        # streamed 14.26 s, not one final yet — the shape at Stop.
+        return _session(streamed_sec=14.26, covered_end=0.0, tail_speech_sec=6.0)
+
+    async def _run_evidence_flush(self, session, second_final_delay: float):
+        async def deliver():
+            await asyncio.sleep(0.013)
+            _deliver_final(session, 0.0, 10.85, self.FIRST_TEXT)
+            await asyncio.sleep(second_final_delay - 0.013)
+            _deliver_final(session, 10.85, 14.26, self.SECOND_TEXT)
+
+        announced: list[float] = []
+        task = asyncio.create_task(deliver())
+        started = time.perf_counter()
+        result = await session.drain_transcript(
+            on_budget=lambda budget, _more: announced.append(budget)
+        )
+        elapsed = time.perf_counter() - started
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return result, elapsed, announced
+
+    async def test_the_second_final_of_a_flush_reaches_the_envelope(self):
+        session = self._evidence_session()
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.30
+        ):
+            result, elapsed, _announced = await self._run_evidence_flush(
+                session, second_final_delay=0.27
+            )
+        self.assertEqual(
+            [seg["text"] for seg in result["segments"]],
+            [self.FIRST_TEXT, self.SECOND_TEXT],
+            "the sentence that arrived 2.7 s late must be in the envelope",
+        )
+        self.assertIn(self.SECOND_TEXT, result["text"])
+        self.assertAlmostEqual(result["coveredEndSec"], 14.26, places=2)
+        self.assertGreaterEqual(
+            elapsed, 0.27, "the wait must have lasted until the second final"
+        )
+        self.assertLess(elapsed, 0.30 * 2, "and must not have paid the retry")
+
+    async def test_the_wait_stays_inside_the_announced_budget(self):
+        session = self._evidence_session()
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.30
+        ):
+            _result, elapsed, announced = await self._run_evidence_flush(
+                session, second_final_delay=0.27
+            )
+        self.assertEqual(len(announced), 1, "announced once, before the waiting")
+        self.assertGreaterEqual(
+            announced[0], elapsed,
+            "the budget the renderer was told must still bound this side",
+        )
+
+    async def test_no_second_finalize_is_sent_while_the_flush_is_arriving(self):
+        # Another Finalize buys nothing while Deepgram is mid-flush, and
+        # a second one is what the tail guard is for.
+        session = self._evidence_session()
+        ws = session._ws
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.30
+        ):
+            await self._run_evidence_flush(session, second_final_delay=0.27)
+        self.assertEqual(ws.types.count("Finalize"), 1)
+
+    async def test_a_single_covering_final_ends_the_wait_at_once(self):
+        session = self._evidence_session()
+
+        async def deliver():
+            await asyncio.sleep(0.01)
+            _deliver_final(session, 0.0, 14.26, "все одним финалом.")
+
+        task = asyncio.create_task(deliver())
+        started = time.perf_counter()
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 5.0
+        ):
+            result = await session.drain_transcript()
+        elapsed = time.perf_counter() - started
+        await task
+        self.assertLess(elapsed, 1.0, f"a covering final waited {elapsed:.2f}s")
+        self.assertEqual(len(result["segments"]), 1)
+
+    async def test_an_exhausted_budget_falls_through_to_the_tail_guard_once(self):
+        # The second final never comes. The budget is the budget: the
+        # loop must stop at it and hand over to the existing tail guard,
+        # which sends exactly one more Finalize.
+        session = self._evidence_session()
+        ws = session._ws
+
+        async def deliver():
+            await asyncio.sleep(0.01)
+            _deliver_final(session, 0.0, 10.85, self.FIRST_TEXT)
+
+        task = asyncio.create_task(deliver())
+        started = time.perf_counter()
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.12
+        ):
+            await session.drain_transcript()
+        elapsed = time.perf_counter() - started
+        await task
+        self.assertEqual(ws.types.count("Finalize"), 2, "tail guard retried once")
+        self.assertGreaterEqual(elapsed, 0.24, "both windows were paid in full")
+        self.assertLess(elapsed, 1.0)
+
+    async def test_a_final_that_lands_during_the_measurement_is_not_lost(self):
+        # The event is re-armed BEFORE coverage is re-measured, so a
+        # final arriving in that window leaves the event set for the
+        # next iteration instead of being erased by a later clear.
+        session = self._evidence_session()
+
+        async def deliver():
+            await asyncio.sleep(0.01)
+            _deliver_final(session, 0.0, 10.85, self.FIRST_TEXT)
+            # Same tick as the first, i.e. inside the measurement.
+            _deliver_final(session, 10.85, 14.26, self.SECOND_TEXT)
+
+        task = asyncio.create_task(deliver())
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.30
+        ):
+            result = await session.drain_transcript()
+        await task
+        self.assertIn(self.SECOND_TEXT, result["text"])
+
+
+class AwaitsMoreFinalsTests(unittest.TestCase):
+    """The predicate that decides whether a flush is finished."""
+
+    def test_an_uncovered_tail_is_still_owed_finals(self):
+        session = _session(streamed_sec=14.26, covered_end=10.85)
+        _s, _c, gap, speech = session._tail_coverage()
+        self.assertTrue(session._tail_awaits_more_finals(gap, speech))
+
+    def test_a_covered_tail_is_finished(self):
+        session = _session(streamed_sec=14.26, covered_end=14.26)
+        _s, _c, gap, speech = session._tail_coverage()
+        self.assertFalse(session._tail_awaits_more_finals(gap, speech))
+
+    def test_a_forced_final_with_audio_past_it_is_still_owed(self):
+        # speech_final=false is Deepgram saying "this final was pushed
+        # out mid-utterance" — which is exactly what Finalize does — so
+        # the continuation of that clause is still coming, even though
+        # what is left is under the retry threshold.
+        session = _session(streamed_sec=14.26, covered_end=13.86)
+        session._finalized_segments = [
+            {"start": 0.0, "end": 13.86, "text": "x", "speech_final": False}
+        ]
+        _s, _c, gap, speech = session._tail_coverage()
+        self.assertLess(gap, TAIL_GUARD_MIN_SEC)
+        self.assertGreater(gap, COVERAGE_GAP_MIN_SEC)
+        self.assertTrue(session._tail_awaits_more_finals(gap, speech))
+
+    def test_the_same_final_with_only_jitter_past_it_is_finished(self):
+        # Otherwise every stop landing mid-utterance burns its whole
+        # budget on a segment-boundary sliver.
+        session = _session(streamed_sec=14.26, covered_end=14.16)
+        session._finalized_segments = [
+            {"start": 0.0, "end": 14.16, "text": "x", "speech_final": False}
+        ]
+        _s, _c, gap, speech = session._tail_coverage()
+        self.assertLessEqual(gap, COVERAGE_GAP_MIN_SEC)
+        self.assertFalse(session._tail_awaits_more_finals(gap, speech))
+
+    def test_a_speech_final_final_ends_the_wait_at_the_same_gap(self):
+        session = _session(streamed_sec=14.26, covered_end=13.86)
+        session._finalized_segments = [
+            {"start": 0.0, "end": 13.86, "text": "x", "speech_final": True}
+        ]
+        _s, _c, gap, speech = session._tail_coverage()
+        self.assertFalse(session._tail_awaits_more_finals(gap, speech))
+
+    def test_no_final_at_all_leaves_the_audio_to_decide(self):
+        session = _session(streamed_sec=14.26, covered_end=0.0)
+        self.assertTrue(session._last_final_ended_the_utterance())
+
+
 class BudgetConstantTests(unittest.TestCase):
     def test_the_short_window_covers_only_empty_tails(self):
         # The 0.25 s window is measured on stops whose gap was 0.06-0.24 s
@@ -491,6 +733,13 @@ class BudgetConstantTests(unittest.TestCase):
 
     def test_confirmation_window_is_shorter_than_the_full_ceiling(self):
         self.assertLess(FINALIZE_COVERED_WAIT_SEC, FINALIZE_FLUSH_WAIT_SEC)
+
+    def test_the_ceiling_covers_the_measured_multi_final_flush(self):
+        # Session 62115e77: the second final of the flush arrived 2.7 s
+        # after the first. The multi-final wait is bounded by the SAME
+        # budget as before — so the ceiling is what decides whether that
+        # sentence is reachable at all, and it must stay above 2.7 s.
+        self.assertGreater(FINALIZE_FLUSH_WAIT_SEC, 2.7)
 
     def test_the_guard_threshold_bounds_what_covered_can_hide(self):
         # "Covered" tolerates up to TAIL_GUARD_MIN_SEC of slack, so the

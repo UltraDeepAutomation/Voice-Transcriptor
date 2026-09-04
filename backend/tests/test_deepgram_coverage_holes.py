@@ -264,3 +264,125 @@ class HoleReportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
             await s.drain_transcript()
         self.assertFalse([m for m in logs.output if "coverage holes at finalize" in m])
+
+
+def _session_with_the_overruled_word() -> DeepgramLiveSession:
+    """The "трёх" shape of 2026-09-03, session a9fd3fd9.
+
+    The interim heard "…в трёх…"; the final that followed carried "в"
+    (the same word, re-timed) and "одном", and "одном" overlaps the
+    ground "трёх" was spoken on by more than
+    ``SPLICE_COVERAGE_OVERLAP_FRACTION`` of it. The coverage rule
+    therefore treats "трёх" as a disagreement the final wins, evicts it,
+    and the word reaches neither the splice nor the user — leaving no
+    hole to measure, because the finals are contiguous and carry words
+    over the whole span.
+    """
+    s = DeepgramLiveSession(api_key="k")
+    s._process_deepgram_message(
+        _interim(
+            4.07, 6.10, "в одном из трёх последних сообщений",
+            [("в", 5.20, 5.40), ("трёх", 5.55, 5.85)],
+        )
+    )
+    s._process_deepgram_message(
+        _final(
+            4.07, 7.66, "в одном из",
+            [("в", 5.22, 5.42), ("одном", 5.60, 6.00), ("из", 6.10, 6.30)],
+        )
+    )
+    return s
+
+
+class OverruledWordReportTests(unittest.IsolatedAsyncioTestCase):
+    """§A1.4: a word dropped for being "covered" by a DIFFERENT word.
+
+    This loss shape leaves no hole and no splice, so every existing
+    measurement reads zero and the log said nothing at all. The rule
+    itself is unchanged here — only the evidence needed to judge it.
+    """
+
+    def test_the_eviction_records_both_words(self):
+        s = _session_with_the_overruled_word()
+        self.assertEqual(s._overruled_total, 1)
+        word, owner = list(s._overruled_words)[0]
+        self.assertEqual(word["word"], "трёх")
+        self.assertEqual(owner["word"], "одном")
+        self.assertAlmostEqual(word["start"], 5.55, places=2)
+        self.assertAlmostEqual(owner["end"], 6.00, places=2)
+
+    def test_the_word_really_is_gone_from_the_transcript(self):
+        # Without this the diagnostic would be describing a word the
+        # user did receive.
+        s = _session_with_the_overruled_word()
+        self.assertEqual(s._interim_words, [])
+        self.assertNotIn("трёх", s.final_text())
+
+    def test_a_re_timed_same_word_is_not_overruled(self):
+        # "в" at 5.20-5.40 became "в" at 5.22-5.42 in the final. Same
+        # spoken word, nothing lost, nothing to report — otherwise the
+        # report would be noise on every session.
+        s = _session_with_the_overruled_word()
+        self.assertNotIn(
+            "в", [w["word"] for w, _owner in s._overruled_words],
+        )
+
+    async def test_finalize_logs_the_pair_with_both_times(self):
+        s = _session_with_the_overruled_word()
+        s.stats.bytes_offered = int(7.66 * 2 * s._cfg.sample_rate)
+        with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
+            await s.drain_transcript()
+        block = next(
+            (m for m in logs.output if "coverage holes at finalize" in m), "",
+        )
+        self.assertTrue(block, f"no block logged; got {logs.output}")
+        self.assertIn("overruled=1", block)
+        self.assertIn("'трёх'", block)
+        self.assertIn("'одном'", block)
+        self.assertIn("[5.55-5.85]", block)
+        self.assertIn("[5.60-6.00]", block)
+
+    async def test_the_block_is_printed_even_with_no_hole_and_no_splice(self):
+        # The gate used to be "spliced or uncovered seconds", both of
+        # which are zero here — exactly the defect this exists to make
+        # visible.
+        s = _session_with_the_overruled_word()
+        s.stats.bytes_offered = int(7.66 * 2 * s._cfg.sample_rate)
+        with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
+            result = await s.drain_transcript()
+        self.assertEqual(result["uncoveredSpeechSec"], 0.0)
+        self.assertTrue(
+            [m for m in logs.output if "coverage holes at finalize" in m]
+        )
+
+    async def test_the_splice_path_records_overruled_words_too(self):
+        # Second drop site: a hypothesis that survives every eviction
+        # can still be discarded at splice time by the same rule, and it
+        # must leave the same trace. Here the covering final arrives
+        # only AFTER the interim has been parked in the orphan pool by a
+        # newer hypothesis, so no eviction ever saw the pair.
+        s = DeepgramLiveSession(api_key="k")
+        s._process_deepgram_message(
+            _interim(4.00, 6.00, "в трёх последних сообщениях",
+                     [("трёх", 5.55, 5.85)])
+        )
+        s._process_deepgram_message(
+            _interim(4.00, 6.00, "в одном последних сообщениях",
+                     [("одном", 5.62, 5.98)])
+        )
+        self.assertEqual([w["word"] for w in s._orphan_interim_words], ["трёх"])
+        # A final with no word list evicts nothing word-wise; the words
+        # are attached afterwards, so the splice is the first thing to
+        # apply word coverage to the orphan.
+        s._finalized_segments.append(
+            {
+                "start": 4.00,
+                "end": 6.10,
+                "text": "в одном",
+                "words": [{"word": "одном", "start": 5.60, "end": 6.00}],
+            }
+        )
+        self.assertEqual(s._splice_uncovered_interim_words(), 0)
+        self.assertEqual(s._overruled_total, 1)
+        word, owner = list(s._overruled_words)[0]
+        self.assertEqual((word["word"], owner["word"]), ("трёх", "одном"))

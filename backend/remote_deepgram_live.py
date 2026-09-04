@@ -185,6 +185,18 @@ INTERIM_HYPOTHESIS_RING_SIZE = 40
 _HOLE_REPORT_TEXT_CHARS = 120
 # At most this many interim hypotheses are printed per hole.
 _HOLE_REPORT_MAX_INTERIMS = 6
+# At most this many OVERRULED words (an interim word whose audio a
+# differently-spelled final word claimed) are printed. A stop with a
+# handful is a diagnosis; a stop with fifty is a rule that needs
+# rethinking, and the count on the header line says so without printing
+# all of them. "Overruled" is deliberately not "displaced": a displaced
+# word was superseded by a newer HYPOTHESIS and lives on in the orphan
+# pool, an overruled one was dropped for good.
+_HOLE_REPORT_MAX_OVERRULED = 12
+# How many displacements are retained for that report. Bounded so a long
+# dictation cannot grow the diagnostic without limit; the total is
+# counted separately, so the header stays truthful when the ring wraps.
+OVERRULED_WORD_RING_SIZE = 50
 
 
 def _word_speech_spans(words: Iterable[dict]) -> list[tuple[float, float]]:
@@ -330,8 +342,22 @@ def word_accounted_for(word: dict, others: Iterable[dict]) -> bool:
     return any(_same_spoken_word(word, other) for other in others)
 
 
-def final_words_cover(word: dict, final_words: Iterable[dict]) -> bool:
-    """Is this interim word's ground already transcribed by a final?
+def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dict]:
+    """Which final word answers for ``word`` — or ``None`` if none does.
+
+    The implementation behind ``final_words_cover``: the predicate is
+    "did anything cover it", this is "what covered it", and they must
+    never be able to disagree, so there is one rule and the predicate
+    delegates to it.
+
+    Naming the covering word is what makes a displacement visible. An
+    interim word judged covered by a final word with a DIFFERENT
+    letter core is not a recovered word and not a hole — it is the
+    coverage rule deciding that the final owns that audio and spelled
+    it otherwise. That decision is right for "слушаю" vs "слушай" and
+    wrong for "трёх" vs "в", and telling the two apart after the fact
+    needs both words and both time spans, which only this function
+    knows (audit §3.4, defect "трёх").
 
     Two ways, and both are needed:
 
@@ -362,15 +388,24 @@ def final_words_cover(word: dict, final_words: Iterable[dict]) -> bool:
     duration = _word_duration(word)
     for other in final_words:
         if _same_spoken_word(word, other):
-            return True
+            return other
         overlap = _time_overlap(word, other)
         if overlap <= 0:
             continue
         if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * duration:
-            return True
+            return other
         if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(other):
-            return True
-    return False
+            return other
+    return None
+
+
+def final_words_cover(word: dict, final_words: Iterable[dict]) -> bool:
+    """Is this interim word's ground already transcribed by a final?
+
+    See ``covering_final_word`` for the rule; this is that answer read
+    as a yes/no.
+    """
+    return covering_final_word(word, final_words) is not None
 
 
 def _segment_words(segment: dict) -> list[dict]:
@@ -897,6 +932,17 @@ class DeepgramLiveSession:
         self._interim_ring: "deque[tuple[float, float, str]]" = deque(
             maxlen=INTERIM_HYPOTHESIS_RING_SIZE
         )
+        # Ring of ``(interim_word, covering_final_word)`` pairs where the
+        # two are spelled differently — the drop that leaves no hole
+        # behind it (see ``_note_overruled_word``). Bounded like the
+        # hypothesis ring; ``_overruled_total`` keeps the count honest
+        # when the ring wraps, because a report that silently caps its
+        # own count is how a rule looks fine while misfiring hundreds of
+        # times.
+        self._overruled_words: "deque[tuple[dict, dict]]" = deque(
+            maxlen=OVERRULED_WORD_RING_SIZE
+        )
+        self._overruled_total = 0
         self._closed = False
         # Separate "consumer-visible closed" (self._closed, flipped by
         # recv_loop.finally as soon as the upstream drops so events()
@@ -1240,8 +1286,10 @@ class DeepgramLiveSession:
 
         This is the half of the old ``finalize()`` that produces the
         transcript: send ``Finalize``, decide and announce the wait
-        budget, wait for the flush (with the tail-guard retry), splice
-        uncovered interim words, merge seams once. It deliberately stops
+        budget, wait for the flush — for as many finals as it takes to
+        cover the streamed tail, inside that one budget, then the
+        tail-guard retry — splice uncovered interim words, merge seams
+        once. It deliberately stops
         the moment the transcript is known complete — CloseStream,
         keepalive teardown and the recv-loop drain are ``shutdown()``'s
         job (C4, audit §2.4/§2.5).
@@ -1351,9 +1399,9 @@ class DeepgramLiveSession:
             # "it ended exactly where I stopped" and "the last sentence
             # is missing".
             #
-            # Bounded, and short-circuited the instant the final lands,
-            # so a well-behaved stream pays only its actual round trip.
-            # (The clear moved ABOVE the send — BUG-68.)
+            # Bounded, and short-circuited the instant the flush covers
+            # the tail, so a well-behaved stream pays only its actual
+            # round trip. (The clear moved ABOVE the send — BUG-68.)
             # Decide the wait budget BEFORE waiting, from what we already
             # know. Coverage is a property of state we hold locally — how
             # much audio we streamed versus how much is represented in
@@ -1390,34 +1438,79 @@ class DeepgramLiveSession:
                     on_budget(worst_case, needs_flush)
                 except Exception as e:  # never let telemetry break a stop
                     logger.warning("deepgram-live: finalize budget callback failed: %s", e)
-            try:
-                await asyncio.wait_for(
-                    self._final_arrived.wait(),
-                    timeout=flush_wait,
-                )
+            # ONE final is not the flush. Deepgram answers a Finalize with
+            # as many ``is_final`` messages as the buffered audio needs,
+            # and the first of them can cover a fraction of the tail:
+            # 2026-09-03T21:42:09Z, session 62115e77 — 14.26 s streamed,
+            # the first final arrived 130 ms after Finalize covering
+            # 0.00-10.85 s, the wait ended there, and the second final
+            # (10.85-14.26 s, "Напиши, на чем кто вас поверил.") landed
+            # 2.7 s later into a transcript that had already been sent.
+            #
+            # So the wait ends on COVERAGE, not on arrival: after each
+            # final, re-measure and keep waiting while the tail is still
+            # unflushed — inside the SAME deadline computed above, which
+            # is what ``on_budget`` already announced. No second Finalize
+            # (the flush is in progress; another one buys nothing) and no
+            # extension of the budget: the renderer was told a number and
+            # this side must obey it. Exhausting it drops through to the
+            # tail guard exactly as before.
+            wait_started = time.perf_counter()
+            deadline = wait_started + flush_wait
+            finals_seen = 0
+            flush_covered_tail = False
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        self._final_arrived.wait(),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    break
+                # Re-armed BEFORE the measurement, never after it: a
+                # final landing while we measure must leave the event
+                # set for the next iteration rather than be erased by a
+                # clear that runs after it (the BUG-68 shape, one level
+                # down).
+                self._final_arrived.clear()
+                finals_seen += 1
+                streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
+                if not self._tail_awaits_more_finals(tail_gap, tail_speech):
+                    flush_covered_tail = True
+                    break
+            waited_ms = (time.perf_counter() - wait_started) * 1000.0
+            if flush_covered_tail:
                 logger.info(
-                    "deepgram-live: post-Finalize transcript received "
-                    "(budget=%.2fs streamed=%.2fs covered=%.2fs gap=%.2fs "
-                    "speech_in_gap=%.2fs)",
-                    flush_wait,
-                    streamed_sec,
+                    "deepgram-live: post-Finalize finals=%d covered=%.2fs gap=%.2fs "
+                    "waited=%.0fms (budget=%.2fs streamed=%.2fs speech_in_gap=%.2fs)",
+                    finals_seen,
                     covered_end,
                     tail_gap,
+                    waited_ms,
+                    flush_wait,
+                    streamed_sec,
                     tail_speech,
                 )
-            except asyncio.TimeoutError:
-                # Tail guard: silence after Finalize is only fatal if the
-                # stream actually has unflushed speech. Re-measure — the
-                # reader task may have finalized more segments while we
-                # waited, which can close a gap that was open when the
-                # budget was chosen.
+            else:
+                # The budget ran out with the tail still unflushed —
+                # either nothing came at all, or the finals that came
+                # did not reach the end of the streamed audio.
+                # Re-measure: the reader task may have finalized more
+                # segments while we were on our way here, which can
+                # close a gap that was open a moment ago.
                 streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
                 if self._tail_needs_flush(tail_gap, tail_speech):
                     logger.warning(
                         "deepgram-live: tail guard: %.2fs of audio past last final "
-                        "(%.2fs of it recognised speech); retrying Finalize once",
+                        "(%.2fs of it recognised speech) after %d post-Finalize "
+                        "final(s) in %.0fms; retrying Finalize once",
                         tail_gap,
                         tail_speech,
+                        finals_seen,
+                        waited_ms,
                     )
                     # Armed BEFORE the retry send (BUG-68): a final
                     # landing while the frame is in flight must be seen
@@ -1455,14 +1548,21 @@ class DeepgramLiveSession:
                         if tail_gap <= COVERAGE_GAP_MIN_SEC
                         else "below the retry threshold, but not empty"
                     )
+                    # And say how many finals the wait actually saw:
+                    # "no post-Finalize transcript" was the honest
+                    # phrasing when the wait ended on the first arrival,
+                    # but it now ends on coverage, so a budget can
+                    # expire after several finals have landed.
                     logger.info(
-                        "deepgram-live: no post-Finalize transcript within %.2fs "
-                        "(streamed=%.2fs covered=%.2fs gap=%.2fs speech_in_gap=%.2fs "
-                        "— %s); closing",
-                        flush_wait,
-                        streamed_sec,
+                        "deepgram-live: post-Finalize finals=%d covered=%.2fs "
+                        "gap=%.2fs waited=%.0fms (budget=%.2fs streamed=%.2fs "
+                        "speech_in_gap=%.2fs — %s); closing",
+                        finals_seen,
                         covered_end,
                         tail_gap,
+                        waited_ms,
+                        flush_wait,
+                        streamed_sec,
                         tail_speech,
                         verdict,
                     )
@@ -1519,7 +1619,13 @@ class DeepgramLiveSession:
                 "final segment — the committed transcript has holes",
                 uncovered_speech_sec,
             )
-        if spliced_words or uncovered_speech_sec > 0:
+        # Displacements trigger the block on their own: they are the one
+        # loss shape that produces neither a splice nor uncovered
+        # seconds, so gating the report on those two would have kept it
+        # silent for exactly the defect it was extended to explain.
+        # Read after the splice, which is the second place a hypothesis
+        # can be discarded for being covered.
+        if spliced_words or uncovered_speech_sec > 0 or self._overruled_total:
             self._log_coverage_holes(
                 holes_before_splice, spliced_words, uncovered_speech_sec
             )
@@ -1627,18 +1733,88 @@ class DeepgramLiveSession:
         that arrived without a word list falls back to its span, because
         then the span is the sole thing knowable about it.
         """
+        return (
+            self._covering_final_word_for(word) is not None
+            or self._word_covered_by_spanless_final(word)
+        )
+
+    def _covering_final_word_for(self, word: dict) -> Optional[dict]:
+        """The final WORD that answers for ``word``, across all finals.
+
+        The first half of ``_word_covered_by_finals``, separated because
+        the splice needs to NAME the word that overruled a hypothesis
+        it is about to discard, not merely know that one exists.
+        """
         for seg in self._finalized_segments:
             seg_words = _segment_words(seg)
-            if seg_words and final_words_cover(word, seg_words):
-                return True
-        # Finals that arrived without a word list are merged into one
-        # span first: two adjacent finals meeting at 10.0 s cover a word
-        # centred exactly on the boundary, which neither of them covers
-        # on its own.
+            if not seg_words:
+                continue
+            owner = covering_final_word(word, seg_words)
+            if owner is not None:
+                return owner
+        return None
+
+    def _word_covered_by_spanless_final(self, word: dict) -> bool:
+        """The other half: finals that arrived without a word list.
+
+        They are merged into one span first — two adjacent finals
+        meeting at 10.0 s cover a word centred exactly on the boundary,
+        which neither of them covers on its own. There is no covering
+        WORD to name in this case, only a span.
+        """
         center = (_as_float(word.get("start")) + _as_float(word.get("end"))) / 2.0
         return any(
             c_start < center < c_end for c_start, c_end in self._spanless_coverage()
         )
+
+    def _note_overruled_word(self, word: dict, owner: dict) -> None:
+        """Record an interim word a DIFFERENTLY-SPELLED final answered for.
+
+        The coverage rule's second clause: the final overlapped that
+        audio by at least ``SPLICE_COVERAGE_OVERLAP_FRACTION`` of either
+        word and wrote something whose letter core differs, so the
+        interim word is dropped as a disagreement the final wins.
+
+        That is right for "слушаю" vs "слушай" (one word, two
+        spellings) and wrong for "трёх" vs "в" (two words, one of them
+        gone) — 2026-09-03, session a9fd3fd9, where "трёх" lived only
+        in an interim and never reached the user. Nothing in the log
+        told the two shapes apart, so the rule could not be fixed from
+        evidence. This IS that evidence and only that: the rule is
+        unchanged.
+
+        It has to be recorded at the moment of the drop, because that
+        is the only moment both words exist together — the eviction
+        deletes the interim word, and by finalize there is nothing left
+        to notice. Copies are stored so a later splice into the host
+        segment cannot rewrite the record.
+        """
+        core = _word_core(word)
+        # An owner found by identity shares the core by construction
+        # (``_same_spoken_word``), so this keeps exactly the
+        # overlap-clause cases — the ones where a word went missing.
+        if not core or core == _word_core(owner):
+            return
+        self._overruled_total += 1
+        self._overruled_words.append((dict(word), dict(owner)))
+
+    def _evict_words_covered_by(
+        self, words: list[dict], final_words: list[dict]
+    ) -> list[dict]:
+        """Drop the retained words this final answers for, and say which.
+
+        The eviction itself is unchanged (``covering_final_word`` is the
+        same rule ``final_words_cover`` asks); it now names the covering
+        word on its way past so a displacement leaves a trace.
+        """
+        kept: list[dict] = []
+        for word in words:
+            owner = covering_final_word(word, final_words)
+            if owner is None:
+                kept.append(word)
+            else:
+                self._note_overruled_word(word, owner)
+        return kept
 
     def _spanless_coverage(self) -> list[tuple[float, float]]:
         """Merged spans of the finals that carry no word list.
@@ -1813,10 +1989,17 @@ class DeepgramLiveSession:
                 "deepgram-live: splice pool included %d orphaned interim words",
                 orphan_count,
             )
-        survivors = sorted(
-            (w for w in candidates if not self._word_covered_by_finals(w)),
-            key=lambda w: (w["start"], w["end"]),
-        )
+        survivors: list[dict] = []
+        for word in sorted(candidates, key=lambda w: (w["start"], w["end"])):
+            owner = self._covering_final_word_for(word)
+            if owner is not None:
+                # The second place a hypothesis is discarded for being
+                # covered — same rule, same record (``_note_overruled_word``).
+                self._note_overruled_word(word, owner)
+                continue
+            if self._word_covered_by_spanless_final(word):
+                continue
+            survivors.append(word)
         if not survivors:
             return 0
 
@@ -1939,15 +2122,24 @@ class DeepgramLiveSession:
         stop and only when something was actually missing, each hole
         span next to the interim hypotheses that overlapped it.
 
+        The overruled words recorded during the session
+        (``_note_overruled_word``) are listed too: they are the other
+        way a word goes missing, the one that leaves no hole behind
+        because a differently-spelled final word claimed its audio.
+        They belong in this block rather than one of their own so that
+        a reader chasing a missing word has exactly one place to look.
+
         Bounded on every axis: the ring holds the newest
         ``INTERIM_HYPOTHESIS_RING_SIZE`` hypotheses, at most
-        ``_HOLE_REPORT_MAX_INTERIMS`` are printed per hole, and each
-        line is truncated to ``_HOLE_REPORT_TEXT_CHARS``.
+        ``_HOLE_REPORT_MAX_INTERIMS`` are printed per hole, at most
+        ``_HOLE_REPORT_MAX_OVERRULED`` overruled words are printed, and
+        each line is truncated to ``_HOLE_REPORT_TEXT_CHARS``.
         """
+        overruled = list(self._overruled_words)
         lines = [
             "deepgram-live: coverage holes at finalize "
             f"(spliced_words={spliced_words} uncovered={uncovered_sec:.2f}s "
-            f"holes={len(holes)})"
+            f"holes={len(holes)} overruled={self._overruled_total})"
         ]
         if not holes:
             lines.append("  (no hole spans — words were recovered before measuring)")
@@ -1969,6 +2161,27 @@ class DeepgramLiveSession:
                 lines.append(
                     f"    interim [{i_start:.2f}-{i_end:.2f}] {clipped!r}{suffix}"
                 )
+        if overruled:
+            lines.append(
+                "  overruled interim words — judged covered by a "
+                f"DIFFERENT final word ({self._overruled_total}):"
+            )
+            for word, owner in overruled[:_HOLE_REPORT_MAX_OVERRULED]:
+                lines.append(
+                    "    overruled interim "
+                    f"[{_as_float(word.get('start')):.2f}-"
+                    f"{_as_float(word.get('end')):.2f}] "
+                    f"{str(word.get('word') or '')!r} → final "
+                    f"[{_as_float(owner.get('start')):.2f}-"
+                    f"{_as_float(owner.get('end')):.2f}] "
+                    f"{str(owner.get('word') or '')!r} "
+                    f"(overlap {max(0.0, _time_overlap(word, owner)):.2f}s)"
+                )
+            not_shown = self._overruled_total - min(
+                len(overruled), _HOLE_REPORT_MAX_OVERRULED
+            )
+            if not_shown > 0:
+                lines.append(f"    … {not_shown} more not shown")
         logger.info("\n".join(lines))
 
     def _tail_coverage(self) -> tuple[float, float, float, float]:
@@ -2086,6 +2299,49 @@ class DeepgramLiveSession:
         how this was caught.
         """
         return tail_gap >= TAIL_GUARD_MIN_SEC or tail_speech >= TAIL_GUARD_MIN_SEC
+
+    def _last_final_ended_the_utterance(self) -> bool:
+        """Did the newest final claim to end where the speaker stopped?
+
+        ``speech_final=true`` is Deepgram saying it closed the utterance
+        at an endpoint it detected; ``false`` says the final was forced
+        out mid-utterance (which is exactly what ``Finalize`` does), so
+        more of the same utterance may still be on its way.
+
+        True when there is no final to judge: the caller only consults
+        this to decide whether to keep waiting, and "we have heard
+        nothing at all" is a question ``_tail_needs_flush`` answers on
+        the audio, which is the stronger signal.
+        """
+        if not self._finalized_segments:
+            return True
+        return bool(self._finalized_segments[-1].get("speech_final"))
+
+    def _tail_awaits_more_finals(self, tail_gap: float, tail_speech: float) -> bool:
+        """Is the post-Finalize flush still incomplete?
+
+        Asked after each final that lands during the flush wait, to
+        decide whether the wait has been answered or only partly
+        answered. Two ways it can still be owed:
+
+        * the tail is uncovered by the same measure the retry uses
+          (``_tail_needs_flush``) — the flush has not reached the end of
+          the streamed audio; or
+        * the newest final was forced out mid-utterance
+          (``speech_final=false``) and something, however small, still
+          lies past it. Deepgram splits a forced flush across finals,
+          and the continuation carries the rest of that clause.
+
+        A gap no larger than ``COVERAGE_GAP_MIN_SEC`` is segment-boundary
+        jitter, not a tail (the same floor the budget uses), so it ends
+        the wait whatever ``speech_final`` said — otherwise every stop
+        landing mid-utterance would burn its whole budget on a sliver.
+        """
+        if self._tail_needs_flush(tail_gap, tail_speech):
+            return True
+        if tail_gap <= COVERAGE_GAP_MIN_SEC:
+            return False
+        return not self._last_final_ended_the_utterance()
 
     @staticmethod
     def _union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -2650,14 +2906,12 @@ class DeepgramLiveSession:
             # span as the only thing knowable, so that case keeps the
             # old centre rule rather than retaining everything forever.
             if message_words:
-                self._interim_words = [
-                    w for w in self._interim_words
-                    if not final_words_cover(w, message_words)
-                ]
-                self._orphan_interim_words = [
-                    w for w in self._orphan_interim_words
-                    if not final_words_cover(w, message_words)
-                ]
+                self._interim_words = self._evict_words_covered_by(
+                    self._interim_words, message_words
+                )
+                self._orphan_interim_words = self._evict_words_covered_by(
+                    self._orphan_interim_words, message_words
+                )
             else:
                 self._interim_words = [
                     w for w in self._interim_words
@@ -2797,6 +3051,7 @@ __all__ = [
     # definitions the rest of the module — and its tests — reason about:
     # what a word record is, when two of them are the same spoken word,
     # and when a final already accounts for one.
+    "covering_final_word",
     "drop_repeated_seam_ngrams",
     "final_words_cover",
     "merge_seam_fragments",
