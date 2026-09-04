@@ -90,9 +90,50 @@ def _default_data_dir() -> Path:
     return Path.home() / ".local" / "share" / "transcriptor"
 
 
-DATA_DIR = _default_data_dir()
+def _resolve_data_dir() -> Path:
+    """The data directory, degrading to a fallback instead of killing boot.
+
+    This runs at IMPORT — ``backend.main`` imports this module at module
+    level — so an exception here kills the process before uvicorn ever
+    starts, and Electron sees nothing but an immediate child exit,
+    retries eight times and shows "backend did not start". No part of
+    that says the cause was one environment variable
+    (``TRANSCRIPTOR_DATA_DIR``, a documented user setting), a read-only
+    home directory, or a sandbox refusal.
+
+    The house policy for bad environment input is already written down
+    in ``backend.deepgram_endpoints`` and followed by
+    ``backend.main._env_int``: warn, use a documented default, keep the
+    app bootable and the misconfiguration visible in the log. This was
+    the one place that raised instead.
+    """
+    candidate = _default_data_dir()
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError as e:
+        fallback = Path.home() / ".transcriptor"
+        logger.error(
+            "data dir %s is unusable (%s); falling back to %s. Set "
+            "TRANSCRIPTOR_DATA_DIR to a writable path to choose another.",
+            candidate, e, fallback,
+        )
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError as e2:
+            # Home itself is unwritable. Still do not raise: the app can
+            # serve a session with no persisted config, and the log now
+            # says why every save will fail.
+            logger.error(
+                "fallback data dir %s is unusable too (%s); config will not "
+                "persist this session",
+                fallback, e2,
+            )
+        return fallback
+
+
+DATA_DIR = _resolve_data_dir()
 CONFIG_PATH = DATA_DIR / "config.json"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Fernet encryption key — one per machine, stored with strict permissions.
@@ -132,10 +173,41 @@ def _load_or_create_fernet_key() -> bytes:
                 )
         return b""
 
+    def _clear_empty_keyfile() -> bool:
+        """Remove a 0-byte keyfile so a real one can be written.
+
+        The "never overwrite an existing keyfile" rule below is right for
+        a file WITH CONTENT: something may still be decryptable with it.
+        A zero-byte file protects nothing, and refusing to replace it
+        guarantees permanent breakage instead — ``_FERNET`` stays
+        ``None`` for the life of the process and for every process
+        after it, so every ``POST /api/config`` carrying a provider key
+        answers 503 and the user can never enter one.
+        ``main._load_or_create_api_token`` regenerates an empty token
+        file for exactly this reason; this was the one secret that did
+        not.
+        """
+        try:
+            if _KEYFILE.stat().st_size != 0:
+                return False
+        except OSError:
+            return False
+        try:
+            _KEYFILE.unlink()
+        except OSError as e:
+            logger.error("could not clear the empty keyfile at %s: %s", _KEYFILE, e)
+            return False
+        logger.warning(
+            "encryption keyfile at %s was empty (0 bytes); replacing it with "
+            "a fresh key", _KEYFILE,
+        )
+        return True
+
     if _KEYFILE.exists():
         raw = _read_existing_keyfile()
         if raw:
             return raw
+        _clear_empty_keyfile()
     key = Fernet.generate_key()
     # Direct write through ``os.open`` with O_CREAT | O_EXCL | mode=0o600
     # so the file is NEVER readable by other users on the system, not
@@ -207,6 +279,11 @@ def _load_or_create_fernet_key() -> bytes:
             raced_key = _read_existing_keyfile()
             if raced_key:
                 return raced_key
+            if _clear_empty_keyfile():
+                # The file that appeared is empty, so it is not another
+                # process's key — retry once rather than giving up on
+                # encryption for the life of this install.
+                return _load_or_create_fernet_key()
             logger.error(
                 "encryption keyfile appeared during creation but is not usable at %s; "
                 "REFUSING to use a session-only key.",
@@ -657,6 +734,33 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
                 dg_prefs = {**dg_prefs, **repaired}
                 preferences["deepgram"] = dg_prefs
                 out["preferences"] = preferences
+        # The same repair for the OTHER provider preference block. This
+        # module's own docstring promises that "a missing
+        # preferences.openrouter branch shouldn't crash a caller that
+        # reads cfg['preferences']['openrouter']['model']" — but only
+        # ``deepgram`` was ever checked, so one authenticated
+        # ``POST /api/config`` with ``{"preferences":{"openrouter":"x"}}``
+        # persisted a string there and every later Upscale and remote
+        # transcription answered 500, across restarts, with no way to
+        # undo it from the UI.
+        or_prefs = preferences.get("openrouter")
+        or_defaults = DEFAULT_CONFIG["preferences"]["openrouter"]
+        if or_prefs is not None and not isinstance(or_prefs, dict):
+            logger.warning("config.preferences.openrouter must be an object; resetting")
+            preferences = dict(preferences)
+            preferences["openrouter"] = dict(or_defaults)
+            out["preferences"] = preferences
+        elif isinstance(or_prefs, dict):
+            model_raw = or_prefs.get("model")
+            if model_raw is not None and not isinstance(model_raw, str):
+                logger.warning(
+                    "config.preferences.openrouter.model must be a string; resetting"
+                )
+                preferences = dict(preferences)
+                preferences["openrouter"] = {
+                    **or_prefs, "model": or_defaults["model"],
+                }
+                out["preferences"] = preferences
     # schema_version: must be a positive int if present.
     sv = out.get("schema_version")
     if sv is not None and not (isinstance(sv, int) and sv > 0 and not isinstance(sv, bool)):
@@ -908,10 +1012,32 @@ def _load_config_unlocked() -> Dict[str, Any]:
         # above. Do NOT read `raw["schema_version"]` here — _migrate_schema
         # has already mutated it to SCHEMA_VERSION, so the comparison
         # would always be False and the stamp would never run.
-        if original_schema_version != SCHEMA_VERSION and CONFIG_PATH.exists():
+        # Only a config OLDER than this build (or one with no version
+        # field at all) needs stamping. ``!=`` also fired for a NEWER
+        # file — a downgrade, or a hand-edit — and since the value
+        # written came from the deep merge with the raw file it was
+        # still the newer number, so the condition never cleared. Every
+        # single ``load_config()`` then rewrote ``config.json`` and
+        # rotated ``.bak``: four fsyncs on a READ path called from
+        # ``GET /api/config``, ``POST /api/upscale``, remote
+        # transcription and the live path, and — far worse — ``.bak``,
+        # the only automatic recovery copy of the user's settings,
+        # overwritten with the current file seconds after any corruption.
+        needs_stamp = CONFIG_PATH.exists() and (
+            original_schema_version is None
+            or original_schema_version < SCHEMA_VERSION
+        )
+        if needs_stamp:
             try:
+                # Write the version we are about to claim we wrote. The
+                # value in ``merged`` came from the file, so stamping
+                # without this logged "stamped with version=2" while
+                # persisting something else.
+                stamped = dict(merged)
+                stamped["schema_version"] = SCHEMA_VERSION
                 _rotate_backup_if_primary_valid()
-                _atomic_write_json(CONFIG_PATH, _encrypt_provider_keys(merged))
+                _atomic_write_json(CONFIG_PATH, _encrypt_provider_keys(stamped))
+                merged["schema_version"] = SCHEMA_VERSION
                 logger.info(
                     "config schema stamped with version=%d at %s (was: %r)",
                     SCHEMA_VERSION, CONFIG_PATH, original_schema_version,

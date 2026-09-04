@@ -283,5 +283,215 @@ class TestConfigLifecycle(unittest.TestCase):
                 )
 
 
+class SchemaStampTests(unittest.TestCase):
+    """``load_config()`` is a READ (B-018).
+
+    The stamp branch fired on ``original_schema_version != SCHEMA_VERSION``
+    and wrote back ``merged``, whose ``schema_version`` came from the
+    file — so for a file written by a NEWER build the condition never
+    cleared. Every read rewrote ``config.json`` and rotated ``.bak``:
+    four fsyncs on a path served ~120 times a minute, and the only
+    automatic recovery copy of the user's settings destroyed within
+    seconds of any corruption.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = self._tmp.name
+        self.config_mod = _reload_config_module(self.data_dir)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+
+    def _write(self, payload: dict) -> None:
+        self.config_mod.CONFIG_PATH.write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def _mtimes(self):
+        cfg = self.config_mod.CONFIG_PATH
+        bak = cfg.with_suffix(cfg.suffix + ".bak")
+        return (
+            cfg.stat().st_mtime_ns if cfg.exists() else None,
+            bak.exists(),
+        )
+
+    def test_a_newer_config_is_never_rewritten_on_read(self):
+        self._write({"schema_version": self.config_mod.SCHEMA_VERSION + 1})
+        first = self.config_mod.CONFIG_PATH.read_bytes()
+        for _ in range(3):
+            self.config_mod.load_config()
+        self.assertEqual(
+            self.config_mod.CONFIG_PATH.read_bytes(),
+            first,
+            "a read rewrote the config file",
+        )
+        self.assertFalse(
+            self._mtimes()[1],
+            "a read rotated .bak, the only recovery copy of the settings",
+        )
+
+    def test_a_config_at_this_version_is_never_rewritten_on_read(self):
+        self._write({"schema_version": self.config_mod.SCHEMA_VERSION})
+        first = self.config_mod.CONFIG_PATH.read_bytes()
+        self.config_mod.load_config()
+        self.assertEqual(self.config_mod.CONFIG_PATH.read_bytes(), first)
+        self.assertFalse(self._mtimes()[1])
+
+    def test_a_config_with_no_version_is_stamped_exactly_once(self):
+        self._write({"providers": {"openrouter": {"key": ""}}})
+        self.config_mod.load_config()
+        stamped = json.loads(
+            self.config_mod.CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        # What is PRINTED is what is WRITTEN: the log said version=2
+        # while persisting whatever the file already had.
+        self.assertEqual(
+            stamped["schema_version"], self.config_mod.SCHEMA_VERSION
+        )
+        after_first = self.config_mod.CONFIG_PATH.read_bytes()
+        self.config_mod.load_config()
+        self.assertEqual(
+            self.config_mod.CONFIG_PATH.read_bytes(),
+            after_first,
+            "the one-off stamp ran again",
+        )
+
+
+class OpenRouterPreferenceValidationTests(unittest.TestCase):
+    """``preferences.openrouter`` is repaired like ``preferences.deepgram`` (B-019)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.config_mod = _reload_config_module(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+
+    def test_a_string_where_the_block_belongs_is_reset(self):
+        self.config_mod.save_config({"preferences": {"openrouter": "oops"}})
+        cfg = self.config_mod.load_config()
+        # The consumers do exactly this and used to raise AttributeError
+        # into a 500 on every Upscale and every remote transcription,
+        # permanently, with no way to undo it from the UI.
+        self.assertIsInstance(cfg["preferences"]["openrouter"], dict)
+        self.assertEqual(
+            cfg["preferences"]["openrouter"]["model"],
+            self.config_mod.DEFAULT_CONFIG["preferences"]["openrouter"]["model"],
+        )
+
+    def test_a_non_string_model_falls_back_to_the_default(self):
+        self.config_mod.save_config(
+            {"preferences": {"openrouter": {"model": 42}}}
+        )
+        cfg = self.config_mod.load_config()
+        self.assertEqual(
+            cfg["preferences"]["openrouter"]["model"],
+            self.config_mod.DEFAULT_CONFIG["preferences"]["openrouter"]["model"],
+        )
+
+    def test_a_valid_model_is_left_alone(self):
+        self.config_mod.save_config(
+            {"preferences": {"openrouter": {"model": "vendor/some-model"}}}
+        )
+        cfg = self.config_mod.load_config()
+        self.assertEqual(
+            cfg["preferences"]["openrouter"]["model"], "vendor/some-model"
+        )
+
+
+class EmptyKeyfileTests(unittest.TestCase):
+    """A 0-byte keyfile is an ABSENT keyfile (B-020).
+
+    "Never overwrite an existing keyfile" is right for a file with
+    content — something may still be decryptable with it. An empty file
+    protects nothing, and refusing to replace it left ``_FERNET`` at
+    ``None`` for this process and every process after it: every
+    ``POST /api/config`` carrying a provider key answered 503 and the
+    user could never enter one, on any restart.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+
+    def test_an_empty_keyfile_is_replaced_and_secrets_work_again(self):
+        from pathlib import Path
+
+        keyfile = Path(self.data_dir) / ".encryption_key"
+        keyfile.write_bytes(b"")
+        mod = _reload_config_module(self.data_dir)
+        if not mod._HAS_CRYPTO:
+            self.skipTest("cryptography is not installed")
+        self.assertGreater(
+            keyfile.stat().st_size, 0, "the empty keyfile was left in place"
+        )
+        mod.save_config({"providers": {"openrouter": {"key": "sk-secret"}}})
+        self.assertEqual(
+            mod.load_config()["providers"]["openrouter"]["key"], "sk-secret"
+        )
+
+    def test_a_keyfile_with_content_is_never_replaced(self):
+        from pathlib import Path
+
+        keyfile = Path(self.data_dir) / ".encryption_key"
+        keyfile.write_bytes(b"not-a-valid-fernet-key")
+        mod = _reload_config_module(self.data_dir)
+        if not mod._HAS_CRYPTO:
+            self.skipTest("cryptography is not installed")
+        self.assertEqual(
+            keyfile.read_bytes(),
+            b"not-a-valid-fernet-key",
+            "a keyfile with content was overwritten; stored secrets would be lost",
+        )
+
+
+class DataDirFallbackTests(unittest.TestCase):
+    """Importing this module must not be able to kill the process (B-021)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("HOME")
+        # The fallback is ``~/.transcriptor``; HOME is redirected so the
+        # test cannot leave a stray key directory in the real one.
+        os.environ["HOME"] = self._tmp.name
+
+    def tearDown(self):
+        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        sys.modules.pop("backend.config", None)
+        self._tmp.cleanup()
+
+    def test_an_unusable_data_dir_degrades_instead_of_raising(self):
+        # ``backend.main`` imports this module at module level, so an
+        # exception here killed the backend before uvicorn started and
+        # Electron could only report "backend did not start" — never
+        # that one documented environment variable was the cause.
+        from pathlib import Path
+
+        blocker = Path(self._tmp.name) / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        os.environ["TRANSCRIPTOR_DATA_DIR"] = str(blocker / "data")
+        sys.modules.pop("backend.config", None)
+        with self.assertLogs("backend.config", level="ERROR") as logs:
+            mod = importlib.import_module("backend.config")
+        self.assertTrue(
+            any("is unusable" in line for line in logs.output), logs.output
+        )
+        self.assertEqual(
+            mod.DATA_DIR, Path(self._tmp.name) / ".transcriptor"
+        )
+        self.assertTrue(mod.DATA_DIR.is_dir())
+
+
 if __name__ == "__main__":
     unittest.main()

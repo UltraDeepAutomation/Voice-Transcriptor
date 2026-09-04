@@ -277,3 +277,49 @@ OK
   *Тест* `test_the_expression_is_no_longer_written_out_by_hand` ищет обе формы по всему `backend/*.py`, поэтому шестая копия не появится молча.
 
 **Не сделано:** —
+
+---
+
+## Коммит 7 — конфигурация
+
+**Заголовок:** «Reading the config stops rewriting it, an unusable data dir no longer kills the backend before it starts, and one bad POST can no longer brick Upscale forever»
+
+**ID:** B-018 (P1), B-019 (P1), B-020 (P1), B-021 (P1).
+
+**Файлы:** `backend/config.py`, `backend/tests/test_config.py`.
+
+**Верификация.** Новые тесты на коде ДО правки:
+```
+FAIL: test_a_newer_config_is_never_rewritten_on_read
+  b'{\n  "schema_version": 3, …}' != b'{"schema_version": 3}' : a read rewrote the config file
+FAIL: test_a_string_where_the_block_belongs_is_reset
+  'oops' is not an instance of <class 'dict'>
+FAIL: test_a_non_string_model_falls_back_to_the_default
+  42 != 'google/gemini-2.5-flash'
+FAIL: test_an_empty_keyfile_is_replaced_and_secrets_work_again
+  0 not greater than 0 : the empty keyfile was left in place
+ERROR: test_an_unusable_data_dir_degrades_instead_of_raising   (NotADirectoryError на импорте)
+```
+Полный набор:
+```
+Ran 692 tests in 36.772s
+OK
+```
+(683 → 692.)
+
+**Решения.**
+
+* **B-018.** *Выбрано:* штамповать только конфиг СТАРЕЕ этой сборки (`original < SCHEMA_VERSION`) или вовсе без поля, и писать именно `SCHEMA_VERSION`, а не то, что пришло из файла. `merged["schema_version"]` обновляется в памяти, чтобы возвращаемый словарь совпадал с диском.
+  *Почему это важнее, чем «лишние fsync»:* `.bak` документирован как единственная автоматическая копия настроек; ротация на каждом чтении схлопывала окно восстановления в секунды.
+  *Отвергнуто:* «понижать версию к нашей» — `_migrate_schema` специально сохраняет форвард-совместимость и неизвестные поля.
+* **B-019.** *Выбрано:* симметричный ремонт `preferences.openrouter` рядом с блоком `deepgram`, по тем же правилам (не объект → дефолтный блок; `model` не строка → дефолтная модель).
+  *Почему:* докстринг модуля прямо обещает это поведение для `openrouter`; сделано было только для `deepgram`.
+* **B-020.** *Выбрано:* нулевой keyfile удаляется и создаётся заново; правило «никогда не перезаписывать» сохраняется для файла С СОДЕРЖИМЫМ (тест это фиксирует отдельно — испорченный, но непустой ключ не трогают). Ветка `FileExistsError` делает то же и один раз рекурсивно повторяет создание.
+  *Почему так:* `main._load_or_create_api_token` для точно такой же ситуации уже перегенерирует файл — политика в проекте есть, здесь её просто не применили.
+* **B-021.** *Выбрано:* `_resolve_data_dir()` — предупредить и уйти на `~/.transcriptor`; если и он недоступен, всё равно не падать, а сказать в лог, что конфиг не будет сохраняться.
+  *Почему:* политика «warn and default» записана в `deepgram_endpoints` и исполняется `main._env_int`; `TRANSCRIPTOR_DATA_DIR` — единственная документированная настройка, которая ей не следовала, и её цена — «backend did not start» без причины.
+  *Тест* подменяет `HOME`, чтобы не создавать каталог в настоящем домашнем.
+
+**Не сделано:** —
+
+**Долг:** первая версия теста B-021 (до подмены `HOME`) один раз создала `~/.transcriptor/.encryption_key` на машине пользователя. Файл пустой смысловой нагрузки не несёт и ничем не читается, пока `TRANSCRIPTOR_DATA_DIR` доступен; удалить его может пользователь — агент чужие файлы не удаляет.
