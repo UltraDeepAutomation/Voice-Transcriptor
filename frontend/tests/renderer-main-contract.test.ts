@@ -143,3 +143,59 @@ describe("segmentEpsilonSec vs. live.py's emit_epsilon_sec (S-06, deliberately n
     expect(backendBefore).toMatch(/segmentEpsilonSec/);
   });
 });
+
+/**
+ * F/7 / U-022 — ``stopLive`` had seven near-identical "stop without a
+ * transcript" epilogues. Only their common, order-independent tail (drop
+ * the live draft, clear the busy flag, release the stop transition) was
+ * safe to extract without live-recording verification this environment
+ * cannot perform (see backend-fix-journal.md "Швы" for the scoping
+ * decision); the surrounding save/patch/status logic keeps its per-site
+ * variation. What must never drift regardless is the invariant the
+ * 2026-09-04 session pinned by hand with a one-off ``git diff``: exactly
+ * ONE place in ``stopLive`` delivers an actual transcript
+ * (``kind: "transcript"``) to the user. A second delivery site would
+ * mean two different code paths can both decide "the stop is done, here
+ * is the text" — which is exactly the three-source-of-truth bug the
+ * B-038/889c91a work fixed. This test makes that a standing check
+ * instead of a manual one-time verification.
+ */
+describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () => {
+  const stopLiveStart = mainTsx.indexOf("async function stopLive(");
+  const nextTopLevelFn = mainTsx.indexOf("\nasync function initRecordingsBootstrap(", stopLiveStart);
+  const stopLiveBody = stopLiveStart !== -1 && nextTopLevelFn > stopLiveStart
+    ? mainTsx.slice(stopLiveStart, nextTopLevelFn)
+    : "";
+
+  it("the boundary markers used to isolate stopLive's body are still present", () => {
+    expect(stopLiveStart, "async function stopLive( not found in main.tsx").not.toBe(-1);
+    expect(nextTopLevelFn, "end-of-stopLive marker not found").toBeGreaterThan(stopLiveStart);
+  });
+
+  it("calls publishRecordingFinalSignal with kind: \"transcript\" exactly once", () => {
+    const matches = stopLiveBody.match(/kind:\s*"transcript"/g) || [];
+    expect(matches.length).toBe(1);
+  });
+
+  it("the one delivery site is reached only through transcriptSource === \"envelope\" (or its recovery fallback), never a second parser", () => {
+    // Both assignments feed the SAME downstream delivery — the fast
+    // envelope path and its recovery re-run through the same variable,
+    // not a second one.
+    const assignments = stopLiveBody.match(/transcriptSource\s*=\s*"envelope"/g) || [];
+    expect(assignments.length).toBeGreaterThanOrEqual(1);
+    // The delivery call must read transcriptRaw the envelope produced —
+    // not reassemble text from segments/words itself.
+    const deliveryIndex = stopLiveBody.indexOf('kind: "transcript"');
+    const around = stopLiveBody.slice(Math.max(0, deliveryIndex - 400), deliveryIndex);
+    expect(around).toMatch(/domText:\s*transcriptRaw/);
+  });
+
+  it("the seven no-transcript epilogues share one bookkeeping helper, not a copy each", () => {
+    const helperCalls = stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || [];
+    // Six early returns extracted; the seventh (finalization-failed
+    // catch) shares the success path's own `finally` instead — see the
+    // helper's doc comment for why that one is deliberately left alone.
+    expect(helperCalls.length).toBe(6);
+    expect(stopLiveBody).toContain("const releaseStopEpilogueBookkeeping = (): void =>");
+  });
+});

@@ -11515,6 +11515,33 @@ async function stopLive(
       stopTransitionOwnerToken = "";
     }
   };
+  /**
+   * The one piece every "stop without a transcript" epilogue shares
+   * (F/7): release the live draft, drop the busy flag, and let the next
+   * capture start.
+   *
+   * F/7 found seven near-identical ~20-line epilogues below (discarded
+   * take, aborted startup, silence, transcription skipped, no provider,
+   * missing key, and the finalization-failed catch). This triplet —
+   * ``clearLiveDraft``, ``setBusy(false)``, ``releaseStopTransition
+   * AfterCaptureDetach`` — is the only part that is byte-for-byte
+   * identical across all six of the early returns below (the seventh,
+   * the finalization-failed catch, releases through the shared
+   * ``finally`` it has with the success path instead, and is left
+   * alone). Everything AROUND this triplet is not: whether
+   * ``#progressRow`` is hidden, whether ``saveRecordingText`` runs first
+   * or the summary patch does, and the exact status/tone text differ
+   * per site in ways that are not safe to normalize without live-
+   * recording verification this environment cannot perform — see the
+   * backend-fix-journal "Швы" entry for the scoping decision. Extracting
+   * only this order-independent, argument-independent triplet is a pure
+   * mechanical de-duplication with no behaviour change.
+   */
+  const releaseStopEpilogueBookkeeping = (): void => {
+    clearLiveDraft(sessionUiToken);
+    setBusy(false, sessionUiToken);
+    releaseStopTransitionAfterCaptureDetach();
+  };
   // ── Trailing capture ────────────────────────────────────────────────
   // The microphone stays open a moment past the press so the last word
   // is complete in the audio. Everything below — the drain, the sink,
@@ -12116,9 +12143,7 @@ async function stopLive(
     if (deferredSinkDestroy) {
       void deferredSinkDestroy.destroy();
     }
-    clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
-    releaseStopTransitionAfterCaptureDetach();
+    releaseStopEpilogueBookkeeping();
     setStatusScoped(sessionUiToken, "Idle");
     if (isCurrentUiSession(sessionUiToken)) {
       $("progressRow").hidden = true;
@@ -12233,9 +12258,7 @@ async function stopLive(
     if (isCurrentUiSession(sessionUiToken)) {
       $("progressRow").hidden = true;
     }
-    clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
-    releaseStopTransitionAfterCaptureDetach();
+    releaseStopEpilogueBookkeeping();
     setStatusScoped(sessionUiToken, "Error");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -12283,9 +12306,7 @@ async function stopLive(
         }, sessionUiToken);
       }
     }
-    clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
-    releaseStopTransitionAfterCaptureDetach();
+    releaseStopEpilogueBookkeeping();
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
@@ -12331,9 +12352,7 @@ async function stopLive(
         }, sessionUiToken);
       }
     }
-    clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
-    releaseStopTransitionAfterCaptureDetach();
+    releaseStopEpilogueBookkeeping();
     setStatusScoped(sessionUiToken, skippedBySetting ? "Idle" : "Error");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -12379,9 +12398,7 @@ async function stopLive(
         }, sessionUiToken);
       }
     }
-    clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
-    releaseStopTransitionAfterCaptureDetach();
+    releaseStopEpilogueBookkeeping();
     setStatusScoped(sessionUiToken, "Idle");
     patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -12439,9 +12456,7 @@ async function stopLive(
         }, sessionUiToken);
       }
     }
-    clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
-    releaseStopTransitionAfterCaptureDetach();
+    releaseStopEpilogueBookkeeping();
     return;
   }
   // (``transcribeStartedAt`` is captured at the top of ``stopLive``)
