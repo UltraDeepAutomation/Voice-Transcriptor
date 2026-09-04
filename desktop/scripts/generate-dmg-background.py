@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 """Generate the branded DMG installer background.
 
-The output image is committed and consumed by electron-builder. This script is
-kept so the asset stays reproducible when the app name, version, or palette
-changes.
+The output image is committed and consumed by electron-builder
+(``build.dmg.background`` in desktop/package.json). This script is kept so the
+asset stays reproducible when the app name or palette changes.
+
+Not part of any build. Run it by hand after changing the palette or the DMG
+layout, then commit the regenerated PNG::
+
+    python3 -m pip install pillow
+    python3 desktop/scripts/generate-dmg-background.py
+
+Pillow is deliberately NOT in requirements.txt: it is a maintainer tool, not a
+runtime dependency of the product, and adding it would ship ~3 MB of imaging
+code into every user's runtime for an image that is already committed.
+
+The icon positions this draws its wells and arrow around come from
+``build.dmg.contents`` in package.json rather than being retyped here. They
+were literals (178 / 482) duplicating the same numbers in the manifest, so a
+layout change moved the icons and left the artwork behind them pointing at
+where they used to be.
 """
 
 from __future__ import annotations
@@ -111,20 +127,52 @@ def draw_background(draw: ImageDraw.ImageDraw) -> None:
     return glow
 
 
-def draw_install_wells(base: Image.Image, draw: ImageDraw.ImageDraw) -> None:
-    for cx, label in ((178, "APP"), (482, "APPLICATIONS")):
+def dmg_icon_columns(metadata: dict) -> tuple[tuple[int, str], ...]:
+    """(x, label) for each icon electron-builder will place on the DMG."""
+    labels = {"file": "APP", "link": "APPLICATIONS"}
+    contents = metadata["build"]["dmg"]["contents"]
+    columns = tuple(
+        (int(item["x"]), labels.get(item.get("type"), str(item.get("type", "")).upper()))
+        for item in contents
+    )
+    if len(columns) != 2:
+        raise SystemExit(
+            "generate-dmg-background: expected exactly two dmg.contents entries, "
+            f"got {len(columns)} — the artwork below assumes an app well and an "
+            "Applications well with an arrow between them."
+        )
+    return columns
+
+
+def draw_install_wells(
+    base: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    columns: tuple[tuple[int, str], ...],
+) -> None:
+    left_x = min(x for x, _ in columns)
+    right_x = max(x for x, _ in columns)
+    for cx, label in columns:
         rounded_rectangle(draw, (cx - 82, 132, cx + 82, 292), 28, fill=(255, 255, 255, 15))
         rounded_rectangle(draw, (cx - 82, 132, cx + 82, 292), 28, outline=(255, 255, 255, 29), width=1)
         text(draw, (cx, 142), label, load_font(FONT_MONO, 10), (255, 255, 255, 88), anchor="mt")
 
     arrow_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     arrow_draw = ImageDraw.Draw(arrow_layer)
-    line(arrow_draw, [(282, 220), (378, 220)], (255, 255, 255, 170), width=4)
+    # The arrow spans the gap between the two wells, whatever the manifest
+    # says those are: from just outside the left well to just inside the right.
+    arrow_from = left_x + 104
+    arrow_to = right_x - 104
+    arrow_y = 220
+    line(arrow_draw, [(arrow_from, arrow_y), (arrow_to, arrow_y)], (255, 255, 255, 170), width=4)
     arrow_draw.polygon(
-        [(378 * SCALE, 220 * SCALE), (356 * SCALE, 206 * SCALE), (356 * SCALE, 234 * SCALE)],
+        [
+            (arrow_to * SCALE, arrow_y * SCALE),
+            ((arrow_to - 22) * SCALE, (arrow_y - 14) * SCALE),
+            ((arrow_to - 22) * SCALE, (arrow_y + 14) * SCALE),
+        ],
         fill=(255, 255, 255, 178),
     )
-    line(arrow_draw, [(286, 242), (374, 242)], (78, 199, 176, 118), width=2)
+    line(arrow_draw, [(arrow_from + 4, 242), (arrow_to - 4, 242)], (78, 199, 176, 118), width=2)
     arrow_layer = arrow_layer.filter(ImageFilter.GaussianBlur(0.18 * SCALE))
     base.paste(arrow_layer.convert("RGB"), (0, 0), arrow_layer)
 
@@ -146,7 +194,7 @@ def main() -> None:
     text(draw, (28, 34), product_name, title_font, (247, 248, 252, 246))
     text(draw, (30, 75), "Install for macOS Sonoma", subtitle_font, (204, 213, 228, 172))
 
-    draw_install_wells(canvas, draw)
+    draw_install_wells(canvas, draw, dmg_icon_columns(metadata))
 
     text(draw, (WIDTH // 2, 104), "Drag Transcriptor to Applications", instruction_font, (248, 250, 255, 230), anchor="mm")
     text(draw, (WIDTH // 2, 130), "The app will be copied into your Applications folder.", subtitle_font, (204, 213, 228, 154), anchor="mm")

@@ -1,18 +1,38 @@
 # Runs every suite the repo ships, on the same interpreters the product
 # uses: Node 22 LTS (>=22.12 per both package.json engines) and Python
-# 3.12 (the version bundled under desktop/runtime).
+# 3.12 (the version bundled under desktop/runtime, pinned in
+# .python-version).
 #
 # The desktop job needs no `npm install` — its tests (accelerator,
-# packaging whitelist) are pure node:test modules with zero dependencies;
-# requiring "electron" would need it only if a future test imports an
-# entrypoint, and that failure mode is exactly what packaging.test.js
-# exists to describe.
+# packaging whitelist, paste modules, signing) are pure node:test modules
+# with zero dependencies; requiring "electron" would need it only if a
+# future test imports an entrypoint, and that failure mode is exactly
+# what packaging.test.js exists to describe.
+#
+# It runs on macOS. Two of its suites — applescript.test.js and
+# paste-script.test.js — compile the AppleScript the product actually
+# ships, with osacompile, and skip themselves anywhere else. On
+# ubuntu-latest they had never run: a syntax error in the generated paste
+# script would have reached users with CI green, on the one platform the
+# product is primarily shipped for.
 name: tests
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# The default token is read-only here: nothing in this workflow writes to
+# the repository.
+permissions:
+  contents: read
+
+# A second push to the same branch cancels the first. Without this,
+# superseded runs keep a runner busy to report on a commit nobody is
+# waiting for any more.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
@@ -21,13 +41,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
           cache: pip
       # Backend dependencies MUST be installed before discovery — without
       # this every module importing numpy/soundfile/fastapi fails to load
       # (regression caught by CI run 32623507428 after the Node steps
       # were added for the TS cross-tests).
-      - run: pip install -r requirements.txt
+      #
+      # -c requirements.runtime-lock.txt: the same constraints the shipped
+      # runtime is built with (desktop/scripts/prepare-runtime.sh). Without
+      # them CI tested one set of versions and the DMG shipped another, so a
+      # green run said nothing about what users would actually run.
+      - run: pip install -c requirements.runtime-lock.txt -r requirements.txt
       # Node + frontend/node_modules are REQUIRED here, not optional:
       # backend/tests/test_live_coverage_policy.py compiles and executes
       # frontend/src/live-coverage.ts via node/tsc and silently
@@ -62,7 +87,8 @@ jobs:
       - run: npm run build
 
   desktop:
-    runs-on: ubuntu-latest
+    # macOS, so the two osacompile suites actually execute. See the header.
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: desktop
@@ -71,4 +97,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      # AGENTS.md declares this a required check; it was declared and
+      # never run. packaging.test.js reads main.js as text, so nothing
+      # else parses these two files as modules.
+      - run: node --check main.js && node --check preload.js
       - run: npm test

@@ -7064,10 +7064,23 @@ async function ensureBackendRuntime(python, repoRoot) {
   const isAppVenv =
     pathEq(pythonResolved, venvDirNormalized) ||
     pathStartsWith(pythonResolved, venvDirNormalized + path.sep);
-  const pipArgs = ["-m", "pip", "install", "-r", requirementsPath];
-  if (!isAppVenv) {
-    pipArgs.splice(3, 0, "--user");
+  // The SAME constraints the shipped runtime was built with
+  // (desktop/scripts/prepare-runtime.sh). requirements.txt keeps ranges
+  // for five direct dependencies on purpose and the exact versions live
+  // in the lock; without it this repair install could put a numpy or
+  // onnxruntime into the user's environment that the pinned
+  // faster-whisper / ctranslate2 pair was never tested against — a
+  // runtime regression on the user's machine, produced by a repair.
+  // The lock ships in extraResources so it is actually here.
+  const lockPath = path.join(repoRoot, "requirements.runtime-lock.txt");
+  const pipArgs = ["-m", "pip", "install"];
+  if (!isAppVenv) pipArgs.push("--user");
+  if (fs.existsSync(lockPath)) {
+    pipArgs.push("-c", lockPath);
+  } else {
+    appendMainLog(`[deps] WARN: ${lockPath} missing — installing without the release constraints`);
   }
+  pipArgs.push("-r", requirementsPath);
 
   // Same scrubbed interpreter env as every other runCommand(python, ...)
   // call in this file. Without it a stray PYTHONPATH / PYTHONHOME /
@@ -7086,7 +7099,12 @@ async function ensureBackendRuntime(python, repoRoot) {
     appendMainLog("[backend-runtime] retrying pip with --break-system-packages");
     const retry = await runCommand(
       python,
-      ["-m", "pip", "install", "--user", "--break-system-packages", "-r", requirementsPath],
+      // Same constraints as the first attempt: a retry must not install
+      // a different set of versions than the one that just failed for an
+      // unrelated reason.
+      ["-m", "pip", "install", "--user", "--break-system-packages",
+        ...(fs.existsSync(lockPath) ? ["-c", lockPath] : []),
+        "-r", requirementsPath],
       { cwd: repoRoot, timeoutMs: 300000, env: buildPythonEnv(python) }
     );
     if (!retry.ok) {

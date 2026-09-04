@@ -10,7 +10,11 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *.pyd
-.python-version
+# NOT .python-version: it is COMMITTED and is the SSOT for the
+# interpreter this product is built and tested against — the same role
+# .nvmrc plays for Node. desktop/scripts/prepare-runtime.sh, the CI
+# workflow and the bundled-runtime layout all read it, which is what
+# stops "Python 3.12" from being retyped in nine places that can drift.
 .venv/
 venv/
 env/
@@ -72,12 +76,17 @@ temp/
 # Catch every runtime/<anything>/ dir (new platforms are dropped in here by
 # the script), plus the download cache.
 desktop/runtime/
-!desktop/scripts/prepare-runtime.sh
 
 # electron-builder intermediate output
-desktop/dist/
 desktop/out/
-desktop/build/
+# `desktop/build/*` and not `desktop/build/`: git will not descend into
+# an excluded DIRECTORY, so a negation under one can never match.
+desktop/build/*
+# ...except the DMG background, which is a committed source asset that
+# package.json build.dmg.background points at. It survived only because
+# git had already been tracking it; a regenerated or renamed one would
+# not have shown up in `git status` at all.
+!desktop/build/dmg-background.png
 *.exe
 *.AppImage
 *.blockmap
@@ -99,7 +108,9 @@ backend/.pytest_cache/
 # macOS metadata
 **/.DS_Store
 **/__MACOSX/
-.claude/
+# Local agent state, except the committed launch configuration.
+.claude/*
+!.claude/launch.json
 # Local agent/tool state — never part of a release checkout
 .mcode/
 # Per-version release staging folders (release-1.1.x/). Built

@@ -118,3 +118,92 @@ test("frontend and desktop package versions match the desktop SSOT", () => {
     `version drift: desktop/package.json=${pkg.version}, frontend/package.json=${frontendPkg.version} — bump both together`,
   );
 });
+
+test("the release runtime constraints actually ship, so a repair install can use them", () => {
+  // requirements.txt keeps ranges for five direct dependencies on
+  // purpose and the exact versions live in requirements.runtime-lock.txt,
+  // which was applied ONLY when building the bundle. It was not in
+  // extraResources, so the on-device repair install
+  // ("Installing dependencies (first launch)…") could not possibly apply
+  // it — it could put a numpy or onnxruntime into the user's environment
+  // that the pinned faster-whisper / ctranslate2 pair was never tested
+  // against.
+  const froms = pkg.build.extraResources.map((entry) => entry.from);
+  assert.ok(froms.includes("../requirements.txt"));
+  assert.ok(froms.includes("../requirements.runtime-lock.txt"));
+  assert.ok(
+    fs.existsSync(path.join(__dirname, "..", "requirements.runtime-lock.txt")),
+    "the lock file named in extraResources must exist",
+  );
+  const mainSource = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(mainSource, /requirements\.runtime-lock\.txt/, "and main.js must pass it to pip as -c");
+});
+
+test("no extraResource is copied to the same destination twice", () => {
+  // app-builder-lib CONCATENATES build.<platform>.extraResources onto
+  // build.extraResources rather than replacing them, so
+  // ../requirements-gigaam.txt and ../ENABLE_GIGAAM appeared four times
+  // across the manifest: each was copied to the same path twice, all four
+  // had to be edited together, and `mas` was missing them entirely.
+  for (const platform of ["mac", "win", "linux", "mas"]) {
+    const platformCfg = pkg.build[platform] || {};
+    const combined = [...pkg.build.extraResources, ...(platformCfg.extraResources || [])];
+    const destinations = combined.map((entry) => entry.to);
+    assert.deepEqual(
+      [...new Set(destinations)].sort(),
+      [...destinations].sort(),
+      `${platform}: duplicate extraResources destinations ${JSON.stringify(destinations)}`,
+    );
+  }
+});
+
+test("the DMG artifact name is pinned, not inherited from a default template", () => {
+  // Five independent strings across BUILD.command, notarize-dmg.sh,
+  // sign-mas.js, INSTALL_ON_OTHER_MAC.command and docs reproduce
+  // electron-builder's DEFAULT artifact name. A default is not a
+  // contract: an upstream change to it breaks the release at
+  // "Built DMG not found".
+  assert.equal(pkg.build.artifactName, "${productName}-${version}-${arch}.${ext}");
+});
+
+test("the Python version is committed, in one file, and every reader uses it", () => {
+  const root = path.join(__dirname, "..");
+  const versionFile = path.join(root, ".python-version");
+  assert.ok(fs.existsSync(versionFile), ".python-version is the SSOT and must be committed");
+  const version = fs.readFileSync(versionFile, "utf8").trim();
+  assert.match(version, /^\d+\.\d+\.\d+$/, `.python-version must hold X.Y.Z, got "${version}"`);
+
+  // prepare-runtime.sh used to carry PBS_PYVER="3.12.13" plus five more
+  // literal "3.12"/"cp312" occurrences; a minor bump needed nine
+  // synchronised edits across the repo and a missed one either failed the
+  // build with "could not find site-packages" or left CI on the old
+  // interpreter.
+  const prepare = fs.readFileSync(path.join(__dirname, "scripts", "prepare-runtime.sh"), "utf8");
+  assert.match(prepare, /\.python-version/, "prepare-runtime.sh must read the SSOT");
+  const stripped = prepare.replace(/^\s*#.*$/gm, "");
+  assert.ok(
+    !/\bcp3\d\d\b/.test(stripped) && !/python3\.\d+\//.test(stripped),
+    "prepare-runtime.sh must derive its interpreter tags, not retype them",
+  );
+
+  const workflow = fs.readFileSync(path.join(root, ".github", "workflows", "tests.yml"), "utf8");
+  assert.match(workflow, /python-version-file:\s*\.python-version/, "CI must read the SSOT too");
+});
+
+test("CI runs the desktop suite where its osacompile tests can execute", () => {
+  // applescript.test.js and paste-script.test.js compile the AppleScript
+  // the product ships and skip themselves off darwin. On ubuntu-latest
+  // they had never run once: a syntax error in the generated paste script
+  // would have reached users with CI green.
+  const workflow = fs.readFileSync(
+    path.join(__dirname, "..", ".github", "workflows", "tests.yml"),
+    "utf8",
+  );
+  const desktopJob = workflow.slice(workflow.indexOf("\n  desktop:"));
+  assert.match(desktopJob, /runs-on:\s*macos-latest/);
+  // AGENTS.md declares this a required check; it was declared and never run.
+  assert.match(desktopJob, /node --check main\.js && node --check preload\.js/);
+  // And the workflow states its token scope and cancels superseded runs.
+  assert.match(workflow, /^permissions:/m);
+  assert.match(workflow, /^concurrency:/m);
+});

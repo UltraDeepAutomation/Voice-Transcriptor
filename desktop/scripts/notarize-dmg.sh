@@ -81,7 +81,19 @@ if [ "$SUBMIT_STATUS" != "Accepted" ]; then
   if [ -n "$SUBMIT_ID" ]; then
     LOG_PATH="${DMG_PATH}.notary-log.json"
     echo "[notarize-dmg] Fetching rejection log to $LOG_PATH" >&2
-    xcrun notarytool log "$SUBMIT_ID" "${auth_args[@]}" --output-format json | tee "$LOG_PATH" >&2 || true
+    # `| tee ... || true` under `set -euo pipefail` swallowed the whole
+    # pipeline, so a failure to FETCH the log looked identical to a log
+    # with nothing in it: the script then said "Notarization did not
+    # succeed: Invalid" with no reason and no hint that the reason was
+    # unavailable. Say which of the two happened.
+    if xcrun notarytool log "$SUBMIT_ID" "${auth_args[@]}" --output-format json > "$LOG_PATH" 2>"${LOG_PATH}.err"; then
+      cat "$LOG_PATH" >&2
+      rm -f "${LOG_PATH}.err"
+    else
+      echo "[notarize-dmg] Could not fetch the notarization log for submission $SUBMIT_ID:" >&2
+      cat "${LOG_PATH}.err" >&2 || true
+      echo "[notarize-dmg] Retry by hand: xcrun notarytool log $SUBMIT_ID <auth args>" >&2
+    fi
   fi
   die "Notarization did not succeed: ${SUBMIT_STATUS:-unknown}"
 fi

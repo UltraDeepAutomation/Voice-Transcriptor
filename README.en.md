@@ -19,7 +19,7 @@ Desktop speech-to-text app: record from the microphone, transcribe your own file
 
 ### 1. Live — record from the microphone in real time
 
-- Start it from the in-app button, the tray menu, or a global hotkey (`Option`+`←` / `F9`).
+- Start it from the in-app button, the tray menu, or a global hotkey (`Option`+`←` on macOS, `Ctrl`+`Alt`+`Shift`+`R` on Windows/Linux).
 - Engines: **Local Whisper** (fully offline, faster on Apple Silicon) or **Deepgram Nova-3** (cloud, better on noisy recordings).
 - Pauses are detected automatically — segments are committed on silence and the final text is assembled without duplicates.
 - A microphone health pill in the topbar: green means audio is flowing, amber means silence, red means no access or the device is busy.
@@ -88,8 +88,8 @@ On Wayland use `wtype` / `ydotool` instead of `xdotool`.
 
 | Action | macOS | Windows / Linux |
 |--------|-------|-----------------|
-| Record / stop | `Option`+`←` | `F9` |
-| Paste the last transcript again | `Option`+`Shift`+`V` | `F10` |
+| Record / stop | `Option`+`←` | `Ctrl`+`Alt`+`Shift`+`R` |
+| Paste the last transcript again | `Option`+`Shift`+`V` | `Ctrl`+`Alt`+`Shift`+`V` |
 
 Rebind them under **Settings → Shortcuts**. A red highlight means another
 application already owns that combination.

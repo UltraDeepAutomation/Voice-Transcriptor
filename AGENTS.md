@@ -8,22 +8,26 @@ repository.
 2. Do not add temporary hacks, hidden TODOs, duplicated logic, or parallel
    sources of truth.
 3. Do not delete logs unless the user explicitly asks for log deletion.
-4. Preserve SSOT boundaries. Product vision lives in `PRODUCT.md`; release
+4. Preserve SSOT boundaries. Product vision lives in `docs/PRODUCT.md`
+   (`docs/VISION.md` is the one-paragraph statement it expands); release
    environment variables live in `.env.example`; app version lives in
-   `desktop/package.json`.
+   `desktop/package.json`; the Python version lives in `.python-version`
+   and the Node version in `.nvmrc`; the exact dependency versions the
+   shipped runtime is built with live in `requirements.runtime-lock.txt`;
+   the default hotkeys live in `desktop/shortcut-defaults.json`.
 5. Before edits, check `git status` and `git worktree list`, then keep changes
    atomic and commit only verified code.
 
 ## Verification commands (run before every commit)
 
-Backend (Python 3.12; a local interpreter without the deps is fine to skip —
-CI runs these on every push):
+Backend (the interpreter version is `.python-version`; a local interpreter
+without the deps is fine to skip — CI runs these on every push):
 
 ```bash
 python3 -m unittest discover -s backend/tests
 ```
 
-The whole suite (368 tests) runs offline in a throwaway venv — worth doing
+The whole backend suite runs offline in a throwaway venv — worth doing
 rather than deferring to CI, because the modules with the most behaviour
 per line (Deepgram live, coverage, splice) need only pure-Python deps:
 
@@ -43,9 +47,13 @@ npm --prefix frontend run build       # vite build (CI parity)
 Desktop:
 
 ```bash
-npm --prefix desktop test             # node --test (accelerator, packaging, engine-deps)
+npm --prefix desktop test             # node --test — every desktop suite
 node --check desktop/main.js && node --check desktop/preload.js
 ```
+
+The desktop job runs on macOS in CI so that the two suites which compile the
+shipped AppleScript with `osacompile` (`applescript.test.js`,
+`paste-script.test.js`) actually execute; they skip themselves elsewhere.
 
 A change is committable only when the suites covering it pass. Push `main`
 after committing — work left only on a local branch is considered lost.
