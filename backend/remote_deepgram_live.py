@@ -835,6 +835,15 @@ class DeepgramLiveStats:
     finalize_ms: Optional[float] = None
     last_send_at: Optional[float] = None
     last_recv_at: Optional[float] = None
+    # ``time.monotonic()`` of the last KeepAlive frame that actually
+    # reached the wire. A socket held open with nothing but KeepAlives
+    # (``backend.deepgram_warm``) has no other evidence that its send
+    # path still works: a half-open TCP connection accepts writes into a
+    # black hole, and Deepgram never answers a KeepAlive. This is the age
+    # the warm pool reads before adopting a socket. Deliberately NOT in
+    # ``as_dict`` — that dict is the ``stats`` field of the renderer's
+    # final envelope, and this is backend liveness bookkeeping.
+    last_keepalive_at: Optional[float] = None
 
     def as_dict(self) -> dict:
         return {
@@ -868,11 +877,27 @@ class DeepgramLiveSession:
         *,
         keepalive_interval_sec: float = 7.0,
         keepalive_idle_threshold_sec: float = 3.5,
+        audio_offset_sec: float = 0.0,
     ):
         if not api_key:
             raise DeepgramLiveError("Deepgram API key is required")
         self._api_key = api_key
         self._cfg = config or DeepgramLiveConfig()
+        # Where this SOCKET's audio starts on the RECORDING's timeline
+        # (B1). Deepgram times its results from the audio a connection
+        # has received — "Word timings in streaming transcription
+        # results are based on the audio stream itself, not the lifetime
+        # of the WebSocket connection" — so a socket that is handed the
+        # recording from its first byte needs no offset, and one that
+        # takes over mid-recording (the warm-socket replacement in
+        # ``backend.main``, which replays a bounded ring and therefore
+        # starts after whatever the ring dropped) needs exactly this
+        # one. Applied in ``_process_deepgram_message`` and
+        # ``_streamed_seconds`` — the two points where provider numbers
+        # and byte counts become session seconds — and nowhere else, so
+        # segments, interim words, coverage, ``coveredEndSec`` and
+        # ``streamedSec`` are all on one timeline by construction.
+        self._audio_offset_sec = max(0.0, float(audio_offset_sec))
         self._keepalive_interval_sec = max(1.0, float(keepalive_interval_sec))
         self._keepalive_idle_threshold_sec = max(
             0.5, float(keepalive_idle_threshold_sec)
@@ -954,6 +979,9 @@ class DeepgramLiveSession:
         # socket (never sent the WS close frame) and the keepalive task
         # (never cancelled). TCP FIN-WAITs piled up until OS reclaim.
         self._close_ran = False
+        # Set by ``discard()``: this socket is being replaced on purpose,
+        # so its teardown must not reach the consumer as an error event.
+        self._discarded = False
         self._finalize_sent = False
         # Set once drain_transcript() actually enters the Finalize dance
         # (ws present, Finalize not already sent). shutdown() reads this
@@ -1629,9 +1657,7 @@ class DeepgramLiveSession:
             self._log_coverage_holes(
                 holes_before_splice, spliced_words, uncovered_speech_sec
             )
-        streamed_sec = self.stats.bytes_sent / float(
-            2 * max(1, int(self._cfg.sample_rate))
-        )
+        streamed_sec = self._streamed_seconds(self.stats.bytes_sent)
         return {
             "text": final_text,
             "segments": merged_segments,
@@ -2184,6 +2210,22 @@ class DeepgramLiveSession:
                 lines.append(f"    … {not_shown} more not shown")
         logger.info("\n".join(lines))
 
+    def _streamed_seconds(self, byte_count: int) -> float:
+        """PCM bytes as a position on the RECORDING's timeline.
+
+        The byte-count half of the one offset (see
+        ``audio_offset_sec``): a socket that took over mid-recording has
+        only its own bytes, so without the shift its "streamed" seconds
+        would be measured from its own start while every timestamp it
+        reports is measured from the recording's — and the tail-gap
+        between the two would be pure fiction. One conversion, used by
+        both the coverage measurement and the envelope's
+        ``streamedSec``, so they cannot drift apart.
+        """
+        return self._audio_offset_sec + byte_count / float(
+            2 * max(1, int(self._cfg.sample_rate))
+        )
+
     def _tail_coverage(self) -> tuple[float, float, float, float]:
         """What is unflushed at the end of the stream.
 
@@ -2222,8 +2264,8 @@ class DeepgramLiveSession:
         session that never drops a send has ``bytes_offered ==
         bytes_sent`` and this is a no-op.
         """
-        streamed_sec = max(self.stats.bytes_offered, self.stats.bytes_sent) / (
-            2 * max(1, int(self._cfg.sample_rate))
+        streamed_sec = self._streamed_seconds(
+            max(self.stats.bytes_offered, self.stats.bytes_sent)
         )
         covered_end = max(
             (float(seg.get("end", 0.0) or 0.0) for seg in self._finalized_segments),
@@ -2479,6 +2521,27 @@ class DeepgramLiveSession:
         span_total = sum(end - start for start, end in self._span_level_holes())
         return word_total + span_total
 
+    async def discard(self) -> None:
+        """Close a session the CALLER has decided to replace.
+
+        Identical to ``close()`` except that the teardown is not
+        reported as an error. A caller that swaps one upstream socket
+        for another mid-recording (the warm-socket liveness path in
+        ``backend.main``, audit §3.7) is performing the recovery, not
+        suffering a failure: routing the resulting ``ConnectionClosed``
+        through ``_report_error`` would push ``{"fatal": true}`` at the
+        renderer and abort a recording that is about to continue on the
+        replacement socket.
+
+        Flipping ``_closed`` first also makes every in-flight
+        ``send_pcm`` a silent no-op, so audio still in the caller's send
+        queue is not written into a socket that is going away — it is
+        replayed into the new one instead.
+        """
+        self._discarded = True
+        self._closed = True
+        await self.close()
+
     async def close(self) -> None:
         """Idempotently release the upstream socket and background tasks."""
         if self._close_ran:
@@ -2663,6 +2726,14 @@ class DeepgramLiveSession:
 
     def _report_error(self, message: str, *, fatal: bool) -> None:
         """Record an error and push a normalized error event to the queue."""
+        if self._discarded:
+            # The caller replaced this socket deliberately (``discard()``).
+            # Everything the teardown raises from here on is the expected
+            # consequence of that decision, not a failure the user needs
+            # to see — and emitting it would abort the recording that is
+            # already continuing on the replacement socket.
+            logger.debug("deepgram-live: error on discarded session: %s", message)
+            return
         self._last_error = message
         self._last_fatal = fatal or self._last_fatal
         logger.warning(
@@ -2758,6 +2829,13 @@ class DeepgramLiveSession:
         threshold that keeps Deepgram happy. Emitting an explicit
         KeepAlive control message costs nothing and prevents unexpected
         disconnects.
+
+        This is also the whole mechanism keeping a PRE-WARMED socket
+        open, where no audio flows at all — Deepgram documents the
+        10 s idle timeout as reset by "audio data or ``KeepAlive``
+        messages", so no silence-frame trickle is needed. See
+        ``backend.deepgram_warm`` for the cited sentences and for the
+        4 s cadence a warm socket is constructed with.
         """
         try:
             while not self._closed and self._ws is not None:
@@ -2779,6 +2857,7 @@ class DeepgramLiveSession:
                 try:
                     await ws.send(json.dumps({"type": "KeepAlive"}))
                     self.stats.keepalives_sent += 1
+                    self.stats.last_keepalive_at = time.monotonic()
                     logger.debug(
                         "deepgram-live: sent KeepAlive after %.1fs idle",
                         idle_for,
@@ -2819,6 +2898,9 @@ class DeepgramLiveSession:
             except (TypeError, ValueError):
                 value = None
             if value is not None:
+                # Also a provider timestamp, so it takes the same shift
+                # as every other one (see the Results branch below).
+                value += self._audio_offset_sec
                 self._last_utterance_end = value
                 logger.debug(
                     "deepgram-live: UtteranceEnd last_word_end=%.2f", value,
@@ -2853,7 +2935,7 @@ class DeepgramLiveSession:
         # recv loop, because that would terminate the whole recording
         # session over a single stray frame. Invalid numerics degrade to
         # 0.0 and the segment still renders.
-        start = _as_float(msg.get("start"))
+        start = _as_float(msg.get("start")) + self._audio_offset_sec
         duration = _as_float(msg.get("duration"))
         end = start + duration
         is_final = bool(msg.get("is_final"))
@@ -2875,6 +2957,17 @@ class DeepgramLiveSession:
         # treating the window as the content is what evicted words the
         # final never carried.
         message_words = normalize_words(raw_words)
+        # THE normalisation point (B1). Every consumer downstream —
+        # segments, retained interim words, the coverage measurements,
+        # the splice, ``coveredEndSec`` — reads the numbers produced
+        # here and none of them re-derives anything from the raw
+        # message, so shifting a socket that began mid-recording onto
+        # the recording's own timeline happens once, here, or not at
+        # all. ``_streamed_seconds`` is the same shift for byte counts.
+        if self._audio_offset_sec:
+            for w in message_words:
+                w["start"] = round(w["start"] + self._audio_offset_sec, 3)
+                w["end"] = round(w["end"] + self._audio_offset_sec, 3)
 
         segment = {
             "start": round(start, 3),
@@ -2930,6 +3023,18 @@ class DeepgramLiveSession:
                 "end": segment["end"],
                 "text": segment["text"],
             }
+            if message_words:
+                # The renderer merges two readings of the same recording
+                # by word time (``transcript-merge.ts``), and a segment
+                # frame stripped of its word list left it with nothing
+                # finer than the segment span to merge on. The words are
+                # already in hand — the same list the envelope carries
+                # and the same list coverage is computed from, offset
+                # included — so this is the one shape, forwarded, not a
+                # second one. Omitted entirely when the provider sent no
+                # word list, which is the only honest way to say "not
+                # known" (an empty list reads as "no words here").
+                out_segment["words"] = [dict(w) for w in message_words]
             if speaker is not None:
                 out_segment["speaker"] = speaker
             return {

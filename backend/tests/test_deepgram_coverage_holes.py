@@ -294,6 +294,70 @@ def _session_with_the_overruled_word() -> DeepgramLiveSession:
     return s
 
 
+class ForwardedSegmentShapeTests(unittest.TestCase):
+    """A forwarded final segment carries its word list.
+
+    The renderer merges two readings of the same recording by word time
+    (``frontend/src/transcript-merge.ts``). Stripping the words out of
+    the live ``segments`` frame left it merging on segment spans alone,
+    which is the wrong resolution for the seam it is trying to repair —
+    and the words were already in hand: the same list the final envelope
+    carries, and the same one coverage is computed from.
+    """
+
+    def test_a_final_segment_frame_carries_word_times(self):
+        s = DeepgramLiveSession(api_key="k")
+        event = s._process_deepgram_message(
+            _final(0.0, 2.0, "можешь взять",
+                   [("можешь", 0.10, 0.55), ("взять", 0.60, 1.10)])
+        )
+        self.assertEqual(event["type"], "segments")
+        self.assertTrue(event["is_final"])
+        self.assertEqual(
+            event["segments"][0]["words"],
+            [
+                {"word": "можешь", "start": 0.1, "end": 0.55},
+                {"word": "взять", "start": 0.6, "end": 1.1},
+            ],
+        )
+
+    def test_the_forwarded_words_are_the_envelope_words(self):
+        # One shape, not two: whatever the renderer merges on must be
+        # the list the backend itself reasons about.
+        s = DeepgramLiveSession(api_key="k")
+        event = s._process_deepgram_message(
+            _final(0.0, 2.0, "можешь взять", [("можешь", 0.10, 0.55)])
+        )
+        self.assertEqual(
+            event["segments"][0]["words"],
+            s._finalized_segments[0]["words"],
+        )
+
+    def test_a_provider_response_without_words_omits_the_key(self):
+        # An empty list would read as "no words were spoken here"; the
+        # honest statement is that the provider did not say.
+        s = DeepgramLiveSession(api_key="k")
+        event = s._process_deepgram_message(
+            {
+                "type": "Results",
+                "is_final": True,
+                "speech_final": True,
+                "start": 0.0,
+                "duration": 1.0,
+                "channel": {"alternatives": [{"transcript": "без слов"}]},
+            }
+        )
+        self.assertNotIn("words", event["segments"][0])
+
+    def test_an_interim_frame_is_unchanged(self):
+        s = DeepgramLiveSession(api_key="k")
+        event = s._process_deepgram_message(
+            _interim(0.0, 2.0, "ещё не финал", [("ещё", 0.10, 0.40)])
+        )
+        self.assertFalse(event.get("is_final"))
+        self.assertNotIn("segments", event)
+
+
 class OverruledWordReportTests(unittest.IsolatedAsyncioTestCase):
     """§A1.4: a word dropped for being "covered" by a DIFFERENT word.
 
