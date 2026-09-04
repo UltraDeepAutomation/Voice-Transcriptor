@@ -14,6 +14,20 @@ const { formatConsoleMirrorLine } = require("./renderer-console");
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
 // 2026-09-03 §6.1/§6.4/§6.6) — unit-tested by desktop/paste-result.test.js.
 const { evaluatePasteOutcome } = require("./paste-result");
+// SSOT for the AppleScript the macOS paste runs, in both its verifying
+// and non-verifying shape, and for escaping anything interpolated into
+// an AppleScript — unit-tested by desktop/paste-script.test.js.
+const { robustPasteScript, escapeAppleScriptString } = require("./paste-script");
+// SSOT for "is it worth verifying a paste into THIS app" — the per-target
+// memory that stops paying for accessibility reads an app can never
+// answer (BUGS_AUDIT 2026-09-03 §6.6) — unit-tested by
+// desktop/paste-verification-policy.test.js.
+const {
+  PASTE_VERIFICATION_OUTCOME,
+  pasteVerificationKey,
+  createPasteVerificationPolicy,
+  summarizeAxReadTrace,
+} = require("./paste-verification-policy");
 // SSOT for the renderer → main transcript hand-off: the shape of a
 // "recording-final" IPC payload and the per-recordingId mailbox the
 // post-stop task waits on (BUGS_AUDIT 2026-09-03 §6.7/§6.8/§6.9) —
@@ -2798,17 +2812,24 @@ function saveLastTranscriptToDisk(text) {
   }
 }
 
-function escapeAppleScriptString(s) {
-  // AppleScript string literals terminate at CR/LF. A bare newline in a
-  // target app name would break out of the quoted string and inject
-  // arbitrary AppleScript. Strip all control characters AND escape
-  // backslashes + quotes. Backslash must be replaced FIRST so the
-  // subsequent ``"`` replacement doesn't double-escape its own slash.
-  return String(s || "")
-    .replace(/[\x00-\x1f\x7f]/g, "")
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"');
-}
+// escapeAppleScriptString now lives in ./paste-script, next to the
+// scripts it protects, so the escaping and the largest consumer of it
+// cannot drift apart. It is required at the top of this file.
+
+/**
+ * Process-wide memory of which apps are worth verifying a paste into.
+ * The decisions are pure (./paste-verification-policy); the one log line
+ * per app that is switched off is the only side effect, and it belongs
+ * here.
+ */
+const pasteVerificationPolicy = createPasteVerificationPolicy({
+  onDisable: ({ key, limit }) => {
+    appendMainLog(
+      `[paste-verification] disabled for app="${key}" after ${limit} consecutive unverified pastes ` +
+      "(accessibility reads skipped for this app for the lifetime of this process)"
+    );
+  },
+});
 
 function isBadActivationTarget(name) {
   const n = String(name || "").trim().toLowerCase();
@@ -4068,182 +4089,17 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       await sleep(80);
     } catch { }
   }
+  // For the secondary menu-paste fallback below; the primary script
+  // escapes its own interpolations inside ./paste-script.
   const escapedApp = escapeAppleScriptString(effectiveTarget.appName);
-  const escapedWindowTitle = escapeAppleScriptString(effectiveTarget.windowTitle);
   const rawPid = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
   // Defense-in-depth: reject any value that is not a safe non-negative integer
   // before interpolating it into the AppleScript source string.
   const pid = (Number.isFinite(rawPid) && rawPid >= 0 && rawPid < 2 ** 31) ? Math.trunc(rawPid) : 0;
-  // Needed inside the script below (as a plain integer, never as
-  // interpolated text) to decide whether the focused element's value
-  // grew by exactly the pasted length — see the verification block.
+  // Passed to the paste script as a plain integer, never as interpolated
+  // text: it is what the verification reads compare the focused element
+  // growth against.
   const pastedTextLen = String(text || "").length;
-  const robustPasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${pid}
-    set targetWindowTitle to "${escapedWindowTitle}"
-    set pastedTextLen to ${pastedTextLen}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set p to missing value
-
-      -- Priority 1: Target by exact Unix PID
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-        end if
-      end if
-
-      -- Priority 2: Target by exact App Name
-      if p is missing value and targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-        end if
-      end if
-
-      if p is missing value then return "ERR:no-process"
-
-      -- Fast path: bring target to front and send physical Cmd+V keycode.
-      -- Avoid AXFocusedUIElement probing HERE (before even deciding how
-      -- to paste) because some apps block this call for several seconds
-      -- and make the recording status look stuck on transcribing —
-      -- measured against the Finder process AXFocusedUIElement itself,
-      -- a probe with no bound blocked for 40+ seconds. The verification
-      -- read below (axFocusedValueLength) is bounded to 1 s per call via
-      -- "with timeout of 1 second" specifically so it can be taken
-      -- right around the paste itself without reintroducing that hang.
-      --
-      -- The activation and its settle delay are conditional. Transcriptor
-      -- never takes focus — the capsule is a non-focusable window — so the
-      -- app the user dictated into is still frontmost when the transcript
-      -- comes back: 1459 of 1459 pastes in the log recorded
-      -- "target_activation_skipped reason=already-frontmost". Raising an
-      -- app that is already raised is free; the 80 ms delay after it was
-      -- not, and it was paid on every one of them. Reading "frontmost"
-      -- is a single attribute fetch, and the activation still happens
-      -- whenever focus really did move.
-      set activationTag to ""
-      if frontmost of p is false then
-        set frontmost of p to true
-        set activationTag to "+activated"
-        delay 0.08
-      end if
-      if targetWindowTitle is not "" then
-        try
-          -- Resolve the window ONCE. "if exists X then set w to X" runs
-          -- the same accessibility traversal twice; a try around a
-          -- single fetch has identical semantics (a missing window
-          -- raises, which the surrounding try already swallows).
-          set w to missing value
-          try
-            set w to first window of p whose name is targetWindowTitle
-          end try
-          if w is not missing value then
-            try
-              perform action "AXRaise" of w
-            end try
-            try
-              set value of attribute "AXMain" of w to true
-            end try
-            delay 0.05
-          end if
-        end try
-      end if
-
-      -- Snapshot the focused element text length right before the
-      -- paste fires, so the same length read after it fires (at either
-      -- return point below) can tell a genuine paste from a click/keycode
-      -- that was sent but never received by anything.
-      set beforeLen to my axFocusedValueLength(p)
-
-      -- If the target exposes a standard Edit > Paste command, prefer
-      -- executing that command directly over synthesising Cmd+V. A
-      -- keycode only proves the keyboard event was delivered; the menu
-      -- command is the target app's own paste action and is a stronger
-      -- signal that the active responder can accept text.
-      try
-        -- Walk the target's menu bar ONCE. The previous form asked
-        -- "exists" for this exact path and then fetched it again — two
-        -- full accessibility traversals of another application's menu
-        -- bar, the most expensive operation in this script. Measured
-        -- against a live app: 170-240 ms duplicated (and visibly
-        -- jittery) versus a flat 160 ms evaluated once, over a 40 ms
-        -- osascript baseline. Semantics are unchanged: a missing menu
-        -- item raises, which is what the "exists" test was detecting.
-        set pasteMenuItem to missing value
-        try
-          set pasteMenuItem to menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p
-        end try
-        if pasteMenuItem is not missing value then
-          if enabled of pasteMenuItem is false then
-            return "ERR:no-focus"
-          end if
-          try
-            click pasteMenuItem
-            -- No settle delay before returning. "click" performs the
-            -- app's own paste action; nothing this script does afterwards
-            -- observes the result, and the two things that DO care about
-            -- the paste having landed carry their own waits: the clipboard
-            -- restore does not run for at least 1.5 s, and the auto-send
-            -- Enter sleeps before it fires. A delay here was 160 ms added
-            -- to the moment the user is waiting for.
-            set afterLen to my axFocusedValueLength(p)
-            set verifiedTag to ":unverified"
-            if beforeLen is not -1 and afterLen is not -1 and (afterLen - beforeLen) is equal to pastedTextLen then
-              set verifiedTag to ":verified"
-            end if
-            return "OK:menu-paste-primary" & activationTag & verifiedTag
-          end try
-        end if
-      end try
-
-      -- Perform physical V key press (key code 9) + Cmd
-      -- This bypasses keyboard layout issues (like Russian "м") where keystroke "v" fails
-      tell p
-        key code 9 using {command down}
-      end tell
-
-      -- Same reasoning as the menu path: the settle allowance lives with
-      -- the caller that needs it, not in front of the return.
-      set afterLen to my axFocusedValueLength(p)
-      set verifiedTag to ":unverified"
-      if beforeLen is not -1 and afterLen is not -1 and (afterLen - beforeLen) is equal to pastedTextLen then
-        set verifiedTag to ":verified"
-      end if
-      return "OK:robust-paste" & activationTag & verifiedTag
-    end tell
-
-    -- Length of the focused UI element text value, or -1 when it is
-    -- unavailable/unreadable/times out. Bounded to 0.5 s per attribute
-    -- read ("with timeout of 0.5 second") — an UNBOUNDED
-    -- AXFocusedUIElement read measured 40+ seconds against Finder in
-    -- testing, which is exactly the "some apps block this call for
-    -- several seconds" risk the fast path above avoids. Falls back from
-    -- AXValue (works for standard text fields) to AXNumberOfCharacters
-    -- (some custom text views expose only this) before giving up. This
-    -- function is called twice per paste (before and after), so its
-    -- bound is half of what the caller's own osascript timeout budgets
-    -- for the pair — see the 4200 ms comment below.
-    on axFocusedValueLength(p)
-      tell application "System Events"
-        try
-          with timeout of 0.5 second
-            set axElem to (value of attribute "AXFocusedUIElement" of p)
-          end timeout
-        on error
-          return -1
-        end try
-        try
-          return (count of (value of attribute "AXValue" of axElem))
-        end try
-        try
-          return (value of attribute "AXNumberOfCharacters" of axElem)
-        end try
-        return -1
-      end tell
-    end axFocusedValueLength
-  `;
-
   let lastReason = "paste-no-attempt";
 
   // ── Enterprise Paste Logic ──
@@ -4536,6 +4392,26 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     }
   } else {
     // macOS AppleScript 'key code 9'
+    //
+    // ONE decision, taken once for the whole ladder: does this paste
+    // carry the accessibility verification reads? The policy remembers
+    // per app; ./paste-script emits a script with no read in it at all
+    // when the answer is no (BUGS_AUDIT §6.6 / hotfix A3).
+    const verificationKey = pasteVerificationKey({
+      appName: effectiveTarget.appName || frontBefore.name || "",
+    });
+    const verifyPaste = pasteVerificationPolicy.shouldAttemptVerification(verificationKey);
+    traceStep(trace, "paste_verification_policy", {
+      ...pasteVerificationPolicy.stateFor(verificationKey),
+      verify: verifyPaste,
+    });
+    const pasteScript = robustPasteScript({
+      appName: effectiveTarget.appName,
+      windowTitle: effectiveTarget.windowTitle,
+      pid,
+      pastedTextLen,
+      verify: verifyPaste,
+    });
     for (let attempt = 0; attempt < 3; attempt++) {
     // Refresh clipboard just in case OS flushed it
     try { clipboard.writeText(String(text)); } catch { }
@@ -4545,20 +4421,37 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     traceStep(trace, "method_begin", { method: "robust_paste", attempt: attempt + 1 });
 
     const cmdStarted = Date.now();
-    // 4200 ms (was 3200): the script now takes up to two AX-verification
-    // reads (axFocusedValueLength, before and after the paste), each
-    // individually bounded to 0.5 s via ``with timeout of 0.5 second``.
-    // The extra 1000 ms (2 x 0.5 s) covers that worst case on top of the
-    // previous budget; the reads themselves are typically single-digit
-    // ms, so a paste that used to take ~270 ms is not pushed toward a
-    // multi-second wait by this bound — only a genuinely hung AX read
-    // (the measured Finder hang the timeout guards against) is.
-    const check = await runCommand("osascript", ["-e", robustPasteScript], { timeoutMs: 4200 });
+    // The script marks the edges of each AX read with ``log``, which
+    // osascript flushes to stderr as it happens. Timing their arrival is
+    // the only way to measure what the reads cost without spending a
+    // ``do shell script`` inside the script to read a clock.
+    const axTraceEvents = [];
+    const onStreamLine = verifyPaste
+      ? (streamName, line, ms) => {
+        if (streamName === "stderr" && line.startsWith("AXT:")) axTraceEvents.push({ line, ms });
+      }
+      : null;
+    // 3200 ms is the budget for the paste itself. When the verification
+    // reads are attempted they add at most 2 x 0.5 s: one
+    // axFocusedValueLength call is up to three Apple Events bounded at
+    // 0.25 s each, and the "after" call is skipped outright when the
+    // "before" one failed. Without verification the budget is exactly
+    // what it was before verification existed, because the script then
+    // contains no read to wait for.
+    const check = await runCommand("osascript", ["-e", pasteScript], {
+      timeoutMs: verifyPaste ? 4200 : 3200,
+      onStreamLine,
+    });
+    const axReads = summarizeAxReadTrace(axTraceEvents);
 
     traceStep(trace, "method_result", {
       method: "robust_paste",
       attempt: attempt + 1,
       ms: Date.now() - cmdStarted,
+      verify: verifyPaste,
+      axReadMs: axReads.totalMs,
+      axReads: axReads.reads,
+      axReadUnfinished: axReads.unfinished,
       ok: !!check.ok,
       code: check.code,
       stdout: compactLogText(check.stdout),
@@ -4568,6 +4461,8 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       attempt: attempt + 1,
       ok: !!check.ok,
       code: check.code,
+      verify: verifyPaste,
+      axReadMs: axReads.totalMs,
       stdout: compactLogText(check.stdout),
       stderr: compactLogText(check.stderr),
     });
@@ -4575,6 +4470,20 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     if (check.ok) {
       const out = (check.stdout || "").trim();
       const macOutcome = evaluatePasteOutcome({ method: "robust_paste", ok: check.ok, stdout: check.stdout });
+      // Only an ATTEMPTED verification teaches the policy anything. A
+      // paste that ran without the reads reports "unverified" too, and
+      // feeding that back would keep the app switched off on evidence it
+      // manufactured itself.
+      if (verifyPaste) {
+        pasteVerificationPolicy.recordOutcome(
+          verificationKey,
+          macOutcome.success
+            ? (macOutcome.verified
+              ? PASTE_VERIFICATION_OUTCOME.VERIFIED
+              : PASTE_VERIFICATION_OUTCOME.UNVERIFIED)
+            : PASTE_VERIFICATION_OUTCOME.ERROR,
+        );
+      }
       if (macOutcome.success) {
         logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified });
         traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified });
@@ -5606,6 +5515,14 @@ function killAllTrackedChildren() {
 
 function runCommand(cmd, args, options = {}) {
   const timeoutMs = options.timeoutMs || 30000;
+  // Optional live view of the child's output: (streamName, line,
+  // msSinceSpawn) per COMPLETE line, as it arrives. The buffered
+  // stdout/stderr in the resolved value cannot say WHEN anything
+  // happened, and for a child that reports progress before its result —
+  // the paste script logging the edges of its accessibility reads — when
+  // is the whole measurement. A partial trailing line is never
+  // delivered: every progress marker ends in a newline.
+  const onStreamLine = typeof options.onStreamLine === "function" ? options.onStreamLine : null;
   // On Windows, PowerShell emits stdout in the system OEM code page
   // (CP866/CP1251/CP932/…) by default. When we read it as UTF-8 the
   // non-ASCII bytes become mojibake, breaking app-name detection for
@@ -5660,6 +5577,24 @@ function runCommand(cmd, args, options = {}) {
       settled = true;
       resolve(value);
     };
+    const spawnedAt = Date.now();
+    const lineBuffers = { stdout: "", stderr: "" };
+    const emitLines = (streamName, chunk) => {
+      if (!onStreamLine) return;
+      const at = Date.now() - spawnedAt;
+      lineBuffers[streamName] += chunk;
+      let newlineAt = lineBuffers[streamName].indexOf("\n");
+      while (newlineAt >= 0) {
+        const line = lineBuffers[streamName].slice(0, newlineAt).replace(/\r$/, "").trim();
+        lineBuffers[streamName] = lineBuffers[streamName].slice(newlineAt + 1);
+        if (line) {
+          // A misbehaving observer must never take down the child it is
+          // only watching.
+          try { onStreamLine(streamName, line, at); } catch { }
+        }
+        newlineAt = lineBuffers[streamName].indexOf("\n");
+      }
+    };
     const child = spawn(cmd, effectiveArgs, {
       cwd: options.cwd,
       env: options.env || process.env,
@@ -5687,11 +5622,15 @@ function runCommand(cmd, args, options = {}) {
     }, timeoutMs);
 
     child.stdout.on("data", (d) => {
-      stdout = appendBoundedOutput(stdout, d.toString(), "stdout");
+      const chunk = d.toString();
+      stdout = appendBoundedOutput(stdout, chunk, "stdout");
+      emitLines("stdout", chunk);
     });
 
     child.stderr.on("data", (d) => {
-      stderr = appendBoundedOutput(stderr, d.toString(), "stderr");
+      const chunk = d.toString();
+      stderr = appendBoundedOutput(stderr, chunk, "stderr");
+      emitLines("stderr", chunk);
     });
 
     child.on("error", (err) => {

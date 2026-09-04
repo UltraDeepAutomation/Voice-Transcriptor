@@ -31,7 +31,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const MAIN_JS = path.join(__dirname, "main.js");
+// Every file that builds AppleScript out of template literals. The paste
+// script moved into its own module (desktop/paste-script.js) so that its
+// two real shapes can be compiled by desktop/paste-script.test.js; this
+// scan still covers it, because a stray backtick truncates a template
+// wherever it lives.
+const APPLESCRIPT_SOURCES = ["main.js", "paste-script.js"].map((f) => path.join(__dirname, f));
 
 /**
  * Every template literal in `source`, as {value, line} — `value` being
@@ -94,14 +99,21 @@ function templateLiterals(source) {
       continue;
     }
     if (c === '"' || c === "'") {
+      // A quoted string ends at its quote OR at the end of its line: a
+      // JavaScript string literal cannot span an unescaped newline, so
+      // stopping there makes the scan RESYNCHRONISE once per line. That
+      // matters because this scanner does not track regular-expression
+      // literals, and a regex containing a quote — `.replace(/"/g, …)` —
+      // otherwise opens a "string" that swallows the rest of the file,
+      // including every template it was supposed to find. (Measured: it
+      // silently found 0 templates in paste-script.js.)
       const quote = c;
       i += 1;
-      while (i < source.length && source[i] !== quote) {
+      while (i < source.length && source[i] !== quote && source[i] !== "\n") {
         if (source[i] === "\\") i += 1;
-        if (source[i] === "\n") line += 1;
         i += 1;
       }
-      i += 1;
+      if (source[i] === quote) i += 1;
       continue;
     }
     if (c === "`") {
@@ -149,15 +161,19 @@ function withPlaceholders(text) {
   return text.replace(/\$\{[^}]*\}/g, "0");
 }
 
-const source = fs.readFileSync(MAIN_JS, "utf8");
-const scripts = appleScriptTemplates(source);
+const scripts = APPLESCRIPT_SOURCES.flatMap((file) =>
+  appleScriptTemplates(fs.readFileSync(file, "utf8")).map((script) => ({
+    ...script,
+    file: path.basename(file),
+  })),
+);
 
 test("the scanner finds the AppleScript sources it is meant to guard", () => {
   // A scanner that silently matches nothing would make every test below
   // pass while checking nothing at all.
   assert.ok(
     scripts.length >= 4,
-    `expected at least 4 AppleScript templates in main.js, found ${scripts.length}`,
+    `expected at least 4 AppleScript templates, found ${scripts.length}`,
   );
   const joined = scripts.map((s) => s.value).join("\n");
   assert.match(joined, /menu item "Paste"/, "the paste script must be among them");
@@ -170,12 +186,15 @@ test("no AppleScript template is cut short by a stray backtick", () => {
   // tell` — lands outside the string. Cheap structural check, run even
   // where osacompile does not exist.
   for (const script of scripts) {
-    const opens = (script.value.match(/^\s*tell /gm) || []).length;
+    // Only the BLOCK form needs an "end tell". The one-line form —
+    // `tell application "X" to activate` — is complete on its own, so a
+    // count that included it would report a phantom imbalance.
+    const opens = (script.value.match(/^\s*tell\b(?!.*\bto\b).*$/gm) || []).length;
     const closes = (script.value.match(/^\s*end tell\b/gm) || []).length;
     assert.equal(
       opens,
       closes,
-      `template at main.js:${script.line} has ${opens} "tell" and ${closes} "end tell"`,
+      `template at ${script.file}:${script.line} has ${opens} "tell" and ${closes} "end tell"`,
     );
   }
 });
@@ -198,7 +217,7 @@ test("every AppleScript in main.js compiles", { skip: process.platform !== "darw
       assert.equal(
         res.status,
         0,
-        `AppleScript at main.js:${script.line} does not compile:\n${(res.stderr || "").trim()}`,
+        `AppleScript at ${script.file}:${script.line} does not compile:\n${(res.stderr || "").trim()}`,
       );
     });
   } finally {

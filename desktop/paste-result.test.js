@@ -84,6 +84,24 @@ test("mac: bare OK with no suffix at all (secondary menu-paste fallback) is succ
   assert.equal(r.verified, false);
 });
 
+test("mac: a paste run with verification switched off is a success, unverified", () => {
+  // Hotfix A3: when desktop/paste-verification-policy.js has switched an
+  // app off, desktop/paste-script.js emits a script with no accessibility
+  // read in it, so the primary path returns the SUFFIX-LESS form. The
+  // parser must read that exactly as it reads the secondary fallback: the
+  // paste happened, nothing verified it, so the clipboard keeps the
+  // transcript.
+  for (const stdout of ["OK:menu-paste-primary", "OK:menu-paste-primary+activated", "OK:robust-paste+activated"]) {
+    const r = parseMacPasteOutcome({ ok: true, stdout });
+    assert.equal(r.success, true, `${stdout} is a successful paste`);
+    assert.equal(r.verified, false, `${stdout} verifies nothing`);
+    assert.equal(r.reason, stdout);
+  }
+  const dispatched = evaluatePasteOutcome({ method: "robust_paste", ok: true, stdout: "OK:menu-paste-primary\n" });
+  assert.equal(dispatched.success, true);
+  assert.equal(dispatched.verified, false);
+});
+
 test("mac: ERR:secure-field and ERR:no-accessibility are failures, not crashes", () => {
   assert.equal(parseMacPasteOutcome({ ok: true, stdout: "ERR:secure-field" }).success, false);
   assert.equal(parseMacPasteOutcome({ ok: true, stdout: "ERR:no-accessibility" }).success, false);

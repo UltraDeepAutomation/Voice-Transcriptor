@@ -47,6 +47,8 @@
       "engine-deps.js",
       "renderer-console.js",
       "paste-result.js",
+      "paste-script.js",
+      "paste-verification-policy.js",
       "recording-final-slot.js",
       "preload.js",
       "shortcut-defaults.json",
