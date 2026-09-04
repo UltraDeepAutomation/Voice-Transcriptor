@@ -107,3 +107,36 @@ export function windowStatusText(rendered: number, total: number): string {
   if (total <= 0 || rendered >= total) return "";
   return `Showing ${rendered} of ${total}`;
 }
+
+export interface WindowResetInput {
+  /** The archive directory changed, so this is a different list entirely. */
+  directoryChanged: boolean;
+  /** Keys of the rows that were materialised before the load. */
+  previousWindowKeys: ReadonlyArray<string>;
+  /** Keys of every row the new payload contains. */
+  nextKeys: ReadonlyArray<string>;
+}
+
+/**
+ * Does a completed load replace the list, or refresh it?
+ *
+ * The window used to be reset on EVERY load, including the background
+ * refresh that runs after each save — so the keyed reconciler preserved
+ * the DOM nodes and the reset deleted them one line later, and a user who
+ * had scrolled through five hundred rows was thrown back to the top by an
+ * event they did not cause. The mechanism worked; the symptom it was
+ * written against survived intact.
+ *
+ * "Replaces the list" is true when the archive directory changed, and
+ * when nothing that was on screen is in the new payload — a set with no
+ * overlap is a different list, and a window measured against the old one
+ * describes nothing. Anything else is the same list with items added or
+ * removed, and the position the user scrolled to still means what it
+ * meant.
+ */
+export function shouldResetWindowAfterLoad(input: WindowResetInput): boolean {
+  if (input.directoryChanged) return true;
+  if (input.previousWindowKeys.length === 0) return true;
+  const next = new Set(input.nextKeys);
+  return !input.previousWindowKeys.some((key) => next.has(key));
+}

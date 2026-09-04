@@ -43,6 +43,7 @@ import {
   grownWindowSize,
   resolveWindowSize,
   shouldGrowWindow,
+  shouldResetWindowAfterLoad,
   windowStatusText,
 } from "./list-window";
 import { reconcileRecordingsList } from "./recordings-list-reconciler";
@@ -1152,9 +1153,19 @@ function renderTranscriptionSelectors(): void {
   for (const id of ["providerSelect", "uploadProviderMirror"]) {
     const sel = document.getElementById(id) as HTMLSelectElement | null;
     if (!sel) continue;
-    const signature = groups
-      .map((g) => `${g.id}:${g.models.some((m) => m.available) ? "1" : "0"}`)
-      .join("|");
+    // "None" (no transcription) is a Transcribe-toolbar concept; the
+    // Upload mirror always transcribes. It is part of the signature
+    // because it is part of what gets rendered: without it the signature
+    // described four options while the select held five, never matched
+    // again after the first build, and the idempotence guard this
+    // function is built around silently inverted into "rebuild every
+    // time" — closing the dropdown under the user on every 10 s health
+    // poll, which is the exact regression it was written to prevent.
+    const wantsNone = id === "providerSelect";
+    const signature = [
+      ...groups.map((g) => `${g.id}:${g.models.some((m) => m.available) ? "1" : "0"}`),
+      ...(wantsNone ? [":1"] : []),
+    ].join("|");
     const current = Array.from(sel.options)
       .map((o) => `${o.value}:${o.disabled ? "0" : "1"}`)
       .join("|");
@@ -1167,16 +1178,21 @@ function renderTranscriptionSelectors(): void {
         opt.disabled = !g.models.some((m) => m.available);
         sel.appendChild(opt);
       }
-      // "None" (no transcription) is a Transcribe-toolbar concept; the
-      // Upload mirror always transcribes.
-      if (id === "providerSelect") {
+      if (wantsNone) {
         const none = document.createElement("option");
         none.value = "";
         none.textContent = "None";
         sel.appendChild(none);
       }
     }
-    if (uiProviderGroup) sel.value = uiProviderGroup;
+    // The empty string is assigned too, on the select that has a "None"
+    // option: skipping it let the browser fall back to the first option,
+    // so the toolbar read "Local Whisper" while the SSOT said "None".
+    // These selects are views, and a view that declines to show one of
+    // its states is not one. The Upload mirror is the exception on
+    // purpose — it has no "None" to show, so it keeps its selection
+    // rather than blanking out.
+    if (wantsNone || uiProviderGroup) sel.value = uiProviderGroup;
   }
   const group = groups.find((g) => g.id === uiProviderGroup) || null;
   for (const id of ["remoteModelSelect", "uploadModelMirror"]) {
@@ -1276,7 +1292,25 @@ type LocalModelRow = {
 
 let localModelsCache: LocalModelRow[] = [];
 let localModelsFetchFailed = false;
+/**
+ * A model whose download was CONFIRMED and successfully started. When it
+ * lands, ``refreshLocalModels`` applies it to the unified selection.
+ */
 let pendingModelSelection: string | null = null;
+/**
+ * The model the download modal is currently ASKING about.
+ *
+ * Separate from the pin above, and that separation is the whole fix: the
+ * confirm handler read ``pendingModelSelection``, which nothing on the
+ * path that opens the modal ever set — every assignment to it is either
+ * ``null`` or the assignment inside that same confirm handler, under
+ * ``if (id)``. So ``id`` was always null, ``requestModelDownload`` was
+ * never reached from the modal, and pressing "Download" after being told
+ * "medium is not on this machine yet (~1.4 GB download). Download it
+ * now?" did nothing at all: no request, no status, no error, just a
+ * modal closing.
+ */
+let pendingModelDownloadCandidate: string | null = null;
 // Desktop-side GigaAM engine install state machine mirror. Populated via
 // the __transcriptorEngine bridge; absent entirely in browser dev preview
 // where gigaam rows simply show their backend-reported note.
@@ -1606,6 +1640,49 @@ async function syncEngineInstallState(): Promise<void> {
 }
 
 function wireLocalModelsUi(): void {
+  // The modal is set up FIRST: the table's click handler opens it, and
+  // when these ``const``s were declared below that listener the code
+  // only worked because the callback happened to run after the temporal
+  // dead zone had passed. Declaration order that has to be reasoned
+  // about is declaration order in the wrong place.
+  const modal = document.getElementById("modelDownloadModal");
+  const titleEl = document.getElementById("modelDownloadTitle");
+  const textEl = document.getElementById("modelDownloadText");
+  const confirmBtn = document.getElementById("modelDownloadConfirmBtn");
+  const cancelBtn = document.getElementById("modelDownloadCancelBtn");
+  const openModelModal = (copy: { title: string; body: string; confirmLabel: string }): void => {
+    if (titleEl) titleEl.textContent = copy.title;
+    if (textEl) textEl.textContent = copy.body;
+    if (confirmBtn) confirmBtn.textContent = copy.confirmLabel;
+    if (modal) modal.hidden = false;
+    confirmBtn?.focus();
+  };
+  const closeModal = (): void => {
+    if (modal) modal.hidden = true;
+    pendingEngineInstall = false;
+    // Only the question is dropped. The unified selection state is
+    // mutated on a CONFIRMED, successful download (auto-apply in
+    // refreshLocalModels), so Cancel has nothing to restore — the
+    // BUG-45 stale-select class cannot exist when the selects are views
+    // of the SSOT rather than its source — and a pin left by an EARLIER
+    // download that is still in flight is not this modal's to discard.
+    pendingModelDownloadCandidate = null;
+  };
+  cancelBtn?.addEventListener("click", closeModal);
+  modal?.addEventListener("click", (ev) => {
+    if (ev.target === modal) closeModal();
+  });
+  confirmBtn?.addEventListener("click", () => {
+    const engineRequested = pendingEngineInstall;
+    const id = pendingModelDownloadCandidate;
+    closeModal();
+    if (engineRequested) void requestEngineInstall();
+    if (id) void requestModelDownload(id).then((started) => {
+      if (!started) return; // BUG-40: never pin on a failed request
+      pendingModelSelection = id; // applied automatically once ready
+    });
+  });
+
   const table = document.getElementById("localModelsTable");
   table?.addEventListener("click", (ev) => {
     const target = ev.target as HTMLElement | null;
@@ -1617,63 +1694,46 @@ function wireLocalModelsUi(): void {
     // consent — a multi-GB download must never start from a stray click.
     if (target?.closest?.("[data-engine-install]")) {
       pendingEngineInstall = true;
-      if (textEl) {
-        textEl.textContent =
-          "Install the Russian GigaAM engine? This downloads ~2 GB and needs "
-          + "8 GB of free disk space. The backend restarts when it finishes.";
-      }
-      if (modal) modal.hidden = false;
-      confirmBtn?.focus();
+      // One modal, two questions — so the heading and the button have to
+      // be part of what the question sets. They used to be markup
+      // constants, which meant this branch asked "Install the Russian
+      // GigaAM engine?" under a heading that said "Model not downloaded"
+      // above a button that said "Download".
+      openModelModal({
+        title: "Install the GigaAM engine",
+        body: "Install the Russian GigaAM engine? This downloads ~2 GB and needs "
+          + "8 GB of free disk space. The backend restarts when it finishes.",
+        confirmLabel: "Install",
+      });
     }
-  });
-
-  const modal = document.getElementById("modelDownloadModal");
-  const textEl = document.getElementById("modelDownloadText");
-  const confirmBtn = document.getElementById("modelDownloadConfirmBtn");
-  const cancelBtn = document.getElementById("modelDownloadCancelBtn");
-  const closeModal = (): void => {
-    if (modal) modal.hidden = true;
-    pendingEngineInstall = false;
-    // The unified selection state is only mutated on a CONFIRMED,
-    // successful download (auto-apply in refreshLocalModels), so Cancel
-    // has nothing to restore — the BUG-45 stale-select class cannot
-    // exist when the selects are views of the SSOT rather than its
-    // source.
-    pendingModelSelection = null;
-  };
-  cancelBtn?.addEventListener("click", closeModal);
-  modal?.addEventListener("click", (ev) => {
-    if (ev.target === modal) closeModal();
-  });
-  confirmBtn?.addEventListener("click", () => {
-    const engineRequested = pendingEngineInstall;
-    const id = pendingModelSelection;
-    closeModal();
-    if (engineRequested) void requestEngineInstall();
-    if (id) void requestModelDownload(id).then((started) => {
-      if (!started) return; // BUG-40: never pin on a failed request
-      pendingModelSelection = id; // applied automatically once ready
-    });
   });
 
   const modelSel = document.getElementById("remoteModelSelect") as HTMLSelectElement | null;
   if (modelSel) {
     modelSel.addEventListener("change", () => {
       const value = modelSel.value;
+      // ``#remoteModelSelect`` is ONE select for every group, so this
+      // handler sees Deepgram's nova-3 and OpenRouter's models too.
+      // Neither has a row in the local-model table, so
+      // ``isLocalModelReady`` returned false for them and the user was
+      // asked to download cloud weights onto their disk. Only a local
+      // group has anything to download.
+      if (!isLocalGroup(readProviderGroup())) return;
       if (isLocalModelReady(value)) return;
-      // Not on disk yet: keep the candidate visible in the VIEW while
-      // the modal asks, but the SSOT state itself only mutates after a
-      // confirmed, successful download (auto-apply above) — the
-      // BUG-45 stale-select class cannot exist when selects are views.
+      // Not on disk yet: remember what the modal is asking about, keep
+      // the candidate visible in the VIEW while it asks, but mutate the
+      // SSOT state only after a confirmed, successful download
+      // (auto-apply above) — the BUG-45 stale-select class cannot exist
+      // when selects are views.
+      pendingModelDownloadCandidate = value;
       const rowSize = findLocalModelRow(value)?.size_hint_bytes;
-      if (textEl) {
-        textEl.textContent =
-          `${value} is not on this machine yet`
+      openModelModal({
+        title: "Model not downloaded",
+        body: `${value} is not on this machine yet`
           + (rowSize ? ` (~${fmtBytes(rowSize)} download)` : "")
-          + ". Download it now?";
-      }
-      if (modal) modal.hidden = false;
-      confirmBtn?.focus();
+          + ". Download it now?",
+        confirmLabel: "Download",
+      });
     });
   }
 }
@@ -2140,6 +2200,9 @@ function setPlayerEnabled(enabled: boolean, reason = ""): void {
   }
 }
 
+/** One sentence, two surfaces (the disabled player and the session notice). */
+const AUDIO_LOAD_FAILED_TEXT = "Audio for this recording could not be loaded.";
+
 async function renderLatestSavedAudio(): Promise<void> {
   const renderSeq = ++currentRecordingAudioRenderSeq;
   const row = $("currentRecordingAudioRow");
@@ -2239,9 +2302,20 @@ async function renderLatestSavedAudio(): Promise<void> {
       playbackUrl = URL.createObjectURL(audioFile);
       playbackSourceKey = desiredBackendKey;
     } catch (e) {
+      // The staleness guard has to be repeated here. It sat only on the
+      // success branch, so a rejected fetch — which happens on the
+      // ordinary path, because the backend prunes archived audio by
+      // retention on every save — carried a superseded render all the
+      // way through: it overwrote ``currentRecordingAudioObjectUrl``
+      // (leaking the fresh render's multi-megabyte blob for the rest of
+      // the session), pointed the player at the PREVIOUS recording, and
+      // pinned that substitution through the source-key skip guard.
+      // ``openRecording`` gets this right; this function did not.
+      if (renderSeq !== currentRecordingAudioRenderSeq) return;
       console.warn("Saved audio playback fetch failed; falling back to in-memory file", e);
     }
   }
+  if (renderSeq !== currentRecordingAudioRenderSeq) return;
   if (!playbackUrl && latestSavedAudioState.file) {
     playbackUrl = URL.createObjectURL(latestSavedAudioState.file);
     playbackSourceKey = latestSavedAudioState.savedName
@@ -2256,12 +2330,8 @@ async function renderLatestSavedAudio(): Promise<void> {
     // not be loaded from the backend or from memory. Surface it where
     // the pane's other failures appear rather than in a label the user
     // has to notice.
-    setPlayerEnabled(false, "Audio for this recording could not be loaded.");
-    showRecordSessionNotice(
-      "Audio for this recording could not be loaded.",
-      "warning",
-      6000,
-    );
+    setPlayerEnabled(false, AUDIO_LOAD_FAILED_TEXT);
+    showRecordSessionNotice(AUDIO_LOAD_FAILED_TEXT, "warning", 6000);
     return;
   }
   // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
@@ -7412,6 +7482,12 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
   const options = normalizeLoadRecordingsOptions(optionsOrKeepSelection);
   const requestSeq = ++recordingsLoadRequestSeq;
   const selectedKeyBeforeLoad = selectedRecordingKey();
+  // Snapshot what is on screen BEFORE the payload replaces the items, so
+  // the window decision below can ask whether this is the same list.
+  const previousWindowKeys = getFilteredRecordings()
+    .slice(0, recordingsWindowSize)
+    .map(recordingItemKey);
+  const previousResolvedDir = activeResolvedRecordingsDir;
   if (!options.background) {
     setRecordingsUiLoading(true);
   }
@@ -7419,11 +7495,19 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
     const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
     if (requestSeq !== recordingsLoadRequestSeq) return;
     recordingItems = r.items || [];
-    // A fresh archive load replaces the filtered set wholesale, so the
-    // window carried from the previous list no longer describes
-    // anything. Reset for the same reason a query change resets.
-    resetRecordingsWindow();
     activeResolvedRecordingsDir = String(r.directory || "").trim();
+    // A load that REPLACES the list invalidates the window; a load that
+    // refreshes it does not. Resetting unconditionally meant the
+    // background refresh after every save threw a user who had scrolled
+    // through hundreds of rows back to the top — deleting exactly the
+    // nodes the keyed reconciler had just preserved.
+    if (shouldResetWindowAfterLoad({
+      directoryChanged: previousResolvedDir !== "" && previousResolvedDir !== activeResolvedRecordingsDir,
+      previousWindowKeys,
+      nextKeys: recordingItems.map(recordingItemKey),
+    })) {
+      resetRecordingsWindow();
+    }
     syncLatestSavedAudioFromRecordings();
     const filteredItems = getFilteredRecordings();
     if (!options.keepSelection || !filteredItems.some((x) => isSelectedRecordingItem(x))) {
@@ -8197,12 +8281,22 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
     const summary = failedCount > 0
       ? `Deleted ${deletedCount} recording(s) — ${failedCount} failed (see main.log).`
       : `Deleted ${deletedCount} recording(s).`;
-    showRecordSessionNotice(summary, tone, 7000);
-    $("recordingContent").textContent = summary;
+    // Reported through the status pill, which is visible from every
+    // view. ``showRecordSessionNotice`` writes into ``#recordSessionNotice``,
+    // which lives inside the Record view — hidden at the moment this
+    // button can be pressed — and the viewer body it also wrote to was
+    // wiped one line later by ``loadRecordings`` → ``resetRecordingViewer``.
+    // So a partial failure the backend does count was reported to nobody.
+    setStatus(summary, tone === "error" ? "error" : "done");
+    showRecordSessionNotice(summary, tone);
     $("recordingMeta").textContent = "";
     await loadRecordings(true);
+    // After the reload, so it survives ``resetRecordingViewer``.
+    resetRecordingViewer(summary);
   } catch (e: unknown) {
-    $("recordingContent").textContent = sanitizeUiErrorMessage(e, "Could not delete the archive.");
+    const msg = sanitizeUiErrorMessage(e, "Could not delete the archive.");
+    setStatus(`Delete all failed: ${msg}`, "error");
+    $("recordingContent").textContent = msg;
   } finally {
     closeModal("deleteAllModal");
   }
@@ -12861,6 +12955,13 @@ interface UploadQueueItem {
   endedAt?: number;
   completedAt?: number;
   provider?: Provider;
+  /**
+   * Why the provider that actually ran is not the one that was asked
+   * for. The Live path has had a sentence for this since
+   * ``localFallbackReason`` was written; the queue silently swapped the
+   * provider and said nothing, on all twenty files of a batch.
+   */
+  providerFallbackNote?: string;
   model?: string;
   language?: string;
   audioDurationSec?: number;
@@ -13515,8 +13616,7 @@ function setupUploadView(): void {
         // Drop only finished items so an in-flight transcription is
         // never aborted by an accidental Clear click.
         for (let i = uploadQueue.length - 1; i >= 0; i--) {
-          const st = uploadQueue[i].status;
-          if (st === "done" || st === "error" || st === "cancelled") {
+          if (isUploadTerminalStatus(uploadQueue[i].status)) {
             uploadQueue.splice(i, 1);
           }
         }
@@ -13700,10 +13800,20 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   const language = String(item.requestedLanguage || item.language || "auto").trim() || "auto";
   const diarize = item.requestedDiarize === true;
   item.provider = provider;
+  // Say so. ``resolveEffectiveProvider`` routes to local when the remote
+  // provider has no key or the network is down, and the Live path has
+  // had a sentence for exactly this since ``localFallbackReason`` was
+  // written — the queue said nothing, so a twenty-file batch swapped
+  // provider twenty times in silence.
+  //
+  // The key check that used to stand here was unreachable: the line
+  // above has already returned "local" when the key is missing, and
+  // there is no await between them. Throwing for a missing key would
+  // also have contradicted the batch contract stated just above it.
+  item.providerFallbackNote = provider !== selectedProvider
+    ? localFallbackReason(selectedProvider)
+    : "";
   try {
-    if (provider !== "local" && !isProviderKeyConfigured(provider)) {
-      throw new Error(providerKeyErrorMessage(provider));
-    }
     let text = "";
     let modelLabel = "";
     let saveAudioSourcePath = useSourcePath ? sourcePath : "";
@@ -14023,6 +14133,11 @@ function renderUploadQueue(): void {
     ? uploadQueue.filter((it) => !isUploadPastItem(it))
     : uploadQueue;
   if (uploadQueue.length === 0) {
+    // The result pane is rendered at the END of this function, and this
+    // branch returns before it — so after "Clear done" emptied the queue
+    // the pane kept showing the removed item's transcript and a live
+    // "Reveal in folder" button still bound to it.
+    uploadSelectedId = null;
     list.innerHTML = "";
     empty.hidden = false;
     const emptyTitle = empty.querySelector(".upload-empty-state-title");
@@ -14034,11 +14149,10 @@ function renderUploadQueue(): void {
     clearBtn.hidden = true;
     if (hideBtn) hideBtn.hidden = true;
     if (titleEl) titleEl.textContent = "Queue";
+    renderUploadResultPane();
     return;
   }
-  const finished = uploadQueue.filter(
-    (it) => it.status === "done" || it.status === "error" || it.status === "cancelled",
-  ).length;
+  const finished = uploadQueue.filter((it) => isUploadTerminalStatus(it.status)).length;
   clearBtn.hidden = finished === 0;
   if (hideBtn) {
     hideBtn.hidden = finished === 0;
@@ -14176,6 +14290,12 @@ function renderUploadQueue(): void {
     }
 
     if (item.status === "done") {
+      if (item.providerFallbackNote) {
+        const note = document.createElement("div");
+        note.className = "upload-queue-item-note";
+        note.textContent = item.providerFallbackNote;
+        li.appendChild(note);
+      }
       const body = document.createElement("div");
       body.className = "upload-queue-item-body";
       body.textContent = uploadItemResultText(item);

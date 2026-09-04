@@ -57,6 +57,14 @@ export interface GatedPoll {
    * Run a tick now if the gate is open, then resume the cadence from
    * that point. Used when a state change makes the current data stale
    * rather than merely resuming interest in it.
+   *
+   * A tick already in flight was started against the OLD state, so it
+   * cannot be the answer to this request: the refresh is queued and runs
+   * as soon as that tick finishes. Dropping it instead — which is what
+   * an `inFlight` early return amounts to — left the network indicator,
+   * and with it `isRemoteProviderReachable`, holding a value known to be
+   * wrong for a whole interval, and a recording started in that window
+   * went to an unreachable cloud instead of falling back to local.
    */
   refreshNow(): void;
   /** Cancel permanently. Safe to call more than once. */
@@ -85,6 +93,8 @@ export function createGatedPoll(options: GatedPollOptions): GatedPoll {
   let handle: number | null = null;
   let stopped = false;
   let inFlight = false;
+  /** A `refreshNow` that arrived while a tick was already running. */
+  let refreshQueued = false;
 
   const cancel = (): void => {
     if (handle === null) return;
@@ -114,9 +124,20 @@ export function createGatedPoll(options: GatedPollOptions): GatedPoll {
       onError(error, name);
     } finally {
       inFlight = false;
+      const catchUp = refreshQueued;
+      refreshQueued = false;
       // Re-check the gate: a tick can be what closes it (a download
       // finishing, a view switching away mid-request).
-      if (!stopped && shouldRun()) arm();
+      if (!stopped && shouldRun()) {
+        if (catchUp) {
+          // A refresh that arrived mid-tick. The tick that just
+          // finished read the old state, so it did not answer it.
+          cancel();
+          void run();
+        } else {
+          arm();
+        }
+      }
     }
   };
 
@@ -131,6 +152,10 @@ export function createGatedPoll(options: GatedPollOptions): GatedPoll {
     },
     refreshNow(): void {
       if (stopped || !shouldRun()) return;
+      if (inFlight) {
+        refreshQueued = true;
+        return;
+      }
       cancel();
       void run();
     },
@@ -139,7 +164,7 @@ export function createGatedPoll(options: GatedPollOptions): GatedPoll {
       cancel();
     },
     get active(): boolean {
-      return handle !== null || inFlight;
+      return handle !== null || inFlight || refreshQueued;
     },
   };
 }

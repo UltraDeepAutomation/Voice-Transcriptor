@@ -6,6 +6,7 @@ import {
   grownWindowSize,
   resolveWindowSize,
   shouldGrowWindow,
+  shouldResetWindowAfterLoad,
   windowStatusText,
 } from "../src/list-window";
 
@@ -90,5 +91,70 @@ describe("windowStatusText", () => {
     // A count on a complete list is noise, not information.
     expect(windowStatusText(5900, 5900)).toBe("");
     expect(windowStatusText(0, 0)).toBe("");
+  });
+});
+
+describe("shouldResetWindowAfterLoad", () => {
+  it("keeps the window on a background refresh that only prepends a new recording", () => {
+    // The exact path that threw the user back to the top: save a
+    // recording, the deferred refresh reloads the archive, and every row
+    // that was on screen is still there.
+    expect(
+      shouldResetWindowAfterLoad({
+        directoryChanged: false,
+        previousWindowKeys: ["a", "b", "c"],
+        nextKeys: ["new", "a", "b", "c"],
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the window when some visible rows were deleted but others remain", () => {
+    expect(
+      shouldResetWindowAfterLoad({
+        directoryChanged: false,
+        previousWindowKeys: ["a", "b", "c"],
+        nextKeys: ["c"],
+      }),
+    ).toBe(false);
+  });
+
+  it("resets when the archive directory changed", () => {
+    expect(
+      shouldResetWindowAfterLoad({
+        directoryChanged: true,
+        previousWindowKeys: ["a"],
+        nextKeys: ["a"],
+      }),
+    ).toBe(true);
+  });
+
+  it("resets when nothing that was on screen survives", () => {
+    expect(
+      shouldResetWindowAfterLoad({
+        directoryChanged: false,
+        previousWindowKeys: ["a", "b"],
+        nextKeys: ["x", "y"],
+      }),
+    ).toBe(true);
+  });
+
+  it("resets on the first load, when nothing was on screen", () => {
+    expect(
+      shouldResetWindowAfterLoad({
+        directoryChanged: false,
+        previousWindowKeys: [],
+        nextKeys: ["a", "b"],
+      }),
+    ).toBe(true);
+  });
+
+  it("resets when the archive became empty", () => {
+    expect(
+      shouldResetWindowAfterLoad({
+        directoryChanged: false,
+        previousWindowKeys: ["a"],
+        nextKeys: [],
+      }),
+    ).toBe(true);
   });
 });

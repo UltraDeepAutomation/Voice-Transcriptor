@@ -266,3 +266,106 @@ describe("createGatedPoll", () => {
     expect(tick).not.toHaveBeenCalled();
   });
 });
+
+describe("refreshNow while a tick is in flight (U-005)", () => {
+  it("runs the queued refresh once the in-flight tick finishes", async () => {
+    const clock = fakeTimers();
+    let release: (() => void) | null = null;
+    const tick = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const poll = createGatedPoll({
+      intervalMs: 10_000,
+      shouldRun: () => true,
+      tick,
+      timers: clock.timers,
+    });
+
+    poll.refreshNow();
+    await Promise.resolve();
+    expect(tick).toHaveBeenCalledTimes(1);
+
+    // The network went offline while the first tick was still reading
+    // the old state. Before the fix this call was silently dropped.
+    poll.refreshNow();
+    expect(tick).toHaveBeenCalledTimes(1);
+    expect(poll.active).toBe(true);
+
+    release!();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tick).toHaveBeenCalledTimes(2);
+    poll.stop();
+  });
+
+  it("coalesces several mid-tick refreshes into one catch-up run", async () => {
+    const clock = fakeTimers();
+    let release: (() => void) | null = null;
+    const tick = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const poll = createGatedPoll({
+      intervalMs: 10_000,
+      shouldRun: () => true,
+      tick,
+      timers: clock.timers,
+    });
+
+    poll.refreshNow();
+    await Promise.resolve();
+    poll.refreshNow();
+    poll.refreshNow();
+    poll.refreshNow();
+
+    release!();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tick).toHaveBeenCalledTimes(2);
+    poll.stop();
+  });
+
+  it("drops the queued refresh when the gate closed while the tick ran", async () => {
+    const clock = fakeTimers();
+    let release: (() => void) | null = null;
+    let open = true;
+    const tick = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const poll = createGatedPoll({
+      intervalMs: 10_000,
+      shouldRun: () => open,
+      tick,
+      timers: clock.timers,
+    });
+
+    poll.refreshNow();
+    await Promise.resolve();
+    poll.refreshNow();
+    open = false;
+
+    release!();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tick).toHaveBeenCalledTimes(1);
+    expect(clock.scheduled).toBe(0);
+    poll.stop();
+  });
+
+  it("does not run a queued refresh after stop()", async () => {
+    const clock = fakeTimers();
+    let release: (() => void) | null = null;
+    const tick = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const poll = createGatedPoll({
+      intervalMs: 10_000,
+      shouldRun: () => true,
+      tick,
+      timers: clock.timers,
+    });
+
+    poll.refreshNow();
+    await Promise.resolve();
+    poll.refreshNow();
+    poll.stop();
+
+    release!();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tick).toHaveBeenCalledTimes(1);
+  });
+});
