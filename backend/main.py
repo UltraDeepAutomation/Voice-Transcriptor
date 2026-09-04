@@ -4628,14 +4628,17 @@ async def _run_deepgram_live_session(
             secondary = await DEEPGRAM_WARM_POOL.acquire(
                 api_key, secondary_config(dg_cfg, dual_language)
             )
+            primary_language = resolve_live_language(language)
             session = DualLiveSession(
                 primary=session,
                 secondary=secondary.session,
                 secondary_language=dual_language,
-                primary_language=resolve_live_language(language),
+                primary_language=primary_language,
             )
             logger.info(
-                "dual-stream: second reading opened language=%s (adopted=%s)",
+                "dual-stream: second reading opened primary=%s secondary=%s "
+                "(adopted=%s)",
+                primary_language,
                 dual_language,
                 secondary.adopted,
             )

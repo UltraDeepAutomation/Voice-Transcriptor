@@ -491,6 +491,32 @@ class DualLiveSessionFanOutTests(unittest.IsolatedAsyncioTestCase):
         events = [e async for e in dual.events()]
         self.assertEqual(events, [{"type": "marker", "from": "primary"}])
 
+    async def test_events_follow_a_primary_replacement(self):
+        # The warm-socket liveness path (``backend.main``) replaces the
+        # primary mid-recording without ever handing out a new facade —
+        # ``replace_primary`` mutates ``dual.primary`` in place. A
+        # consumer that started iterating ``dual.events()`` before the
+        # swap must keep receiving events from the NEW primary
+        # afterward, never see the secondary's, and must not be cut off
+        # just because the old primary's own generator ended.
+        primary, secondary = _primary(), _secondary()
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        fresh = _primary(name="fresh-primary")
+        collected = []
+        async for event in dual.events():
+            collected.append(event)
+            if event["from"] == "primary":
+                old = dual.replace_primary(fresh)
+                self.assertIs(old, primary)
+        self.assertEqual(
+            collected,
+            [
+                {"type": "marker", "from": "primary"},
+                {"type": "marker", "from": "fresh-primary"},
+            ],
+        )
+        self.assertTrue(all(e["from"] != "secondary" for e in collected))
+
     async def test_a_secondary_send_failure_degrades_without_touching_the_primary(self):
         primary = _primary()
         secondary = _secondary(send_error=RuntimeError("boom"))

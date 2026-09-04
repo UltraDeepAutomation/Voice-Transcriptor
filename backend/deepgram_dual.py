@@ -441,10 +441,13 @@ class DualLiveSession:
 
     Three asymmetries, all deliberate:
 
-    * EVENTS come only from the primary. The live preview and every
-      renderer buffer downstream of it are built for one stream of
-      interims and finals; two would interleave into nonsense, and the
-      secondary's value is in the merge at stop, not on screen.
+    * EVENTS come only from the primary — and ``events()`` follows a
+      ``replace_primary`` swap transparently, so that stays true across
+      the whole recording, not just up to the first replacement. The
+      live preview and every renderer buffer downstream of it are built
+      for one stream of interims and finals; two would interleave into
+      nonsense, and the secondary's value is in the merge at stop, not
+      on screen.
     * ERRORS are the primary's alone. A secondary that dies takes the
       recording's completeness back to where it was without this
       feature, which is not a failure worth aborting a recording for —
@@ -495,8 +498,30 @@ class DualLiveSession:
         if self.secondary is not None:
             self.secondary.note_undelivered_audio(nbytes)
 
-    def events(self):
-        return self.primary.events()
+    async def events(self):
+        """Yield the CURRENT primary's events, across any number of swaps.
+
+        ``DeepgramLiveSession.events()`` promises "exactly one consumer,
+        for the life of the session" — a caller gets one generator and
+        drives it until the recording ends. This facade has to keep that
+        same promise even though ITS primary can be replaced mid-flight
+        (``replace_primary``, the warm-socket liveness path in
+        ``backend.main``): a caller that took a snapshot of
+        ``self.primary.events()`` at construction time would silently
+        stop receiving anything the moment the old primary's socket was
+        torn down (``discard()`` pushes the sentinel that ends its
+        generator), even though a fresh primary is now live and still
+        producing finals. That is exactly the failure this method exists
+        to prevent — read ``self.primary`` fresh each time the previous
+        primary's stream ends, and only stop once it truly is the same
+        primary that started this leg.
+        """
+        while True:
+            current_primary = self.primary
+            async for event in current_primary.events():
+                yield event
+            if self.primary is current_primary:
+                return
 
     def final_text(self) -> str:
         return self.primary.final_text()
@@ -540,6 +565,12 @@ class DualLiveSession:
         socket that never answered. Only the primary is probed — it is
         the one whose silence the user would notice — so this is where
         that swap lands when the recording is running two readings.
+
+        Mutates ``self.primary`` in place rather than handing back a new
+        facade, which is exactly why ``events()`` has to notice the swap
+        itself instead of relying on a caller's identity check: the
+        facade object a WS handler holds never changes, only what it
+        wraps does.
         """
         old = self.primary
         self.primary = fresh
