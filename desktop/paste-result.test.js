@@ -194,9 +194,16 @@ test("mac: a paste run with verification switched off is a success, unverified",
   assert.equal(dispatched.verified, false);
 });
 
-test("mac: ERR:secure-field and ERR:no-accessibility are failures, not crashes", () => {
-  assert.equal(parseMacPasteOutcome({ ok: true, stdout: "ERR:secure-field" }).success, false);
-  assert.equal(parseMacPasteOutcome({ ok: true, stdout: "ERR:no-accessibility" }).success, false);
+test("mac: every ERR: the scripts emit is a failure, not a crash", () => {
+  // The markers listed here are the ones desktop/paste-script.js actually
+  // prints. The example used to be "ERR:secure-field", which no script has
+  // ever emitted — a test can only describe the protocol if it quotes the
+  // protocol.
+  for (const marker of ["ERR:no-accessibility", "ERR:no-process", "ERR:no-focus", "ERR:menu-paste:boom"]) {
+    assert.equal(parseMacPasteOutcome({ ok: true, stdout: marker }).success, false, marker);
+  }
+  // ...and an unknown ERR: is still a failure rather than a parse crash.
+  assert.equal(parseMacPasteOutcome({ ok: true, stdout: "ERR:something-new" }).success, false);
 });
 
 test("evaluatePasteOutcome dispatches vbs_paste like isVbsPasteSuccess", () => {

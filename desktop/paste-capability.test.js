@@ -133,7 +133,7 @@ test("one silent failure is a loaded machine; two in a row is a stale grant", ()
 
 test("target-shaped failures say nothing about the capability", () => {
   const active = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: 0 });
-  for (const reason of ["no-target", "ERR:no-process", "ERR:secure-field", "ERR:no-focus", "empty-text"]) {
+  for (const reason of ["no-target", "ERR:no-process", "ERR:no-focus", "not-editable", "empty-text"]) {
     const next = applyPasteOutcome(active, { ok: false, reason, now: 5 });
     assert.equal(next.state, PASTE_CAPABILITY.ACTIVE, reason);
     assert.equal(next.silentFailures, 0, reason);
@@ -143,7 +143,11 @@ test("target-shaped failures say nothing about the capability", () => {
 test("classifyPasteFailure buckets every reason the ladder can produce", () => {
   assert.equal(classifyPasteFailure("ERR:no-accessibility"), "permission");
   assert.equal(classifyPasteFailure("not permitted"), "permission");
-  assert.equal(classifyPasteFailure("ERR:secure-field"), "target");
+  assert.equal(classifyPasteFailure("ERR:no-focus"), "target");
+  // "secure-field" is deliberately NOT in the vocabulary: no script emits
+  // it, and a classifier entry for a marker nothing produces is a third
+  // piece of code describing a capability the product does not have.
+  assert.equal(classifyPasteFailure("ERR:secure-field"), "other");
   assert.equal(classifyPasteFailure("spawn osascript ENOENT"), "silent");
   assert.equal(classifyPasteFailure(""), "other");
   assert.equal(classifyPasteFailure("paste-return-unknown"), "other");

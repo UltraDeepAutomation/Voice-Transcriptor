@@ -192,7 +192,12 @@ const { AX_TRACE_LINE_RE: AX_TRACE_LINE } = require("./paste-protocol");
  *   killed mid-read, which is exactly the case the bound is for.
  */
 function summarizeAxReadTrace(events = []) {
-  const openedAt = new Map();
+  // Reads are placed in the order they BEGAN, not the order they ended, and
+  // an unfinished read keeps its slot. They used to be appended as they
+  // closed with the unfinished ones tacked on at the end, so a trace read
+  // top-to-bottom told the wrong story about which read was still running
+  // when osascript was killed — the one question the array exists to answer.
+  const open = new Map(); // label -> index into `reads`
   const reads = [];
   for (const event of Array.isArray(events) ? events : []) {
     const match = AX_TRACE_LINE.exec(String((event && event.line) || "").trim());
@@ -200,14 +205,21 @@ function summarizeAxReadTrace(events = []) {
     const [, label, edge] = match;
     const at = Number((event && event.ms) || 0);
     if (edge === "begin") {
-      openedAt.set(label, at);
+      open.set(label, reads.push({ label, ms: -1, startedAt: at }) - 1);
       continue;
     }
-    if (!openedAt.has(label)) continue;
-    reads.push({ label, ms: Math.max(0, at - openedAt.get(label)) });
-    openedAt.delete(label);
+    if (!open.has(label)) continue;
+    const slot = reads[open.get(label)];
+    // Resolution is bounded by CHUNK arrival, not by line arrival: two
+    // markers flushed into one pipe read carry the same timestamp, so a
+    // read faster than the pipe reports 0 rather than a smaller number.
+    // That is a floor on what can be measured from outside the process,
+    // not a lost measurement — and 0 is the honest answer for "shorter
+    // than one chunk".
+    slot.ms = Math.max(0, at - slot.startedAt);
+    open.delete(label);
   }
-  for (const [label] of openedAt) reads.push({ label, ms: -1 });
+  for (const read of reads) delete read.startedAt;
   return {
     reads,
     totalMs: reads.reduce((sum, read) => sum + Math.max(0, read.ms), 0),

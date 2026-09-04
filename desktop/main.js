@@ -12,6 +12,9 @@ const { canonicalAcceleratorForPlatform } = require("./accelerator");
 // One declaration of "this stored hotkey pair is retired" — see
 // desktop/shortcut-migration.js.
 const { migrateShortcutPair } = require("./shortcut-migration");
+// wmctrl -x joins X11's two WM_CLASS strings with a dot and gives no way to
+// tell where the join is — see desktop/linux-wm-class.js.
+const { parseLinuxWmClass } = require("./linux-wm-class");
 const { formatConsoleMirrorLine } = require("./renderer-console");
 // SSOT for "did this paste attempt actually succeed, and is it verified
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
@@ -20,7 +23,7 @@ const { MAC_VERIFICATION, evaluatePasteOutcome } = require("./paste-result");
 // SSOT for the AppleScript the macOS paste runs, in both its verifying
 // and non-verifying shape, and for escaping anything interpolated into
 // an AppleScript — unit-tested by desktop/paste-script.test.js.
-const { robustPasteScript, escapeAppleScriptString } = require("./paste-script");
+const { robustPasteScript, menuPasteFallbackScript, escapeAppleScriptString } = require("./paste-script");
 
 // SSOT for the paste wire protocol — the markers the paste scripts
 // print and every parser reads.
@@ -2985,6 +2988,24 @@ function pasteLastAccelerator() {
   return lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "";
 }
 
+// The system paste chord — what the user presses to recover a transcript
+// from the clipboard by hand. Named here because it is the ONLY recovery
+// advice that is still true after the app's own paste-last hotkey has just
+// failed.
+function systemPasteAccelerator() {
+  return process.platform === "darwin" ? "Cmd+V" : "Ctrl+V";
+}
+
+/**
+ * Status text for a failed paste.
+ *
+ * `pasteAccel` is the key the status tells the user to press. It defaults to
+ * the app's paste-last hotkey, which is right on the post-stop path — the
+ * user has not tried it yet. It is NOT right on the paste-last path itself:
+ * there the hotkey is the thing that just failed, and a status reading
+ * "In Clipboard — press Alt+Shift+V" after Alt+Shift+V did nothing is advice
+ * that loops. That caller passes the system chord instead.
+ */
 function recordingStatusForPasteFailure(reason, pasteAccel = pasteLastAccelerator()) {
   const r = String(reason || "").toLowerCase();
   // The capability preflight refused to even try (./paste-capability):
@@ -3018,7 +3039,6 @@ function recordingStatusBadgeForPasteFailure(r) {
   // the separate callback path, so the user can grant access AND
   // knows the text survived.
   if (r.includes("no-accessibility")) return "In Clipboard · Accessibility";
-  if (r.includes("secure-field")) return "In Clipboard · Secure Field";
   if (r.includes("no-target") || r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "In Clipboard · No Focus";
   if (r.includes("clipboard")) return "Clipboard Error";
   if (classifyPastePermissionFailure(r) === PASTE_PERMISSION_ROUTE.AUTOMATION) return "In Clipboard · Automation";
@@ -3078,16 +3098,6 @@ function linuxWindowIdToDecimal(value) {
   const parsed = Number.parseInt(normalized.slice(2), 16);
   if (!Number.isFinite(parsed) || parsed <= 0) return "";
   return String(parsed);
-}
-
-function parseLinuxWmClass(value) {
-  const raw = String(value || "").trim();
-  const [instanceName = "", className = ""] = raw.split(".", 2);
-  return {
-    wmClass: raw,
-    instanceName: instanceName.trim(),
-    className: className.trim(),
-  };
 }
 
 function normalizeLinuxMatchValue(value) {
@@ -4547,9 +4557,6 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       await sleep(pasteBudget.preflightSettleMs);
     } catch { }
   }
-  // For the secondary menu-paste fallback below; the primary script
-  // escapes its own interpolations inside ./paste-script.
-  const escapedApp = escapeAppleScriptString(effectiveTarget.appName);
   const rawPid = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
   // Defense-in-depth: reject any value that is not a safe non-negative integer
   // before interpolating it into the AppleScript source string.
@@ -4985,11 +4992,13 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
     }
     if (check.ok) {
-      if (out === "ERR:secure-field") {
-        traceEnd(trace, "failed", { reason: "secure-field" });
-        keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:secure_field");
-        return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
-      }
+      // There is no `ERR:secure-field` branch here. Nothing emits that
+      // marker — neither paste script produces it, and detecting a secure
+      // text field needs an AXSubrole read of the focused element, which is
+      // the expensive call this ladder is built to avoid. The branch, the
+      // "In Clipboard · Secure Field" status behind it and the classifier
+      // entry were three pieces of code describing a capability the product
+      // does not have. Recorded in the debt ledger.
       if (out === "ERR:no-accessibility") {
         lastReason = "ERR:no-accessibility";
         traceEnd(trace, "failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
@@ -5025,34 +5034,14 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       verified: false,
     };
   }
-  const menuPasteScript = `
-    set targetApp to "${escapedApp}"
-    set targetPid to ${Math.trunc(pid)}
-    tell application "System Events"
-      if UI elements enabled is false then return "ERR:no-accessibility"
-      set p to missing value
-      if targetPid > 0 then
-        if exists (first process whose unix id is targetPid) then
-          set p to first process whose unix id is targetPid
-        end if
-      end if
-      if p is missing value and targetApp is not "" then
-        if exists process targetApp then
-          set p to process targetApp
-        end if
-      end if
-      if p is missing value then return "ERR:no-process"
-      set frontmost of p to true
-      delay 0.32
-      try
-        click menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p
-        delay 0.16
-        return "OK:menu-paste"
-      on error errMsg
-        return "ERR:menu-paste:" & errMsg
-      end try
-    end tell
-  `;
+  // The secondary fallback's AppleScript lives in ./paste-script with the
+  // primary one, so both speak the same ERR: vocabulary, both escape their
+  // interpolations with the same helpers, and applescript.test.js compiles
+  // both.
+  const menuPasteScript = menuPasteFallbackScript({
+    appName: effectiveTarget.appName,
+    pid,
+  });
   const menuRes = await runCommand("osascript", ["-e", menuPasteScript], {
     timeoutMs: pasteBudget.tailFallbackTimeoutMs,
   });
@@ -5968,7 +5957,9 @@ async function pasteLatestTranscriptFromShortcut() {
       `[paste-last] ${pasteTargetSummary(shortcutPasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
     await setRecordingStatus(
-      pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason),
+      // The paste-last hotkey is what the user just pressed, so the advice
+      // is the system chord, not the key that failed.
+      pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason, systemPasteAccelerator()),
       pasted.ok ? RECORDING_STATUS_KIND.OK : RECORDING_STATUS_KIND.WARN,
     );
     if (!pasted.ok) {

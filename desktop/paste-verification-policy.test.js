@@ -175,3 +175,32 @@ test("unrelated output and stray ends are ignored", () => {
   assert.equal(summarizeAxReadTrace().reads.length, 0);
   assert.equal(summarizeAxReadTrace(null).totalMs, 0);
 });
+
+test("the AX trace keeps chronological order, unfinished reads included", () => {
+  // Reads used to be appended as they CLOSED, with the unfinished ones
+  // tacked on at the end — so a trace read top-to-bottom said the wrong
+  // read was the one still running when osascript was killed, which is the
+  // single question the array exists to answer.
+  const summary = summarizeAxReadTrace([
+    { line: "AXT:before:begin", ms: 10 },
+    { line: "AXT:before:end", ms: 30 },
+    { line: "AXT:focus:begin", ms: 40 },   // never ends — killed mid-read
+    { line: "AXT:after:begin", ms: 45 },
+    { line: "AXT:after:end", ms: 60 },
+  ]);
+  assert.deepEqual(summary.reads.map((r) => r.label), ["before", "focus", "after"]);
+  assert.deepEqual(summary.reads.map((r) => r.ms), [20, -1, 15]);
+  assert.equal(summary.unfinished, true);
+  assert.equal(summary.totalMs, 35);
+  // No bookkeeping field leaks into the trace payload.
+  for (const read of summary.reads) assert.deepEqual(Object.keys(read).sort(), ["label", "ms"]);
+});
+
+test("two markers in one pipe chunk report 0, not a negative or a guess", () => {
+  const summary = summarizeAxReadTrace([
+    { line: "AXT:before:begin", ms: 12 },
+    { line: "AXT:before:end", ms: 12 },
+  ]);
+  assert.deepEqual(summary.reads, [{ label: "before", ms: 0 }]);
+  assert.equal(summary.unfinished, false);
+});

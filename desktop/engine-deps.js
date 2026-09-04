@@ -438,7 +438,7 @@ function distInfoInventory(readdirSync) {
  * constrained name, the union of specifiers any staged package declares.
  * A staged copy of X is shadowing-safe only if the BUNDLE copy of X
  * satisfies EVERY declaration (that is exactly pip's resolver contract,
-// restricted to the overlap surface this install can actually affect).
+ * restricted to the overlap surface this install can actually affect).
  */
 function collectRequirementIndex(stagingDir, fsLike, env = defaultMarkerEnvironment()) {
   const index = new Map(); // name -> Array<spec>

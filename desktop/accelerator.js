@@ -35,7 +35,18 @@ const TOKEN_MAPS = Object.freeze({
 function canonicalAcceleratorForPlatform(acc, platform = process.platform) {
   if (!acc || typeof acc !== "string") return acc;
   const map = TOKEN_MAPS[platform] || TOKEN_MAPS.default;
-  const tokens = acc.split("+").map((t) => t.trim()).filter(Boolean);
+  const rawTokens = acc.split("+");
+  // An EMPTY segment means the string is not an Electron accelerator:
+  // the plus key is spelled "Plus" ("Control+Plus"), so "Control++" is
+  // malformed. Dropping the empties with `.filter(Boolean)` turned that
+  // into the single token "Control" — a bare modifier, which
+  // safeRegisterShortcut then tried to bind as if the user had asked for
+  // it. This module is declared the one boundary every accelerator passes
+  // through, so it must hand malformed input BACK unchanged and let the
+  // registration fail with the string the user actually stored, rather
+  // than repair it into something else.
+  if (rawTokens.some((t) => t.trim() === "")) return acc;
+  const tokens = rawTokens.map((t) => t.trim());
   const out = new Array(tokens.length);
   for (let i = 0; i < tokens.length; i++) {
     const raw = tokens[i];

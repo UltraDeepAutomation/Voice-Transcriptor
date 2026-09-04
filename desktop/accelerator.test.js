@@ -83,3 +83,24 @@ test("normalisation is idempotent", () => {
     }
   }
 });
+
+test("a malformed accelerator is handed back, not repaired into a bare modifier", () => {
+  // "Control++" is what a naive capture writes for the Plus key (Electron
+  // spells it "Control+Plus"). The old `.filter(Boolean)` reduced it to the
+  // single token "Control", and safeRegisterShortcut then attempted to bind
+  // a bare modifier — a global shortcut the user never asked for, on a key
+  // every other chord in the system also uses.
+  for (const platform of ["darwin", "win32", "linux"]) {
+    assert.equal(canonicalAcceleratorForPlatform("Control++", platform), "Control++");
+    assert.equal(canonicalAcceleratorForPlatform("Cmd++", platform), "Cmd++");
+    assert.equal(canonicalAcceleratorForPlatform("+", platform), "+");
+    assert.equal(canonicalAcceleratorForPlatform("Control+ +V", platform), "Control+ +V");
+  }
+  // The well-formed spelling of the same key still canonicalises.
+  assert.equal(canonicalAcceleratorForPlatform("Cmd+Plus", "darwin"), "Command+Plus");
+  assert.equal(canonicalAcceleratorForPlatform("Cmd+Plus", "win32"), "Super+Plus");
+});
+
+test("surrounding whitespace inside a well-formed chord is still normalised", () => {
+  assert.equal(canonicalAcceleratorForPlatform(" Cmd + Shift + V ", "darwin"), "Command+Shift+V");
+});

@@ -820,3 +820,114 @@ cross-process `executeJavaScript` feeding a global nothing has ever read.
   granted" from "grant is dead"; what is missing is a renderer surface for
   it. Recorded in "долг".
 
+---
+## Commit 15 — the paste path's last duplicated truths
+
+**IDs:** D-034 (P2), D-035 (P2), D-036 (P2), D-041 (P2), D-049 (P2, resolved
+as "not the stated defect" — see Decisions), D-055 (P2), D-074 (P2),
+D-084 (P2). D-045 verified as **already fixed** in `19b0235`.
+
+**Files:** `desktop/main.js`, `desktop/paste-script.js`,
+`desktop/paste-script.test.js`, `desktop/paste-result.test.js`,
+`desktop/paste-capability.js`, `desktop/paste-capability.test.js`,
+`desktop/paste-verification-policy.js`,
+`desktop/paste-verification-policy.test.js`, `desktop/accelerator.js`,
+`desktop/accelerator.test.js`, `desktop/linux-wm-class.js` (new),
+`desktop/linux-wm-class.test.js` (new), `desktop/engine-deps.js`,
+`desktop/package.json`.
+
+**Re-verified on current code before fixing:** yes, each one.
+
+**Verification**
+- **D-055**, the strongest of the group. Both versions of the module loaded
+  side by side and given the same input:
+  ```
+  "Control++"    OLD -> "Control"    NEW -> "Control++"
+  "Cmd++"        OLD -> "Super"      NEW -> "Cmd++"
+  "+"            OLD -> ""           NEW -> "+"
+  "Control+ +V"  OLD -> "Control+V"  NEW -> "Control+ +V"
+  ```
+  The last line is the serious one: a stored accelerator with a stray space
+  was silently canonicalised into `Control+V` and REGISTERED as a global
+  shortcut — the app would have taken over paste for the whole desktop. The
+  module now hands malformed input back unchanged so registration fails
+  with the string the user actually stored.
+- **D-041**, the discarded tail, stated as the property that failed:
+  ```
+  "org.gnome.Nautilus.Org.gnome.Nautilus".split(".", 2)  ->  ["org", "gnome"]
+  ```
+  JavaScript's split limit DROPS the tail (unlike Python's `maxsplit`), so
+  every modern GNOME/Flatpak window produced instance `org`, class `gnome`,
+  and `pickLinuxTargetName` recorded `"gnome"` as the window to bring back
+  to the front before pasting. Seven new cases cover the classic form, both
+  reverse-DNS forms, the no-dot form and a round-trip property (the halves
+  always rejoin to the raw value).
+- **D-035**: `OLD main.js hand-written menuPasteScript template: true`. The
+  builder moved into `paste-script.js`, so `osacompile` now compiles it
+  (`paste-script.test.js`, on macOS) — nothing ever had, because
+  `applescript.test.js` scans template LITERALS and that one was
+  interpolated in main.js.
+- **D-034**: `OLD: any script emitting ERR:secure-field: false` — confirmed
+  across both script sources. Three pieces of code described a capability
+  the product does not have: the branch, the
+  "In Clipboard · Secure Field" status and the classifier entry. All three
+  gone; the tests that used the marker as an example now quote markers the
+  scripts actually print.
+- **D-036**:
+  ```
+  OLD call sites: ["pasted.reason", "pasted.reason"]
+  NEW call sites: ["pasted.reason", "pasted.reason, systemPasteAccelerator()"]
+  ```
+  The second site is the paste-last hotkey path, where the old status read
+  "In Clipboard — press Alt+Shift+V" after Alt+Shift+V had just failed.
+- **D-074**: the source carried a raw 0x00 byte at offset 9221
+  (`escapeAppleScriptString("a<NUL>b")`), so git treated the file as binary
+  and `git log -p` was useless on it. `file desktop/paste-script.test.js`
+  now reports `Unicode text, UTF-8 text`.
+- **D-084**: the stray `//` inside a `/** */` block in `engine-deps.js` is a
+  `*` line; AX trace reads keep the order they BEGAN in, with unfinished
+  ones in their own slot rather than appended at the end. Two new cases.
+- `npm --prefix desktop test` -> `tests 243 / pass 243 / fail 0` (was 231).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *D-055, chosen:* return malformed input UNCHANGED rather than repair it.
+  A repair here would be this module guessing what the user meant; refusing
+  makes `safeRegisterShortcut` report the failure with the string that is
+  actually stored, which is the only string the user can go and fix.
+- *D-034, chosen:* delete rather than implement. Detecting a secure text
+  field needs an `AXSubrole` read of the focused element — the expensive
+  call this ladder is built to avoid, on the one path where the user is
+  waiting. Same precedent as D-030 (a channel with a sender and no
+  receiver). Recorded in "долг" as a product item.
+- *D-036, chosen:* a `systemPasteAccelerator()` (`Cmd+V` / `Ctrl+V`) for the
+  paste-last path, not "drop the hint". The transcript IS on the clipboard;
+  the advice was circular, not useless.
+- *D-041, chosen:* an explicit rule — halves equal apart from case split in
+  the middle, otherwise split at the LAST dot — rather than "keep the tail
+  on the second element". Keeping the tail would have turned instance `org`
+  into instance `org` and class `gnome.Nautilus.Org.gnome.Nautilus`: still
+  wrong, just differently. The raw string is kept as `wmClass` and
+  `scoreLinuxWindowMatch` weights it, so a shape this rule reads differently
+  than the window manager intended still has an exact-match path.
+- *D-035, chosen:* move the script into `paste-script.js` rather than delete
+  the second attempt. It is a genuinely different last rung — it forces
+  `frontmost` and does no verification — and it is the only thing between a
+  failed primary and a bare clipboard.
+
+**Not done / resolved otherwise**
+- **D-049 — not the stated defect.** `const at = Date.now() - spawnedAt`
+  being computed per chunk rather than per line changes nothing: every line
+  in one chunk genuinely arrived at the same instant, and moving the call
+  into the loop would only measure this process's own parsing. The real
+  limit is that the resolution is bounded by pipe-chunk arrival, so a read
+  faster than one chunk reports 0. That is a floor on what can be measured
+  from outside the process, and 0 is the honest answer for "shorter than one
+  chunk" — now written at the site that computes it, so the number is not
+  over-trusted. The chronology half of the complaint (D-084) IS a defect and
+  is fixed.
+- **D-045 — устранено ранее в `19b0235`.** `reconcileEngineSiteWithBundle`
+  was rewritten to delete by the distribution's own RECORD; the
+  `` `${siteDir}/…` `` concatenation went with it. `grep` finds one
+  remaining `siteDir}` and it is inside a log message, not a path.
+

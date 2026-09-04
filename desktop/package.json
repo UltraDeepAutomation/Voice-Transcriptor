@@ -58,6 +58,7 @@
       "paste-protocol.js",
       "recording-status.js",
       "shortcut-migration.js",
+      "linux-wm-class.js",
       "python-version.js",
       "preload.js",
       "shortcut-defaults.json",

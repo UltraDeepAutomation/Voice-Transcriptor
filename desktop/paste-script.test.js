@@ -33,6 +33,7 @@ const {
   PASTE_SENT_PREFIX,
   escapeAppleScriptString,
   robustPasteScript,
+  menuPasteFallbackScript,
 } = require("./paste-script");
 
 const TARGET = Object.freeze({
@@ -197,10 +198,10 @@ test("target text cannot break out of its AppleScript string literal", () => {
   });
   assert.match(script, /set targetApp to "Ev\\"ilApp"\n/);
   assert.match(script, /set targetWindowTitle to "a\\\\b\\"c"\n/);
-  assert.equal(escapeAppleScriptString("a b"), "ab");
+  assert.equal(escapeAppleScriptString("a\u0000b"), "ab");
 });
 
-test("both shapes compile", { skip: process.platform !== "darwin" }, () => {
+test("every shape the product runs compiles", { skip: process.platform !== "darwin" }, () => {
   const probe = spawnSync("osacompile", ["-h"], { encoding: "utf8" });
   if (probe.error) return; // osacompile ships with macOS; nothing to do without it.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "transcriptor-paste-script-"));
@@ -217,7 +218,43 @@ test("both shapes compile", { skip: process.platform !== "darwin" }, () => {
         `robustPasteScript({verify:${verify}}) does not compile:\n${(res.stderr || "").trim()}`,
       );
     }
+    // The secondary fallback too. It used to be a hand-written template in
+    // main.js, so nothing compiled it: applescript.test.js scans template
+    // LITERALS, and that one was interpolated at three places with values
+    // main.js escaped itself.
+    const fallbackOut = path.join(dir, "menu-paste-fallback.scpt");
+    const fallback = spawnSync("osacompile", ["-o", fallbackOut], {
+      input: menuPasteFallbackScript({ appName: TARGET.appName, pid: TARGET.pid }),
+      encoding: "utf8",
+    });
+    assert.equal(
+      fallback.status,
+      0,
+      `menuPasteFallbackScript() does not compile:\n${(fallback.stderr || "").trim()}`,
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the fallback escapes its interpolations with this module's helpers", () => {
+  // In main.js it interpolated `escapedApp` (escaped there) and
+  // `Math.trunc(pid)` — a second escaping ladder for the same protocol.
+  const script = menuPasteFallbackScript({ appName: 'Ev"il\\App', pid: "417notanumber" });
+  assert.match(script, /set targetApp to "Ev\\"il\\\\App"/);
+  assert.match(script, /set targetPid to 417\n/);
+  // A pid that is not a number at all becomes 0 (safeInt), not NaN.
+  assert.match(menuPasteFallbackScript({ appName: "A", pid: "abc" }), /set targetPid to 0\n/);
+  // It performs no accessibility read: the whole point of the last rung is
+  // that it costs nothing beyond the click.
+  assert.ok(!script.includes(AX_TRACE_PREFIX), "the fallback must not carry AX trace reads");
+});
+
+test("the fallback and the primary script speak the same ERR vocabulary", () => {
+  const fallback = menuPasteFallbackScript({ appName: "A", pid: 1 });
+  const primary = robustPasteScript({ ...TARGET, verify: true });
+  for (const marker of ["ERR:no-accessibility", "ERR:no-process"]) {
+    assert.ok(fallback.includes(marker), `fallback is missing ${marker}`);
+    assert.ok(primary.includes(marker), `primary is missing ${marker}`);
   }
 });

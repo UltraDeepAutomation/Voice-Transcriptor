@@ -85,6 +85,13 @@ const AX_READ_TIMEOUT_SEC = 0.25;
  * 4 x (50 ms + one bounded AXValue read), which is what
  * PASTE_BUDGET.verificationAllowanceMs is sized for.
  */
+// Menu-paste fallback settle delays. Unlike the primary script's polls,
+// these are fixed: this path forces another application to the front and
+// then drives ITS menu bar, and neither step publishes anything to observe.
+// The values are the ones the fallback has always used.
+const MENU_FALLBACK_FRONTMOST_SETTLE_SEC = 0.32;
+const MENU_FALLBACK_CLICK_SETTLE_SEC = 0.16;
+
 const AX_VERIFY_POLLS = 4;
 const AX_VERIFY_POLL_INTERVAL_SEC = 0.05;
 
@@ -437,6 +444,64 @@ function axVerificationHandlers() {
   `;
 }
 
+/**
+ * Build the SECONDARY menu-paste fallback, run only after the primary script
+ * has failed and the ladder is exhausted.
+ *
+ * It lived in main.js as a hand-written template that re-implemented this
+ * module's process resolution and re-typed its `ERR:` vocabulary, and it
+ * interpolated its two values with main.js's own escaping rather than
+ * `escapeAppleScriptString` / `safeInt`. Two AppleScripts speaking the same
+ * protocol, only one of which any test compiled.
+ *
+ * Deliberately different from `robustPasteScript` in exactly two ways, both
+ * because it is the last attempt rather than the first:
+ *   - it forces `frontmost` instead of trying the focused element first;
+ *   - it does no AX verification, so it returns the plain `OK:` form that
+ *     paste-result.js reads as an unverified success.
+ *
+ * @param {object} target
+ * @param {string} target.appName  raw app name (escaped here)
+ * @param {number} target.pid      unix pid of the target process
+ * @returns {string} AppleScript source for `osascript -e`
+ *
+ * Returns, on stdout:
+ *   OK:menu-paste
+ *   ERR:no-accessibility | ERR:no-process | ERR:menu-paste:<message>
+ */
+function menuPasteFallbackScript({ appName = "", pid = 0 } = {}) {
+  const escapedApp = escapeAppleScriptString(appName);
+  const safePid = safeInt(pid);
+  return `
+    set targetApp to "${escapedApp}"
+    set targetPid to ${safePid}
+    tell application "System Events"
+      if UI elements enabled is false then return "ERR:no-accessibility"
+      set p to missing value
+      if targetPid > 0 then
+        if exists (first process whose unix id is targetPid) then
+          set p to first process whose unix id is targetPid
+        end if
+      end if
+      if p is missing value and targetApp is not "" then
+        if exists process targetApp then
+          set p to process targetApp
+        end if
+      end if
+      if p is missing value then return "ERR:no-process"
+      set frontmost of p to true
+      delay ${MENU_FALLBACK_FRONTMOST_SETTLE_SEC}
+      try
+        click menu item "Paste" of menu 1 of menu bar item "Edit" of menu bar 1 of p
+        delay ${MENU_FALLBACK_CLICK_SETTLE_SEC}
+        return "OK:menu-paste"
+      on error errMsg
+        return "ERR:menu-paste:" & errMsg
+      end try
+    end tell
+  `;
+}
+
 module.exports = {
   AX_READ_TIMEOUT_SEC,
   AX_VERIFY_POLLS,
@@ -445,4 +510,5 @@ module.exports = {
   PASTE_SENT_PREFIX,
   escapeAppleScriptString,
   robustPasteScript,
+  menuPasteFallbackScript,
 };

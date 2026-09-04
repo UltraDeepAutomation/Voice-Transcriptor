@@ -187,7 +187,6 @@ function classifyPasteFailure(reason) {
     r.includes("no-process") ||
     r.includes("no-focus") ||
     r.includes("not-editable") ||
-    r.includes("secure-field") ||
     r.includes("empty-text")
   ) {
     return "target";
