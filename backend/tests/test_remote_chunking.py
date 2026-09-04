@@ -185,14 +185,21 @@ class RemoteChunkingTests(unittest.TestCase):
         self.assertIn("No space left", recovery["write_error"])
         warn.assert_called_once()
 
-    def test_unique_recording_stem_skips_existing_stem(self):
+    def test_claiming_a_name_skips_an_existing_stem(self):
+        # Through ``_claim_recording_text_path``, which is what every
+        # caller uses. The check-then-use helper this test used to call
+        # was dead in production and kept alive only by this test.
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
-        first = self.main._unique_recording_stem(target, "same title")
-        (target / f"{first}.txt").write_text("existing", encoding="utf-8")
+        first, first_out = self.main._claim_recording_text_path(
+            target, self.main._recording_stem_candidates("same title")
+        )
+        first_out.write_text("existing", encoding="utf-8")
 
         with mock.patch.object(self.main, "_recording_stem", return_value=first):
-            second = self.main._unique_recording_stem(target, "same title")
+            second, _second_out = self.main._claim_recording_text_path(
+                target, self.main._recording_stem_candidates("same title")
+            )
 
         self.assertNotEqual(second, first)
         self.assertTrue(second.startswith(first + "-"))

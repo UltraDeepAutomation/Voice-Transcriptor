@@ -62,6 +62,7 @@ from backend.model_catalog import (
     DEFAULT_LOCAL_TRANSCRIPTION_MODEL,
     DEFAULT_OPENROUTER_AUDIO_MODEL,
     DEFAULT_OPENROUTER_UPSCALE_MODEL,
+    DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
     LOCAL_TRANSCRIPTION_MODELS,
     OPENROUTER_UPSCALE_FALLBACK_MODELS,
     REMOTE_TRANSCRIPTION_PROVIDERS,
@@ -678,7 +679,6 @@ COMMON_STOPWORDS = {
     "i", "you", "we", "they", "he", "she", "be", "are", "was", "were", "do", "does", "did",
 }
 
-UPSCALE_PRESETS = {"clean", "business", "ai_code", "refine"}
 UPSCALE_PRESETS_DIR = DATA_DIR / "upscale_presets"
 UPSCALE_MAX_CUSTOM_PRESETS = 3
 
@@ -705,6 +705,11 @@ DEFAULT_UPSCALE_PRESET_KEY = "clean"
 DEFAULT_UPSCALE_PRESET_ID = f"builtin_{DEFAULT_UPSCALE_PRESET_KEY}"
 MAX_UPSCALE_INPUT_CHARS = 120_000
 
+# The built-in presets. Their ids used to be written out a second time
+# as a bare set (``UPSCALE_PRESETS``) for the legacy ``preset`` field's
+# validation, with nothing connecting the two — so adding a fifth
+# built-in would have answered "unsupported upscale preset" to a legacy
+# client asking for a preset that exists.
 BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
     "clean": {
         "name": "Clean",
@@ -1365,9 +1370,16 @@ def _promote_live_recovery(
                 archive_dir or pinned_archive_dir,
                 collection=collection,
             )
-            stem = _unique_recording_stem(target_dir, title)
+            # The SAME reservation the save endpoints use. This used to
+            # be ``_unique_recording_stem`` — check the name, then use
+            # it — while the reservation primitive (``O_EXCL``) already
+            # existed and was applied on the neighbouring path. Two
+            # answers to "is this name free", one of them able to lose a
+            # race with the other and overwrite the .txt/.wav it picked.
+            stem, text_out = _claim_recording_text_path(
+                target_dir, _recording_stem_candidates(title)
+            )
             audio_out = target_dir / f"{stem}.wav"
-            text_out = target_dir / f"{stem}.txt"
             tmp_audio = _atomic_temp_path(audio_out)
             try:
                 write_wav_from_pcm16_stream(str(pcm_path), str(tmp_audio), LIVE_SAMPLE_RATE_HZ)
@@ -1393,6 +1405,12 @@ def _promote_live_recovery(
                 # already placed at its final path, delete the orphaned
                 # audio so it doesn't leak on disk with no .txt sibling.
                 _best_effort_unlink(audio_out, context="live recovery promotion rollback")
+                # And give the NAME back — the claim marker outlives the
+                # files, and ``_write_recording_text_file`` only releases
+                # it on the paths that reach it (B-016).
+                _release_recording_text_claim(
+                    text_out, "live recovery promotion claim rollback"
+                )
                 raise
             finally:
                 _best_effort_unlink(tmp_audio, context="live recovery tmp cleanup")
@@ -2649,13 +2667,12 @@ def _recording_stem_available(target_dir: Path, stem: str) -> bool:
     return True
 
 
-def _unique_stem_from_base(target_dir: Path, base: str, *, collision_suffix: str = "timestamp") -> str:
-    for candidate in _recording_stem_candidates_from_base(base, collision_suffix=collision_suffix):
-        if _recording_stem_available(target_dir, candidate):
-            return candidate
-    raise HTTPException(status_code=500, detail="could not allocate unique recording name")
-
-
+# The names a recording may be given, in order of preference. Three
+# "pick a free name" functions used to sit beside these generators —
+# check the directory, then use the winner — and every production caller
+# now goes through ``_claim_recording_text_path``, which RESERVES the
+# name with O_EXCL instead. They were kept alive only by the tests that
+# covered them, while the path the app actually takes was not.
 def _recording_stem_candidates_from_base(base: str, *, collision_suffix: str = "timestamp") -> Iterable[str]:
     safe_base = _sanitize_name(base)
     yield safe_base
@@ -2664,13 +2681,6 @@ def _recording_stem_candidates_from_base(base: str, *, collision_suffix: str = "
         yield f"{safe_base}__{ts}"
     for _ in range(128):
         yield f"{safe_base}-{uuid.uuid4().hex[:8]}"
-
-
-def _unique_recording_stem(target_dir: Path, title: str) -> str:
-    for candidate in _recording_stem_candidates(title):
-        if _recording_stem_available(target_dir, candidate):
-            return candidate
-    raise HTTPException(status_code=500, detail="could not allocate unique recording name")
 
 
 def _recording_stem_candidates(title: str) -> Iterable[str]:
@@ -2685,6 +2695,28 @@ def _recording_text_claim_path(out: Path) -> Path:
     # a visible empty .txt. The suffix matches _TMP_ORPHAN_RE, so a process
     # crash before _write_recording_text_file is swept on next startup.
     return out.with_name(f"{out.name}.tmp-000000.claim")
+
+
+NO_SPEECH_PLACEHOLDER = "[No speech captured]"
+
+
+def _placeholder_source_text(
+    source_text: str, transcript_text: str, provider: str
+) -> str:
+    """The ONE rule for what an empty recognition writes to the file.
+
+    Both save endpoints wrote this rule out, and they had already
+    drifted: only one of them exempted ``provider="none"`` — the
+    renderer's marker for "the user saved a recording without asking for
+    any transcription at all" — so the same empty result produced a
+    different file depending on which endpoint the renderer happened to
+    call.
+    """
+    if source_text or transcript_text:
+        return source_text
+    if str(provider or "").strip().lower() == "none":
+        return source_text
+    return NO_SPEECH_PLACEHOLDER
 
 
 def _release_recording_text_claim(out: Path, context: str) -> None:
@@ -2731,13 +2763,6 @@ def _source_recording_display_name(filename: str) -> str:
     if not normalized or _is_generic_capture_filename(normalized):
         return ""
     return normalized
-
-
-def _unique_recording_stem_for_source_file(target_dir: Path, filename: str, fallback_title: str) -> str:
-    source_name = _source_recording_display_name(filename)
-    if source_name:
-        return _unique_stem_from_base(target_dir, Path(source_name).stem, collision_suffix="timestamp")
-    return _unique_recording_stem(target_dir, fallback_title)
 
 
 def _recording_stem_candidates_for_source_file(filename: str, fallback_title: str) -> Iterable[str]:
@@ -5951,15 +5976,17 @@ def _run_remote_transcribe_once(
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> dict[str, Any]:
     def _remote_result_duration_sec(result: dict[str, Any]) -> float:
-        raw = result.get("raw")
-        if isinstance(raw, dict):
-            metadata = raw.get("metadata")
-            if isinstance(metadata, dict):
-                try:
-                    return max(0.0, float(metadata.get("duration") or 0.0))
-                except (TypeError, ValueError):
-                    return 0.0
-        return 0.0
+        """Seconds of audio the provider says it decoded.
+
+        Read off the ADAPTER's ``duration`` key. This used to dig into
+        ``raw["metadata"]["duration"]`` — Deepgram's payload shape —
+        and was applied to the OpenRouter result too, where no such key
+        exists, so every OpenRouter transcription reported zero.
+        """
+        try:
+            return max(0.0, float(result.get("duration") or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def _raise_if_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -5985,7 +6012,7 @@ def _run_remote_transcribe_once(
     prov = (
         provider_norm
         or ((cfg.get("preferences") or {}).get("remote_provider"))
-        or "openrouter"
+        or DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER
     ).strip()
     explicit_model = _first_nonempty_text(remote_model, openrouter_model)
 
@@ -6504,7 +6531,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
     preset_id = str(payload.get("preset_id") or "").strip()
     if not preset_id:
         legacy = str(payload.get("preset") or DEFAULT_UPSCALE_PRESET_KEY).strip().lower()
-        if legacy not in UPSCALE_PRESETS:
+        if legacy not in BUILTIN_UPSCALE_PRESETS:
             raise HTTPException(status_code=400, detail="unsupported upscale preset")
         preset_id = f"builtin_{legacy}"
     preset = _resolve_upscale_preset(preset_id)
@@ -7468,8 +7495,7 @@ def save_recording(
     provider = str(payload.get("provider") or "").strip()
     model = str(payload.get("model") or "").strip()
     language = str(payload.get("language") or "").strip()
-    if not source_text and not transcript_text:
-        source_text = "[No speech captured]"
+    source_text = _placeholder_source_text(source_text, transcript_text, provider)
 
     target_dir = _resolve_recordings_collection_target_dir(
         archive_dir,
@@ -7532,8 +7558,9 @@ async def _save_recording_audio_source(
     safe_provider = str(provider or "").strip()
     safe_model = str(model or "").strip()
     safe_language = str(language or "").strip()
-    if not safe_source_text and not safe_transcript_text and safe_provider.lower() != "none":
-        safe_source_text = "[No speech captured]"
+    safe_source_text = _placeholder_source_text(
+        safe_source_text, safe_transcript_text, safe_provider
+    )
 
     safe_orig_name = _normalize_filename(orig_name or "recording.wav")
     _validate_audio_filename(safe_orig_name)

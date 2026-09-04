@@ -77,5 +77,85 @@ class OpenRouterJsonTests(unittest.TestCase):
         self.assertIn("invalid JSON response", str(raised.exception))
 
 
+class AdapterDurationContractTests(unittest.TestCase):
+    """``duration`` belongs to the adapter, not to the caller (B-084).
+
+    ``main._remote_result_duration_sec`` dug into
+    ``raw["metadata"]["duration"]`` — Deepgram's payload shape — and was
+    applied to the OpenRouter result too, where no such key exists, so
+    every OpenRouter transcription reported zero seconds of audio.
+    """
+
+    def test_openrouter_reports_a_duration_of_its_own(self):
+        class FakeResponse:
+            status_code = 200
+            text = '{"choices":[{"message":{"content":"hello"}}]}'
+
+            def json(self):
+                return {"choices": [{"message": {"content": "hello"}}]}
+
+        with mock.patch(
+            "backend.remote_openrouter.request_with_retry",
+            return_value=FakeResponse(),
+        ):
+            out = openrouter_transcribe(
+                api_key="sk-or-test",
+                model="google/gemini-2.5-flash",
+                audio_bytes=b"opus",
+                filename="clip.opus",
+            )
+        # A chat completion carries no audio duration; 0.0 because this
+        # provider says so, not because the caller read the wrong shape.
+        self.assertIn("duration", out)
+        self.assertEqual(out["duration"], 0.0)
+
+    def test_deepgram_reports_the_duration_from_its_own_metadata(self):
+        from backend.remote_deepgram import deepgram_transcribe
+
+        payload = {
+            "metadata": {"duration": 12.5},
+            "results": {
+                "channels": [{"alternatives": [{"transcript": "привет"}]}]
+            },
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return payload
+
+        with mock.patch(
+            "backend.remote_deepgram.request_with_retry", return_value=FakeResponse()
+        ):
+            out = deepgram_transcribe(
+                api_key="dg", audio_bytes=b"wav", filename="a.wav"
+            )
+        self.assertEqual(out["duration"], 12.5)
+
+    def test_a_malformed_duration_is_zero_rather_than_a_crash(self):
+        from backend.remote_deepgram import deepgram_transcribe
+
+        payload = {
+            "metadata": {"duration": "twelve"},
+            "results": {"channels": [{"alternatives": [{"transcript": "x"}]}]},
+        }
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return payload
+
+        with mock.patch(
+            "backend.remote_deepgram.request_with_retry", return_value=FakeResponse()
+        ):
+            out = deepgram_transcribe(
+                api_key="dg", audio_bytes=b"wav", filename="a.wav"
+            )
+        self.assertEqual(out["duration"], 0.0)
+
 if __name__ == "__main__":
     unittest.main()

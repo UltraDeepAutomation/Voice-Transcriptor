@@ -192,7 +192,12 @@ def openrouter_transcribe(
         ) from shape_err
 
     logger.info("openrouter_transcribe: success, %d chars", len(text))
-    return {"text": text, "raw": js}
+    # ``duration`` is part of the adapter contract (see the Deepgram
+    # adapter). A chat-completion response carries no audio duration, so
+    # this one reports 0.0 — which is what the caller was already
+    # getting, but now because this provider says so rather than because
+    # the caller was reading another provider's payload shape.
+    return {"text": text, "duration": 0.0, "raw": js}
 
 
 def openrouter_upscale_text(

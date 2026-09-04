@@ -48,7 +48,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 from backend.audio_mime import AUDIO_EXT_TO_MIME
-from backend.model_catalog import DEFAULT_OPENROUTER_AUDIO_MODEL, REMOTE_TRANSCRIPTION_PROVIDERS
+from backend.model_catalog import (
+    DEFAULT_OPENROUTER_AUDIO_MODEL,
+    DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
+    REMOTE_TRANSCRIPTION_PROVIDERS,
+)
 from backend.storage import atomic_copy_file, atomic_write_bytes, atomic_write_json, rotate_backup
 
 logger = logging.getLogger(__name__)
@@ -566,7 +570,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # provisions its config slot.
     "providers": {name: {"key": ""} for name in REMOTE_TRANSCRIPTION_PROVIDERS},
     "preferences": {
-        "remote_provider": "openrouter",
+        "remote_provider": DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
         "recordings_dir": "",
         "openrouter": {
             "model": DEFAULT_OPENROUTER_AUDIO_MODEL,

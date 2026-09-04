@@ -294,8 +294,22 @@ def deepgram_transcribe(
         )
         raise RemoteError("Deepgram: malformed response payload") from e
 
+    # ``duration`` is part of the adapter contract, not of the caller's
+    # knowledge of this provider's payload: the caller used to reach
+    # into ``raw["metadata"]["duration"]`` — a Deepgram shape — for
+    # EVERY provider, so an OpenRouter transcription always reported
+    # zero seconds. Each adapter answers for its own response.
+    duration = 0.0
+    metadata = result.get("metadata") if isinstance(result, dict) else None
+    if isinstance(metadata, dict):
+        try:
+            duration = max(0.0, float(metadata.get("duration") or 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+
     logger.info("deepgram_transcribe: success, %d chars", len(text))
     return {
         "text": str(text).strip(),
+        "duration": duration,
         "raw": result,
     }

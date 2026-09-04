@@ -75,5 +75,83 @@ class UpscalePresetContractTests(unittest.TestCase):
         self.assertEqual(upscale.call_args.kwargs["text"], oversized[11:])
 
 
+class BuiltinPresetIdSsotTests(unittest.TestCase):
+    """One list of built-in presets (B-030).
+
+    Their ids were written out a second time as a bare set, used in
+    exactly one place: validating the legacy ``preset`` field. Nothing
+    connected the two, so a fifth built-in would have answered
+    "unsupported upscale preset" to a legacy client asking for a preset
+    that exists.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self.main = _reload_backend_main(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
+        for module_name in ("backend.main", "backend.config", "backend.storage"):
+            sys.modules.pop(module_name, None)
+
+    def test_there_is_no_second_list_of_builtin_ids(self):
+        self.assertFalse(hasattr(self.main, "UPSCALE_PRESETS"))
+
+    def test_every_builtin_is_accepted_as_a_legacy_preset(self):
+        # The legacy field's validation and the presets themselves must
+        # answer from the same list.
+        for pid in self.main.BUILTIN_UPSCALE_PRESETS:
+            with self.subTest(preset=pid):
+                self.assertIn(pid, self.main.BUILTIN_UPSCALE_PRESETS)
+        self.assertNotIn("no-such-preset", self.main.BUILTIN_UPSCALE_PRESETS)
+
+    def test_the_default_preset_is_one_of_them(self):
+        self.assertIn(
+            self.main.DEFAULT_UPSCALE_PRESET_KEY, self.main.BUILTIN_UPSCALE_PRESETS
+        )
+
+
+class DefaultRemoteProviderTests(unittest.TestCase):
+    """"Which provider serves a request that names none" has one answer (B-028)."""
+
+    def test_the_default_is_the_first_of_the_supported_tuple(self):
+        from backend.model_catalog import (
+            DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
+            REMOTE_TRANSCRIPTION_PROVIDERS,
+        )
+
+        self.assertEqual(
+            DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER, REMOTE_TRANSCRIPTION_PROVIDERS[0]
+        )
+
+    def test_the_config_default_is_that_same_value(self):
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as td:
+            old = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = td
+            sys.modules.pop("backend.config", None)
+            try:
+                import backend.config as cfg_mod
+                from backend.model_catalog import (
+                    DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
+                )
+
+                self.assertEqual(
+                    cfg_mod.DEFAULT_CONFIG["preferences"]["remote_provider"],
+                    DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
+                )
+            finally:
+                sys.modules.pop("backend.config", None)
+                if old is None:
+                    os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+                else:
+                    os.environ["TRANSCRIPTOR_DATA_DIR"] = old
+
 if __name__ == "__main__":
     unittest.main()

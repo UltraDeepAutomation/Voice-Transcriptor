@@ -414,3 +414,33 @@ OK
 * **B-044.** `int(os.environ...)` → `_env_int` (политика пакета), импортирован из `backend.transcribe`; цикла нет — обратные импорты gigaam там ленивые.
 
 **Не сделано:** —
+
+---
+
+## Коммит 10 — одно правило в одном месте (сохранение записей, пресеты, провайдеры)
+
+**Заголовок:** «One list of built-in presets, one rule for an empty recognition, one way to claim a recording's name, and a duration each provider reports for itself»
+
+**ID:** B-028 (P2), B-030 (P2), B-031 (P2), B-032 (P2), B-073 (P2), B-084 (P2).
+
+**Файлы:** `backend/main.py`, `backend/model_catalog.py`, `backend/config.py`, `backend/remote_deepgram.py`, `backend/remote_openrouter.py`, `backend/tests/test_upscale_presets.py`, `backend/tests/test_recording_names.py`, `backend/tests/test_remote_chunking.py`, `backend/tests/test_remote_openrouter.py`.
+
+**Верификация.**
+```
+Ran 719 tests in 38.173s
+OK
+```
+(708 → 719.)
+
+**Решения.**
+
+* **B-030.** `UPSCALE_PRESETS` удалён; валидация легаси-поля читает ключи `BUILTIN_UPSCALE_PRESETS`. Тест запрещает второму списку вернуться (`assertFalse(hasattr(main, "UPSCALE_PRESETS"))`).
+* **B-028.** `DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER = REMOTE_TRANSCRIPTION_PROVIDERS[0]` в `model_catalog` — той же формы, что рядом стоящий `DEFAULT_LIVE_PREVIEW_LOCAL_MODEL`; `config.DEFAULT_CONFIG` и вызов в `main` читают его.
+* **B-031.** `_placeholder_source_text(...)` + `NO_SPEECH_PLACEHOLDER`. Расхождение было содержательным: только один эндпоинт освобождал `provider="none"` — маркер рендерера «сохранить запись, не прося транскрипт», — поэтому одно и то же пустое распознавание давало разные файлы. Правило одно, тест проверяет обе стороны и оба эндпоинта.
+* **B-032.** Промоут берёт имя через `_claim_recording_text_path` (O_EXCL), как оба эндпоинта сохранения, и освобождает claim на откате. *Отвергнуто:* оставить `_unique_recording_stem` и «просто добавить лок» — примитив резервирования уже написан, второй механизм не нужен.
+* **B-073.** Три функции семейства «проверить-и-использовать» (`_unique_recording_stem`, `_unique_stem_from_base`, `_unique_recording_stem_for_source_file`) после B-032 не имеют ни одного продакшн-вызывающего и удалены. Четыре теста, которые их держали, **перенаправлены на живой путь** — это и был смысл находки: покрытым был мёртвый код, а не тот, по которому ходит приложение.
+* **B-084.** `duration` — часть контракта адаптера: `deepgram_transcribe` читает свой `metadata.duration`, `openrouter_transcribe` честно отдаёт 0.0, вызывающий читает один ключ. Раньше вызывающий разбирал форму Deepgram у ответа OpenRouter, и каждая удалённая транскрипция через OpenRouter сообщала нулевую длительность.
+
+**Не сделано:**
+
+* **B-038** (три формы одного wire-типа `final`). Закрыть его — значит поменять форму конверта локального пути и парсер рендерера ОДНИМ коммитом: `frontend/src/main.tsx` читает плоские `complete/coveredSec/totalSec/droppedSec/uncoveredTailSec` и прямо документирует «coverage присутствует только у local-assist». Рендерер в этой сессии ведёт другой агент; менять его отсюда нельзя, а односторонняя правка либо ломает парсер, либо добавляет ЧЕТВЁРТУЮ форму. → долг с готовой рекомендацией.

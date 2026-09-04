@@ -1,6 +1,7 @@
 import importlib
 import asyncio
 import io
+import json
 import os
 import sys
 import tempfile
@@ -60,10 +61,15 @@ class RecordingNameTests(unittest.TestCase):
         source_name = self.main._normalize_filename(r"C:\input\2 Эфир - Часть 2.mp4")
         self.assertEqual(source_name, "2 Эфир - Часть 2.mp4")
 
-        stem = self.main._unique_recording_stem_for_source_file(
+        # Through the path the app actually takes: the candidates
+        # generator plus the O_EXCL reservation. The check-then-use
+        # helper these tests used to call was dead in production and
+        # kept alive only by them.
+        stem, _out = self.main._claim_recording_text_path(
             target,
-            source_name,
-            "fallback title",
+            self.main._recording_stem_candidates_for_source_file(
+                source_name, "fallback title"
+            ),
         )
         self.assertEqual(stem, "2 Эфир - Часть 2")
 
@@ -91,10 +97,11 @@ class RecordingNameTests(unittest.TestCase):
         target.mkdir()
         (target / "demo.txt").write_text("existing", encoding="utf-8")
 
-        stem = self.main._unique_recording_stem_for_source_file(
+        stem, _out = self.main._claim_recording_text_path(
             target,
-            "demo.mp4",
-            "fallback title",
+            self.main._recording_stem_candidates_for_source_file(
+                "demo.mp4", "fallback title"
+            ),
         )
 
         self.assertRegex(stem, r"^demo__\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}$")
@@ -103,10 +110,11 @@ class RecordingNameTests(unittest.TestCase):
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
 
-        stem = self.main._unique_recording_stem_for_source_file(
+        stem, _out = self.main._claim_recording_text_path(
             target,
-            "live-1780752285796.webm",
-            "spoken title",
+            self.main._recording_stem_candidates_for_source_file(
+                "live-1780752285796.webm", "spoken title"
+            ),
         )
 
         self.assertRegex(stem, r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}__spoken title$")
@@ -1215,6 +1223,105 @@ class RecordingNameTests(unittest.TestCase):
         saved = [p.name for p in target.glob("*.txt")]
         self.assertEqual(saved, ["lecture.txt"], saved)
 
+
+    def test_the_empty_recognition_placeholder_is_one_rule(self):
+        # B-031: both save endpoints wrote this rule out, and they had
+        # already drifted — only one exempted provider="none", the
+        # renderer's marker for "saved without asking for any
+        # transcription". The same empty result produced a different
+        # file depending on which endpoint was called.
+        placeholder = self.main._placeholder_source_text
+        self.assertEqual(
+            placeholder("", "", "deepgram"), self.main.NO_SPEECH_PLACEHOLDER
+        )
+        self.assertEqual(placeholder("", "", ""), self.main.NO_SPEECH_PLACEHOLDER)
+        # provider="none" means the user never asked for a transcript,
+        # so an empty one is not a failed recognition.
+        self.assertEqual(placeholder("", "", "none"), "")
+        self.assertEqual(placeholder("", "", " NONE "), "")
+        # Anything actually recognised is left exactly as it came.
+        self.assertEqual(placeholder("сказанное", "", "deepgram"), "сказанное")
+        self.assertEqual(placeholder("", "готово", "deepgram"), "")
+
+    def test_both_save_endpoints_write_the_same_placeholder(self):
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+
+        self.main.save_recording({
+            "title": "silent-a",
+            "source_text": "",
+            "transcript_text": "",
+            "provider": "deepgram",
+            "archive_dir": str(target),
+        })
+
+        async def writer(tmp_audio: Path) -> None:
+            tmp_audio.write_bytes(b"audio")
+
+        asyncio.run(self.main._save_recording_audio_source(
+            orig_name="silent-b.wav",
+            write_tmp_audio=writer,
+            archive_dir=str(target),
+            title="silent-b",
+            source_text="",
+            transcript_text="",
+            provider="deepgram",
+            model="nova-3",
+            language="ru",
+            recording_collection="",
+            live_session_id="",
+        ))
+
+        bodies = {
+            p.name: p.read_text(encoding="utf-8") for p in target.glob("*.txt")
+        }
+        self.assertEqual(len(bodies), 2, sorted(bodies))
+        for name, body in bodies.items():
+            with self.subTest(name=name):
+                self.assertIn(self.main.NO_SPEECH_PLACEHOLDER, body)
+
+    def test_the_promote_reserves_its_name_like_every_other_save(self):
+        # B-032: the promote used check-then-use while the reservation
+        # primitive existed and was used on the neighbouring path — two
+        # answers to "is this name free", one able to lose a race with
+        # the other and overwrite the .txt/.wav it picked.
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+        seen: list = []
+        real = self.main._claim_recording_text_path
+
+        def spy(target_dir, candidates):
+            out = real(target_dir, candidates)
+            seen.append(out[0])
+            return out
+
+        session_id = "promote-claim"
+        recovery_dir = self.main.LIVE_RECOVERY_DIR
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        # ``_live_recovery_paths`` globs ``*_<session>.pcm16``.
+        pcm = recovery_dir / f"2026-09-04_19-37-12_{session_id}.pcm16"
+        pcm.write_bytes(b"\x00\x00" * 16000)
+        pcm.with_suffix(".json").write_text(
+            json.dumps({
+                "session_id": session_id,
+                "started_at": "2026-09-04T19:37:12.123456",
+                "bytes": pcm.stat().st_size,
+                "model": "nova-3",
+                "language": "ru",
+            }),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(self.main, "_claim_recording_text_path", spy):
+            result = self.main._promote_live_recovery(
+                session_id, archive_dir=str(target), recording_collection=""
+            )
+
+        self.assertEqual(len(seen), 1, "the promote did not reserve its name")
+        promoted_dir = Path(result["archive_dir"])
+        self.assertTrue((promoted_dir / result["name"]).exists())
+        self.assertTrue((promoted_dir / result["audio_name"]).exists())
+        self.assertEqual(list(promoted_dir.glob("*.claim")), [])
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,6 +72,12 @@ LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = (WHISPER_LOCAL_MODELS[0],)
 DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
 REMOTE_TRANSCRIPTION_PROVIDERS: tuple[str, ...] = ("openrouter", "deepgram")
+#: The provider a request that names none is served by. First of the
+#: tuple above, in the same shape ``DEFAULT_LIVE_PREVIEW_LOCAL_MODEL``
+#: uses a few lines up — so "which provider is the default" has one
+#: answer rather than one here, one in ``config.DEFAULT_CONFIG`` and one
+#: written out again as ``or "openrouter"`` at the call site.
+DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER = REMOTE_TRANSCRIPTION_PROVIDERS[0]
 
 OPENROUTER_AUDIO_MODELS: tuple[str, ...] = (
     "google/gemini-2.5-flash",
