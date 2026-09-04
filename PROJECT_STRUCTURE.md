@@ -51,6 +51,8 @@ backend/
 ├── deepgram_endpoints.py      # Deepgram endpoint SSOT
 ├── deepgram_words.py          # Deepgram word-spelling SSOT (punctuated vs raw)
 ├── deepgram_keyterms.py       # Deepgram Nova-3 Keyterm Prompting SSOT (parse/limit/query pairs)
+├── deepgram_warm.py           # warm Deepgram live-socket pool SSOT (KeepAlive cadence, liveness probe, replay ring)
+├── deepgram_dual.py           # dual-stream Auto SSOT: second Deepgram session + word-timestamp merge of the two readings
 ├── http_retry.py              # remote request retry handling
 ├── jobs.py                    # in-memory job store and cancellation
 ├── storage.py                 # atomic write helpers
@@ -87,6 +89,8 @@ frontend/
     ├── envelope-deadline.ts          # re-armable stop-envelope deadline SSOT (pure)
     ├── mic-health.ts                 # microphone-health FSM SSOT (clock-injected, pure)
     ├── audio-levels.ts               # capture-level SSOT: session noise floor, relative speech threshold (pure)
+    ├── capture-warm.ts               # warm-hold/pre-roll/reuse decision SSOT for held-microphone captures (pure)
+    ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
     ├── recordings-list-reconciler.ts # keyed DOM reconciler for the history list (pure)
     ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
     ├── error-text.ts                 # readable text for thrown values SSOT (pure)
@@ -113,7 +117,11 @@ desktop/
 ├── renderer-console.js             # renderer console → support-log policy SSOT (pure, node --test)
 ├── paste-result.js                 # auto-paste success/verification decision SSOT (pure, node --test)
 ├── recording-final-slot.js         # renderer→main transcript hand-off payload + mailbox SSOT (pure, node --test)
-├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only)
+├── paste-capability.js             # paste-capability state machine SSOT: stale Accessibility grants, Unknown/Untrusted/Active/Broken (pure, node --test)
+├── paste-script.js                 # macOS paste AppleScript builder SSOT: robustPasteScript(verify) (pure, node --test)
+├── paste-verification-policy.js    # per-target AX-verification memory SSOT: disables verification after repeated unverifiable reads (pure, node --test)
+├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
+├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)
 ├── package.json                    # electron-builder config and desktop scripts
 ├── shortcut-defaults.json          # per-platform default hotkey manifest
 ├── afterPack.js                    # macOS bundle signing/runtime fixups
