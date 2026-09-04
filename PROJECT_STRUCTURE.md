@@ -15,9 +15,12 @@ Voice Transcriptor/
 ├── requirements.txt               # direct backend/runtime Python dependencies
 ├── requirements-gigaam.txt        # optional GigaAM engine stack (ENABLE_GIGAAM opt-in)
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
+├── .python-version                # Python version the shipped runtime is built with (SSOT)
+├── contracts/                     # cross-domain wire fixtures: live-final-envelope.json, live-defaults.json (fail the build on drift)
 ├── BUGS_AUDIT.md                  # running audit ledger (2026-08-23 wave)
 ├── BUGS_AUDIT_2026-08-24.md       # dated audit waves + fix statuses (root per audit charter)
 ├── BUGS_AUDIT_2026-09-03.md       # dated audit waves + fix statuses (root per audit charter)
+├── BUGSAUDIT-2026-09-04.md        # Ultra-Audit 2026-09-04 summary: 270 findings, all P0 closed; consolidated journals
 ├── .env.example                   # user-facing environment-variable SSOT
 ├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
@@ -53,6 +56,10 @@ backend/
 ├── deepgram_keyterms.py       # Deepgram Nova-3 Keyterm Prompting SSOT (parse/limit/query pairs)
 ├── deepgram_warm.py           # warm Deepgram live-socket pool SSOT (KeepAlive cadence, liveness probe, replay ring)
 ├── deepgram_dual.py           # dual-stream Auto SSOT: second Deepgram session + word-timestamp merge of the two readings
+├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language)
+├── deepgram_recovery.py       # re-decode of uncovered spans before the final envelope is sent (one owner of recovery)
+├── live_envelope.py           # the `final` WebSocket envelope: one shape, one constructor
+├── async_tasks.py             # ending started asyncio tasks without ending the awaiting coroutine (one owner of the pattern)
 ├── http_retry.py              # remote request retry handling
 ├── jobs.py                    # in-memory job store and cancellation
 ├── storage.py                 # atomic write helpers
@@ -91,6 +98,12 @@ frontend/
     ├── audio-levels.ts               # capture-level SSOT: session noise floor, relative speech threshold (pure)
     ├── capture-warm.ts               # warm-hold/pre-roll/reuse decision SSOT for held-microphone captures (pure)
     ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
+    ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
+    ├── upload-queue-restore.ts       # upload-queue snapshot restore SSOT: a failed read leaves the latch down (pure)
+    ├── settings-autosave.ts          # settings autosave gate SSOT: no write of a config that was never read (pure)
+    ├── recording-title.ts            # recording title rule SSOT (pure)
+    ├── button-feedback.ts            # copy/button feedback copy SSOT (pure)
+    ├── ui-copy.ts                    # UI copy + interface numbers tokens SSOT (pure)
     ├── recordings-list-reconciler.ts # keyed DOM reconciler for the history list (pure)
     ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
     ├── error-text.ts                 # readable text for thrown values SSOT (pure)
@@ -120,6 +133,13 @@ desktop/
 ├── paste-capability.js             # paste-capability state machine SSOT: stale Accessibility grants, Unknown/Untrusted/Active/Broken (pure, node --test)
 ├── paste-script.js                 # macOS paste AppleScript builder SSOT: robustPasteScript(verify) (pure, node --test)
 ├── paste-verification-policy.js    # per-target AX-verification memory SSOT: disables verification after repeated unverifiable reads (pure, node --test)
+├── paste-protocol.js               # paste wire protocol SSOT: marker strings the paste scripts print and parsers read (pure, node --test)
+├── power-events.js                 # powerMonitor subscription SSOT: each handler subscribed exactly once at startup (pure, node --test)
+├── recording-status.js             # recording-capsule status classification SSOT: one ladder both sides read (pure, node --test)
+├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
+├── python-version.js               # interpreter version reader: the ONE file that declares it is .python-version (pure, node --test)
+├── shortcut-migration.js           # retired-hotkey migration rule SSOT, shared with the renderer (pure, node --test)
+├── linux-wm-class.js               # WM_CLASS split from `wmctrl -lpGx` for Linux window activation (pure, node --test)
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)
 ├── package.json                    # electron-builder config and desktop scripts
@@ -127,9 +147,11 @@ desktop/
 ├── afterPack.js                    # macOS bundle signing/runtime fixups
 ├── afterAllArtifactBuild.js        # macOS DMG artifact signing hook
 ├── unlockDist.js                   # build artifact lock cleanup
-├── entitlements.mac.plist          # macOS app entitlements
-├── entitlements.mac.inherit.plist  # macOS helper entitlements
-├── entitlements.mas.plist          # Mac App Store app entitlements
+├── entitlements.mac.plist             # macOS app entitlements
+├── entitlements.mac.inherit.plist     # macOS helper entitlements
+├── entitlements.mac.selfsigned.plist      # self-signed (non-Developer-ID) macOS app entitlements
+├── entitlements.mac.selfsigned.inherit.plist # self-signed macOS helper entitlements
+├── entitlements.mas.plist             # Mac App Store app entitlements
 ├── entitlements.mas.inherit.plist  # Mac App Store helper entitlements
 ├── icon.png / icon.ico             # package icons
 └── scripts/
@@ -159,7 +181,8 @@ Desktop owns:
 
 ## Build SSOT
 
-- App version: `desktop/package.json`.
+- App version: `desktop/package.json` (frontend/package.json duplicates the number for tooling; the drift test in `desktop/packaging.test.js` fails if they diverge).
+- Python version: `.python-version` (read by `desktop/python-version.js`).
 - Direct Python dependencies: `requirements.txt`.
 - Release runtime constraints: `requirements.runtime-lock.txt`.
 - User-facing environment variables: `.env.example`.
@@ -167,6 +190,6 @@ Desktop owns:
 - Packaged resources: `desktop/package.json` `build.extraResources`.
 
 - `docs/NEXT_SESSION_2026-09-04.md` — точка входа следующей сессии: ТЗ трёх хотфиксов и трёх worktree-веток.
-- `docs/NEXT_SESSION_2026-09-04b.md` — хендофф вечера 2026-09-04: единый владелец текста, Ultra-Audit, кто на чём остановился.
-- `docs/audit-2026-09-04/` — разделы находок и журналы правок Ultra-Audit; сводка — `BUGSAUDIT-2026-09-04.md` в корне.
+- `docs/NEXT_SESSION_2026-09-04b.md` — хендофф вечера 2026-09-04: единый владелец текста, Ultra-Audit, кто на чём остановился; §8 — релиз 1.6.1 и живые проверки.
+- `docs/audit-2026-09-04/` — разделы находок, журналы правок и отчёты агентов Ultra-Audit (включая «Швы (2026-09-05)»); сводка — `BUGSAUDIT-2026-09-04.md` в корне.
 - `docs/COMPARISON_2026-09-04.md` — сравнение с лучшими open-source/коммерческими реализациями диктовки: ранжированная таблица по 11 пунктам дизайна, что уже не хуже, что сознательно не берём.

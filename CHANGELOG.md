@@ -5,6 +5,90 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-05
+
+The 2026-09-04 Ultra-Audit (`BUGSAUDIT-2026-09-04.md`, 270 numbered findings across backend, renderer and desktop) plus the cross-domain seams that closed the day after. Suites on the released revision: backend 819, frontend 363, desktop 256, all green.
+
+### Fixed
+
+**The transcript has one owner.**
+
+- **The renderer assembled its own transcript at stop from data it had already streamed, so any clause the backend's envelope also carried could be pasted twice.** The renderer no longer assembles anything: it delivers the backend's final envelope verbatim (`889c91a`), and a complete envelope now replaces the live preview outright instead of being merged into it (`0de0c2d`) — which is exactly what made whole clauses double at stop. What is on screen is what the backend built, or nothing.
+
+- **An envelope could be sent before it was complete, leaving hole-filling to whatever the renderer could guess.** The backend now re-decodes its own uncovered spans before the final envelope is sent (`bf84d6b`, `backend/deepgram_recovery.py`): covered time is never re-decoded, only the tail that reaches past it, and a wordless final no longer gets its own speech duplicated by the recovery pass. Measured on the 72.7 s three-language evidence recording: recovery spans=2 total=2.22 s in 1166 ms, `rec=2/0@1166ms uncov=1.31s` in the stop trace. The trace can state the number because the envelope reports it (`46934ce`) — the backend computes it, the renderer only reads it.
+
+- **The tail guard retried on guesses, and a slow dual-stream secondary was dropped whole.** Retries fire only on real evidence — a hole proven by word times, not by absence (`e8f1632`) — and a secondary reading that arrives past its budget is merged partial instead of dropped.
+
+- **A dual-stream primary replaced by the warm-socket liveness path went silent on the renderer.** The replacement publishes its segments through the same path as the original primary (`022fd27`), so finals keep arriving when liveness swaps the socket mid-recording.
+
+- **Deepgram's answer to Finalize was thrown away, so the stop ended when a timer ran out instead of when the provider had answered.** The drain now ends on the provider's response, not on a timer (`3b8f5a8`); measured live, the wait ended by answer at 360 ms of the 3.0 s ceiling — and the two timer constants it replaced (`FINALIZE_COVERED_WAIT_SEC`, `FINALIZE_EMPTY_TAIL_WAIT_SEC`) are deleted, because they were the workaround the audit named first.
+
+- **The stop envelope had as many wire shapes as writers, and nothing failed when the two sides drifted.** One builder on the wire (`backend/live_envelope.py`), one reader in the renderer (`frontend/src/live-envelope.ts`), and `contracts/live-final-envelope.json` + `contracts/live-defaults.json` as fixtures that fail the build when either side drifts (`52dab76`).
+
+- **Three copies of backend knowledge lived in the renderer: the dual-stream defaults, the audio MIME map, and — supposedly — the segment epsilon.** The backend now ships the dual-stream defaults and the extension↔MIME map in the bootstrap payload, so neither can silently disagree with the config it describes (`6d31b53`); the third suspect, the 0.08 s segment epsilon, was checked and is *not* a duplicate — the renderer deduplicates already-sent segments of any provider, the backend's `emit_epsilon_sec` decides when a segment closes in the stream.
+
+**The Ultra-Audit P0s, and the P1s that carried the release.**
+
+- **A failed upload-queue load wiped every completed upload's transcript.** The `catch` that swallowed a failed state read still latched `uploadQueueSnapshotLoaded = true` and let the next autosave replace the state file — which the backend writes as a whole — with an empty queue. The latch is now honest (`74ff589`, `frontend/src/upload-queue-restore.ts`): a failed load leaves it down and the next entry into Upload restarts the restore. 9 tests; frontend 196 → 205.
+
+- **Sleep, lock and wake never reached the app.** The power handlers were subscribed inside the hotkey capture path, so one aborted capture left the app deaf to sleep/lock/wake for the rest of its life. `desktop/power-events.js` subscribes each handler exactly once at startup (`a152ec7`), and the warm capture hold is released on suspend/lock like any other lifecycle edge.
+
+- **A successful Windows paste was decoded as a failure, so the transcript was pasted twice.** The AppleScript handler's output is UTF-16LE on win32 and was read byte-wise; the paste wire protocol and the child-process decoding now live in `desktop/paste-protocol.js` and `desktop/child-io.js` — one decoder, one outcome grammar, no second copy in `main.js` (`317b4ca`).
+
+- **A Deepgram final that arrives without a word list is a reading again, and the merge of two long readings no longer stops the backend for half a minute.** One rule, `segment_word_records(segment)`: a segment with words reads as words, a segment without them as a single spanless reading with its span and text — every asker goes through it (`d590a4e`). On any stretch of audio exactly one reading wins (a wordless blob loses to real words covering ≥ 50 % of its span). Merge cost measured: 3000×3000 words, 30.8 s (blocked the event loop) → 39.6 ms CPU / 65.2 ms wall under load average 44. The perf test measures `time.process_time`, the only measure a loaded machine cannot turn into a false red.
+
+- **Paste verification verified nothing, and a failed paste deleted the transcript from the clipboard anyway.** Measured on macOS 27: `count of (value of attribute "AXValue" …)` inside `tell "System Events"` counts specifier elements, not characters — a scratch document holding "abcde" read back `1`, so no paste could ever verify, and a merely slow target was treated like a mute one. The element is resolved once and polled (4 × 50 ms, exit on match), three outcomes (`:verified/:unverified/:unreadable`) plus `INCONCLUSIVE` in the policy, `verificationAllowanceMs` 1500 → 3300 derived in the budget table (darwin worst case ≈ 24.8 s of the 32 s post-stop deadline). A/B with the real generated handlers against a scratch TextEdit document: `before=1 after=1 :unverified` → `before=0 after=5 :verified`. A failed paste no longer restores the clipboard, so the dictated text stays where the status says it is (`22c6e3d`).
+
+- **The Accessibility prompt never came back, auto-send didn't send, a failed Windows activation claimed success, and the paste budget lied about its bounds.** The prompt path can be re-entered after a refusal, auto-send delivers to the focused app, the Windows activation path reports failure instead of assuming it, and the paste retry budget reads its bounds from the one table that is tested against the post-stop deadline (`86d63d3`).
+
+- **The warm microphone hold and its 500 ms pre-roll could never engage: the hold was decided after the track had been stopped.** Stop step 1 now freezes the pipeline first — the hold is planned and the worklet armed (flush + armed: no frame after this point reaches the sink or the socket), `stopMediaRecorderAndFlush` moves up with it because the WebM container feeds from the MediaStream and would otherwise keep writing post-stop audio while the mic is still held, and ownership commits in teardown with the mic silenced if the planned hold failed (`3ee4cb9`). The end-to-end test that was unreachable before now holds a live track and refuses the same graph once it has ended; 32 tests in the module (was 25).
+
+- **A failed settings load let the next click overwrite keyterms, the archive path and both hotkeys with defaults.** Autosave no longer writes a config that was never read: a failed load names the state, and the next click cannot persist defaults over real settings; the upload-queue snapshot carries a schema version read at migration instead of a magic number (`585b45f`).
+
+- **The CSP didn't pin the WebSocket to the backend origin, and what rendered was not what was designed.** The CSP now names the backend origin for `ws:`/`wss:` (default-src 'self' does not cover them); the five undeclared UI tokens and nine with contradicting fallbacks are declared, `.btn-primary` is defined once, the dead `--record-stop-*` palette and the double-styled boot overlay are gone — the styles that render are the designed ones (`06f3330`).
+
+- **A Developer ID build could not be signed without one developer's keychain.** The signing identity is discovered instead of hardcoded in build hooks, self-signed builds get their own entitlements plists, and the notarization profile and script ship ready-to-run — first notarization still awaits a Developer ID certificate in the build environment (`1d9fda2`).
+
+**Resources, lifecycle and cancellation.**
+
+- **ffmpeg read the channel Electron talks on, the heaviest model could not be unloaded, and a failed save kept a name it did not own.** ffmpeg no longer inherits the channel Electron talks on; the heaviest model can finally be unloaded; a failed save releases its name claim (`aed1e61`). The stereo split no longer loads the file it splits, and the job store's soft cap has a hard one behind it (`eb93fde`).
+
+- **A cancelled stop did not stop, a control frame could be cancelled mid-write, and a socket swap could be pulled out from under the finalize.** A cancelled stop stops; control frames are written outside cancellation; the socket swap is ordered against the finalize (`f9ffa80`). `coveredEndSec` no longer repeats `durationSec`, so a spliced tail word can no longer make an incomplete envelope look complete (`3c3bbe9`).
+
+- **A recording could be killed by silence without warning, and the capsule guessed its own state from the words in a status.** The status classification lives in `desktop/recording-status.js` — one ladder both sides read — and silence autostop warns before it fires (`0bf8ed7`). A recording that survives a stale stop keeps its monitor, a recovered backend gets its restart budget back, and a failed engine install says so (`966bcf7`). The paste memory learns which app it is talking to, and a loud renderer can no longer stall the main process (`aeb7039`).
+
+**Engines and languages.**
+
+- **"auto" meant different things per endpoint and nothing said why.** One meaning per endpoint with the reason written once (`backend/deepgram_language.py`): live resolves `auto`, REST deliberately keeps `detect_language=true` — the REST pass is the "full reading", and switching it to `multi` would be a quality regression, not a unification; the live config has one builder, and the predicates two modules shared are public (`cdcb11c`). The recovery pass stops re-flattening the two envelope numbers it repairs, stops duplicating speech a wordless final already owned, and stops knowing where Deepgram keeps its words (`1a4b122`). The local assist stops overstating what it lost, sees its own output while deciding what to trim, and moves a trimmed segment out of committed time (`6999634`). One list of built-in presets, one rule for an empty recognition, one way to claim a recording's name, and a duration each provider reports for itself — OpenRouter transcriptions no longer reported 0.0 s (`7461a64`). A refusal stops reporting itself as success, and eight pieces of code that did nothing are gone (`fadc50e`). A dual-stream recording pays one connect before its first byte instead of two, and the second reading is warmed like the first (`ea25b4f`).
+
+**Configuration.**
+
+- **Reading the config rewrote it, an unusable data dir killed the backend before it started, and one bad POST could brick Upscale forever.** Reading the config stops rewriting it; the backend survives an unusable data dir long enough to say why; the Upscale POST is idempotent (`b463e58`). The env reference stops describing a mechanism that does not exist, and the package six symbols are imported from is declared (`1ed7b32`).
+
+**Errors that said the wrong thing.**
+
+- **"Is this a network failure?" was answered in as many places as it was asked, and History showed a fiction.** The predicate is answered in one place (`b0eecd1`); History says what actually happened — a failed stats read is not an empty archive, an error is not a transcript, and re-transcribe no longer invents a session to guard itself with (`90876fa`); failures say what actually failed, a button that cannot work is not shown, and the title bridge is one idiom instead of three (`e1bf3d4`).
+
+**Seams between the domains, closed.**
+
+- **`stopLive` had six no-transcript exits repeating the same bookkeeping.** They share one bookkeeping step now, and the exactly-one-delivery-site invariant is a standing test (`c06b4f7`). No backend test can write into the real `~/Library/Application Support/Transcriptor` any more, no matter which module happens to import first (`82ba454`). The three renderer halves desktop was left waiting on: an Accessibility badge that actually reaches the user (invoke-only `paste-capability:get-status` bridge filling a note next to Shortcuts, instead of the `executeJavaScript`-injection pattern the audit named as the previous failure), one shortcut-migration rule (the renderer imports `migrateShortcutPair` from `desktop/shortcut-migration.js` instead of re-implementing it), and a suspend subscription that cannot stack (retire-before-resubscribe) (`b2ea2c5`).
+
+### Changed
+
+**One declaration per piece of knowledge: constants, copy, types, identity.**
+
+- The numbers that shape the interface have names and one home (`UI_TOKENS`/`ui-copy.ts`), and a Copy button says the same thing everywhere (`50e52f6`); the numbers that decide a stop have names, the memory fallback has the bound its comment claimed, and a recording is titled by one rule (`f09c904`); auto-stop-on-silence has one set of numbers, and speaker diarization is snapshotted at start and remembered between launches (`27fba8d`); one declaration per type and per design token, and one number bounds the status pill (`a52e976`); accept lists and empty-state copy come from one source (`e679872`); nothing the renderer starts outlives what started it (per-instance teardown), and a clock set backwards no longer switches the update check off for good (`206737f`); scrolling History no longer refilters the whole archive on every scroll event (`58bafe8`).
+- Desktop: a permission state nothing reads stops being polled, and the retired-hotkey rule has one home (`e74fca6`); an accelerator with a stray space stops becoming a global Ctrl+V, and the paste path drops three fictions (`f8db476`); the app's identity is declared once and the copies are checked against it (`f59850d`); the release manifest names its own artifact and stops copying the same file twice (`091865f`); pruning an engine-site duplicate removes the package, not just its label (`19b0235`); the hotkeys in the README are the ones the app registers (`c9d905a`); six numbers that decide behaviour get names, and the README stops describing a build we no longer make (`88de1c7`); the belt-and-braces paste guard says what it really guards, and both audit indexes carry a verdict for every entry (`7be4938`).
+
+**Tests, CI and packaging.**
+
+- Tests are type-checked — `tests/` is in `tsconfig.include` — and the microphone-health FSM is covered by the frontend suite (`0c916b9`); CI now runs the desktop suite where its AppleScript tests can compile (`b2d3461`); the two packaging and budget tests can now fail (`15bd422`); the finished-records depth check follows the main process now that its copy has a name (`4da7273`); the copy-feedback module the previous commit imports is in the repository (`9cca7d0`).
+- **Every install of the backend's dependencies now uses the versions the release was built with.** `requirements.runtime-lock.txt` holds the exact versions the shipped runtime is built with; the release build, CI and the on-device repair all apply the same lock, and a packaging test fails when they disagree (`e679872`). The Python version the product ships is written down once (`.python-version`, read by `desktop/python-version.js`) (`8585a37`).
+
+**Documented, so nothing depends on a live session surviving.**
+
+- The Ultra-Audit report, journals and the evening hand-off are in the repo (`437d46e`); every agent's final report and the 2026-09-05 status are in docs (`300cfac`); the backend journal records the live A/B run and the debt this pass leaves behind (`b209c87`), the frontend journal accounts for every row of both audit indexes (`c31b642`), the desktop journal closes with what was measured on this Mac and what was not (`ae42aa3`), and the journal names the commit that repaired the depth check, not the one it replaced (`5c56e65`).
+
 ## [1.6.0] - 2026-09-04
 
 ### Fixed

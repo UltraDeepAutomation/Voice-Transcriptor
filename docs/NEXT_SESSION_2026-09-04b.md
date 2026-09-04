@@ -50,3 +50,22 @@ Ultra-Audit, бэкенд: `d590a4e` (P0: финал без слов — чте�
 Идёт агент «швы между доменами» (первый коммит `52dab76`: одна схема конверта `final`, один конструктор, фикстура, ломающая сборку при расхождении сторон); остальное из его задания — дефолты dual-stream и факты бэкенда из bootstrap, половинки D-009/013/015/053, один эпилог `stopLive`, изоляция тестов от `HOME` — результат в `backend-fix-journal.md`, раздел «Швы (2026-09-05)».
 
 Дальше строго по §5 (пункты 4–6): сборщик отчёта `BUGSAUDIT-2026-09-04.md` §4–§7 из журналов; релиз 1.6.1 — CHANGELOG за все коммиты после `373ce84`, версия в обоих `package.json`, PROJECT_STRUCTURE (новые модули: `backend/async_tasks.py`, `backend/deepgram_language.py`, `backend/deepgram_recovery.py`, `backend/deepgram_envelope.py` если создан, `frontend/src/ui-copy.ts`, `frontend/src/button-feedback.ts`, `desktop/python-version.js`), реестр долга из трёх журналов; `./BUILD.command` (диск теперь свободен, 30 ГБ); перезапуск; проверка boot-лога и первых записей.
+
+## 8. Релиз 1.6.1 (2026-09-05)
+
+Выполнено (§5 пункты 4–6):
+
+- **BUGSAUDIT-2026-09-04.md** собран из журналов: §1 обновлён (HEAD `b2ea2c5`, сьюты бэкенд 819 / рендерер 363 / desktop 256 — перепрогнаны на релизной ревизии), §4 «Журнал решений» и §5 «Журнал правок» консолидированы по доменам с таблицами коммит → ID → файлы → проверка (бэкенд 15 коммитов, 631 → 819; рендерер 18, 196 → 363; desktop 20, 208 → 256; швы 5 коммитов), §6 «Не сделано» поимённо с причиной, §7 «Подготовлено, но не выполнено» (релиз выполнен; нотаризация и Windows/Linux на железе — остаются).
+- **BUGS_AUDIT_2026-09-03.md**: «Реестр долга» консолидирован из долгов этого файла и трёх журналов — один нумерованный список (35 позиций: что · почему · где · статус); позиция «Статус на 2026-09-04 вечер» заменена на «Состояние на 2026-09-05 (релиз 1.6.1)».
+- **CHANGELOG.md**: `## [1.6.1] - 2026-09-05` — все коммиты после `373ce84` в голосе файла (дефект → механизм → измерение → что изменилось), сгруппированы: единый владелец транскрипта, Ultra-Audit P0, ресурсы/жизненный цикл, движки/языки, конфигурация, ошибки, SSOT, тесты/CI/упаковка, документация; `[Unreleased]` пуст.
+- **Версии**: `desktop/package.json` и `frontend/package.json` → `1.6.1` (drift-тест `desktop/packaging.test.js` держит их вместе).
+- **PROJECT_STRUCTURE.md**: новые модули с `373ce84` — `backend/{async_tasks,deepgram_language,deepgram_recovery,live_envelope}.py`, `frontend/src/{live-envelope,upload-queue-restore,settings-autosave,recording-title,button-feedback,ui-copy}.ts`, `desktop/{paste-protocol,power-events,recording-status,child-io,python-version,shortcut-migration,linux-wm-class}.js`, `desktop/entitlements.mac.selfsigned*.plist`, `contracts/`, `.python-version`, `BUGSAUDIT-2026-09-04.md`.
+- **Сьюты на релизной ревизии `main`** (все зелёные): бэкенд 819 OK; рендерер typecheck/lint чисто, 363 passed, build ok; desktop 256 pass / 0 fail; `node --check` обеих точек входа — чисто.
+
+Живые проверки после установки (выполнить после сборки и перезапуска):
+
+1. `osascript -e 'tell application "Transcriptor" to quit'` (≤15 с, без kill -9), затем `open -a /Applications/Transcriptor.app`, подождать 20 с.
+2. `~/Library/Application Support/transcriptor/main.log` — чистый старт: бэкенд поднялся, нет Traceback, хоткеи зарегистрированы, paste-capability `state=active`, тёплый сокет подключён, строка подписки `powerMonitor`.
+3. `GET /api/config` (`x-api-token` из `api_token.txt`) — в ответе keyterms и `dual_stream: true`.
+4. Артефакты: `CFBundleShortVersionString` = 1.6.1; `codesign --verify --deep --strict` проходит; `app.asar` содержит desktop-модули из `build.files` (`power-events.js`, `paste-protocol.js`, `child-io.js`, `recording-status.js`, `shortcut-migration.js`, `python-version.js`, `linux-wm-class.js`); `Resources/runtime` содержит `deepgram_recovery.py`, `deepgram_language.py`, `async_tasks.py`; `requirements.runtime-lock.txt` в extraResources (desktop-фикс заставил его попадать в бандл).
+5. Первые живые записи: в `[trace stopLive] FINAL` — `source=envelope`, на dual-записи `recovery=…`; на второй записи подряд `warm=1 preRollMs=500`; вставка ≤0.5 с, `verified=1`, буфер восстановлен.
