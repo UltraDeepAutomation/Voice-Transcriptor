@@ -470,6 +470,12 @@ class DualLiveSession:
         self._secondary_language = secondary_language
         self._primary_language = primary_language
         self._secondary_failed = False
+        # The last merge this facade produced. Coverage questions
+        # asked AFTER the stop ("what is still missing?") must be
+        # answered against the merged transcript, not against either
+        # reading alone — a hole the primary reported is not a hole in
+        # what the user receives if the secondary's words went into it.
+        self._last_merged: Optional[MergedReading] = None
 
     # ----- The single-session interface --------------------------------
 
@@ -488,6 +494,78 @@ class DualLiveSession:
     @property
     def last_fatal(self) -> bool:
         return self.primary.last_fatal
+
+    @property
+    def stream_death_sec(self) -> Optional[float]:
+        """When the recording's upstream died — the PRIMARY's answer.
+
+        The secondary owns nothing the user would notice losing (see the
+        class docstring), so the moment THIS recording stopped reaching
+        Deepgram is the moment the primary stopped reaching it.
+        """
+        return self.primary.stream_death_sec
+
+    @property
+    def endpointing_sec(self) -> float:
+        return self.primary.endpointing_sec
+
+    @property
+    def streamed_sec(self) -> float:
+        """The recording's streamed position — both readings are fed the
+        same bytes, so the furthest either got is the recording's."""
+        values = [self.primary.streamed_sec]
+        if self.secondary is not None:
+            values.append(self.secondary.streamed_sec)
+        return max(values)
+
+    def committed_segments(self) -> list[dict]:
+        """Both readings' committed segments, for coverage only.
+
+        Not a transcript: overlapping segments from the two readings
+        would read as a doubled one. It is the union of the GROUND the
+        two readings account for, which is what the recovery budget
+        prediction asks about — the merge that turns them into one
+        transcript happens at stop, in ``_merged_envelope``.
+        """
+        out = list(self.primary.committed_segments())
+        if self.secondary is not None:
+            out.extend(self.secondary.committed_segments())
+        return out
+
+    @property
+    def interim_window_end(self) -> float:
+        """The furthest either reading's decoder has reached.
+
+        Evidence that SOMETHING is still working the tail — and either
+        reading still working it is evidence, so this is a max and not
+        the primary's alone.
+        """
+        ends = [self.primary.interim_window_end]
+        if self.secondary is not None:
+            ends.append(self.secondary.interim_window_end)
+        return max(ends)
+
+    def interim_speech_spans(self) -> list[tuple[float, float]]:
+        """Where EITHER reading heard words. Merged, so nothing counts twice."""
+        spans = list(self.primary.interim_speech_spans())
+        if self.secondary is not None:
+            spans.extend(self.secondary.interim_speech_spans())
+        return union_spans(spans)
+
+    def coverage_hole_spans(self) -> list[tuple[float, float]]:
+        """What the MERGED transcript still fails to cover.
+
+        Both readings' holes taken together, minus whatever the merged
+        words actually cover. Before the merge exists (the recovery
+        budget is estimated at announce time, mid-stop) the honest
+        answer is the union of both readings' holes.
+        """
+        holes = list(self.primary.coverage_hole_spans())
+        if self.secondary is not None:
+            holes.extend(self.secondary.coverage_hole_spans())
+        if self._last_merged is None:
+            return union_spans(holes)
+        return subtract_spans(holes, self._last_merged.covered_spans())
 
     def report_fatal(self, message: str) -> None:
         self.primary.report_fatal(message)
@@ -524,6 +602,21 @@ class DualLiveSession:
 
     def final_text(self) -> str:
         return self.primary.final_text()
+
+    def partial_result(self) -> dict:
+        """A merged envelope from whatever both readings hold RIGHT NOW.
+
+        Same promise ``DeepgramLiveSession.partial_result`` makes — a
+        read of committed state, no Finalize, no waiting — kept for a
+        dual recording so a caller that cannot wait for
+        ``drain_transcript`` (the WS handler's error path, whose payload
+        is now the input to the REST recovery pass) gets the MERGED
+        transcript rather than one reading of it.
+        """
+        return self._merged_envelope(
+            self.primary.partial_result(),
+            self.secondary.partial_result() if self.secondary is not None else None,
+        )
 
     async def send_pcm(self, chunk: bytes) -> None:
         # The primary's exception is the caller's, unchanged: it owns
@@ -671,6 +764,7 @@ class DualLiveSession:
             primary_source=self._primary_language,
             secondary_source=self._secondary_language,
         )
+        self._last_merged = merged
         logger.info(
             "dual-stream merge: %s=%d words %s=%d words merged=%d "
             "filled_from_%s=%d filled_from_%s=%d dups_removed=%d",
@@ -703,7 +797,7 @@ class DualLiveSession:
         envelope["coveredEndSec"] = round(merged.covered_end_sec(), 3)
         envelope["streamedSec"] = round(streamed_sec, 3)
         envelope["uncoveredSpeechSec"] = round(
-            self._merged_uncovered_speech_sec(merged), 3
+            self._merged_uncovered_speech_sec(), 3
         )
         # Wire contract with the renderer: ``stats.dual_stream`` is the
         # boolean it reads to know this envelope came from the merged
@@ -725,20 +819,15 @@ class DualLiveSession:
         envelope["stats"] = stats
         return envelope
 
-    def _merged_uncovered_speech_sec(self, merged: MergedReading) -> float:
+    def _merged_uncovered_speech_sec(self) -> float:
         """Seconds neither reading committed and the merge could not fill.
 
-        Computed on the MERGED list, which is the only honest place: a
-        hole the primary reported is not a hole in what the user
-        receives if the secondary's words went into it. Both readings'
-        hole spans are taken together, and whatever the merged words
-        cover is subtracted.
+        The total of ``coverage_hole_spans`` — one implementation of
+        "what is still missing", read here as a number and by the
+        recovery pass as spans, so the envelope's figure and the spans
+        that get re-decoded can never describe different ground.
         """
-        holes = list(self.primary.coverage_hole_spans())
-        if self.secondary is not None:
-            holes.extend(self.secondary.coverage_hole_spans())
-        residual = subtract_spans(holes, merged.covered_spans())
-        return sum(end - start for start, end in residual)
+        return sum(end - start for start, end in self.coverage_hole_spans())
 
     async def shutdown(self, wait_timeout: float = 3.0) -> None:
         await self._both("shutdown", wait_timeout=wait_timeout)

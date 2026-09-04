@@ -1,0 +1,662 @@
+"""Recovery of the spans a live reading failed to cover — one owner.
+
+Why
+---
+Until now the ``final`` envelope was allowed to be incomplete and the
+RENDERER made up the difference: it raced a REST re-decode of the saved
+recording against the envelope, unioned the two texts, and grafted a
+"recovered tail" on. Two owners of one transcript is how every
+duplication defect of 2026-09-03/04 happened — the preview restates
+ground the envelope already covers, in slightly different words, and no
+alignment can reliably tell that apart from new speech
+(``BUGS_AUDIT_2026-09-03.md`` §2.2/§2.3/§4.8).
+
+So the envelope becomes complete BY CONSTRUCTION and the renderer
+becomes a consumer. After the live drain — single stream or dual — the
+backend asks what it still fails to cover, re-decodes exactly those
+spans from its OWN audio spool through the Deepgram REST endpoint,
+splices the words in by time, and only then sends the envelope.
+
+What is a "span this reading failed to cover"
+---------------------------------------------
+Four shapes, and they are different failures, not four guesses at one:
+
+(a) HOLES the reading itself reports — interim-heard words no final
+    carried, and regions no final reached at all
+    (``DeepgramLiveSession.coverage_hole_spans``, audit §3.1-§3.4);
+(b) an unflushed TAIL past the last final, when there is evidence
+    something is in it (``tail_needs_flush`` — the same rule the stop
+    uses to decide whether a second ``Finalize`` is worth sending, so
+    the stop and the recovery cannot disagree about what a live tail is);
+(c) everything after the upstream socket DIED (``stream_death_sec``).
+    Those bytes were captured by the app and never seen by Deepgram, so
+    no amount of waiting can produce them (audit §3.6/§3.7);
+(d) NOTHING AT ALL: no finals for a recording long enough that silence
+    is not the explanation (``LIVE_EMPTY_RESULT_MIN_SEC``). Measured at
+    29 of 706 sessions, 21 of them past 2 s of audio.
+
+Every candidate is then reduced by what the assembled transcript
+ACTUALLY covers, word by word — so a hole the dual-stream merge already
+filled is not re-decoded, and re-running this function on the repaired
+envelope reports what is genuinely still missing rather than the same
+spans again.
+
+What it costs
+-------------
+Bounded by construction: the spans are padded and merged, the whole
+pass runs under ``recovery_budget_sec`` (a base plus a share of the
+audio being re-decoded, hard-capped), and a REST call that fails or
+runs long is logged once and dropped. The spans it could not recover
+stay in the envelope's ``uncoveredSpeechSec`` — honest, not silent.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import time
+import wave
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Optional, Sequence
+
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
+from backend.remote_deepgram import deepgram_transcribe
+from backend.remote_deepgram_live import (
+    DeepgramLiveConfig,
+    covering_final_word,
+    intersect_spans,
+    join_segment_texts,
+    normalize_words,
+    resolve_live_language,
+    splice_words_into_segments,
+    subtract_spans,
+    tail_needs_flush,
+    union_spans,
+)
+from backend.remote_deepgram_live import _as_float, _segment_words  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+# A live session that streamed at least this much audio and produced no
+# final segment at all did not record silence — it failed. Below it, a
+# recording with no transcript is most likely a hotkey misfire, and
+# re-decoding it would cost a REST round trip to be told the same
+# nothing. Lives here rather than in ``backend.main`` because the
+# recovery pass is now the first reader of it: the WS handler's
+# "produced NO final segments" warning and rule (d) below must fire on
+# exactly the same threshold, or the log would announce a failure the
+# recovery declined to act on.
+LIVE_EMPTY_RESULT_MIN_SEC = 2.0
+
+# Each span is widened by this much on both sides before it is decoded.
+# A hole's edges are where two decoders disagreed about a word boundary,
+# so the word that is missing usually starts slightly before the span
+# that betrays it; and a decoder handed 0.4 s of speech with no lead-in
+# has no context to decode it with. The overlap this creates with
+# already-transcribed audio is not a duplication risk: the splice drops
+# any recovered word whose ground a committed word already owns
+# (``covering_final_word``) and guards both seams (``fits_beside``).
+RECOVERY_SPAN_PAD_SEC = 0.3
+
+# A candidate span shorter than this is not a missing word. The shortest
+# real word runs about 0.15 s; anything under 0.1 s is a boundary the
+# two measurements rounded differently, and paying a network round trip
+# for it would make every healthy stop slower for nothing.
+RECOVERY_MIN_SPAN_SEC = 0.1
+
+# The recovery budget: one REST round trip's fixed cost, plus a share of
+# the audio being decoded.
+#
+# Measured 2026-09-04 against the live Deepgram REST endpoint, five
+# 1.8-2.9 s spans of the 72.7 s trilingual evidence recording, in one
+# process: the FIRST call cost 2078 ms and the four after it 331, 355,
+# 369 and 636 ms. The difference is connection setup — ``http_retry``
+# pools the socket, so every call but the first is a warm POST — and the
+# recovery pass is very often the first REST call this process makes.
+# A 1.5 s base was tried first and timed out the whole pass on exactly
+# that cold call, which is the worst possible failure: the stop pays the
+# wait and the user gets nothing for it. 2.5 s clears the measured cold
+# call with margin and costs a healthy stop nothing at all, because no
+# recovery is announced when there are no spans.
+#
+# The hard cap is what makes this safe to promise the renderer: a stop
+# can never run longer because the recovery had a lot of ground to cover.
+RECOVERY_BUDGET_BASE_SEC = 2.5
+RECOVERY_BUDGET_PER_SPAN_SEC = 0.25
+RECOVERY_BUDGET_MAX_SEC = 8.0
+
+# What a recovered word is labelled with, in the envelope's per-word
+# ``source`` and on any segment it creates.
+RECOVERY_SOURCE = "recovery"
+
+
+@dataclass(frozen=True)
+class InterimEvidence:
+    """What a live reading knows about its own gaps, as plain data.
+
+    Deliberately a value object rather than a session reference: the
+    span computation is pure and testable, and the dual-stream facade
+    can answer these four questions for two sessions at once without
+    this module knowing there were two.
+    """
+
+    # Spans the reading reports as missing from its committed transcript.
+    hole_spans: tuple[tuple[float, float], ...] = ()
+    # Spans where an interim carried real recognised text.
+    speech_spans: tuple[tuple[float, float], ...] = ()
+    # End of the newest interim's own decode window, session timeline.
+    interim_window_end: float = 0.0
+    # The session's configured endpointing silence window, in seconds.
+    endpointing_sec: float = 0.3
+
+
+def evidence_from_session(session: Any) -> InterimEvidence:
+    """Read a live session's (or the dual facade's) coverage evidence.
+
+    Duck-typed on purpose — ``DeepgramLiveSession`` and
+    ``DualLiveSession`` both answer these four, and this module must not
+    have to know which one it was handed.
+    """
+    return InterimEvidence(
+        hole_spans=tuple(session.coverage_hole_spans()),
+        speech_spans=tuple(session.interim_speech_spans()),
+        interim_window_end=float(session.interim_window_end or 0.0),
+        endpointing_sec=float(session.endpointing_sec or 0.3),
+    )
+
+
+def covered_spans(segments: Iterable[dict]) -> list[tuple[float, float]]:
+    """The audio the assembled transcript actually accounts for.
+
+    Word spans where a segment carries words — coverage is a property of
+    WORDS, not of message windows, which is the whole finding of audit
+    §3.1 — and the segment's own span where it does not, because for
+    such a segment its span is the only thing knowable about what it
+    contains.
+    """
+    spans: list[tuple[float, float]] = []
+    for seg in segments or []:
+        words = _segment_words(seg)
+        if words:
+            spans.extend(
+                (_as_float(w.get("start")), _as_float(w.get("end"))) for w in words
+            )
+            continue
+        spans.append((_as_float(seg.get("start")), _as_float(seg.get("end"))))
+    return union_spans(spans)
+
+
+def missing_spans(
+    streamed_sec: float,
+    segments: Sequence[dict],
+    evidence: InterimEvidence,
+    stream_death_sec: Optional[float] = None,
+    *,
+    audio_sec: Optional[float] = None,
+    min_span_sec: float = RECOVERY_MIN_SPAN_SEC,
+) -> list[tuple[float, float]]:
+    """The ground this recording's transcript does not account for.
+
+    The MEASUREMENT — exactly the audio no word covers, with no decode
+    padding on it. ``uncovered_spans`` is this same answer widened into
+    something worth handing a decoder; the envelope's
+    ``uncoveredSpeechSec`` is this one, because padding is a decoding
+    concern and reporting it as missing speech would overstate the loss
+    by 0.6 s per hole.
+
+    ``segments`` is the ASSEMBLED transcript — post seam-merge, post
+    interim splice, post dual-stream merge — because what matters is
+    what the user is about to receive, not what any one reading
+    committed. ``audio_sec`` is how much audio the spool actually holds;
+    it exceeds ``streamed_sec`` exactly when the upstream stopped
+    accepting bytes, which is the case rules (c) and (d) exist for.
+
+    Idempotent by construction: every candidate is reduced by
+    ``covered_spans(segments)``, so calling this again on a repaired
+    envelope reports what is genuinely still missing rather than the
+    spans that were just filled.
+    """
+    limit = max(0.0, float(streamed_sec or 0.0), float(audio_sec or 0.0))
+    if limit <= 0.0:
+        return []
+    covered = covered_spans(segments)
+    covered_end = max((end for _s, end in covered), default=0.0)
+
+    candidates: list[tuple[float, float]] = []
+
+    # (a) What the reading itself says it missed.
+    candidates.extend(evidence.hole_spans)
+
+    # (b) The tail past the last committed word, when there is evidence
+    #     something is in it. Same predicate the stop uses to decide
+    #     whether a second Finalize is worth sending, so a tail the stop
+    #     waited for and did not get is exactly the tail this re-decodes.
+    tail = (covered_end, min(limit, max(covered_end, float(streamed_sec or 0.0))))
+    if tail[1] > tail[0]:
+        tail_speech = sum(
+            end - start
+            for start, end in intersect_spans(evidence.speech_spans, [tail])
+        )
+        if tail_needs_flush(
+            tail_speech,
+            evidence.interim_window_end - covered_end,
+            evidence.endpointing_sec,
+        ):
+            candidates.append(tail)
+
+    # (c) Everything after the socket died. Those bytes were never
+    #     offered to Deepgram at all, so there is no "wait longer" that
+    #     could have produced them.
+    if stream_death_sec is not None:
+        death = max(0.0, float(stream_death_sec))
+        if limit > death:
+            candidates.append((death, limit))
+
+    # (d) Nothing at all, for a recording too long to be silence.
+    if not covered and limit >= LIVE_EMPTY_RESULT_MIN_SEC:
+        candidates.append((0.0, limit))
+
+    return [
+        (round(start, 3), round(end, 3))
+        for start, end in subtract_spans(candidates, covered)
+        if end - start >= min_span_sec
+    ]
+
+
+def uncovered_spans(
+    streamed_sec: float,
+    segments: Sequence[dict],
+    evidence: InterimEvidence,
+    stream_death_sec: Optional[float] = None,
+    *,
+    audio_sec: Optional[float] = None,
+    pad_sec: float = RECOVERY_SPAN_PAD_SEC,
+    min_span_sec: float = RECOVERY_MIN_SPAN_SEC,
+) -> list[tuple[float, float]]:
+    """The spans to hand a decoder: ``missing_spans`` widened and merged.
+
+    Each missing span is padded by ``pad_sec`` on both sides, clamped to
+    the audio, and overlapping results are merged — so two holes half a
+    second apart become one decode instead of two, and a decoder is
+    never handed a fragment with no lead-in. The overlap with
+    already-transcribed audio that padding creates is not a duplication
+    risk: ``splice_recovered_words`` drops any recovered word whose
+    ground a committed word already owns.
+    """
+    limit = max(0.0, float(streamed_sec or 0.0), float(audio_sec or 0.0))
+    missing = missing_spans(
+        streamed_sec,
+        segments,
+        evidence,
+        stream_death_sec,
+        audio_sec=audio_sec,
+        min_span_sec=min_span_sec,
+    )
+    if not missing:
+        return []
+    padded = [
+        (max(0.0, start - pad_sec), min(limit, end + pad_sec))
+        for start, end in missing
+    ]
+    return [(round(a, 3), round(b, 3)) for a, b in union_spans(padded) if b > a]
+
+
+def recovery_budget_sec(spans: Sequence[tuple[float, float]]) -> float:
+    """How long the recovery pass may take, for these spans.
+
+    Zero for no spans — the announced stop budget must not grow by a
+    penny on a recording that needs no recovery, which is the
+    overwhelming majority of them.
+    """
+    total = sum(max(0.0, end - start) for start, end in spans)
+    if total <= 0.0:
+        return 0.0
+    return min(
+        RECOVERY_BUDGET_MAX_SEC,
+        RECOVERY_BUDGET_BASE_SEC + RECOVERY_BUDGET_PER_SPAN_SEC * total,
+    )
+
+
+def pcm_span_wav(
+    pcm: bytes, start_sec: float, end_sec: float, sample_rate: int = LIVE_SAMPLE_RATE_HZ
+) -> bytes:
+    """One span of the mono 16 kHz PCM16 spool as a self-contained WAV.
+
+    The spool is headerless raw samples, and the REST endpoint needs a
+    container. Offsets are clamped to the buffer and snapped to whole
+    samples — a WAV whose data length is odd would shift every sample
+    after it by one byte, which is white noise, not audio.
+    """
+    frame_bytes = 2
+    total_frames = len(pcm) // frame_bytes
+    lo = max(0, int(round(max(0.0, start_sec) * sample_rate)))
+    hi = min(total_frames, int(round(max(0.0, end_sec) * sample_rate)))
+    payload = pcm[lo * frame_bytes:max(lo, hi) * frame_bytes]
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(frame_bytes)
+        wav.setframerate(int(sample_rate))
+        wav.writeframes(payload)
+    return buf.getvalue()
+
+
+def _words_from_rest_result(result: Any, offset_sec: float) -> list[dict]:
+    """The word list of a REST response, on the RECORDING's timeline.
+
+    Deepgram times a pre-recorded decode from the start of the audio it
+    was given, and it was given one span — so every word comes back
+    ``offset_sec`` early. Applied here, in the one place a REST word
+    becomes an internal word record, exactly as ``audio_offset_sec``
+    does for a socket that took over mid-recording.
+    """
+    raw = result if isinstance(result, dict) else {}
+    try:
+        alternative = raw["raw"]["results"]["channels"][0]["alternatives"][0]
+    except (KeyError, IndexError, TypeError):
+        return []
+    words = normalize_words(alternative.get("words"))
+    out: list[dict] = []
+    for word in words:
+        out.append(
+            {
+                "word": word["word"],
+                "start": round(word["start"] + offset_sec, 3),
+                "end": round(word["end"] + offset_sec, 3),
+                "source": RECOVERY_SOURCE,
+            }
+        )
+    return out
+
+
+async def recover_spans(
+    pcm_bytes: bytes,
+    spans: Sequence[tuple[float, float]],
+    cfg: DeepgramLiveConfig,
+    *,
+    api_key: str,
+    sample_rate: int = LIVE_SAMPLE_RATE_HZ,
+    budget_sec: Optional[float] = None,
+    transcribe: Optional[Callable[..., dict]] = None,
+) -> list[dict]:
+    """Re-decode ``spans`` of the spool and return the words, time-shifted.
+
+    The REST call is made with the SAME language decision the live
+    stream made — ``resolve_live_language``, so "auto" reaches the
+    pre-recorded endpoint as ``language=multi`` and never as
+    ``detect_language``, which would let the re-decode of a hole read
+    the recording in a different language than the reading it is
+    repairing. Model, key terms and the shared formatting parameters
+    come from the same session config and the same shared modules for
+    the same reason.
+
+    Every span is decoded concurrently under ONE deadline: they are
+    independent uploads of a few dozen kilobytes each, and the budget
+    the renderer was told about bounds the whole pass, not each call.
+    Failure — HTTP error, malformed payload, the budget expiring — is
+    logged once and costs only the spans it touched: the caller ships
+    the envelope without them, and reports them as uncovered.
+    """
+    if not spans or not pcm_bytes or not api_key:
+        return []
+    call = transcribe or deepgram_transcribe
+    language = resolve_live_language(cfg.language)
+    model = cfg.model or DEFAULT_DEEPGRAM_AUDIO_MODEL
+    keyterms = tuple(cfg.keyterms or ())
+    deadline = budget_sec if budget_sec is not None else recovery_budget_sec(spans)
+
+    def _decode(index: int, start: float, end: float) -> list[dict]:
+        wav = pcm_span_wav(pcm_bytes, start, end, sample_rate)
+        result = call(
+            api_key=api_key,
+            audio_bytes=wav,
+            filename=f"recovery-{index}.wav",
+            model=model,
+            language=language,
+            diarize=False,
+            keyterms=keyterms,
+        )
+        return _words_from_rest_result(result, start)
+
+    async def _one(index: int, start: float, end: float) -> list[dict]:
+        return await asyncio.to_thread(_decode, index, start, end)
+
+    tasks = [
+        asyncio.ensure_future(_one(i, start, end))
+        for i, (start, end) in enumerate(spans)
+    ]
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=max(0.1, deadline),
+        )
+    except asyncio.TimeoutError:
+        for task in tasks:
+            task.cancel()
+        logger.warning(
+            "recovery: %d span(s) did not decode within %.2fs; the envelope "
+            "reports them as uncovered",
+            len(spans),
+            max(0.1, deadline),
+        )
+        return []
+
+    words: list[dict] = []
+    failures = 0
+    for result in results:
+        if isinstance(result, BaseException):
+            failures += 1
+            continue
+        words.extend(result)
+    if failures:
+        logger.warning(
+            "recovery: %d of %d span(s) failed to decode; the envelope "
+            "reports them as uncovered",
+            failures,
+            len(spans),
+        )
+    words.sort(key=lambda w: (w["start"], w["end"]))
+    return words
+
+
+def splice_recovered_words(
+    segments: Sequence[dict], words: Sequence[dict]
+) -> tuple[list[dict], int]:
+    """Place recovered words into the assembled transcript by time.
+
+    Two filters before placement, both of them rules this product
+    already has rather than new ones:
+
+    * a recovered word whose ground a committed word already owns is
+      dropped (``covering_final_word``). Spans are decoded with padding,
+      so the re-decode always returns some words the transcript already
+      has, and shipping them would read as a stutter — exactly the
+      failure the splice guard was written for;
+    * placement itself is ``splice_words_into_segments``, the same
+      implementation the interim splice uses, so a recovered word lands
+      the same way whether the hole was found by the live reading or by
+      this pass.
+    """
+    committed = [
+        w for seg in segments for w in _segment_words(seg)
+    ]
+    fresh = [
+        word for word in words
+        if covering_final_word(word, committed) is None
+    ]
+    # Said out loud, both times. A recovery that decodes ten words and
+    # ships none is either working exactly as intended (the padding
+    # returned words the transcript already had) or misfiring, and the
+    # difference is invisible unless the two reasons are counted apart.
+    if len(fresh) != len(words):
+        logger.info(
+            "recovery: %d decoded word(s) already owned by the transcript: %s",
+            len(words) - len(fresh),
+            [str(w.get("word")) for w in words if w not in fresh][:12],
+        )
+    if not fresh:
+        return list(segments), 0
+    outcome = splice_words_into_segments(
+        segments, fresh, source=RECOVERY_SOURCE
+    )
+    if outcome.total != len(fresh):
+        logger.info(
+            "recovery: %d decoded word(s) had no room beside the transcript: %s",
+            len(fresh) - outcome.total,
+            [str(w.get("word")) for w in fresh][:12],
+        )
+    return outcome.segments, outcome.total
+
+
+@dataclass
+class RecoveryReport:
+    """What the recovery pass did, as it appears in ``stats.recovery``."""
+
+    spans: list[tuple[float, float]] = field(default_factory=list)
+    ms: float = 0.0
+    words: int = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "spans": [[round(s, 3), round(e, 3)] for s, e in self.spans],
+            "ms": round(self.ms, 1),
+            "words": int(self.words),
+        }
+
+
+async def run_recovery(
+    *,
+    payload: dict,
+    evidence: InterimEvidence,
+    stream_death_sec: Optional[float],
+    pcm: "bytes | Callable[[], bytes]",
+    audio_sec: Optional[float] = None,
+    cfg: DeepgramLiveConfig,
+    api_key: str,
+    sample_rate: int = LIVE_SAMPLE_RATE_HZ,
+    announce: Optional[Callable[[float], None]] = None,
+    announced_recovery_sec: float = 0.0,
+    transcribe: Optional[Callable[..., dict]] = None,
+) -> dict:
+    """Complete a ``final`` envelope before it is sent. The ONE entry point.
+
+    Takes the envelope the live drain produced (or the skeleton the
+    connect-failure path produced, which has no segments at all),
+    re-decodes whatever it still fails to cover, splices the words in,
+    and returns the envelope with ``text``, ``segments``,
+    ``durationSec``, ``coveredEndSec``, ``uncoveredSpeechSec`` and
+    ``stats.recovery`` all describing the SAME repaired transcript.
+
+    ``announce`` is called with the recovery budget when it exceeds what
+    the stop already announced — the renderer's deadline is re-armable,
+    and a bound it was never told about is not a bound.
+
+    ``pcm`` may be a callable, and then it is only invoked once spans
+    are known to exist. That is what keeps the common stop — the one
+    with nothing to recover — from reading a whole recording's spool
+    into memory to be told it was not needed; pass ``audio_sec``
+    alongside it (from the spool's byte count) so the decision itself
+    costs nothing. Passing the bytes directly is equivalent and is what
+    a caller that already holds the audio does.
+
+    Never raises: a recovery that cannot run leaves the envelope exactly
+    as it arrived, with the spans it could not cover still counted in
+    ``uncoveredSpeechSec``.
+    """
+    started = time.perf_counter()
+    segments = list(payload.get("segments") or [])
+    streamed_sec = float(payload.get("streamedSec") or 0.0)
+    audio: Optional[bytes] = None if callable(pcm) else bytes(pcm)
+    if audio_sec is None:
+        if audio is None:
+            audio = pcm()  # type: ignore[operator]
+        audio_sec = len(audio) / float(2 * max(1, int(sample_rate)))
+
+    spans = uncovered_spans(
+        streamed_sec,
+        segments,
+        evidence,
+        stream_death_sec,
+        audio_sec=audio_sec,
+    )
+    if not spans:
+        logger.info("recovery: none needed")
+        return payload
+    if audio is None:
+        audio = pcm()  # type: ignore[operator]
+    if not audio:
+        logger.info("recovery: no audio spool for this session; envelope unchanged")
+        return payload
+
+    budget = recovery_budget_sec(spans)
+    if announce is not None and budget > announced_recovery_sec:
+        try:
+            announce(budget)
+        except Exception as e:  # never let an announcement break a stop
+            logger.warning("recovery: budget announcement failed: %s", e)
+
+    words = await recover_spans(
+        audio,
+        spans,
+        cfg,
+        api_key=api_key,
+        sample_rate=sample_rate,
+        budget_sec=budget,
+        transcribe=transcribe,
+    )
+    segments, spliced = splice_recovered_words(segments, words)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    total_span_sec = sum(end - start for start, end in spans)
+    logger.info(
+        "recovery: spans=%d total=%.2fs → words=%d in %.0fms",
+        len(spans),
+        total_span_sec,
+        spliced,
+        elapsed_ms,
+    )
+
+    out = dict(payload)
+    out["segments"] = segments
+    out["text"] = join_segment_texts(segments)
+    covered = covered_spans(segments)
+    covered_end = max((end for _s, end in covered), default=0.0)
+    out["durationSec"] = round(covered_end, 3)
+    out["coveredEndSec"] = round(covered_end, 3)
+    # Re-asked, not adjusted: whatever this function would still call
+    # uncovered IS what is still uncovered, so the number the envelope
+    # reports and the decision the recovery made can never drift apart.
+    residual = missing_spans(
+        streamed_sec, segments, evidence, stream_death_sec, audio_sec=audio_sec
+    )
+    out["uncoveredSpeechSec"] = round(
+        sum(end - start for start, end in residual), 3
+    )
+    stats = dict(payload.get("stats") or {})
+    stats["recovery"] = RecoveryReport(
+        spans=list(spans), ms=elapsed_ms, words=spliced
+    ).as_dict()
+    out["stats"] = stats
+    return out
+
+
+__all__ = [
+    "LIVE_EMPTY_RESULT_MIN_SEC",
+    "RECOVERY_BUDGET_MAX_SEC",
+    "RECOVERY_MIN_SPAN_SEC",
+    "RECOVERY_SOURCE",
+    "RECOVERY_SPAN_PAD_SEC",
+    "InterimEvidence",
+    "RecoveryReport",
+    "covered_spans",
+    "evidence_from_session",
+    "missing_spans",
+    "pcm_span_wav",
+    "recover_spans",
+    "recovery_budget_sec",
+    "run_recovery",
+    "splice_recovered_words",
+    "uncovered_spans",
+]

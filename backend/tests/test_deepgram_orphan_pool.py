@@ -306,7 +306,7 @@ class OrphanPoolTests(unittest.TestCase):
         (0.05 s gap, no time overlap, so rule 1 leaves it genuinely
         uncovered — same word, re-decoded a beat later) and became the
         first word of a brand-new fallback segment right after it. The
-        per-final neighbour guard on ``_insert_word_into_segment`` never
+        per-final neighbour guard on ``insert_word_into_segment`` never
         saw this pair, because the recovered word has no host final —
         it is a NEW segment sitting at a seam, not an insertion into an
         existing one. The seam guard closes exactly that gap: the

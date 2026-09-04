@@ -1,0 +1,820 @@
+"""The backend owns recovery: the envelope is complete before it is sent.
+
+Covers ``backend.deepgram_recovery`` — which spans a live reading still
+fails to cover, how they are re-decoded from the session's own audio
+spool, and how the words land in the envelope — plus the two places
+``backend.main`` wires it in (the normal stop and the connect failure
+that used to ship an empty envelope and leave the recording to the
+renderer).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import io
+import json
+import os
+import struct
+import sys
+import tempfile
+import unittest
+import wave
+from pathlib import Path
+from unittest import mock
+
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.deepgram_recovery import (
+    LIVE_EMPTY_RESULT_MIN_SEC,
+    RECOVERY_BUDGET_BASE_SEC,
+    RECOVERY_BUDGET_MAX_SEC,
+    RECOVERY_BUDGET_PER_SPAN_SEC,
+    RECOVERY_SOURCE,
+    RECOVERY_SPAN_PAD_SEC,
+    InterimEvidence,
+    covered_spans,
+    pcm_span_wav,
+    recover_spans,
+    recovery_budget_sec,
+    run_recovery,
+    splice_recovered_words,
+    uncovered_spans,
+)
+from backend.remote_deepgram_live import DeepgramLiveConfig
+
+
+def _pcm(seconds: float, value: int = 1000) -> bytes:
+    """``seconds`` of a constant-valued 16 kHz mono PCM16 buffer."""
+    frames = int(seconds * LIVE_SAMPLE_RATE_HZ)
+    return struct.pack(f"<{frames}h", *([value] * frames))
+
+
+def _ramp_pcm(frames: int) -> bytes:
+    """PCM whose every sample is distinguishable, for slicing assertions."""
+    return struct.pack(f"<{frames}h", *[(i % 3000) - 1500 for i in range(frames)])
+
+
+def _segment(start: float, end: float, words: list[tuple[str, float, float]]) -> dict:
+    return {
+        "start": start,
+        "end": end,
+        "text": " ".join(w for w, _s, _e in words),
+        "is_final": True,
+        "speech_final": True,
+        "words": [
+            {"word": w, "start": s, "end": e} for w, s, e in words
+        ],
+    }
+
+
+def _rest_result(words: list[tuple[str, float, float]]) -> dict:
+    """A Deepgram pre-recorded response carrying exactly these words."""
+    return {
+        "text": " ".join(w for w, _s, _e in words),
+        "raw": {
+            "results": {
+                "channels": [
+                    {
+                        "alternatives": [
+                            {
+                                "transcript": " ".join(w for w, _s, _e in words),
+                                "words": [
+                                    {"word": w, "start": s, "end": e}
+                                    for w, s, e in words
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+    }
+
+
+class UncoveredSpanTests(unittest.TestCase):
+    """R1 (a)-(d): what counts as a span that still needs re-decoding."""
+
+    def test_a_word_level_hole_inside_a_covered_final_becomes_a_span(self):
+        # Audit §3.4: contiguous finals leave no gap to measure, so a
+        # word the final simply failed to transcribe disappears without
+        # trace unless coverage is measured word by word.
+        segments = [
+            _segment(0.0, 10.0, [("начало", 0.0, 5.0), ("конец", 5.6, 10.0)]),
+        ]
+        spans = uncovered_spans(
+            10.0,
+            segments,
+            InterimEvidence(hole_spans=((5.0, 5.6),)),
+            None,
+        )
+        self.assertEqual(spans, [(4.7, 5.9)])
+
+    def test_b_voiced_tail_past_the_last_final_becomes_a_span(self):
+        segments = [_segment(0.0, 8.0, [("слово", 0.0, 8.0)])]
+        spans = uncovered_spans(
+            10.0,
+            segments,
+            InterimEvidence(speech_spans=((8.2, 9.0),)),
+            None,
+        )
+        self.assertEqual(spans, [(7.7, 10.0)])
+
+    def test_b_tail_whose_decoder_still_reaches_past_the_final_becomes_a_span(self):
+        # The second kind of evidence in ``tail_needs_flush``: no
+        # recognised words yet, but Deepgram's own decode window is
+        # still working audio past the last final.
+        segments = [_segment(0.0, 8.0, [("слово", 0.0, 8.0)])]
+        spans = uncovered_spans(
+            10.0,
+            segments,
+            InterimEvidence(interim_window_end=8.9, endpointing_sec=0.3),
+            None,
+        )
+        self.assertEqual(spans, [(7.7, 10.0)])
+
+    def test_b_silent_tail_is_not_a_span(self):
+        # Audit §5: 83 of 84 uncovered-but-unvoiced tails produced
+        # nothing when waited for. Re-decoding them would be the same
+        # mistake with a REST bill attached.
+        segments = [_segment(0.0, 8.0, [("слово", 0.0, 8.0)])]
+        spans = uncovered_spans(
+            10.0,
+            segments,
+            InterimEvidence(interim_window_end=7.5, endpointing_sec=0.3),
+            None,
+        )
+        self.assertEqual(spans, [])
+
+    def test_c_everything_after_the_socket_died_is_a_span(self):
+        segments = [_segment(0.0, 6.0, [("слово", 0.0, 6.0)])]
+        spans = uncovered_spans(
+            6.0,
+            segments,
+            InterimEvidence(),
+            6.0,
+            audio_sec=12.0,
+        )
+        self.assertEqual(spans, [(5.7, 12.0)])
+
+    def test_c_death_span_shrinks_to_nothing_once_recovery_has_covered_it(self):
+        # Idempotence: re-asking after the repair must not re-decode the
+        # ground the repair just filled, or the envelope's own
+        # ``uncoveredSpeechSec`` would never fall to zero.
+        segments = [_segment(0.0, 12.0, [("всё", 0.0, 12.0)])]
+        spans = uncovered_spans(
+            6.0, segments, InterimEvidence(), 6.0, audio_sec=12.0
+        )
+        self.assertEqual(spans, [])
+
+    def test_d_no_finals_at_all_recovers_the_whole_recording(self):
+        spans = uncovered_spans(0.0, [], InterimEvidence(), None, audio_sec=5.0)
+        self.assertEqual(spans, [(0.0, 5.0)])
+
+    def test_d_too_short_to_be_a_failure_is_left_alone(self):
+        spans = uncovered_spans(
+            0.0, [], InterimEvidence(), None,
+            audio_sec=LIVE_EMPTY_RESULT_MIN_SEC - 0.5,
+        )
+        self.assertEqual(spans, [])
+
+    def test_adjacent_spans_merge_after_padding(self):
+        segments = [_segment(0.0, 10.0, [("a", 0.0, 3.0), ("b", 4.2, 10.0)])]
+        spans = uncovered_spans(
+            10.0,
+            segments,
+            InterimEvidence(hole_spans=((3.0, 3.4), (3.8, 4.2))),
+            None,
+        )
+        self.assertEqual(spans, [(2.7, 4.5)])
+
+    def test_padding_is_clamped_to_the_audio_at_both_ends(self):
+        segments = [_segment(0.0, 4.0, [("a", 0.0, 0.05), ("b", 0.4, 4.0)])]
+        spans = uncovered_spans(
+            4.0,
+            segments,
+            InterimEvidence(hole_spans=((0.05, 0.4),)),
+            None,
+            audio_sec=4.0,
+        )
+        self.assertEqual(spans, [(0.0, 0.7)])
+        self.assertGreaterEqual(spans[0][0], 0.0)
+
+    def test_a_sliver_shorter_than_a_word_is_not_worth_a_round_trip(self):
+        segments = [_segment(0.0, 10.0, [("a", 0.0, 5.0), ("b", 5.05, 10.0)])]
+        spans = uncovered_spans(
+            10.0,
+            segments,
+            InterimEvidence(hole_spans=((5.0, 5.05),)),
+            None,
+        )
+        self.assertEqual(spans, [])
+
+    def test_padding_constant_is_the_one_applied(self):
+        segments = [_segment(0.0, 10.0, [("a", 0.0, 4.0), ("b", 5.0, 10.0)])]
+        spans = uncovered_spans(
+            10.0, segments, InterimEvidence(hole_spans=((4.0, 5.0),)), None
+        )
+        self.assertEqual(
+            spans, [(round(4.0 - RECOVERY_SPAN_PAD_SEC, 3),
+                     round(5.0 + RECOVERY_SPAN_PAD_SEC, 3))]
+        )
+
+    def test_a_segment_without_words_still_covers_its_own_span(self):
+        # For such a segment its span is the only thing knowable about
+        # what it contains, so it must not read as uncovered ground.
+        segments = [{"start": 0.0, "end": 9.0, "text": "нет слов", "is_final": True}]
+        self.assertEqual(covered_spans(segments), [(0.0, 9.0)])
+        self.assertEqual(
+            uncovered_spans(9.0, segments, InterimEvidence(), None), []
+        )
+
+
+class RecoveryBudgetTests(unittest.TestCase):
+    def test_no_spans_costs_the_stop_nothing(self):
+        self.assertEqual(recovery_budget_sec([]), 0.0)
+
+    def test_budget_grows_with_the_audio_being_decoded(self):
+        self.assertAlmostEqual(
+            recovery_budget_sec([(0.0, 2.0)]),
+            RECOVERY_BUDGET_BASE_SEC + 2.0 * RECOVERY_BUDGET_PER_SPAN_SEC,
+        )
+        self.assertAlmostEqual(
+            recovery_budget_sec([(0.0, 2.0), (5.0, 7.0)]),
+            RECOVERY_BUDGET_BASE_SEC + 4.0 * RECOVERY_BUDGET_PER_SPAN_SEC,
+        )
+
+    def test_budget_is_hard_capped(self):
+        self.assertEqual(
+            recovery_budget_sec([(0.0, 600.0)]), RECOVERY_BUDGET_MAX_SEC
+        )
+
+
+class PcmSliceTests(unittest.TestCase):
+    def test_span_wav_carries_exactly_the_requested_samples(self):
+        pcm = _ramp_pcm(LIVE_SAMPLE_RATE_HZ * 2)
+        wav_bytes = pcm_span_wav(pcm, 0.5, 1.0)
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+            self.assertEqual(wav.getnchannels(), 1)
+            self.assertEqual(wav.getsampwidth(), 2)
+            self.assertEqual(wav.getframerate(), LIVE_SAMPLE_RATE_HZ)
+            frames = wav.readframes(wav.getnframes())
+        expected = pcm[
+            int(0.5 * LIVE_SAMPLE_RATE_HZ) * 2: int(1.0 * LIVE_SAMPLE_RATE_HZ) * 2
+        ]
+        self.assertEqual(frames, expected)
+
+    def test_span_wav_clamps_to_the_buffer(self):
+        pcm = _ramp_pcm(1000)
+        wav_bytes = pcm_span_wav(pcm, -5.0, 99.0)
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+            frames = wav.readframes(wav.getnframes())
+        self.assertEqual(frames, pcm)
+
+    def test_span_wav_never_produces_an_odd_data_length(self):
+        # A WAV whose data length is odd shifts every sample after it by
+        # one byte, which is white noise rather than audio.
+        pcm = _ramp_pcm(777)
+        for start, end in ((0.0, 0.0123), (0.011, 0.033), (0.0, 1.0)):
+            with self.subTest(span=(start, end)):
+                wav_bytes = pcm_span_wav(pcm, start, end)
+                with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+                    self.assertEqual(len(wav.readframes(wav.getnframes())) % 2, 0)
+
+
+class RecoverSpansTests(unittest.IsolatedAsyncioTestCase):
+    async def test_words_come_back_offset_onto_the_recordings_timeline(self):
+        calls: list[dict] = []
+
+        def fake_rest(**kwargs):
+            calls.append(kwargs)
+            return _rest_result([("субагента", 0.2, 0.8)])
+
+        words = await recover_spans(
+            _pcm(12.0),
+            [(5.0, 6.0)],
+            DeepgramLiveConfig(language="auto"),
+            api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertEqual(len(words), 1)
+        self.assertEqual(words[0]["word"], "субагента")
+        self.assertAlmostEqual(words[0]["start"], 5.2)
+        self.assertAlmostEqual(words[0]["end"], 5.8)
+        self.assertEqual(words[0]["source"], RECOVERY_SOURCE)
+        self.assertEqual(len(calls), 1)
+
+    async def test_the_live_language_decision_is_reused_verbatim(self):
+        # "auto" is a UI word. The live stream sends ``language=multi``;
+        # a REST re-decode that fell back to ``detect_language`` would
+        # read the hole in a different language than the reading it is
+        # repairing.
+        seen: list[str] = []
+
+        def fake_rest(**kwargs):
+            seen.append(kwargs["language"])
+            return _rest_result([])
+
+        for configured, expected in (("auto", "multi"), ("", "multi"), ("ru", "ru")):
+            with self.subTest(language=configured):
+                seen.clear()
+                await recover_spans(
+                    _pcm(4.0),
+                    [(0.0, 1.0)],
+                    DeepgramLiveConfig(language=configured),
+                    api_key="dg",
+                    transcribe=fake_rest,
+                )
+                self.assertEqual(seen, [expected])
+
+    async def test_keyterms_and_model_travel_with_the_call(self):
+        seen: list[dict] = []
+
+        def fake_rest(**kwargs):
+            seen.append(kwargs)
+            return _rest_result([])
+
+        await recover_spans(
+            _pcm(4.0),
+            [(0.0, 1.0)],
+            DeepgramLiveConfig(model="nova-3", keyterms=("Sonnet", "субагент")),
+            api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertEqual(seen[0]["model"], "nova-3")
+        self.assertEqual(seen[0]["keyterms"], ("Sonnet", "субагент"))
+        self.assertFalse(seen[0]["diarize"])
+
+    async def test_a_failing_span_costs_only_itself(self):
+        def fake_rest(**kwargs):
+            if kwargs["filename"].endswith("-0.wav"):
+                raise RuntimeError("Deepgram API error (HTTP 503)")
+            return _rest_result([("второй", 0.1, 0.4)])
+
+        words = await recover_spans(
+            _pcm(12.0),
+            [(1.0, 2.0), (6.0, 7.0)],
+            DeepgramLiveConfig(),
+            api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertEqual([w["word"] for w in words], ["второй"])
+
+    async def test_the_budget_is_a_deadline_not_a_suggestion(self):
+        def slow_rest(**kwargs):
+            import time as _time
+
+            _time.sleep(1.0)
+            return _rest_result([("поздно", 0.1, 0.4)])
+
+        words = await recover_spans(
+            _pcm(12.0),
+            [(1.0, 2.0)],
+            DeepgramLiveConfig(),
+            api_key="dg",
+            budget_sec=0.15,
+            transcribe=slow_rest,
+        )
+        self.assertEqual(words, [])
+
+    async def test_no_key_means_no_call(self):
+        def fake_rest(**kwargs):  # pragma: no cover - must never run
+            raise AssertionError("REST must not be called without a key")
+
+        self.assertEqual(
+            await recover_spans(
+                _pcm(4.0), [(0.0, 1.0)], DeepgramLiveConfig(),
+                api_key="", transcribe=fake_rest,
+            ),
+            [],
+        )
+
+
+class SpliceRecoveredWordsTests(unittest.TestCase):
+    def test_a_word_inside_a_final_is_put_back_at_its_time_position(self):
+        segments = [
+            _segment(4.91, 9.70, [("три", 4.91, 5.3), ("на", 6.4, 6.8)]),
+        ]
+        out, spliced = splice_recovered_words(
+            segments,
+            [{"word": "субагента", "start": 5.5, "end": 6.1, "source": RECOVERY_SOURCE}],
+        )
+        self.assertEqual(spliced, 1)
+        self.assertEqual(out[0]["text"], "три субагента на")
+        placed = [w for w in out[0]["words"] if w["word"] == "субагента"][0]
+        self.assertEqual(placed["source"], RECOVERY_SOURCE)
+
+    def test_a_word_outside_every_final_becomes_its_own_segment(self):
+        segments = [_segment(0.0, 3.0, [("начало", 0.0, 3.0)])]
+        out, spliced = splice_recovered_words(
+            segments,
+            [{"word": "хвост", "start": 6.0, "end": 6.6, "source": RECOVERY_SOURCE}],
+        )
+        self.assertEqual(spliced, 1)
+        self.assertEqual(out[-1]["source"], RECOVERY_SOURCE)
+        self.assertEqual(out[-1]["text"], "хвост")
+
+    def test_a_word_the_transcript_already_owns_is_dropped(self):
+        # Spans are decoded with padding, so the re-decode always
+        # returns words the transcript already has. Shipping them reads
+        # as a stutter.
+        segments = [_segment(0.0, 3.0, [("привет", 1.0, 1.6)])]
+        out, spliced = splice_recovered_words(
+            segments,
+            [{"word": "Привет,", "start": 1.02, "end": 1.58, "source": RECOVERY_SOURCE}],
+        )
+        self.assertEqual(spliced, 0)
+        self.assertEqual(out[0]["text"], "привет")
+
+
+class RunRecoveryEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nothing_to_do_leaves_the_envelope_untouched(self):
+        payload = {
+            "type": "final",
+            "text": "всё на месте",
+            "segments": [_segment(0.0, 4.0, [("всё", 0.0, 1.0), ("на", 1.0, 2.0),
+                                             ("месте", 2.0, 4.0)])],
+            "streamedSec": 4.0,
+            "stats": {"bytes_sent": 1},
+        }
+
+        def fake_rest(**kwargs):  # pragma: no cover - must never run
+            raise AssertionError("no recovery was needed")
+
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(),
+            stream_death_sec=None,
+            pcm=_pcm(4.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertIs(out, payload)
+        self.assertNotIn("recovery", out.get("stats", {}))
+
+    async def test_a_hole_is_re_decoded_and_reported_in_stats(self):
+        payload = {
+            "type": "final",
+            "text": "три на",
+            "segments": [_segment(4.91, 9.70, [("три", 4.91, 5.3), ("на", 6.4, 6.8)])],
+            "streamedSec": 9.7,
+            "stats": {"bytes_sent": 10},
+        }
+        announced: list[float] = []
+
+        def fake_rest(**kwargs):
+            # Placed to cover the hole exactly, so nothing is left over.
+            return _rest_result([("субагента", 0.3, 0.9)])
+
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(hole_spans=((5.5, 6.1),)),
+            stream_death_sec=None,
+            pcm=_pcm(10.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            announce=announced.append,
+            transcribe=fake_rest,
+        )
+        self.assertIn("субагента", out["text"])
+        self.assertEqual(out["text"], "три субагента на")
+        report = out["stats"]["recovery"]
+        self.assertEqual(report["words"], 1)
+        self.assertEqual(report["spans"], [[5.2, 6.4]])
+        self.assertGreaterEqual(report["ms"], 0.0)
+        # The recovery budget was not part of the drain's announcement,
+        # so a second one has to carry it.
+        self.assertEqual(len(announced), 1)
+        self.assertAlmostEqual(announced[0], recovery_budget_sec([(5.2, 6.4)]))
+        # And what the envelope now reports as uncovered is what this
+        # module would still call uncovered — one answer, not two.
+        self.assertEqual(out["uncoveredSpeechSec"], 0.0)
+
+    async def test_the_envelope_reports_what_recovery_could_not_reach(self):
+        payload = {
+            "type": "final",
+            "text": "начало",
+            "segments": [_segment(0.0, 3.0, [("начало", 0.0, 3.0)])],
+            "streamedSec": 3.0,
+            "stats": {},
+        }
+
+        def failing_rest(**kwargs):
+            raise RuntimeError("Deepgram API error (HTTP 500)")
+
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(),
+            stream_death_sec=3.0,
+            pcm=_pcm(9.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            transcribe=failing_rest,
+        )
+        self.assertEqual(out["text"], "начало")
+        self.assertEqual(out["stats"]["recovery"]["words"], 0)
+        # Honest, not silent: the span that failed is still declared.
+        self.assertGreater(out["uncoveredSpeechSec"], 5.0)
+
+    async def test_an_already_announced_budget_is_not_announced_twice(self):
+        payload = {
+            "type": "final",
+            "text": "",
+            "segments": [],
+            "streamedSec": 0.0,
+            "stats": {},
+        }
+        announced: list[float] = []
+        spans = uncovered_spans(0.0, [], InterimEvidence(), 0.0, audio_sec=4.0)
+
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(),
+            stream_death_sec=0.0,
+            pcm=_pcm(4.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            announce=announced.append,
+            announced_recovery_sec=recovery_budget_sec(spans),
+            transcribe=lambda **kw: _rest_result([("привет", 0.5, 1.0)]),
+        )
+        self.assertEqual(announced, [])
+        self.assertEqual(out["text"], "привет")
+
+    async def test_whole_recording_recovery_produces_a_non_empty_envelope(self):
+        # The connect-failure shape, at the module level: no reading, no
+        # segments, and every captured byte unseen by Deepgram.
+        payload = {
+            "type": "final",
+            "text": "",
+            "segments": [],
+            "durationSec": 0.0,
+            "streamedSec": 0.0,
+            "coveredEndSec": 0.0,
+            "uncoveredSpeechSec": 0.0,
+            "error": "connect failed",
+            "stats": {},
+        }
+        out = await run_recovery(
+            payload=payload,
+            evidence=InterimEvidence(),
+            stream_death_sec=0.0,
+            pcm=_pcm(6.0),
+            cfg=DeepgramLiveConfig(),
+            api_key="dg",
+            transcribe=lambda **kw: _rest_result(
+                [("так", 0.5, 0.9), ("слушай", 1.0, 1.6)]
+            ),
+        )
+        self.assertEqual(out["text"], "так слушай")
+        self.assertEqual(out["stats"]["recovery"]["words"], 2)
+        self.assertEqual(out["stats"]["recovery"]["spans"], [[0.0, 6.0]])
+        self.assertEqual(out["coveredEndSec"], 1.6)
+        self.assertEqual(out["durationSec"], 1.6)
+        self.assertEqual(
+            [w.get("source") for seg in out["segments"] for w in seg["words"]],
+            [RECOVERY_SOURCE, RECOVERY_SOURCE],
+        )
+        # The failure that produced this envelope is still declared.
+        self.assertEqual(out["error"], "connect failed")
+
+
+class _FakeWebSocket:
+    def __init__(self):
+        self.messages: "asyncio.Queue[dict]" = asyncio.Queue()
+        self.sent: list[dict] = []
+
+    async def receive(self):
+        return await self.messages.get()
+
+    async def send_text(self, text):
+        self.sent.append(json.loads(text))
+
+
+class _FakeStats:
+    bytes_sent = 0
+    bytes_offered = 0
+    chunks_sent = 0
+    segments_final = 0
+    segments_interim = 0
+    connect_ms = None
+    finalize_ms = None
+
+    def as_dict(self):
+        return {}
+
+
+class LiveSessionRecoveryWiringTests(unittest.IsolatedAsyncioTestCase):
+    """R3: the connect-failure path recovers the recording itself.
+
+    It used to send ``{"text": "", "segments": []}`` and return while
+    the microphone was still open (audit §3.7 — a 12 s connect timeout
+    with 126 s dictated into a dead stream), leaving the transcript to a
+    renderer-side REST pass that no longer exists.
+    """
+
+    def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
+        os.environ["TRANSCRIPTOR_DATA_DIR"] = self._tmp.name
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        self.main = importlib.import_module("backend.main")
+
+    def tearDown(self):
+        try:
+            self.main.jobs.shutdown(timeout=0.1)
+        except Exception:
+            pass
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
+        self._tmp.cleanup()
+
+    def _spool(self) -> dict:
+        pcm_path = Path(self._tmp.name) / "spool.pcm16"
+        handle = pcm_path.open("wb", buffering=0)
+        return {
+            "session_id": "s",
+            "pcm_path": pcm_path,
+            "meta_path": Path(self._tmp.name) / "spool.json",
+            "pcm_file": handle,
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+
+    async def test_a_failed_connect_still_delivers_a_transcript(self):
+        main = self.main
+        release_connect = asyncio.Event()
+
+        class FailingConnectSession:
+            def __init__(self, *_a, **_kw):
+                self.stats = _FakeStats()
+
+            async def connect(self):
+                await release_connect.wait()
+                raise main.DeepgramLiveError("simulated connect failure")
+
+        ws = _FakeWebSocket()
+        recovery = self._spool()
+        audio = _pcm(4.0)
+        rest_calls: list[dict] = []
+
+        def fake_rest(**kwargs):
+            rest_calls.append(kwargs)
+            return _rest_result([("так", 0.5, 0.9), ("слушай", 1.0, 1.6)])
+
+        try:
+            with mock.patch.object(main, "DeepgramLiveSession", FailingConnectSession), \
+                    mock.patch(
+                        "backend.deepgram_recovery.deepgram_transcribe", fake_rest
+                    ):
+                task = asyncio.create_task(main._run_deepgram_live_session(
+                    websocket=ws,
+                    api_key="dg",
+                    model="nova-3",
+                    language="auto",
+                    diarize=False,
+                    recovery=recovery,
+                ))
+                await asyncio.sleep(0.01)
+                await ws.messages.put(
+                    {"type": "websocket.receive", "bytes": audio}
+                )
+                await asyncio.sleep(0.01)
+                release_connect.set()
+                # The user is still talking: the handler must keep
+                # reading (and spooling) rather than return an empty
+                # envelope the moment connect failed.
+                await asyncio.sleep(0.05)
+                self.assertFalse(task.done())
+                await ws.messages.put({
+                    "type": "websocket.receive",
+                    "text": json.dumps({"type": "finalize"}),
+                })
+                await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            recovery["pcm_file"].close()
+
+        self.assertTrue(recovery["had_error"])
+        self.assertEqual(recovery["bytes"], len(audio))
+        types = [m["type"] for m in ws.sent]
+        self.assertEqual(types[0], "error")
+        self.assertEqual(types[-1], "final")
+        # The renderer is told how long this stop may now take.
+        self.assertIn("finalizing", types)
+        envelope = ws.sent[-1]
+        self.assertEqual(envelope["text"], "так слушай")
+        self.assertEqual(envelope["stats"]["recovery"]["words"], 2)
+        self.assertTrue(envelope["error"])
+        # Same language decision the dead live stream would have used.
+        self.assertEqual(rest_calls[0]["language"], "multi")
+
+    async def test_a_connect_failure_with_no_spool_still_answers(self):
+        main = self.main
+        release_connect = asyncio.Event()
+
+        class FailingConnectSession:
+            def __init__(self, *_a, **_kw):
+                self.stats = _FakeStats()
+
+            async def connect(self):
+                await release_connect.wait()
+                raise main.DeepgramLiveError("simulated connect failure")
+
+        ws = _FakeWebSocket()
+        recovery = {
+            "pcm_file": io.BytesIO(),
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+        with mock.patch.object(main, "DeepgramLiveSession", FailingConnectSession):
+            task = asyncio.create_task(main._run_deepgram_live_session(
+                websocket=ws,
+                api_key="dg",
+                model="nova-3",
+                language="auto",
+                diarize=False,
+                recovery=recovery,
+            ))
+            await asyncio.sleep(0.01)
+            release_connect.set()
+            await ws.messages.put({
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "finalize"}),
+            })
+            await asyncio.wait_for(task, timeout=5.0)
+
+        self.assertEqual([m["type"] for m in ws.sent], ["error", "final"])
+        self.assertEqual(ws.sent[-1]["text"], "")
+
+
+class RecoverySpoolReadTests(unittest.TestCase):
+    """R4: the PCM must be available and complete at finalize."""
+
+    def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
+        os.environ["TRANSCRIPTOR_DATA_DIR"] = self._tmp.name
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        self.main = importlib.import_module("backend.main")
+
+    def tearDown(self):
+        try:
+            self.main.jobs.shutdown(timeout=0.1)
+        except Exception:
+            pass
+        for name in ("backend.main", "backend.config"):
+            sys.modules.pop(name, None)
+        os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
+        self._tmp.cleanup()
+
+    def test_the_spool_is_readable_while_the_writer_still_holds_it(self):
+        main = self.main
+        pcm_path = Path(self._tmp.name) / "s.pcm16"
+        handle = pcm_path.open("wb", buffering=0)
+        recovery = {
+            "pcm_path": pcm_path,
+            "meta_path": Path(self._tmp.name) / "s.json",
+            "pcm_file": handle,
+            "bytes": 0,
+            "chunks": 0,
+            "had_error": False,
+        }
+        try:
+            main._record_recovery_chunk(recovery, b"\x01\x02\x03\x04")
+            main._record_recovery_chunk(recovery, b"\x05\x06")
+            self.assertEqual(
+                main._recovery_spool_bytes(recovery), b"\x01\x02\x03\x04\x05\x06"
+            )
+        finally:
+            handle.close()
+
+    def test_no_spool_reads_as_no_audio(self):
+        self.assertEqual(self.main._recovery_spool_bytes(None), b"")
+        self.assertEqual(self.main._recovery_spool_bytes({}), b"")
+
+    def test_an_oversized_spool_is_refused_rather_than_read(self):
+        main = self.main
+        pcm_path = Path(self._tmp.name) / "big.pcm16"
+        pcm_path.write_bytes(b"\x00\x00")
+        recovery = {"pcm_path": pcm_path}
+        with mock.patch.object(main, "MAX_RECOVERY_READ_BYTES", 1):
+            self.assertEqual(main._recovery_spool_bytes(recovery), b"")
+
+
+if __name__ == "__main__":
+    unittest.main()

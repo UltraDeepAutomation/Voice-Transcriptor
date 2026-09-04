@@ -86,6 +86,14 @@ from backend.deepgram_dual import (
     dual_stream_enabled,
     secondary_config,
 )
+from backend.deepgram_recovery import (
+    LIVE_EMPTY_RESULT_MIN_SEC,
+    InterimEvidence,
+    evidence_from_session,
+    recovery_budget_sec,
+    run_recovery,
+    uncovered_spans,
+)
 from backend.deepgram_warm import (
     WARM_KEEPALIVE_INTERVAL_SEC,
     DeepgramWarmPool,
@@ -2866,11 +2874,6 @@ DEFAULT_AUDIO_RETENTION_POLICY = AUDIO_RETENTION_POLICIES[RECORDING_COLLECTION_L
 # fortnight keeps every file that aged out while it was up. (Count
 # limits are naturally enforced on every save.) Hourly is far finer
 # than a 7-day window needs and costs one directory listing per dir.
-# Below this much streamed audio, "no final segments" is an ordinary
-# outcome — a hotkey pressed and released, a moment of silence — not a
-# failure worth a warning.
-LIVE_EMPTY_RESULT_MIN_SEC = 2.0
-
 AUDIO_RETENTION_SWEEP_INTERVAL_SEC = max(
     60, _env_int("TRANSCRIPTOR_AUDIO_RETENTION_SWEEP_SEC", 3600)
 )
@@ -4073,6 +4076,196 @@ def _finalize_live_recovery(recovery: dict) -> None:
         logger.warning("live recovery meta write failed: %s", e)
 
 
+# How much spool PCM the finalize-time recovery pass will hold in memory
+# at once. 128 MB is 68 minutes of 16 kHz mono PCM16 — an order of
+# magnitude past the longest dictation this app is built for, and the
+# point past which reading a whole spool to repair a few seconds of it
+# costs more than the repair is worth. Above it the recovery is skipped
+# with a warning and the spans it would have covered stay declared in
+# the envelope's ``uncoveredSpeechSec``, which is what makes the skip
+# visible rather than silent.
+MAX_RECOVERY_READ_BYTES = 128 * 1024 * 1024
+
+
+def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
+    """The PCM this recording captured, read back from its own spool.
+
+    The backend now owns recovery (audit §2.2/§3.7): the ``final``
+    envelope is completed from this audio before it is sent, instead of
+    the renderer racing its own REST pass against it. That is only
+    possible because the spool is complete and readable AT FINALIZE:
+
+    * every binary frame is written to it as it arrives — by the
+      pre-connect reader, by the receiver, and by the finalize drain, so
+      audio captured while ``connect()`` was still in flight (or after
+      the upstream died) is in it too;
+    * the file is opened UNBUFFERED (``_open_live_recovery``), so
+      everything ``_record_recovery_chunk`` accepted is already visible
+      to this read even though the writer still holds the handle;
+    * it is deleted only by ``_finalize_live_recovery``, which the
+      WebSocket handler runs in its ``finally`` — strictly after the
+      envelope has been sent.
+
+    Returns ``b""`` — never raises — when there is no spool, when it is
+    unreadable, or when it is larger than this process will read at
+    once. The caller then ships the envelope unrepaired, with the
+    uncovered spans still declared.
+    """
+    if not recovery:
+        return b""
+    pcm_path = recovery.get("pcm_path")
+    if pcm_path is None:
+        return b""
+    try:
+        size = Path(pcm_path).stat().st_size
+    except OSError as e:
+        logger.warning("live recovery spool not readable at finalize: %s", e)
+        return b""
+    if size > MAX_RECOVERY_READ_BYTES:
+        logger.warning(
+            "live recovery spool is %d B (> %d B); skipping finalize-time "
+            "recovery for this session",
+            size,
+            MAX_RECOVERY_READ_BYTES,
+        )
+        return b""
+    try:
+        data = Path(pcm_path).read_bytes()
+    except OSError as e:
+        logger.warning("live recovery spool read failed at finalize: %s", e)
+        return b""
+    if len(data) % 2:
+        # A 16-bit sample split across the read boundary would shift
+        # every sample after it; drop the odd trailing byte instead.
+        data = data[:-1]
+    return data
+
+
+def _recovery_spool_seconds(recovery: Optional[dict]) -> float:
+    """How much audio the spool holds, without reading it.
+
+    The size on disk rather than the ``bytes`` counter: a partial write
+    (``_record_recovery_chunk`` marks the session degraded and keeps
+    going) leaves the two disagreeing, and the recovery pass must
+    measure the audio it can actually read.
+    """
+    if not recovery:
+        return 0.0
+    pcm_path = recovery.get("pcm_path")
+    if pcm_path is None:
+        return 0.0
+    try:
+        size = Path(pcm_path).stat().st_size
+    except OSError:
+        return 0.0
+    return (size - size % 2) / float(2 * LIVE_SAMPLE_RATE_HZ)
+
+
+def _finalizing_payload(budget_sec: float, expects_more: bool) -> dict:
+    """The ``finalizing`` announcement, built in ONE place.
+
+    Both announcements a stop can make — the drain's budget and the
+    extension the recovery pass may need — are the same message with the
+    same meaning to the renderer (a re-armable deadline measured from
+    the start of its wait), so they are built by one function rather
+    than typed out twice with a chance of diverging.
+    """
+    return {
+        "type": "finalizing",
+        "budgetMs": int(round(max(0.0, budget_sec) * 1000)),
+        "expectsMore": bool(expects_more),
+    }
+
+
+def _predicted_recovery_budget_sec(session: Any, spool_sec: float) -> float:
+    """The recovery budget this stop looks like it will need, announced early.
+
+    Asked at the moment the drain announces its own budget, from
+    coverage the session already holds, so the number the renderer is
+    told bounds the time until the ENVELOPE is sent rather than only the
+    time until the provider flush resolves (C3, audit §2.5).
+
+    Deliberately the PESSIMISTIC estimate: it reads the readings'
+    committed segments as they stand mid-stop, before the flush that is
+    about to land and (for a dual recording) before the merge that may
+    fill a hole from the other reading — so it over-announces rather
+    than under-announces. Over-announcing costs nothing: the renderer's
+    wait ends when the envelope arrives, not when the budget does.
+    Under-announcing costs the user their last clause.
+    """
+    try:
+        spans = uncovered_spans(
+            session.streamed_sec,
+            session.committed_segments(),
+            evidence_from_session(session),
+            session.stream_death_sec,
+            audio_sec=spool_sec,
+        )
+    except Exception as e:
+        # A prediction is not worth a failed stop.
+        logger.warning("recovery: budget prediction failed: %s", e)
+        return 0.0
+    return recovery_budget_sec(spans)
+
+
+async def _apply_live_recovery(
+    *,
+    payload: dict,
+    session: Any,
+    recovery: Optional[dict],
+    cfg: DeepgramLiveConfig,
+    api_key: str,
+    announce: Optional[Callable[[float], None]] = None,
+    announced_recovery_sec: float = 0.0,
+) -> dict:
+    """Complete a ``final`` envelope from this backend's own audio spool.
+
+    The ONE place the recovery pass is wired in. Both stop shapes reach
+    it: the normal one, with the drained envelope and the session that
+    produced it, and the connect-failure one, with a skeleton envelope
+    and no session at all — which is exactly the case that used to send
+    an empty envelope and leave the recording to the renderer.
+
+    Never raises and never blocks the envelope: anything that goes wrong
+    here leaves the payload as it arrived, with the spans it could not
+    cover still counted in ``uncoveredSpeechSec``.
+    """
+    if not api_key:
+        return payload
+    try:
+        if session is None:
+            # The upstream never opened: no reading exists, nothing was
+            # heard, and every captured byte is unseen by Deepgram —
+            # which is what ``stream_death_sec=0`` says.
+            evidence = InterimEvidence()
+            stream_death_sec: Optional[float] = 0.0
+        else:
+            evidence = evidence_from_session(session)
+            stream_death_sec = session.stream_death_sec
+        return await run_recovery(
+            payload=payload,
+            evidence=evidence,
+            stream_death_sec=stream_death_sec,
+            # Lazily: the overwhelming majority of stops need no
+            # recovery, and reading a long recording's spool into memory
+            # to be told so would put that cost on every one of them.
+            # The byte count answers "how much audio is there" without
+            # the read.
+            pcm=lambda: _recovery_spool_bytes(recovery),
+            audio_sec=_recovery_spool_seconds(recovery),
+            cfg=cfg,
+            api_key=api_key,
+            sample_rate=LIVE_SAMPLE_RATE_HZ,
+            announce=announce,
+            announced_recovery_sec=announced_recovery_sec,
+        )
+    except Exception as e:
+        logger.error(
+            "live recovery failed; envelope sent unrepaired: %s", e, exc_info=True
+        )
+        return payload
+
+
 # 1.1.25: hard timeout for the per-message WS send.
 # A misbehaving / paused client (background tab, slow renderer) would
 # otherwise let Starlette's send buffer back up and the await would
@@ -4579,6 +4772,25 @@ async def _run_deepgram_live_session(
     pre_task = asyncio.create_task(
         _preconnect_reader(), name="ws-dg-preconnect-rx",
     )
+
+    # The stop's deadline is decided once, by the coverage analysis, and
+    # told to the client before the waiting starts. A strong reference
+    # until the send completes: asyncio holds only a weak one, so a
+    # fire-and-forget task can be collected mid-flight.
+    #
+    # Declared HERE rather than in the finally block because the
+    # connect-failure path below also announces one: that path now
+    # re-decodes the whole recording itself, and a wait the renderer was
+    # never told about is not a bounded wait.
+    budget_sends: set[asyncio.Task] = set()
+
+    def _send_finalizing(budget_sec: float, expects_more: bool) -> None:
+        task = asyncio.get_running_loop().create_task(
+            _ws_send_json(websocket, _finalizing_payload(budget_sec, expects_more))
+        )
+        budget_sends.add(task)
+        task.add_done_callback(budget_sends.discard)
+
     try:
         # Adopts the pre-opened socket when one matches this exact
         # configuration and is healthy; otherwise this is the same
@@ -4586,12 +4798,8 @@ async def _run_deepgram_live_session(
         acquisition = await DEEPGRAM_WARM_POOL.acquire(api_key, dg_cfg)
         session = acquisition.session
     except DeepgramLiveError as e:
-        pre_task.cancel()
-        try:
-            await pre_task
-        except (asyncio.CancelledError, Exception):
-            pass
         logger.warning("ws deepgram connect failed: %s", e)
+        _mark_recovery_error(recovery)
         await _ws_send_json(
             websocket,
             # Redact: Deepgram error messages can include API path
@@ -4599,24 +4807,53 @@ async def _run_deepgram_live_session(
             # API key prefix or upstream IP.
             {"type": "error", "error": _safe_error_text(e), "fatal": True},
         )
-        await _ws_send_json(
-            websocket,
-            {
-                "type": "final",
-                "text": "",
-                "segments": [],
-                "durationSec": 0.0,
-                "source": "deepgram-live",
-                # 1.1.25: route through ``_safe_error_text`` so this
-                # final envelope matches the redaction policy applied
-                # to the ``error`` event a few lines above. Previously
-                # this path leaked raw Deepgram error bodies (which
-                # can include the upstream URL + token prefix) into
-                # the renderer payload.
-                "error": _safe_error_text(e),
-            },
+        # The upstream never opened, so nothing will transcribe this
+        # recording unless this side does — the renderer's own REST
+        # recovery is gone, the envelope is the only transcript there is.
+        # This used to return an EMPTY envelope here and leave the user
+        # to the frontend's fallback while the microphone was still open
+        # (audit §3.7: a 12 s connect timeout with 126 s dictated into a
+        # dead stream). Keep the pre-connect reader running instead — it
+        # already records every frame into the spool — until the renderer
+        # finalizes or disconnects, then re-decode the whole recording.
+        try:
+            await pre_task
+        except asyncio.CancelledError:
+            # THIS session is being torn down (server shutdown, client
+            # gone). Unlike everywhere else in this handler, the wait
+            # above can legitimately last as long as the user keeps
+            # talking, so swallowing a cancellation here would keep a
+            # dead session running and pretend to deliver an envelope
+            # nobody can receive.
+            raise
+        except Exception:
+            pass
+        connect_error = _safe_error_text(e)
+        final_payload = {
+            "type": "final",
+            "text": "",
+            "segments": [],
+            "durationSec": 0.0,
+            "source": "deepgram-live",
+            # 1.1.25: route through ``_safe_error_text`` so this final
+            # envelope matches the redaction policy applied to the
+            # ``error`` event a few lines above. Previously this path
+            # leaked raw Deepgram error bodies (which can include the
+            # upstream URL + token prefix) into the renderer payload.
+            "error": connect_error,
+            "streamedSec": 0.0,
+            "coveredEndSec": 0.0,
+            "uncoveredSpeechSec": 0.0,
+        }
+        final_payload = await _apply_live_recovery(
+            payload=final_payload,
+            session=None,
+            recovery=recovery,
+            cfg=dg_cfg,
+            api_key=api_key,
+            announce=lambda budget: _send_finalizing(budget, True),
         )
-        _mark_recovery_error(recovery)
+        await _ws_send_json(websocket, final_payload)
         return
 
     # The second reading, if this recording is running two. Its failure
@@ -5175,29 +5412,44 @@ async def _run_deepgram_live_session(
         finalize_error: Optional[str] = None
 
         # The stop's deadline is decided once, by the coverage analysis
-        # inside finalize(), and told to the client before the waiting
-        # starts. The renderer used to guess it with a constant while
-        # this side could legitimately spend nine seconds; a quarter of
-        # stops exceeded that constant, and everything the extra wait
-        # recovered arrived after the transcript had already been
-        # delivered. One number, produced where it is decided.
-        # A strong reference until the send completes: asyncio holds only
-        # a weak one, so a fire-and-forget task can be collected mid-flight.
-        budget_sends: set[asyncio.Task] = set()
+        # inside drain_transcript(), and told to the client before the
+        # waiting starts. The renderer used to guess it with a constant
+        # while this side could legitimately spend nine seconds; a
+        # quarter of stops exceeded that constant, and everything the
+        # extra wait recovered arrived after the transcript had already
+        # been delivered. One number, produced where it is decided.
+        #
+        # That number must now bound the REST recovery too, because the
+        # envelope is sent AFTER it. The drain's own budget and the
+        # recovery's are tracked separately so the extension announcement
+        # below can replace one without re-deriving the other.
+        announced_drain_sec = 0.0
+        announced_recovery_sec = 0.0
 
         def _announce_budget(budget_sec: float, expects_more: bool) -> None:
-            task = asyncio.get_running_loop().create_task(
-                _ws_send_json(
-                    websocket,
-                    {
-                        "type": "finalizing",
-                        "budgetMs": int(round(budget_sec * 1000)),
-                        "expectsMore": bool(expects_more),
-                    },
-                )
+            nonlocal announced_drain_sec, announced_recovery_sec
+            announced_drain_sec = budget_sec
+            announced_recovery_sec = _predicted_recovery_budget_sec(
+                session, _recovery_spool_seconds(recovery)
             )
-            budget_sends.add(task)
-            task.add_done_callback(budget_sends.discard)
+            _send_finalizing(
+                announced_drain_sec + announced_recovery_sec,
+                expects_more or announced_recovery_sec > 0.0,
+            )
+
+        def _announce_recovery_extension(budget_sec: float) -> None:
+            """A second announcement, when the drain changed the answer.
+
+            The prediction above is made before the post-Finalize flush
+            lands, so a hole that only becomes visible once the flush is
+            in (or a socket that dies during it) can need more time than
+            was announced. The renderer's deadline is re-armable and is
+            always measured from the start of ITS wait, so the honest
+            second number is the whole stop's bound, not the remainder.
+            """
+            nonlocal announced_recovery_sec
+            announced_recovery_sec = budget_sec
+            _send_finalizing(announced_drain_sec + budget_sec, True)
 
         try:
             # C4: drain_transcript() produces the transcript and returns —
@@ -5247,21 +5499,54 @@ async def _run_deepgram_live_session(
             finalize_error = _safe_error_text(e)
             _mark_recovery_error(recovery)
             logger.error("deepgram finalize failed: %s", e, exc_info=True)
+            # ``partial_result()``, not ``final_text()`` with an empty
+            # segment list: this envelope is now the input to the
+            # recovery pass, which needs to know what ground IS covered
+            # in order to ask for the rest — and a payload whose text and
+            # segments describe different transcripts is the C6 defect
+            # (audit §3.8) on the error path.
+            try:
+                partial = session.partial_result()
+            except Exception as snapshot_error:
+                # This is already the failure path; a snapshot that also
+                # fails must not replace the error the user is owed with
+                # a second one.
+                logger.warning(
+                    "deepgram partial snapshot failed: %s", snapshot_error
+                )
+                partial = {}
             final_payload = {
                 "type": "final",
-                "text": session.final_text(),
-                "segments": [],
-                "durationSec": 0.0,
+                "text": partial.get("text", ""),
+                "segments": partial.get("segments", []),
+                "durationSec": partial.get("durationSec", 0.0),
                 "source": "deepgram-live",
                 "error": finalize_error,
-                "streamedSec": round(
-                    session.stats.bytes_sent / float(2 * LIVE_SAMPLE_RATE_HZ), 3,
-                ),
-                "coveredEndSec": 0.0,
+                "stats": partial.get("stats"),
+                "uncoveredSpeechSec": partial.get("uncoveredSpeechSec", 0.0),
+                "streamedSec": partial.get("streamedSec", 0.0),
+                "coveredEndSec": partial.get("coveredEndSec", 0.0),
             }
 
         if upstream_fatal and session.last_error:
             final_payload["error"] = _safe_error_text(session.last_error)
+
+        # The envelope is complete BY CONSTRUCTION or it is not complete
+        # at all: whatever the live reading (or the dual merge) still
+        # fails to cover is re-decoded from this backend's own audio
+        # spool and spliced in by time, HERE, before the envelope is
+        # sent. The renderer has no second reading to fall back on any
+        # more, which is the point — two owners of one transcript is
+        # what produced every duplication defect of 2026-09-03/04.
+        final_payload = await _apply_live_recovery(
+            payload=final_payload,
+            session=session,
+            recovery=recovery,
+            cfg=dg_cfg,
+            api_key=api_key,
+            announce=_announce_recovery_extension,
+            announced_recovery_sec=announced_recovery_sec,
+        )
 
         # Envelope out FIRST (C4) — everything below is teardown the
         # client no longer waits on.

@@ -72,6 +72,10 @@ from backend.deepgram_dual import (  # noqa: E402
     DualLiveSession,
     secondary_config,
 )
+from backend.deepgram_recovery import (  # noqa: E402
+    evidence_from_session,
+    run_recovery,
+)
 from backend.deepgram_warm import DeepgramWarmPool  # noqa: E402
 from backend.remote_deepgram_live import (  # noqa: E402
     DeepgramLiveConfig,
@@ -104,6 +108,13 @@ class RunResult:
     words: int
     chars: int
     text: str
+    # What the finalize-time REST recovery pass did — the second half of
+    # the stop the app performs (``backend.deepgram_recovery``). A row
+    # with ``rec=0/0`` is a recording the live reading covered on its own.
+    recovery_spans: int = 0
+    recovery_words: int = 0
+    recovery_ms: float = 0.0
+    uncovered_sec: float = 0.0
     error: "str | None" = None
 
 
@@ -190,7 +201,22 @@ async def _run_one(
                 await asyncio.sleep(delay)
         # Let the last chunk actually reach Deepgram before finalizing.
         await asyncio.sleep(0.2)
-        result = await session.finalize()
+        # Drain, then RECOVER, then shut down — the exact order the WS
+        # handler uses. ``finalize()`` (drain + shutdown) would measure
+        # only the half of the stop that happens before the envelope is
+        # completed, and the envelope is what the user receives.
+        result = await session.drain_transcript()
+        evidence = evidence_from_session(session)
+        stream_death_sec = session.stream_death_sec
+        result = await run_recovery(
+            payload=result,
+            evidence=evidence,
+            stream_death_sec=stream_death_sec,
+            pcm=pcm,
+            cfg=cfg,
+            api_key=api_key,
+        )
+        await session.shutdown()
     finally:
         try:
             await asyncio.wait_for(drain_task, timeout=5.0)
@@ -198,6 +224,7 @@ async def _run_one(
             drain_task.cancel()
 
     stats = result.get("stats") or {}
+    recovery = stats.get("recovery") or {}
     text = str(result.get("text") or "")
     label = f"{language}+{dual_language}" if dual_language else language
     return RunResult(
@@ -206,6 +233,10 @@ async def _run_one(
         connect_ms=stats.get("connect_ms"), finalize_ms=stats.get("finalize_ms"),
         segments=len(result.get("segments") or []), words=len(text.split()),
         chars=len(text), text=text,
+        recovery_spans=len(recovery.get("spans") or []),
+        recovery_words=int(recovery.get("words") or 0),
+        recovery_ms=float(recovery.get("ms") or 0.0),
+        uncovered_sec=float(result.get("uncoveredSpeechSec") or 0.0),
     )
 
 
@@ -220,7 +251,9 @@ def _format_row(r: RunResult, *, full: bool) -> str:
     return (
         f"{r.file:<28} lang={r.language:<9} kt={r.keyterms_count:<2} run={r.run} "
         f"connect={connect}ms finalize={finalize}ms "
-        f"segs={r.segments:<3} words={r.words:<4} chars={r.chars:<5} | {text}"
+        f"segs={r.segments:<3} words={r.words:<4} chars={r.chars:<5} "
+        f"rec={r.recovery_spans}/{r.recovery_words}@{r.recovery_ms:.0f}ms "
+        f"uncov={r.uncovered_sec:.2f}s | {text}"
     )
 
 

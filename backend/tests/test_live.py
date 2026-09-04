@@ -360,13 +360,29 @@ class DeepgramLivePreconnectBufferTests(IsolatedBackendMainImportMixin, unittest
             await ws.messages.put({"type": "websocket.receive", "bytes": b"CCCC"})
             await asyncio.sleep(0.01)
             release_connect.set()
-            await asyncio.wait_for(task, timeout=1.0)
+            # The upstream is dead but the microphone is not: the
+            # handler keeps reading (and spooling) until the renderer
+            # finalizes, because the envelope it will send is now the
+            # only transcript this recording can get — the renderer's
+            # own REST recovery is gone. Before that, this returned an
+            # EMPTY envelope here while the user was still talking.
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+            await ws.messages.put({
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "finalize"}),
+            })
+            await asyncio.wait_for(task, timeout=2.0)
 
         self.assertTrue(recovery["had_error"])
         self.assertEqual(recovery["bytes"], 12)
         self.assertEqual(recovery["chunks"], 3)
         self.assertEqual(recovery["pcm_file"].getvalue(), b"AAAABBBBCCCC")
-        # The renderer still gets its error + final envelope.
+        # The renderer still gets its error + final envelope. (This
+        # spool has no path on disk, so the recovery pass finds no audio
+        # to re-decode and the envelope is delivered unrepaired — the
+        # recovery itself is covered end to end in
+        # ``test_deepgram_recovery.LiveSessionRecoveryWiringTests``.)
         self.assertEqual([m["type"] for m in ws.sent], ["error", "final"])
 
     async def test_frames_buffered_during_connect_are_replayed_in_order_on_success(self):

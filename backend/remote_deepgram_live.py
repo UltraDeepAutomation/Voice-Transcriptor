@@ -594,8 +594,8 @@ def drop_repeated_seam_ngrams(segments: list[dict]) -> list[dict]:
 
     Nothing else in this module de-duplicates across two ALREADY-FINAL
     segments: ``merge_seam_fragments`` only rejoins one word a flush cut
-    in half, and the splice guard (``_insert_word_into_segment`` /
-    ``_fits_beside``) only stops a newly RECOVERED word from duplicating
+    in half, and the splice guard (``insert_word_into_segment`` /
+    ``fits_beside``) only stops a newly RECOVERED word from duplicating
     a final's word — neither touches two native finals that both
     transcribed the same boundary word on their own.
 
@@ -685,6 +685,286 @@ COVERAGE_GAP_MIN_SEC = 0.25
 # Matches a natural inter-clause pause; smaller values would fuse words
 # the user spoke several sentences apart into one run-on blob.
 INTERIM_WORD_GAP_SPLIT_SEC = 1.0
+
+
+# ---- Word placement: one implementation, several askers ---------------
+#
+# "Where does a word that the committed transcript is missing go?" is
+# one question, and it now has more than one asker: the interim splice
+# in this module, and the REST re-decode of an uncovered span
+# (``backend.deepgram_recovery``). A second implementation would let the
+# same recording be repaired two different ways depending on which path
+# found the hole, so the rules live here — at module level, taking the
+# segment list as an argument instead of reading ``self`` — and the
+# session's own methods delegate to them.
+
+
+def host_segment_for(word: dict, segments: "Iterable[dict]") -> Optional[dict]:
+    """The segment a recovered word belongs INSIDE, if any.
+
+    Word-level coverage makes holes possible in the middle of a final's
+    span: "субагента" was spoken at 5.5-6.1 s inside a final covering
+    4.91-9.70 s whose text omitted it. Appending such a word as a
+    separate trailing segment would put it after the whole clause it
+    belongs in the middle of, so it is inserted into the host segment at
+    its time position instead.
+
+    Only segments that carry a word list can host: for a segment without
+    one, its span is the only thing knowable about what it contains, and
+    inserting into a text we cannot position against would guess.
+    """
+    center = (_as_float(word.get("start")) + _as_float(word.get("end"))) / 2.0
+    for seg in segments:
+        if not _segment_words(seg):
+            continue
+        if _as_float(seg.get("start")) < center < _as_float(seg.get("end")):
+            return seg
+    return None
+
+
+def nearest_segment_word(
+    segments: "Iterable[dict]", time: float, *, before: bool
+) -> Optional[dict]:
+    """The committed word closest to ``time`` on the requested side.
+
+    Feeds the splice's seam guard (rule 2/3 of the A/B fix): before a
+    recovered word is allowed to become — or extend — a fallback segment
+    at the edge of the assembled text, this is what sits on the other
+    side of the seam it would create.
+    """
+    best: Optional[dict] = None
+    for seg in segments:
+        for w in _segment_words(seg):
+            if before:
+                if _as_float(w.get("end")) <= time and (
+                    best is None or _as_float(w.get("end")) > _as_float(best.get("end"))
+                ):
+                    best = w
+            else:
+                if _as_float(w.get("start")) >= time and (
+                    best is None
+                    or _as_float(w.get("start")) < _as_float(best.get("start"))
+                ):
+                    best = w
+    return best
+
+
+def fits_beside(
+    word: dict, neighbour: Optional[dict], *, neighbour_before: bool
+) -> bool:
+    """Same test as ``insert_word_into_segment``'s guard, for a seam
+    between segments instead of a position inside one word list: no stem
+    match with the word on the other side of the seam, and enough room
+    for this word's own duration.
+    """
+    if neighbour is None:
+        return True
+    stem = _word_stem(word)
+    if stem and stem == _word_stem(neighbour):
+        return False
+    gap = (
+        _as_float(word.get("start")) - _as_float(neighbour.get("end"))
+        if neighbour_before
+        else _as_float(neighbour.get("start")) - _as_float(word.get("end"))
+    )
+    return gap >= _word_duration(word) - SPLICE_GAP_SLACK_SEC
+
+
+def insert_word_into_segment(segment: dict, word: dict) -> bool:
+    """Put ``word`` into ``segment`` at its time position.
+
+    The segment's own word list gives the position: the index is how
+    many of its words start before this one. The text is edited at the
+    same index so ``text`` and ``words`` keep describing one transcript;
+    when the two do not have the same token count (the provider's
+    transcript is not always a plain join of its words) the index is
+    clamped rather than guessed at.
+
+    Returns False, changing nothing, in two cases (audit A/B on the
+    trilingual evidence recording, rules 2 and 3 of the splice guard):
+
+    * the word would land immediately beside a word sharing its stem
+      (``_word_stem`` — first ``_SPLICE_STEM_LETTERS`` letters of the
+      alpha core). Such a pair is one spoken word whose boundary the
+      re-decode moved, or that the two decodes spelled differently —
+      "тебе тебе нужно", "посмотреть в в WAV" and "слушаю"/"слушай" are
+      all this same failure. A recovery that reads as a stutter is not a
+      recovery;
+    * there is not enough room: the gap between this segment's own
+      neighbouring words (or the segment's own start/end, at an edge) is
+      shorter than the word's duration less ``SPLICE_GAP_SLACK_SEC``. A
+      final that already accounts for that time in a shape the coverage
+      test did not recognise must not be overwritten by force-fitting a
+      word into a slot too small for it.
+
+    ``source`` travels with the word when it carries one, so a merged or
+    recovered word stays attributable in the envelope's word list.
+    """
+    seg_words = _segment_words(segment)
+    index = sum(
+        1 for w in seg_words if _as_float(w.get("start")) <= _as_float(word.get("start"))
+    )
+    stem = _word_stem(word)
+    neighbours = seg_words[max(0, index - 1):index + 1]
+    if stem and any(_word_stem(n) == stem for n in neighbours):
+        return False
+    prev_word = seg_words[index - 1] if index > 0 else None
+    next_word = seg_words[index] if index < len(seg_words) else None
+    before_bound = (
+        _as_float(prev_word.get("end")) if prev_word else _as_float(segment.get("start"))
+    )
+    after_bound = (
+        _as_float(next_word.get("start")) if next_word else _as_float(segment.get("end"))
+    )
+    if after_bound - before_bound < _word_duration(word) - SPLICE_GAP_SLACK_SEC:
+        return False
+    tokens = str(segment.get("text") or "").split()
+    tokens.insert(min(index, len(tokens)), str(word.get("word") or ""))
+    segment["text"] = " ".join(tokens)
+    placed = {
+        "word": word.get("word"),
+        "start": word.get("start"),
+        "end": word.get("end"),
+    }
+    if word.get("source"):
+        placed["source"] = word["source"]
+    seg_words.insert(index, placed)
+    segment["words"] = seg_words
+    # Diagnostic only (like ``source`` on the fallback segments): says
+    # this segment was repaired, and by how much.
+    segment["splicedWords"] = int(segment.get("splicedWords") or 0) + 1
+    return True
+
+
+@dataclass
+class SpliceOutcome:
+    """What ``splice_words_into_segments`` did, for the caller to log."""
+
+    segments: list[dict]
+    # Words put back INSIDE a segment that had omitted them.
+    inserted: int = 0
+    # Words that became new fallback segments of their own.
+    appended: int = 0
+    # How many fallback segments those words became.
+    groups: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.inserted + self.appended
+
+
+def splice_words_into_segments(
+    segments: "Iterable[dict]", words: "Iterable[dict]", *, source: str
+) -> SpliceOutcome:
+    """Fold ``words`` into ``segments`` by time, guarded.
+
+    Words that fall inside a segment's span go back into that segment at
+    their time position; only words outside every segment become
+    segments of their own, grouped at clause-length silences
+    (``INTERIM_WORD_GAP_SPLIT_SEC``) and trimmed at each end until the
+    boundary word both differs in stem from, and has room beside, the
+    nearest committed word on that side.
+
+    That seam guard is what stops "them" (recovered) landing next to the
+    transcript's own "them", and "WAV"/"WAB" doing the same across a
+    fallback-segment seam; only a group's interior is exempt, because by
+    construction it is the inside of one recovered run of speech.
+
+    The returned list is a new list; the segments themselves are the
+    caller's own dicts, mutated in place where a word was inserted.
+    """
+    out = list(segments)
+    ordered = sorted(
+        words, key=lambda w: (_as_float(w.get("start")), _as_float(w.get("end")))
+    )
+    if not ordered:
+        return SpliceOutcome(segments=out)
+
+    inserted = 0
+    outside: list[dict] = []
+    for word in ordered:
+        host = host_segment_for(word, out)
+        if host is None:
+            outside.append(word)
+            continue
+        if insert_word_into_segment(host, word):
+            inserted += 1
+    if not outside:
+        return SpliceOutcome(segments=out, inserted=inserted)
+
+    groups: list[list[dict]] = [[outside[0]]]
+    for prev, cur in zip(outside, outside[1:]):
+        if (
+            _as_float(cur.get("start")) - _as_float(prev.get("end"))
+            > INTERIM_WORD_GAP_SPLIT_SEC
+        ):
+            groups.append([cur])
+        else:
+            groups[-1].append(cur)
+
+    trimmed_groups: list[list[dict]] = []
+    for group in groups:
+        group = list(group)
+        while group:
+            prev_word = nearest_segment_word(
+                out, _as_float(group[0].get("start")), before=True
+            )
+            if not fits_beside(group[0], prev_word, neighbour_before=True):
+                group.pop(0)
+                continue
+            next_word = nearest_segment_word(
+                out, _as_float(group[-1].get("end")), before=False
+            )
+            if not fits_beside(group[-1], next_word, neighbour_before=False):
+                group.pop()
+                continue
+            break
+        if group:
+            trimmed_groups.append(group)
+    if not trimmed_groups:
+        return SpliceOutcome(segments=out, inserted=inserted)
+
+    fallback_segments = [
+        {
+            "start": round(_as_float(group[0].get("start")), 3),
+            "end": round(max(_as_float(w.get("end")) for w in group), 3),
+            "text": " ".join(str(w.get("word") or "") for w in group),
+            "confidence": 0.0,
+            "is_final": True,
+            "speech_final": False,
+            # The recovered words travel with the segment they became,
+            # exactly like a native final's — so seam repair and coverage
+            # read one shape, not two.
+            "words": [dict(w) for w in group],
+            # Distinguishes recovered content from native finals; the
+            # frontend merges by time like any other segment, so this is
+            # diagnostic metadata only.
+            "source": source,
+        }
+        for group in trimmed_groups
+    ]
+    out = sorted(
+        [*out, *fallback_segments],
+        key=lambda s: (_as_float(s.get("start")), _as_float(s.get("end"))),
+    )
+    return SpliceOutcome(
+        segments=out,
+        inserted=inserted,
+        appended=sum(len(group) for group in trimmed_groups),
+        groups=len(fallback_segments),
+    )
+
+
+def join_segment_texts(segments: "Iterable[dict]") -> str:
+    """SSOT join: the ONE place assembled segments become ``text``.
+
+    ``final_text()``, ``drain_transcript()`` and the REST recovery pass
+    all go through this, so ``text`` and ``segments`` in the envelope can
+    never describe different transcripts (C6, audit §3.8) — they are
+    built from exactly the same merged list.
+    """
+    parts = [str(seg.get("text") or "").strip() for seg in segments]
+    return " ".join(p for p in parts if p).strip()
 
 
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
@@ -873,6 +1153,58 @@ def subtract_spans(
         if cursor < end:
             result.append((cursor, end))
     return result
+
+
+def intersect_spans(
+    spans: "Iterable[tuple[float, float]]",
+    mask: "Iterable[tuple[float, float]]",
+) -> list[tuple[float, float]]:
+    """The parts of ``spans`` that lie inside ``mask``.
+
+    The third of the span-arithmetic trio, kept beside the other two so
+    every module that measures coverage — this one,
+    ``backend.deepgram_dual``, ``backend.deepgram_recovery`` — asks the
+    same implementation what "the speech inside this window" means.
+    """
+    blocks = union_spans(mask)
+    out: list[tuple[float, float]] = []
+    for start, end in union_spans(spans):
+        for m_start, m_end in blocks:
+            if m_end <= start:
+                continue
+            if m_start >= end:
+                break
+            lo = max(start, m_start)
+            hi = min(end, m_end)
+            if hi > lo:
+                out.append((lo, hi))
+    return union_spans(out)
+
+
+def tail_needs_flush(
+    tail_speech: float, window_overhang: float, endpointing_sec: float
+) -> bool:
+    """Is a trailing region worth waiting — and retrying — for?
+
+    A tail is "unflushed speech" ONLY when there is actual EVIDENCE of
+    it — never from elapsed time alone. Two kinds of evidence, either is
+    enough: an interim already recognised at least
+    ``TAIL_GUARD_MIN_SPEECH_SEC`` worth of WORDS in the uncovered span,
+    or Deepgram's newest decode WINDOW still reaches past the last final
+    by more than the session's configured endpointing silence.
+
+    Module level because the stop and the REST recovery both ask it:
+    ``DeepgramLiveSession._tail_needs_flush`` decides whether to spend a
+    second Finalize, and ``backend.deepgram_recovery`` decides whether
+    the tail that survived that Finalize is worth re-decoding. Two
+    implementations would let the stop wait for a tail the recovery then
+    declares silent, or the reverse. See
+    ``DeepgramLiveSession._tail_needs_flush`` for the measurement this
+    rule was sized from (audit §5).
+    """
+    if tail_speech >= TAIL_GUARD_MIN_SPEECH_SEC:
+        return True
+    return window_overhang > endpointing_sec
 
 
 def resolve_live_language(language: str) -> str:
@@ -1101,6 +1433,11 @@ class DeepgramLiveSession:
         self._last_utterance_end: Optional[float] = None
         self._last_error: Optional[str] = None
         self._last_fatal: bool = False
+        # ``stats.bytes_sent`` at the first FATAL error — the moment the
+        # upstream stopped taking audio. Read as ``stream_death_sec``;
+        # everything captured after it is recovery ground, not a hole
+        # (audit §3.6/§3.7).
+        self._fatal_at_bytes: Optional[int] = None
         self.stats = DeepgramLiveStats()
 
     # ----- Lifecycle --------------------------------------------------------
@@ -1955,129 +2292,12 @@ class DeepgramLiveSession:
         )
 
     def _host_final_for(self, word: dict) -> Optional[dict]:
-        """The final segment a recovered word belongs INSIDE, if any.
-
-        Word-level coverage makes holes possible in the middle of a
-        final's span: "субагента" was spoken at 5.5-6.1 s inside a final
-        covering 4.91-9.70 s whose text omitted it. Appending such a
-        word as a separate trailing segment would put it after the whole
-        clause it belongs in the middle of, so it is inserted into the
-        host segment at its time position instead.
-        """
-        center = (_as_float(word.get("start")) + _as_float(word.get("end"))) / 2.0
-        for seg in self._finalized_segments:
-            if not _segment_words(seg):
-                continue
-            if _as_float(seg.get("start")) < center < _as_float(seg.get("end")):
-                return seg
-        return None
+        """This session's finals asked ``host_segment_for``."""
+        return host_segment_for(word, self._finalized_segments)
 
     def _nearest_final_word(self, time: float, before: bool) -> Optional[dict]:
-        """The final word closest to ``time`` on the requested side.
-
-        Feeds the splice's seam guard (rule 2/3 of the A/B fix): before a
-        recovered word is allowed to become — or extend — a fallback
-        segment at the edge of the assembled text, this is what sits on
-        the other side of the seam it would create.
-        """
-        best: Optional[dict] = None
-        for seg in self._finalized_segments:
-            for w in _segment_words(seg):
-                if before:
-                    if _as_float(w.get("end")) <= time and (
-                        best is None or _as_float(w.get("end")) > _as_float(best.get("end"))
-                    ):
-                        best = w
-                else:
-                    if _as_float(w.get("start")) >= time and (
-                        best is None or _as_float(w.get("start")) < _as_float(best.get("start"))
-                    ):
-                        best = w
-        return best
-
-    @staticmethod
-    def _fits_beside(word: dict, neighbour: Optional[dict], neighbour_before: bool) -> bool:
-        """Same test as ``_insert_word_into_segment``'s guard, for a
-        seam between segments instead of a position inside one word
-        list: no stem match with the word on the other side of the
-        seam, and enough room for this word's own duration.
-        """
-        if neighbour is None:
-            return True
-        stem = _word_stem(word)
-        if stem and stem == _word_stem(neighbour):
-            return False
-        gap = (
-            _as_float(word.get("start")) - _as_float(neighbour.get("end"))
-            if neighbour_before
-            else _as_float(neighbour.get("start")) - _as_float(word.get("end"))
-        )
-        return gap >= _word_duration(word) - SPLICE_GAP_SLACK_SEC
-
-    @staticmethod
-    def _insert_word_into_segment(segment: dict, word: dict) -> bool:
-        """Put ``word`` into ``segment`` at its time position.
-
-        The segment's own word list gives the position: the index is how
-        many of its words start before this one. The text is edited at
-        the same index so ``text`` and ``words`` keep describing one
-        transcript; when the two do not have the same token count (the
-        provider's transcript is not always a plain join of its words)
-        the index is clamped rather than guessed at.
-
-        Returns False, changing nothing, in two cases (audit A/B on the
-        trilingual evidence recording, rules 2 and 3 of the splice
-        guard):
-
-        * the word would land immediately beside a word sharing its stem
-          (``_word_stem`` — first ``_SPLICE_STEM_LETTERS`` letters of the
-          alpha core). Such a pair is one spoken word whose boundary the
-          re-decode moved, or that the two decodes spelled differently —
-          "тебе тебе нужно", "посмотреть в в WAV" and "слушаю"/"слушай"
-          are all this same failure. A recovery that reads as a stutter
-          is not a recovery;
-        * there is not enough room: the gap between this final's own
-          neighbouring words (or the segment's own start/end, at an
-          edge) is shorter than the word's duration less
-          ``SPLICE_GAP_SLACK_SEC``. A final that already accounts for
-          that time in a shape the coverage test did not recognise must
-          not be overwritten by force-fitting a word into a slot too
-          small for it.
-        """
-        seg_words = _segment_words(segment)
-        index = sum(
-            1 for w in seg_words if _as_float(w.get("start")) <= _as_float(word.get("start"))
-        )
-        stem = _word_stem(word)
-        neighbours = seg_words[max(0, index - 1):index + 1]
-        if stem and any(_word_stem(n) == stem for n in neighbours):
-            return False
-        prev_word = seg_words[index - 1] if index > 0 else None
-        next_word = seg_words[index] if index < len(seg_words) else None
-        before_bound = (
-            _as_float(prev_word.get("end")) if prev_word else _as_float(segment.get("start"))
-        )
-        after_bound = (
-            _as_float(next_word.get("start")) if next_word else _as_float(segment.get("end"))
-        )
-        if after_bound - before_bound < _word_duration(word) - SPLICE_GAP_SLACK_SEC:
-            return False
-        tokens = str(segment.get("text") or "").split()
-        tokens.insert(min(index, len(tokens)), str(word.get("word") or ""))
-        segment["text"] = " ".join(tokens)
-        seg_words.insert(
-            index,
-            {
-                "word": word.get("word"),
-                "start": word.get("start"),
-                "end": word.get("end"),
-            },
-        )
-        segment["words"] = seg_words
-        # Diagnostic only (like ``source`` on the fallback segments
-        # below): says this final was repaired, and by how much.
-        segment["splicedWords"] = int(segment.get("splicedWords") or 0) + 1
-        return True
+        """This session's finals asked ``nearest_segment_word``."""
+        return nearest_segment_word(self._finalized_segments, time, before=before)
 
     def _splice_uncovered_interim_words(self) -> int:
         """Fold interim-recognised words no final ever covered into the
@@ -2129,109 +2349,31 @@ class DeepgramLiveSession:
         if not survivors:
             return 0
 
-        # Words that fall inside a final's span go back into that final,
-        # at their time position; only words outside every final become
-        # segments of their own.
-        inserted = 0
-        outside: list[dict] = []
-        for word in survivors:
-            host = self._host_final_for(word)
-            if host is None:
-                outside.append(word)
-                continue
-            if self._insert_word_into_segment(host, word):
-                inserted += 1
-        if not outside:
-            if inserted:
-                logger.warning(
-                    "deepgram-live: spliced %d uncovered interim word(s) back "
-                    "into the finals that omitted them",
-                    inserted,
-                )
-            return inserted
-        survivors = outside
-
-        # Group consecutive words into segments; a silence gap longer
-        # than INTERIM_WORD_GAP_SPLIT_SEC starts a new group so words
-        # from different clauses do not fuse into one run-on blob.
-        groups: list[list[dict]] = [[survivors[0]]]
-        for prev, cur in zip(survivors, survivors[1:]):
-            if cur["start"] - prev["end"] > INTERIM_WORD_GAP_SPLIT_SEC:
-                groups.append([cur])
-            else:
-                groups[-1].append(cur)
-
-        # Seam guard (rule 2/3 of the A/B fix): a group about to become a
-        # brand-new fallback segment sits at a SEAM against whatever
-        # finals are already in the transcript, and nothing has checked
-        # that seam yet — the per-final neighbour guard in
-        # ``_insert_word_into_segment`` only ever runs when a word has a
-        # host final to be inserted INTO. Trim from each end until the
-        # boundary word both differs in stem from, and has room beside,
-        # the nearest final word on that side; a group can shrink to
-        # nothing; only internal words (never checked against a final,
-        # by construction — they are already the interior of one
-        # recovered run of speech) are exempt. This is what stops "them"
-        # (recovered) landing next to the final's own "them", and
-        # "WAV"/"WAB" doing the same across a fallback-segment seam.
-        trimmed_groups: list[list[dict]] = []
-        for group in groups:
-            group = list(group)
-            while group:
-                prev_word = self._nearest_final_word(group[0]["start"], before=True)
-                if not self._fits_beside(group[0], prev_word, neighbour_before=True):
-                    group.pop(0)
-                    continue
-                next_word = self._nearest_final_word(group[-1]["end"], before=False)
-                if not self._fits_beside(group[-1], next_word, neighbour_before=False):
-                    group.pop()
-                    continue
-                break
-            if group:
-                trimmed_groups.append(group)
-        groups = trimmed_groups
-        if not groups:
-            if inserted:
-                logger.warning(
-                    "deepgram-live: spliced %d uncovered interim word(s) back "
-                    "into the finals that omitted them",
-                    inserted,
-                )
-            return inserted
-        spliced_outside = sum(len(group) for group in groups)
-
-        fallback_segments = [
-            {
-                "start": round(group[0]["start"], 3),
-                "end": round(max(w["end"] for w in group), 3),
-                "text": " ".join(str(w["word"]) for w in group),
-                "confidence": 0.0,
-                "is_final": True,
-                "speech_final": False,
-                # The recovered words travel with the segment they
-                # became, exactly like a native final's — so seam repair
-                # and coverage read one shape, not two.
-                "words": [dict(w) for w in group],
-                # Distinguishes recovered content from native finals;
-                # the frontend merges by time and text like any other
-                # segment, so this is diagnostic metadata only.
-                "source": "interim-fallback",
-            }
-            for group in groups
-        ]
-        self._finalized_segments = sorted(
-            [*self._finalized_segments, *fallback_segments],
-            key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))),
+        # Placement is not this method's job (``splice_words_into_segments``
+        # — the ONE implementation, shared with the REST recovery pass in
+        # ``backend.deepgram_recovery``). This method's job is deciding
+        # WHICH hypotheses deserve placing, which is what everything
+        # above does.
+        outcome = splice_words_into_segments(
+            self._finalized_segments, survivors, source="interim-fallback"
         )
-        logger.warning(
-            "deepgram-live: spliced %d uncovered interim words across %d "
-            "fallback segment(s) into the final transcript "
-            "(+%d word(s) put back inside the finals that omitted them)",
-            spliced_outside,
-            len(fallback_segments),
-            inserted,
-        )
-        return spliced_outside + inserted
+        self._finalized_segments = outcome.segments
+        if outcome.appended:
+            logger.warning(
+                "deepgram-live: spliced %d uncovered interim words across %d "
+                "fallback segment(s) into the final transcript "
+                "(+%d word(s) put back inside the finals that omitted them)",
+                outcome.appended,
+                outcome.groups,
+                outcome.inserted,
+            )
+        elif outcome.inserted:
+            logger.warning(
+                "deepgram-live: spliced %d uncovered interim word(s) back "
+                "into the finals that omitted them",
+                outcome.inserted,
+            )
+        return outcome.total
 
     def _log_coverage_holes(
         self,
@@ -2459,11 +2601,11 @@ class DeepgramLiveSession:
         recognised words or not — is exactly what audit §5 shows waiting
         cannot help.
         """
-        if tail_speech >= TAIL_GUARD_MIN_SPEECH_SEC:
-            return True
-        endpointing_window_sec = self._cfg.endpointing_ms / 1000.0
-        window_overhang = self._latest_interim_window_end - covered_end
-        return window_overhang > endpointing_window_sec
+        return tail_needs_flush(
+            tail_speech,
+            self._latest_interim_window_end - covered_end,
+            self.endpointing_sec,
+        )
 
     def _last_final_ended_the_utterance(self) -> bool:
         """Did the newest final claim to end where the speaker stopped?
@@ -2724,17 +2866,71 @@ class DeepgramLiveSession:
     def last_fatal(self) -> bool:
         return self._last_fatal
 
+    @property
+    def stream_death_sec(self) -> Optional[float]:
+        """Where on the recording's timeline the upstream stopped taking audio.
+
+        ``None`` while the socket is healthy. Once a FATAL error is
+        reported, this is ``bytes_sent`` at that instant expressed in
+        seconds — everything the user spoke after it was captured by the
+        app and never seen by Deepgram, which is what makes it a
+        recovery span rather than a hole (audit §3.6/§3.7). Recorded at
+        the first fatal, not the last: a socket that dies twice died
+        once as far as the audio is concerned.
+        """
+        if self._fatal_at_bytes is None:
+            return None
+        return self._streamed_seconds(self._fatal_at_bytes)
+
+    @property
+    def endpointing_sec(self) -> float:
+        """The configured endpointing silence window, in seconds."""
+        return self._cfg.endpointing_ms / 1000.0
+
+    @property
+    def streamed_sec(self) -> float:
+        """How far into the recording this reading has been fed audio.
+
+        ``max(bytes_offered, bytes_sent)`` on the recording's timeline —
+        the same quantity ``_tail_coverage`` measures the tail against
+        (B1, audit §3.6): a mid-stream send timeout drops a chunk from
+        ``bytes_sent`` but the audio was still captured, so the smaller
+        count would shrink the tail and could hide a real hole.
+        """
+        return self._streamed_seconds(
+            max(self.stats.bytes_offered, self.stats.bytes_sent)
+        )
+
+    def committed_segments(self) -> list[dict]:
+        """The finalized segments as they stand right now.
+
+        A snapshot for coverage arithmetic mid-stop (the recovery budget
+        prediction), deliberately WITHOUT the seam merge and dedupe that
+        ``drain_transcript`` applies: those change spelling and segment
+        boundaries, not which audio is accounted for, and the caller is
+        asking about ground, not text.
+        """
+        return list(self._finalized_segments)
+
+    @property
+    def interim_window_end(self) -> float:
+        """End of the newest interim's own decode window, session timeline."""
+        return self._latest_interim_window_end
+
+    def interim_speech_spans(self) -> list[tuple[float, float]]:
+        """Merged spans where an interim carried real recognised text.
+
+        Public for the same reason ``coverage_hole_spans`` is: the REST
+        recovery pass has to know where the service heard speech in
+        order to decide whether an uncovered tail is worth re-decoding
+        or is just the user reaching for the stop key.
+        """
+        return union_spans(self._interim_speech_spans)
+
     @staticmethod
     def _join_segment_texts(segments: Iterable[dict]) -> str:
-        """SSOT join: the ONE place seam-merged segments become ``text``.
-
-        ``final_text()`` and ``drain_transcript()`` both go through this
-        so ``text`` and ``segments`` in the envelope can never describe
-        different transcripts (C6, audit §3.8) — they are built from
-        exactly the same merged list.
-        """
-        parts = [str(seg.get("text") or "").strip() for seg in segments]
-        return " ".join(p for p in parts if p).strip()
+        """This session asking the module-level ``join_segment_texts``."""
+        return join_segment_texts(segments)
 
     def final_text(self) -> str:
         """Best-effort transcript text independent of drain_transcript().
@@ -2896,6 +3092,11 @@ class DeepgramLiveSession:
             return
         self._last_error = message
         self._last_fatal = fatal or self._last_fatal
+        if fatal and self._fatal_at_bytes is None:
+            # Pin the audio position of the death BEFORE anything else
+            # can move ``bytes_sent``: this is the boundary the recovery
+            # pass re-decodes from.
+            self._fatal_at_bytes = int(self.stats.bytes_sent)
         logger.warning(
             "deepgram-live: error (fatal=%s): %s", fatal, message
         )
@@ -3334,7 +3535,19 @@ __all__ = [
     # Shared with ``backend.deepgram_dual``, which merges two readings
     # of one recording: what "auto" means as a Deepgram language, and
     # the span arithmetic behind "is this still a hole?".
+    "intersect_spans",
     "resolve_live_language",
     "subtract_spans",
     "union_spans",
+    # Word placement and text assembly, shared with
+    # ``backend.deepgram_recovery``: one implementation of "where does a
+    # missing word go" and one of "how do segments become text".
+    "SpliceOutcome",
+    "fits_beside",
+    "host_segment_for",
+    "insert_word_into_segment",
+    "join_segment_texts",
+    "nearest_segment_word",
+    "splice_words_into_segments",
+    "tail_needs_flush",
 ]
