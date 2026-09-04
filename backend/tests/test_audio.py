@@ -9,7 +9,6 @@ from unittest import mock
 from backend.audio import (
     AudioError,
     _compact_audio_chunks_for_remote_cmd,
-    _compact_audio_for_remote_cmd,
     _ffmpeg_stderr_has_decode_error,
     _run_ffmpeg,
     compact_audio_chunks_for_remote,
@@ -25,7 +24,13 @@ from backend.audio_constants import (
 
 class AudioCommandTests(unittest.TestCase):
     def test_remote_compaction_extracts_audio_only_from_video_inputs(self):
-        cmd = _compact_audio_for_remote_cmd("/tmp/input.mp4", "/tmp/output.webm")
+        # Pointed at the chunked builder — the only remote-compaction
+        # command this backend runs. It used to assert the argv of a
+        # single-file counterpart with no production caller at all, so
+        # the rule looked covered while the live command was not (B-072).
+        cmd = _compact_audio_chunks_for_remote_cmd(
+            "/tmp/input.mp4", "/tmp/chunk_%05d.webm", 900
+        )
 
         self.assertEqual(cmd[0], "ffmpeg")
         self.assertIn("-nostdin", cmd)
@@ -38,11 +43,13 @@ class AudioCommandTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-ar") + 1], str(LIVE_SAMPLE_RATE_HZ))
         self.assertEqual(cmd[cmd.index("-ac") + 1], "1")
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "libopus")
-        self.assertEqual(cmd[cmd.index("-f") + 1], "webm")
-        self.assertEqual(cmd[-1], "/tmp/output.webm")
+        self.assertEqual(cmd[cmd.index("-f") + 1], "segment")
+        self.assertEqual(cmd[-1], "/tmp/chunk_%05d.webm")
 
     def test_remote_compaction_command_has_no_video_encoder(self):
-        cmd = _compact_audio_for_remote_cmd("/tmp/input.mov", "/tmp/output.webm")
+        cmd = _compact_audio_chunks_for_remote_cmd(
+            "/tmp/input.mov", "/tmp/chunk_%05d.webm", 900
+        )
 
         self.assertNotIn("-c:v", cmd)
         self.assertNotIn("-vcodec", cmd)

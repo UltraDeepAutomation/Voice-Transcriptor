@@ -234,40 +234,6 @@ def _run_ffmpeg(
     )
 
 
-def _compact_audio_for_remote_cmd(path_in: str, path_out: str) -> list[str]:
-    return [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",
-        "-i", path_in,
-        # Remote uploads may be full video files. Select exactly one audio
-        # stream and disable every non-audio stream so ffmpeg never spends
-        # minutes transcoding video into the WebM output.
-        "-map", "0:a:0",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-map_metadata", "-1",
-        # Resample to LIVE_SAMPLE_RATE_HZ mono — Whisper / Deepgram both
-        # target this rate; anything higher is wasted bandwidth.
-        "-ar", str(LIVE_SAMPLE_RATE_HZ),
-        "-ac", "1",
-        # Opus encoder. ``-b:a 24k`` is the sweet spot for speech: still
-        # intelligible at 24 kbit/s, indistinguishable from 64 kbit/s
-        # WAV PCM at the Whisper / Deepgram model's input granularity.
-        "-c:a", "libopus",
-        "-b:a", "24k",
-        # ``-application voip`` tunes the Opus encoder for speech
-        # rather than music — better intelligibility at low bitrates.
-        "-application", "voip",
-        # Force WebM container output regardless of ``path_out`` ext.
-        "-f", "webm",
-        path_out,
-    ]
-
-
 def _compact_audio_chunks_for_remote_cmd(
     path_in: str,
     segment_pattern: str,
@@ -299,69 +265,6 @@ def _compact_audio_chunks_for_remote_cmd(
     ]
 
 
-def compact_audio_for_remote(
-    path_in: str,
-    path_out: str,
-    cancel_event: Optional[threading.Event] = None,
-) -> str:
-    """Compress arbitrary audio/video to a Deepgram-friendly compact form.
-
-    Output: 16 kHz mono Opus in WebM container at ~24 kbit/s. This
-    cuts a typical 128 kbit/s stereo m4a / mp3 down by 5-10× — for
-    a 26.6 MB / ~28 min file, the encoded WebM is ~5 MB. Smaller
-    upload = far less likely to trip a write-timeout on slow or
-    cross-region links (RU → us-east Deepgram is the documented
-    failure mode), and Deepgram natively understands webm/opus so
-    container-sniffing edge cases for m4a / mp4 / mkv go away too.
-
-    Why ALWAYS convert (vs. "convert only when >5 MB"):
-      * Tiny files (<2 MB): ffmpeg overhead is ~1-3 s; upload savings
-        are smaller but the codec normalization still buys reliability
-        on Deepgram's container parser.
-      * Container quirks (mp4 with multiple audio tracks, m4a with
-        unusual moov-atom placement): provider-side decode failures
-        are far rarer with a clean Opus/WebM stream.
-      * Cost / latency / failure profile is BOUNDED — the worst case
-        is a tiny CPU spike, no risk of bandwidth blow-up.
-
-    Output extension is enforced as ``.webm``; callers should pass
-    a path ending in ``.webm`` so MIME sniffing on the receiving
-    side aligns. ``ensure_wav_16k`` is unchanged — local Whisper
-    still receives PCM WAV (Whisper expects raw waveform input,
-    not a compressed container).
-
-    Raises AudioError if ffmpeg isn't installed or the conversion fails.
-    """
-    if not _has_ffmpeg():
-        raise AudioError(
-            "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg` "
-            "or `winget install Gyan.FFmpeg`) — required for remote-provider "
-            "audio compression."
-        )
-    cmd = _compact_audio_for_remote_cmd(path_in, path_out)
-    # 1.1.25: clean up partial output on ffmpeg failure. ffmpeg's
-    # ``-y`` flag truncates the output up front, so a non-zero exit
-    # leaves a 0-byte (or partially-written) file at ``path_out``.
-    # A subsequent transcribe call that doesn't size-check would
-    # then read the fragment and produce garbage. Belt-and-braces
-    # cleanup keeps the contract "either path_out is a complete
-    # encoded file or it doesn't exist".
-    try:
-        _run_ffmpeg(
-            cmd,
-            timeout_sec=_REMOTE_COMPACT_TIMEOUT_SEC,
-            cancel_event=cancel_event,
-            fail_on_decode_error=True,
-        )
-    except AudioError:
-        try:
-            os.unlink(path_out)
-        except OSError:
-            pass
-        raise
-    return path_out
-
-
 def compact_audio_chunks_for_remote(
     path_in: str,
     output_dir: str,
@@ -374,9 +277,21 @@ def compact_audio_chunks_for_remote(
     Each output chunk is a standalone 16 kHz mono Opus/WebM file. The
     remote transcription layer sends those chunks sequentially and
     merges text afterward, so long videos never depend on one large
-    socket write succeeding. This is the long-form counterpart to
-    :func:`compact_audio_for_remote` and intentionally uses the same
-    codec/rate/container settings.
+    socket write succeeding.
+
+    Why ALWAYS convert, rather than only for large inputs: ffmpeg costs
+    1-3 s on a tiny file, and what the conversion buys is not only size
+    — a clean Opus/WebM stream removes the container quirks (mp4 with
+    several audio tracks, m4a with an unusual moov-atom placement) that
+    make provider-side decoding fail. The cost is bounded; the failure
+    it prevents is not. ``ensure_wav_16k`` is unchanged: local Whisper
+    still receives raw PCM WAV, which is what it expects.
+
+    (There used to be a single-file counterpart with the same settings.
+    Every remote upload goes through this chunked path — ``main`` has no
+    other caller — so the single-file one was ~60 lines of documented
+    behaviour describing a path nobody took, plus a test pinning an argv
+    nobody built.)
     """
     if not _has_ffmpeg():
         raise AudioError(

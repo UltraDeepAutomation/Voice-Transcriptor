@@ -40,11 +40,6 @@ class DeepgramRemoteError(RemoteError):
     """
 
 
-# ``raise RemoteError(...)`` inside this module must now produce the
-# Deepgram subclass. The assignment replaces the locally-bound name
-# without touching the base class in http_retry.
-RemoteError = DeepgramRemoteError  # type: ignore[misc]
-
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints`` so REST
 # and live modules share one source of truth for the Deepgram host.
 # Re-exported as ``DEEPGRAM_API_BASE`` for backward compat with any
@@ -158,7 +153,7 @@ def deepgram_transcribe(
     comma-joined string would send ONE term, not several).
     """
     if not api_key:
-        raise RemoteError("Deepgram API key is not configured")
+        raise DeepgramRemoteError("Deepgram API key is not configured")
 
     url = f"{DEEPGRAM_API_BASE}/listen"
 
@@ -180,9 +175,9 @@ def deepgram_transcribe(
             try:
                 speakers = int(speakers_raw)
             except ValueError as exc:
-                raise RemoteError("Deepgram num_speakers must be an integer") from exc
+                raise DeepgramRemoteError("Deepgram num_speakers must be an integer") from exc
             if speakers < 1 or speakers > 10:
-                raise RemoteError("Deepgram num_speakers must be between 1 and 10")
+                raise DeepgramRemoteError("Deepgram num_speakers must be between 1 and 10")
             params["num_speakers"] = str(speakers)
     kt_pairs = keyterm_query_pairs(keyterms, params["model"])
     if kt_pairs:
@@ -242,12 +237,12 @@ def deepgram_transcribe(
 
     if r.status_code >= 400:
         error_text = r.text[:400]
-        raise RemoteError(f"Deepgram API error (HTTP {r.status_code}): {error_text}")
+        raise DeepgramRemoteError(f"Deepgram API error (HTTP {r.status_code}): {error_text}")
 
     try:
         result = r.json()
     except Exception:
-        raise RemoteError(f"Deepgram: invalid JSON response: {r.text[:300]}")
+        raise DeepgramRemoteError(f"Deepgram: invalid JSON response: {r.text[:300]}")
 
     # Extract text from Deepgram response structure.
     # When paragraphs=true, Deepgram returns a structured paragraphs object
@@ -296,7 +291,7 @@ def deepgram_transcribe(
             e,
             list(result.keys()) if isinstance(result, dict) else type(result).__name__,
         )
-        raise RemoteError("Deepgram: malformed response payload") from e
+        raise DeepgramRemoteError("Deepgram: malformed response payload") from e
 
     # ``duration`` is part of the adapter contract, not of the caller's
     # knowledge of this provider's payload: the caller used to reach

@@ -165,9 +165,21 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: Optional[int] = None) -
         if mode is not None:
             try:
                 os.chmod(path, mode)
-            except OSError:
-                if os.name != "nt":
-                    raise
+            except OSError as chmod_err:
+                # The write LANDED. Raising here reported a failed write
+                # for a write that succeeded — and the outer handler then
+                # tried to unlink a tmp file that no longer exists and
+                # re-raised. ``main._load_or_create_api_token`` answers
+                # that by falling back to an in-memory token while a
+                # DIFFERENT token sits on disk, so every client of this
+                # session ends up out of sync with the next boot. The
+                # file already carries the mode requested at creation
+                # (``O_CREAT`` above); this chmod only re-tightens it
+                # after the rename, and a filesystem that refuses it
+                # (SMB, exFAT) is a warning, not a data loss.
+                logger.warning(
+                    "chmod %o skipped for %s: %s", mode, path, chmod_err,
+                )
         _fsync_parent_dir(path)
     except OSError:
         try:
@@ -192,10 +204,19 @@ def atomic_write_text(
     atomic_write_bytes(path, text.encode(encoding), mode=mode)
 
 
-def atomic_write_json(path: Path, data: JSONData, *, indent: int = 2) -> None:
-    """Serialise *data* as UTF-8 JSON and write atomically + durably."""
+def atomic_write_json(
+    path: Path, data: JSONData, *, indent: int = 2, mode: Optional[int] = None
+) -> None:
+    """Serialise *data* as UTF-8 JSON and write atomically + durably.
+
+    ``mode`` is passed through for the same reason ``atomic_write_text``
+    takes it: ``config.json`` can hold provider API keys in plain text
+    when ``cryptography`` is absent — a fallback this project documents
+    — and it was written at the process umask (measured 0644) beside a
+    keyfile written at 0600.
+    """
     payload = json.dumps(data, ensure_ascii=False, indent=indent)
-    atomic_write_text(path, payload)
+    atomic_write_text(path, payload, mode=mode)
 
 
 def atomic_copy_file(src: Path, path: Path, *, preserve_stat: bool = True) -> None:

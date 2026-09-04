@@ -58,6 +58,16 @@ def _log_target(method: str, url: str) -> str:
         return verb
 
 
+def _close_quietly(resp: object) -> None:
+    """Release a response nobody will read. Never raises."""
+    try:
+        close = getattr(resp, "close", None)
+        if callable(close):
+            close()
+    except Exception as e:  # pragma: no cover - teardown is best-effort
+        logger.debug("closing a superseded response failed: %s", e)
+
+
 def _exponential_backoff(attempt: int, base: float) -> float:
     """Return the wait-time for retry attempt N with jitter.
 
@@ -185,6 +195,12 @@ def request_with_retry(
         try:
             resp = _SESSION.request(method, url, timeout=timeout, **kwargs)
             if resp.status_code in _TRANSIENT_HTTP_STATUS and attempt < attempts - 1:
+                if last_resp is not None:
+                    # The previous transient response is superseded and
+                    # will never be returned. With ``stream=True`` its
+                    # body is unread, so it holds a connection-pool slot
+                    # for the whole backoff.
+                    _close_quietly(last_resp)
                 last_resp = resp
                 delay = _exponential_backoff(attempt, backoff_base)
                 # Honour Retry-After per RFC 7231. Providers
@@ -295,7 +311,15 @@ def request_with_retry(
                 " — provider took too long to respond. Retry, or switch Provider "
                 'to "local" in Settings if the link is consistently slow.'
             )
-        raise RemoteError(f"network error after {attempts} attempts: {err_text}{hint}")
+        # ``retried + 1``, not the configured ceiling: the
+        # non-idempotent read-timeout branch breaks out after ONE
+        # attempt, and the log line above already prints the honest
+        # number. Two different counts for one event, and the user saw
+        # the wrong one.
+        raise RemoteError(
+            f"network error after {retried + 1} attempt"
+            f"{'' if retried == 0 else 's'}: {err_text}{hint}"
+        )
     # All attempts returned a transient HTTP status — return the last
     # response so the caller surfaces the exact upstream error.
     assert last_resp is not None

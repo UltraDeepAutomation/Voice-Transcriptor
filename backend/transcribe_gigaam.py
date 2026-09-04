@@ -70,18 +70,19 @@ _MODEL_LOCKS: "dict[str, threading.Lock]" = {}
 # failure with no mention of the variable.
 _GIGAAM_CACHE_MAX = max(1, _env_int("TRANSCRIPTOR_GIGAAM_CACHE_SIZE", 1))
 
-_LAST_LOAD_ERROR: Optional[str] = None
-
-
 def gigaam_import_error() -> Optional[str]:
-    """Return why the engine is unavailable, or None when usable."""
-    global _LAST_LOAD_ERROR
+    """Return why the engine is unavailable, or None when usable.
+
+    The answer is computed fresh each time and returned. It used to be
+    stashed in a module global first — one that nothing ever read, and
+    that was never cleared when a later import succeeded, so the only
+    thing the global could have done was answer a stale question.
+    """
     try:
         import gigaam  # noqa: F401
         return None
     except Exception as e:  # pragma: no cover - environment-dependent
-        _LAST_LOAD_ERROR = f"{type(e).__name__}: {e}"
-        return _LAST_LOAD_ERROR
+        return f"{type(e).__name__}: {e}"
 
 
 def _model_lock(model_id: str) -> threading.Lock:
@@ -170,12 +171,15 @@ def _chunk_bounds(total_sec: float) -> list[tuple[float, float]]:
         return [(0.0, total_sec)]
     bounds: list[tuple[float, float]] = []
     t = 0.0
-    step = GIGAAM_MAX_CHUNK_SEC - GIGAAM_CHUNK_OVERLAP_SEC
     while t < total_sec - 1e-6:
         end = min(t + GIGAAM_MAX_CHUNK_SEC, total_sec)
         bounds.append((t, end))
         if end >= total_sec - 1e-6:
             break
+        # The next chunk starts one overlap back from where this one
+        # ended — NOT one fixed step from where it started, which is
+        # what a ``step`` variable computed here and never used would
+        # have implied. The two differ on the last chunk, which is short.
         t = end - GIGAAM_CHUNK_OVERLAP_SEC
     return bounds
 

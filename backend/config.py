@@ -115,7 +115,7 @@ def _resolve_data_dir() -> Path:
     """
     candidate = _default_data_dir()
     try:
-        candidate.mkdir(parents=True, exist_ok=True)
+        candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
         return candidate
     except OSError as e:
         fallback = Path.home() / ".transcriptor"
@@ -125,7 +125,7 @@ def _resolve_data_dir() -> Path:
             candidate, e, fallback,
         )
         try:
-            fallback.mkdir(parents=True, exist_ok=True)
+            fallback.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as e2:
             # Home itself is unwritable. Still do not raise: the app can
             # serve a session with no persisted config, and the log now
@@ -499,6 +499,30 @@ def _redact_provider_key_value(key: str) -> str:
     return "" if not key else (key[:3] + "..." + key[-2:])
 
 
+# What the RENDERER shows in a provider-key field once a key is stored:
+# a run of U+2022 bullets (``frontend/src/main.tsx``'s
+# ``MASKED_KEY_VALUE``). It is not what this module produces
+# (``abc...yz``), so the two sides of one contract described the same
+# value differently — and ``_preserve_redacted_provider_keys``, whose
+# whole job is to stop a mask being saved AS the key, recognised only
+# its own form. Today the renderer guards its own input, which means
+# the protection stands on the opposite side from where it was designed;
+# any other client posting back what it was shown would have written a
+# string of bullets into the config as an API key.
+_UI_MASK_CHAR = "\u2022"
+
+
+def _is_masked_key_value(incoming: str, current: str) -> bool:
+    """Is ``incoming`` a MASK of ``current`` rather than a new key?"""
+    if not incoming:
+        return False
+    if incoming == _redact_provider_key_value(current):
+        return True
+    # A field showing nothing but bullets carries no key material, so it
+    # can never be one — whatever length the UI chose to render.
+    return set(incoming) == {_UI_MASK_CHAR}
+
+
 def _preserve_redacted_provider_keys(update: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
     """Treat redacted provider keys posted back by the UI as unchanged."""
     providers = update.get("providers")
@@ -518,7 +542,7 @@ def _preserve_redacted_provider_keys(update: Dict[str, Any], current: Dict[str, 
         current_key = current_provider.get("key")
         if not isinstance(current_key, str) or not current_key:
             continue
-        if incoming_key == _redact_provider_key_value(current_key):
+        if _is_masked_key_value(incoming_key, current_key):
             prov.pop("key", None)
     return update
 
@@ -625,6 +649,14 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
 # implementation (say, an async writer or a WAL-style journal) be a
 # one-line change here rather than a grep across the whole module.
 _atomic_write_json = atomic_write_json
+
+# ``config.json`` is written owner-only. In the normal case its provider
+# keys are ``enc:`` ciphertext, but this module documents a plaintext
+# fallback for a runtime without ``cryptography`` — and the file sat at
+# the process umask (measured 0644) beside a keyfile at 0600. The mode a
+# secret-bearing file of this class gets is already demonstrated by
+# ``main._load_or_create_api_token``.
+CONFIG_FILE_MODE = 0o600
 _rotate_backup = rotate_backup
 
 
@@ -990,7 +1022,7 @@ def _load_config_unlocked() -> Dict[str, Any]:
         try:
             encrypted_cfg = _encrypt_provider_keys(merged)
             _rotate_backup_if_primary_valid()
-            _atomic_write_json(CONFIG_PATH, encrypted_cfg)
+            _atomic_write_json(CONFIG_PATH, encrypted_cfg, mode=CONFIG_FILE_MODE)
             logger.info(
                 "migrated plain-text provider keys to Fernet-encrypted form at %s",
                 CONFIG_PATH,
@@ -1042,7 +1074,11 @@ def _load_config_unlocked() -> Dict[str, Any]:
                 stamped = dict(merged)
                 stamped["schema_version"] = SCHEMA_VERSION
                 _rotate_backup_if_primary_valid()
-                _atomic_write_json(CONFIG_PATH, _encrypt_provider_keys(stamped))
+                _atomic_write_json(
+                    CONFIG_PATH,
+                    _encrypt_provider_keys(stamped),
+                    mode=CONFIG_FILE_MODE,
+                )
                 merged["schema_version"] = SCHEMA_VERSION
                 logger.info(
                     "config schema stamped with version=%d at %s (was: %r)",
@@ -1105,7 +1141,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
         # the backup on the next boot.
         _rotate_backup_if_primary_valid()
         try:
-            _atomic_write_json(CONFIG_PATH, encrypted)
+            _atomic_write_json(CONFIG_PATH, encrypted, mode=CONFIG_FILE_MODE)
         except OSError as e:
             logger.error("failed to persist config at %s: %s", CONFIG_PATH, e)
             raise

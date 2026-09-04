@@ -100,6 +100,24 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
         asyncio.run(self.main._require_api_auth(request))
 
     def test_network_probe_requires_token_but_health_does_not(self):
+        # Asserted where the rule LIVES — on the route declarations.
+        # ``_require_api_auth`` also carried a path check exempting
+        # /api/health, which was unreachable (that route declares no
+        # dependency) and would have silently exempted the endpoint the
+        # day someone added one (B-075). Testing that branch tested the
+        # copy, not the rule.
+        deps = {}
+        for route in self.main.app.routes:
+            path = getattr(route, "path", None)
+            if path in ("/api/health", "/api/network"):
+                deps[path] = [
+                    dep.call for dep in route.dependant.dependencies
+                ]
+        self.assertIn(self.main._require_api_auth, deps["/api/network"])
+        self.assertNotIn(self.main._require_api_auth, deps["/api/health"])
+
+        # And the dependency itself refuses an unauthenticated request,
+        # whatever path it is asked about.
         request = type("FakeRequest", (), {})()
         request.url = type("FakeURL", (), {"path": "/api/network"})()
         request.headers = {}
@@ -111,9 +129,6 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             asyncio.run(self.main._require_api_auth(request))
 
         self.assertEqual(raised.exception.status_code, 401)
-
-        request.url = type("FakeURL", (), {"path": "/api/health"})()
-        asyncio.run(self.main._require_api_auth(request))
 
     def test_health_exposes_upload_extension_ssot(self):
         payload = self.main.health()

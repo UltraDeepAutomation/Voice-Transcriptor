@@ -25,7 +25,6 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-import numpy as np
 from fastapi import (
     Body,
     Depends,
@@ -75,7 +74,6 @@ from backend.audio import (
     ensure_wav_16k,
     ensure_wav_16k_preserve_channels,
     split_channels,
-    write_wav,
     write_wav_from_pcm16_stream,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
@@ -1066,11 +1064,18 @@ def _delete_live_recovery(session_id: str) -> bool:
     if not stem_glob:
         return False
     removed = False
-    # Sidecar BEFORE spool, and the order is load-bearing. If the sidecar
-    # cannot be removed we must not have removed the audio either: an
-    # orphan ``.json`` still advertising a recovery whose PCM is gone is
-    # worse than leaving both in place for the retention sweep. Deleting
-    # the spool first would break that on any locked-sidecar failure.
+    # Sidecar BEFORE spool, and the order is load-bearing — for the
+    # opposite reason to the one recorded here before. An orphan
+    # ``.json`` advertises nothing: ``_list_live_recoveries`` globs the
+    # ``.pcm16`` files and tolerates a missing sidecar, so a recovery
+    # whose PCM is gone is simply not listed. The failure that DOES
+    # matter is the other one — sidecar removed, spool unlink failed —
+    # because the ``.pcm16`` is what makes a recovery visible and
+    # promotable, so the "discard" the user asked for would silently not
+    # have happened. Removing the sidecar first means that shape ends
+    # with the spool still present and the entry still offered, which is
+    # the honest outcome; removing the spool first would end with a
+    # discarded recording that still has a sidecar and looks discarded.
     for suffix in (".json", ".pcm16"):
         for path in LIVE_RECOVERY_DIR.glob(f"{stem_glob}{suffix}"):
             path.unlink(missing_ok=True)
@@ -1182,6 +1187,15 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                     "model": str(raw.get("model") or DEFAULT_LOCAL_TRANSCRIPTION_MODEL),
                     "language": str(raw.get("language") or "auto"),
                     "duration_sec": round(bytes_count / float(LIVE_PCM_BYTES_PER_SEC), 2),
+                    # The sidecar's own account of how the spool ended.
+                    # ``_finalize_live_recovery`` records ``status`` and a
+                    # ``write_error`` reason when the spool could not take
+                    # a chunk, and nothing read either field — so a
+                    # half-written session was offered to the user exactly
+                    # like a clean one, and promoting it silently produced
+                    # truncated audio.
+                    "status": str(raw.get("status") or ""),
+                    "write_error": str(raw.get("write_error") or ""),
                 }
             )
         except Exception as _list_err:
@@ -1322,9 +1336,13 @@ def _promote_live_recovery(
                     status_code=409,
                     detail="session is still recording; stop it before promoting",
                 )
-            # Reject oversized spool files BEFORE the read to avoid OOM:
-            # np.frombuffer + astype(float32) materialises 3× the raw PCM
-            # size in RAM simultaneously.
+            # Refuse an oversized spool BEFORE touching it. The
+            # conversion below streams (``write_wav_from_pcm16_stream``,
+            # ~2 MB per chunk), so this is a bound on how much of the
+            # user's disk one promote may turn into a WAV — not the RAM
+            # bound the old whole-file float32 conversion needed. The
+            # ceiling is ``MAX_RECOVERY_PROMOTE_BYTES``, derived from
+            # the spool ceiling so the two cannot drift.
             pcm_size = pcm_path.stat().st_size
             readable_pcm_size = pcm_size - (pcm_size % 2)
             if pcm_size != readable_pcm_size:
@@ -1435,8 +1453,12 @@ def _promote_live_recovery(
 
 
 async def _require_api_auth(request: Request) -> None:
-    if request.url.path == "/api/health":
-        return
+    # ``/api/health`` is unauthenticated because it declares no
+    # ``Depends(_require_api_auth)``, and that route declaration is the
+    # only place the exemption should live. A path check here was
+    # unreachable — and would have silently exempted the endpoint the
+    # day someone added the dependency, which is the opposite of what
+    # adding it means.
     provided = (request.headers.get("x-api-token") or "").strip()
     # Constant-time comparison — prevents a timing-attack-based byte-by-byte
     # recovery of API_TOKEN over the loopback/LAN. secrets.compare_digest
@@ -2342,7 +2364,12 @@ def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
         return None
     status = _upload_queue_str(raw.get("status"), 32)
     if status not in UPLOAD_QUEUE_STATUSES:
-        status = "error"
+        # "I do not recognise this" is not "this failed". A client that
+        # adds a status — a newer renderer against an older backend —
+        # got every such item back from the persisted snapshot marked as
+        # a failure it never had. ``queued`` is the neutral answer: the
+        # item is still there and nothing is claimed about it.
+        status = "queued"
     item: dict[str, Any] = {
         "id": _upload_queue_str(raw.get("id"), 128) or uuid.uuid4().hex,
         "displayName": display_name,
@@ -2428,7 +2455,20 @@ def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
         return None
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="live draft state must be an object")
-    draft_src = payload.get("draft") if "draft" in payload and len(payload) <= 2 else payload
+    # Decide on the SCHEMA, not on how many keys the caller happened to
+    # send. ``put_live_draft_state`` answers with
+    # ``{"ok", "version", "draft"}`` — three keys — so echoing that
+    # response back, which is the natural idiom a GET/PUT pair teaches,
+    # took the ``else`` branch: the envelope was read AS the draft, every
+    # field fell to its default, and an empty draft was persisted with
+    # HTTP 200. The live draft is the safety net against a crash during
+    # dictation, so that failure is both silent and expensive.
+    if isinstance(payload.get("draft"), dict) or (
+        "draft" in payload and payload["draft"] is None
+    ):
+        draft_src = payload["draft"]
+    else:
+        draft_src = payload
     if draft_src is None:
         return None
     if not isinstance(draft_src, dict):
@@ -2475,15 +2515,27 @@ def _write_live_draft_state(payload: object) -> dict[str, Any]:
 
 
 def _clear_live_draft_state(session_id: str = "") -> dict[str, Any]:
+    """Clear the live draft, unless it belongs to another session.
+
+    The returned state carries ``cleared``: a caller that trusted the
+    endpoint's ``ok: true`` could not tell "the draft is gone" from
+    "another session owns it and I left it alone", and both answered
+    the same. ``ok`` in this API means the request was handled; whether
+    the draft was actually removed is a separate fact and is now stated.
+    """
     current = _read_live_draft_state()
     draft = current.get("draft") if isinstance(current.get("draft"), dict) else None
     expected_owner = _live_draft_str(session_id, 128)
     actual_owner = _live_draft_str(draft.get("session_id"), 128) if draft else ""
     if expected_owner and actual_owner and actual_owner != expected_owner:
-        return current
+        logger.info(
+            "live draft not cleared: owned by session %s, not %s",
+            actual_owner, expected_owner,
+        )
+        return {**current, "cleared": False}
     state = _default_live_draft_state()
     atomic_write_json(LIVE_DRAFT_STATE_PATH, state)
-    return state
+    return {**state, "cleared": True}
 
 
 _rec_dir_cache: Optional[Path] = None
@@ -2657,14 +2709,27 @@ def _recording_stem(name_or_title: str) -> str:
 
 
 def _recording_stem_available(target_dir: Path, stem: str) -> bool:
+    """Is this stem free in ``target_dir``?
+
+    An unreadable directory is NOT "the name is taken". Answering False
+    there rejected every candidate in turn and the caller ended with
+    ``500 could not allocate unique recording name`` — a message about
+    naming for a problem that is an archive on a disconnected drive or a
+    permissions change, with the real cause nowhere in the response.
+    """
     stem_key = str(stem or "").casefold()
     try:
         for entry in target_dir.iterdir():
             if entry.stem.casefold() == stem_key:
                 return False
     except OSError as exc:
-        logger.warning("recording stem availability scan failed for %s: %s", target_dir, exc)
-        return False
+        logger.error(
+            "recordings folder %s is not readable: %s", target_dir, exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"recordings folder is not readable: {target_dir}",
+        ) from exc
     return True
 
 
@@ -3794,9 +3859,21 @@ async def ws_transcribe(websocket: WebSocket):
     lang_opt: Optional[str] = None if language in ("", "auto", "Auto") else language
     session_id = _normalize_live_session_id(qp.get("session_id") or "")
     archive_dir = str(qp.get("archive_dir") or "").strip()
-    recording_collection = _normalize_recording_collection(
-        qp.get("recording_collection") or RECORDING_COLLECTION_LIVE
-    )
+    # In WebSocket scope an ``HTTPException`` has no handler: the client
+    # gets an unhandled server error and a 1011 close instead of a
+    # protocol message it can act on. Same normaliser, protocol-shaped
+    # answer.
+    try:
+        recording_collection = _normalize_recording_collection(
+            qp.get("recording_collection") or RECORDING_COLLECTION_LIVE
+        )
+    except HTTPException as e:
+        await _ws_send_json(
+            websocket,
+            {"type": "error", "error": str(e.detail), "fatal": True},
+        )
+        await websocket.close(code=4400, reason="unsupported recording collection")
+        return
     diarize = str(qp.get("diarize") or "").strip().lower() in ("1", "true", "yes", "on")
 
     started_at = datetime.now()
@@ -5807,12 +5884,14 @@ async def promote_live_recovery(
     payload: dict = Body(default_factory=dict),
     _auth: None = Depends(_require_api_auth),
 ):
-    # Async + offload: `_promote_live_recovery` reads up to 500 MB of
-    # PCM into a numpy float32 array (~1.5 GB transient heap) and
-    # writes a WAV — multi-second blocking I/O. Sync def pinned an
-    # executor thread for the entire run; concurrent promotions
-    # serialised. Now scheduled on the threadpool with the event
-    # loop free to keep WS frames flowing.
+    # Async + offload: ``_promote_live_recovery`` streams the spool
+    # through ``write_wav_from_pcm16_stream`` and writes a WAV —
+    # multi-second blocking I/O either way. A sync def pinned an
+    # executor thread for the whole run and serialised concurrent
+    # promotions; on the threadpool the event loop stays free to keep
+    # WS frames flowing. (This comment used to describe a whole-file
+    # numpy conversion and a 500 MB cap; both are gone, and the real
+    # ceiling is ``MAX_RECOVERY_PROMOTE_BYTES``.)
     archive_dir = str((payload or {}).get("archive_dir") or "").strip()
     recording_collection = str((payload or {}).get("recording_collection") or "live").strip()
     result = await asyncio.to_thread(

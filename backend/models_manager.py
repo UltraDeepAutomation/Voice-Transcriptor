@@ -86,11 +86,19 @@ def whisper_downloaded(model_id: str) -> bool:
         return False
     try:
         from huggingface_hub import try_to_load_from_cache
-        from huggingface_hub.utils import (
-            EntryNotFoundError,  # type: ignore[attr-defined]
-            RepositoryNotFoundError,  # type: ignore[attr-defined]
+    except ImportError as e:
+        # Told apart from "not in the cache", and told LOUDLY. Two unused
+        # exception imports used to sit in this try block; if a future
+        # huggingface_hub moved any imported symbol, the ImportError was
+        # swallowed into "not downloaded" for EVERY whisper model at once
+        # and the UI offered to re-download gigabytes already on disk,
+        # leaving only a logger.debug behind.
+        logger.warning(
+            "whisper presence check unavailable (huggingface_hub import "
+            "failed: %s); reporting models as not downloaded", e,
         )
-
+        return False
+    try:
         result = try_to_load_from_cache(repo_id=repo, filename="model.bin")
         return isinstance(result, str)
     except Exception as e:  # cache dir unreadable etc. — treat as absent
@@ -334,5 +342,22 @@ def start_download(model_id: str) -> Dict[str, Any]:
         name=f"model-dl-{model_id}",
         daemon=True,
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception as e:
+        # The state was claimed above so two callers cannot both start a
+        # download. If the worker never runs, nothing will ever release
+        # that claim — and ``delete_model`` refuses a model whose status
+        # is "downloading", so it becomes neither downloadable nor
+        # deletable until the process restarts.
+        logger.error("model download thread failed to start for %s: %s", model_id, e)
+        with _lock:
+            entry = dict(_state.get(model_id) or {})
+            entry.update({
+                "status": "error",
+                "progress": 0.0,
+                "error": f"{type(e).__name__}: {e}",
+            })
+            _state[model_id] = entry
+        raise
     return _get_state(model_id)

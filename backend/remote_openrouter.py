@@ -246,15 +246,25 @@ def openrouter_upscale_text(
         raise RemoteError(f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}")
 
     js = _json_response(r, "OpenRouter upscale")
-    out_text = ""
     try:
-        out_text = (js["choices"][0]["message"]["content"] or "").strip()
+        raw_content = js["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as shape_err:
         # A response-shape change must not masquerade as "empty text"
         # (BUG-66): triage needs to see WHAT was actually received.
         raise RemoteError(
             f"openrouter upscale: unexpected response shape ({shape_err}): {str(js)[:200]}"
-        )
+        ) from shape_err
+    # ``openrouter_transcribe`` coerces defensively for exactly this
+    # reason and this function did not: a model answering with the
+    # multimodal form (``content: [{"type": "text", ...}]``) reaches
+    # ``.strip()`` on a list, and ``AttributeError`` is not in the tuple
+    # above — so it escaped as an unredacted 500 instead of a provider
+    # error the caller could fall back from.
+    if raw_content is None:
+        raise RemoteError("openrouter upscale returned no content")
+    out_text = (
+        raw_content if isinstance(raw_content, str) else str(raw_content)
+    ).strip()
     if not out_text:
         raise RemoteError("openrouter upscale returned empty text")
 

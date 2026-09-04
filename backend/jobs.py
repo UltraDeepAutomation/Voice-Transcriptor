@@ -1,6 +1,6 @@
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -118,7 +118,26 @@ class JobStore:
             return job
 
     def submit(self, fn, *args, **kwargs) -> None:
-        self._pool.submit(fn, *args, **kwargs)
+        """Run ``fn`` on the pool, and never lose what it raised.
+
+        ``ThreadPoolExecutor`` puts a worker's exception in the Future
+        and nowhere else. Dropping the Future meant anything that
+        escaped a worker's own handlers — a ``BaseException``, a failure
+        inside its ``finally`` — vanished with no log line at all, and
+        the job it was running stayed "running" forever while the
+        renderer polled it.
+        """
+        future = self._pool.submit(fn, *args, **kwargs)
+
+        def _report(fut: "Future") -> None:
+            try:
+                exc = fut.exception()
+            except Exception:  # pragma: no cover - cancelled future
+                return
+            if exc is not None:
+                logger.error("job worker crashed: %s", exc, exc_info=exc)
+
+        future.add_done_callback(_report)
 
     # All four setters use ``.get`` + None-guard instead of bracket access.
     # _prune (invoked on every ``create``) evicts the oldest jobs when the
