@@ -13,6 +13,8 @@ import {
 import {
   decideDeadStreamRecovery,
   decideLiveTranscriptAdoption,
+  envelopeAudioEndSec,
+  envelopeCoversRecording,
   type LiveCoverageReport as LiveCoverage,
 } from "./live-coverage";
 import {
@@ -54,7 +56,9 @@ import {
 import {
   boundRecoveredTail,
   composeCanonicalLiveSourceText,
+  interimWindowOutrunsCoverage,
   mergeInterim,
+  retiredInterimTailBeyondCoverage,
   uncoveredInterimTail,
 } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
@@ -8607,13 +8611,13 @@ function appendSegmentsToBuffer(
     merged.slice(0, prevLen).every((seg, i) => seg === buffer.segments[i]);
 
   buffer.segments = merged;
+  // The retiring hypothesis and the window it was decoded over. Both are
+  // read below, AFTER the merge, because the question they answer — does
+  // this hypothesis reach past the time the finals now cover? — can only
+  // be asked against the coverage as it is once this final is in.
   const retiringInterim = buffer.interimText;
-  if (retiringInterim) {
-    buffer.lastInterimText = retiringInterim;
-  }
-  if (buffer.interimSegment) {
-    buffer.lastInterimSegment = buffer.interimSegment;
-  }
+  const retiringInterimEnd = buffer.interimSegment ? buffer.interimSegment.end : null;
+  const retiringInterimSegment = buffer.interimSegment;
   buffer.interimText = "";
   buffer.interimSegment = null;
 
@@ -8651,10 +8655,37 @@ function appendSegmentsToBuffer(
   // covered leaves it, so the field holds exactly the words no
   // committed segment accounts for and cannot accumulate duplicates of
   // text that arrived properly a moment later.
+  //
+  // D2: only a hypothesis whose decode window reaches PAST the covered
+  // time may contribute. A hypothesis that lived entirely inside the
+  // finals' time range holds no tail — a word missing from those finals
+  // is missing from the middle, where only the backend's word-level
+  // splice can put it back, and appending it here places it where it was
+  // never spoken ("трёх в" glued onto the end of session ``a9fd3fd9``).
+  // The same gate guards the SNAPSHOT: ``lastInterimText`` is composed
+  // into the canonical live text exactly like the durable tail is, so
+  // leaving a covered hypothesis there would re-open the defect through
+  // the other door — including one retained by an EARLIER final and only
+  // now overtaken by the coverage this one adds.
+  const coveredEndSec = maxSegmentEnd(buffer.segments);
+  if (
+    buffer.lastInterimSegment &&
+    !interimWindowOutrunsCoverage(buffer.lastInterimSegment.end, coveredEndSec)
+  ) {
+    buffer.lastInterimText = "";
+    buffer.lastInterimSegment = null;
+  }
+  if (retiringInterim && interimWindowOutrunsCoverage(retiringInterimEnd, coveredEndSec)) {
+    buffer.lastInterimText = retiringInterim;
+    buffer.lastInterimSegment = retiringInterimSegment;
+  }
   const carried = uncoveredInterimTail(buffer.committedText, buffer.recoveredTailText);
-  const fresh = retiringInterim
-    ? uncoveredInterimTail(buffer.committedText, retiringInterim)
-    : "";
+  const fresh = retiredInterimTailBeyondCoverage(
+    buffer.committedText,
+    retiringInterim,
+    retiringInterimEnd,
+    coveredEndSec,
+  );
   buffer.recoveredTailText = boundRecoveredTail(
     fresh ? mergeInterim(carried, fresh) : carried,
   );
@@ -11362,6 +11393,25 @@ async function stopLive(
       const lowCoverage = decideDeadStreamRecovery({ ...lowCoverageInputBase, uncoveredSpeechSec: 0 });
       console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} lastCapturedActivitySec=${lastCapturedActivitySec.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} tailActivityGapSec=${tailActivityGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" wsOpenAtStop=${wsOpenAtStop} framesNeverSent=${wsFramesNeverSent} decision=${lowCoverage.recover ? "RECOVER" : "skip"} reason=${lowCoverage.reason}`);
 
+      // D1: the envelope's own coverage arithmetic, assembled once for
+      // both stop branches. ``envelopeCoversRecording`` is the predicate
+      // (./live-coverage); this only supplies it with the C5 fields plus
+      // the renderer's own recording length, so the race and the confirm
+      // branch cannot end up asking slightly different questions.
+      const envelopeCoverageOf = (env: LiveFinalEnvelope | null | undefined) => ({
+        streamedSec: env?.streamedSec,
+        coveredEndSec: env?.coveredEndSec,
+        uncoveredSpeechSec: env?.uncoveredSpeechSec,
+        recordedSec,
+      });
+      const traceEnvelopeCoverage = (env: LiveFinalEnvelope | null | undefined): string => {
+        const input = envelopeCoverageOf(env);
+        const covered = Number.isFinite(input.coveredEndSec)
+          ? Number(input.coveredEndSec).toFixed(2)
+          : "n/a";
+        return `covered=${covered}/${envelopeAudioEndSec(input).toFixed(2)}`;
+      };
+
       if (instantTranscript) {
         transcriptRaw = instantTranscript;
 
@@ -11421,17 +11471,34 @@ async function stopLive(
           // value — this is the one path that does NOT already run the
           // full-audio recovery in parallel, so a hole the envelope
           // just proved would otherwise be delivered silently.
+          //
+          // D1: and the same envelope can be partial in the OTHER way —
+          // its last final ending seconds before the audio does, with no
+          // hole to report because the words simply had not arrived yet
+          // (session ``62115e77``: 10.85 s of final against 14.26 s of
+          // stream). ``envelopeCoversRecording`` is that check, the same
+          // one the race below applies; an envelope that does not cover
+          // the recording turns recovery on exactly as a proven hole
+          // does.
           const uncoveredSpeechSec = env?.uncoveredSpeechSec ?? 0;
+          const envelopeIsComplete = envelopeCoversRecording(envelopeCoverageOf(env));
           const postEnvelopeDecision = decideDeadStreamRecovery({ ...lowCoverageInputBase, uncoveredSpeechSec });
-          if (postEnvelopeDecision.recover) {
-            console.log(`[trace tail-gap] decision=RECOVER (post-envelope) reason=${postEnvelopeDecision.reason}`);
+          if (postEnvelopeDecision.recover || !envelopeIsComplete) {
+            const recoverReason = postEnvelopeDecision.recover
+              ? postEnvelopeDecision.reason
+              : "envelope-incomplete";
+            console.log(`[trace tail-gap] decision=RECOVER (post-envelope) reason=${recoverReason} ${traceEnvelopeCoverage(env)}`);
             patchCurrentRecordingSummary({
               title: provisionalTitle,
-              status: `${uncoveredSpeechSec.toFixed(1)}s of recognised speech never reached a final segment — recovering full transcript from saved audio…`,
+              status: uncoveredSpeechSec > 0
+                ? `${uncoveredSpeechSec.toFixed(1)}s of recognised speech never reached a final segment — recovering full transcript from saved audio…`
+                : "The final transcript stops short of the recording — recovering full transcript from saved audio…",
               tone: "warning",
             }, sessionUiToken);
             const recovered = await recoverFromEmptyTranscript(
-              `Envelope proved ${uncoveredSpeechSec.toFixed(1)}s of uncovered speech.`,
+              uncoveredSpeechSec > 0
+                ? `Envelope proved ${uncoveredSpeechSec.toFixed(1)}s of uncovered speech.`
+                : `Envelope incomplete (${recoverReason}, ${traceEnvelopeCoverage(env)}).`,
               Math.min(RECOVERY_HARD_TIMEOUT_MS, LIVE_TAIL_RECOVERY_TIMEOUT_MS),
             );
             const beforeRecovery = transcriptRaw;
@@ -11551,7 +11618,24 @@ async function stopLive(
           //   5. If neither beat instant, keep instant.
           //
           // Saves ~1.5 s per long recording in the typical case.
-          type Cand = { label: "envelope" | "recovery"; text: string; words: number; uncovered?: number };
+          //   6. D1: an envelope that does not cover the recording
+          //      never ends the race at all — not even when it improves
+          //      on the instant transcript. Session ``62115e77`` ended
+          //      the race 130 ms in on an envelope worth one extra word
+          //      that stopped at 10.85 s of a 14.26 s recording; the
+          //      clause the provider was still finalizing had nowhere
+          //      left to arrive. An incomplete envelope is a floor now,
+          //      never a verdict: the recovery candidate is awaited
+          //      within the race budget it already has.
+          type Cand = {
+            label: "envelope" | "recovery";
+            text: string;
+            words: number;
+            uncovered?: number;
+            /** D1: only the envelope can answer this; recovery leaves it undefined. */
+            coversRecording?: boolean;
+            coverageTrace?: string;
+          };
           const baseTranscriptForRace = transcriptRaw;
           const wcInstant = wordCountOf(baseTranscriptForRace);
           const envelopeCand: Promise<Cand> = envelopePromise.then((env) => {
@@ -11561,6 +11645,8 @@ async function stopLive(
               text,
               words: wordCountOf(text),
               uncovered: env?.uncoveredSpeechSec,
+              coversRecording: envelopeCoversRecording(envelopeCoverageOf(env)),
+              coverageTrace: traceEnvelopeCoverage(env),
             };
           });
           const recoveryCand: Promise<Cand> = recoveryPromise.then((text) => ({
@@ -11593,7 +11679,19 @@ async function stopLive(
             first.label === "envelope" &&
             firstConfirmsInstant &&
             !chose;
-          if (!chose && (!firstConfirmsInstant || waitForRecoveryDespiteEnvelopeConfirmation)) {
+          // D1: an incomplete envelope keeps whatever it added (above)
+          // as the floor, but it does not get to end the race — the
+          // words it is missing are still in flight, and only the
+          // full-audio decode can produce them now.
+          const firstEnvelopeIncomplete =
+            first.label === "envelope" && first.coversRecording === false;
+          if (firstEnvelopeIncomplete) {
+            console.log(`[trace tail-gap] race-first envelope incomplete ${first.coverageTrace} → waiting for recovery`);
+          }
+          if (
+            firstEnvelopeIncomplete ||
+            (!chose && (!firstConfirmsInstant || waitForRecoveryDespiteEnvelopeConfirmation))
+          ) {
             // First didn't improve. If it was the envelope and we
             // are already in the tail-likely-missing branch, give
             // the in-flight REST/local recovery a short bounded
@@ -11602,7 +11700,13 @@ async function stopLive(
             // envelope "confirms" a clipped live transcript while
             // recovery would have returned the missing last phrase.
             const otherPromise = first.label === "envelope" ? recoveryCand : envelopeCand;
-            const other = waitForRecoveryDespiteEnvelopeConfirmation
+            // The short second-candidate window exists for an envelope
+            // that CONFIRMED the instant transcript — there, waiting is
+            // a gamble against paste latency. An incomplete envelope is
+            // not a confirmation of anything, so that path waits for the
+            // recovery candidate itself; ``recoveryPromise`` is already
+            // bounded by ``recoveryBudgetMs``, which is the race budget.
+            const other = waitForRecoveryDespiteEnvelopeConfirmation && !firstEnvelopeIncomplete
               ? await Promise.race([
                 otherPromise,
                 new Promise<Cand | null>((resolve) => {
@@ -11619,8 +11723,15 @@ async function stopLive(
               // §4.8, same as the ``first`` candidate above: picked by
               // ``richerTranscript``, not united, because this path
               // cannot tell an envelope from an independent decode.
-              improvedText = richerTranscript(composeStopTranscript(baseTranscriptForRace, sessionUiToken, ""), other.text);
-              if (improvedText !== baseTranscriptForRace) {
+              //
+              // D1: the floor is whatever we already chose — on the
+              // incomplete-envelope path the envelope may have added
+              // words before the race went on, and starting the second
+              // comparison from the untouched base would throw them away
+              // whenever the recovery decode is the thinner reading.
+              const floorForOther = chose?.text ?? baseTranscriptForRace;
+              improvedText = richerTranscript(composeStopTranscript(floorForOther, sessionUiToken, ""), other.text);
+              if (improvedText !== floorForOther) {
                 chose = { ...other, text: improvedText, words: wordCountOf(improvedText) };
               }
             } else {

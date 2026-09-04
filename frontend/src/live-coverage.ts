@@ -219,3 +219,77 @@ export function decideDeadStreamRecovery(input: LowCoverageInput): LowCoverageDe
   if (tailLikelyMissing) return { recover: true, reason: "tail-gap" };
   return { recover: false, reason: "none" };
 }
+
+/**
+ * Does the final envelope account for the whole recording?
+ *
+ * D1 (BUGS_AUDIT_2026-09-03, three defects found on 1.5.0; log
+ * 2026-09-03T21:42:09Z, session ``62115e77``). The backend accepted the
+ * first post-``Finalize`` final as the end of the transcript and sent an
+ * envelope covering 0–10.85 s of a 14.26 s stream; the renderer's stop
+ * race saw that envelope 130 ms later, found it one word richer than the
+ * live splice and ended the race with it (``decision=USE_ENVELOPE
+ * (+1 words)``). The second final — "Напиши, на чем кто вас поверил." at
+ * 10.85–14.26 — arrived 2.7 s later and was never delivered.
+ *
+ * The race had every number it needed to know the envelope was partial:
+ * PROTOCOL CONTRACT C5 puts ``streamedSec`` (audio the backend actually
+ * handed the provider) and ``coveredEndSec`` (end of the last finalized
+ * segment) on the envelope itself. It simply never asked. This predicate
+ * is that question, asked in one place and used by both stop branches:
+ * the parallel race (an envelope that does not cover the recording never
+ * ends the race — the recovery candidate is awaited within the race
+ * budget) and the interim-covered confirm branch (an envelope that does
+ * not cover the recording turns recovery ON, exactly as a proven hole
+ * does).
+ *
+ * Two ways to fail, and only two:
+ *
+ *  * the transcript stops more than ``TAIL_GAP_THRESHOLD_SEC`` before
+ *    the audio does — the same threshold, not a second copy, that
+ *    separates trailing silence from a real tail cut everywhere else;
+ *  * the backend proved a hole anywhere (``uncoveredSpeechSec > 0``):
+ *    its own interims recognised speech no final segment covers.
+ *
+ * Absent data is NOT failure. ``streamedSec``/``coveredEndSec`` are
+ * optional C5 fields an older backend may not send, and treating "no
+ * field" as "not covered" would send every stop through full-audio
+ * recovery on the basis of a protocol mismatch. Absent stays absent
+ * here, the same way ``parseLiveWsMessage`` refuses to default the
+ * fields to 0.
+ */
+export interface EnvelopeCoverageInput {
+  /** C5: seconds of audio the backend actually streamed to the provider. */
+  streamedSec?: number;
+  /** C5: end of the last finalized segment in the envelope. */
+  coveredEndSec?: number;
+  /** Seconds of recognised speech no final segment covers (backend-proven). */
+  uncoveredSpeechSec?: number;
+  /** The renderer's own recording duration — the fallback time axis end. */
+  recordedSec?: number;
+}
+
+/**
+ * Where the audio ends on the envelope's time axis.
+ *
+ * ``streamedSec`` and ``recordedSec`` measure the same axis from the two
+ * ends of the socket, and they disagree by whatever is still in flight;
+ * the LATER of the two is the point a transcript has to reach, because a
+ * second of audio one side accounts for is a second that was spoken.
+ * Exported so the predicate and the trace log that reports it read one
+ * definition instead of two.
+ */
+export function envelopeAudioEndSec(input: EnvelopeCoverageInput): number {
+  const streamed = Number.isFinite(input.streamedSec) ? Number(input.streamedSec) : 0;
+  const recorded = Number.isFinite(input.recordedSec) ? Number(input.recordedSec) : 0;
+  return Math.max(streamed, recorded, 0);
+}
+
+export function envelopeCoversRecording(input: EnvelopeCoverageInput): boolean {
+  if ((input.uncoveredSpeechSec ?? 0) > 0) return false;
+  const coveredEndSec = input.coveredEndSec;
+  if (!Number.isFinite(coveredEndSec)) return true;
+  const audioEndSec = envelopeAudioEndSec(input);
+  if (!(audioEndSec > 0)) return true;
+  return audioEndSec - Number(coveredEndSec) <= TAIL_GAP_THRESHOLD_SEC;
+}

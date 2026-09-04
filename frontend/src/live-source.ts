@@ -320,3 +320,78 @@ export function composeCanonicalLiveSourceText(
   return [committed, withRecovered, withSnapshot, withCurrent, snapshotThenCurrent]
     .reduce((best, candidate) => pickRicher(best, candidate), "");
 }
+
+/**
+ * Shortest lead over the committed coverage that can hold a spoken word.
+ *
+ * A retiring hypothesis whose decode window ends within this much of the
+ * last final's end says nothing that the final does not already account
+ * for in time: no word is spoken in 0.2 s, so a lead that short is
+ * timestamp jitter at the seam, not speech past the seam.
+ */
+export const INTERIM_TAIL_MIN_LEAD_SEC = 0.2;
+
+/**
+ * What a retiring hypothesis may contribute to the durable tail.
+ *
+ * D2 (BUGS_AUDIT_2026-09-03, three defects found on 1.5.0; log
+ * 2026-09-03T21:43:06Z, session ``a9fd3fd9``). Deepgram dropped "трёх"
+ * from its finals — the word existed only in an interim, INSIDE the time
+ * range the finals covered. The §4.1 accumulation added it to
+ * ``recoveredTailText`` because the committed TEXT did not contain it,
+ * and the stop path, having nowhere else to put a word with no position,
+ * glued "трёх в" onto the END of the transcript. A word was recovered
+ * into a place it was never spoken, which is worse than the loss.
+ *
+ * The rule that fixes it, and the reason it is a time rule and not a
+ * text rule: a word inside covered time belongs to the backend's splice
+ * (§3.1 — Deepgram's own interim words are retained there and spliced
+ * into the segment whose span they fall in, where they land in the right
+ * PLACE), and the renderer must only recover what lies past the end of
+ * the final that displaced the hypothesis, where appending IS the right
+ * place.
+ *
+ * The granularity is the hypothesis's decode WINDOW, deliberately, and
+ * not an interpolated per-word time. The backend documents what that
+ * window is (``remote_deepgram_live``: "The message span is the
+ * re-decode window, not the speech in it: a rolling interim can span
+ * five seconds and carry two words near its end"), so spreading the
+ * hypothesis's words evenly across it would invent timings the data does
+ * not contain and drop real tail words on the strength of them. The
+ * window end is a sound BOUND: nothing the hypothesis heard is later
+ * than it, so a window that ends inside covered time cannot hold a word
+ * the finals missed at the tail — and one that reaches past coverage
+ * bounds only the words the committed text does not already carry
+ * (``uncoveredInterimTail``, the same seam rules as every other merge).
+ *
+ * No timestamp at all (``windowEndSec`` null, or a provider that sends
+ * no times) recovers nothing: without a position there is no evidence
+ * the words belong at the tail, and appending them blind is the defect
+ * this function exists to prevent.
+ */
+export function interimWindowOutrunsCoverage(
+  windowEndSec: number | null | undefined,
+  coveredEndSec: number,
+): boolean {
+  if (!Number.isFinite(windowEndSec) || !Number.isFinite(coveredEndSec)) return false;
+  const windowEnd = Number(windowEndSec);
+  if (!(windowEnd > 0)) return false;
+  // Both timestamps reach the renderer rounded to milliseconds (the
+  // backend rounds every segment time to three decimals), so the lead is
+  // compared at that precision — binary floating point cannot represent
+  // 0.2 exactly, and an unrounded subtraction puts a lead that IS the
+  // threshold a hair below it.
+  const leadSec = Math.round((windowEnd - coveredEndSec) * 1000) / 1000;
+  return leadSec >= INTERIM_TAIL_MIN_LEAD_SEC;
+}
+
+export function retiredInterimTailBeyondCoverage(
+  committedTextRaw: string,
+  retiringInterimRaw: string,
+  windowEndSec: number | null | undefined,
+  coveredEndSec: number,
+): string {
+  if (!normalizeTranscriptWhitespace(retiringInterimRaw)) return "";
+  if (!interimWindowOutrunsCoverage(windowEndSec, coveredEndSec)) return "";
+  return uncoveredInterimTail(committedTextRaw, retiringInterimRaw);
+}

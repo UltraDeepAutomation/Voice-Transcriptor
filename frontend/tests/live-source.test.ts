@@ -3,7 +3,10 @@ import { describe, it, expect } from "vitest";
 import {
   boundRecoveredTail,
   composeCanonicalLiveSourceText,
+  INTERIM_TAIL_MIN_LEAD_SEC,
+  interimWindowOutrunsCoverage,
   mergeInterim,
+  retiredInterimTailBeyondCoverage,
   uncoveredInterimTail,
 } from "../src/live-source";
 
@@ -176,5 +179,61 @@ describe("live-source composition", () => {
         "первая часть и вторая часть",
       );
     });
+  });
+});
+
+describe("D2 — the renderer recovers only what lies past the covered time", () => {
+  // Session ``a9fd3fd9``, 2026-09-03T21:43:06Z. Deepgram's finals were
+  // "…в одном из" [4.07-7.66] and "последних сообщений. Посмотри
+  // внимательно." [7.66-10.30]; the word "трёх" existed only in the
+  // interim [4.07-6.10] that the first final retired. The §4.1
+  // accumulation recovered "трёх в" — the committed TEXT did not
+  // contain it — and the stop path glued it onto the END of the
+  // transcript, placing a word where it was never spoken.
+  const firstFinal = "Посмотри, пожалуйста, в одном из";
+  const secondFinal = "последних сообщений. Посмотри внимательно.";
+  const bothFinals = `${firstFinal} ${secondFinal}`;
+  const retiringInterim = "Посмотри, пожалуйста, в одном из трёх в";
+
+  it("still finds the words the final did not carry over (the §4.1 half)", () => {
+    expect(uncoveredInterimTail(firstFinal, retiringInterim)).toBe("трёх в");
+  });
+
+  it("recovers nothing from a hypothesis that ended inside the final's time", () => {
+    // The hypothesis's decode window ends at 6.10 s; the final that
+    // retired it covers through 7.66 s. Nothing it heard is later than
+    // the coverage, so it holds no tail — "трёх" is a hole in the
+    // middle, and only the backend's word-level splice can place it.
+    expect(retiredInterimTailBeyondCoverage(firstFinal, retiringInterim, 6.10, 7.66)).toBe("");
+  });
+
+  it("delivers exactly the two finals", () => {
+    expect(composeCanonicalLiveSourceText(bothFinals, "", "", "")).toBe(bothFinals);
+  });
+
+  it("recovers a hypothesis that outruns the last final, and appends it at the end", () => {
+    // The positive case the gate must not break: the last final ends at
+    // 10.30 s and the hypothesis was decoded over a window reaching
+    // 10.60 s, so the words it holds past the coverage are the tail.
+    const committed = "Посмотри, пожалуйста, в одном из последних сообщений";
+    const interim = "последних сообщений на всякий случай";
+    const tail = retiredInterimTailBeyondCoverage(committed, interim, 10.6, 10.3);
+    expect(tail).toBe("на всякий случай");
+    expect(composeCanonicalLiveSourceText(committed, tail, "", "")).toBe(
+      "Посмотри, пожалуйста, в одном из последних сообщений на всякий случай",
+    );
+  });
+
+  it("recovers nothing when the hypothesis carries no timestamp", () => {
+    // No position, no evidence the words belong at the tail.
+    expect(retiredInterimTailBeyondCoverage("committed text here", "committed text here and more", null, 5)).toBe("");
+    expect(retiredInterimTailBeyondCoverage("committed text here", "committed text here and more", 0, 5)).toBe("");
+    expect(retiredInterimTailBeyondCoverage("committed text here", "committed text here and more", undefined, 5)).toBe("");
+  });
+
+  it("treats a lead shorter than a spoken word as seam jitter", () => {
+    expect(interimWindowOutrunsCoverage(10 + INTERIM_TAIL_MIN_LEAD_SEC, 10)).toBe(true);
+    expect(interimWindowOutrunsCoverage(10 + INTERIM_TAIL_MIN_LEAD_SEC - 0.01, 10)).toBe(false);
+    expect(interimWindowOutrunsCoverage(9.5, 10)).toBe(false);
   });
 });
