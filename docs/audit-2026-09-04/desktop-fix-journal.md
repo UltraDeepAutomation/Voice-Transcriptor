@@ -983,3 +983,60 @@ copyright                      — package.json:39 and twice more in mac/mas ext
 
 **Not done in this commit:** nothing from this group.
 
+---
+## Commit 17 — two tests that could not fail
+
+**IDs:** D-077 (P2), D-079 (P2).
+
+**Files:** `desktop/paste-capability.test.js`, `desktop/packaging.test.js`.
+
+**Re-verified on current code before fixing:** yes. `grep -n
+"pasteBudgetWorstCaseMs" desktop/*.js` still showed the function called from
+the test file only, and `positiveWhitelist()` still dropped every `!`
+pattern before matching.
+
+**Verification**
+- D-077. The new scan brace-matches ten paste-path functions in `main.js`
+  and fails on any wall-clock literal inside them. Replayed against the
+  pre-D-019 source (`889c91a`), i.e. the state the report described:
+  ```
+  889c91a runPasteLadder               unbudgeted timeouts: []
+  889c91a activateAppByPid             unbudgeted timeouts: ["5000","5000"]
+  889c91a activateAppByName            unbudgeted timeouts: ["5000","5000"]
+  889c91a activateMacCapturedWindow    unbudgeted timeouts: ["5000"]
+  889c91a sendCommandEnterToFocusedApp unbudgeted timeouts: ["3200","2000","2000","2000","2000","2000","5000","5000"]
+  ```
+  Thirteen unbudgeted timeouts — exactly D-019 and D-047 — which the old
+  "worst case fits the deadline" test passed straight over, because it
+  compared the table against itself. The scan also asserts each function
+  still exists, so it cannot silently start covering nothing.
+- D-079. The matcher now applies `build.files` IN ORDER with last-match-wins,
+  the rule electron-builder itself uses, and understands the glob subset the
+  manifest actually contains. Cases asserted:
+  ```
+  ["main.js","accelerator.js"]                    accelerator.js -> included
+  ["main.js","accelerator.js","!accelerator.js"]  accelerator.js -> EXCLUDED   (old matcher: included)
+  ["**/*","!lib/**"]                              lib/drop.js    -> excluded
+  ["**/*","!lib/**","lib/keep.js"]                lib/keep.js    -> included
+  "*.js" vs "lib/main.js"                         -> false  (* does not cross a separator)
+  "runtime/**/*" vs "runtimex/a.js"               -> false
+  ```
+  Plus a sweep asserting every literal entry in the real manifest matches
+  itself and that `!runtime/**/*` still excludes what it names.
+- `npm --prefix desktop test` -> `tests 247 / pass 247 / fail 0` (was 245).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *D-077, chosen:* keep `pasteBudgetWorstCaseMs` and make it FAITHFUL rather
+  than delete it or inline its formula into main.js. The number is only
+  meaningful next to `PASTE_POST_STOP_DEADLINE_MS`, and what was missing was
+  never the arithmetic — it was any evidence that the ladder spends its clock
+  through the table. A source scan is the only seam a `node --test` process
+  has into a 9k-line Electron module, and it is the one that would have
+  caught the original defect.
+- *D-079, chosen:* a deliberately small glob (`**` crosses separators, `*`
+  and `?` do not). Anything richer would be a second minimatch to get wrong,
+  and the manifest uses exactly this subset.
+
+**Not done in this commit:** nothing from this group.
+

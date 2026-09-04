@@ -62,22 +62,53 @@ function collectLocalRequiresGraph() {
   return edges;
 }
 
-function positiveWhitelist() {
-  return (pkg.build?.files || []).filter((p) => !p.startsWith("!"));
+/**
+ * Does one `build.files` pattern (already stripped of its leading "!")
+ * match this path?
+ *
+ * A deliberately small glob: `**` crosses separators, `*` and `?` do not.
+ * That is the subset electron-builder's patterns in this manifest use, and
+ * anything richer would be a second minimatch to get wrong.
+ */
+function patternMatches(pattern, resolved) {
+  if (pattern === resolved) return true;
+  const escaped = (text) => text.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  // A trailing "/**" is "everything under this directory", including the
+  // directory itself — minimatch's rule and the one build.files relies on.
+  if (pattern.endsWith("/**")) {
+    return new RegExp(`^${escaped(pattern.slice(0, -3))}(?:/.*)?$`).test(resolved);
+  }
+  // `escaped` leaves * and ? alone (they are the glob syntax), so the
+  // sentinels below are safe: nothing that replaces them reintroduces one.
+  const body = escaped(pattern)
+    .split("**/").join("<<ANYDIR>>")
+    .split("**").join("<<ANY>>")
+    .split("*").join("[^/]*")
+    .split("?").join("[^/]")
+    .split("<<ANYDIR>>").join("(?:.*/)?")
+    .split("<<ANY>>").join(".*");
+  return new RegExp(`^${body}$`).test(resolved);
 }
 
+
+/**
+ * electron-builder applies build.files IN ORDER and the LAST pattern that
+ * matches decides, so a "!" entry after a positive one excludes what the
+ * positive one included.
+ *
+ * This used to drop every "!" pattern before matching, which meant the spec
+ * could report a module as packaged while the manifest excluded it — the
+ * exact MODULE_NOT_FOUND-in-a-user's-DMG failure the file exists to prevent,
+ * with a green test on top of it.
+ */
 function coveredByWhitelist(resolved) {
-  // Exact-name entries are how every current module is whitelisted;
-  // glob patterns are honoured conservatively via prefix match so a
-  // future "lib/**" entry also satisfies "lib/foo.js".
-  return positiveWhitelist().some((pattern) => {
-    if (pattern === resolved) return true;
-    if (pattern.endsWith("/**")) {
-      const dir = pattern.slice(0, -3);
-      return resolved.startsWith(dir.endsWith("/") ? dir : dir + "/");
-    }
-    return false;
-  });
+  let included = false;
+  for (const raw of pkg.build?.files || []) {
+    const negated = raw.startsWith("!");
+    if (!patternMatches(negated ? raw.slice(1) : raw, resolved)) continue;
+    included = !negated;
+  }
+  return included;
 }
 
 test("build.files whitelist covers every local require of the packaged entrypoints", () => {
@@ -348,5 +379,42 @@ test("the identity strings that appear outside the manifest are locked to it", (
       !("NSHumanReadableCopyright" in (pkg.build[platform].extendInfo || {})),
       `build.${platform}.extendInfo must not restate the copyright`,
     );
+  }
+});
+
+test("a later ! pattern excludes what an earlier one included — matching honours order", () => {
+  // The whitelist matcher used to discard "!" patterns entirely, so this
+  // manifest shape reported every module as packaged while electron-builder
+  // shipped none of them.
+  const ordered = (files, resolved) => {
+    let included = false;
+    for (const raw of files) {
+      const negated = raw.startsWith("!");
+      if (!patternMatches(negated ? raw.slice(1) : raw, resolved)) continue;
+      included = !negated;
+    }
+    return included;
+  };
+  assert.equal(ordered(["main.js", "accelerator.js"], "accelerator.js"), true);
+  assert.equal(ordered(["main.js", "accelerator.js", "!accelerator.js"], "accelerator.js"), false);
+  // ...and a positive after a negative wins again.
+  assert.equal(ordered(["**/*", "!lib/**", "lib/keep.js"], "lib/keep.js"), true);
+  assert.equal(ordered(["**/*", "!lib/**"], "lib/drop.js"), false);
+
+  // The glob subset itself.
+  assert.equal(patternMatches("runtime/**/*", "runtime/mac-arm64/python/bin/python3"), true);
+  assert.equal(patternMatches("runtime/**/*", "runtimex/a.js"), false);
+  assert.equal(patternMatches("*.js", "main.js"), true);
+  assert.equal(patternMatches("*.js", "lib/main.js"), false, "* must not cross a separator");
+  assert.equal(patternMatches("lib/**", "lib/deep/a.js"), true);
+  assert.equal(patternMatches("icon.png", "icon.png"), true);
+
+  // The manifest's own negative pattern still excludes what it names, and
+  // still leaves every packaged module included.
+  assert.ok(pkg.build.files.includes("!runtime/**/*"), "the runtime exclusion is part of this contract");
+  assert.equal(coveredByWhitelist("runtime/mac-arm64/python/bin/python3"), false);
+  for (const entry of pkg.build.files) {
+    if (entry.startsWith("!") || entry.includes("*")) continue;
+    assert.equal(coveredByWhitelist(entry), true, `${entry} is listed but does not match`);
   }
 });

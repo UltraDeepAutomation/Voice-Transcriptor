@@ -447,3 +447,63 @@ test("one classifier decides which macOS permission a failure is asking for", ()
   assert.equal(classifyPastePermissionFailure(""), R.NONE);
   assert.equal(classifyPastePermissionFailure(null), R.NONE);
 });
+
+test("the budget table is the ladder's real clock, not a model of it", () => {
+  // pasteBudgetWorstCaseMs is called from nowhere but this file, so the
+  // "worst case fits the post-stop deadline" property above is only as true
+  // as the ladder's agreement with the table. That agreement was assumed;
+  // this asserts it. Every wall-clock bound spent inside a paste-path
+  // function must come FROM the table — a literal there is a second clock
+  // the worst case does not know about, which is exactly the shape D-019
+  // found (six hardcoded 5000 ms activation timeouts outside the budget).
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+
+  // Brace-matched body of a top-level function, so the scan cannot silently
+  // cover nothing (the guard below fails if a name stops matching).
+  const bodyOf = (name) => {
+    const head = new RegExp(`^(?:async )?function ${name}\\(`, "m").exec(source);
+    assert.ok(head, `main.js no longer declares ${name} — this scan must be updated, not deleted`);
+    let i = source.indexOf("{", head.index);
+    let depth = 0;
+    for (let j = i; j < source.length; j++) {
+      if (source[j] === "{") depth++;
+      else if (source[j] === "}" && --depth === 0) return source.slice(i, j + 1);
+    }
+    throw new Error(`unbalanced braces in ${name}`);
+  };
+
+  const PASTE_PATH_FUNCTIONS = [
+    "runPasteLadder",
+    "tryPasteToFocusedField",
+    "awaitModifierRelease",
+    "activateCapturedPasteTarget",
+    "activateMacCapturedWindow",
+    "activateAppByPid",
+    "activateAppByName",
+    "activateWindowsWindowByHwnd",
+    "activateLinuxWindowById",
+    "sendCommandEnterToFocusedApp",
+  ];
+  for (const name of PASTE_PATH_FUNCTIONS) {
+    const body = bodyOf(name);
+    const literals = [...body.matchAll(/timeoutMs:\s*(\d+)/g)].map((m) => m[1]);
+    assert.deepEqual(
+      literals,
+      [],
+      `${name} spends ${literals.join(", ")} ms of wall clock that pasteBudgetWorstCaseMs cannot see`,
+    );
+  }
+
+  // ...and the worst case is not a number this test invented: it is spent
+  // by the accessors the ladder actually calls.
+  for (const accessor of [
+    "pasteMethodTimeoutMs",
+    "pasteAttemptDelayMs",
+    "pasteActivationTimeoutMs",
+    "pasteAutoSendTimeoutMs",
+  ]) {
+    assert.ok(source.includes(`${accessor}(`), `main.js must spend its clock through ${accessor}`);
+  }
+});
