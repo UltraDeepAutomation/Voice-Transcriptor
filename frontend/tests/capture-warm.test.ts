@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 
 import {
   captureElapsedMs,
+  WARM_HOLD_LIFECYCLE_RELEASES,
+  type WarmHoldLifecycleRelease,
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
@@ -215,5 +217,28 @@ describe("captureElapsedMs — one clock for 'is this a recording yet?'", () => 
   it("is zero before either clock starts, and never negative", () => {
     expect(captureElapsedMs({ now: 1_600, startRequestedAt: 0, startAt: 0 })).toBe(0);
     expect(captureElapsedMs({ now: 900, startRequestedAt: 1_000, startAt: 0 })).toBe(0);
+  });
+});
+
+describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
+  it("names every event that ends a hold, and nothing else", () => {
+    // A support-log contract: these are the strings
+    // ``[trace warmCapture] released reason=…`` prints, and the renderer
+    // has one listener per entry.
+    expect([...WARM_HOLD_LIFECYCLE_RELEASES]).toEqual([
+      "ttl",
+      "window-hidden",
+      "pagehide",
+      "devicechange",
+      "system-suspend",
+    ]);
+  });
+
+  it("includes sleep, which nothing inside the renderer can infer", () => {
+    // setTimeout does not run while the machine is asleep, so the hold's
+    // own TTL timer cannot be what releases it — the main process's
+    // powerMonitor event is.
+    const sleep: WarmHoldLifecycleRelease = "system-suspend";
+    expect(WARM_HOLD_LIFECYCLE_RELEASES).toContain(sleep);
   });
 });

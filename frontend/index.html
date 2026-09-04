@@ -338,7 +338,7 @@
             2026-09-03 it can drop phrases around language switches,
             while a fixed language keeps that language but garbles the
             others. Add names under Key terms — they reduce drops in
-            both modes.
+            both modes.<span id="languageAutoDualHint"></span>
           </p>
         </div>
 
@@ -661,6 +661,33 @@
                 names, people, project words. One per line or
                 comma-separated. Nova-3 only.
               </p>
+              <!--
+                Dual-stream Auto. Measured 2026-09-04: two Nova-3 streams
+                (multi + one fixed language) merged by word timestamps
+                closed both language-switch holes on the trilingual test
+                recording, at twice the Deepgram minutes and no extra
+                latency. It only means anything while LANG is Auto — a
+                fixed language has no second stream to add — so the whole
+                row is hidden otherwise by the one function that decides
+                everything Auto-dependent (syncAutoLanguageUi in main.tsx).
+                The language list is NOT written out again here: it is
+                filled from #language's own options at load, so the two
+                can never drift.
+              -->
+              <div class="field-stack" id="deepgramDualStreamRow" hidden>
+                <label class="toggle-inline settings-toggle">
+                  <span>Auto: two streams (multi + fixed language)</span>
+                  <input type="checkbox" id="deepgramDualStreamCheck" />
+                </label>
+                <label class="field">
+                  <span class="lbl">Second language</span>
+                  <select id="deepgramDualSecondaryLang"></select>
+                </label>
+                <p class="settings-note" id="deepgramDualStreamNote">
+                  Fills phrases the multilingual model drops; costs 2×
+                  Deepgram minutes.
+                </p>
+              </div>
               <label class="field">
                 <span class="lbl">OpenRouter</span>
                 <span class="key-row">

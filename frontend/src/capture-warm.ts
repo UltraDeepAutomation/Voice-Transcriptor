@@ -142,6 +142,44 @@ export function decideWarmHold(input: WarmHoldInput): WarmHoldDecision {
   return { hold: true, reason: "held" };
 }
 
+/**
+ * The lifecycle events that end a warm hold, and why each one does.
+ *
+ * These strings are a support-log contract — they are what
+ * ``[trace warmCapture] released reason=…`` prints — so they live here,
+ * with the rest of the warm-capture policy, rather than as four string
+ * literals spread across the renderer's event listeners.
+ *
+ *   ttl            — the hold's own timer expired: 30 s of holding the
+ *                    microphone open is the whole budget.
+ *   window-hidden  — the app left the screen. A microphone held open by
+ *                    an app that is not visible is the one case where
+ *                    the OS indicator has nothing at all to show for
+ *                    itself. (The TRANSITION is what releases; a hold
+ *                    taken while already hidden is the ordinary case of
+ *                    dictating by global hotkey.)
+ *   pagehide       — the renderer itself is going away.
+ *   devicechange   — the device list changed underneath us, so the "same
+ *                    microphone" premise the hold rests on is gone.
+ *   system-suspend — the machine is sleeping or the screen is locking.
+ *                    This one cannot be inferred from inside the
+ *                    renderer: ``setTimeout`` does not run while asleep,
+ *                    so the TTL timer above cannot fire, and the OS may
+ *                    hand the input device to something else in the
+ *                    meantime. ``decideWarmReuse`` still re-checks the
+ *                    wall clock at the next press — that is the backstop
+ *                    for a shell too old to send the event.
+ */
+export const WARM_HOLD_LIFECYCLE_RELEASES = [
+  "ttl",
+  "window-hidden",
+  "pagehide",
+  "devicechange",
+  "system-suspend",
+] as const;
+
+export type WarmHoldLifecycleRelease = typeof WARM_HOLD_LIFECYCLE_RELEASES[number];
+
 export interface WarmReuseInput {
   now: number;
   /** `Date.now()` at the moment the hold was taken. */

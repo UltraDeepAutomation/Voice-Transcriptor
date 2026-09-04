@@ -26,7 +26,13 @@ import {
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
+  type WarmHoldLifecycleRelease,
 } from "./capture-warm";
+import {
+  DUAL_SECONDARY_LANGUAGE_DEFAULT,
+  DUAL_STREAM_DEFAULT,
+  resolveDualStreamPreference,
+} from "./deepgram-dual";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
 import { installErrorAwareConsole } from "./error-text";
@@ -141,7 +147,21 @@ interface AppConfig {
     // a single raw string exactly as the user typed it (comma- or
     // newline-separated) — the backend owns normalisation into the
     // Deepgram ``keyterm`` query params. The frontend never parses it.
-    deepgram?: { keyterms?: string };
+    //
+    // ``dual_stream`` / ``dual_secondary_language`` are the dual-stream
+    // Auto contract: two Nova-3 streams (multi + one fixed language)
+    // merged by word timestamps, which on 2026-09-04 closed both
+    // language-switch holes of the trilingual recording at twice the
+    // Deepgram minutes. Raw here too — the backend validates them, and
+    // they only apply while the live language is Auto. Absent means the
+    // documented defaults (on, "ru"), never "off": a config written by
+    // an older build must not silently disable a feature the backend
+    // has on by default.
+    deepgram?: {
+      keyterms?: string;
+      dual_stream?: boolean;
+      dual_secondary_language?: string;
+    };
     ui?: {
       provider?: string;
       language?: string;
@@ -282,6 +302,14 @@ interface TranscriptWord {
   start: number;
   end: number;
   text: string;
+  /**
+   * Which reading this word came from, when the backend says so — the
+   * dual-stream merge tags each word with the stream that produced it
+   * ("multi", the secondary language, "interim-fallback"). Diagnostic
+   * provenance only: nothing in the renderer decides anything from it,
+   * and it is simply absent on a single-stream envelope.
+   */
+  source?: string;
 }
 
 interface TranscriptSegment {
@@ -367,6 +395,31 @@ interface LiveFinalEnvelope {
   streamedSec?: number;
   /** PROTOCOL CONTRACT C5: the last second of audio a final segment covers — the tail-gap arithmetic's authoritative end point. */
   coveredEndSec?: number;
+  /** What the session reports about itself — see ``LiveFinalStats``. */
+  stats?: LiveFinalStats;
+}
+
+/**
+ * The slice of the backend's ``stats`` dict the renderer reads.
+ *
+ * The envelope has carried a full ``stats`` object all along
+ * (``LiveSession.stats.as_dict()``); the renderer never had a reason to
+ * look inside it. Dual-stream Auto is that reason: whether the recording
+ * was decoded by one Nova-3 stream or two is invisible in the transcript
+ * and decides how to read every other number in a support log, so the
+ * stop trace states it.
+ *
+ * Only the one field is parsed, and only as a boolean: anything else in
+ * ``stats`` is the backend's business.
+ *
+ * NOTE (2026-09-04): ``backend/deepgram_dual.py`` had not landed when
+ * this was written, so the field name here is the one from the
+ * dual-stream config contract (``dual_stream``). If the backend reports
+ * it under another name, this is the single place to correct — a missing
+ * or non-boolean field reads as "not dual", never as a crash.
+ */
+interface LiveFinalStats {
+  dualStream?: boolean;
 }
 
 /**
@@ -391,6 +444,7 @@ type LiveWsMessage =
       uncoveredSpeechSec?: number;
       streamedSec?: number;
       coveredEndSec?: number;
+      stats?: LiveFinalStats;
     }
   | { type: "error"; error: string; fatal: boolean }
   /**
@@ -415,6 +469,18 @@ type LiveWsMessage =
 function parseOptionalNonNegativeNumber(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * ``stats.dual_stream`` and nothing else. Absent, malformed or
+ * non-boolean is absent — the same rule the C5 fields follow, for the
+ * same reason: a protocol mismatch must never be read as a fact.
+ */
+function parseLiveFinalStats(raw: unknown): LiveFinalStats | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const dualStream = (raw as { dual_stream?: unknown }).dual_stream;
+  if (typeof dualStream !== "boolean") return undefined;
+  return { dualStream };
 }
 
 function parseLiveWsMessage(raw: string): LiveWsMessage | null {
@@ -494,6 +560,7 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
       uncoveredSpeechSec: parseOptionalNonNegativeNumber(obj.uncoveredSpeechSec),
       streamedSec: parseOptionalNonNegativeNumber(obj.streamedSec),
       coveredEndSec: parseOptionalNonNegativeNumber(obj.coveredEndSec),
+      stats: parseLiveFinalStats(obj.stats),
     };
   }
 
@@ -648,6 +715,23 @@ declare global {
         final: boolean;
         source: string;
       }) => boolean;
+      /**
+       * "The machine is going to sleep, or the screen is locking."
+       *
+       * ``powerMonitor`` is a main-process API, so the main process is
+       * the only one that can say this; the preload forwards it on the
+       * fixed ``system-suspend`` channel (``reason`` is "suspend" or
+       * "lock-screen") and returns an unsubscribe function.
+       *
+       * The renderer needs it for exactly one thing: a warm capture hold
+       * must not survive sleep. Nothing else in the app can tell —
+       * ``setTimeout`` does not run while the machine is asleep, so the
+       * hold's own TTL timer cannot fire, and the OS may hand the input
+       * device to something else while we are not looking.
+       */
+      onSystemSuspend?: (
+        callback: (payload: { reason: string }) => void,
+      ) => (() => void);
     };
   }
 }
@@ -2506,14 +2590,20 @@ function normalizeTranscriptWords(raw: unknown, timeOffsetSec: number): Transcri
   const out: TranscriptWord[] = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") return null;
-    const source = entry as { word?: unknown; punctuated_word?: unknown; text?: unknown; start?: unknown; end?: unknown };
+    const source = entry as {
+      word?: unknown; punctuated_word?: unknown; text?: unknown;
+      start?: unknown; end?: unknown; source?: unknown;
+    };
     const text = normalizeTranscriptWhitespace(
       String(source.punctuated_word ?? source.word ?? source.text ?? ""),
     );
     const start = Number(source.start) + timeOffsetSec;
     const end = Number(source.end) + timeOffsetSec;
     if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
-    out.push({ start: Math.max(0, start), end: Math.max(0, end), text });
+    const word: TranscriptWord = { start: Math.max(0, start), end: Math.max(0, end), text };
+    const provenance = typeof source.source === "string" ? source.source.trim() : "";
+    if (provenance) word.source = provenance;
+    out.push(word);
   }
   return out.length ? out : null;
 }
@@ -5257,6 +5347,34 @@ function readDeepgramKeyterms(): string {
   return (el?.value || "").trim();
 }
 
+/**
+ * Dual-stream Auto, as the two controls in the Deepgram card have it.
+ *
+ * Both fall back to the documented backend defaults when the control is
+ * missing (a shell rendering an older index.html) rather than to "off"
+ * or "": persisting a value the user never chose would turn a backend
+ * default off behind their back on the very first autosave. The defaults
+ * and the resolution rule live in ./deepgram-dual, where they are tested.
+ */
+function dualStreamCheckbox(): HTMLInputElement | null {
+  return document.getElementById("deepgramDualStreamCheck") as HTMLInputElement | null;
+}
+
+function dualSecondaryLanguageSelect(): HTMLSelectElement | null {
+  return document.getElementById("deepgramDualSecondaryLang") as HTMLSelectElement | null;
+}
+
+function readDeepgramDualStream(): boolean {
+  const el = dualStreamCheckbox();
+  return el ? el.checked : DUAL_STREAM_DEFAULT;
+}
+
+function readDeepgramDualSecondaryLanguage(): string {
+  const el = dualSecondaryLanguageSelect();
+  const value = (el?.value || "").trim();
+  return value || DUAL_SECONDARY_LANGUAGE_DEFAULT;
+}
+
 function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
   const silence = getAutoStopSilenceConfig();
   return {
@@ -6071,7 +6189,11 @@ function buildUiPreferencesSavePlan() {
         // as every other preference, so a stale backend that doesn't
         // yet know this key still round-trips it via config.py's
         // deep-merge (unvalidated keys pass through untouched).
-        deepgram: { keyterms: readDeepgramKeyterms() },
+        deepgram: {
+          keyterms: readDeepgramKeyterms(),
+          dual_stream: readDeepgramDualStream(),
+          dual_secondary_language: readDeepgramDualSecondaryLanguage(),
+        },
         ui: collectUiPreferences(),
       },
     },
@@ -6174,6 +6296,23 @@ async function loadCfg(): Promise<void> {
     const deepgramPrefs = (cfg.preferences || {}).deepgram || {};
     const keytermsEl = document.getElementById("deepgramKeytermsInput") as HTMLTextAreaElement | null;
     if (keytermsEl) keytermsEl.value = String(deepgramPrefs.keyterms || "");
+    // The options come from ``#language`` itself, so the two lists cannot
+    // drift; this runs before the stored value is applied, or there would
+    // be nothing to select it from.
+    fillDualSecondaryLanguageOptions();
+    const dualLangSel = dualSecondaryLanguageSelect();
+    const dualPrefs = resolveDualStreamPreference({
+      dualStream: deepgramPrefs.dual_stream,
+      secondaryLanguage: deepgramPrefs.dual_secondary_language,
+      availableLanguages: dualLangSel
+        ? Array.from(dualLangSel.options).map((o) => o.value)
+        : [DUAL_SECONDARY_LANGUAGE_DEFAULT],
+    });
+    const dualCheck = dualStreamCheckbox();
+    if (dualCheck) dualCheck.checked = dualPrefs.dualStream;
+    if (dualLangSel && Array.from(dualLangSel.options).some((o) => o.value === dualPrefs.secondaryLanguage)) {
+      dualLangSel.value = dualPrefs.secondaryLanguage;
+    }
     const ui = (cfg.preferences || {}).ui || {};
     remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
     remoteModelByProvider.deepgram = String(ui.remote_model_deepgram || DEFAULT_DEEPGRAM_AUDIO_MODEL || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL;
@@ -6181,7 +6320,7 @@ async function loadCfg(): Promise<void> {
     if (ui.language && Array.from(languageSel.options).some((o) => o.value === ui.language)) {
       languageSel.value = ui.language;
     }
-    syncLanguageAutoHint();
+    syncAutoLanguageUi();
     // Restore the unified selection from persisted wire values
     // (provider + local_model + per-provider remote models). The UI
     // group is DERIVED (gigaam-* local model ⇒ gigaam group), never
@@ -8123,19 +8262,85 @@ function shouldLivePreview(): boolean {
   setTranscriptionSelection(readProviderGroup(), v || undefined);
 });
 
-// #languageAutoHint (frontend/index.html) explains that Auto maps to
-// Deepgram's multi-language mode and what that costs (BUGS_AUDIT_2026-09-03.md
-// §1) — relevant only while Auto is actually selected. One function
-// decides visibility so load and change can never disagree about it.
-function syncLanguageAutoHint(): void {
-  const hint = document.getElementById("languageAutoHint");
-  if (!hint) return;
+/**
+ * Fill the dual-stream secondary-language select from ``#language``.
+ *
+ * The language list is written out once, in index.html, on ``#language``.
+ * Copying it into a second markup block — or into a constant here —
+ * would be a second source that drifts the first time a language is
+ * added. "Auto" is the one option that cannot appear: the secondary
+ * stream exists precisely to be monolingual, and an Auto secondary would
+ * be the multi stream twice.
+ */
+function fillDualSecondaryLanguageOptions(): void {
+  const target = dualSecondaryLanguageSelect();
+  if (!target || target.options.length) return;
+  const source = document.getElementById("language") as HTMLSelectElement | null;
+  if (!source) return;
+  for (const option of Array.from(source.options)) {
+    const value = (option.value || "").trim().toLowerCase();
+    if (!value || value === "auto") continue;
+    const copy = document.createElement("option");
+    copy.value = value;
+    copy.textContent = option.textContent || value.toUpperCase();
+    target.appendChild(copy);
+  }
+}
+
+/**
+ * Everything the live LANG selection decides outside the select itself.
+ *
+ * #languageAutoHint (frontend/index.html) explains that Auto maps to
+ * Deepgram's multi-language mode and what that costs
+ * (BUGS_AUDIT_2026-09-03.md §1). Dual-stream Auto — the second,
+ * monolingual Nova-3 stream merged into the first by word timestamps —
+ * is the answer to that cost, and it applies to Auto and nothing else: a
+ * fixed language has no second stream to add. So its two controls live
+ * or die by the same condition as the hint, and the hint says which way
+ * they are set.
+ *
+ * ONE function decides all of it (it was ``syncLanguageAutoHint`` while
+ * the hint was all there was), so a load and a change can never disagree
+ * about what Auto means on screen.
+ */
+function syncAutoLanguageUi(): void {
   const lang = (($("language") as HTMLSelectElement).value || "auto").trim().toLowerCase();
-  hint.hidden = lang !== "auto";
+  const isAuto = lang === "auto";
+  const hint = document.getElementById("languageAutoHint");
+  if (hint) hint.hidden = !isAuto;
+  const dualRow = document.getElementById("deepgramDualStreamRow");
+  if (dualRow) dualRow.hidden = !isAuto;
+  const dualHint = document.getElementById("languageAutoDualHint");
+  if (dualHint) {
+    if (!isAuto) {
+      dualHint.textContent = "";
+    } else if (readDeepgramDualStream()) {
+      const secondary = readDeepgramDualSecondaryLanguage().toUpperCase();
+      dualHint.textContent =
+        ` Two-stream Auto is ON: a second ${secondary} stream fills what the` +
+        " multilingual model drops, for twice the Deepgram minutes" +
+        " (Settings › API Keys).";
+    } else {
+      dualHint.textContent =
+        " Two-stream Auto is off — one multilingual stream only" +
+        " (Settings › API Keys).";
+    }
+  }
 }
 
 ($("language") as HTMLSelectElement).addEventListener("change", () => {
-  syncLanguageAutoHint();
+  syncAutoLanguageUi();
+  queueUiPreferencesSave();
+});
+// Both dual-stream controls persist through the same debounced
+// ``/api/config`` save as Key terms, and both change what the Auto hint
+// says — so both re-run the one decision above.
+dualStreamCheckbox()?.addEventListener("change", () => {
+  syncAutoLanguageUi();
+  queueUiPreferencesSave();
+});
+dualSecondaryLanguageSelect()?.addEventListener("change", () => {
+  syncAutoLanguageUi();
   queueUiPreferencesSave();
 });
 ($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
@@ -8689,7 +8894,7 @@ function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string
     deviceLabel,
     heldSince: Date.now(),
     expiryTimer: window.setTimeout(
-      () => releaseWarmCapture("ttl"),
+      () => releaseWarmCaptureOnLifecycle("ttl"),
       UI_TOKENS.capture.warmHoldMs,
     ),
   };
@@ -8733,12 +8938,18 @@ function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
   return held;
 }
 
-// The hold survives an idle window, not a change of circumstances. A
-// device list that changed underneath us invalidates the "same mic"
-// premise outright; the window going away means the user has left the
-// app, and a microphone held open by an app that is not on screen is
-// the one case where the indicator has nothing at all to show for
-// itself. Both release immediately rather than waiting out the TTL.
+// The hold survives an idle window, not a change of circumstances — one
+// listener per entry of ``WARM_HOLD_LIFECYCLE_RELEASES`` (./capture-warm,
+// where each reason and its rationale live), all of them going through
+// the one release path. ``releaseWarmCapture`` itself takes any string,
+// because ``decideWarmReuse`` hands it its own rejection reasons; this
+// wrapper is what holds the lifecycle listeners to the named set.
+// Declared, not assigned to a const: the expiry timer in
+// ``holdWarmCapture`` above refers to it, and a hoisted declaration
+// cannot be reached before it exists.
+function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
+  releaseWarmCapture(reason);
+}
 //
 // Note what is NOT here: "hidden" is not tested at Stop. Dictation by
 // global hotkey routinely happens with the main window hidden, so a
@@ -8747,7 +8958,7 @@ function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
 // TRANSITION to hidden that releases.
 try {
   navigator.mediaDevices?.addEventListener?.("devicechange", () => {
-    releaseWarmCapture("devicechange");
+    releaseWarmCaptureOnLifecycle("devicechange");
   });
 } catch (e) {
   // Older shells expose mediaDevices without EventTarget semantics; the
@@ -8755,9 +8966,26 @@ try {
   console.debug("warm capture: devicechange listener unavailable", e);
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") releaseWarmCapture("window-hidden");
+  if (document.visibilityState === "hidden") releaseWarmCaptureOnLifecycle("window-hidden");
 });
-window.addEventListener("pagehide", () => releaseWarmCapture("pagehide"));
+window.addEventListener("pagehide", () => releaseWarmCaptureOnLifecycle("pagehide"));
+// Sleep and lock-screen. Subscribed ONCE, at renderer boot, and never
+// unsubscribed: the hold outlives every recording, so the release has to
+// outlive them too. The renderer cannot see this event on its own —
+// ``setTimeout`` does not run while the machine is asleep, so the hold's
+// TTL timer cannot fire, and the OS may hand the microphone to another
+// application while we are not looking. A shell without the bridge (an
+// older desktop build, or the app opened in a plain browser) is not
+// broken by its absence: ``decideWarmReuse`` re-checks the wall clock at
+// the next press and refuses a hold that slept through.
+try {
+  window.transcriptor?.onSystemSuspend?.(({ reason }) => {
+    console.log(`[trace warmCapture] system suspend (${reason || "unknown"}) — releasing the hold`);
+    releaseWarmCaptureOnLifecycle("system-suspend");
+  });
+} catch (e) {
+  console.debug("warm capture: system-suspend bridge unavailable", e);
+}
 
 /**
  * The stream this session's device watchers are already attached to.
@@ -10235,6 +10463,7 @@ async function startLive(): Promise<void> {
           // of inventing a second tolerance.
           if (typeof msg.streamedSec === "number") envelope.streamedSec = msg.streamedSec;
           if (typeof msg.coveredEndSec === "number") envelope.coveredEndSec = msg.coveredEndSec;
+          if (msg.stats) envelope.stats = msg.stats;
           resolveLiveFinal(sessionUiToken, envelope);
           return;
         }
@@ -12522,7 +12751,13 @@ async function stopLive(
     // R4: wsFramesNeverSent printed here regardless of provider — it is
     // the client half of the coverage contract for both the local-assist
     // and Deepgram paths (hasUnsentFrames in ./live-coverage).
-    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} wsFramesNeverSent=${wsFramesNeverSent}`);
+    // ``dual`` says whether the backend decoded this recording with two
+    // Nova-3 streams or one (dual-stream Auto). It is not visible in the
+    // transcript and it doubles the provider minutes, so every support
+    // log has to state it next to the coverage numbers it explains.
+    // Non-Deepgram stops have no envelope and read 0.
+    const finalEnvelopeStats = liveFinalSlots.get(sessionUiToken)?.envelope?.stats;
+    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} wsFramesNeverSent=${wsFramesNeverSent} dual=${finalEnvelopeStats?.dualStream ? 1 : 0}`);
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
     const noSpeechFinalStatus = "Recording completed, no speech detected.";
     const finalUiText = transcriptRaw || noSpeechFinalStatus;
