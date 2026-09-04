@@ -361,6 +361,35 @@ let backendRestartTimer = null;
 // webContents and produce shutdown-log noise.
 let renderRecoveryTimer = null;
 let backendRestartAttempts = 0;
+
+/**
+ * How long a restarted backend is given to answer /api/health before the
+ * restart is treated as not having recovered. Shorter than the cold-start
+ * budget in createWindow: by this point the runtime is warm and the only
+ * thing being started is uvicorn.
+ */
+const BACKEND_RESTART_HEALTH_TIMEOUT_MS = 30000;
+
+/**
+ * Bounds for the backend-down recovery poll shown in the error window.
+ * 40 attempts x 3 s is two minutes: long enough for a slow cold start or
+ * a user fixing a port conflict, short enough that a backend which is
+ * never coming back stops counting at the user forever.
+ */
+const BACKEND_RECOVERY_MAX_ATTEMPTS = 40;
+const BACKEND_RECOVERY_PROBE_TIMEOUT_MS = 3000;
+const BACKEND_RECOVERY_POLL_INTERVAL_MS = 3000;
+
+/**
+ * The backend answered a health check, so whatever incident the restart
+ * counter was tracking is over. ONE place, because the counter's cap is
+ * meant to bound a single failing incident, not the whole session.
+ */
+function noteBackendHealthy(source) {
+  if (backendRestartAttempts === 0) return;
+  appendMainLog(`[${source}] healthy after ${backendRestartAttempts} attempt(s); resetting counter`);
+  backendRestartAttempts = 0;
+}
 // Set at app.whenReady, cleared on before-quit so shutdown doesn't
 // produce unhandledRejection noise from executeJavaScript against a
 // destroyed webContents.
@@ -415,7 +444,9 @@ app.on("second-instance", () => {
 // days, making the log unusable for support triage and unnecessarily
 // consuming userData disk.
 const MAIN_LOG_MAX_BYTES = 5 * 1024 * 1024;
-let mainLogSizeCached = -1;
+// No cached size: `mainLogSizeCached` was written in two places and read
+// in none, which made it look as if the rotation check avoided a stat it
+// never avoided. mainLogCheckCounter is the real throttle.
 let mainLogCheckCounter = 0;
 
 function mainLogArchivePath(kind) {
@@ -508,7 +539,6 @@ function rotateMainLogIfNeeded() {
   if (!mainLogFilePath) return;
   try {
     const st = fs.statSync(mainLogFilePath);
-    mainLogSizeCached = st.size;
     if (st.size < MAIN_LOG_MAX_BYTES) return;
     const legacyPending = mainLogFilePath + ".rotating";
     if (fs.existsSync(legacyPending)) {
@@ -530,7 +560,6 @@ function rotateMainLogIfNeeded() {
     }
     try {
       fs.renameSync(pending, archived);
-      mainLogSizeCached = 0;
     } catch {
       // Promotion failed. Restore the log to its original name so
       // appendFile keeps working. If THAT also fails, preserve the
@@ -2106,7 +2135,13 @@ async function beginRecordingStatusSession() {
   recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   startRecordingStateMonitor();
   await setRecordingStatus("Recording");
-  recordingAutoStopConfig = await getRendererAutoStopSilenceConfig();
+  // Guarded by the same generation counter the monitor's own refresh
+  // uses: this await crosses a renderer round-trip, and a session that
+  // was reset while it was in flight must not have the PREVIOUS take's
+  // auto-stop config installed on top of its defaults.
+  const gen = ++recordingAutoStopConfigGen;
+  const cfg = await getRendererAutoStopSilenceConfig();
+  if (gen === recordingAutoStopConfigGen) recordingAutoStopConfig = cfg;
 }
 
 async function publishRecordingStatus(status) {
@@ -2544,6 +2579,17 @@ async function stopRecordingFromMainProcess() {
       appendMainLog(
         `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
       );
+      // The recording continues, so the monitor must too. Both callers
+      // that can reach a stale stop — the silence auto-stop and the
+      // capsule click — call stopRecordingStateMonitor() before coming
+      // in, and beginRecordingStatusSession (the only other place that
+      // starts it) does not run on this path. Without the restart the
+      // capsule level freezes, the silence auto-stop silently stops
+      // working, and the dead-audio fail-safe that exists to stop a dead
+      // mic leaving the capsule recording forever is gone — all for the
+      // rest of the take. Restoring the status here without restoring
+      // the monitor was half the recovery.
+      startRecordingStateMonitor();
       await setRecordingStatus("Recording");
     } else if (result?.ok) {
       if (result.auto) {
@@ -4452,8 +4498,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     });
     effectiveTarget = emptyCapturedPasteTarget();
   }
-  const preferTypedFirst = false;
-  traceStep(trace, "paste_strategy", { preferTypedFirst, targetHint: compactLogText(targetHint, 80) });
+  traceStep(trace, "paste_strategy", { targetHint: compactLogText(targetHint, 80) });
   logPasteTrace("start", {
     target: pasteTargetSummary(effectiveTarget),
     frontBeforeName: frontBefore.name || "",
@@ -6590,6 +6635,14 @@ async function isEngineInstallNetworkAvailable() {
 // State is the SSOT for every surface: IPC "engine:get-status" returns
 // this snapshot verbatim, and every phase transition is logged. The
 // renderer never learns about pip internals — only phases and a reason.
+//
+// There is no push channel. An "engine:status" broadcast used to be sent
+// to every BrowserWindow — including the sandboxed status capsule — on
+// four transitions, but preload never exposed it and the renderer polls
+// on purpose ("pull beats push here: no subscription lifecycle to leak
+// across window reloads", frontend/src/main.tsx syncEngineInstallState).
+// A channel with a sender and no receiver is not a contract; it is work
+// and a name that suggests a surface which does not exist.
 const engineInstall = {
   phase: engineDeps.ENGINE_INSTALL_PHASES.IDLE,
   reason: "",
@@ -6614,13 +6667,6 @@ function engineInstallSnapshot() {
     error: engineInstall.error,
     startedAtMs: engineInstall.startedAtMs,
   };
-}
-
-function broadcastEngineStatus() {
-  const snapshot = engineInstallSnapshot();
-  for (const win of BrowserWindow.getAllWindows()) {
-    try { win.webContents.send("engine:status", snapshot); } catch { /* closing */ }
-  }
 }
 
 async function probeGigaamImportable(python, repoRoot) {
@@ -6659,19 +6705,16 @@ async function installGigaamEngine(python, repoRoot) {
   }
 
   setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.PROBING);
-  broadcastEngineStatus();
 
   if (await probeGigaamImportable(python, repoRoot)
     && fs.existsSync(path.join(getEngineSiteDir(), ENGINE_INSTALL_MARKER))) {
     setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE, { reason: "already installed" });
-    broadcastEngineStatus();
-    return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
+      return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
   }
 
   engineInstall.inFlight = (async () => {
     setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.INSTALLING);
-    broadcastEngineStatus();
-    appendMainLog("[engine-install] started (user request)");
+      appendMainLog("[engine-install] started (user request)");
 
     try {
       // Network gate first: ~2.5 s worst case offline, versus minutes of
@@ -6685,9 +6728,14 @@ async function installGigaamEngine(python, repoRoot) {
         const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
         if (freeBytes < BigInt(engineDeps.ENGINE_MIN_FREE_BYTES)) {
           const gb = Math.floor(Number(freeBytes / (1024 * 1024 * 1024)));
+          // ONE formatting of the requirement. The message the user sees
+          // used to carry a hardcoded "8 GB" while the log line derived
+          // its number from the constant, so changing the constant would
+          // have changed the log and left the user reading the old figure.
+          const neededGb = engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3);
           throw Object.assign(
-            new Error(`only ${gb} GB free, need ${engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3)} GB`),
-            { userReason: `insufficient disk space (${gb} GB free, 8 GB needed)` },
+            new Error(`only ${gb} GB free, need ${neededGb} GB`),
+            { userReason: `insufficient disk space (${gb} GB free, ${neededGb} GB needed)` },
           );
         }
       } catch (e) {
@@ -6764,8 +6812,7 @@ async function installGigaamEngine(python, repoRoot) {
       try { fs.rmSync(`${getEngineSiteDir()}.staging`, { recursive: true, force: true }); } catch { /* best effort */ }
     } finally {
       engineInstall.inFlight = null;
-      broadcastEngineStatus();
-    }
+        }
   })();
 
   return engineInstall.inFlight.then(() => ({ ok: engineInstall.phase === engineDeps.ENGINE_INSTALL_PHASES.DONE, ...engineInstallSnapshot() }));
@@ -7196,7 +7243,25 @@ async function startBackend() {
         // clearTimeout above is a no-op only AFTER the inflight promise
         // is in place.
         startBackend()
-          .then(() => appendMainLog("[backend-restart] attempted"))
+          .then(async () => {
+            appendMainLog("[backend-restart] attempted");
+            // Confirm the restart produced a HEALTHY backend, and clear
+            // the counter when it did. Without this the cap above is a
+            // per-session budget rather than a per-incident one: the
+            // only other resets are a clean exit (which, per the comment
+            // on it, never fires outside shutdown) and createWindow's
+            // health wait, which does not re-run on this path. Eight
+            // unrelated, fully recovered crashes in one session and the
+            // ninth gave up permanently — and installGigaamEngine spends
+            // one of them deliberately, by design, on every engine
+            // install.
+            try {
+              await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_RESTART_HEALTH_TIMEOUT_MS);
+              noteBackendHealthy("backend-restart");
+            } catch (e) {
+              appendMainLog(`[backend-restart] not healthy after restart: ${e?.message || e}`);
+            }
+          })
           .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`))
           .finally(() => { backendRestartTimer = null; });
       }, delay);
@@ -8073,10 +8138,7 @@ async function createWindow(options = {}) {
     // counter only decayed on a clean `exit code 0`, which never fires
     // outside shutdown, so the exponential backoff compounded across
     // sessions making the log delay misleading.
-    if (backendRestartAttempts !== 0) {
-      appendMainLog(`[backend-recovery] healthy after ${backendRestartAttempts} attempt(s); resetting counter`);
-      backendRestartAttempts = 0;
-    }
+    noteBackendHealthy("backend-recovery");
     // CLEAR `backendBootError` once /api/health responds OK. Pass-24c
     // added a `did-finish-load` replay of this string so a closed-
     // and-reopened window can re-deliver the diagnostic — but if the
@@ -8146,7 +8208,7 @@ async function createWindow(options = {}) {
         `<h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>` +
         `<p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>` +
         `<p style="color:#ddd;margin:8px 0">Quit and reopen Transcriptor. For a source checkout, run the current root installer:</p>` +
-        `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">cd ~/Downloads/Voice\\\\ Transcriptor && ./INSTALL.command</pre>` +
+        `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">cd ~/Downloads/Voice\\ Transcriptor && ./INSTALL.command</pre>` +
         `<p style="color:#888;font-size:12px;margin-top:14px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
       );
     }
@@ -8183,19 +8245,31 @@ async function createWindow(options = {}) {
       try { await win.webContents.executeJavaScript(js, true); } catch { /* page may have navigated */ }
     };
     const pollRecovery = async () => {
-      while (win && !win.isDestroyed()) {
+      // Bounded, and it stops when the app is going away. The loop used
+      // to run `while (win && !win.isDestroyed())` with no ceiling and no
+      // isQuitting check: on a backend that is not coming back it polled
+      // every 3 s for the life of the process, printing an
+      // ever-increasing attempt number at the user.
+      while (win && !win.isDestroyed() && !isQuitting && recoveryAttempt < BACKEND_RECOVERY_MAX_ATTEMPTS) {
         recoveryAttempt += 1;
-        await updateRecoveryStatus(`⏳ Waiting for backend... (attempt ${recoveryAttempt})`);
+        await updateRecoveryStatus(`⏳ Waiting for backend... (attempt ${recoveryAttempt}/${BACKEND_RECOVERY_MAX_ATTEMPTS})`);
         try {
-          await waitForBackendHealth(`${BASE_URL}/api/health`, 3000);
+          await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_RECOVERY_PROBE_TIMEOUT_MS);
           await updateRecoveryStatus("✅ Backend is up! Loading app...", true);
           if (win && !win.isDestroyed()) {
             await win.loadURL(`${BASE_URL}/`);
           }
           return;
         } catch {
-          await new Promise((resolve) => setTimeout(resolve, 3000));
+          await new Promise((resolve) => setTimeout(resolve, BACKEND_RECOVERY_POLL_INTERVAL_MS));
         }
+      }
+      if (win && !win.isDestroyed() && !isQuitting) {
+        appendMainLog(`[backend-recovery] gave up after ${recoveryAttempt} attempts`);
+        await updateRecoveryStatus(
+          `The backend did not come back after ${recoveryAttempt} attempts. Reopen Transcriptor, or send the log file above.`,
+          true,
+        );
       }
     };
     void pollRecovery();
@@ -8495,14 +8569,25 @@ app.whenReady().then(async () => {
   const { ipcMain } = require("electron");
   ipcMain.handle("engine:get-status", () => engineInstallSnapshot());
   ipcMain.handle("engine:install", async () => {
+    // Every return carries the phase snapshot the renderer branches on.
+    // Two of these three paths used to return an object WITHOUT `phase`
+    // — so an install that failed because there was no usable Python, or
+    // because the handler threw, showed the user nothing at all, and
+    // left engineInstallState as a shape syncEngineInstallState and
+    // renderLocalModels could not read.
     const repoRoot = getRepoRoot();
     try {
       const python = await resolvePython(repoRoot);
-      if (!python) return { ok: false, status: "no-python", reason: "no usable Python runtime" };
+      if (!python) {
+        setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, { reason: "no usable Python runtime" });
+        return { ok: false, status: "no-python", ...engineInstallSnapshot() };
+      }
       return await installGigaamEngine(python, repoRoot);
     } catch (e) {
-      appendMainLog(`[engine-install] handler error: ${e?.message || e}`);
-      return { ok: false, status: "error", error: e?.message || String(e) };
+      const reason = e?.message || String(e);
+      appendMainLog(`[engine-install] handler error: ${reason}`);
+      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, { reason });
+      return { ok: false, status: "error", error: reason, ...engineInstallSnapshot() };
     }
   });
 
