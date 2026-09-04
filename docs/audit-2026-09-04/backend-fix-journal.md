@@ -624,3 +624,74 @@ AssertionError: Lists differ: [] != [{'word': 'слово', …, 'source': 'reco
 * **R-006 (мелочь).** Лог-строка «слова, которые транскрипт уже содержит» строилась через `w not in fresh` — сравнение словарей по значению и O(n²); заменено на сравнение по `id`.
 
 **Чисто (смотрел, дефекта нет):** бюджет и его вывод (`recovery_budget_sec`, ноль при отсутствии спанов); `pcm_span_wav` (клампы и привязка к целым сэмплам); ленивое чтение спула через callable + `audio_sec`; идемпотентность `missing_spans` (кандидаты всегда уменьшаются на `covered_spans`); `announce` под `try` — сбой уведомления не ломает стоп; отсутствие ключа/спанов/аудио — три ранних выхода без побочных эффектов.
+
+---
+
+## Живая проверка (шаг 5 хендоффа) — A/B на записи-улике 72.7 с, `--dual`
+
+Команда (ключ не печатается ни в одной строке вывода — инструмент читает его из конфига):
+
+```
+PYTHONPATH=. TRANSCRIPTOR_DATA_DIR="$HOME/Library/Application Support/transcriptor" \
+TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG=1 \
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 \
+  backend/tools/deepgram_live_ab.py --language auto --dual --runs 1 --full --log-level INFO \
+  "$HOME/Library/Application Support/transcriptor/evidence-2026-09-03/2026-09-03_23-49-57-983102__Так_ слушай. Если тебе нужно_ я вот сейчас.wav"
+```
+
+(`--language` обязателен — в хендоффе он опущен; взято `auto`, то есть ровно то, что шлёт приложение.)
+
+**Слияние двух чтений:**
+```
+INFO backend.deepgram_dual: dual-stream merge: auto=105 words ru=119 words merged=128
+     filled_from_ru=23 filled_from_auto=9 dups_removed=0
+```
+Совпадает с измерением 2026-09-03 (105 / 119 / 128) — правки dual-пути ничего не сдвинули.
+
+**Восстановление:**
+```
+INFO backend.remote_deepgram: deepgram_transcribe: model=nova-3, audio=29164 bytes timeout=(10, 12) attempts=1 keyterms=0
+INFO backend.remote_deepgram: deepgram_transcribe: model=nova-3, audio=41804 bytes timeout=(10, 12) attempts=1 keyterms=0
+INFO backend.deepgram_recovery: recovery: 2 decoded word(s) already owned by the transcript: ['Them', 'Сейчас.']
+INFO backend.deepgram_recovery: recovery: spans=2 total=2.22s → words=0 in 1166ms
+```
+Два спана передекодированы параллельно под одним бюджетом; оба вернувшихся слова отброшены как уже принадлежащие транскрипту — это тот самый guard от дублирования, который R-002 усилил правилом spanless. Второй прогон той же записи дал `rec=2/1`: одно слово всё же добавлено.
+
+**Стоп и хвост:**
+```
+INFO backend.remote_deepgram_live: deepgram-live: post-Finalize finals=1 covered=72.72s gap=0.00s waited=360ms (budget=3.00s streamed=72.72s speech_in_gap=0.00s)
+INFO backend.remote_deepgram_live: deepgram-live: finalize EXIT 368 ms text_len=725 segments_final=17 duration_sec=72.72 bytes_sent=2326890
+INFO backend.remote_deepgram_live: deepgram-live: CloseStream sent
+INFO backend.remote_deepgram_live: deepgram-live: CloseStream sent
+```
+Ожидание закончилось по ОТВЕТУ (360 мс из потолка 3.0 с) — это B-005 в работе; `CloseStream` ушёл на обе сессии через новый `_send_control` (B-009).
+
+**Итоговая строка и текст:**
+```
+…wav lang=auto+ru kt=0 run=1 connect=882ms finalize=323ms segs=4 words=128 chars=759 rec=2/0@1166ms uncov=1.31s |
+Так, слушай. Если тебе нужно, я вот сейчас записываю прямо сейчас голосовое сообщение, оно останется hello,
+hello everybody that's close up agents workflow that we говорю просто большую кучу разных слов, only долго.
+И ты можешь detect and find the issues inside my text lab de la capitale de la France. На французском я обычно
+не говорю, но тем не менее Возможно, проблемы в чанках, возможно проблема в том что происходит после нажатия
+кнопки стол. стоп. возможно проблема в обрезках, я не знаю, тебе нужно самостоятельно это все изучить, может
+ты уже нашел истинные причины и can fix the nan sub agents sub agents subaging single source of 1 единый
+источник истины вот такой вот длинный prompt я наговорил, ты можешь посмотреть в файл через логи прямо сейчас
+```
+Ни одного повтора фразы; трёхъязычные переходы (RU → EN → FR → RU) на месте; `connect=882 ms` — холодный, пул в инструменте намеренно не взведён.
+
+---
+
+## Долг (не делается здесь; ID, одна строка, рекомендация)
+
+| ID | Что | Рекомендация |
+|---|---|---|
+| D-01 | **B-038**: три несовместимые формы wire-типа `final` (Deepgram / локальный / ветка ошибки) | свести к одному блоку `coverage` ОДНИМ коммитом с `frontend/src/main.tsx` (`parseLiveWsMessage` читает плоские `complete/coveredSec/totalSec/droppedSec/uncoveredTailSec`); односторонняя правка либо ломает парсер, либо добавляет четвёртую форму |
+| D-02 | **B-023** (вторая половина): `README.md:127` предлагает `cp .env.example .env`, механизма нет | README вне периметра бэкенд-агента — поправить строку или подключить `python-dotenv` (продуктовое решение: новая зависимость + порядок «файл против окружения» на старте) |
+| D-03 | **B-027** (третья копия): дефолты dual-stream в `frontend/src/deepgram-dual.ts` | читать из конфиг-пейлоада бэкенда; копия опасна тем, что неверный дефолт «отсутствия» ПЕРЕЗАПИСЫВАЕТСЯ следующим автосейвом и молча выключает фичу на диске |
+| D-04 | **B-088** (вторая половина): ~20 утверждений по настенным часам в тестах финализации | инжектируемые часы в `DeepgramLiveSession` вместо прямого `time.perf_counter()`; сейчас запас ≥ 2× и самый дорогой модуль уже пропатчен (12.0 s → 0.12 s) |
+| D-05 | **B-063**: GigaAM пишет временный WAV на КАЖДЫЙ чанк, в том числе на горячем пути live-ассиста; `vad_filter`/`language`/`beam_size` молча отбрасываются | продуктовое: либо один временный файл на сессию (нужно состояние адаптера, спроектированное под конкурентные вызовы), либо сузить live-ассист до движков, уважающих `vad_filter` |
+| D-06 | **B-065**: `_copy_source_media_file` читает исходник дважды (до 4 ГБ на задание) | сам отчёт называет это «решением, которое стоит пересмотреть»: сверка дайджестов ловит только перезапись на месте с тем же inode и размером — ввести порог по размеру |
+| D-07 | **B-057**: `preferences.ui` — 22 ключа без дефолта, схемы и читателя на бэкенде | ветка принадлежит рендереру; описывать её на бэкенде — фиксировать чужой контракт без владельца |
+| D-08 | **B-025 / B-059**: `desktop/main.js` читает `config.json` в обход миграции и перетирает `TRANSCRIPTOR_DATA_DIR` | вне периметра — desktop-агенту |
+| D-09 | `PROJECT_STRUCTURE` не знает о трёх новых модулях: `backend/async_tasks.py`, `backend/deepgram_language.py`, `backend/deepgram_recovery.py` (и о двух новых тестовых) | обновить на шаге релиза 1.6.1 (§5 хендоффа), файл вне периметра бэкенд-агента |
+| D-10 | Первая версия теста B-021 (до подмены `HOME`) один раз создала `~/.transcriptor/.encryption_key` на машине | файл ничем не читается, пока `TRANSCRIPTOR_DATA_DIR` доступен; удалить может пользователь |
