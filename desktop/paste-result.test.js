@@ -8,6 +8,8 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  lastLineOf,
+  pasteSentReceipt,
   isVbsPasteSuccess,
   isPwshPasteFallbackSuccess,
   isLinuxPasteSuccess,
@@ -41,10 +43,68 @@ test("linux: exit code is the only signal (no protocol string)", () => {
   assert.equal(isLinuxPasteSuccess({ ok: false }), false);
 });
 
-test("mac: !ok is always a failure regardless of stdout content", () => {
+test("mac: !ok with no receipt is a failure regardless of stdout content", () => {
   const r = parseMacPasteOutcome({ ok: false, stdout: "OK:menu-paste-primary:verified" });
   assert.equal(r.success, false);
   assert.equal(r.verified, false);
+  assert.equal(r.sent, false);
+});
+
+test("mac: a SENT receipt after a wall-clock kill counts as pasted-but-unverified", () => {
+  // The per-attempt bound killed osascript while the AX verification
+  // read was still running — AFTER the keystroke was delivered. Retrying
+  // here would paste the transcript a second time.
+  const r = parseMacPasteOutcome({
+    ok: false,
+    stdout: "",
+    stderr: "SENT:robust-paste\nTimed out",
+  });
+  assert.equal(r.success, true, "the paste did land; the ladder must stop");
+  assert.equal(r.verified, false, "nothing verified it, so the clipboard keeps the transcript");
+  assert.equal(r.sent, true);
+  assert.equal(r.reason, "SENT:robust-paste");
+});
+
+test("mac: a receipt does NOT override the script's own ERR verdict", () => {
+  const r = parseMacPasteOutcome({
+    ok: true,
+    stdout: "ERR:no-focus",
+    stderr: "SENT:robust-paste",
+  });
+  assert.equal(r.success, false);
+  assert.equal(r.sent, false);
+});
+
+test("mac: the receipt on stderr does not shadow a complete OK result", () => {
+  const r = parseMacPasteOutcome({
+    ok: true,
+    stdout: "OK:robust-paste:verified",
+    stderr: "SENT:robust-paste",
+  });
+  assert.equal(r.success, true);
+  assert.equal(r.verified, true);
+  assert.equal(r.sent, true);
+});
+
+test("mac: the verdict is the LAST line, so a receipt printed to stdout cannot hide it", () => {
+  const r = parseMacPasteOutcome({ ok: true, stdout: "SENT:robust-paste\nOK:robust-paste:verified" });
+  assert.equal(r.success, true);
+  assert.equal(r.verified, true);
+});
+
+test("pasteSentReceipt only matches a marker at the start of a line", () => {
+  assert.equal(pasteSentReceipt({ stderr: "SENT:menu-paste-primary\n" }), "SENT:menu-paste-primary");
+  assert.equal(pasteSentReceipt({ stdout: "line\nSENT:robust-paste" }), "SENT:robust-paste");
+  // A target app's own error text mentioning the word must not be read
+  // as our receipt.
+  assert.equal(pasteSentReceipt({ stderr: 'error: nothing was SENT:anything' }), "");
+  assert.equal(pasteSentReceipt({}), "");
+});
+
+test("lastLineOf ignores blank lines and trailing newlines", () => {
+  assert.equal(lastLineOf("a\n\nb\n\n"), "b");
+  assert.equal(lastLineOf(""), "");
+  assert.equal(lastLineOf(null), "");
 });
 
 test("mac: OK: prefix required for success", () => {
@@ -128,7 +188,7 @@ test("evaluatePasteOutcome dispatches each linux method by ok alone", () => {
 
 test("evaluatePasteOutcome dispatches mac methods through parseMacPasteOutcome", () => {
   const r = evaluatePasteOutcome({ method: "robust_paste", ok: true, stdout: "OK:robust-paste:verified" });
-  assert.deepEqual(r, { success: true, verified: true, reason: "OK:robust-paste:verified" });
+  assert.deepEqual(r, { success: true, verified: true, sent: false, reason: "OK:robust-paste:verified" });
   const r2 = evaluatePasteOutcome({ method: "menu-paste-primary", ok: true, stdout: "OK:menu-paste-primary:unverified" });
   assert.equal(r2.success, true);
   assert.equal(r2.verified, false);

@@ -1,0 +1,357 @@
+"use strict";
+
+// Executable specification for desktop/paste-capability.js — the state
+// machine that decides whether auto-paste can work at all, the single
+// retry/timeout table the paste ladder spends, and the modifier-release
+// plan for the paste-last hotkey. Run: npm --prefix desktop test.
+const { test } = require("node:test");
+const assert = require("node:assert/strict");
+
+const {
+  PASTE_CAPABILITY,
+  PASTE_PROBE_ACTIVE_TTL_MS,
+  PASTE_PROBE_RECHECK_MS,
+  PASTE_PROBE_COMMAND,
+  SILENT_FAILURES_BEFORE_BROKEN,
+  initialPasteCapability,
+  applyProbeResult,
+  applyPasteOutcome,
+  classifyPasteFailure,
+  shouldAttemptPaste,
+  shouldProbe,
+  mustProbeBeforePaste,
+  pasteCapabilityMessage,
+  PASTE_BUDGET,
+  PASTE_MAX_ATTEMPTS,
+  PASTE_POST_STOP_DEADLINE_MS,
+  PASTE_TRANSIENT_TYPE,
+  PASTE_TRANSIENT_TYPE_SUPPORTED,
+  pasteBudgetFor,
+  pasteAttemptDelayMs,
+  pasteMethodTimeoutMs,
+  pasteBudgetWorstCaseMs,
+  NS_EVENT_MODIFIER_FLAGS,
+  planModifierRelease,
+  modifierReleaseScript,
+  modifierReleaseCommand,
+  MODIFIER_SPAWN_ALLOWANCE_MS,
+  parseModifierReleaseResult,
+  heldModifiersFromFlags,
+} = require("./paste-capability");
+
+// ── states ────────────────────────────────────────────────────────────
+
+test("a fresh process is unknown and has never probed", () => {
+  const cap = initialPasteCapability(1000);
+  assert.equal(cap.state, PASTE_CAPABILITY.UNKNOWN);
+  assert.equal(cap.probedAt, 0);
+  assert.equal(shouldProbe(cap, 1000), true);
+});
+
+test("trusted + working probe = active", () => {
+  const cap = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: true, probeOk: true, now: 10,
+  });
+  assert.equal(cap.state, PASTE_CAPABILITY.ACTIVE);
+  assert.equal(cap.probedAt, 10);
+  assert.equal(shouldAttemptPaste(cap), true);
+});
+
+test("trusted + failing probe = broken — the stale post-update grant", () => {
+  // The whole reason this module exists: AXIsProcessTrusted() says yes,
+  // the real action says no. Reporting "pasted" here is the lie.
+  const cap = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: true, probeOk: false, probeReason: "Timed out", now: 10,
+  });
+  assert.equal(cap.state, PASTE_CAPABILITY.BROKEN);
+  assert.match(cap.reason, /stale-grant/);
+  assert.equal(shouldAttemptPaste(cap), false);
+});
+
+test("not trusted = untrusted even when the probe somehow answers", () => {
+  const cap = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: false, probeOk: true, now: 10,
+  });
+  assert.equal(cap.state, PASTE_CAPABILITY.UNTRUSTED);
+  assert.equal(shouldAttemptPaste(cap), false);
+});
+
+test("no trust bit (Windows/Linux) = unknown, and unknown still pastes", () => {
+  for (const trusted of [null, undefined]) {
+    const cap = applyProbeResult(initialPasteCapability(0), {
+      platform: "win32", trusted, probeOk: false, now: 10,
+    });
+    assert.equal(cap.state, PASTE_CAPABILITY.UNKNOWN);
+    assert.equal(cap.reason, "probe-unavailable");
+    assert.equal(shouldAttemptPaste(cap), true, "unknown is Active-until-proven-otherwise");
+  }
+});
+
+test("since/changedAt only move when the state actually changes", () => {
+  const a = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: 100 });
+  const b = applyProbeResult(a, { platform: "darwin", trusted: true, probeOk: true, now: 500 });
+  assert.equal(b.since, a.since);
+  assert.equal(b.changedAt, a.changedAt);
+  assert.equal(b.probedAt, 500, "probedAt always moves — it is what staleness is measured from");
+  const c = applyProbeResult(b, { platform: "darwin", trusted: false, probeOk: false, now: 900 });
+  assert.equal(c.since, 900);
+});
+
+// ── transitions from paste outcomes ───────────────────────────────────
+
+test("a successful paste is the strongest liveness evidence — it promotes any state", () => {
+  for (const start of [PASTE_CAPABILITY.UNKNOWN, PASTE_CAPABILITY.UNTRUSTED, PASTE_CAPABILITY.BROKEN]) {
+    const prev = { ...initialPasteCapability(0), state: start, silentFailures: 5 };
+    const next = applyPasteOutcome(prev, { ok: true, now: 1 });
+    assert.equal(next.state, PASTE_CAPABILITY.ACTIVE);
+    assert.equal(next.silentFailures, 0);
+  }
+});
+
+test("a permission-shaped failure drops straight to untrusted", () => {
+  const active = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: 0 });
+  for (const reason of ["ERR:no-accessibility", "System Events got an error: … not authorized (-1743)"]) {
+    const next = applyPasteOutcome(active, { ok: false, reason, now: 5 });
+    assert.equal(next.state, PASTE_CAPABILITY.UNTRUSTED, reason);
+  }
+});
+
+test("one silent failure is a loaded machine; two in a row is a stale grant", () => {
+  const active = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: 0 });
+  const once = applyPasteOutcome(active, { ok: false, reason: "osascript-failed\nTimed out", now: 5 });
+  assert.equal(once.state, PASTE_CAPABILITY.ACTIVE, "a single timeout must not condemn the grant");
+  assert.equal(once.silentFailures, 1);
+  const twice = applyPasteOutcome(once, { ok: false, reason: "AppleEvent timed out (-1712)", now: 6 });
+  assert.equal(twice.state, PASTE_CAPABILITY.BROKEN);
+  assert.equal(SILENT_FAILURES_BEFORE_BROKEN, 2);
+});
+
+test("target-shaped failures say nothing about the capability", () => {
+  const active = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: 0 });
+  for (const reason of ["no-target", "ERR:no-process", "ERR:secure-field", "ERR:no-focus", "empty-text"]) {
+    const next = applyPasteOutcome(active, { ok: false, reason, now: 5 });
+    assert.equal(next.state, PASTE_CAPABILITY.ACTIVE, reason);
+    assert.equal(next.silentFailures, 0, reason);
+  }
+});
+
+test("classifyPasteFailure buckets every reason the ladder can produce", () => {
+  assert.equal(classifyPasteFailure("ERR:no-accessibility"), "permission");
+  assert.equal(classifyPasteFailure("not permitted"), "permission");
+  assert.equal(classifyPasteFailure("ERR:secure-field"), "target");
+  assert.equal(classifyPasteFailure("spawn osascript ENOENT"), "silent");
+  assert.equal(classifyPasteFailure(""), "other");
+  assert.equal(classifyPasteFailure("paste-return-unknown"), "other");
+});
+
+test("a failing paste on an untrusted system never upgrades it to broken", () => {
+  const untrusted = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: false, probeOk: false, now: 0 });
+  let s = untrusted;
+  for (let i = 0; i < 4; i++) s = applyPasteOutcome(s, { ok: false, reason: "Timed out", now: i });
+  assert.equal(s.state, PASTE_CAPABILITY.UNTRUSTED, "the fix for untrusted is different from the fix for broken");
+});
+
+// ── staleness ─────────────────────────────────────────────────────────
+
+test("an active verdict is believed for a minute; a bad one is re-checked in ten seconds", () => {
+  const T0 = 1000;
+  const active = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: T0 });
+  assert.equal(shouldProbe(active, T0 + PASTE_PROBE_ACTIVE_TTL_MS - 1), false);
+  assert.equal(shouldProbe(active, T0 + PASTE_PROBE_ACTIVE_TTL_MS), true);
+  const broken = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: false, now: T0 });
+  assert.equal(shouldProbe(broken, T0 + PASTE_PROBE_RECHECK_MS - 1), false);
+  assert.equal(shouldProbe(broken, T0 + PASTE_PROBE_RECHECK_MS), true);
+  assert.ok(PASTE_PROBE_RECHECK_MS < PASTE_PROBE_ACTIVE_TTL_MS);
+  // A state that has never been probed is always worth probing, whatever
+  // the clock says — this is the "before the first paste after boot" call.
+  assert.equal(shouldProbe(initialPasteCapability(T0), T0), true);
+});
+
+test("a verdict that would REFUSE a paste is never trusted without re-probing", () => {
+  // Two transient timeouts must not switch pasting off for the whole
+  // recheck window. Before a paste, a blocking verdict is always
+  // re-tested — the probe is one bounded round trip against a ladder
+  // that would otherwise spend seconds failing.
+  const T0 = 1000;
+  const broken = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: true, probeOk: false, now: T0,
+  });
+  assert.equal(shouldProbe(broken, T0 + 100), false, "the periodic check still respects its interval");
+  assert.equal(mustProbeBeforePaste(broken), true);
+  const untrusted = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: false, probeOk: false, now: T0,
+  });
+  assert.equal(mustProbeBeforePaste(untrusted), true);
+  // An active verdict is never waited on, however old — the user has
+  // just stopped talking and is waiting for text.
+  const active = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: true, probeOk: true, now: T0,
+  });
+  assert.equal(mustProbeBeforePaste(active), false);
+  assert.equal(shouldProbe(active, T0 + PASTE_PROBE_ACTIVE_TTL_MS), true, "it is refreshed in the background instead");
+  // Nothing probed yet is the one case a first paste does wait for.
+  assert.equal(mustProbeBeforePaste(initialPasteCapability(T0)), true);
+  assert.equal(mustProbeBeforePaste(null), true);
+});
+
+// ── user-facing message ───────────────────────────────────────────────
+
+test("broken tells the user to REMOVE and re-add — toggling a stale row does not fix it", () => {
+  const msg = pasteCapabilityMessage(PASTE_CAPABILITY.BROKEN);
+  assert.match(msg.fix, /Privacy & Security → Accessibility/);
+  assert.match(msg.fix, /remove and re-add/i);
+  const untrusted = pasteCapabilityMessage(PASTE_CAPABILITY.UNTRUSTED);
+  assert.match(untrusted.fix, /Accessibility/);
+  assert.doesNotMatch(untrusted.fix, /remove and re-add/i);
+  assert.equal(pasteCapabilityMessage(PASTE_CAPABILITY.ACTIVE).fix, "");
+  assert.equal(pasteCapabilityMessage(PASTE_CAPABILITY.UNKNOWN).fix, "");
+});
+
+test("the probe is the same mechanism the paste uses, and it is bounded", () => {
+  assert.equal(PASTE_PROBE_COMMAND.cmd, "osascript");
+  assert.match(PASTE_PROBE_COMMAND.args.join(" "), /System Events/);
+  assert.ok(PASTE_PROBE_COMMAND.timeoutMs <= 1000, "a probe on the paste path may not cost more than a second");
+});
+
+// ── budget table ─────────────────────────────────────────────────
+
+test("the paste ladder's worst case fits inside the post-stop deadline on every platform", () => {
+  for (const platform of Object.keys(PASTE_BUDGET)) {
+    const worst = pasteBudgetWorstCaseMs(platform);
+    assert.ok(
+      worst <= PASTE_POST_STOP_DEADLINE_MS,
+      `${platform}: worst case ${worst}ms exceeds the ${PASTE_POST_STOP_DEADLINE_MS}ms post-stop deadline`,
+    );
+  }
+});
+
+test("macOS honours the paste contract: at most 5 attempts, one delay each", () => {
+  for (const platform of Object.keys(PASTE_BUDGET)) {
+    const b = pasteBudgetFor(platform);
+    assert.ok(b.maxAttempts >= 1 && b.maxAttempts <= PASTE_MAX_ATTEMPTS, platform);
+    assert.equal(b.attemptDelaysMs.length, b.maxAttempts, `${platform}: one delay per attempt, no fallthrough`);
+    assert.ok(b.methodTimeoutsMs.length >= 1, platform);
+    assert.ok(b.methodTimeoutsMs.every((t) => t > 0), platform);
+  }
+  assert.equal(PASTE_MAX_ATTEMPTS, 5);
+});
+
+test("the table does NOT own the accessibility read bound", () => {
+  // Three SSOTs, no overlap: paste-capability decides IF and FOR HOW
+  // LONG the ladder may run, paste-script owns how long ONE
+  // accessibility read inside the AppleScript may take (it is the thing
+  // AppleScript enforces), paste-verification-policy decides whether the
+  // reads happen at all. A read timeout in this table would be a fourth
+  // opinion on a number only one file can enforce.
+  for (const platform of Object.keys(PASTE_BUDGET)) {
+    assert.ok(!("axReadTimeoutSec" in PASTE_BUDGET[platform]), platform);
+  }
+  // What it DOES own is the parent wall clock those reads need.
+  assert.ok(pasteBudgetFor("darwin").verificationAllowanceMs > 0);
+  assert.equal(pasteBudgetFor("win32").verificationAllowanceMs, 0);
+});
+
+test("verification only widens the attempt that carries the reads", () => {
+  const b = pasteBudgetFor("darwin");
+  assert.equal(pasteMethodTimeoutMs("darwin", 0, false), b.methodTimeoutsMs[0]);
+  assert.equal(
+    pasteMethodTimeoutMs("darwin", 0, true),
+    b.methodTimeoutsMs[0] + b.verificationAllowanceMs,
+  );
+  // Windows/Linux never verify, so asking for it changes nothing.
+  assert.equal(pasteMethodTimeoutMs("win32", 0, true), pasteMethodTimeoutMs("win32", 0, false));
+  // Method index is clamped, never undefined.
+  assert.equal(pasteMethodTimeoutMs("win32", 1), 3000);
+  assert.equal(pasteMethodTimeoutMs("win32", 99), 3000);
+  // Only the FIRST method of an attempt carries the reads.
+  assert.equal(pasteMethodTimeoutMs("linux", 2, true), pasteMethodTimeoutMs("linux", 2, false));
+});
+
+test("an unknown platform falls back to a real table rather than undefined", () => {
+  assert.deepEqual(pasteBudgetFor("sunos"), PASTE_BUDGET.linux);
+});
+
+test("attempt delays are clamped, never undefined past the last attempt", () => {
+  assert.equal(pasteAttemptDelayMs("darwin", 0), 45);
+  assert.equal(pasteAttemptDelayMs("darwin", 2), 125);
+  assert.equal(pasteAttemptDelayMs("darwin", 99), 125);
+  assert.equal(pasteAttemptDelayMs("darwin", -1), 45);
+});
+
+test("marking the transcript transient is documented as impossible here, not silently skipped", () => {
+  // Electron 42.4.1: clipboard.write takes a fixed Data shape with no
+  // custom-UTI key, and clipboard.writeBuffer REPLACES the pasteboard
+  // rather than adding a type to it. Doing this properly needs
+  // NSPasteboard, i.e. a native addon.
+  assert.equal(PASTE_TRANSIENT_TYPE, "org.nspasteboard.TransientType");
+  assert.equal(PASTE_TRANSIENT_TYPE_SUPPORTED, false);
+});
+
+// ── modifier release ─────────────────────────────────────────────
+
+test("only the hotkey path with a modifier chord waits for modifiers", () => {
+  assert.equal(planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" }).needed, true);
+  // Auto-paste after a recording: 1–2 s have passed, the chord is long up.
+  assert.equal(planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "auto" }).needed, false);
+  // A bare key has no modifiers to inherit.
+  assert.equal(planModifierRelease({ platform: "darwin", accelerator: "F10", trigger: "hotkey" }).needed, false);
+  // Windows SendKeys does not inherit physical flags the same way; R5
+  // keeps that path untouched.
+  assert.equal(planModifierRelease({ platform: "win32", accelerator: "Control+Alt+Shift+V", trigger: "hotkey" }).needed, false);
+});
+
+test("the wait borrows Handy's chord hold and local-speak's deadline", () => {
+  const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
+  assert.ok(plan.holdMs >= 150, "≥ CHORD_HOLD_MS (100) plus headroom, per R4");
+  assert.equal(plan.deadlineMs, 500, "local-speak CTRL_WAIT_DEADLINE");
+  assert.ok(plan.holdMs < plan.deadlineMs, "the floor must fit under the ceiling");
+  assert.ok(plan.pollIntervalMs > 0);
+});
+
+test("the wait plan's ceiling is inside the darwin preflight budget", () => {
+  const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
+  assert.ok(plan.deadlineMs <= pasteBudgetFor("darwin").preflightMs);
+});
+
+test("the modifier script polls in ONE spawn and carries the plan's numbers", () => {
+  const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
+  const src = modifierReleaseScript(plan);
+  assert.match(src, /NSEvent\.modifierFlags/);
+  assert.match(src, /var HOLD = 150;/);
+  assert.match(src, /var DEADLINE = 500;/);
+  assert.match(src, /sleepForTimeInterval/, "the poll loop lives inside the script, not in spawn calls");
+});
+
+test("the modifier wait is spawned as JavaScript, not AppleScript", () => {
+  // The script is JXA; osascript compiles AppleScript unless told
+  // otherwise, so the interpreter flag is part of the contract rather
+  // than something each caller remembers.
+  const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
+  const command = modifierReleaseCommand(plan);
+  assert.equal(command.cmd, "osascript");
+  assert.deepEqual(command.args.slice(0, 3), ["-l", "JavaScript", "-e"]);
+  assert.equal(command.args[3], modifierReleaseScript(plan));
+  // The script returns on its own at the deadline; the wall-clock bound
+  // only has to cover that plus osascript + JXA startup (~240 ms
+  // measured on macOS 27).
+  assert.equal(command.timeoutMs, plan.deadlineMs + MODIFIER_SPAWN_ALLOWANCE_MS);
+  assert.ok(command.timeoutMs > plan.deadlineMs);
+});
+
+test("parseModifierReleaseResult reads the marker and rejects anything else", () => {
+  assert.deepEqual(parseModifierReleaseResult("MODS:cleared:0:132"), {
+    ok: true, cleared: true, flags: 0, waitedMs: 132,
+  });
+  const held = parseModifierReleaseResult("noise\nMODS:held:655360:500\n");
+  assert.equal(held.ok, true);
+  assert.equal(held.cleared, false);
+  assert.equal(held.flags, 655360);
+  assert.deepEqual(parseModifierReleaseResult(""), { ok: false, cleared: false, flags: 0, waitedMs: 0 });
+  assert.equal(parseModifierReleaseResult("execution error: …").ok, false);
+});
+
+test("held flags decode to the modifier names the log prints", () => {
+  const flags = NS_EVENT_MODIFIER_FLAGS.option | NS_EVENT_MODIFIER_FLAGS.shift;
+  assert.deepEqual(heldModifiersFromFlags(flags).sort(), ["option", "shift"]);
+  assert.deepEqual(heldModifiersFromFlags(0), []);
+});

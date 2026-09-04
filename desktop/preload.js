@@ -47,7 +47,48 @@ contextBridge.exposeInMainWorld("__transcriptorEngine", {
 // because an IPC clone was refused. The main process validates the
 // shape it receives (desktop/recording-final-slot.js); nothing here
 // judges the payload, so there is only one definition of "well formed".
+// The renderer also needs to hear ONE thing from main: that the machine
+// is going to sleep or lock. It keeps a microphone capture warm for a
+// while after a recording (UI_TOKENS.capture.warmHoldMs) so the next one
+// starts without a getUserMedia round trip, and a warm capture carried
+// across a suspend comes back attached to a device that may not exist
+// any more. powerMonitor is a main-process API, so main is the only one
+// that can say it — see notifyRendererSystemSuspend in desktop/main.js,
+// which sends on both "suspend" and "lock-screen".
+//
+// Same shape rules as the send side: one fixed channel, no raw
+// ipcRenderer, and the payload is copied onto a fresh plain object so
+// the renderer never touches the IPC event itself.
 contextBridge.exposeInMainWorld("transcriptor", {
+  /**
+   * Subscribe to "the system is suspending or locking".
+   *
+   *   const off = window.transcriptor.onSystemSuspend(({ reason }) => …)
+   *
+   * `reason` is "suspend" or "lock-screen". Returns an unsubscribe
+   * function; calling it twice is harmless. A listener that throws is
+   * swallowed — this runs on a power event, which must not be broken by
+   * one bad subscriber.
+   */
+  onSystemSuspend: (callback) => {
+    if (typeof callback !== "function") return () => { };
+    const listener = (_event, payload) => {
+      try {
+        const p = payload && typeof payload === "object" ? payload : {};
+        callback({ reason: String(p.reason || "") });
+      } catch {
+        // A subscriber's failure is not the power event's problem.
+      }
+    };
+    ipcRenderer.on("system-suspend", listener);
+    return () => {
+      try {
+        ipcRenderer.removeListener("system-suspend", listener);
+      } catch {
+        // Already removed, or the bridge is torn down.
+      }
+    };
+  },
   recordingFinal: (payload) => {
     try {
       const p = payload && typeof payload === "object" ? payload : {};

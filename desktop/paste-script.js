@@ -85,6 +85,22 @@ const AX_READ_TIMEOUT_SEC = 0.25;
  */
 const AX_TRACE_PREFIX = "AXT:";
 
+/**
+ * Prefix of the "the paste is already out" receipt, logged the instant
+ * after the Cmd+V keycode or the Edit > Paste click leaves and BEFORE
+ * anything that can block — the verification read, or simply the return
+ * trip. That ordering is the whole point: when the parent wall-clock
+ * bound kills osascript, the receipt is what tells the ladder whether
+ * the kill landed before or after the paste was delivered. Without it,
+ * a kill during the verification read looked exactly like a kill before
+ * the keystroke, the ladder retried, and the target got the transcript
+ * TWICE. Handy paste_tx draws the same line: only a receipt that arrives
+ * after chord injection counts as proof.
+ *
+ * Parsed by desktop/paste-result.js pasteSentReceipt.
+ */
+const PASTE_SENT_PREFIX = "SENT:";
+
 /** Sanitize a numeric interpolation before it reaches AppleScript. */
 function safeInt(value, max = 2 ** 31) {
   const n = Number.parseInt(String(value ?? 0), 10) || 0;
@@ -253,6 +269,7 @@ function robustPasteScript({
             -- restore does not run for at least 1.5 s, and the auto-send
             -- Enter sleeps before it fires. A delay here was 160 ms added
             -- to the moment the user is waiting for.
+            log "${PASTE_SENT_PREFIX}menu-paste-primary"
             ${afterRead}
             return "OK:menu-paste-primary" & activationTag & ${verifiedTagExpr}
           end try
@@ -267,6 +284,7 @@ function robustPasteScript({
 
       -- Same reasoning as the menu path: the settle allowance lives with
       -- the caller that needs it, not in front of the return.
+      log "${PASTE_SENT_PREFIX}robust-paste"
       ${afterRead}
       return "OK:robust-paste" & activationTag & ${verifiedTagExpr}
     end tell
@@ -342,6 +360,7 @@ function axVerificationHandlers() {
 module.exports = {
   AX_READ_TIMEOUT_SEC,
   AX_TRACE_PREFIX,
+  PASTE_SENT_PREFIX,
   escapeAppleScriptString,
   robustPasteScript,
 };

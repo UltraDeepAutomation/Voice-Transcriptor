@@ -46,6 +46,7 @@
       "accelerator.js",
       "engine-deps.js",
       "renderer-console.js",
+      "paste-capability.js",
       "paste-result.js",
       "paste-script.js",
       "paste-verification-policy.js",

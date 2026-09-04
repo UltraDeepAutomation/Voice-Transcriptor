@@ -28,6 +28,30 @@ const {
   createPasteVerificationPolicy,
   summarizeAxReadTrace,
 } = require("./paste-verification-policy");
+// SSOT for "can this machine paste at all right now" (the stale
+// post-update Accessibility grant that AXIsProcessTrusted still reports
+// as trusted), for the retry/timeout budget the paste ladder spends, and
+// for the modifier-release wait the paste-last hotkey needs — unit-tested
+// by desktop/paste-capability.test.js.
+const {
+  PASTE_CAPABILITY,
+  PASTE_PROBE_COMMAND,
+  PASTE_POST_STOP_DEADLINE_MS,
+  initialPasteCapability,
+  applyProbeResult,
+  applyPasteOutcome,
+  shouldAttemptPaste,
+  shouldProbe,
+  mustProbeBeforePaste,
+  pasteCapabilityMessage,
+  pasteBudgetFor,
+  pasteAttemptDelayMs,
+  pasteMethodTimeoutMs,
+  planModifierRelease,
+  modifierReleaseCommand,
+  parseModifierReleaseResult,
+  heldModifiersFromFlags,
+} = require("./paste-capability");
 // SSOT for the renderer → main transcript hand-off: the shape of a
 // "recording-final" IPC payload and the per-recordingId mailbox the
 // post-stop task waits on (BUGS_AUDIT 2026-09-03 §6.7/§6.8/§6.9) —
@@ -2869,8 +2893,38 @@ function looksLikeAutomationPermissionError(reason) {
   );
 }
 
-function recordingStatusForPasteFailure(reason) {
+/**
+ * The accelerator the "paste last transcript" hotkey is registered on,
+ * as the user would press it. Read from the same published shortcut
+ * status the renderer shows, so a status that names the hotkey can never
+ * name one that is not actually registered.
+ */
+function pasteLastAccelerator() {
+  return lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "";
+}
+
+function recordingStatusForPasteFailure(reason, pasteAccel = pasteLastAccelerator()) {
   const r = String(reason || "").toLowerCase();
+  // The capability preflight refused to even try (./paste-capability):
+  // the grant is missing, or it survived the re-signed install and no
+  // longer works. Both are fixed by a specific sequence of clicks, and a
+  // status that just said "In Clipboard" would leave the user to guess
+  // it. The transcript is on the clipboard either way.
+  if (r.includes("paste-capability-")) {
+    const capabilityStatus = pasteCapabilityStatusText();
+    if (capabilityStatus) {
+      return pasteAccel ? `${capabilityStatus} Then press ${pasteAccel} to paste.` : capabilityStatus;
+    }
+  }
+  // Every other failure leaves the transcript on the clipboard too (see
+  // keepTranscriptOnClipboardAfterFailure), so every one of them names
+  // the hotkey that pastes it — the recovery is one keypress, and the
+  // user cannot use it if nothing says which key.
+  const hint = pasteAccel ? ` — press ${pasteAccel}` : "";
+  return `${recordingStatusBadgeForPasteFailure(r)}${hint}`;
+}
+
+function recordingStatusBadgeForPasteFailure(r) {
   // The transcript is ALWAYS written to the system clipboard before
   // the paste attempt (see ``clipboard.writeText(transcript)`` in
   // processPostStopTask), so every failure mode below still leaves
@@ -3634,6 +3688,163 @@ function refreshMacAccessibilityTrustState({ prompt = false } = {}) {
   return trusted;
 }
 
+// ── Paste capability probe ─────────────────────────────────────────────
+//
+// ``isTrustedAccessibilityClient`` answers a question about a TCC row,
+// not about whether events we synthesise actually land. After the app is
+// re-signed and replaced — which is exactly what installing a new build
+// does — that row can outlive the code identity it was granted to: the
+// bit stays true and every synthesised event is dropped in silence. The
+// only way to tell from inside Electron is to DO something that needs
+// the same grant and see whether it works, which is what the probe below
+// is: one bounded osascript round trip through System Events, the same
+// road the paste itself travels. Decisions live in
+// ./paste-capability (pure, tested); the side effects live here.
+let pasteCapability = initialPasteCapability();
+let pasteCapabilityProbeInFlight = null;
+
+/**
+ * The user-facing half of the capability, as a status line: short enough
+ * for the capsule, specific enough to act on. `setRecordingStatus` is
+ * the channel the renderer already renders — inventing a second one
+ * would mean touching the renderer for a message the existing one can
+ * carry.
+ */
+function pasteCapabilityStatusText() {
+  const message = pasteCapabilityMessage(pasteCapability.state);
+  if (!message.fix) return "";
+  return `In Clipboard · ${message.title}. ${message.fix}`;
+}
+
+function logPasteCapability(context) {
+  const line =
+    `state=${pasteCapability.state} cause=${context} ` +
+    `reason="${compactLogText(pasteCapability.reason, 160)}"`;
+  if (pasteCapability.state === PASTE_CAPABILITY.ACTIVE ||
+    pasteCapability.state === PASTE_CAPABILITY.UNKNOWN) {
+    appendMainLog(`[paste-capability] ${line}`);
+    return;
+  }
+  appendMainLog(
+    `[paste-capability] WARN: ${line} fix="${pasteCapabilityMessage(pasteCapability.state).fix}"`
+  );
+}
+
+/**
+ * Run the real probe and fold it into the state. Concurrent callers
+ * share one in-flight probe — boot, focus and the pre-paste check can
+ * all fire within the same second.
+ */
+async function probePasteCapability(cause = "manual") {
+  if (pasteCapabilityProbeInFlight) return pasteCapabilityProbeInFlight;
+  pasteCapabilityProbeInFlight = (async () => {
+    if (process.platform !== "darwin") {
+      // No trust bit, no probe — Unknown, and Unknown still pastes. The
+      // Windows and Linux ladders are unchanged by this module.
+      pasteCapability = applyProbeResult(pasteCapability, {
+        platform: process.platform,
+        trusted: null,
+        probeOk: false,
+      });
+      return pasteCapability;
+    }
+    const trusted = refreshMacAccessibilityTrustState() === true;
+    if (!trusted) {
+      // No spawn: the verdict is already decided, and an Apple Event we
+      // do not need is exactly the kind of thing that summons a TCC
+      // prompt at startup. "Startup must not summon macOS permission
+      // prompts" — see the whenReady comment. On a machine that HAS the
+      // grant, the probe below sends the same Apple Event the paste
+      // itself sends, so it can raise no prompt the first paste would
+      // not have raised anyway.
+      pasteCapability = applyProbeResult(pasteCapability, {
+        platform: "darwin",
+        trusted: false,
+        probeOk: false,
+      });
+      logPasteCapability(`${cause} trusted=0 probeOk=skipped`);
+      return pasteCapability;
+    }
+    const startedAt = Date.now();
+    let probeOk = false;
+    let probeReason = "";
+    try {
+      const res = await runCommand(PASTE_PROBE_COMMAND.cmd, PASTE_PROBE_COMMAND.args.slice(), {
+        timeoutMs: PASTE_PROBE_COMMAND.timeoutMs,
+      });
+      probeOk = !!res.ok && String(res.stdout || "").trim().length > 0;
+      if (!probeOk) {
+        probeReason = compactLogText(String(res.stderr || res.stdout || "probe-empty").trim(), 160);
+      }
+    } catch (e) {
+      probeReason = compactLogText(String(e?.message || e), 160);
+    }
+    pasteCapability = applyProbeResult(pasteCapability, {
+      platform: "darwin",
+      trusted,
+      probeOk,
+      probeReason,
+    });
+    logPasteCapability(`${cause} trusted=${trusted ? 1 : 0} probeOk=${probeOk ? 1 : 0} ms=${Date.now() - startedAt}`);
+    return pasteCapability;
+  })();
+  try {
+    return await pasteCapabilityProbeInFlight;
+  } finally {
+    pasteCapabilityProbeInFlight = null;
+  }
+}
+
+/** Probe only if the cached verdict is stale (see shouldProbe). */
+async function ensurePasteCapabilityFresh(cause = "focus") {
+  if (process.platform !== "darwin") return pasteCapability;
+  if (!shouldProbe(pasteCapability, Date.now())) return pasteCapability;
+  return probePasteCapability(cause);
+}
+
+/**
+ * The pre-paste check, which is the only one on a latency-critical path:
+ * the user has stopped talking and is waiting for text to appear.
+ *
+ * So it BLOCKS only where blocking changes the outcome — nothing has
+ * ever been probed, or the cached verdict is the thing that would refuse
+ * this paste (never act on a stale refusal: two transient timeouts must
+ * not switch pasting off for a whole recheck window). A cached verdict
+ * that allows the paste is used as-is and refreshed in the background,
+ * so a paste an hour after the last probe costs nothing extra.
+ */
+async function ensurePasteCapabilityForPaste() {
+  if (process.platform !== "darwin") return pasteCapability;
+  if (mustProbeBeforePaste(pasteCapability)) return probePasteCapability("pre-paste");
+  if (shouldProbe(pasteCapability, Date.now())) {
+    probePasteCapability("pre-paste-stale").catch(() => { });
+  }
+  return pasteCapability;
+}
+
+/**
+ * Fold a real paste result into the capability. A paste that worked is
+ * stronger evidence than any probe; a paste that failed the way a dead
+ * grant fails is what turns the state to broken between probes.
+ */
+function notePasteOutcome({ ok, reason } = {}) {
+  // Windows and Linux have no trust bit and no probe, so there is
+  // nothing for an outcome to correct: their state stays Unknown, which
+  // pastes. Folding failures in there could only ever take a working
+  // platform and start refusing its pastes on a heuristic built for a
+  // macOS-specific TCC bug.
+  if (process.platform !== "darwin") return;
+  const before = pasteCapability.state;
+  pasteCapability = applyPasteOutcome(pasteCapability, {
+    ok: !!ok,
+    reason: String(reason || ""),
+    platform: process.platform,
+  });
+  if (pasteCapability.state !== before) {
+    logPasteCapability(`paste-outcome from=${before}`);
+  }
+}
+
 async function promptMacPastePermissions(reason = "") {
   if (process.platform !== "darwin") return;
   const now = Date.now();
@@ -3868,6 +4079,24 @@ function releaseClipboardSnapshot() {
  * is left on the clipboard on purpose: the user can still paste it by
  * hand, whereas a silent restore gives them nothing.
  */
+/**
+ * The failure half of the clipboard contract (BUGS_AUDIT §6.5, debt
+ * registry item 3, and the Wispr Flow rule the registry records: the
+ * clipboard is never restored on failure).
+ *
+ * Restoring here used to be the worst of both worlds — the paste did not
+ * happen AND the text the user had just dictated was gone, while the
+ * status told them it was "In Clipboard". Leaving the transcript there
+ * is what makes that status true and what makes the paste-last hotkey
+ * work as the recovery it is advertised as.
+ */
+function keepTranscriptOnClipboardAfterFailure(logCtx) {
+  appendMainLog(
+    `[${logCtx}] paste failed; transcript left on the clipboard, previous clipboard NOT restored`
+  );
+  releaseClipboardSnapshot();
+}
+
 function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
   if (verified !== true) {
     appendMainLog(`[${logCtx}] paste not verified; leaving transcript on the clipboard instead of restoring`);
@@ -3971,7 +4200,71 @@ async function resolvePasteDestination(capturedTarget) {
   return { target: startTarget, alreadyFront: false };
 }
 
+/**
+ * The paste entry point. It is a thin shell on purpose: the ladder below
+ * is long, has a dozen return points, and every one of them is evidence
+ * about whether this machine can paste at all. Folding that evidence in
+ * ONE place is what keeps the capability state honest — a paste that
+ * worked is stronger liveness proof than any probe, and the failure
+ * shape that means "the grant is dead" is what turns the state broken
+ * between probes (./paste-capability).
+ */
 async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(), options = {}) {
+  const result = await runPasteLadder(text, target, options);
+  notePasteOutcome({ ok: result.ok, reason: result.reason });
+  return result;
+}
+
+/**
+ * The paste-last hotkey fires while its own chord is still physically
+ * held, and a synthesised Cmd+V inherits the real modifier flags — the
+ * target then receives Cmd+Alt+Shift+V and does something else entirely.
+ * The record hotkey has no such problem: it pastes a second or more
+ * after the key came up.
+ *
+ * Handy holds its injected chord for CHORD_HOLD_MS = 100 ms so the
+ * target reliably sees a complete event; local-speak waits up to 0.5 s
+ * for the user's own control keys to come up before injecting. We do
+ * both: never inject sooner than 150 ms after the hotkey, wait for the
+ * flags to actually clear, and give up at 500 ms and paste anyway
+ * (a stuck flag must not swallow the transcript).
+ *
+ * Explicit key-UP events for the user's own physical modifiers would be
+ * the belt to this braces, and they are NOT available here: System
+ * Events can press a chord but has no "key up" command, so synthesising
+ * one needs CGEventPost — a native addon. Waiting for the real release
+ * is what an Electron main process can do, and it is what this does.
+ */
+async function awaitModifierRelease(options = {}) {
+  const plan = planModifierRelease({
+    platform: process.platform,
+    accelerator: options.accelerator || "",
+    trigger: options.trigger || "",
+  });
+  if (!plan.needed) return null;
+  const command = modifierReleaseCommand(plan);
+  const startedAt = Date.now();
+  const res = await runCommand(command.cmd, command.args, { timeoutMs: command.timeoutMs });
+  const parsed = parseModifierReleaseResult(res.stdout);
+  const held = heldModifiersFromFlags(parsed.flags);
+  appendMainLog(
+    `[paste-modifiers] cleared=${parsed.cleared ? 1 : 0} held="${held.join("+") || "none"}" ` +
+    `waitedMs=${parsed.waitedMs} spawnMs=${Date.now() - startedAt} parsed=${parsed.ok ? 1 : 0}`
+  );
+  if (!parsed.ok) {
+    // The wait itself failed (JXA unavailable, killed). Fall back to the
+    // fixed floor so the chord still has time to come up.
+    await sleep(plan.holdMs);
+  }
+  return parsed;
+}
+
+async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options = {}) {
+  // Every wall-clock bound this function spends comes from ONE table
+  // (./paste-capability PASTE_BUDGET), so "how long can a paste take" has
+  // a single answer, and a test can check that answer against the
+  // deadline the user is already waiting inside.
+  const pasteBudget = pasteBudgetFor(process.platform);
   const skipActivation = !!options.alreadyFront;
   const originalTarget = normalizeCapturedPasteTarget(target);
   let effectiveTarget = cloneCapturedPasteTarget(originalTarget);
@@ -3986,6 +4279,35 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     logPasteTrace("start_skip", { reason: "empty-text" });
     traceEnd(trace, "failed", { reason: "empty-text" });
     return { ok: false, reason: "empty-text", method: "none", verified: false };
+  }
+  // Can we paste at all? ``isTrustedAccessibilityClient`` answers a
+  // question about a TCC row, not about whether the events we synthesise
+  // land — and after the app is re-signed and replaced, which is exactly
+  // what installing a new build does, that row can outlive the code
+  // identity it was granted to. The probe DOES something that needs the
+  // same grant and looks at whether it worked. When the answer is no,
+  // running the ladder anyway would spend seconds of Apple Events to end
+  // up reporting a paste that never happened; the transcript is already
+  // on the clipboard (the caller wrote it there), so the honest outcome
+  // is to say so, with the click sequence that repairs it.
+  const capability = await ensurePasteCapabilityForPaste();
+  traceStep(trace, "paste_capability", {
+    state: capability.state,
+    reason: compactLogText(capability.reason, 120),
+  });
+  if (!shouldAttemptPaste(capability)) {
+    const reason = `paste-capability-${capability.state}`;
+    logPasteTrace("start_skip", { reason, capabilityReason: compactLogText(capability.reason, 120) });
+    traceEnd(trace, "failed", { reason, method: "capability-preflight" });
+    return { ok: false, reason, method: "capability-preflight", verified: false };
+  }
+  const modifiers = await awaitModifierRelease(options);
+  if (modifiers) {
+    traceStep(trace, "modifier_release", {
+      cleared: !!modifiers.cleared,
+      held: heldModifiersFromFlags(modifiers.flags),
+      waitedMs: modifiers.waitedMs,
+    });
   }
   let frontBefore = { name: "", pid: 0 };
   try {
@@ -4086,7 +4408,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       traceStep(trace, restored ? "target_activated" : "target_activation_failed", {
         target: pasteTargetSummary(effectiveTarget),
       });
-      await sleep(80);
+      await sleep(pasteBudget.preflightSettleMs);
     } catch { }
   }
   // For the secondary menu-paste fallback below; the primary script
@@ -4119,12 +4441,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     // Both methods require the clipboard to be populated BEFORE the
     // keypress fires, which we do via Electron's clipboard.writeText
     // synchronously.
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < pasteBudget.maxAttempts; attempt++) {
       try { clipboard.writeText(String(text)); } catch { }
-      await sleep(30 + attempt * 30);
+      await sleep(pasteAttemptDelayMs(process.platform, attempt));
       if (hasCapturedPasteTarget(effectiveTarget)) {
         await activateCapturedPasteTarget(effectiveTarget).catch(() => false);
-        await sleep(70);
+        await sleep(pasteBudget.activationSettleMs);
       }
 
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "win_paste" });
@@ -4212,7 +4534,9 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
         // previous 5000 ms budget let every failing attempt burn a full
         // 5 s before the PowerShell fallback (below) even started,
         // which is what let the retry ladder reach ~30 s end to end.
-        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], { timeoutMs: 3500 });
+        const check = await runCommand("cscript", ["//Nologo", "//B", "//U", vbsPath], {
+          timeoutMs: pasteMethodTimeoutMs(process.platform, 0),
+        });
 
         // Clean up temp file
         try { fs.unlinkSync(vbsPath); } catch { }
@@ -4268,7 +4592,9 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
           `try { $p = Get-Process -Id ${safePid} -ErrorAction Stop; [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
         ) : "";
         const pwshSimple = `${activateBlock}Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
-        const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], { timeoutMs: 3000 });
+        const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], {
+          timeoutMs: pasteMethodTimeoutMs(process.platform, 1),
+        });
         const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
         if (pwshOutcome.success) {
           traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
@@ -4309,16 +4635,16 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     const isWayland = !!process.env.WAYLAND_DISPLAY;
     const hasX11 = !!process.env.DISPLAY;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < pasteBudget.maxAttempts; attempt++) {
       try { clipboard.writeText(String(text)); } catch { }
-      await sleep(30 + attempt * 30);
+      await sleep(pasteAttemptDelayMs(process.platform, attempt));
 
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "linux_paste" });
       traceStep(trace, "method_begin", { method: "linux_paste", attempt: attempt + 1, wayland: isWayland });
 
       if (hasCapturedPasteTarget(effectiveTarget)) {
         await activateCapturedPasteTarget(effectiveTarget).catch(() => false);
-        await sleep(60);
+        await sleep(pasteBudget.activationSettleMs);
       }
 
       // Build ordered cascade for the detected session type.
@@ -4364,6 +4690,12 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
         });
       }
 
+      // The per-tool bound comes from the same table as everything else;
+      // the literals the cascade was built with would have been a second
+      // place to change it.
+      attempts.forEach((a, index) => {
+        a.timeoutMs = pasteMethodTimeoutMs(process.platform, index);
+      });
       let methodOk = false;
       let lastPasteErr = "";
       for (const a of attempts) {
@@ -4412,10 +4744,10 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       pastedTextLen,
       verify: verifyPaste,
     });
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < pasteBudget.maxAttempts; attempt++) {
     // Refresh clipboard just in case OS flushed it
     try { clipboard.writeText(String(text)); } catch { }
-    await sleep(45 + attempt * 40);
+    await sleep(pasteAttemptDelayMs(process.platform, attempt));
 
     logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "robust_paste" });
     traceStep(trace, "method_begin", { method: "robust_paste", attempt: attempt + 1 });
@@ -4439,7 +4771,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     // what it was before verification existed, because the script then
     // contains no read to wait for.
     const check = await runCommand("osascript", ["-e", pasteScript], {
-      timeoutMs: verifyPaste ? 4200 : 3200,
+      timeoutMs: pasteMethodTimeoutMs(process.platform, 0, verifyPaste),
       onStreamLine,
     });
     const axReads = summarizeAxReadTrace(axTraceEvents);
@@ -4467,43 +4799,52 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       stderr: compactLogText(check.stderr),
     });
 
+    // Evaluated even when the child did NOT exit cleanly: the script
+    // logs a "SENT:" receipt the instant the paste is out, so a
+    // wall-clock kill that landed AFTER the keystroke is a paste that
+    // happened. Retrying it would put the transcript into the target a
+    // second time — the exact reason the receipt exists.
+    const macOutcome = evaluatePasteOutcome({
+      method: "robust_paste",
+      ok: check.ok,
+      stdout: check.stdout,
+      stderr: check.stderr,
+    });
+    const out = macOutcome.reason;
+    // Only a COMPLETED verification attempt teaches the policy anything.
+    // A paste that ran without the reads reports "unverified" too, and a
+    // paste cut short mid-read verified nothing it could report —
+    // feeding either back would switch the app off on evidence the
+    // policy manufactured itself.
+    if (verifyPaste) {
+      pasteVerificationPolicy.recordOutcome(
+        verificationKey,
+        check.ok && macOutcome.success
+          ? (macOutcome.verified
+            ? PASTE_VERIFICATION_OUTCOME.VERIFIED
+            : PASTE_VERIFICATION_OUTCOME.UNVERIFIED)
+          : PASTE_VERIFICATION_OUTCOME.ERROR,
+      );
+    }
+    if (macOutcome.success) {
+      logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
+      traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
+      // Restore previous clipboard only when the paste was verified —
+      // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
+      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
+      return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
+    }
     if (check.ok) {
-      const out = (check.stdout || "").trim();
-      const macOutcome = evaluatePasteOutcome({ method: "robust_paste", ok: check.ok, stdout: check.stdout });
-      // Only an ATTEMPTED verification teaches the policy anything. A
-      // paste that ran without the reads reports "unverified" too, and
-      // feeding that back would keep the app switched off on evidence it
-      // manufactured itself.
-      if (verifyPaste) {
-        pasteVerificationPolicy.recordOutcome(
-          verificationKey,
-          macOutcome.success
-            ? (macOutcome.verified
-              ? PASTE_VERIFICATION_OUTCOME.VERIFIED
-              : PASTE_VERIFICATION_OUTCOME.UNVERIFIED)
-            : PASTE_VERIFICATION_OUTCOME.ERROR,
-        );
-      }
-      if (macOutcome.success) {
-        logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified });
-        traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified });
-        // Restore previous clipboard only when the paste was verified —
-        // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
-        scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
-        return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
-      }
       if (out === "ERR:secure-field") {
         traceEnd(trace, "failed", { reason: "secure-field" });
-        safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-        releaseClipboardSnapshot();
+        keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:secure_field");
         return { ok: false, reason: "secure-field", method: "robust_paste", verified: false };
       }
       if (out === "ERR:no-accessibility") {
         lastReason = "ERR:no-accessibility";
         traceEnd(trace, "failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
         logPasteTrace("failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
-        try { restoreClipboard(savedClipboard); } catch { }
-        releaseClipboardSnapshot();
+        keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:robust_paste");
         return { ok: false, reason: lastReason, method: "robust_paste", verified: false };
       } else {
         lastReason = out || "paste-return-unknown";
@@ -4524,8 +4865,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
   // to the consolidated failure path which restores the clipboard +
   // releases the snapshot symmetrically with the success branches.
   if (process.platform !== "darwin") {
-    try { restoreClipboard(savedClipboard); } catch { }
-    releaseClipboardSnapshot();
+    keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:exhausted");
     traceEnd(trace, "failed", { reason: lastReason || "paste-no-attempt", method: "exhausted" });
     logPasteTrace("failed", { reason: compactLogText(lastReason || "paste-no-attempt") });
     return {
@@ -4563,7 +4903,9 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       end try
     end tell
   `;
-  const menuRes = await runCommand("osascript", ["-e", menuPasteScript], { timeoutMs: 4500 });
+  const menuRes = await runCommand("osascript", ["-e", menuPasteScript], {
+    timeoutMs: pasteBudget.tailFallbackTimeoutMs,
+  });
   traceStep(trace, "menu_paste_result", {
     ok: !!menuRes.ok,
     code: menuRes.code,
@@ -4586,8 +4928,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
       lastReason = out;
       traceEnd(trace, "failed", { reason: lastReason, method: "menu-paste" });
       logPasteTrace("failed", { reason: lastReason, method: "menu-paste" });
-      try { restoreClipboard(savedClipboard); } catch { }
-      releaseClipboardSnapshot();
+      keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:menu_paste");
       return { ok: false, reason: lastReason, method: "menu-paste", verified: false };
     }
     lastReason = out || lastReason;
@@ -4614,9 +4955,7 @@ async function tryPasteToFocusedField(text, target = emptyCapturedPasteTarget(),
     reason: compactLogText(lastReason),
     finalMethod: "failed",
   });
-  // Restore original clipboard whether paste succeeded or all methods failed.
-  try { restoreClipboard(savedClipboard); } catch { }
-  releaseClipboardSnapshot();
+  keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:failed");
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
@@ -4872,7 +5211,7 @@ async function processPostStopTask(task) {
   // the first paste-ready signal, so increasing this ceiling does not
   // add latency to healthy recordings; it only prevents legitimate
   // slow recovery from degrading into "Saved To App" with no paste.
-  const POST_STOP_TRANSCRIPT_TIMEOUT_MS = 32000;
+  const POST_STOP_TRANSCRIPT_TIMEOUT_MS = PASTE_POST_STOP_DEADLINE_MS;
   // BUGS_AUDIT §6.7. The renderer's IPC hand-off is the primary path;
   // the executeJavaScript poll is what happens when it never speaks.
   // A renderer that has the bridge sends its first signal within
@@ -5453,6 +5792,10 @@ async function pasteLatestTranscriptFromShortcut() {
     // owns focus — re-activating it would only cost a round trip.
     const pasted = await tryPasteToFocusedField(text, shortcutPasteTarget, {
       alreadyFront: Number(front?.pid) > 0 && !isBadActivationTarget(front?.name),
+      // This paste is happening WHILE the hotkey chord is held — see
+      // awaitModifierRelease.
+      trigger: "hotkey",
+      accelerator: lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "",
     });
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
@@ -7763,6 +8106,14 @@ app.on("window-all-closed", () => {
   }
 });
 
+// Focus regain is the moment the user comes back from System Settings,
+// so it is when a repaired grant should be noticed — and when a grant
+// that died while we were in the background should be. The check is
+// cache-first: it spawns nothing unless the cached verdict is stale.
+app.on("browser-window-focus", () => {
+  ensurePasteCapabilityFresh("focus").catch(() => { });
+});
+
 app.on("activate", (_event, hasVisibleWindows) => {
   mainWindowActivateRequestedAt = Date.now();
   ensureMacDockPresence("activate");
@@ -8102,6 +8453,12 @@ app.whenReady().then(async () => {
       } catch { }
     };
     checkAccessibility();
+    // One real probe at boot, so a grant that survived the re-signed
+    // install but no longer works is known BEFORE the first recording
+    // ends with a paste that silently goes nowhere. It is skipped
+    // entirely when Accessibility is not granted (see
+    // probePasteCapability), so a fresh install spawns nothing.
+    probePasteCapability("boot").catch(() => { });
     // Capture the handle so we can clear it on before-quit (otherwise
     // repeated dev-reload leaks intervals, and on production the
     // refed timer can delay clean shutdown by up to 30 s). `.unref`
@@ -8351,6 +8708,36 @@ app.whenReady().then(async () => {
       appendMainLog(`[power] shortcut re-register failed: ${e?.message || e}`);
     }
   });
+
+  // The renderer holds a microphone capture warm for a while after a
+  // recording so the next one starts instantly, and it has no way to
+  // learn that the machine is about to sleep or lock: powerMonitor lives
+  // in the main process. A warm capture carried across a suspend comes
+  // back attached to a device that may no longer exist, so main tells
+  // the renderer to let it go. Sent on both events, because a lock does
+  // not always become a suspend and a suspend does not always announce a
+  // lock first; the renderer's handler is idempotent by construction
+  // (release what is warm, or nothing).
+  for (const reason of ["suspend", "lock-screen"]) {
+    powerMonitor.on(reason, () => {
+      appendMainLog(`[power] ${reason} — notifying renderer to release any warm capture`);
+      notifyRendererSystemSuspend(reason);
+    });
+  }
+  }
+
+  /**
+   * Fire-and-forget main → renderer notification. A destroyed or
+   * not-yet-created window is the normal case during shutdown, not an
+   * error worth failing a power event over.
+   */
+  function notifyRendererSystemSuspend(reason) {
+    try {
+      if (!win || win.isDestroyed() || !win.webContents) return;
+      win.webContents.send("system-suspend", { reason: String(reason || "") });
+    } catch (e) {
+      appendMainLog(`[power] system-suspend notify failed: ${compactLogText(e?.message || e)}`);
+    }
   }
 
   function registerGlobalShortcuts(override = null) {
