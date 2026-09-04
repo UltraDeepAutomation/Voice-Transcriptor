@@ -1,33 +1,35 @@
 /**
  * Canonical live-source composition — the single source of truth for
- * turning what the streaming provider has said so far into the one text
- * the stop path delivers.
+ * turning what the streaming provider has said so far into the text the
+ * live preview shows and the draft autosave stores.
  *
- * Four inputs, none of which is complete on its own:
+ * Two inputs:
  *
- *   committed     — the finalized segments, authoritative but always
- *                 behind the speaker;
- *   recoveredTail — what earlier finals dropped from their own
- *                 interims, reconciled at the moment of each commit
- *                 and kept in a durable field instead of a register
- *                 the next final overwrites;
- *   interim       — the current hypothesis for the tail;
- *   snapshot      — the hypothesis that was on screen just before the last
- *                 `is_final` replaced it. A final that covers only PART
- *                 of what its own interim heard ("последние" out of
- *                 "последние слова") loses the rest, and by the time the
- *                 stop path reads this the tail word is gone.
+ *   committed — the finalized segments, authoritative but always behind
+ *               the speaker;
+ *   interim   — the current hypothesis for the tail.
  *
  * The hard part is that an interim is a ROLLING RE-DECODE: it restates
  * ground the committed text already covers, in different words, and
  * appending it duplicates a clause. Every guard in `mergeInterim` exists
  * because a specific duplication reached a user's transcript.
  *
+ * This module used to compose a third and fourth input as well — the
+ * hypothesis that the last final displaced (`lastInterimText`) and a
+ * durable `recoveredTailText` accumulated from every earlier final —
+ * because the stop path read this text and delivered it. It no longer
+ * does: the backend's `final` envelope is the only source of the
+ * delivered transcript, and recovering a word the provider's finals
+ * dropped is the backend's word-level splice's job, where the word can
+ * be put back in the PLACE it was spoken instead of glued onto the end
+ * (the "трёх в" defect of session a9fd3fd9). What is left here is
+ * display and draft state only, and it can no longer reach the text the
+ * user is handed.
+ *
  * Pure: no DOM, no state. Unit-tested in tests/live-source.test.ts.
  */
 
 import {
-  countWords,
   normalizeComparable,
   normalizeTranscriptWhitespace,
   normalizeWords,
@@ -49,7 +51,7 @@ const REDECODE_MIN_WORDS = 3;
 const REDECODE_MIN_SHARE = 0.7;
 
 /** Longest committed tail a single hypothesis may be allowed to supersede. */
-export const REDECODE_MAX_WINDOW_WORDS = 40;
+const REDECODE_MAX_WINDOW_WORDS = 40;
 
 /**
  * Most committed words a hypothesis may supersede WITHOUT restating
@@ -89,18 +91,6 @@ const REDECODE_MAX_SUPERSEDED_WORDS = 2;
  */
 const SEAM_WINDOW_MIN_WORDS = 10;
 const SEAM_WINDOW_SLACK_WORDS = 2;
-
-function pickRicher(a: string, b: string): string {
-  const left = normalizeTranscriptWhitespace(a);
-  const right = normalizeTranscriptWhitespace(b);
-  if (!left) return right;
-  if (!right) return left;
-  const leftWords = countWords(left);
-  const rightWords = countWords(right);
-  if (rightWords > leftWords) return right;
-  if (rightWords === leftWords && right.length > left.length) return right;
-  return left;
-}
 
 /** Length of the common leading run of two stem sequences. */
 function commonPrefixLength(a: ReadonlyArray<string>, b: ReadonlyArray<string>): number {
@@ -157,21 +147,6 @@ function redecodedTailAlignment(
   return best;
 }
 
-/**
- * What one hypothesis adds to the text we already hold.
- *
- * `text` is the merged result; `added` is the part of the hypothesis
- * that was genuinely new — empty when the committed text already
- * covered the whole hypothesis. Callers that only need the merged text
- * use `mergeInterim`; the commit-time reconciliation in the renderer
- * needs `added` on its own, and deriving it by slicing the merged
- * string apart would be a second, drifting definition of the same
- * decision.
- */
-export interface InterimFold {
-  text: string;
-  added: string;
-}
 
 /**
  * Fold one hypothesis into the text we already hold, without repeating
@@ -183,14 +158,17 @@ export interface InterimFold {
  * literally the committed tail; it is the committed tail re-worded; it
  * overlaps the tail exactly; it re-decodes the tail with a divergent
  * seam; it is new speech.
+ *
+ * This is the whole of the live composition: preview text and draft
+ * autosave text are `mergeInterim(committed, interim)` and nothing else.
  */
-export function foldInterim(baseRaw: string, interimRaw: string): InterimFold {
+export function mergeInterim(baseRaw: string, interimRaw: string): string {
   const base = normalizeTranscriptWhitespace(baseRaw);
   const interim = normalizeTranscriptWhitespace(interimRaw);
-  if (!interim) return { text: base, added: "" };
-  if (!base) return { text: interim, added: interim };
+  if (!interim) return base;
+  if (!base) return interim;
   const interimWords = normalizeWords(interim);
-  if (interimWords.length === 0) return { text: base, added: "" };
+  if (interimWords.length === 0) return base;
 
   const baseRawWords = base.split(/\s+/).filter(Boolean);
   const seamWindowWords = Math.max(SEAM_WINDOW_MIN_WORDS, interimWords.length + SEAM_WINDOW_SLACK_WORDS);
@@ -203,7 +181,7 @@ export function foldInterim(baseRaw: string, interimRaw: string): InterimFold {
   //    again.
   const interimComparable = normalizeComparable(interim);
   if (interimComparable && normalizeComparable(seamRaw).endsWith(interimComparable)) {
-    return { text: base, added: "" };
+    return base;
   }
 
   // 2. The committed tail ends with a RE-WORDING of this hypothesis —
@@ -216,7 +194,7 @@ export function foldInterim(baseRaw: string, interimRaw: string): InterimFold {
   const interimStems = interimWords.map(stemKey);
   const seamStems = seamWords.map(stemKey);
   if (tokensInOrderAtTail(seamStems, interimStems, REDECODE_MAX_SUPERSEDED_WORDS)) {
-    return { text: base, added: "" };
+    return base;
   }
 
   // 3. Exact overlap with a shifted boundary, e.g. committed "... сказал
@@ -230,7 +208,7 @@ export function foldInterim(baseRaw: string, interimRaw: string): InterimFold {
     const interimPrefix = interimWords.slice(0, n).join(" ");
     if (baseSuffix !== interimPrefix) continue;
     const remainder = interimRawWords.slice(n).join(" ").trim();
-    return { text: remainder ? `${base} ${remainder}` : base, added: remainder };
+    return remainder ? `${base} ${remainder}` : base;
   }
 
   // 4. Re-decode of a committed run whose seam diverges. Rule 3 needs
@@ -244,154 +222,14 @@ export function foldInterim(baseRaw: string, interimRaw: string): InterimFold {
       // A mis-heard word or two at the seam: the hypothesis's reading
       // of the whole run wins.
       const kept = baseRawWords.slice(0, redecode.start).join(" ").trim();
-      return { text: kept ? `${kept} ${interim}` : interim, added: continuation };
+      return kept ? `${kept} ${interim}` : interim;
     }
     // Too much committed text would go with it. Keep every committed
     // word and append only what the hypothesis adds past the run it
     // restates — appending the hypothesis whole would repeat the run.
-    return { text: continuation ? `${base} ${continuation}` : base, added: continuation };
+    return continuation ? `${base} ${continuation}` : base;
   }
 
   // 5. New speech.
-  return { text: `${base} ${interim}`, added: interim };
-}
-
-/**
- * Fold one hypothesis into the text we already hold, without repeating
- * ground it re-states.
- */
-export function mergeInterim(baseRaw: string, interimRaw: string): string {
-  return foldInterim(baseRaw, interimRaw).text;
-}
-
-/**
- * The part of `interim` the committed text does not cover.
- *
- * This is the commit-time half of the §4.1 fix: when a final clears the
- * interim that produced it, whatever the final did not carry over is
- * gone from every live view of the session, and the stop path — which
- * reads those views minutes later — can no longer see it. Asking the
- * question at the moment of the commit, with the same rules that decide
- * every other merge, is what makes the answer durable.
- */
-export function uncoveredInterimTail(baseRaw: string, interimRaw: string): string {
-  return foldInterim(baseRaw, interimRaw).added;
-}
-
-/**
- * Keep the recovered tail bounded by the same window that bounds every
- * other seam decision: words older than the re-decode window can no
- * longer be placed by any of the rules above, so carrying them would
- * only grow the field without ever changing an outcome.
- */
-export function boundRecoveredTail(textRaw: string): string {
-  const words = normalizeTranscriptWhitespace(textRaw).split(" ").filter(Boolean);
-  if (words.length <= REDECODE_MAX_WINDOW_WORDS) return words.join(" ");
-  return words.slice(-REDECODE_MAX_WINDOW_WORDS).join(" ");
-}
-
-/**
- * The one text the stop path delivers, from the four partial views.
- *
- * Each candidate is built and the richest wins, because which view
- * holds the tail depends on where the provider stopped finalizing.
- *
- * `recoveredTail` is the durable one: the current and snapshot
- * hypotheses only ever describe the LAST final, while the recovered
- * tail carries what earlier finals cut from their own interims and
- * would otherwise have been overwritten (BUGS_AUDIT_2026-09-03 §4.1).
- * It is folded in first so the hypotheses are merged against a base
- * that already contains it, and never appended twice.
- */
-export function composeCanonicalLiveSourceText(
-  committedRaw: string,
-  recoveredTailRaw: string,
-  currentInterimRaw: string,
-  snapshotInterimRaw: string,
-): string {
-  const committed = normalizeTranscriptWhitespace(committedRaw);
-  const currentInterim = normalizeTranscriptWhitespace(currentInterimRaw);
-  const snapshotInterim = normalizeTranscriptWhitespace(snapshotInterimRaw);
-
-  const withRecovered = mergeInterim(committed, recoveredTailRaw);
-  const withSnapshot = mergeInterim(withRecovered, snapshotInterim);
-  const withCurrent = mergeInterim(withRecovered, currentInterim);
-  const snapshotThenCurrent = mergeInterim(withSnapshot, currentInterim);
-  return [committed, withRecovered, withSnapshot, withCurrent, snapshotThenCurrent]
-    .reduce((best, candidate) => pickRicher(best, candidate), "");
-}
-
-/**
- * Shortest lead over the committed coverage that can hold a spoken word.
- *
- * A retiring hypothesis whose decode window ends within this much of the
- * last final's end says nothing that the final does not already account
- * for in time: no word is spoken in 0.2 s, so a lead that short is
- * timestamp jitter at the seam, not speech past the seam.
- */
-export const INTERIM_TAIL_MIN_LEAD_SEC = 0.2;
-
-/**
- * What a retiring hypothesis may contribute to the durable tail.
- *
- * D2 (BUGS_AUDIT_2026-09-03, three defects found on 1.5.0; log
- * 2026-09-03T21:43:06Z, session ``a9fd3fd9``). Deepgram dropped "трёх"
- * from its finals — the word existed only in an interim, INSIDE the time
- * range the finals covered. The §4.1 accumulation added it to
- * ``recoveredTailText`` because the committed TEXT did not contain it,
- * and the stop path, having nowhere else to put a word with no position,
- * glued "трёх в" onto the END of the transcript. A word was recovered
- * into a place it was never spoken, which is worse than the loss.
- *
- * The rule that fixes it, and the reason it is a time rule and not a
- * text rule: a word inside covered time belongs to the backend's splice
- * (§3.1 — Deepgram's own interim words are retained there and spliced
- * into the segment whose span they fall in, where they land in the right
- * PLACE), and the renderer must only recover what lies past the end of
- * the final that displaced the hypothesis, where appending IS the right
- * place.
- *
- * The granularity is the hypothesis's decode WINDOW, deliberately, and
- * not an interpolated per-word time. The backend documents what that
- * window is (``remote_deepgram_live``: "The message span is the
- * re-decode window, not the speech in it: a rolling interim can span
- * five seconds and carry two words near its end"), so spreading the
- * hypothesis's words evenly across it would invent timings the data does
- * not contain and drop real tail words on the strength of them. The
- * window end is a sound BOUND: nothing the hypothesis heard is later
- * than it, so a window that ends inside covered time cannot hold a word
- * the finals missed at the tail — and one that reaches past coverage
- * bounds only the words the committed text does not already carry
- * (``uncoveredInterimTail``, the same seam rules as every other merge).
- *
- * No timestamp at all (``windowEndSec`` null, or a provider that sends
- * no times) recovers nothing: without a position there is no evidence
- * the words belong at the tail, and appending them blind is the defect
- * this function exists to prevent.
- */
-export function interimWindowOutrunsCoverage(
-  windowEndSec: number | null | undefined,
-  coveredEndSec: number,
-): boolean {
-  if (!Number.isFinite(windowEndSec) || !Number.isFinite(coveredEndSec)) return false;
-  const windowEnd = Number(windowEndSec);
-  if (!(windowEnd > 0)) return false;
-  // Both timestamps reach the renderer rounded to milliseconds (the
-  // backend rounds every segment time to three decimals), so the lead is
-  // compared at that precision — binary floating point cannot represent
-  // 0.2 exactly, and an unrounded subtraction puts a lead that IS the
-  // threshold a hair below it.
-  const leadSec = Math.round((windowEnd - coveredEndSec) * 1000) / 1000;
-  return leadSec >= INTERIM_TAIL_MIN_LEAD_SEC;
-}
-
-export function retiredInterimTailBeyondCoverage(
-  committedTextRaw: string,
-  retiringInterimRaw: string,
-  windowEndSec: number | null | undefined,
-  coveredEndSec: number,
-): string {
-  if (!normalizeTranscriptWhitespace(retiringInterimRaw)) return "";
-  if (!interimWindowOutrunsCoverage(windowEndSec, coveredEndSec)) return "";
-  return uncoveredInterimTail(committedTextRaw, retiringInterimRaw);
+  return `${base} ${interim}`;
 }

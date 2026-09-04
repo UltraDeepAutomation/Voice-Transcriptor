@@ -54,37 +54,7 @@ export function stemKey(token: string): string {
 }
 
 /**
- * True when every element of `needle` occurs in `haystack` in order
- * (classic subsequence test).
- *
- * Purpose: an interim hypothesis frequently RE-STATES its own previous
- * span with different word forms and even different word counts — e.g.
- * the committed text ends "…именно обратил внимание на визуальную
- * часть" while the fresh hypothesis says "именно обратил внимание на
- * визуальное". Exact suffix/prefix matching can never align those (endings
- * differ, counts differ), so the caller would concatenate the hypothesis
- * as new content and duplicate the phrase (seen live 2026-08-24, session
- * 20-32-21). Stem-normalized subsequence containment recognizes the
- * re-statement as already-covered content.
- *
- * Inputs should be pre-stemmed via stemKey(normalizeWords(...)).
- * Pure; O(len(haystack)).
- */
-export function tokensInOrder(haystack: string[], needle: string[]): boolean {
-  if (needle.length === 0) return true;
-  if (haystack.length < needle.length) return false;
-  let i = 0;
-  for (const tok of haystack) {
-    if (tok === needle[i]) {
-      i += 1;
-      if (i === needle.length) return true;
-    }
-  }
-  return false;
-}
-
-/**
- * `tokensInOrder`, anchored at the END of the haystack.
+ * Subsequence containment, anchored at the END of the haystack.
  *
  * True when every element of `needle` occurs in `haystack` in order AND
  * the match reaches the haystack's tail: at most `maxTrailingSlack`

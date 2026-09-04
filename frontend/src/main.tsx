@@ -11,15 +11,15 @@ import {
   summarizeCaptureLevel,
 } from "./audio-levels";
 import {
-  decideDeadStreamRecovery,
   decideLiveTranscriptAdoption,
-  envelopeAudioEndSec,
-  envelopeCoversRecording,
   type LiveCoverageReport as LiveCoverage,
 } from "./live-coverage";
 import {
   computeEnvelopeDeadlineMs,
+  envelopeMissing,
+  envelopeTranscript,
   type FinalizeBudgetAnnouncement,
+  type StopTranscriptSource,
 } from "./envelope-deadline";
 import {
   captureElapsedMs,
@@ -59,23 +59,10 @@ import {
   normalizeTranscriptWhitespace,
 } from "./text-match";
 import {
-  candidateConfirmsTranscriptCoverage,
-  chooseStopTranscript,
   joinTranscriptSegments,
   richerTranscript,
-  textFromEnvelope,
-  type StopTranscriptResult,
-  type StopTranscriptSource,
-  type TimedSegmentLike,
 } from "./transcript-merge";
-import {
-  boundRecoveredTail,
-  composeCanonicalLiveSourceText,
-  interimWindowOutrunsCoverage,
-  mergeInterim,
-  retiredInterimTailBeyondCoverage,
-  uncoveredInterimTail,
-} from "./live-source";
+import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
 
 declare global {
@@ -300,37 +287,12 @@ const RECORDING_COLLECTIONS = {
 type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
 const RECORDING_VIEWER_AUDIO_READY_TIMEOUT_MS = 1500;
 
-interface TranscriptWord {
-  start: number;
-  end: number;
-  text: string;
-  /**
-   * Which reading this word came from, when the backend says so — the
-   * dual-stream merge tags each word with the stream that produced it
-   * ("multi", the secondary language, "interim-fallback"). Diagnostic
-   * provenance only: nothing in the renderer decides anything from it,
-   * and it is simply absent on a single-stream envelope.
-   */
-  source?: string;
-}
-
 interface TranscriptSegment {
   start: number;
   end: number;
   text: string;
   /** Deepgram diarization index when enabled. undefined otherwise. */
   speaker?: number;
-  /**
-   * Per-word times, when the provider sent them.
-   *
-   * The backend attaches them to every final segment
-   * (``normalize_words`` in ``remote_deepgram_live``) so the seam-time
-   * merge can place a reading word by word instead of by the span its
-   * decode window happened to have. Absent on interim segments and on
-   * providers that do not report word times — which is exactly the
-   * condition ``mergeReadings`` reads to choose its strategy.
-   */
-  words?: TranscriptWord[];
 }
 
 interface LocalTranscriptionResult {
@@ -388,14 +350,18 @@ interface LiveFinalEnvelope {
   coverage?: LiveCoverage;
   /**
    * Seconds where the backend's own interims recognised speech that no
-   * final segment covers (backend ``_uncovered_speech_sec``). Non-zero
-   * is PROOF the streamed text is incomplete — drives the tail-recovery
-   * escalation instead of silently delivering a truncated transcript.
+   * final segment covers (backend ``_uncovered_speech_sec``).
+   *
+   * Diagnostic only. It used to drive a renderer-side recovery
+   * escalation; the backend now closes those spans itself, before the
+   * envelope is sent, and reports what it re-decoded in
+   * ``stats.recovery``. A renderer that still escalated on this number
+   * would be re-decoding audio the envelope already accounts for.
    */
   uncoveredSpeechSec?: number;
-  /** PROTOCOL CONTRACT C5: seconds of audio the backend actually streamed to the provider (``bytes_sent / (2 * sampleRate)``). */
+  /** PROTOCOL CONTRACT C5: seconds of audio the backend actually streamed to the provider (``bytes_sent / (2 * sampleRate)``). Diagnostic. */
   streamedSec?: number;
-  /** PROTOCOL CONTRACT C5: the last second of audio a final segment covers — the tail-gap arithmetic's authoritative end point. */
+  /** PROTOCOL CONTRACT C5: the last second of audio a final segment covers. Diagnostic. */
   coveredEndSec?: number;
   /** What the session reports about itself — see ``LiveFinalStats``. */
   stats?: LiveFinalStats;
@@ -411,17 +377,31 @@ interface LiveFinalEnvelope {
  * and decides how to read every other number in a support log, so the
  * stop trace states it.
  *
- * Only the one field is parsed, and only as a boolean: anything else in
- * ``stats`` is the backend's business.
+ * ``stats.recovery`` is the second reason. The envelope is complete by
+ * construction: whatever span of the recording the live stream left
+ * uncovered, the backend re-decodes from its own audio spool before it
+ * sends. That work is invisible in the transcript and it is the single
+ * biggest term in how long a stop took, so the stop trace states how
+ * many seconds were re-decoded and how long it cost.
+ *
+ * Only these fields are parsed, and only as numbers/booleans: anything
+ * else in ``stats`` is the backend's business.
  *
  * NOTE (2026-09-04): ``backend/deepgram_dual.py`` had not landed when
- * this was written, so the field name here is the one from the
- * dual-stream config contract (``dual_stream``). If the backend reports
- * it under another name, this is the single place to correct — a missing
- * or non-boolean field reads as "not dual", never as a crash.
+ * the dual-stream field was written, and ``backend/deepgram_recovery.py``
+ * had not landed when the recovery fields were. The names here are the
+ * contract this renderer implements — ``stats.dual_stream`` (boolean),
+ * ``stats.recovery.spans_sec`` and ``stats.recovery.ms`` (numbers). If
+ * the backend reports them under other names, this is the single place
+ * to correct; a missing or malformed field reads as absent, never as a
+ * fact and never as a crash.
  */
 interface LiveFinalStats {
   dualStream?: boolean;
+  /** Seconds of the recording the backend re-decoded to close a gap. */
+  recoverySpansSec?: number;
+  /** What that re-decode cost, in ms — part of the announced budget. */
+  recoveryMs?: number;
 }
 
 /**
@@ -474,15 +454,25 @@ function parseOptionalNonNegativeNumber(value: unknown): number | undefined {
 }
 
 /**
- * ``stats.dual_stream`` and nothing else. Absent, malformed or
- * non-boolean is absent — the same rule the C5 fields follow, for the
- * same reason: a protocol mismatch must never be read as a fact.
+ * ``stats.dual_stream`` and ``stats.recovery`` and nothing else. Absent
+ * or malformed is absent — the same rule the C5 fields follow, for the
+ * same reason: a protocol mismatch must never be read as a fact. Each
+ * field stands on its own, so a backend that reports one and not the
+ * other still gets the one it reports through.
  */
 function parseLiveFinalStats(raw: unknown): LiveFinalStats | undefined {
   if (!raw || typeof raw !== "object") return undefined;
+  const stats: LiveFinalStats = {};
   const dualStream = (raw as { dual_stream?: unknown }).dual_stream;
-  if (typeof dualStream !== "boolean") return undefined;
-  return { dualStream };
+  if (typeof dualStream === "boolean") stats.dualStream = dualStream;
+  const recovery = (raw as { recovery?: unknown }).recovery;
+  if (recovery && typeof recovery === "object") {
+    const spansSec = parseOptionalNonNegativeNumber((recovery as { spans_sec?: unknown }).spans_sec);
+    if (spansSec !== undefined) stats.recoverySpansSec = spansSec;
+    const ms = parseOptionalNonNegativeNumber((recovery as { ms?: unknown }).ms);
+    if (ms !== undefined) stats.recoveryMs = ms;
+  }
+  return Object.keys(stats).length ? stats : undefined;
 }
 
 function parseLiveWsMessage(raw: string): LiveWsMessage | null {
@@ -1014,7 +1004,6 @@ const UI_TOKENS = {
   },
   finalize: {
     segmentEpsilonSec: 0.08,
-    tailRecoverySecondCandidateWaitMs: 2_500,
   },
   drain: {
     maxWaitMs: 450,
@@ -2433,14 +2422,6 @@ const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
 const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = 13_000;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = 8_000;
 const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = 20_000;
-// Ceiling for the tail-gap recovery pass — the case where a usable
-// transcript ALREADY exists and recovery is only chasing a trailing
-// clause. Deliberately far below the empty-transcript budgets: the
-// user is waiting on Stop with a finished transcript in hand, so a long
-// wait for a marginal improvement is a worse outcome than shipping what
-// we have.
-const LIVE_TAIL_RECOVERY_TIMEOUT_MS = 6_000;
-
 function isRemoteProvider(provider: Provider): provider is RemoteProvider {
   return provider === "openrouter" || provider === "deepgram";
 }
@@ -2578,38 +2559,6 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   return cleaned.length > 800 ? fallback : cleaned;
 }
 
-/**
- * Per-word times as the backend sends them (``{word, start, end}``),
- * shifted onto the same axis as the segment that carries them.
- *
- * All or nothing: a list where any entry is missing its text or its
- * times cannot place a reading, and half a word list would place SOME of
- * a segment's words honestly and leave the rest to be guessed at. The
- * segment's own span is the fallback, and it is a truthful one.
- */
-function normalizeTranscriptWords(raw: unknown, timeOffsetSec: number): TranscriptWord[] | null {
-  if (!Array.isArray(raw) || !raw.length) return null;
-  const out: TranscriptWord[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") return null;
-    const source = entry as {
-      word?: unknown; punctuated_word?: unknown; text?: unknown;
-      start?: unknown; end?: unknown; source?: unknown;
-    };
-    const text = normalizeTranscriptWhitespace(
-      String(source.punctuated_word ?? source.word ?? source.text ?? ""),
-    );
-    const start = Number(source.start) + timeOffsetSec;
-    const end = Number(source.end) + timeOffsetSec;
-    if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
-    const word: TranscriptWord = { start: Math.max(0, start), end: Math.max(0, end), text };
-    const provenance = typeof source.source === "string" ? source.source.trim() : "";
-    if (provenance) word.source = provenance;
-    out.push(word);
-  }
-  return out.length ? out : null;
-}
-
 function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): TranscriptSegment | null {
   if (!raw || typeof raw !== "object") return null;
   const source = raw as { start?: unknown; end?: unknown; text?: unknown; speaker?: unknown };
@@ -2617,12 +2566,13 @@ function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): Transcript
   const start = Math.max(0, Number(source.start || 0) + timeOffsetSec);
   const end = Math.max(start, Number(source.end || 0) + timeOffsetSec);
   if (!text || !Number.isFinite(start) || !Number.isFinite(end)) return null;
+  // The backend also attaches per-word times to every final segment
+  // (``normalize_words`` in ``remote_deepgram_live``). They are not
+  // parsed: the only thing that ever read them was the renderer's
+  // seam-time merge of two readings, and there is one reading now. The
+  // words still travel on the wire for the backend's own splice, which
+  // is where placing a word by its time belongs.
   const segment: TranscriptSegment = { start, end, text };
-  const words = normalizeTranscriptWords(
-    (raw as { words?: unknown }).words,
-    timeOffsetSec,
-  );
-  if (words) segment.words = words;
   if (source.speaker !== undefined && source.speaker !== null) {
     const speakerIndex = Number(source.speaker);
     if (Number.isFinite(speakerIndex) && speakerIndex >= 0) {
@@ -4533,37 +4483,15 @@ function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
 }
 
 function getCanonicalLiveSourceText(): string {
-  // Include committed segments plus every useful interim candidate so
-  // the tail of the utterance is never lost.
+  // The live reading of the active session: the committed finals plus
+  // the current interim, folded in by the seam rules in ./live-source so
+  // a rolling re-decode cannot duplicate a clause.
   //
-  // Why ``lastInterimSnapshot``: when Deepgram sends an ``is_final``
-  // event, the session buffer commit projection clears ``liveInterimText``
-  // (correct for live display — the interim is replaced by the final).
-  // But if Deepgram finalized only PART of what was in the interim
-  // (e.g. "последние" out of "последние слова"), the cleared interim
-  // loses "слова" and the committed cache only has "последние". By
-  // the time stopLive reads this function, the tail word is gone.
-  //
-  // ``lastInterimSnapshot`` preserves the interim text from just
-  // before the last clear. We merge ALL THREE:
-  //   1. Current ``liveInterimText`` (if Deepgram sent a fresh interim
-  //      after the last is_final)
-  //   2. ``lastInterimSnapshot`` (the interim just before the last
-  //      is_final wiped it)
-  //   3. ``recoveredTailSnapshot`` — the same reconciliation done for
-  //      EVERY earlier final, not just the last one. Both snapshots
-  //      above describe one commit; a word dropped by final N is gone
-  //      from them the moment final N+1 lands (§4.1).
-  //
-  // Deduplication: if an interim is already represented in committed
-  // text, skip it; if it overlaps at the boundary, append only the new
-  // tail words.
-  return composeCanonicalLiveSourceText(
-    liveDraftText,
-    recoveredTailSnapshot,
-    liveInterimText,
-    lastInterimSnapshot,
-  );
+  // This is DISPLAY AND DRAFT state. It is what the preview shows and
+  // what the draft autosave and the archive's ``source_text`` record;
+  // it is never merged into the delivered transcript, which is the
+  // backend's ``final`` envelope and only that.
+  return mergeInterim(liveDraftText, liveInterimText);
 }
 
 function getVisibleLivePreviewText(): string {
@@ -8533,8 +8461,6 @@ const SCRIPT_PROCESSOR_BUFFER_SAMPLES = 4096;
 // against a constant amplitude (./audio-levels, BUGS_AUDIT_2026-09-03
 // §4.3).
 let captureLevel = createCaptureLevel();
-let capturePcmSampleCount = 0;
-let captureLastActivePcmSample = 0;
 let liveDraftText = "";
 let liveDraftDisplayText = "";
 let liveInterimText = "";
@@ -9143,28 +9069,27 @@ interface LiveFinalSlot {
   waiters: Array<(envelope: LiveFinalEnvelope | null) => void>;
 }
 
+/**
+ * Per-session live PREVIEW state: the committed finals and the current
+ * hypothesis for the tail, and nothing else.
+ *
+ * It used to carry two more fields — ``lastInterimText`` (the
+ * hypothesis the last final displaced) and ``recoveredTailText`` (what
+ * every earlier final dropped from its own interim, accumulated) —
+ * because the stop path read this buffer and delivered what it found.
+ * It no longer does. Recovering a word the provider's finals dropped is
+ * the backend's word-level splice's job, where the word goes back where
+ * it was spoken; the renderer's version of it could only append, which
+ * put "трёх в" on the end of session ``a9fd3fd9``'s transcript. The
+ * preview never regresses visibly without them either: the display floor
+ * in ``scheduleLiveOutputRender`` is monotonic.
+ */
 interface LiveTranscriptBuffer {
   segments: TranscriptSegment[];
   committedText: string;
   committedDisplayText: string;
-  /**
-   * What earlier finals did not carry over from their own interims.
-   *
-   * ``lastInterimText`` is a one-slot register: a word heard by interim
-   * N and dropped by final N survives only until final N+1 overwrites
-   * it, and the stop path — which reads this buffer minutes later —
-   * never sees it (BUGS_AUDIT_2026-09-03 §4.1; measured on the 12 s
-   * recording of 2026-09-03, where "субагента" stood in an interim
-   * before the first final and was overwritten twice). Reconciling at
-   * the moment of each commit and keeping the residue here makes it
-   * durable. Bounded by the same window that bounds every other seam
-   * decision (``boundRecoveredTail``).
-   */
-  recoveredTailText: string;
   interimText: string;
   interimSegment: TranscriptSegment | null;
-  lastInterimText: string;
-  lastInterimSegment: TranscriptSegment | null;
   committedDisplayCache: string;
   wsMode: LiveWsMode;
 }
@@ -9194,11 +9119,8 @@ function createLiveTranscriptBuffer(wsMode: LiveWsMode): LiveTranscriptBuffer {
     segments: [],
     committedText: "",
     committedDisplayText: "",
-    recoveredTailText: "",
     interimText: "",
     interimSegment: null,
-    lastInterimText: "",
-    lastInterimSegment: null,
     committedDisplayCache: "",
     wsMode,
   };
@@ -9218,51 +9140,12 @@ function ensureLiveTranscriptBuffer(token: string, wsMode: LiveWsMode): LiveTran
 }
 
 function canonicalTextFromBuffer(buffer: LiveTranscriptBuffer): string {
-  return composeCanonicalLiveSourceText(
-    buffer.committedText,
-    buffer.recoveredTailText,
-    buffer.interimText,
-    buffer.lastInterimText,
-  );
+  return mergeInterim(buffer.committedText, buffer.interimText);
 }
 
 function getSessionCanonicalLiveSourceText(token: string): string {
   const buffer = getLiveTranscriptBuffer(token);
   return buffer ? canonicalTextFromBuffer(buffer) : getCanonicalLiveSourceText();
-}
-
-/**
- * The held live reading, refreshed from the session's live buffer.
- *
- * ``floor`` is a snapshot of ``getSessionCanonicalLiveSourceText`` taken
- * before some ``await`` (an envelope wait, a recovery race). By the time
- * this runs, a ``segments`` WS message may have promoted an interim into
- * a committed final, and the canonical text is re-read here so growth
- * during the wait is not silently dropped.
- *
- * ``floor`` and the fresh read are two snapshots of the SAME reading,
- * not two independent ones to reconcile — a later read differs only
- * because a final ADDED to it, never because it decoded the audio a
- * different way. Picking the richer of the two, instead of aligning
- * them with ``mergeReadings``/``unionTranscripts`` the way this used to
- * (inside the deleted ``composeStopTranscript``), is what stops two
- * near-identical snapshots — worded slightly differently at the edge of
- * a newly-promoted segment — from being unioned into a duplicate. That
- * was a real defect (support log 2026-09-04): composing the floor
- * against a fresh buffer read, with no envelope involved at all,
- * inflated a clean 24-word transcript to 36 words (session
- * ``ed79f04a``) and a 73-word one to 189 (session ``521f9788``), both by
- * duplicating a clause the two snapshots merely worded differently.
- */
-interface HeldReading {
-  text: string;
-  segments?: ReadonlyArray<TimedSegmentLike> | null;
-}
-
-function currentHeldReading(floor: string, sessionToken: string): HeldReading {
-  const buffer = getLiveTranscriptBuffer(sessionToken);
-  const fresh = getSessionCanonicalLiveSourceText(sessionToken);
-  return { text: richerTranscript(floor, fresh), segments: buffer?.segments };
 }
 
 function appendSegmentsToBuffer(
@@ -9285,13 +9168,9 @@ function appendSegmentsToBuffer(
     merged.slice(0, prevLen).every((seg, i) => seg === buffer.segments[i]);
 
   buffer.segments = merged;
-  // The retiring hypothesis and the window it was decoded over. Both are
-  // read below, AFTER the merge, because the question they answer — does
-  // this hypothesis reach past the time the finals now cover? — can only
-  // be asked against the coverage as it is once this final is in.
-  const retiringInterim = buffer.interimText;
-  const retiringInterimEnd = buffer.interimSegment ? buffer.interimSegment.end : null;
-  const retiringInterimSegment = buffer.interimSegment;
+  // The final retires the hypothesis that produced it. Whatever the
+  // final did not carry over is the backend's to splice back in, at the
+  // time it was spoken — see the LiveTranscriptBuffer doc.
   buffer.interimText = "";
   buffer.interimSegment = null;
 
@@ -9321,61 +9200,6 @@ function appendSegmentsToBuffer(
   }
   buffer.committedText = joinTranscriptSegments(buffer.segments);
   buffer.committedDisplayText = buffer.committedDisplayCache || buffer.committedText;
-
-  // Reconcile the retiring hypothesis against the final that retired it
-  // — with the committed text as it is NOW, which is why this runs last
-  // (BUGS_AUDIT_2026-09-03 §4.1). Whatever this final did not carry
-  // over joins the durable tail; whatever a LATER final has since
-  // covered leaves it, so the field holds exactly the words no
-  // committed segment accounts for and cannot accumulate duplicates of
-  // text that arrived properly a moment later.
-  //
-  // D2: only a hypothesis whose decode window reaches PAST the covered
-  // time may contribute. A hypothesis that lived entirely inside the
-  // finals' time range holds no tail — a word missing from those finals
-  // is missing from the middle, where only the backend's word-level
-  // splice can put it back, and appending it here places it where it was
-  // never spoken ("трёх в" glued onto the end of session ``a9fd3fd9``).
-  // The same gate guards the SNAPSHOT: ``lastInterimText`` is composed
-  // into the canonical live text exactly like the durable tail is, so
-  // leaving a covered hypothesis there would re-open the defect through
-  // the other door — including one retained by an EARLIER final and only
-  // now overtaken by the coverage this one adds.
-  const coveredEndSec = maxSegmentEnd(buffer.segments);
-  if (
-    buffer.lastInterimSegment &&
-    !interimWindowOutrunsCoverage(buffer.lastInterimSegment.end, coveredEndSec)
-  ) {
-    buffer.lastInterimText = "";
-    buffer.lastInterimSegment = null;
-  }
-  if (retiringInterim && interimWindowOutrunsCoverage(retiringInterimEnd, coveredEndSec)) {
-    buffer.lastInterimText = retiringInterim;
-    buffer.lastInterimSegment = retiringInterimSegment;
-  }
-  const carried = uncoveredInterimTail(buffer.committedText, buffer.recoveredTailText);
-  const fresh = retiredInterimTailBeyondCoverage(
-    buffer.committedText,
-    retiringInterim,
-    retiringInterimEnd,
-    coveredEndSec,
-  );
-  buffer.recoveredTailText = boundRecoveredTail(
-    fresh ? mergeInterim(carried, fresh) : carried,
-  );
-}
-
-function maxSegmentEnd(segments: TranscriptSegment[]): number {
-  return segments.reduce((max, seg) => (seg.end > max ? seg.end : max), 0);
-}
-
-function maxLiveBufferSpeechEnd(buffer: LiveTranscriptBuffer | null): number {
-  if (!buffer) return 0;
-  return Math.max(
-    maxSegmentEnd(buffer.segments),
-    buffer.interimSegment?.end || 0,
-    buffer.lastInterimSegment?.end || 0,
-  );
 }
 
 function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
@@ -9383,17 +9207,13 @@ function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
   return (
     buffer.segments.length > 0 ||
     !!buffer.committedText.trim() ||
-    !!buffer.interimText.trim() ||
-    !!buffer.lastInterimText.trim() ||
-    !!buffer.recoveredTailText.trim()
+    !!buffer.interimText.trim()
   );
 }
 
 function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer): void {
   liveTranscriptSegments = buffer.segments;
   liveInterimText = buffer.interimText;
-  lastInterimSnapshot = buffer.lastInterimText;
-  recoveredTailSnapshot = buffer.recoveredTailText;
   setLiveDraftState(buffer.committedText, buffer.committedDisplayText);
 }
 
@@ -9735,27 +9555,9 @@ function setLiveDraftState(text: string, displayText = text): void {
 }
 
 // The authoritative committed/interim state lives in LiveTranscriptBuffer
-// per session. These globals are only the currently active UI projection
-// kept for the existing renderer/main-process read paths.
-// Snapshot of ``liveInterimText`` taken JUST BEFORE it is cleared by
-// an incoming ``is_final`` event. When the user presses Stop while
-// Deepgram is mid-utterance, the live interim may contain words that
-// Deepgram's ``is_final`` hasn't covered yet. The ``is_final`` handler
-// clears ``liveInterimText`` (correct for live display), but stopLive's
-// ``getCanonicalLiveSourceText()`` then sees an empty interim and loses
-// those trailing words.
-//
-// ``lastInterimSnapshot`` preserves the interim so stopLive can recover
-// it. It is reset to "" at the start of every new recording (startLive)
-// and updated when committed segments are projected from that session's
-// LiveTranscriptBuffer into the active preview state.
-let lastInterimSnapshot = "";
-
-// Mirror of the active session buffer's ``recoveredTailText`` — the
-// words earlier finals cut from their own interims. Projected together
-// with the interim snapshot so the active-state view and the session
-// buffer answer the composition question with the same four inputs.
-let recoveredTailSnapshot = "";
+// per session; ``liveDraftText``/``liveInterimText`` above are only the
+// currently active UI projection kept for the existing renderer and
+// main-process read paths.
 
 /**
  * The stop deadline the backend announced for the current session.
@@ -9879,7 +9681,7 @@ function waitForLiveEnvelopeWithAnnouncedBudget(token: string): Promise<LiveFina
       if (settled) return;
       const deadlineMs = computeEnvelopeDeadlineMs(announcement, deadlineConfig);
       console.log(
-        `[trace tail-gap] backend announced finalize budget=${announcement.budgetMs}ms ` +
+        `[trace stopLive] backend announced finalize budget=${announcement.budgetMs}ms ` +
         `expectsMore=${announcement.expectsMore ? 1 : 0} newDeadline=${deadlineMs.toFixed(0)}ms ` +
         `elapsed=${(performance.now() - tEnv).toFixed(0)}ms`,
       );
@@ -9987,7 +9789,12 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     if (a > peak) peak = a;
   }
   const rms = Math.sqrt(sum / input.length);
-  const frameCarriesSpeech = observeCaptureFrame(captureLevel, rms, peak);
+  // Updates the session's measured level in place — every "speech or
+  // silence?" question the capture path asks is answered against it
+  // (./audio-levels). The per-frame verdict itself has no reader: the
+  // stop path used to keep the last speech-carrying sample offset for
+  // its tail-gap arithmetic, and that arithmetic is the backend's now.
+  observeCaptureFrame(captureLevel, rms, peak);
   // Smooth RMS via EMA so the main-process silence detector sees the
   // energy trend over ~120 ms, not a single 2.67 ms micro-window
   // that might happen to land on an inter-syllable gap.
@@ -9999,11 +9806,6 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   window.__transcriptorVuLevel = Math.max(0, Math.min(1, rms * UI_TOKENS.capture.vuAmplify));
   if (!ac) return;
   const ds = downsample(input, ac.sampleRate, LIVE_SAMPLE_RATE_HZ);
-  const frameStartSample = capturePcmSampleCount;
-  capturePcmSampleCount += ds.length;
-  if (frameCarriesSpeech) {
-    captureLastActivePcmSample = frameStartSample + ds.length;
-  }
 
   // ── Canonical-audio sink path ──────────────────────────────────────
   // Samples go into the session's ``PcmSink``. The OPFS-backed
@@ -10206,14 +10008,10 @@ async function startLive(): Promise<void> {
   markStartPhase("pcmSink");
   workletLastFrameAt = 0;
   captureLevel = createCaptureLevel();
-  capturePcmSampleCount = 0;
-  captureLastActivePcmSample = 0;
   captureRmsEma = 0;
   // The resampler carries <1 output-sample of the PREVIOUS session's
   // audio; clear it so a new recording never starts with a stale frame.
   resetDownsampleState();
-  lastInterimSnapshot = "";
-  recoveredTailSnapshot = "";
 
   wsPendingFrames = [];
   wsPendingFrameSamples = 0;
@@ -10404,7 +10202,7 @@ async function startLive(): Promise<void> {
             expectsMore: msg.expectsMore,
           });
           console.log(
-            `[trace tail-gap] backend announced finalize budget=${msg.budgetMs}ms expectsMore=${msg.expectsMore ? 1 : 0}`,
+            `[trace stopLive] backend announced finalize budget=${msg.budgetMs}ms expectsMore=${msg.expectsMore ? 1 : 0}`,
           );
           return;
         }
@@ -10431,17 +10229,15 @@ async function startLive(): Promise<void> {
           };
           if (msg.error) envelope.error = msg.error;
           if (msg.coverage) envelope.coverage = msg.coverage;
-          // BUG-20: the backend measures speech its own interims heard
-          // but no final ever covered. Non-zero is proof of truncation —
-          // surface it on the envelope so the stop path can escalate to
-          // tail recovery instead of delivering holes silently.
+          // BUG-20 / PROTOCOL CONTRACT C5. Carried onto the envelope as
+          // diagnostics: the backend closes its own coverage gaps before
+          // it sends (``stats.recovery``), so these numbers explain a
+          // stop in the log rather than steering it. A renderer that
+          // escalated on them would be re-decoding audio the envelope
+          // already accounts for.
           if (typeof msg.uncoveredSpeechSec === "number" && msg.uncoveredSpeechSec > 0) {
             envelope.uncoveredSpeechSec = msg.uncoveredSpeechSec;
           }
-          // PROTOCOL CONTRACT C5: carried through untouched so the stop
-          // path's coverage-implausibility check (R2) can reuse the same
-          // tail-gap arithmetic the rest of the file already uses instead
-          // of inventing a second tolerance.
           if (typeof msg.streamedSec === "number") envelope.streamedSec = msg.streamedSec;
           if (typeof msg.coveredEndSec === "number") envelope.coveredEndSec = msg.coveredEndSec;
           if (msg.stats) envelope.stats = msg.stats;
@@ -11021,12 +10817,7 @@ async function stopLive(
   // AFTER CloseStream and get dropped. Reordering stream.stop() to
   // step 1 fixes this at the root.
   const stopEntryBuffer = getLiveTranscriptBuffer(sessionUiToken);
-  // R2: captured at the moment stopLive is entered, not read later —
-  // the socket's readyState keeps moving through the stop sequence
-  // (finalize send, CloseStream, close()), so a later read would no
-  // longer answer "was it OPEN when the user hit Stop".
-  const wsOpenAtStop = ws ? ws.readyState === WebSocket.OPEN : false;
-  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? liveTranscriptSegments.length} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length} lastInterimSnapshotLen=${stopEntryBuffer?.lastInterimText.length ?? lastInterimSnapshot.length}`);
+  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? liveTranscriptSegments.length} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length}`);
   try {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   } catch (e) {
@@ -11925,12 +11716,10 @@ async function stopLive(
     // (its promises don't get cancelled — the caller just stops
     // waiting), so a delayed result still gets logged; we just don't
     // block the UI on it.
-    let emptyRecoveryAttempted = false;
     const recoverFromEmptyTranscript = async (
       reason: string,
       budgetMs = RECOVERY_HARD_TIMEOUT_MS,
     ): Promise<string> => {
-      emptyRecoveryAttempted = true;
       const tStart = performance.now();
       const abortController = new AbortController();
       // ``timeoutHandle`` is captured so the inner-resolves-first path
@@ -11959,11 +11748,11 @@ async function stopLive(
     let transcriptForPaste = "";
     let finalSaveConflict = false;
     // Provenance of ``transcriptRaw`` for the ``[trace stopLive] FINAL``
-    // line — which of ``chooseStopTranscript``'s buckets (or the
-    // equivalent decision on a non-Deepgram path) produced the delivered
-    // text. Defaults to "held" (the live/preview reading, untouched);
-    // every site that changes ``transcriptRaw`` updates it alongside.
-    let transcriptSource: StopTranscriptSource = "held";
+    // line. On the Deepgram path there are exactly two possible values —
+    // ``envelope`` or ``ondisk-fallback`` — and which one a stop printed
+    // is the whole diagnosis of that stop. Defaults to "none"; every
+    // site that sets ``transcriptRaw`` updates it alongside.
+    let transcriptSource: StopTranscriptSource = "none";
 
     if (provider === "local") {
       if (isCurrentUiSession(sessionUiToken)) {
@@ -12005,721 +11794,122 @@ async function stopLive(
         console.log(`[trace stopLive] full local pass (adoption rejected: ${decision.reason})`);
         const syncOut = await runLocalFinalPass();
         transcriptRaw = String(syncOut.text || "").trim();
-        transcriptSource = "recovery";
+        transcriptSource = "ondisk-fallback";
       }
     } else if (provider === "deepgram") {
-      // Deepgram already streamed the transcript in real time. We
-      // wait up to 4000 ms for the final envelope after CloseStream
-      // because Nova-3 can take 1.8–2.5 s to emit the last is_final
-      // message for a long utterance's trailing clause. If the
-      // stream errored mid-way, we STILL use whatever committed
-      // segments we have without waiting at all.
+      // ── The stop path: one linear sequence, no races ──────────────
+      //
+      // Everything above this point has already happened, in this
+      // order: the microphone was stopped, the tail hold ran, the
+      // worklet barrier proved every captured PCM sample was handed
+      // over, and ``{type:"finalize", framesSent, bytesSent}`` was sent
+      // (PROTOCOL CONTRACT C1). What is left is one wait and one
+      // delivery.
+      //
+      // THE BACKEND ENVELOPE IS THE ONLY SOURCE OF THE DELIVERED
+      // TRANSCRIPT. The backend makes the ``final`` envelope complete
+      // by construction — Deepgram finals, its own word-level interim
+      // splice, the dual-stream merge, and a REST re-decode of any span
+      // it still cannot account for, all from its own audio spool and
+      // all before the envelope is sent (``stats.recovery`` says what
+      // it re-decoded, ``finalizing.budgetMs`` is the honest bound
+      // until it arrives). So the renderer assembles nothing at stop:
+      // it waits for the envelope and delivers ``envelope.text``
+      // verbatim.
+      //
+      // What used to stand here, and why it is gone: an opportunistic
+      // union of an already-resolved envelope with the live preview, a
+      // tail-gap arithmetic that started a parallel REST recovery, a
+      // race between that recovery and the envelope, a renderer-side
+      // "recovered tail" grafted onto the end, and a
+      // suspiciously-short-result re-transcribe on top of all of it.
+      // Five mechanisms, each of which could overrule the others, all
+      // trying to own the same string. Every duplication defect of
+      // 2026-09-03/04 (sessions 8c12d76e, ed79f04a, 521f9788: a clean
+      // 24-word transcript delivered as 36, a 73-word one as 189) and
+      // the "трёх в" mis-placement of ``a9fd3fd9`` came out of two
+      // owners disagreeing about the same speech. One owner cannot
+      // disagree with itself.
       if (isCurrentUiSession(sessionUiToken)) {
         $("progressFill").style.width = "85%";
         $("progressText").textContent = "85%";
       }
       setStatusScoped(sessionUiToken, "Finalizing");
 
-      // R2 (BUGS_AUDIT_2026-09-03, catastrophic-stop class: 2026-08-27
-      // 12:09, 2026-09-02 17:52). A fatal stream error used to be a
-      // special early exit that skipped every recovery signal except
-      // "is the transcript empty" — exactly backwards, since a fatal
-      // error is the STRONGEST proof the streamed transcript cannot be
-      // trusted. It now feeds the same dead-stream decision as every
-      // other low-coverage signal (``decideDeadStreamRecovery`` in
-      // ./live-coverage), computed from data — never from whether the
-      // instant transcript happens to be non-empty.
-      //
-      // ── Instant transcript from committed + interim ───────────────
-      //
-      // The user reported 2–8 second delays on short recordings.
-      // Waiting for the Deepgram envelope (up to 4000 ms ceiling) is
-      // unnecessary when the streaming path has already delivered
-      // committed (is_final) segments plus the current interim word to
-      // the frontend. ``getSessionCanonicalLiveSourceText()`` returns
-      // committed + interim — that IS the full transcript, whether or
-      // not the stream later errored. Using it immediately gives an
-      // effective 0 ms transcription latency for the common case; the
-      // dead-stream decision below is what keeps a truncated fragment
-      // from ever being the FINAL answer.
-      const instantBuffer = getLiveTranscriptBuffer(sessionUiToken);
-      const instantTranscript = getSessionCanonicalLiveSourceText(sessionUiToken);
-      const instantSegments = instantBuffer?.segments || [];
-      console.log(`[trace stopLive] fast-path enter committedLen=${instantBuffer?.committedText.length ?? 0} interimLen=${instantBuffer?.interimText.length ?? 0} lastInterimSnapshotLen=${instantBuffer?.lastInterimText.length ?? 0} ${traceTextStats("instantTranscript", instantTranscript)}`);
-      // 1.1.25: SSOT — use ``countWords`` (the module-level helper at
-      // line ~862) instead of an inline lambda. Keeps word-counting
-      // semantics consistent across the codebase (Unicode handling,
-      // whitespace normalisation), and avoids the maintenance hazard of
-      // two divergent definitions.
-      const wordCountOf = countWords;
+      // Step 1 — wait for the envelope, on the deadline the backend
+      // announced (C3). ``waitForLiveEnvelopeWithAnnouncedBudget``
+      // starts at ``LIVE_ENVELOPE_CONFIRM_MS`` and re-arms when the
+      // ``finalizing`` message lands mid-wait, up to
+      // ``LIVE_ENVELOPE_MAX_WAIT_MS``; it returns immediately when the
+      // envelope is already on the slot, which is the common case. No
+      // socket at all means no envelope can ever arrive, so there is
+      // nothing to wait for.
+      const tEnv = performance.now();
+      const envelope = liveFinalWaiterArmed
+        ? await waitForLiveEnvelopeWithAnnouncedBudget(sessionUiToken)
+        : null;
+      const envelopeWaitMs = performance.now() - tEnv;
 
-      // ── Tail-gap arithmetic ─────────────────────────────────────
-      //
-      // Computed unconditionally now (not just inside the old
-      // "instant transcript is non-empty" branch) so the dead-stream
-      // decision below can use it even when there is no instant
-      // transcript at all — an empty transcript from a socket that
-      // never opened is exactly the R2 case with the least other
-      // evidence available.
-      //
-      // Each committed segment has a Deepgram-provided ``end``
-      // timestamp (seconds since stream start). If the last committed
-      // segment ends well before the recording's total duration, there
-      // is audio AT THE TAIL that wasn't yet finalized when
-      // ``getSessionCanonicalLiveSourceText()`` was called. Threshold:
-      // 0.6 s — less than Deepgram's 0.7 s endpointing window, so
-      // anything under is normal latency for the last word and
-      // anything over is a real tail-cut (``TAIL_GAP_THRESHOLD_SEC`` in
-      // ./live-coverage — the one definition, reused here and in
-      // ``decideDeadStreamRecovery``).
-      const lastSpeechEnd = maxLiveBufferSpeechEnd(instantBuffer);
-      const lastCapturedActivitySec = captureLastActivePcmSample / LIVE_SAMPLE_RATE_HZ;
-      const tailGapSec = recordedSec - lastSpeechEnd;
-      const tailActivityGapSec = lastCapturedActivitySec - lastSpeechEnd;
-      const hasTimestampedLiveCoverage = lastSpeechEnd > 0;
-      const tailHasCapturedActivity = tailActivityGapSec > 0.2;
-      // An unflushed interim at the tail IS speech evidence even when
-      // PCM activity already decayed (BUG-20): Deepgram heard words it
-      // had not finalized, which is exactly the reported "конец
-      // сообщения обрезается".
-      const tailHasInterimSpeechEvidence = !!(
-        instantBuffer?.interimText?.trim() || instantBuffer?.lastInterimText?.trim()
-      );
-      // PROTOCOL CONTRACT R2: the shared dead-stream decision, minus
-      // uncoveredSpeechSec (not knowable until an envelope has actually
-      // arrived — re-checked inside the envelope-confirm branch below
-      // once it has).
-      const lowCoverageInputBase = {
-        liveStreamErrorAtStop: !!liveStreamErrorAtStop,
-        wsOpenAtStop,
-        framesNeverSent: wsFramesNeverSent,
-        recordedSec,
-        hasTimestampedLiveCoverage,
-        tailGapSec,
-        tailHasCapturedActivity,
-        tailHasInterimSpeechEvidence,
-      };
-      const lowCoverage = decideDeadStreamRecovery({ ...lowCoverageInputBase, uncoveredSpeechSec: 0 });
-      console.log(`[trace tail-gap] recordedSec=${recordedSec.toFixed(2)} lastSpeechEnd=${lastSpeechEnd.toFixed(2)} lastCapturedActivitySec=${lastCapturedActivitySec.toFixed(2)} tailGapSec=${tailGapSec.toFixed(2)} tailActivityGapSec=${tailActivityGapSec.toFixed(2)} liveStreamErrorAtStop="${liveStreamErrorAtStop}" wsOpenAtStop=${wsOpenAtStop} framesNeverSent=${wsFramesNeverSent} decision=${lowCoverage.recover ? "RECOVER" : "skip"} reason=${lowCoverage.reason}`);
-
-      // D1: the envelope's own coverage arithmetic, assembled once for
-      // both stop branches. ``envelopeCoversRecording`` is the predicate
-      // (./live-coverage); this only supplies it with the C5 fields plus
-      // the renderer's own recording length, so the race and the confirm
-      // branch cannot end up asking slightly different questions.
-      const envelopeCoverageOf = (env: LiveFinalEnvelope | null | undefined) => ({
-        streamedSec: env?.streamedSec,
-        coveredEndSec: env?.coveredEndSec,
-        uncoveredSpeechSec: env?.uncoveredSpeechSec,
-        recordedSec,
-      });
-      const traceEnvelopeCoverage = (env: LiveFinalEnvelope | null | undefined): string => {
-        const input = envelopeCoverageOf(env);
-        const covered = Number.isFinite(input.coveredEndSec)
-          ? Number(input.coveredEndSec).toFixed(2)
-          : "n/a";
-        return `covered=${covered}/${envelopeAudioEndSec(input).toFixed(2)}`;
-      };
-
-      if (instantTranscript) {
-        transcriptRaw = instantTranscript;
-
-        const alreadyResolvedEnvelope = liveFinalSlots.get(sessionUiToken)?.envelope || null;
-        const opportunisticEnvelopeText = textFromEnvelope(alreadyResolvedEnvelope);
-        // D2 / ``chooseStopTranscript`` (./transcript-merge): a complete
-        // envelope REPLACES the splice outright — no union, no grafting.
-        // An incomplete one still contributes through the seam-time
-        // merge, and the held reading is re-read fresh here (it may have
-        // grown since ``instantTranscript`` was captured above).
-        const opportunisticHeld = currentHeldReading(transcriptRaw, sessionUiToken);
-        const opportunisticChoice = chooseStopTranscript({
-          envelopeText: opportunisticEnvelopeText,
-          envelopeSegments: alreadyResolvedEnvelope?.segments,
-          envelopeCovers: envelopeCoversRecording(envelopeCoverageOf(alreadyResolvedEnvelope)),
-          heldText: opportunisticHeld.text,
-          heldSegments: opportunisticHeld.segments,
-        });
-        if (opportunisticChoice.text !== transcriptRaw) {
-          transcriptRaw = opportunisticChoice.text;
-          transcriptSource = opportunisticChoice.source;
-          console.log(`[trace stopLive] opportunistic-envelope used source=${opportunisticChoice.source} ${traceTextStats("transcript", transcriptRaw)}`);
-        }
-
-        // Interim words are ALREADY part of the canonical instant
-        // transcript (committed + interim), so interim evidence at the
-        // tail means the visible transcript covers the tail — a plain
-        // envelope confirm is enough UNLESS the dead-stream decision
-        // above says otherwise, in which case the full parallel race
-        // (envelope + recovery) below is what's required instead.
-        const tailCoveredByInterim = tailHasInterimSpeechEvidence;
-        if (tailCoveredByInterim && recordedSec > 1.0 && !lowCoverage.recover) {
-          // ── Envelope confirmation, racing the backend's own deadline (C3) ──
-          //
-          // The cap used to be a constant 1.5 s, chosen against the
-          // "stop takes 5-7 seconds" complaint on the assumption that
-          // post-CloseStream finals land in 1-2 s. They often do — p50
-          // 550 ms — but the backend pays a 3 s ceiling plus a retry
-          // when the tail is uncovered, and 24 % of stops on
-          // 2026-08-25 ran past 1.5 s, up to 9.4 s. A cap frozen before
-          // the ``finalizing`` announcement could physically arrive
-          // (median +126ms) ignored the announcement in 65% of stops.
-          // ``waitForLiveEnvelopeWithAnnouncedBudget`` races the
-          // envelope against the announcement itself, recomputing the
-          // deadline (via the pure, unit-tested
-          // ``computeEnvelopeDeadlineMs``) if the announcement lands
-          // mid-wait instead of only being usable by a wait that starts
-          // after it.
-          const tEnv = performance.now();
-          const env = await waitForLiveEnvelopeWithAnnouncedBudget(sessionUiToken);
-          const envText = textFromEnvelope(env);
-          const before = transcriptRaw;
-          // D1: whether the envelope covers the recording is needed
-          // BEFORE composing, not after — a complete envelope replaces
-          // the splice outright (D2 / ``chooseStopTranscript``), it does
-          // not get unioned with it.
-          const envelopeIsComplete = envelopeCoversRecording(envelopeCoverageOf(env));
-          const confirmHeld = currentHeldReading(transcriptRaw, sessionUiToken);
-          const confirmChoice = chooseStopTranscript({
-            envelopeText: envText,
-            envelopeSegments: env?.segments,
-            envelopeCovers: envelopeIsComplete,
-            heldText: confirmHeld.text,
-            heldSegments: confirmHeld.segments,
-          });
-          transcriptRaw = confirmChoice.text;
-          transcriptSource = confirmChoice.source;
-          console.log(
-            `[trace tail-gap] interim-covered: envelope ` +
-            `${transcriptRaw !== before ? "upgraded" : "confirmed"} instant transcript ` +
-            `source=${confirmChoice.source} ms=${(performance.now() - tEnv).toFixed(0)}`,
-          );
-          // R2: uncoveredSpeechSec is only knowable once the envelope
-          // has actually arrived. Re-run the decision with the real
-          // value — this is the one path that does NOT already run the
-          // full-audio recovery in parallel, so a hole the envelope
-          // just proved would otherwise be delivered silently.
-          //
-          // D1: and the same envelope can be partial in the OTHER way —
-          // its last final ending seconds before the audio does, with no
-          // hole to report because the words simply had not arrived yet
-          // (session ``62115e77``: 10.85 s of final against 14.26 s of
-          // stream). ``envelopeCoversRecording`` (computed above, before
-          // the compose) is that check, the same one the race below
-          // applies; an envelope that does not cover the recording turns
-          // recovery on exactly as a proven hole does.
-          const uncoveredSpeechSec = env?.uncoveredSpeechSec ?? 0;
-          const postEnvelopeDecision = decideDeadStreamRecovery({ ...lowCoverageInputBase, uncoveredSpeechSec });
-          if (postEnvelopeDecision.recover || !envelopeIsComplete) {
-            const recoverReason = postEnvelopeDecision.recover
-              ? postEnvelopeDecision.reason
-              : "envelope-incomplete";
-            console.log(`[trace tail-gap] decision=RECOVER (post-envelope) reason=${recoverReason} ${traceEnvelopeCoverage(env)}`);
-            patchCurrentRecordingSummary({
-              title: provisionalTitle,
-              status: uncoveredSpeechSec > 0
-                ? `${uncoveredSpeechSec.toFixed(1)}s of recognised speech never reached a final segment — recovering full transcript from saved audio…`
-                : "The final transcript stops short of the recording — recovering full transcript from saved audio…",
-              tone: "warning",
-            }, sessionUiToken);
-            const recovered = await recoverFromEmptyTranscript(
-              uncoveredSpeechSec > 0
-                ? `Envelope proved ${uncoveredSpeechSec.toFixed(1)}s of uncovered speech.`
-                : `Envelope incomplete (${recoverReason}, ${traceEnvelopeCoverage(env)}).`,
-              Math.min(RECOVERY_HARD_TIMEOUT_MS, LIVE_TAIL_RECOVERY_TIMEOUT_MS),
-            );
-            const beforeRecovery = transcriptRaw;
-            // §4.8, decided rather than pending: ``recovered`` is an
-            // INDEPENDENT full-audio decode of the on-disk recording,
-            // not a partial reading of the live stream the way the
-            // envelope is. The three alignment defects §4.8 recorded
-            // are fixed and under test — a two-sided gap keeps the
-            // longer of the two readings instead of discarding the held
-            // one, the similarity gate is measured against the larger
-            // side with an absolute floor under it, and the seam
-            // duplication of 2026-09-03 23:49 has a regression test
-            // built from that recording's own two texts.
-            //
-            // Every one of those decisions was validated against pairs
-            // from the SAME stream, which is what the envelope is. No
-            // captured pair of a live splice and a full-audio decode
-            // exists to validate alignment ACROSS engines, and the cost
-            // of the gates being wrong there is a hybrid sentence in
-            // the user's paste buffer. So the live reading is assembled
-            // fresh (floor united with whatever the session buffer has
-            // grown to since — no envelope text here, the envelope
-            // already lost this round) and that assembled text competes
-            // with the independent decode by ``richerTranscript``'s
-            // word-count/prefix rule, via ``chooseStopTranscript``'s
-            // ``recoveredText`` input. Switch to a plain merge once a
-            // recovery pair from a real session has been measured.
-            const recoveryHeld = currentHeldReading(transcriptRaw, sessionUiToken);
-            const recoveryChoice = chooseStopTranscript({
-              envelopeText: "",
-              envelopeCovers: false,
-              heldText: recoveryHeld.text,
-              heldSegments: recoveryHeld.segments,
-              recoveredText: recovered,
-            });
-            transcriptRaw = recoveryChoice.text;
-            transcriptSource = recoveryChoice.source;
-            patchCurrentRecordingSummary({
-              title: provisionalTitle,
-              status: transcriptRaw !== beforeRecovery
-                ? "Recovered full transcript from saved audio."
-                : "Full-audio recovery did not improve on the streamed transcript.",
-              tone: transcriptRaw !== beforeRecovery ? "success" : "warning",
-            }, sessionUiToken);
-          }
-        } else if (lowCoverage.recover) {
-          // ── Parallel race: envelope + REST recovery ─────────────
-          //
-          // Previous (1.1.15-1.1.16) implementation was SEQUENTIAL:
-          //   1. await envelope (up to 4 s ceiling)
-          //   2. if envelope didn't help, await recovery (~3 s)
-          // → worst case 7+ s of post-Stop latency.
-          //
-          // The user's real-world test showed segmentCount=0 after
-          // 14 s of audio (Deepgram WS was streaming interim but
-          // never finalizing into is_final). The envelope was
-          // GUARANTEED empty in that case — we waited 3.7 s for a
-          // result we knew wouldn't come, then started recovery
-          // serially. Total: 7.6 s of dead-time after Stop.
-          //
-          // New strategy:
-          //   • Skip envelope wait only when neither finalized nor
-          //     interim timestamps exist. If the stream has interim
-          //     coverage, CloseStream can still promote it to final.
-          //   • Otherwise launch envelope + recovery IN PARALLEL,
-          //     await both via Promise.all, then pick whichever
-          //     candidate (instant / envelope / recovery) has the
-          //     most words. Cost is max(env, recovery) instead of
-          //     env + recovery.
-          //
-          // Net for the user's case: 7.6 s → ~3 s. R2: this branch is
-          // now reached for every dead-stream reason (fatal error,
-          // socket not open, unsent frames, uncovered speech, tail
-          // gap) — the fragment is never returned on its own; the
-          // full-audio decode below always runs.
-          const skipEnvelope = instantSegments.length === 0 && lastSpeechEnd <= 0;
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: skipEnvelope
-              ? "Live stream had no finalized segments — recovering full transcript from saved audio…"
-              : `Recovering (${lowCoverage.reason}, ${Math.round(tailGapSec * 1000)}ms tail gap)…`,
-            tone: "info",
-          }, sessionUiToken);
-          console.log(`[trace tail-gap] strategy=${skipEnvelope ? "RECOVERY-ONLY (no timestamped live coverage)" : "PARALLEL (envelope + recovery)"} reason=${lowCoverage.reason}`);
-
-          const tRace = performance.now();
-          const envelopePromise: Promise<LiveFinalEnvelope | null> = skipEnvelope
-            ? Promise.resolve(null)
-            : liveFinalPromise();
-          // Budget split. When the live stream produced NO timestamped
-          // coverage at all (``skipEnvelope``) the recovery pass IS the
-          // transcript, so it gets the full budget. When we already
-          // hold a usable transcript and are only chasing a trailing
-          // clause, spending up to 20 s on a maybe-two-extra-words
-          // improvement is the single largest contributor to the
-          // "sometimes Stop takes 20 seconds" complaint — cap it.
-          const recoveryBudgetMs = skipEnvelope
-            ? RECOVERY_HARD_TIMEOUT_MS
-            : Math.min(RECOVERY_HARD_TIMEOUT_MS, LIVE_TAIL_RECOVERY_TIMEOUT_MS);
-          const recoveryPromise = recoverFromEmptyTranscript(
-            `Live tail truncated (${lowCoverage.reason}, ${Math.round(tailGapSec * 1000)}ms gap${skipEnvelope ? ", Deepgram WS silent" : ""}).`,
-            recoveryBudgetMs,
-          );
-          // ── 1.1.19: smart race instead of Promise.all ─────────────
-          //
-          // Promise.all blocked until BOTH promises resolved. The
-          // user's logs revealed that on long recordings the
-          // post-CloseStream envelope often resolves with empty text
-          // at the 4 s ceiling (Deepgram regional issue) while
-          // recovery resolves at 2-3 s with a strict improvement.
-          // Promise.all then waited an additional 1-2 s for the
-          // envelope timeout — pure waste because we already had a
-          // better answer.
-          //
-          // New strategy:
-          //   1. Race envelope vs recovery.
-          //   2. If the FIRST resolved promise produces a strict
-          //      word-count improvement over ``instantTranscript``,
-          //      use it immediately — DO NOT wait for the second.
-          //   3. If the first candidate is already within 90% of
-          //      instant, keep instant immediately. Waiting for REST
-          //      after an equal envelope is pure latency and caused
-          //      the post-stop paste task to time out.
-          //   4. Only if the first candidate is clearly worse/empty,
-          //      await the OTHER (it might yet recover a real stream
-          //      dropout).
-          //   5. If neither beat instant, keep instant.
-          //
-          // Saves ~1.5 s per long recording in the typical case.
-          //   6. D1: an envelope that does not cover the recording
-          //      never ends the race at all — not even when it improves
-          //      on the instant transcript. Session ``62115e77`` ended
-          //      the race 130 ms in on an envelope worth one extra word
-          //      that stopped at 10.85 s of a 14.26 s recording; the
-          //      clause the provider was still finalizing had nowhere
-          //      left to arrive. An incomplete envelope is a floor now,
-          //      never a verdict: the recovery candidate is awaited
-          //      within the race budget it already has.
-          type Cand = {
-            label: "envelope" | "recovery";
-            text: string;
-            words: number;
-            uncovered?: number;
-            /** D1: only the envelope can answer this; recovery leaves it undefined. */
-            coversRecording?: boolean;
-            coverageTrace?: string;
-            /** Only the envelope carries timed segments; recovery is a bare string. */
-            segments?: ReadonlyArray<TimedSegmentLike> | null;
-          };
-          const baseTranscriptForRace = transcriptRaw;
-          const wcInstant = wordCountOf(baseTranscriptForRace);
-          const envelopeCand: Promise<Cand> = envelopePromise.then((env) => {
-            const text = textFromEnvelope(env);
-            return {
-              label: "envelope" as const,
-              text,
-              words: wordCountOf(text),
-              uncovered: env?.uncoveredSpeechSec,
-              coversRecording: envelopeCoversRecording(envelopeCoverageOf(env)),
-              coverageTrace: traceEnvelopeCoverage(env),
-              segments: env?.segments,
-            };
-          });
-          const recoveryCand: Promise<Cand> = recoveryPromise.then((text) => ({
-            label: "recovery" as const, text, words: wordCountOf(text),
-          }));
-          const first = await Promise.race([envelopeCand, recoveryCand]);
-          const firstMs = performance.now() - tRace;
-          console.log(`[trace tail-gap] race-first ${first.label} ms=${firstMs.toFixed(0)} words=${first.words} instantWords=${wcInstant} ${traceTextStats("candidate", first.text)}`);
-          // D2 / ``chooseStopTranscript`` (./transcript-merge): the ONE
-          // decision function used at every delivery site, here too. A
-          // candidate labelled "envelope" that covers the recording
-          // replaces the held reading outright (no union — that used to
-          // duplicate whole clauses, see the fixtures cited on
-          // ``chooseStopTranscript``); an incomplete envelope still
-          // contributes through the seam-time merge, using the segments
-          // it carries; a "recovery" candidate — an independent full-
-          // audio decode this call site never aligns, only compares by
-          // word count — competes with the held reading through
-          // ``richerTranscript``. One call handles all three labels, so
-          // this site no longer has to guess which composition a given
-          // label deserves.
-          const composeCandidate = (floorText: string, cand: Cand): StopTranscriptResult => {
-            const held = currentHeldReading(floorText, sessionUiToken);
-            return chooseStopTranscript({
-              envelopeText: cand.label === "envelope" ? cand.text : "",
-              envelopeSegments: cand.label === "envelope" ? cand.segments : null,
-              envelopeCovers: cand.label === "envelope" ? !!cand.coversRecording : false,
-              heldText: held.text,
-              heldSegments: held.segments,
-              recoveredText: cand.label === "recovery" ? cand.text : "",
-            });
-          };
-          const firstOutcome = composeCandidate(baseTranscriptForRace, first);
-          let chose: Cand | null = firstOutcome.text !== baseTranscriptForRace
-            ? { ...first, text: firstOutcome.text, words: wordCountOf(firstOutcome.text) }
-            : null;
-          if (chose) transcriptSource = firstOutcome.source;
-          const firstConfirmsInstant = candidateConfirmsTranscriptCoverage(
-            baseTranscriptForRace,
-            first.text,
-          );
-          const waitForRecoveryDespiteEnvelopeConfirmation =
-            first.label === "envelope" &&
-            firstConfirmsInstant &&
-            !chose;
-          // D1: an incomplete envelope keeps whatever it added (above)
-          // as the floor, but it does not get to end the race — the
-          // words it is missing are still in flight, and only the
-          // full-audio decode can produce them now.
-          const firstEnvelopeIncomplete =
-            first.label === "envelope" && first.coversRecording === false;
-          if (firstEnvelopeIncomplete) {
-            console.log(`[trace tail-gap] race-first envelope incomplete ${first.coverageTrace} → waiting for recovery`);
-          }
-          if (
-            firstEnvelopeIncomplete ||
-            (!chose && (!firstConfirmsInstant || waitForRecoveryDespiteEnvelopeConfirmation))
-          ) {
-            // First didn't improve. If it was the envelope and we
-            // are already in the tail-likely-missing branch, give
-            // the in-flight REST/local recovery a short bounded
-            // second chance before keeping the instant transcript.
-            // This avoids the equal-word-count trap where the final
-            // envelope "confirms" a clipped live transcript while
-            // recovery would have returned the missing last phrase.
-            const otherPromise = first.label === "envelope" ? recoveryCand : envelopeCand;
-            // The short second-candidate window exists for an envelope
-            // that CONFIRMED the instant transcript — there, waiting is
-            // a gamble against paste latency. An incomplete envelope is
-            // not a confirmation of anything, so that path waits for the
-            // recovery candidate itself; ``recoveryPromise`` is already
-            // bounded by ``recoveryBudgetMs``, which is the race budget.
-            const other = waitForRecoveryDespiteEnvelopeConfirmation && !firstEnvelopeIncomplete
-              ? await Promise.race([
-                otherPromise,
-                new Promise<Cand | null>((resolve) => {
-                  window.setTimeout(
-                    () => resolve(null),
-                    UI_TOKENS.finalize.tailRecoverySecondCandidateWaitMs,
-                  );
-                }),
-              ])
-              : await otherPromise;
-            const otherMs = performance.now() - tRace;
-            if (other) {
-              console.log(`[trace tail-gap] race-second ${other.label} ms=${otherMs.toFixed(0)} words=${other.words} ${traceTextStats("candidate", other.text)}`);
-              // Same ``composeCandidate`` as the ``first`` candidate
-              // above — envelope-covers replaces outright, an incomplete
-              // envelope merges by seam, a recovery decode competes by
-              // word count.
-              //
-              // D1: the floor is whatever we already chose — on the
-              // incomplete-envelope path the envelope may have added
-              // words before the race went on, and starting the second
-              // comparison from the untouched base would throw them away
-              // whenever the recovery decode is the thinner reading.
-              const floorForOther = chose?.text ?? baseTranscriptForRace;
-              const otherOutcome = composeCandidate(floorForOther, other);
-              if (otherOutcome.text !== floorForOther) {
-                chose = { ...other, text: otherOutcome.text, words: wordCountOf(otherOutcome.text) };
-                transcriptSource = otherOutcome.source;
-              }
-            } else {
-              console.log(`[trace tail-gap] race-second timeout ms=${otherMs.toFixed(0)} first=${first.label} words=${wcInstant}`);
-            }
-          }
-          if (!chose && firstConfirmsInstant) {
-            console.log(`[trace tail-gap] decision=KEEP_INSTANT_EARLY first=${first.label} totalMs=${(performance.now() - tRace).toFixed(0)} words=${wcInstant}`);
-          }
-          const totalRaceMs = performance.now() - tRace;
-          if (chose) {
-            transcriptRaw = chose.text;
-            console.log(`[trace tail-gap] decision=USE_${chose.label.toUpperCase()} source=${transcriptSource} (+${chose.words - wcInstant} words) totalMs=${totalRaceMs.toFixed(0)}`);
-            if (chose.label === "recovery") {
-              patchCurrentRecordingSummary({
-                title: provisionalTitle,
-                status: "Recovered full transcript from saved audio.",
-                tone: "success",
-              }, sessionUiToken);
-            }
-          } else if (!firstConfirmsInstant) {
-            console.log(`[trace tail-gap] decision=KEEP_INSTANT (no improvement) totalMs=${totalRaceMs.toFixed(0)}`);
-          }
-          // BUG-20 observability: even after recovery, report PROVEN
-          // holes the provider itself admitted to. Recovery candidates
-          // carry no such number — only the envelope does.
-          const provenUncoveredSec = Math.max(chose?.uncovered ?? 0, first.uncovered ?? 0);
-          if ((!chose || chose.label !== "recovery") && provenUncoveredSec > 0.5) {
-            patchCurrentRecordingSummary({
-              title: provisionalTitle,
-              status: `${provenUncoveredSec.toFixed(1)}s of recognised speech never reached a final segment — the transcript may be incomplete.`,
-              tone: "warning",
-            }, sessionUiToken);
-          }
-        }
-
-        // ── Auto REST re-transcribe on suspiciously short streaming result ──
-        //
-        // Catches the catastrophic case (>70% of expected words
-        // missing — usually a streaming dropout, not just a tail
-        // cut). Still relies on the on-disk audio being present
-        // and a Deepgram key being configured. The tail-gap
-        // recovery above is the more precise fix; this stays as a
-        // safety net for the broader "streaming captured almost
-        // nothing" scenario.
-        //
-        // Heuristic: expect ~2.5 words per second of speech. If the
-        // streaming result has less than 30% of the expected word
-        // count, trigger an automatic REST re-transcribe.
-        const wordCount = wordCountOf(transcriptRaw);
-        const expectedWords = recordedSec * 2.5;
-        const isSuspiciouslyShort = recordedSec > 5 && wordCount < expectedWords * 0.3;
-        if (isSuspiciouslyShort && isProviderKeyConfigured("deepgram") && isRemoteProviderReachable("deepgram", deepgramReachabilityHint)) {
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: `Streaming captured only ${wordCount} words for ${Math.round(recordedSec)}s. Re-transcribing via REST...`,
-            tone: "warning",
-          }, sessionUiToken);
-          const restRecoveryFile = await fetchRecoveryAudioFile();
-          if (restRecoveryFile) {
-            try {
-              const restResult = await remoteJobSync(restRecoveryFile, {
-                provider: "deepgram",
-                language: languageValue,
-                diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
-                remoteModel: getRemoteModelValue("deepgram"),
-                providerReachabilityHint: deepgramReachabilityHint,
-              });
-              const restText = String(restResult.text || "").trim();
-              if (restText && wordCountOf(restText) > wordCount) {
-                transcriptRaw = restText;
-                transcriptSource = "recovery";
-                patchCurrentRecordingSummary({
-                  title: provisionalTitle,
-                  status: "REST re-transcribe recovered full text.",
-                  tone: "success",
-                }, sessionUiToken);
-              }
-            } catch (restErr) {
-              console.warn("Auto REST re-transcribe failed, keeping streaming result", restErr);
-            }
-          }
-        }
-      } else {
-        // No committed/interim text at stop. Do not serialize the
-        // 4s Deepgram final-envelope wait and the saved-audio
-        // recovery pass: on regional WS stalls this was exactly how a
-        // 12s clip displayed "TRANSCRIBE 24s". Start both arms now
-        // and accept the first useful transcript. R2: reachable
-        // regardless of ``liveStreamErrorAtStop`` now — racing the
-        // envelope alongside recovery here is still cheap even for a
-        // dead socket: ``ws.onclose`` already resolves the slot with a
-        // synthetic error envelope the moment an unclean close is
-        // observed, so this does not add a real wait.
-        type NoFinalCandidate = {
-          label: "envelope" | "recovery";
-          text: string;
-          error: string;
-          words: number;
-        };
-        const noStreamingActivity = !hasStreamingActivity(instantBuffer);
-        const noFinalSilence = captureSilenceSnapshot(getSessionCanonicalLiveSourceText(sessionUiToken));
-        const failureReason = stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken));
-        const definitelySilent = noStreamingActivity && (
-          noFinalSilence.hardSilence ||
-          noFinalSilence.likelySilenceWithoutPreview ||
-          micHealthBad
+      // Step 2 — one predicate decides between the two possible
+      // outcomes (``envelopeMissing`` in ./envelope-deadline): the
+      // envelope, or the full-audio decode of the saved recording.
+      // Nothing else.
+      if (!envelopeMissing(envelope)) {
+        transcriptRaw = envelopeTranscript(envelope);
+        transcriptSource = "envelope";
+        console.log(
+          `[trace stopLive] envelope waitMs=${envelopeWaitMs.toFixed(0)} ` +
+          `${traceTextStats("transcript", transcriptRaw)}`,
         );
-        if (definitelySilent) {
-          console.log(`[trace no-final] silent recording — skipping envelope/recovery wait`);
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: failureReason.status || "Recording completed, no speech detected.",
-            tone: failureReason.tone,
-          }, sessionUiToken);
-        } else {
-          const reason = noStreamingActivity
-            ? "Live stream returned no text, but microphone audio was captured."
-            : "Live stream returned no text.";
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: noStreamingActivity
-              ? "Live stream returned no text. Recovering from saved audio…"
-              : "Sealing stream while recovering from saved audio…",
-            tone: noStreamingActivity ? "warning" : "info",
-          }, sessionUiToken);
-          const tNoFinal = performance.now();
-          const envelopeCand: Promise<NoFinalCandidate> = liveFinalPromise()
-            .then((envelope) => {
-              const error = envelope?.error || getLiveStreamError(sessionUiToken) || "";
-              const text = error ? "" : textFromEnvelope(envelope);
-              return {
-                label: "envelope" as const,
-                text,
-                error,
-                words: countWords(text),
-              };
-            });
-          const recoveryCand: Promise<NoFinalCandidate> = recoverFromEmptyTranscript(reason)
-            .then((text) => ({
-              label: "recovery" as const,
-              text,
-              error: "",
-              words: countWords(text),
-            }));
-          const first = await Promise.race([envelopeCand, recoveryCand]);
-          console.log(`[trace no-final] first=${first.label} ms=${(performance.now() - tNoFinal).toFixed(0)} words=${first.words} error="${first.error}"`);
-          if (first.text) {
-            transcriptRaw = first.text;
-            transcriptSource = first.label;
-          } else {
-            const other = await (first.label === "envelope" ? recoveryCand : envelopeCand);
-            console.log(`[trace no-final] second=${other.label} ms=${(performance.now() - tNoFinal).toFixed(0)} words=${other.words} error="${other.error}"`);
-            if (other.text) {
-              transcriptRaw = other.text;
-              transcriptSource = other.label;
-            } else if (first.error || other.error) {
-              console.log(`[trace no-final] no transcript recovered; envelopeError="${first.error || other.error}"`);
-            }
-          }
-        }
-      } // close ``else`` (no instantTranscript)
-
-      // Very last resort: whatever the live source text captured.
-      if (!transcriptRaw && emptyRecoveryAttempted) {
-        console.log(`[trace stopLive] empty transcript remains after recovery; not retrying recovery chain`);
-      } else if (!transcriptRaw) {
-        const committed = getSessionCanonicalLiveSourceText(sessionUiToken);
-        if (committed) transcriptRaw = committed;
+      } else {
+        // The ONLY fallback: no envelope reached us at all — the socket
+        // closed or errored before or during the stop, or the deadline
+        // expired with no ``final``. The backend produced no reading of
+        // this recording, so the renderer decodes the audio it saved,
+        // through the same ``transcribe-on-disk`` chain the manual
+        // Re-transcribe button uses.
+        //
+        // An envelope with EMPTY text and no error is NOT missing: that
+        // is the backend saying the recording holds no speech, and
+        // re-decoding it would spend seconds to be told so again.
+        const failure = envelope?.error || getLiveStreamError(sessionUiToken) || "no final envelope";
+        console.log(`[trace stopLive] envelope missing waitMs=${envelopeWaitMs.toFixed(0)} reason="${failure}"`);
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: "The live stream produced no final transcript — transcribing the saved audio…",
+          tone: "warning",
+        }, sessionUiToken);
+        transcriptRaw = await recoverFromEmptyTranscript(
+          `No final envelope (${failure}).`,
+        );
+        transcriptSource = transcriptRaw ? "ondisk-fallback" : "none";
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: transcriptRaw
+            ? "Transcribed the saved audio after the live stream produced no final transcript."
+            : "Neither the live stream nor the saved audio produced a transcript.",
+          tone: transcriptRaw ? "success" : "warning",
+        }, sessionUiToken);
       }
 
-      // ── Final safety net: empty Deepgram-live result ──────────────
-      //
-      // If we get here with NO transcript, every Deepgram-streaming
-      // path failed silently: streaming was empty, envelope was
-      // empty (no text, no segments, no error), the REST recovery
-      // arm in the envelope-error branch wasn't reached because no
-      // error fired, and ``getCanonicalLiveSourceText()`` returned
-      // nothing. Don't drop the recording silently — the audio file
-      // is on disk and the unified recovery helper can still try
-      // Deepgram REST → local Whisper against it.
-      //
-      // Previously this safety net called only ``runLocalFinalPass``
-      // (added in 1.1.13) — but that's strictly worse than what the
-      // user does manually with Re-transcribe (REST → local). The
-      // unified ``recoverFromEmptyTranscript`` mirrors the manual
-      // path exactly and uses the durable backend-fetched audio
-      // (avoiding the OPFS-dangling-blob class of bug).
-      //
-      // Symptom this addresses: the screenshot showing "TRANSCRIBE
-      // 3 ms" with 0 captured words on a 41 s recording — the live
-      // WS returned empty (auth issue, network drop, sample-rate
-      // mismatch, or server-side silent reject), no error event
-      // fired, and the user had to manually press Re-transcribe.
+      // Nothing delivered: say WHY, from the capture evidence (a mic
+      // that never delivered audio reads differently to the user than a
+      // room that was quiet), instead of the generic "no speech
+      // detected" the shared tail would print. ``stopFailureReason``
+      // owns that judgement — mic health and the session's own measured
+      // silence — and is not re-derived here. Status only: this branch
+      // cannot change ``transcriptRaw``.
       if (!transcriptRaw) {
-        // ── 1.1.19: skip recovery on a truly silent recording ──
-        //
-        // If Deepgram's WebSocket emitted NOTHING during the entire
-        // recording — no committed segments, no interim, no
-        // ``lastInterimSnapshot`` — there is essentially nothing to
-        // recover. Running the full chain (Deepgram REST + local
-        // Whisper) on the silent audio file just confirms there is
-        // no speech, costing ~7 seconds for an empty result. Detect
-        // the "definitely silent" case and emit empty without the
-        // recovery dance.
-        //
-        // The streaming-vs-real-silent distinction matters: a
-        // streaming dropout WOULD have committed/interim residue
-        // from the pre-dropout speech, so this guard correctly
-        // recovers in that case (residue is non-empty → falls through
-        // to the recovery branch below).
-        const noStreamingActivity = !hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken));
-        const finalSilence = captureSilenceSnapshot(getSessionCanonicalLiveSourceText(sessionUiToken) || transcriptRaw);
-        const failureReason = stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken) || transcriptRaw);
-        const definitelySilent = noStreamingActivity && (
-          finalSilence.hardSilence ||
-          finalSilence.likelySilenceWithoutPreview ||
-          micHealthBad
+        const failureReason = stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken));
+        console.log(
+          `[trace stopLive] empty transcript streamingActivity=` +
+          `${hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken)) ? 1 : 0}`,
         );
-        if (definitelySilent) {
-          console.log(`[trace stopLive] silent recording — skipping recovery (no streaming activity at all)`);
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: failureReason.status || "Recording completed, no speech detected.",
-            tone: failureReason.tone,
-          }, sessionUiToken);
-        } else {
-          transcriptRaw = await recoverFromEmptyTranscript(
-            noStreamingActivity
-              ? "Live stream returned no text, but microphone audio was captured."
-              : "Live stream returned no text.",
-          );
-          transcriptSource = "recovery";
-        }
+        patchCurrentRecordingSummary({
+          title: provisionalTitle,
+          status: failureReason.status || "Recording completed, no speech detected.",
+          tone: failureReason.tone,
+        }, sessionUiToken);
       }
     } else {
       // OpenRouter (or any future non-streaming remote): transcribe from the
@@ -12755,6 +11945,7 @@ async function stopLive(
         try {
           const syncOut = await remoteApiPromise;
           transcriptRaw = String(syncOut.text || "").trim();
+          transcriptSource = "remote";
         } catch (e) {
           console.warn("Remote final transcription failed, falling back to local full-audio pass:", e);
           patchCurrentRecordingSummary({
@@ -12764,6 +11955,7 @@ async function stopLive(
           }, sessionUiToken);
           const fallbackOut = await runLocalFinalPass();
           transcriptRaw = String(fallbackOut.text || "").trim();
+          transcriptSource = "ondisk-fallback";
         }
       }
       if (!transcriptRaw && (previewDraft || latestSourceForSave())) {
@@ -12774,22 +11966,27 @@ async function stopLive(
         }, sessionUiToken);
         const fallbackOut = await runLocalFinalPass();
         transcriptRaw = String(fallbackOut.text || "").trim();
-      }
-      if (!transcriptRaw && previewDraft) {
-        transcriptRaw = previewDraft;
+        transcriptSource = transcriptRaw ? "ondisk-fallback" : "none";
       }
     }
 
-    // R4: wsFramesNeverSent printed here regardless of provider — it is
-    // the client half of the coverage contract for both the local-assist
-    // and Deepgram paths (hasUnsentFrames in ./live-coverage).
-    // ``dual`` says whether the backend decoded this recording with two
-    // Nova-3 streams or one (dual-stream Auto). It is not visible in the
-    // transcript and it doubles the provider minutes, so every support
-    // log has to state it next to the coverage numbers it explains.
-    // Non-Deepgram stops have no envelope and read 0.
+    // The one line that says what the user was handed and where it came
+    // from. ``source`` is the stop's whole diagnosis on the Deepgram
+    // path: ``envelope`` (the backend's own complete reading) or
+    // ``ondisk-fallback`` (no envelope arrived at all).
+    //
+    // ``wsFramesNeverSent`` is captured audio the renderer never handed
+    // over; ``dual`` says whether the backend decoded with two Nova-3
+    // streams or one; ``recovery`` is what the backend re-decoded from
+    // its own spool to make the envelope complete (``stats.recovery``)
+    // — invisible in the transcript, and the largest single term in how
+    // long this stop took. Non-Deepgram stops have no envelope and read
+    // 0/n-a.
     const finalEnvelopeStats = liveFinalSlots.get(sessionUiToken)?.envelope?.stats;
-    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} dual=${finalEnvelopeStats?.dualStream ? 1 : 0}`);
+    const recoveryTrace = finalEnvelopeStats?.recoverySpansSec === undefined
+      ? "n/a"
+      : `${finalEnvelopeStats.recoverySpansSec.toFixed(2)}s/${(finalEnvelopeStats.recoveryMs ?? 0).toFixed(0)}ms`;
+    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} dual=${finalEnvelopeStats?.dualStream ? 1 : 0} recovery=${recoveryTrace}`);
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
     const noSpeechFinalStatus = "Recording completed, no speech detected.";
     const finalUiText = transcriptRaw || noSpeechFinalStatus;
