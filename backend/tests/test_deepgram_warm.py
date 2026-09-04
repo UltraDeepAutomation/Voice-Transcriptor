@@ -140,16 +140,52 @@ class AdoptionTests(_PoolCase):
         self.assertIn("saved ~100ms connect", line)
         self.assertAlmostEqual(acquisition.warm_age_sec, 12.0, places=3)
 
-    async def test_a_different_configuration_is_discarded_not_adopted(self):
+    async def test_a_different_configuration_gets_its_own_fresh_socket(self):
+        # Slots are per configuration: a recording whose parameters do
+        # not match anything warm connects fresh, and does NOT take the
+        # other reading's socket down with it — that socket may be the
+        # dual-stream partner of a recording about to start.
         warm = await self._warm()
-        with self.assertLogs("transcriptor.deepgram_warm", level="INFO") as logs:
-            acquisition = await self.pool.acquire("k", _cfg(language="en"))
+        acquisition = await self.pool.acquire("k", _cfg(language="en"))
         self.assertFalse(acquisition.adopted)
         self.assertIsNot(acquisition.session, warm)
-        self.assertTrue(warm.discarded)
-        self.assertIn(
-            "configuration changed",
-            "\n".join(logs.output),
+        self.assertFalse(warm.discarded)
+        self.assertEqual(
+            [row["configKey"] for row in self.pool.status()["sockets"]],
+            [_cfg().to_query_string()],
+        )
+
+    async def test_two_configurations_can_be_warm_at_once(self):
+        # The dual-stream shape: two readings of one recording, two
+        # keys, both adopted without a connect.
+        pool = self.pool
+        pool.start()
+        pool.rewarm("k", _cfg())
+        pool.rewarm("k", _cfg(language="ru2"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.created), 2)
+        first = await pool.acquire("k", _cfg())
+        second = await pool.acquire("k", _cfg(language="ru2"))
+        self.assertTrue(first.adopted)
+        self.assertTrue(second.adopted)
+        self.assertEqual(len(self.created), 2, "neither paid a connect")
+
+    async def test_the_oldest_socket_is_evicted_at_the_bound(self):
+        # Every warm socket is billed and holds a concurrency slot, so a
+        # third one is not opened — the oldest is closed instead.
+        pool = self.pool
+        pool.start()
+        for lang in ("a", "b", "c"):
+            pool.rewarm("k", _cfg(language=lang))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        status = pool.status()
+        self.assertEqual(len(status["sockets"]), pool.status()["maxSockets"])
+        self.assertTrue(self.created[0].discarded, "the oldest was released")
+        self.assertNotIn(
+            _cfg(language="a").to_query_string(),
+            [row["configKey"] for row in status["sockets"]],
         )
 
     async def test_keyterms_are_part_of_the_key(self):
@@ -192,7 +228,7 @@ class AdoptionTests(_PoolCase):
 
     async def test_a_socket_past_its_lifetime_bound_is_not_adopted(self):
         await self._warm()
-        self.clock.advance(self.pool.status()["idleTtlSec"] + 1.0)
+        self.clock.advance(self.pool.status()["idleTtlSec"] + 1.0)  # noqa: E501
         acquisition = await self.pool.acquire("k", _cfg())
         self.assertFalse(acquisition.adopted)
 
@@ -278,7 +314,7 @@ class LifecycleTests(_PoolCase):
         await self.pool.close_all()
         self.assertTrue(warm.discarded)
         self.assertFalse(self.pool.armed)
-        self.assertIsNone(self.pool.status()["configKey"])
+        self.assertEqual(self.pool.status()["sockets"], [])
 
     async def test_the_ttl_reaper_closes_an_idle_socket(self):
         pool = DeepgramWarmPool(
@@ -291,7 +327,7 @@ class LifecycleTests(_PoolCase):
         warm = self.created[-1]
         await asyncio.sleep(0.05)
         self.assertTrue(warm.discarded)
-        self.assertEqual(pool.status()["state"], "idle")
+        self.assertEqual(pool.status()["sockets"], [])
         await pool.close_all()
 
     async def test_a_second_rewarm_for_the_same_config_is_a_no_op(self):
@@ -307,24 +343,25 @@ class StatusTests(_PoolCase):
         self.clock.advance(3.0)
         status = self.pool.status()
         self.assertTrue(status["armed"])
-        self.assertEqual(status["state"], "warm")
-        self.assertEqual(status["configKey"], _cfg().to_query_string())
-        self.assertAlmostEqual(status["ageSec"], 3.0, places=3)
-        self.assertTrue(status["healthy"])
-        self.assertIsNone(status["unfitReason"])
+        self.assertEqual(len(status["sockets"]), 1)
+        row = status["sockets"][0]
+        self.assertEqual(row["state"], "warm")
+        self.assertEqual(row["configKey"], _cfg().to_query_string())
+        self.assertAlmostEqual(row["ageSec"], 3.0, places=3)
+        self.assertTrue(row["healthy"])
+        self.assertIsNone(row["unfitReason"])
 
     async def test_status_names_why_a_socket_would_not_be_adopted(self):
         warm = await self._warm()
         warm.is_closed = True
-        status = self.pool.status()
-        self.assertFalse(status["healthy"])
-        self.assertEqual(status["unfitReason"], "socket already closed")
+        row = self.pool.status()["sockets"][0]
+        self.assertFalse(row["healthy"])
+        self.assertEqual(row["unfitReason"], "socket already closed")
 
     async def test_status_on_an_empty_pool(self):
         status = self.pool.status()
-        self.assertEqual(status["state"], "idle")
-        self.assertIsNone(status["ageSec"])
-        self.assertIsNone(status["healthy"])
+        self.assertEqual(status["sockets"], [])
+        self.assertFalse(status["armed"])
 
 
 class VoiceDetectionTests(unittest.TestCase):
@@ -844,13 +881,12 @@ class WarmSessionLivenessTests(unittest.IsolatedAsyncioTestCase):
             await self._finish(ws, task)
             await asyncio.sleep(0)
             await asyncio.sleep(0)
-            status = pool.status()
-            self.assertEqual(status["state"], "warm")
-            self.assertEqual(
-                status["configKey"],
+            keys = [row["configKey"] for row in pool.status()["sockets"]]
+            self.assertIn(
                 self.main._live_config(
                     model="nova-3", language="auto", diarize=False, keyterms=(),
                 ).to_query_string(),
+                keys,
             )
             await pool.close_all()
 
@@ -906,8 +942,8 @@ class WarmStatusEndpointTests(unittest.TestCase):
         payload = self.main.get_live_warm_state(_auth=None)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["warm"], self.main.DEEPGRAM_WARM_POOL.status())
-        self.assertIn("state", payload["warm"])
+        self.assertIn("sockets", payload["warm"])
 
     def test_the_boot_prewarm_does_nothing_without_a_key(self):
         asyncio.run(self.main._prewarm_deepgram_at_boot())
-        self.assertEqual(self.main.DEEPGRAM_WARM_POOL.status()["state"], "idle")
+        self.assertEqual(self.main.DEEPGRAM_WARM_POOL.status()["sockets"], [])

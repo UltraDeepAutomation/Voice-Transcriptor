@@ -1,5 +1,10 @@
 """Deepgram live A/B tool — reproduce the 2026-09-03 multi-vs-ru measurement.
 
+``--dual`` additionally runs the shipped two-reading merge
+(``backend.deepgram_dual.DualLiveSession``): a second session in the
+given language on the same audio, merged by word timestamps into one
+transcript. The row then reads ``lang=multi+ru``.
+
 Streams saved WAV recordings through a
 ``backend.remote_deepgram_live.DeepgramLiveSession`` (opened by
 ``DeepgramWarmPool.acquire``, the same entry point the app uses) at
@@ -62,6 +67,11 @@ from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.config import load_config  # noqa: E402
 from backend.deepgram_keyterms import normalize_keyterms  # noqa: E402
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
+from backend.deepgram_dual import (  # noqa: E402
+    DUAL_SECONDARY_LANGUAGE_DEFAULT,
+    DualLiveSession,
+    secondary_config,
+)
 from backend.deepgram_warm import DeepgramWarmPool  # noqa: E402
 from backend.remote_deepgram_live import (  # noqa: E402
     DeepgramLiveConfig,
@@ -139,10 +149,23 @@ async def _run_one(
     speed: float,
     file_label: str,
     run_index: int,
+    dual_language: str = "",
 ) -> RunResult:
     cfg = DeepgramLiveConfig(model=model, language=language, keyterms=keyterms)
     try:
         session = (await _POOL.acquire(api_key, cfg)).session
+        if dual_language:
+            # The same facade the app runs, so what is measured here is
+            # the merge that ships — not a second implementation of it.
+            secondary = (
+                await _POOL.acquire(api_key, secondary_config(cfg, dual_language))
+            ).session
+            session = DualLiveSession(
+                primary=session,
+                secondary=secondary,
+                secondary_language=dual_language,
+                primary_language=language,
+            )
     except DeepgramLiveError as e:
         return RunResult(
             file=file_label, language=language, run=run_index,
@@ -176,8 +199,9 @@ async def _run_one(
 
     stats = result.get("stats") or {}
     text = str(result.get("text") or "")
+    label = f"{language}+{dual_language}" if dual_language else language
     return RunResult(
-        file=file_label, language=language, run=run_index,
+        file=file_label, language=label, run=run_index,
         keyterms_count=len(keyterms),
         connect_ms=stats.get("connect_ms"), finalize_ms=stats.get("finalize_ms"),
         segments=len(result.get("segments") or []), words=len(text.split()),
@@ -187,14 +211,14 @@ async def _run_one(
 
 def _format_row(r: RunResult, *, full: bool) -> str:
     if r.error:
-        return f"{r.file:<28} lang={r.language:<6} run={r.run} ERROR: {r.error}"
+        return f"{r.file:<28} lang={r.language:<9} run={r.run} ERROR: {r.error}"
     text = r.text if full or len(r.text) <= _TEXT_TRUNCATE_CHARS else (
         r.text[:_TEXT_TRUNCATE_CHARS] + "…"
     )
     connect = f"{r.connect_ms:6.0f}" if r.connect_ms is not None else "   n/a"
     finalize = f"{r.finalize_ms:6.0f}" if r.finalize_ms is not None else "   n/a"
     return (
-        f"{r.file:<28} lang={r.language:<6} kt={r.keyterms_count:<2} run={r.run} "
+        f"{r.file:<28} lang={r.language:<9} kt={r.keyterms_count:<2} run={r.run} "
         f"connect={connect}ms finalize={finalize}ms "
         f"segs={r.segments:<3} words={r.words:<4} chars={r.chars:<5} | {text}"
     )
@@ -241,6 +265,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         speed=args.speed,
                         file_label=p.name,
                         run_index=run_index,
+                        dual_language=args.dual or "",
                     )
                 )
 
@@ -289,6 +314,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--language", "-l", action="append", required=True,
         help="Deepgram language value to test, e.g. 'multi' or 'ru'. "
              "Repeat the flag to compare several in one run.",
+    )
+    parser.add_argument(
+        "--dual", nargs="?", const=DUAL_SECONDARY_LANGUAGE_DEFAULT, default="",
+        metavar="LANGUAGE",
+        help="Run the DUAL reading for every --language given: a second "
+             "session in LANGUAGE (default "
+             f"'{DUAL_SECONDARY_LANGUAGE_DEFAULT}') on the same audio, "
+             "merged by word timestamps through the same DualLiveSession "
+             "the app uses. Doubles the Deepgram seconds billed.",
     )
     parser.add_argument(
         "--keyterms", default="",

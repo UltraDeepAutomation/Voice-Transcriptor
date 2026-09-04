@@ -80,6 +80,12 @@ from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
 from backend.deepgram_keyterms import configured_keyterms
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
+from backend.deepgram_dual import (
+    DualLiveSession,
+    dual_secondary_language,
+    dual_stream_enabled,
+    secondary_config,
+)
 from backend.deepgram_warm import (
     WARM_KEEPALIVE_INTERVAL_SEC,
     DeepgramWarmPool,
@@ -89,6 +95,7 @@ from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveError,
     DeepgramLiveSession,
+    resolve_live_language,
 )
 from backend.transcribe import (
     merge_channel_transcripts,
@@ -3797,6 +3804,9 @@ async def ws_transcribe(websocket: WebSocket):
                 _mark_recovery_error(recovery_ctx)
                 return
             dg_keyterms = configured_keyterms(dg_cfg)
+            # The dual-reading decision is made HERE, where the config
+            # has just been read, and passed down — the session runner
+            # takes resolved inputs, not a config to re-interpret.
             await _run_deepgram_live_session(
                 websocket=websocket,
                 api_key=dg_key,
@@ -3805,6 +3815,11 @@ async def ws_transcribe(websocket: WebSocket):
                 diarize=diarize,
                 keyterms=dg_keyterms,
                 recovery=recovery_ctx,
+                dual_language=(
+                    dual_secondary_language(dg_cfg)
+                    if dual_stream_enabled(dg_cfg, language)
+                    else ""
+                ),
             )
         else:
             await _run_local_live_session(
@@ -4466,6 +4481,7 @@ async def _run_deepgram_live_session(
     diarize: bool,
     keyterms: tuple[str, ...] = (),
     recovery: Optional[dict],
+    dual_language: str = "",
 ) -> None:
     """Drive the Deepgram live streaming proxy for one recording.
 
@@ -4494,6 +4510,12 @@ async def _run_deepgram_live_session(
     * The envelope carries ``uncoveredSpeechSec``, ``streamedSec`` and
       ``coveredEndSec`` (C5) — see
       ``DeepgramLiveSession.drain_transcript`` for their definitions.
+
+    ``dual_language`` non-empty asks for a SECOND reading of the same
+    audio in that language, merged into one envelope at stop (see
+    ``backend.deepgram_dual``). The decision is the caller's; everything
+    below is written against one session object either way, because the
+    dual facade presents the interface of one.
     """
     dg_cfg = _live_config(
         model=model,
@@ -4596,6 +4618,34 @@ async def _run_deepgram_live_session(
         )
         _mark_recovery_error(recovery)
         return
+
+    # The second reading, if this recording is running two. Its failure
+    # is not the recording's: everything it would have added is what the
+    # user got before this feature existed, so it degrades to one
+    # reading with a warning and never to an aborted recording.
+    if dual_language:
+        try:
+            secondary = await DEEPGRAM_WARM_POOL.acquire(
+                api_key, secondary_config(dg_cfg, dual_language)
+            )
+            session = DualLiveSession(
+                primary=session,
+                secondary=secondary.session,
+                secondary_language=dual_language,
+                primary_language=resolve_live_language(language),
+            )
+            logger.info(
+                "dual-stream: second reading opened language=%s (adopted=%s)",
+                dual_language,
+                secondary.adopted,
+            )
+        except Exception as e:
+            logger.warning(
+                "dual-stream: second reading (%s) could not be opened, "
+                "continuing single-stream: %s",
+                dual_language,
+                e,
+            )
 
     pre_task.cancel()
     try:
@@ -4758,7 +4808,13 @@ async def _run_deepgram_live_session(
             warm_replay.clear()
             warm_swap_in_progress = False
             return
-        session = fresh
+        if isinstance(session, DualLiveSession):
+            # Only the PRIMARY is probed, so only the primary is
+            # replaced; the second reading is still on its own socket
+            # and still being fed.
+            old = session.replace_primary(fresh)
+        else:
+            session = fresh
         await old.discard()
         warm_probe_active = False
         warm_replay.clear()

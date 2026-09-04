@@ -501,6 +501,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # what the user wrote rather than a lossy pre-parsed form.
         "deepgram": {
             "keyterms": "",
+            # Dual-stream reading (``backend.deepgram_dual``): run a
+            # second Deepgram session in ``dual_secondary_language`` on
+            # the same audio and merge the two by word timestamps.
+            # Defaults ON — it exists because ``language=multi`` drops
+            # whole clauses on language switches (BUGS_AUDIT §1) and the
+            # loss is silent — and applies ONLY when the recording
+            # actually resolves to multilingual, so a user who picked a
+            # single language is never billed twice for one reading.
+            "dual_stream": True,
+            "dual_secondary_language": "ru",
         },
     },
 }
@@ -613,12 +623,38 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
             preferences["deepgram"] = dict(DEFAULT_CONFIG["preferences"]["deepgram"])
             out["preferences"] = preferences
         elif isinstance(dg_prefs, dict):
+            dg_defaults = DEFAULT_CONFIG["preferences"]["deepgram"]
+            # One repair pass over the Deepgram preference block: each
+            # key that is present but of the wrong type falls back to
+            # its documented default, and the block is copied exactly
+            # once whatever went wrong.
+            repaired: dict = {}
             keyterms_raw = dg_prefs.get("keyterms")
             if keyterms_raw is not None and not isinstance(keyterms_raw, str):
                 logger.warning("config.preferences.deepgram.keyterms must be a string; resetting")
+                repaired["keyterms"] = dg_defaults["keyterms"]
+            dual_raw = dg_prefs.get("dual_stream")
+            if dual_raw is not None and not isinstance(dual_raw, bool):
+                logger.warning(
+                    "config.preferences.deepgram.dual_stream must be a boolean; resetting"
+                )
+                repaired["dual_stream"] = dg_defaults["dual_stream"]
+            secondary_raw = dg_prefs.get("dual_secondary_language")
+            if secondary_raw is not None and (
+                not isinstance(secondary_raw, str) or not secondary_raw.strip()
+            ):
+                # A blank string is as unusable as a number here: the
+                # second reading needs a language to open a socket with,
+                # and "" would silently resolve to multilingual — i.e.
+                # two identical readings at twice the price.
+                logger.warning(
+                    "config.preferences.deepgram.dual_secondary_language must be a "
+                    "non-empty string; resetting"
+                )
+                repaired["dual_secondary_language"] = dg_defaults["dual_secondary_language"]
+            if repaired:
                 preferences = dict(preferences)
-                dg_prefs = dict(dg_prefs)
-                dg_prefs["keyterms"] = ""
+                dg_prefs = {**dg_prefs, **repaired}
                 preferences["deepgram"] = dg_prefs
                 out["preferences"] = preferences
     # schema_version: must be a positive int if present.

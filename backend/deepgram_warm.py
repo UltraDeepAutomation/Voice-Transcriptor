@@ -89,6 +89,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -111,6 +112,14 @@ WARM_KEEPALIVE_INTERVAL_SEC = 4.0
 # concurrency slot it occupies; the next recording simply pays the
 # connect it would have paid without any warm pool at all.
 WARM_IDLE_TTL_SEC = 300.0
+
+# How many warm sockets may be held at once. Two, because a dual-stream
+# recording (``backend.deepgram_dual``) reads the same audio in two
+# languages and those are two configurations; warming one of them would
+# leave the other paying exactly the connect this module removes. Each
+# is a billed, concurrency-limited connection, so a third is evicted
+# rather than opened.
+WARM_MAX_SOCKETS = 2
 
 # A warm socket proves it is alive by getting its KeepAlive frames onto
 # the wire. Two missed cadences (plus slack) means the send path is no
@@ -172,8 +181,19 @@ def _default_factory(
     )
 
 
+@dataclass
+class _WarmSlot:
+    """One warm socket and everything the pool knows about it."""
+
+    session: DeepgramLiveSession
+    key: str
+    api_key: str
+    warmed_at: float
+    reaper: Optional[asyncio.Task] = None
+
+
 class DeepgramWarmPool:
-    """At most one warm ``DeepgramLiveSession``, keyed by its config.
+    """Warm ``DeepgramLiveSession``s, at most one per configuration.
 
     The key is ``DeepgramLiveConfig.to_query_string()`` — the exact
     string that goes on the wire. Model, language, keyterms, diarize,
@@ -183,12 +203,14 @@ class DeepgramWarmPool:
     The API key is compared alongside it: rotating the key must not
     hand a recording a socket authenticated with the old one.
 
-    One slot, not one per key: every warm socket is a live connection
-    against the user's Deepgram concurrency limit, and the app records
-    with one configuration at a time. A mismatch is self-correcting —
-    ``acquire()`` closes the stale socket and connects fresh, and the
-    re-warm that follows the recording uses the configuration that was
-    actually used.
+    ONE PER KEY, and at most ``WARM_MAX_SOCKETS`` of them. A dual-stream
+    recording (``backend.deepgram_dual``) opens two readings of the same
+    audio in two languages, which are two configurations and therefore
+    two keys; warming only one of them would leave the other paying the
+    connect this module exists to remove. Every warm socket is a real
+    connection against the user's Deepgram concurrency limit and billed
+    for the time it is held, so the count is bounded and the oldest slot
+    is evicted rather than a third being opened.
 
     Bound to the app lifespan: ``start()`` arms it, ``close_all()``
     releases it. Un-armed, ``rewarm()`` is a no-op and ``acquire()``
@@ -205,22 +227,20 @@ class DeepgramWarmPool:
         ] = _default_factory,
         idle_ttl_sec: float = WARM_IDLE_TTL_SEC,
         keepalive_stale_sec: float = WARM_KEEPALIVE_STALE_SEC,
+        max_sockets: int = WARM_MAX_SOCKETS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._factory = session_factory
         self._idle_ttl_sec = float(idle_ttl_sec)
         self._keepalive_stale_sec = float(keepalive_stale_sec)
+        self._max_sockets = max(1, int(max_sockets))
         self._clock = clock
         self._lock = asyncio.Lock()
         self._armed = False
-        self._warm: Optional[DeepgramLiveSession] = None
-        self._warm_key: Optional[str] = None
-        self._warm_api_key: Optional[str] = None
-        self._warmed_at: float = 0.0
-        self._reaper: Optional[asyncio.Task] = None
-        self._connecting: Optional[asyncio.Task] = None
-        self._pending_key: Optional[str] = None
-        self._pending_api_key: Optional[str] = None
+        # Insertion-ordered, and kept that way: the oldest slot is the
+        # first one out when the bound is reached.
+        self._slots: "OrderedDict[str, _WarmSlot]" = OrderedDict()
+        self._pending: dict[str, tuple[asyncio.Task, str]] = {}
 
     # ----- Lifecycle --------------------------------------------------
 
@@ -233,11 +253,13 @@ class DeepgramWarmPool:
         return self._armed
 
     async def close_all(self) -> None:
-        """Release the warm socket and every task the pool owns."""
+        """Release every warm socket and every task the pool owns."""
         self._armed = False
         async with self._lock:
-            await self._cancel_pending()
-            await self._drop_warm("pool closed")
+            for key in list(self._pending):
+                await self._cancel_pending(key)
+            for key in list(self._slots):
+                await self._drop_slot(key, "pool closed")
 
     # ----- Acquisition ------------------------------------------------
 
@@ -246,40 +268,42 @@ class DeepgramWarmPool:
     ) -> WarmAcquisition:
         """Return a connected session for ``cfg``.
 
-        Adopts the warm socket when it matches and is healthy; otherwise
-        discards whatever is warm (saying why) and connects a fresh one.
-        Raises ``DeepgramLiveError`` exactly where a plain
-        ``DeepgramLiveSession.connect()`` would — the caller's failure
+        Adopts the warm socket for this exact configuration when there
+        is one and it is healthy; otherwise connects a fresh one.
+        Sockets held for OTHER configurations are left alone — they
+        belong to another reading, not to this one. Raises
+        ``DeepgramLiveError`` exactly where a plain
+        ``DeepgramLiveSession.connect()`` would, so the caller's failure
         path is unchanged.
         """
         key = cfg.to_query_string()
         async with self._lock:
-            pending = self._connecting
+            pending = self._pending.get(key)
             if pending is not None:
-                if self._pending_key == key and self._pending_api_key == api_key:
+                if pending[1] == api_key:
                     # A re-warm for exactly this configuration is already
                     # in flight and is, at worst, as far along as a fresh
                     # connect started now. Awaiting it also keeps the
                     # worst case at ONE connect budget: a failure is
                     # raised, not retried behind a second 12 s attempt.
-                    session = await self._await_pending()
+                    session = await self._await_pending(key)
                     if session is not None:
-                        return self._adopt(session, key, api_key, from_pending=True)
+                        return self._adopt(session, age=0.0)
                     raise DeepgramLiveError(
                         "Deepgram connect failed (warm connect in flight)"
                     )
-                await self._cancel_pending()
+                await self._cancel_pending(key)
 
-            warm = self._warm
-            if warm is not None:
-                reason = self._unfit_reason(warm, key, api_key)
+            slot = self._slots.get(key)
+            if slot is not None:
+                reason = self._unfit_reason(slot, api_key)
                 if reason is None:
-                    self._cancel_reaper()
-                    self._warm = None
-                    self._warm_key = None
-                    self._warm_api_key = None
-                    return self._adopt(warm, key, api_key, from_pending=False)
-                await self._drop_warm(reason)
+                    self._release_slot(key)
+                    return self._adopt(
+                        slot.session,
+                        age=max(0.0, self._clock() - slot.warmed_at),
+                    )
+                await self._drop_slot(key, reason)
 
             session = self._factory(api_key, cfg)
             await session.connect()
@@ -291,14 +315,8 @@ class DeepgramWarmPool:
             )
 
     def _adopt(
-        self,
-        session: DeepgramLiveSession,
-        key: str,
-        api_key: str,
-        *,
-        from_pending: bool,
+        self, session: DeepgramLiveSession, *, age: float
     ) -> WarmAcquisition:
-        age = max(0.0, self._clock() - self._warmed_at) if not from_pending else 0.0
         connect_ms = session.stats.connect_ms
         logger.info(
             "deepgram-live: adopted warm socket age=%.1fs (saved ~%sms connect)",
@@ -325,23 +343,17 @@ class DeepgramWarmPool:
         if not self._armed or not api_key:
             return
         key = cfg.to_query_string()
-        if (
-            self._warm is not None
-            and self._warm_key == key
-            and self._warm_api_key == api_key
-        ):
+        slot = self._slots.get(key)
+        if slot is not None and slot.api_key == api_key:
             return
-        if self._connecting is not None:
-            # One connect in flight at a time. If it is for a stale
-            # configuration it lands, fails ``_unfit_reason`` at the next
-            # ``acquire()`` and is closed there — cheaper than cancelling
-            # a half-open handshake from a synchronous caller.
+        if key in self._pending:
+            # One connect in flight per configuration. A second would
+            # buy nothing: this one is at worst as far along.
             return
-        self._pending_key = key
-        self._pending_api_key = api_key
-        self._connecting = asyncio.get_running_loop().create_task(
+        task = asyncio.get_running_loop().create_task(
             self._warm_connect(api_key, cfg, key), name="deepgram-warm-connect"
         )
+        self._pending[key] = (task, api_key)
 
     async def _warm_connect(
         self, api_key: str, cfg: DeepgramLiveConfig, key: str
@@ -355,15 +367,14 @@ class DeepgramWarmPool:
         except Exception as e:
             logger.info("deepgram-live: pre-warm connect failed: %s", e)
             await _quiet_close(session)
-            self._forget_pending(key)
+            self._pending.pop(key, None)
             return None
-        # ``acquire()`` may already have taken the pending task's result
-        # (``_await_pending``); it clears ``_connecting`` itself and this
-        # store then simply does not happen.
-        if self._connecting is not None and self._pending_key == key:
+        # ``acquire()`` may already have taken this task's result
+        # (``_await_pending`` pops the entry first), in which case the
+        # session belongs to that caller and must not be stored.
+        if key in self._pending:
+            self._pending.pop(key, None)
             await self._store_warm(session, key, api_key)
-            self._forget_pending(key)
-            return session
         return session
 
     async def _store_warm(
@@ -373,51 +384,62 @@ class DeepgramWarmPool:
         # ``acquire()`` can never observe a half-swapped slot. This runs
         # WITHOUT the pool lock on purpose: ``acquire()`` may be awaiting
         # this very task (``_await_pending``) while holding it.
-        previous = self._warm
-        previous_at = self._warmed_at
-        self._cancel_reaper()
-        self._warm = session
-        self._warm_key = key
-        self._warm_api_key = api_key
-        self._warmed_at = self._clock()
+        previous = self._slots.pop(key, None)
+        if previous is not None:
+            self._cancel_reaper(previous)
+        evicted: list[_WarmSlot] = []
+        while len(self._slots) >= self._max_sockets:
+            _oldest_key, oldest = self._slots.popitem(last=False)
+            self._cancel_reaper(oldest)
+            evicted.append(oldest)
+        slot = _WarmSlot(
+            session=session, key=key, api_key=api_key, warmed_at=self._clock(),
+        )
+        self._slots[key] = slot
         connect_ms = session.stats.connect_ms
         logger.info(
-            "deepgram-live: warm socket ready in %sms (ttl=%.0fs)",
+            "deepgram-live: warm socket ready in %sms (ttl=%.0fs, %d/%d held)",
             f"{connect_ms:.0f}" if connect_ms is not None else "?",
             self._idle_ttl_sec,
+            len(self._slots),
+            self._max_sockets,
         )
-        self._reaper = asyncio.get_running_loop().create_task(
-            self._expire_when_idle(session), name="deepgram-warm-ttl"
+        slot.reaper = asyncio.get_running_loop().create_task(
+            self._expire_when_idle(key, session), name="deepgram-warm-ttl"
         )
-        if previous is not None and previous is not session:
+        for stale in ([previous] if previous is not None else []) + evicted:
+            if stale.session is session:
+                continue
             logger.info(
                 "deepgram-live: discarded warm socket age=%.1fs reason=%s",
-                max(0.0, self._clock() - previous_at),
-                "replaced by a newer warm socket",
+                max(0.0, self._clock() - stale.warmed_at),
+                "replaced by a newer warm socket"
+                if stale is previous
+                else f"oldest of more than {self._max_sockets} warm sockets",
             )
-            await _quiet_close(previous)
+            await _quiet_close(stale.session)
 
-    async def _expire_when_idle(self, session: DeepgramLiveSession) -> None:
+    async def _expire_when_idle(
+        self, key: str, session: DeepgramLiveSession
+    ) -> None:
         try:
             await asyncio.sleep(self._idle_ttl_sec)
         except asyncio.CancelledError:
             return
         async with self._lock:
-            if self._warm is not session:
+            slot = self._slots.get(key)
+            if slot is None or slot.session is not session:
                 return
-            await self._drop_warm(
-                f"idle for {self._idle_ttl_sec:.0f}s (billing/concurrency bound)"
+            await self._drop_slot(
+                key, f"idle for {self._idle_ttl_sec:.0f}s (billing/concurrency bound)"
             )
 
     # ----- Internals --------------------------------------------------
 
-    def _unfit_reason(
-        self, session: DeepgramLiveSession, key: str, api_key: str
-    ) -> Optional[str]:
+    def _unfit_reason(self, slot: _WarmSlot, api_key: str) -> Optional[str]:
         """Why this warm socket must NOT be adopted, or ``None``."""
-        if self._warm_key != key:
-            return "configuration changed"
-        if self._warm_api_key != api_key:
+        session = slot.session
+        if slot.api_key != api_key:
             return "API key changed"
         if session.is_closed:
             return "socket already closed"
@@ -430,7 +452,7 @@ class DeepgramWarmPool:
             # the adopted recording. See the module docstring.
             return "socket already carried audio (timestamps would be shifted)"
         now = self._clock()
-        age = now - self._warmed_at
+        age = now - slot.warmed_at
         if age > self._idle_ttl_sec:
             return f"warm for {age:.0f}s, past the {self._idle_ttl_sec:.0f}s bound"
         last_ka = session.stats.last_keepalive_at
@@ -441,52 +463,46 @@ class DeepgramWarmPool:
             return f"last KeepAlive was {now - last_ka:.0f}s ago"
         return None
 
-    async def _drop_warm(self, reason: str) -> None:
-        self._cancel_reaper()
-        session = self._warm
-        self._warm = None
-        self._warm_key = None
-        self._warm_api_key = None
-        if session is None:
+    def _release_slot(self, key: str) -> Optional[_WarmSlot]:
+        """Take a slot out of the pool without closing its socket."""
+        slot = self._slots.pop(key, None)
+        if slot is not None:
+            self._cancel_reaper(slot)
+        return slot
+
+    async def _drop_slot(self, key: str, reason: str) -> None:
+        slot = self._release_slot(key)
+        if slot is None:
             return
-        age = max(0.0, self._clock() - self._warmed_at)
         logger.info(
-            "deepgram-live: discarded warm socket age=%.1fs reason=%s", age, reason
+            "deepgram-live: discarded warm socket age=%.1fs reason=%s",
+            max(0.0, self._clock() - slot.warmed_at),
+            reason,
         )
-        await _quiet_close(session)
+        await _quiet_close(slot.session)
 
-    def _cancel_reaper(self) -> None:
-        if self._reaper is not None and not self._reaper.done():
-            self._reaper.cancel()
-        self._reaper = None
+    @staticmethod
+    def _cancel_reaper(slot: _WarmSlot) -> None:
+        if slot.reaper is not None and not slot.reaper.done():
+            slot.reaper.cancel()
+        slot.reaper = None
 
-    def _forget_pending(self, key: str) -> None:
-        if self._pending_key == key:
-            self._connecting = None
-            self._pending_key = None
-            self._pending_api_key = None
-
-    async def _await_pending(self) -> Optional[DeepgramLiveSession]:
-        task = self._connecting
-        self._connecting = None
-        self._pending_key = None
-        self._pending_api_key = None
-        if task is None:
+    async def _await_pending(self, key: str) -> Optional[DeepgramLiveSession]:
+        entry = self._pending.pop(key, None)
+        if entry is None:
             return None
         try:
-            return await task
+            return await entry[0]
         except asyncio.CancelledError:
             raise
         except Exception:
             return None
 
-    async def _cancel_pending(self) -> None:
-        task = self._connecting
-        self._connecting = None
-        self._pending_key = None
-        self._pending_api_key = None
-        if task is None:
+    async def _cancel_pending(self, key: str) -> None:
+        entry = self._pending.pop(key, None)
+        if entry is None:
             return
+        task = entry[0]
         if task.done():
             session = None
             try:
@@ -505,43 +521,45 @@ class DeepgramWarmPool:
     # ----- Introspection ----------------------------------------------
 
     def status(self) -> dict:
-        """Debug snapshot for ``GET /api/live/warm``."""
-        session = self._warm
-        state = "idle"
-        if session is not None:
-            state = "warm"
-        elif self._connecting is not None:
-            state = "connecting"
-        age = (
-            round(max(0.0, self._clock() - self._warmed_at), 3)
-            if session is not None
-            else None
-        )
-        healthy = None
-        reason = None
-        if session is not None:
-            reason = self._unfit_reason(
-                session, self._warm_key or "", self._warm_api_key or ""
+        """Debug snapshot for ``GET /api/live/warm``.
+
+        One row per warm socket, plus the configurations currently being
+        connected — a stop-latency investigation asks "was anything warm
+        for this recording, and if not why not", and both answers live
+        here.
+        """
+        now = self._clock()
+        sockets = []
+        for key, slot in self._slots.items():
+            reason = self._unfit_reason(slot, slot.api_key)
+            sockets.append(
+                {
+                    "state": "warm",
+                    "configKey": key,
+                    "ageSec": round(max(0.0, now - slot.warmed_at), 3),
+                    "healthy": reason is None,
+                    "unfitReason": reason,
+                    "connectMs": slot.session.stats.connect_ms,
+                    "keepalivesSent": slot.session.stats.keepalives_sent,
+                }
             )
-            healthy = reason is None
+        for key in self._pending:
+            sockets.append(
+                {
+                    "state": "connecting",
+                    "configKey": key,
+                    "ageSec": None,
+                    "healthy": None,
+                    "unfitReason": None,
+                    "connectMs": None,
+                    "keepalivesSent": None,
+                }
+            )
         return {
             "armed": self._armed,
-            "state": state,
-            "configKey": self._warm_key or self._pending_key,
-            "ageSec": age,
-            "healthy": healthy,
-            "unfitReason": reason,
-            "connectMs": (
-                session.stats.connect_ms
-                if session is not None
-                else None
-            ),
             "idleTtlSec": self._idle_ttl_sec,
-            "keepalivesSent": (
-                session.stats.keepalives_sent
-                if session is not None
-                else None
-            ),
+            "maxSockets": self._max_sockets,
+            "sockets": sockets,
         }
 
 
@@ -560,6 +578,7 @@ __all__ = [
     "DeepgramWarmPool",
     "WarmAcquisition",
     "WARM_IDLE_TTL_SEC",
+    "WARM_MAX_SOCKETS",
     "WARM_KEEPALIVE_INTERVAL_SEC",
     "WARM_KEEPALIVE_STALE_SEC",
     "WARM_VOICE_PEAK",

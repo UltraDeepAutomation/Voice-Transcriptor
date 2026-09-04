@@ -775,36 +775,102 @@ class DeepgramLiveConfig:
         ]
         if self.diarize:
             params.append(("diarize", "true"))
-        lang = (self.language or "").strip().lower()
-        if not lang or lang in ("auto", "multi"):
-            # Nova-3 multilingual mode — the model auto-detects the
-            # active language per utterance across 10 supported
-            # languages including Russian, Spanish, French, German,
-            # Hindi, Portuguese, Italian, Dutch, Japanese, English.
-            #
-            # 2026-09-03 measurement (BUGS_AUDIT_2026-09-03.md §1;
-            # reproducible with ``backend/tools/deepgram_live_ab.py``):
-            # on this app's own saved Russian recordings, ``multi``
-            # dropped ~35% of a 99 s dictation and whole clauses in two
-            # short ones (8.6 s, 12 s), and was non-deterministic
-            # between repeat runs on the SAME audio. ``language=ru`` on
-            # the identical files kept every clause, byte-identical
-            # across repeats. Lowering the level by 14 dB to match the
-            # clean June recording did not change the result. A 173 s
-            # June recording, made without clipping, showed no
-            # difference between the two modes — the failure
-            # is specific to this kind of content, not universal. This
-            # does NOT change what "auto" maps to here — that mapping
-            # is a UI-level choice (see ``frontend``) — it only records
-            # the measured fact where the mapping lives, and points at
-            # Keyterm Prompting (``keyterms`` above) as the mitigation
-            # for the transliteration cost of choosing a monolingual
-            # language instead.
-            params.append(("language", "multi"))
-        else:
-            params.append(("language", lang))
+        # ``resolve_live_language`` is the ONE place "auto" becomes a
+        # Deepgram language value; ``backend.deepgram_dual`` asks the
+        # same question ("is this recording running multilingual?") and
+        # must not be able to answer it differently.
+        #
+        # Nova-3 multilingual mode ("multi") — the model auto-detects the
+        # active language per utterance across 10 supported
+        # languages including Russian, Spanish, French, German,
+        # Hindi, Portuguese, Italian, Dutch, Japanese, English.
+        #
+        # 2026-09-03 measurement (BUGS_AUDIT_2026-09-03.md §1;
+        # reproducible with ``backend/tools/deepgram_live_ab.py``):
+        # on this app's own saved Russian recordings, ``multi``
+        # dropped ~35% of a 99 s dictation and whole clauses in two
+        # short ones (8.6 s, 12 s), and was non-deterministic
+        # between repeat runs on the SAME audio. ``language=ru`` on
+        # the identical files kept every clause, byte-identical
+        # across repeats. Lowering the level by 14 dB to match the
+        # clean June recording did not change the result. A 173 s
+        # June recording, made without clipping, showed no
+        # difference between the two modes — the failure
+        # is specific to this kind of content, not universal. This
+        # does NOT change what "auto" maps to here — that mapping
+        # is a UI-level choice (see ``frontend``) — it only records
+        # the measured fact where the mapping lives, and points at
+        # Keyterm Prompting (``keyterms`` above) as the mitigation
+        # for the transliteration cost of choosing a monolingual
+        # language instead.
+        params.append(("language", resolve_live_language(self.language)))
         params.extend(keyterm_query_pairs(self.keyterms, model))
         return urlencode(params)
+
+
+def union_spans(
+    spans: "Iterable[tuple[float, float]]",
+) -> list[tuple[float, float]]:
+    """Merge overlapping time spans so nothing is measured twice.
+
+    Module level because two modules measure coverage on spans now —
+    this one, and ``backend.deepgram_dual``, which asks what a MERGED
+    reading still fails to cover. One implementation, so the two cannot
+    disagree about what "already counted" means.
+    """
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(s for s in spans if s[1] > s[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def subtract_spans(
+    spans: "Iterable[tuple[float, float]]",
+    covered: "Iterable[tuple[float, float]]",
+) -> list[tuple[float, float]]:
+    """``spans`` with every part of ``covered`` removed.
+
+    The other half of the coverage arithmetic a merged reading needs: a
+    hole one reading reported is only still a hole if the merged
+    transcript put no word over it.
+    """
+    result: list[tuple[float, float]] = []
+    blocks = union_spans(covered)
+    for start, end in union_spans(spans):
+        cursor = start
+        for c_start, c_end in blocks:
+            if c_end <= cursor:
+                continue
+            if c_start >= end:
+                break
+            if c_start > cursor:
+                result.append((cursor, c_start))
+            cursor = max(cursor, c_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end))
+    return result
+
+
+def resolve_live_language(language: str) -> str:
+    """The Deepgram ``language`` value a configured language maps to.
+
+    "auto" is a UI word, not a Deepgram one: Nova-3's live endpoint has
+    no ``detect_language``, it has ``language=multi``. Blank and "auto"
+    therefore both resolve to "multi", and anything else is passed
+    through lowercased.
+
+    Extracted because a SECOND question now depends on the same
+    mapping — ``backend.deepgram_dual`` runs a second reading only when
+    the recording is actually multilingual — and two places deciding
+    what "auto" means is exactly how they would come to disagree.
+    """
+    lang = (language or "").strip().lower()
+    return "multi" if lang in ("", "auto", "multi") else lang
 
 
 def _bool(value: bool) -> str:
@@ -1603,7 +1669,7 @@ class DeepgramLiveSession:
         # the record of what was missing and of what was heard there
         # (audit §3.9). After the splice the words are in the
         # transcript and the evidence is gone.
-        holes_before_splice = self._coverage_hole_spans()
+        holes_before_splice = self.coverage_hole_spans()
         spliced_words = self._splice_uncovered_interim_words()
         # C6 (audit §3.8): merge seams exactly once and derive BOTH
         # ``text`` and ``segments`` from the same merged list. Previously
@@ -2388,13 +2454,7 @@ class DeepgramLiveSession:
     @staticmethod
     def _union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
         """Merge overlapping spans so nothing is measured twice."""
-        merged: list[tuple[float, float]] = []
-        for start, end in sorted(s for s in spans if s[1] > s[0]):
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-        return merged
+        return union_spans(spans)
 
     def _final_coverage(self) -> list[tuple[float, float]]:
         return self._union(
@@ -2445,8 +2505,12 @@ class DeepgramLiveSession:
                     clipped.append((lo, hi))
         return self._union(clipped)
 
-    def _coverage_hole_spans(self) -> list[tuple[float, float]]:
+    def coverage_hole_spans(self) -> list[tuple[float, float]]:
         """Every span this session believes is missing from the transcript.
+
+        Public because a second reading of the same audio
+        (``backend.deepgram_dual``) has to know WHERE this one failed in
+        order to say whether the merged transcript still fails there.
 
         The union of the word-level evidence — unclipped, so a region no
         final reached at all is named too — with the span-level holes.
@@ -3162,4 +3226,10 @@ __all__ = [
     "merge_seam_fragments",
     "normalize_words",
     "word_accounted_for",
+    # Shared with ``backend.deepgram_dual``, which merges two readings
+    # of one recording: what "auto" means as a Deepgram language, and
+    # the span arithmetic behind "is this still a hole?".
+    "resolve_live_language",
+    "subtract_spans",
+    "union_spans",
 ]

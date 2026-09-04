@@ -173,8 +173,17 @@ class ConfigDefaultAndValidationTests(unittest.TestCase):
         self.assertEqual(fixed["preferences"]["deepgram"]["keyterms"], "")
 
     def test_non_dict_deepgram_block_resets_to_default(self):
+        # Reads the defaults rather than restating them: this block has
+        # grown a second setting (dual_stream) and will grow more, and a
+        # test that lists them by hand only ever fails for that.
+        from backend.config import DEFAULT_CONFIG
+
         fixed = _validate_config_shape({"preferences": {"deepgram": "oops-a-string"}})
-        self.assertEqual(fixed["preferences"]["deepgram"], {"keyterms": ""})
+        self.assertEqual(
+            fixed["preferences"]["deepgram"],
+            DEFAULT_CONFIG["preferences"]["deepgram"],
+        )
+        self.assertEqual(fixed["preferences"]["deepgram"]["keyterms"], "")
 
 
 if __name__ == "__main__":
