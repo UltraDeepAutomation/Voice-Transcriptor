@@ -10,10 +10,13 @@ import {
   observeCaptureFrame,
   summarizeCaptureLevel,
 } from "./audio-levels";
+import { decideLiveTranscriptAdoption } from "./live-coverage";
 import {
-  decideLiveTranscriptAdoption,
-  type LiveCoverageReport as LiveCoverage,
-} from "./live-coverage";
+  describeLiveFinalStats,
+  parseLiveFinalEnvelope,
+  type LiveFinalEnvelopeFields as LiveFinalEnvelopeBody,
+  type LiveFinalStats,
+} from "./live-envelope";
 import {
   computeEnvelopeDeadlineMs,
   envelopeMissing,
@@ -405,79 +408,16 @@ interface LiveSessionSnapshot {
 type LiveWsMode = "none" | "local-assist" | "deepgram-stream";
 
 /**
- * ``LiveCoverage`` is re-exported from ``./live-coverage``, which owns
- * both the shape and the policy that reads it. Emitted by the backend's
- * ``LiveSession.finalize_envelope`` and absent for every other transport
- * (Deepgram streams its own transcript and has no notion of windows).
+ * The stop envelope's fields, owned by ``./live-envelope`` — the
+ * renderer's half of a contract whose other half is
+ * ``backend/live_envelope.py``. Both halves are checked against one
+ * fixture, ``contracts/live-final-envelope.json``, which the backend's
+ * own builder produces.
  */
-interface LiveFinalEnvelopeFields {
-  text: string;
-  segments: TranscriptSegment[];
-  durationSec: number;
-  source: string;
-  error?: string;
-  coverage?: LiveCoverage;
-  /**
-   * Seconds where the backend's own interims recognised speech that no
-   * final segment covers (backend ``_uncovered_speech_sec``).
-   *
-   * Diagnostic only. It used to drive a renderer-side recovery
-   * escalation; the backend now closes those spans itself, before the
-   * envelope is sent, and reports what it re-decoded in
-   * ``stats.recovery``. A renderer that still escalated on this number
-   * would be re-decoding audio the envelope already accounts for.
-   */
-  uncoveredSpeechSec?: number;
-  /** PROTOCOL CONTRACT C5: seconds of audio the backend actually streamed to the provider (``bytes_sent / (2 * sampleRate)``). Diagnostic. */
-  streamedSec?: number;
-  /** PROTOCOL CONTRACT C5: the last second of audio a final segment covers. Diagnostic. */
-  coveredEndSec?: number;
-  /** What the session reports about itself — see ``LiveFinalStats``. */
-  stats?: LiveFinalStats;
-}
+type LiveFinalEnvelopeFields = LiveFinalEnvelopeBody<TranscriptSegment>;
 
-/**
- * ``LiveCoverage`` is re-exported from ``./live-coverage``, which owns
- * both the shape and the policy that reads it. Emitted by the backend's
- * ``LiveSession.finalize_envelope`` and absent for every other transport
- * (Deepgram streams its own transcript and has no notion of windows).
- */
+/** The same fields, as the stop path holds them (the ``type`` tag is gone). */
 type LiveFinalEnvelope = Omit<Extract<LiveWsMessage, { type: "final" }>, "type">;
-
-/**
- * The slice of the backend's ``stats`` dict the renderer reads.
- *
- * The envelope has carried a full ``stats`` object all along
- * (``LiveSession.stats.as_dict()``); the renderer never had a reason to
- * look inside it. Dual-stream Auto is that reason: whether the recording
- * was decoded by one Nova-3 stream or two is invisible in the transcript
- * and decides how to read every other number in a support log, so the
- * stop trace states it.
- *
- * ``stats.recovery`` is the second reason. The envelope is complete by
- * construction: whatever span of the recording the live stream left
- * uncovered, the backend re-decodes from its own audio spool before it
- * sends. That work is invisible in the transcript and it is the single
- * biggest term in how long a stop took, so the stop trace states how
- * many seconds were re-decoded and how long it cost.
- *
- * Only these fields are parsed, and only as numbers/booleans: anything
- * else in ``stats`` is the backend's business.
- *
- * The wire names, verified against the code that writes them:
- * ``stats.dual_stream`` (boolean, ``backend/deepgram_dual.py``),
- * ``stats.recovery.spans_sec`` and ``stats.recovery.ms`` (numbers,
- * ``backend/deepgram_recovery.py``). This is the single place to
- * correct if they ever move; a missing or malformed field reads as
- * absent, never as a fact and never as a crash.
- */
-interface LiveFinalStats {
-  dualStream?: boolean;
-  /** Seconds of the recording the backend re-decoded to close a gap. */
-  recoverySpansSec?: number;
-  /** What that re-decode cost, in ms — part of the announced budget. */
-  recoveryMs?: number;
-}
 
 /**
  * Discriminated union of server → client messages on /ws/transcribe.
@@ -510,43 +450,6 @@ type LiveWsMessage =
    * already have. One number, decided where the coverage data lives.
    */
   | { type: "finalizing"; budgetMs: number; expectsMore: boolean };
-
-/**
- * Parse a field that is only meaningful when the backend actually sent
- * a finite, non-negative number. Unlike the ``coverage`` fields (always
- * defaulted to 0 once ``complete`` is present), C5's ``uncoveredSpeechSec``
- * / ``streamedSec`` / ``coveredEndSec`` are independent top-level fields
- * that may be absent from an older backend — defaulting a missing value
- * to 0 would silently assert "fully covered" or "zero seconds streamed",
- * which is exactly the kind of false-complete signal BUGS_AUDIT_2026-09-03
- * §3.4 documents as dead-code-inducing. Absent stays absent.
- */
-function parseOptionalNonNegativeNumber(value: unknown): number | undefined {
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : undefined;
-}
-
-/**
- * ``stats.dual_stream`` and ``stats.recovery`` and nothing else. Absent
- * or malformed is absent — the same rule the C5 fields follow, for the
- * same reason: a protocol mismatch must never be read as a fact. Each
- * field stands on its own, so a backend that reports one and not the
- * other still gets the one it reports through.
- */
-function parseLiveFinalStats(raw: unknown): LiveFinalStats | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const stats: LiveFinalStats = {};
-  const dualStream = (raw as { dual_stream?: unknown }).dual_stream;
-  if (typeof dualStream === "boolean") stats.dualStream = dualStream;
-  const recovery = (raw as { recovery?: unknown }).recovery;
-  if (recovery && typeof recovery === "object") {
-    const spansSec = parseOptionalNonNegativeNumber((recovery as { spans_sec?: unknown }).spans_sec);
-    if (spansSec !== undefined) stats.recoverySpansSec = spansSec;
-    const ms = parseOptionalNonNegativeNumber((recovery as { ms?: unknown }).ms);
-    if (ms !== undefined) stats.recoveryMs = ms;
-  }
-  return Object.keys(stats).length ? stats : undefined;
-}
 
 function parseLiveWsMessage(raw: string): LiveWsMessage | null {
   let parsed: unknown;
@@ -583,44 +486,14 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
   }
 
   if (type === "final") {
-    const rawSegs = Array.isArray(obj.segments) ? obj.segments : [];
-    const segments = rawSegs
-      .map((s) => normalizeTranscriptSegment(s))
-      .filter((s): s is TranscriptSegment => !!s);
-    const error = typeof obj.error === "string" && obj.error ? obj.error : undefined;
-    // Coverage is only present on local-assist envelopes. It must be
-    // treated as absent unless the backend explicitly sent the boolean —
-    // a missing or malformed field can never be read as "complete", or a
-    // protocol mismatch would silently skip the full re-transcription
-    // that guarantees no words are lost.
-    const coverage: LiveCoverage | undefined =
-      typeof obj.complete === "boolean"
-        ? {
-            complete: obj.complete,
-            coveredSec: Math.max(0, Number(obj.coveredSec) || 0),
-            totalSec: Math.max(0, Number(obj.totalSec) || 0),
-            droppedSec: Math.max(0, Number(obj.droppedSec) || 0),
-            uncoveredTailSec: Math.max(0, Number(obj.uncoveredTailSec) || 0),
-          }
-        : undefined;
+    // One shape, read in one place (B-038). ``./live-envelope`` mirrors
+    // ``backend/live_envelope.py`` field for field and both are checked
+    // against the same committed fixture, so a backend that starts
+    // sending a different envelope fails a test rather than quietly
+    // handing the user a shorter transcript.
     return {
       type: "final",
-      text: String(obj.text || ""),
-      segments,
-      durationSec: Math.max(0, Number(obj.durationSec) || 0),
-      source: String(obj.source || ""),
-      error,
-      coverage,
-      // PROTOCOL CONTRACT C5: all three fields the backend documents on
-      // ``final`` must round-trip. ``uncoveredSpeechSec`` used to be
-      // dropped here even though the type declared it and downstream
-      // code read it — dead code (BUGS_AUDIT_2026-09-03 §3.4). All three
-      // stay absent (not defaulted to 0) when the backend does not send
-      // a valid number, so "no field" is never confused with "proven zero".
-      uncoveredSpeechSec: parseOptionalNonNegativeNumber(obj.uncoveredSpeechSec),
-      streamedSec: parseOptionalNonNegativeNumber(obj.streamedSec),
-      coveredEndSec: parseOptionalNonNegativeNumber(obj.coveredEndSec),
-      stats: parseLiveFinalStats(obj.stats),
+      ...parseLiveFinalEnvelope(obj, normalizeTranscriptSegment),
     };
   }
 
@@ -12871,11 +12744,13 @@ async function stopLive(
     // — invisible in the transcript, and the largest single term in how
     // long this stop took. Non-Deepgram stops have no envelope and read
     // 0/n-a.
-    const finalEnvelopeStats = liveFinalSlots.get(sessionUiToken)?.envelope?.stats;
-    const recoveryTrace = finalEnvelopeStats?.recoverySpansSec === undefined
-      ? "n/a"
-      : `${finalEnvelopeStats.recoverySpansSec.toFixed(2)}s/${(finalEnvelopeStats.recoveryMs ?? 0).toFixed(0)}ms`;
-    console.log(`[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} dual=${finalEnvelopeStats?.dualStream ? 1 : 0} recovery=${recoveryTrace}`);
+    const finalEnvelopeStats: LiveFinalStats | undefined =
+      liveFinalSlots.get(sessionUiToken)?.envelope?.stats;
+    console.log(
+      `[trace stopLive] FINAL ${traceTextStats("transcript", transcriptRaw)} ` +
+      `source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} ` +
+      `${describeLiveFinalStats(finalEnvelopeStats)}`,
+    );
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
     const noSpeechFinalStatus = "Recording completed, no speech detected.";
     const finalUiText = transcriptRaw || noSpeechFinalStatus;

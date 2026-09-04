@@ -64,6 +64,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
+from backend.live_envelope import envelope_from_result, live_final_stats
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 from backend.remote_deepgram import deepgram_transcribe
 from backend.remote_deepgram_live import (
@@ -706,6 +707,9 @@ async def run_recovery(
     out["durationSec"] = round(
         max((as_float(seg.get("end")) for seg in segments), default=0.0), 3
     )
+    # NOTE: the repaired payload is rebuilt through the one envelope
+    # constructor at the end of this function, so a field this pass
+    # forgets to carry over cannot silently disappear from the wire.
     # ``coveredEndSec`` is how far a DECODER reported: provider finals
     # and the REST re-decodes this pass just spliced, never an interim
     # hypothesis. Taking the merged end for both put them back in
@@ -722,10 +726,11 @@ async def run_recovery(
     out["uncoveredSpeechSec"] = round(
         sum(end - start for start, end in residual), 3
     )
-    stats = dict(payload.get("stats") or {})
-    stats["recovery"] = report.as_dict()
-    out["stats"] = stats
-    return out
+    out["stats"] = live_final_stats(payload.get("stats"), recovery=report.as_dict())
+    # One shape out, whatever came in: this pass is the last thing that
+    # touches a ``final`` envelope before it is sent, so it hands the
+    # wire the same constructor's output as an unrepaired stop (B-038).
+    return envelope_from_result(out, source=str(payload.get("source") or ""))
 
 
 __all__ = [

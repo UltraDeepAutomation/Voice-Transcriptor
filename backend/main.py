@@ -85,6 +85,13 @@ from backend.storage import (
     atomic_write_text,
 )
 from backend.live import LiveSession
+from backend.live_envelope import (
+    DEEPGRAM_LIVE_SOURCE,
+    LOCAL_ASSIST_SOURCE,
+    envelope_from_result,
+    live_coverage,
+    live_final_envelope,
+)
 from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
@@ -3937,14 +3944,10 @@ async def ws_transcribe(websocket: WebSocket):
                 )
                 await _ws_send_json(
                     websocket,
-                    {
-                        "type": "final",
-                        "text": "",
-                        "segments": [],
-                        "durationSec": 0.0,
-                        "source": "deepgram-live",
-                        "error": "Deepgram API key is not configured",
-                    },
+                    live_final_envelope(
+                        source=DEEPGRAM_LIVE_SOURCE,
+                        error="Deepgram API key is not configured",
+                    ),
                 )
                 _mark_recovery_error(recovery_ctx)
                 return
@@ -4592,23 +4595,43 @@ async def _run_local_live_session(
         final_state = session.finalize_envelope()
         await _ws_send_json(
             websocket,
-            {
-                "type": "final",
-                "text": final_state["text"],
-                "segments": final_state["segments"],
-                "durationSec": final_state["duration_sec"],
-                "source": "local-assist",
+            live_final_envelope(
+                source=LOCAL_ASSIST_SOURCE,
+                text=final_state["text"],
+                segments=final_state["segments"],
+                duration_sec=final_state["duration_sec"],
+                # How far a decoder reported. For the local assist that
+                # is exactly its covered window: everything it emitted
+                # came out of a Whisper pass, never an interim.
+                covered_end_sec=final_state["covered_sec"],
+                streamed_sec=final_state["total_sec"],
+                # ``uncoveredSpeechSec`` is left at its "nothing to
+                # report" value on purpose: it means "seconds where the
+                # provider's own INTERIMS recognised speech no final
+                # covered", and the local assist has no interims. What
+                # this transport genuinely knows about its gaps is in
+                # ``coverage`` below — the report the renderer's
+                # adoption policy actually reads.
                 # Coverage truth for this session. ``complete`` certifies
                 # that every captured second reached the model, which lets
                 # the frontend adopt this transcript instead of paying for
                 # a full re-transcription of the saved recording. See
                 # ``LiveSession.finalize_envelope`` for the definition.
-                "complete": final_state["complete"],
-                "coveredSec": final_state["covered_sec"],
-                "totalSec": final_state["total_sec"],
-                "droppedSec": final_state["dropped_sec"],
-                "uncoveredTailSec": final_state["uncovered_tail_sec"],
-            },
+                #
+                # B-038: these five numbers used to be FLAT keys on this
+                # envelope and on no other, which is what made ``final``
+                # three shapes instead of one. They are one report about
+                # one transport, so they travel as one object — and the
+                # transports that have no windows send ``null``, not
+                # nothing.
+                coverage=live_coverage(
+                    complete=final_state["complete"],
+                    covered_sec=final_state["covered_sec"],
+                    total_sec=final_state["total_sec"],
+                    dropped_sec=final_state["dropped_sec"],
+                    uncovered_tail_sec=final_state["uncovered_tail_sec"],
+                ),
+            ),
         )
 
 
@@ -5007,23 +5030,21 @@ async def _run_deepgram_live_session(
         # account's concurrency limit, so it is disposed of rather than
         # abandoned.
         await _discard_secondary_acquire(secondary_task)
+        # 1.1.25: route through ``_safe_error_text`` so this final
+        # envelope matches the redaction policy applied to the ``error``
+        # event a few lines above. Previously this path leaked raw
+        # Deepgram error bodies (which can include the upstream URL +
+        # token prefix) into the renderer payload.
         connect_error = _safe_error_text(e)
-        final_payload = {
-            "type": "final",
-            "text": "",
-            "segments": [],
-            "durationSec": 0.0,
-            "source": "deepgram-live",
-            # 1.1.25: route through ``_safe_error_text`` so this final
-            # envelope matches the redaction policy applied to the
-            # ``error`` event a few lines above. Previously this path
-            # leaked raw Deepgram error bodies (which can include the
-            # upstream URL + token prefix) into the renderer payload.
-            "error": connect_error,
-            "streamedSec": 0.0,
-            "coveredEndSec": 0.0,
-            "uncoveredSpeechSec": 0.0,
-        }
+        # The skeleton the recovery pass repairs: no reading exists, so
+        # every field takes its "nothing to report" value and the whole
+        # transcript comes from the re-decode below. Built through the
+        # same constructor as a successful stop — this used to be the
+        # THIRD of B-038's three shapes.
+        final_payload = live_final_envelope(
+            source=DEEPGRAM_LIVE_SOURCE,
+            error=connect_error,
+        )
         final_payload = await _apply_live_recovery(
             payload=final_payload,
             session=None,
@@ -5640,35 +5661,14 @@ async def _run_deepgram_live_session(
             # observed up to 5 s waiting for Deepgram to close) no longer
             # sits between the user and their transcript.
             drained = await session.drain_transcript(on_budget=_announce_budget)
-            final_payload = {
-                "type": "final",
-                "text": drained.get("text", ""),
-                "segments": drained.get("segments", []),
-                "durationSec": drained.get("durationSec", 0.0),
-                "source": "deepgram-live",
-                "stats": drained.get("stats"),
-                # Seconds where Deepgram's own interims recognised words
-                # that no final segment ever covered — holes inside the
-                # committed transcript, not trailing silence. Non-zero
-                # means the streamed text is provably incomplete and the
-                # frontend should re-transcribe the saved audio rather
-                # than deliver it. See
-                # ``DeepgramLiveSession._uncovered_speech_sec``.
-                "uncoveredSpeechSec": drained.get("uncoveredSpeechSec", 0.0),
-                # C5: bytes actually delivered to Deepgram, in seconds —
-                # lets the renderer tell "the mic captured N seconds"
-                # from "Deepgram actually processed N seconds" without
-                # guessing from durationSec alone (a session with a
-                # completely uncovered tail has durationSec short of
-                # what was streamed).
-                "streamedSec": drained.get("streamedSec", 0.0),
-                # End of the last finalized segment (post seam-merge) —
-                # the point up to which the transcript is a committed
-                # final, as opposed to spliced interim fallback or
-                # nothing. Paired with uncoveredSpeechSec/streamedSec so
-                # the renderer can judge coverage without re-deriving it.
-                "coveredEndSec": drained.get("coveredEndSec", 0.0),
-            }
+            # ``drain_transcript`` and ``partial_result`` return the same
+            # dict (C6), so both stop shapes reach the wire through one
+            # adapter. Field meanings live with the constructor
+            # (``backend.live_envelope``) rather than being restated at
+            # each call site in a slightly different subset.
+            final_payload = envelope_from_result(
+                drained, source=DEEPGRAM_LIVE_SOURCE
+            )
         except Exception as e:
             # ``str(e)`` can carry the upstream provider's raw error body
             # (Deepgram disconnect with "WebSocket: HTTP 401 Unauthorized
@@ -5696,18 +5696,9 @@ async def _run_deepgram_live_session(
                     "deepgram partial snapshot failed: %s", snapshot_error
                 )
                 partial = {}
-            final_payload = {
-                "type": "final",
-                "text": partial.get("text", ""),
-                "segments": partial.get("segments", []),
-                "durationSec": partial.get("durationSec", 0.0),
-                "source": "deepgram-live",
-                "error": finalize_error,
-                "stats": partial.get("stats"),
-                "uncoveredSpeechSec": partial.get("uncoveredSpeechSec", 0.0),
-                "streamedSec": partial.get("streamedSec", 0.0),
-                "coveredEndSec": partial.get("coveredEndSec", 0.0),
-            }
+            final_payload = envelope_from_result(
+                partial, source=DEEPGRAM_LIVE_SOURCE, error=finalize_error
+            )
 
         if upstream_fatal and session.last_error:
             final_payload["error"] = _safe_error_text(session.last_error)

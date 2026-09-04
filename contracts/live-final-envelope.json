@@ -1,0 +1,120 @@
+{
+  "deepgramStream": {
+    "type": "final",
+    "source": "deepgram-live",
+    "text": "Привет everybody. Это тест.",
+    "segments": [
+      {
+        "start": 0.08,
+        "end": 1.44,
+        "text": "Привет everybody.",
+        "speaker": 0,
+        "source": "deepgram",
+        "words": [
+          {
+            "word": "Привет",
+            "start": 0.08,
+            "end": 0.62,
+            "source": "deepgram"
+          },
+          {
+            "word": "everybody",
+            "start": 0.7,
+            "end": 1.44,
+            "source": "deepgram"
+          }
+        ]
+      },
+      {
+        "start": 2.1,
+        "end": 3.02,
+        "text": "Это тест.",
+        "source": "recovery",
+        "words": [
+          {
+            "word": "Это",
+            "start": 2.1,
+            "end": 2.4,
+            "source": "recovery"
+          },
+          {
+            "word": "тест",
+            "start": 2.45,
+            "end": 3.02,
+            "source": "recovery"
+          }
+        ]
+      }
+    ],
+    "durationSec": 3.02,
+    "coveredEndSec": 3.02,
+    "streamedSec": 3.5,
+    "uncoveredSpeechSec": 0.0,
+    "error": "",
+    "stats": {
+      "bytes_sent": 112000,
+      "bytes_offered": 112000,
+      "chunks_sent": 42,
+      "segments_final": 2,
+      "empty_finals": 1,
+      "segments_interim": 17,
+      "keepalives_sent": 0,
+      "connect_ms": 318.4,
+      "finalize_ms": 214.7,
+      "dual_stream": true,
+      "dual_secondary_language": "ru",
+      "dual_filled_from_secondary": 3,
+      "dual_filled_from_primary": 1,
+      "recovery": {
+        "spans": [
+          [
+            2.0,
+            3.1
+          ]
+        ],
+        "spans_sec": 1.1,
+        "ms": 412.5,
+        "words": 2
+      }
+    },
+    "coverage": null
+  },
+  "localAssist": {
+    "type": "final",
+    "source": "local-assist",
+    "text": "Hello from the local assist.",
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 1.9,
+        "text": "Hello from the local assist."
+      }
+    ],
+    "durationSec": 1.9,
+    "coveredEndSec": 1.9,
+    "streamedSec": 2.0,
+    "uncoveredSpeechSec": 0.0,
+    "error": "",
+    "stats": {},
+    "coverage": {
+      "complete": true,
+      "coveredSec": 2.0,
+      "totalSec": 2.0,
+      "droppedSec": 0.0,
+      "uncoveredTailSec": 0.0
+    }
+  },
+  "connectFailure": {
+    "type": "final",
+    "source": "deepgram-live",
+    "text": "",
+    "segments": [],
+    "durationSec": 0.0,
+    "coveredEndSec": 0.0,
+    "streamedSec": 0.0,
+    "uncoveredSpeechSec": 0.0,
+    "error": "Deepgram API key is not configured",
+    "stats": {},
+    "coverage": null
+  }
+}
