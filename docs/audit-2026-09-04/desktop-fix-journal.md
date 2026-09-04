@@ -688,3 +688,57 @@ mechanism rather than reading it.
   source in the manifest (`build.mac.minimumSystemVersion` is not set).
   Changing user-visible artwork copy is a product decision; recorded in "долг".
 
+---
+## Commit 13 — the documented hotkeys, and the SSOT pointer that pointed nowhere
+
+**IDs:** D-028 (P1), D-029 (P1), D-078 (P2).
+
+**Files:** `README.md`, `README.en.md`, `desktop/shortcut-defaults.test.js`,
+`AGENTS.md`.
+
+**Re-verified on current code before fixing:** yes — both READMEs still printed
+`F9` / `F10`, and `ls PRODUCT.md` still said no such file.
+
+**Verification**
+- The new README lock, run against the pre-fix documentation
+  (`git show HEAD:README*.md` in a scratch dir with the real manifest):
+  ```
+  ✖ the documented Windows/Linux hotkeys are the ones the app registers
+  ℹ tests 7 / pass 6 / fail 1
+  ```
+- D-078, the two weakened assertions, shown with a manifest a reviewer would
+  expect to be rejected:
+  ```
+  defaults {"record":"Ctrl+Alt+F10","paste":"Ctrl+Alt+Shift+V"}
+    OLD suite: pass 6  fail 0      <- fully green on a chord ending in F10
+    NEW suite: pass 5  fail 2
+
+  defaults {"record":"F10","paste":"F9"}   (the legacy pair, swapped)
+    OLD suite: pass 5  fail 1      <- "no bare F9/F10" PASSED
+    NEW suite: pass 4  fail 3
+  ```
+  The old `record !== "F9"` / `paste !== "F10"` pair is slot-specific, so the
+  legacy keys survive in the other slot; and "3+ modifier chords" checked
+  `parts.length >= 3`, which is two modifiers and a key.
+- D-029: every path AGENTS.md names now resolves —
+  `docs/PRODUCT.md`, `docs/VISION.md`, `.env.example`,
+  `desktop/package.json`, `.python-version`, `.nvmrc`,
+  `requirements.runtime-lock.txt`, `desktop/shortcut-defaults.json` — all OK.
+- `npm --prefix desktop test` -> `tests 221 / pass 221 / fail 0` (was 220).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *Chosen:* a test that reads the READMEs and asserts the manifest's current
+  defaults appear and the retired pair does not — rather than generating the
+  tables from `shortcut-defaults.json`. The READMEs are prose in two
+  languages with their own spelling of a chord (`Ctrl`, not Electron's
+  `Control`); generating them would need a templating step in a repo that has
+  none. The rendering rule lives in the test, in one function, and the test
+  is what fails when they drift.
+- *Chosen:* the "bare function key" check covers BOTH slots and consults
+  `legacy` for the values, so it cannot go stale against the manifest.
+- *Chosen:* AGENTS.md rule 4 now names `docs/PRODUCT.md` as the vision and
+  says what `docs/VISION.md` is, instead of leaving a reader to pick.
+
+**Not done in this commit:** nothing from this group.
+

@@ -8,11 +8,13 @@ repository.
 2. Do not add temporary hacks, hidden TODOs, duplicated logic, or parallel
    sources of truth.
 3. Do not delete logs unless the user explicitly asks for log deletion.
-4. Preserve SSOT boundaries. Product vision lives in `PRODUCT.md`; release
+4. Preserve SSOT boundaries. Product vision lives in `docs/PRODUCT.md`
+   (`docs/VISION.md` is the one-paragraph statement it expands); release
    environment variables live in `.env.example`; app version lives in
    `desktop/package.json`; the Python version lives in `.python-version`
    and the Node version in `.nvmrc`; the exact dependency versions the
-   shipped runtime is built with live in `requirements.runtime-lock.txt`.
+   shipped runtime is built with live in `requirements.runtime-lock.txt`;
+   the default hotkeys live in `desktop/shortcut-defaults.json`.
 5. Before edits, check `git status` and `git worktree list`, then keep changes
    atomic and commit only verified code.
 
