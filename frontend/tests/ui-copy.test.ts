@@ -3,7 +3,12 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint } from "../src/ui-copy";
+import {
+  UI_COPY,
+  applyStaticUiCopy,
+  renderAcceptedFormatsHint,
+  resultPaneTitle,
+} from "../src/ui-copy";
 
 /**
  * Every string below appeared on two surfaces — typed into
@@ -113,5 +118,36 @@ describe("renderAcceptedFormatsHint", () => {
     const el = doc.getElementById("uploadAcceptedFormats") as HTMLElement;
     expect(el.hidden).toBe(true);
     expect(el.textContent).toBe("");
+  });
+});
+
+describe("resultPaneTitle", () => {
+  const CAP = 60;
+
+  it("names the file being shown", () => {
+    expect(resultPaneTitle("interview.m4a", CAP)).toBe("Result · interview.m4a");
+  });
+
+  it("truncates a long name instead of dropping it", () => {
+    const long = "a".repeat(120);
+    const title = resultPaneTitle(long, CAP);
+    expect(title.startsWith(UI_COPY.upload.resultTitlePrefix)).toBe(true);
+    expect(title.length).toBeLessThanOrEqual(CAP);
+    expect(title.endsWith("…")).toBe(true);
+    expect(title).not.toBe(UI_COPY.upload.resultTitleEmpty);
+  });
+
+  it("keeps a name that exactly fits whole", () => {
+    const exact = "b".repeat(CAP - UI_COPY.upload.resultTitlePrefix.length);
+    expect(resultPaneTitle(exact, CAP)).toBe(`${UI_COPY.upload.resultTitlePrefix}${exact}`);
+  });
+
+  it("says just Result when there is no item", () => {
+    expect(resultPaneTitle("", CAP)).toBe(UI_COPY.upload.resultTitleEmpty);
+    expect(resultPaneTitle("   ", CAP)).toBe(UI_COPY.upload.resultTitleEmpty);
+  });
+
+  it("says just Result rather than a one-character name", () => {
+    expect(resultPaneTitle("interview.m4a", 10)).toBe(UI_COPY.upload.resultTitleEmpty);
   });
 });

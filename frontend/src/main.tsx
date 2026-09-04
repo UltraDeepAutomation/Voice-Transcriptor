@@ -36,7 +36,8 @@ import {
   dualStreamTradeOffText,
   resolveDualStreamPreference,
 } from "./deepgram-dual";
-import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint } from "./ui-copy";
+import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
+import { flashButtonFeedback } from "./button-feedback";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
 import { installErrorAwareConsole, isGenericFetchFailure } from "./error-text";
@@ -307,7 +308,6 @@ const RECORDING_COLLECTIONS = {
   uploads: "uploads",
 } as const;
 type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
-const RECORDING_VIEWER_AUDIO_READY_TIMEOUT_MS = 1500;
 
 interface TranscriptSegment {
   start: number;
@@ -939,6 +939,65 @@ const UI_TOKENS = {
   settings: {
     saveDebounceMs: 260,
   },
+  /**
+   * How long a button shows that it did the thing.
+   *
+   * One number, because it is one gesture: the two Copy buttons of
+   * History and the Result pane flashed for 900 ms through
+   * ``flashButtonFeedback`` while Upload's own Copy swapped its label
+   * for 1200 ms — two mechanics and two durations for one feedback.
+   */
+  feedback: {
+    flashMs: 900,
+  },
+  /**
+   * The session notice's life, as a three-step scale rather than four
+   * literals sprinkled through the file (6000, 7000, 7000 again as an
+   * argument that repeated the default, 9000).
+   *
+   * The steps differ by how much the user has to do about the message:
+   * a confirmation of something they just asked for is read at a
+   * glance; the default suits a sentence; something that happened
+   * without them asking — a recovered draft, a failed startup — has to
+   * survive them looking back at the screen.
+   */
+  notice: {
+    briefMs: 6_000,
+    defaultMs: 7_000,
+    longMs: 9_000,
+  },
+  /**
+   * History. The one sub-area of the UI that had no entry here at all,
+   * so its timings lived as bare literals inside the functions that
+   * used them and its two debounce steps could not be compared.
+   */
+  recordings: {
+    /** Longest wait for a <audio> element to report itself playable. */
+    viewerAudioReadyTimeoutMs: 1_500,
+    /** Cap on the first archive read, after which the view opens empty. */
+    bootstrapTimeoutMs: 15_000,
+    /** Coalescing window after a save, before the archive is re-read. */
+    deferredRefreshMs: 160,
+    /** Retry step while a recording or a stop is still in progress. */
+    deferredRefreshBusyRetryMs: 220,
+    /** Retry step when a refresh arrived while one was running. */
+    deferredRefreshCoalesceMs: 120,
+    /** How many chips the stats panel shows before it stops. */
+    statsTopProviders: 10,
+    statsTopLanguages: 8,
+  },
+  upload: {
+    /** Debounce on the queue snapshot PUT. */
+    queueSaveDebounceMs: 180,
+    /** Cap on the file name in the result pane's title. */
+    resultTitleMaxChars: 60,
+    /**
+     * Provider a queue item falls back to when the stored one is
+     * unreadable. Was written out at the fallback and again at two of
+     * its three callers.
+     */
+    defaultProvider: "deepgram",
+  },
   upscale: {
     livePasteReadyTimeoutMs: 3_000,
   },
@@ -1148,7 +1207,6 @@ const LEGACY_UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
 // backend UPLOAD_QUEUE_STATE_VERSION); gates the legacy-localStorage read.
 let uploadQueueServerVersion = 1;
 const LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
-const UPLOAD_QUEUE_SAVE_DEBOUNCE_MS = 180;
 /**
  * How many quarantined payloads are kept per prefix.
  *
@@ -2190,7 +2248,7 @@ function waitForRecordingViewerAudioReady(player: HTMLAudioElement): Promise<voi
     player.addEventListener("loadedmetadata", finish, { once: true });
     player.addEventListener("canplay", finish, { once: true });
     player.addEventListener("error", finish, { once: true });
-    timeoutId = window.setTimeout(finish, RECORDING_VIEWER_AUDIO_READY_TIMEOUT_MS);
+    timeoutId = window.setTimeout(finish, UI_TOKENS.recordings.viewerAudioReadyTimeoutMs);
   });
 }
 
@@ -2493,7 +2551,7 @@ async function renderLatestSavedAudio(): Promise<void> {
     // the pane's other failures appear rather than in a label the user
     // has to notice.
     setPlayerEnabled(false, AUDIO_LOAD_FAILED_TEXT);
-    showRecordSessionNotice(AUDIO_LOAD_FAILED_TEXT, "warning", 6000);
+    showRecordSessionNotice(AUDIO_LOAD_FAILED_TEXT, "warning", UI_TOKENS.notice.briefMs);
     return;
   }
   // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
@@ -2671,6 +2729,14 @@ function providerLabel(provider: string): string {
   if (value === "deepgram") return "Deepgram";
   return provider;
 }
+
+/**
+ * The order the three providers are shown in, wherever a list of them
+ * is shown. Was written out twice in a row inside the stats renderer,
+ * three lines apart, as the third copy of a fact already stated by
+ * ``providerLabel`` and by the ``Provider`` type.
+ */
+const PROVIDER_DISPLAY_ORDER: ReadonlyArray<string> = ["local", "openrouter", "deepgram"];
 
 function normalizeProviderSelection(value: unknown, fallback: Provider = "local"): Provider {
   const provider = String(value ?? "").trim();
@@ -2960,7 +3026,12 @@ function resetRecordSessionNotice(): void {
   $("recordSessionNoticeText").textContent = "";
 }
 
-function showRecordSessionNotice(message: string, tone: UiTone = "info", timeoutMs = 7000, sessionToken = ""): void {
+function showRecordSessionNotice(
+  message: string,
+  tone: UiTone = "info",
+  timeoutMs: number = UI_TOKENS.notice.defaultMs,
+  sessionToken = "",
+): void {
   if (!isCurrentUiSession(sessionToken)) return;
   const text = String(message || "").trim();
   if (!text) {
@@ -3082,7 +3153,7 @@ function renderCurrentRecordingSummary(
       const noticeKey = `${tone}::${status}`;
       if (noticeKey !== lastNoticedStatusKey) {
         lastNoticedStatusKey = noticeKey;
-        showRecordSessionNotice(status, tone, 7000, sessionToken);
+        showRecordSessionNotice(status, tone, UI_TOKENS.notice.defaultMs, sessionToken);
       }
     }
   }
@@ -3129,7 +3200,10 @@ function isMainProcessRecordingStatusActive(status = mainProcessRecordingStatus)
  *   five call sites compute a distinct label and it used to be received
  *   as `_reason` and dropped, so the labels described nothing.
  */
-function scheduleDeferredRecordingsRefresh(reason = "save", delayMs = 160): void {
+function scheduleDeferredRecordingsRefresh(
+  reason = "save",
+  delayMs: number = UI_TOKENS.recordings.deferredRefreshMs,
+): void {
   if (!deferredRecordingsRefreshPending) return;
   if (deferredRecordingsRefreshTimer) {
     window.clearTimeout(deferredRecordingsRefreshTimer);
@@ -3155,7 +3229,7 @@ function requestDeferredRecordingsRefresh(saved: SavedRecordingRef | null, reaso
 async function flushDeferredRecordingsRefresh(reason = "manual"): Promise<void> {
   if (!deferredRecordingsRefreshPending || deferredRecordingsRefreshInFlight) return;
   if (isBusy || stopTransitionInFlight || isRecording || recordingsUiLoading || isMainProcessRecordingStatusActive()) {
-    scheduleDeferredRecordingsRefresh(reason, 220);
+    scheduleDeferredRecordingsRefresh(reason, UI_TOKENS.recordings.deferredRefreshBusyRetryMs);
     return;
   }
 
@@ -3182,7 +3256,7 @@ async function flushDeferredRecordingsRefresh(reason = "manual"): Promise<void> 
     deferredRecordingsRefreshInFlight = false;
     deferredRecordingsRefreshLastSaved = null;
     if (deferredRecordingsRefreshPending) {
-      scheduleDeferredRecordingsRefresh("coalesced", 120);
+      scheduleDeferredRecordingsRefresh("coalesced", UI_TOKENS.recordings.deferredRefreshCoalesceMs);
     }
   }
 }
@@ -3293,7 +3367,7 @@ window.__transcriptorSetMainStatus = (status: string, kind?: StatusKind): boolea
   mainProcessRecordingStatus = String(status || "Idle").trim() || "Idle";
   setStatus(mainProcessRecordingStatus, kind);
   if (!isMainProcessRecordingStatusActive(mainProcessRecordingStatus)) {
-    scheduleDeferredRecordingsRefresh("main-status-release", 120);
+    scheduleDeferredRecordingsRefresh("main-status-release", UI_TOKENS.recordings.deferredRefreshCoalesceMs);
   }
   return true;
 };
@@ -5631,7 +5705,11 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       tone: "warning",
       savedName: recovered.name,
     });
-    showRecordSessionNotice("Recovered the last unsaved draft from a previous session.", "warning", 9000);
+    showRecordSessionNotice(
+      "Recovered the last unsaved draft from a previous session.",
+      "warning",
+      UI_TOKENS.notice.longMs,
+    );
     setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
     await clearLiveDraft(sessionId);
   } catch (e) {
@@ -6549,7 +6627,7 @@ function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSave
         if (plan.shouldRefreshRecordingsArchive) {
           setSettingsArchiveStatus(`Archive settings save failed: ${msg}`, "error");
         }
-        showRecordSessionNotice(`Settings were not saved: ${msg}`, "error", 7000);
+        showRecordSessionNotice(`Settings were not saved: ${msg}`, "error", UI_TOKENS.notice.defaultMs);
       }
     });
   return uiPrefInFlightChain;
@@ -7367,20 +7445,6 @@ function setRecordingsUiLoading(nextLoading: boolean): void {
   ($("recordingsSearchClearBtn") as HTMLButtonElement).disabled = recordingsUiLoading || !recordingsSearchQuery.trim();
 }
 
-function flashButtonFeedback(btn: HTMLButtonElement, copiedLabel: string, defaultTitle: string): void {
-  const prevAria = btn.getAttribute("aria-label") || defaultTitle;
-  const prevTitle = btn.title || defaultTitle;
-  btn.classList.remove("is-copy-ok", "is-copy-failed");
-  btn.classList.add(copiedLabel === "Copied" ? "is-copy-ok" : "is-copy-failed");
-  btn.setAttribute("aria-label", copiedLabel);
-  btn.title = copiedLabel;
-  window.setTimeout(() => {
-    btn.classList.remove("is-copy-ok", "is-copy-failed");
-    btn.setAttribute("aria-label", prevAria);
-    btn.title = prevTitle;
-  }, 900);
-}
-
 async function writeTextToClipboard(text: string): Promise<boolean> {
   const value = String(text || "");
   if (!value) return false;
@@ -7418,7 +7482,9 @@ async function copyRecordingText(): Promise<void> {
   if (!text) return;
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
   const ok = await writeTextToClipboard(text);
-  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", "Copy recording text");
+  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", "Copy recording text", {
+    durationMs: UI_TOKENS.feedback.flashMs,
+  });
 }
 
 async function copyTextContent(text: string, btnId = ""): Promise<void> {
@@ -7427,7 +7493,12 @@ async function copyTextContent(text: string, btnId = ""): Promise<void> {
   const ok = await writeTextToClipboard(value);
   if (btnId) {
     const btn = $(btnId) as HTMLButtonElement;
-    flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text");
+    flashButtonFeedback(
+      btn,
+      ok ? "Copied" : "Copy failed",
+      btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text",
+      { durationMs: UI_TOKENS.feedback.flashMs },
+    );
   }
 }
 
@@ -7882,23 +7953,24 @@ async function loadRecordingsStats(): Promise<void> {
     if (!key || key === "fal" || key === "fal.ai" || key === "falai") return;
     providerTotals.set(key, (providerTotals.get(key) || 0) + Number(p.count || 0));
   });
-  ["local", "openrouter", "deepgram"].forEach((key) => {
+  PROVIDER_DISPLAY_ORDER.forEach((key) => {
     if (!providerTotals.has(key)) providerTotals.set(key, 0);
   });
   const providerItems = Array.from(providerTotals.entries())
     .sort((a, b) => {
-      const order = ["local", "openrouter", "deepgram"];
-      const ia = order.indexOf(a[0]);
-      const ib = order.indexOf(b[0]);
+      const ia = PROVIDER_DISPLAY_ORDER.indexOf(a[0]);
+      const ib = PROVIDER_DISPLAY_ORDER.indexOf(b[0]);
       if (ia !== -1 || ib !== -1) return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
       return b[1] - a[1];
     })
-    .slice(0, 10)
+    .slice(0, UI_TOKENS.recordings.statsTopProviders)
     .map(([name, count]) => ({ name, count }));
   providerItems.forEach((p) => {
     const chip = document.createElement("span");
     chip.className = "word-chip";
-    chip.textContent = `${p.name} (${p.count})`;
+    // The list badges say "Deepgram" through providerLabel; the stats
+    // chips said "deepgram". Both are on screen at once.
+    chip.textContent = `${providerLabel(p.name)} (${p.count})`;
     providers.appendChild(chip);
   });
 
@@ -7917,7 +7989,7 @@ async function loadRecordingsStats(): Promise<void> {
       if (b[0] === "auto") return 1;
       return b[1] - a[1];
     })
-    .slice(0, 8)
+    .slice(0, UI_TOKENS.recordings.statsTopLanguages)
     .map(([name, count]) => ({ name, count }));
   languageItems.forEach((l) => {
     const chip = document.createElement("span");
@@ -11873,7 +11945,12 @@ async function stopLive(
           tone: "success",
           savedName: persistedRecordingName,
         }, sessionUiToken);
-        showRecordSessionNotice("Recording audio is saved and available immediately.", "success", 6000, sessionUiToken);
+        showRecordSessionNotice(
+          "Recording audio is saved and available immediately.",
+          "success",
+          UI_TOKENS.notice.briefMs,
+          sessionUiToken,
+        );
         saveDone = true;
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e || "");
@@ -12904,7 +12981,11 @@ async function initRecordingsBootstrap(): Promise<void> {
 // Level 1 of the update story: answer "is there a newer GitHub release?"
 // and link to it. Silent auto-install is blocked on Apple Developer ID
 // signing and stays out of scope until that exists.
-const UPDATE_CHECK_CACHE_KEY = "transcriptor.updateCheck.lastCheckedAt";
+// Versioned like every other key the renderer owns
+// (``transcriptor.<what>.v<n>``): the suffix is what lets a build that
+// changes the payload's shape ignore the previous one instead of
+// misreading it. This key alone carried no version.
+const UPDATE_CHECK_CACHE_KEY = "transcriptor.updateCheck.lastCheckedAt.v1";
 const updateStatusEl = document.getElementById("updateCheckStatus");
 const updateBtnEl = document.getElementById("updateCheckBtn") as HTMLButtonElement | null;
 
@@ -12999,7 +13080,7 @@ void loadCfgOnce()
     console.warn("Startup configuration pipeline failed", e);
     const msg = sanitizeUiErrorMessage(e, "Startup setup failed.");
     setStatus(`Startup setup failed: ${msg}`, "warning");
-    showRecordSessionNotice(`Startup setup failed: ${msg}`, "warning", 9000);
+    showRecordSessionNotice(`Startup setup failed: ${msg}`, "warning", UI_TOKENS.notice.longMs);
   });
 renderTranscriptionSelectors();
 syncAutoSendEnterLabel();
@@ -13048,7 +13129,10 @@ window.addEventListener("pagehide", () => {
 recordingsBootstrapPromise = Promise.race([
   initRecordingsBootstrap(),
   new Promise<void>((_, rej) =>
-    setTimeout(() => rej(new Error("recordings bootstrap timeout (15 s)")), 15000)
+    setTimeout(
+      () => rej(new Error(`recordings bootstrap timeout (${UI_TOKENS.recordings.bootstrapTimeoutMs} ms)`)),
+      UI_TOKENS.recordings.bootstrapTimeoutMs,
+    )
   ),
 ])
   .catch((e) => { console.warn("[bootstrap]", e?.message ?? e); })
@@ -13444,7 +13528,7 @@ function normalizeUploadProvider(value: unknown): Provider {
   const provider = String(value || "").trim();
   return provider === "local" || provider === "openrouter" || provider === "deepgram"
     ? provider
-    : "deepgram";
+    : UI_TOKENS.upload.defaultProvider;
 }
 
 function currentUploadTranscriptionOptions(): {
@@ -13705,7 +13789,7 @@ function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): 
       model: String(src.model || ""),
       language: String(src.language || ""),
       audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),
-      requestedProvider: normalizeUploadProvider(src.requestedProvider || src.provider || "deepgram"),
+      requestedProvider: normalizeUploadProvider(src.requestedProvider || src.provider),
       requestedModel: String(src.requestedModel || ""),
       requestedLanguage: String(src.requestedLanguage || src.language || "auto"),
       requestedDiarize: src.requestedDiarize === true,
@@ -13747,7 +13831,7 @@ function saveUploadQueueSnapshot(): void {
   uploadQueueSaveTimer = window.setTimeout(() => {
     uploadQueueSaveTimer = null;
     void flushUploadQueueSnapshotNow();
-  }, UPLOAD_QUEUE_SAVE_DEBOUNCE_MS);
+  }, UI_TOKENS.upload.queueSaveDebounceMs);
 }
 
 function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | null {
@@ -14151,7 +14235,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       }
     }, _stageCrossoverDelay)
     : 0;
-  const selectedProvider = normalizeUploadProvider(item.requestedProvider || item.provider || "deepgram");
+  const selectedProvider = normalizeUploadProvider(item.requestedProvider || item.provider);
   // Upload is a batch workflow: if the selected remote provider is
   // unavailable or has no key, keep the file moving through Local
   // Whisper instead of failing every queued item.
@@ -14667,8 +14751,10 @@ function renderUploadQueue(): void {
         ev.stopPropagation();
         void (async () => {
           const ok = await writeTextToClipboard(uploadItemResultText(item));
-          copyBtn.textContent = ok ? "Copied" : "Copy failed";
-          setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+            durationMs: UI_TOKENS.feedback.flashMs,
+            swapLabel: true,
+          });
         })();
       });
       actions.appendChild(copyBtn);
@@ -14721,16 +14807,13 @@ function renderUploadResultPane(): void {
   if (!item) {
     textEl.textContent = "";
     metaEl.hidden = true;
-    if (titleEl) titleEl.textContent = "Result";
+    if (titleEl) titleEl.textContent = UI_COPY.upload.resultTitleEmpty;
     if (copyBtn) copyBtn.hidden = true;
     if (revealBtn) revealBtn.hidden = true;
     return;
   }
   if (titleEl) {
-    const itemName = uploadItemName(item);
-    titleEl.textContent = `Result · ${itemName}`.length > 60
-      ? "Result"
-      : `Result · ${itemName}`;
+    titleEl.textContent = resultPaneTitle(uploadItemName(item), UI_TOKENS.upload.resultTitleMaxChars);
   }
   if (item.status === "done") {
     const resultText = uploadItemResultText(item);
@@ -14761,7 +14844,9 @@ function renderUploadResultPane(): void {
       copyBtn.onclick = () => {
         void (async () => {
           const ok = await writeTextToClipboard(uploadItemResultText(item!));
-          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript");
+          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+            durationMs: UI_TOKENS.feedback.flashMs,
+          });
         })();
       };
     }

@@ -50,6 +50,9 @@ export const UI_COPY = {
      * markup and on the one the retry path constructs.
      */
     fileAccept: "audio/*,video/*",
+    /** Result-pane title while nothing is selected. */
+    resultTitleEmpty: "Result",
+    resultTitlePrefix: "Result · ",
   },
 } as const;
 
@@ -115,4 +118,22 @@ export function renderAcceptedFormatsHint(doc: Document, exts: Iterable<string>)
   }
   (el as HTMLElement).hidden = false;
   el.textContent = labels.join(" · ");
+}
+
+/**
+ * The Upload result pane's title.
+ *
+ * A long file name used to collapse the title to a bare "Result",
+ * which is the one thing it must never say while an item IS selected:
+ * the pane's whole job is to tell the user which of twenty queued files
+ * they are reading. Truncating the name is the answer
+ * ``uploadDisplayPreviewFromText`` already gives one line below.
+ */
+export function resultPaneTitle(itemName: string, maxChars: number): string {
+  const name = String(itemName || "").trim();
+  if (!name) return UI_COPY.upload.resultTitleEmpty;
+  const prefix = UI_COPY.upload.resultTitlePrefix;
+  const budget = maxChars - prefix.length;
+  if (budget < 2) return UI_COPY.upload.resultTitleEmpty;
+  return name.length > budget ? `${prefix}${name.slice(0, budget - 1)}…` : `${prefix}${name}`;
 }

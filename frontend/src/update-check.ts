@@ -68,6 +68,19 @@ export function parseLatestRelease(payload: unknown): LatestRelease | null {
   return { version, htmlUrl };
 }
 
+/**
+ * How long the GitHub call may take before it is abandoned.
+ *
+ * The module's other timing — ``CHECK_INTERVAL_MS`` — is named and
+ * declared; this one was an inline literal in the middle of a fetch
+ * options object, so "how long does the update check take at worst"
+ * could not be answered by reading the two constants of the module.
+ * A failed check is silent by design (``status: "unknown"``), so this
+ * is a bound on a background request nobody is waiting for, not a
+ * user-facing deadline.
+ */
+const REQUEST_TIMEOUT_MS = 8_000;
+
 export type UpdateCheckResult =
   | { status: "update-available"; latest: LatestRelease }
   | { status: "up-to-date" }
@@ -86,7 +99,7 @@ export async function checkForUpdate(
       `https://api.github.com/repos/${meta.repoSlug}/releases/latest`,
       {
         headers: { Accept: "application/vnd.github+json" },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       },
     );
     if (!res.ok) {
