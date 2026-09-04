@@ -7,9 +7,7 @@
 
 const { execFileSync } = require("node:child_process");
 const path = require("node:path");
-const { hasSigningIdentity } = require("./scripts/macos-signing-utils");
-
-const DEFAULT_INTERNAL_SIGNING_IDENTITY = "AntigravityTelegramDev";
+const { hasSigningIdentity, resolveSigningPlan } = require("./scripts/macos-signing-utils");
 
 function isDmgArtifact(artifactPath) {
   return path.extname(String(artifactPath || "")).toLowerCase() === ".dmg";
@@ -55,9 +53,10 @@ exports.default = async function afterAllArtifactBuild(buildResult) {
     return [];
   }
 
-  const requestedIdentity = String(
-    process.env.TRANSCRIPTOR_SIGNING_IDENTITY || DEFAULT_INTERNAL_SIGNING_IDENTITY,
-  ).trim();
+  // The same signing decision afterPack.js made — identity, Developer ID
+  // or not, and therefore the timestamp policy. It used to be derived a
+  // second time here, with its own copy of the default identity name.
+  const { requestedIdentity, timestampArg } = resolveSigningPlan(process.env);
   if (!hasSigningIdentity(requestedIdentity)) {
     throw new Error(
       `afterAllArtifactBuild: missing signing identity "${requestedIdentity}". ` +
@@ -65,8 +64,6 @@ exports.default = async function afterAllArtifactBuild(buildResult) {
     );
   }
 
-  const isDeveloperIdIdentity = /^Developer ID Application:/i.test(requestedIdentity);
-  const timestampArg = isDeveloperIdIdentity ? "--timestamp" : "--timestamp=none";
   for (const dmgPath of dmgArtifacts) {
     signDmg(dmgPath, requestedIdentity, timestampArg);
   }

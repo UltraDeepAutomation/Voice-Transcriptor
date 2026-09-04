@@ -130,17 +130,139 @@ function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// ── One signing decision, in one place ────────────────────────────────
+//
+// "Which identity, is it a Developer ID, and therefore which timestamp
+// policy and which entitlements profile" was derived independently in
+// afterPack.js and afterAllArtifactBuild.js, each with its own hardcoded
+// default identity name. Two copies of one decision is how a release
+// ends up half self-signed. Both hooks now call resolveSigningPlan.
+//
+// There is deliberately NO built-in default identity: a build must say
+// what it is signing with. BUILD.command names the internal identity for
+// internal builds; a public release sets TRANSCRIPTOR_SIGNING_IDENTITY to
+// a "Developer ID Application: …" certificate.
+
+/** True for a real Apple Developer ID Application certificate name. */
+function isDeveloperIdIdentity(identity) {
+  return /^Developer ID Application:/i.test(String(identity || "").trim());
+}
+
+/**
+ * The whole signing decision, derived from the environment. Pure: no
+ * keychain access, so it is testable without a Mac keychain. The caller
+ * is responsible for checking the identity actually exists
+ * (`hasSigningIdentity`), because that is the part that needs a keychain.
+ *
+ * @returns {{identity: string, requestedIdentity: string, adhoc: boolean,
+ *            developerId: boolean, timestampArg: string,
+ *            entitlementsProfile: "developer-id"|"self-signed"}}
+ */
+function resolveSigningPlan(env = process.env) {
+  const requestedIdentity = String(env.TRANSCRIPTOR_SIGNING_IDENTITY || "").trim();
+  const adhoc = env.TRANSCRIPTOR_ALLOW_ADHOC_SIGN === "1";
+  if (!adhoc && !requestedIdentity) {
+    throw new Error(
+      "macOS signing: set TRANSCRIPTOR_SIGNING_IDENTITY to the certificate to sign with " +
+        '("Developer ID Application: …" for a public release), or set ' +
+        "TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 for a throwaway local build. " +
+        "There is no built-in default identity: a build must say what signed it.",
+    );
+  }
+  const developerId = !adhoc && isDeveloperIdIdentity(requestedIdentity);
+  return {
+    identity: adhoc ? "-" : requestedIdentity,
+    requestedIdentity,
+    adhoc,
+    developerId,
+    // Notarization requires secure timestamps. Internal/self-signed and
+    // ad-hoc builds are not Gatekeeper-trusted artifacts and must not
+    // fail on an Apple timestamp-service outage.
+    timestampArg: developerId ? "--timestamp" : "--timestamp=none",
+    // Only a self-signed certificate (empty Team ID) needs the library
+    // validation relaxations — see entitlements.mac.selfsigned.plist.
+    entitlementsProfile: developerId ? "developer-id" : "self-signed",
+  };
+}
+
+/**
+ * The self-signed variant of an entitlements filename declared in
+ * package.json: `entitlements.mac.plist` ->
+ * `entitlements.mac.selfsigned.plist`, `entitlements.mac.inherit.plist`
+ * -> `entitlements.mac.selfsigned.inherit.plist`.
+ *
+ * One derivation rule rather than a second list of filenames, so adding
+ * a profile cannot leave the two lists disagreeing.
+ */
+function selfSignedEntitlementsPath(declaredPath) {
+  const name = String(declaredPath || "");
+  if (!/^entitlements\.mac\./.test(name)) {
+    throw new Error(
+      `macOS signing: cannot derive a self-signed entitlements profile from "${name}" — ` +
+        'expected a name beginning "entitlements.mac.".',
+    );
+  }
+  return name.replace(/^entitlements\.mac\./, "entitlements.mac.selfsigned.");
+}
+
+/**
+ * The exact `codesign` argument list for ONE bundled Mach-O file.
+ *
+ * Every Mach-O inside the app — executables, dylibs and Python extension
+ * bundles alike — must carry the SAME identity, the hardened runtime and
+ * the same entitlements, or notarization rejects the package file by
+ * file ("not signed with a valid Developer ID certificate" / "does not
+ * have the hardened runtime enabled"). This used to sign executables
+ * with the requested identity and everything else — every `.so` in
+ * site-packages, `libpython` itself — ad-hoc with "-", and added
+ * `--options runtime` only to the executables. Locally that is invisible:
+ * `codesign --verify --deep --strict` accepts ad-hoc signatures, so the
+ * build looked clean and only notarization would have found it.
+ */
+function runtimeSignArgs({ filePath, identity, entitlements, timestampArg = "--timestamp" }) {
+  if (!filePath) throw new Error("runtimeSignArgs: filePath is required");
+  if (!identity) throw new Error("runtimeSignArgs: identity is required");
+  if (!entitlements) throw new Error("runtimeSignArgs: entitlements is required");
+  const args = ["--force", "--sign", identity, "--options", "runtime", "--entitlements", entitlements];
+  // An ad-hoc signature has no certificate to timestamp against.
+  if (identity !== "-") args.push(timestampArg);
+  args.push(filePath);
+  return args;
+}
+
+/**
+ * Names of the codesigning identities the keychain currently offers.
+ * `security find-identity` prints them as `  1) <sha1> "<name>"`.
+ *
+ * A failure of `security` itself (locked keychain, missing binary) is
+ * NOT "the identity is absent": reporting it as such told a user who had
+ * set TRANSCRIPTOR_SIGNING_IDENTITY correctly to go and set it. It is
+ * raised so the real cause reaches the build log.
+ */
+function listSigningIdentities() {
+  let out;
+  try {
+    out = execSync("/usr/bin/security find-identity -v -p codesigning", { encoding: "utf8" });
+  } catch (e) {
+    const stderr = e && e.stderr ? e.stderr.toString().trim() : "";
+    throw new Error(
+      "macOS signing: could not read the keychain's codesigning identities " +
+        "(`security find-identity -v -p codesigning` failed — a locked keychain is the usual cause). " +
+        `${stderr || (e && e.message) || e}`,
+    );
+  }
+  return [...String(out).matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+}
+
+/**
+ * Whether the keychain holds an identity with exactly this name.
+ * Exact, not substring: "Developer ID Application: Acme" must not be
+ * satisfied by "Developer ID Application: Acme Holdings".
+ */
 function hasSigningIdentity(identity) {
   const wanted = String(identity || "").trim();
   if (!wanted) return false;
-  try {
-    const out = execSync("/usr/bin/security find-identity -v -p codesigning", {
-      encoding: "utf8",
-    });
-    return out.includes(`"${wanted}"`);
-  } catch {
-    return false;
-  }
+  return listSigningIdentities().includes(wanted);
 }
 
 function hasCertificateIdentity(identity) {
@@ -218,20 +340,41 @@ function plistSetString(plistPath, key, value) {
   runPlistBuddy(plistPath, `Add :${key} string ${value}`);
 }
 
-function normalizeMacPrivacyUsageDescriptions(appPath, { log = console.log } = {}) {
+/** Info.plist keys whose text is declared by build.<platform>.extendInfo. */
+const REQUIRED_USAGE_DESCRIPTION_KEYS = Object.freeze([
+  "NSMicrophoneUsageDescription",
+  "NSAppleEventsUsageDescription",
+]);
+
+/**
+ * @param {object} extendInfo `build.mac.extendInfo` / `build.mas.extendInfo`
+ *   from desktop/package.json — the SSOT for these strings. They used to
+ *   be retyped here as JS literals, which silently overwrote whatever
+ *   electron-builder had already written from extendInfo: editing the
+ *   obvious place (package.json) changed nothing in the shipped bundle,
+ *   and the first localisation or App Review rewording would have looked
+ *   like "the change did not apply".
+ */
+function normalizeMacPrivacyUsageDescriptions(appPath, { extendInfo, log = console.log } = {}) {
   const infoPlist = path.join(appPath, "Contents", "Info.plist");
   if (!existsSync(infoPlist)) {
     throw new Error(`Info.plist not found: ${infoPlist}`);
   }
 
-  const microphoneUsage = "Transcriptor records microphone audio when you start a live transcription.";
-  plistSetString(infoPlist, "NSMicrophoneUsageDescription", microphoneUsage);
-  plistSetString(infoPlist, "NSAudioCaptureUsageDescription", microphoneUsage);
-  plistSetString(
-    infoPlist,
-    "NSAppleEventsUsageDescription",
-    "Transcriptor uses Apple Events to paste transcripts into the app you are working in.",
-  );
+  const declared = extendInfo && typeof extendInfo === "object" ? extendInfo : {};
+  for (const key of REQUIRED_USAGE_DESCRIPTION_KEYS) {
+    const value = String(declared[key] || "").trim();
+    if (!value) {
+      throw new Error(
+        `build.<platform>.extendInfo.${key} is required in desktop/package.json — ` +
+          "it is the source of the string macOS shows in the permission prompt.",
+      );
+    }
+    plistSetString(infoPlist, key, value);
+  }
+  // Electron's audio-capture prompt reuses the microphone wording; it is
+  // the same permission being explained, so it is derived, not declared.
+  plistSetString(infoPlist, "NSAudioCaptureUsageDescription", declared.NSMicrophoneUsageDescription);
 
   // Electron injects generic Camera/Bluetooth prompts by default, but
   // Transcriptor only captures microphone audio. Shipping unused usage
@@ -292,17 +435,15 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
     }
   };
   const signOne = (filePath, kind) => {
-    const signIdentity = kind === "executable" ? identity : "-";
-    const args = ["--force", "--sign", signIdentity];
-    if (signIdentity !== "-") args.push(timestampArg);
-    if (kind === "executable") {
-      args.push("--options", "runtime", "--entitlements", entitlements);
-      execCount += 1;
-    } else {
-      dylibCount += 1;
-    }
-    args.push(filePath);
-    let lastError = "";
+    // One identity, one options set, for every Mach-O — see runtimeSignArgs.
+    const args = runtimeSignArgs({ filePath, identity, entitlements, timestampArg });
+    if (kind === "executable") execCount += 1;
+    else dylibCount += 1;
+    // Every attempt's stderr is kept: codesign's first failure is often
+    // the informative one (wrong entitlements, unreadable file) and the
+    // later ones only say "resource busy". Keeping just the last one
+    // threw away the diagnosis for a build that is now dead anyway.
+    const failures = [];
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       removeExistingSignature(filePath);
       removeBuildOnlyXattrs(filePath);
@@ -311,12 +452,14 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
         signedCount += 1;
         return;
       } catch (e) {
-        const stderr = e && e.stderr ? e.stderr.toString() : "";
-        lastError = stderr || (e.message || String(e));
+        const stderr = e && e.stderr ? e.stderr.toString().trim() : "";
+        failures.push(`attempt ${attempt}: ${stderr || (e.message || String(e))}`);
         if (attempt < 5) sleepMs(150 * attempt);
       }
     }
-    throw new Error(`codesign failed for ${filePath}\n${lastError}`);
+    throw new Error(
+      `codesign failed for ${filePath}\n  args: ${args.join(" ")}\n${failures.join("\n")}`,
+    );
   };
   walkTree(runtimeRoot, (entryPath, st) => {
     if (!st.isFile()) return;
@@ -332,15 +475,21 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
 }
 
 module.exports = {
+  REQUIRED_USAGE_DESCRIPTION_KEYS,
   assertNoBundledBytecode,
   classifyMacho,
   hardenAppTransportSecurity,
   hasCertificateIdentity,
   hasSigningIdentity,
+  isDeveloperIdIdentity,
+  listSigningIdentities,
   makeBundledPythonImportsReadOnly,
   normalizeMacPrivacyUsageDescriptions,
   pathIsInside,
   preSignRuntimeBinaries,
+  resolveSigningPlan,
+  runtimeSignArgs,
+  selfSignedEntitlementsPath,
   shouldIgnoreOsxSignPath,
   walkTree,
 };

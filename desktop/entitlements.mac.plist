@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		Developer ID profile — the entitlements a PUBLIC, notarized
+		release ships with. Declared in desktop/package.json
+		(build.mac.entitlements), which afterPack.js reads rather than
+		naming a file of its own.
+
+		This profile deliberately does NOT contain
+		com.apple.security.cs.disable-library-validation or
+		com.apple.security.cs.allow-unsigned-executable-memory. Both
+		exist only to work around a self-signed certificate's EMPTY
+		TeamIdentifier, which makes dyld4 treat the app and the Electron
+		Framework as having "different Team IDs" under hardened-runtime
+		library validation. A real Developer ID certificate has a
+		non-empty Team ID, every Mach-O in the bundle — Electron
+		Framework, helpers, and every bundled Python .so and dylib — is
+		signed with it, and library validation passes on its own.
+
+		Shipping those two relaxations to the public would permanently
+		disable library validation in the released binary (any dylib
+		would be accepted) and grant W+X memory, for a reason that does
+		not apply to that build. `allow-jit` covers what V8 actually
+		needs and is kept.
+
+		The self-signed build gets entitlements.mac.selfsigned.plist,
+		selected by afterPack.js from the identity itself, so neither
+		profile can be used for the wrong kind of build.
+	-->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

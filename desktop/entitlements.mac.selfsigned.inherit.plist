@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- See entitlements.mac.plist for a detailed rationale. Helper
+  <!-- Self-signed profile for nested helpers, frameworks and the
+       bundled Python runtime. See entitlements.mac.selfsigned.plist for
+       the detailed rationale. Helper
        processes also need disable-library-validation under the
        hardened runtime when the app is signed with a self-signed
        certificate, because each helper independently loads the

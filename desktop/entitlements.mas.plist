@@ -2,9 +2,26 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+		Mac App Store profile. The app runs its own backend: uvicorn
+		bind()s a loopback socket (see desktop/main.js buildPythonEnv /
+		startBackend). In the App Sandbox, LISTENING on a socket needs
+		com.apple.security.network.server; network.client only covers
+		outbound connections, so without the server entitlement bind()
+		fails with EPERM and the app goes straight to its backend-error
+		screen. The child process inherits the sandbox via
+		entitlements.mas.inherit.plist, so it needs the same right.
+
+		Note for whoever takes the MAS branch further:
+		com.apple.security.automation.apple-events is accepted by App
+		Review only as a temporary exception with a written
+		justification — see the debt ledger.
+	-->
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
 	<key>com.apple.security.network.client</key>
+	<true/>
+	<key>com.apple.security.network.server</key>
 	<true/>
 	<key>com.apple.security.device.microphone</key>
 	<true/>

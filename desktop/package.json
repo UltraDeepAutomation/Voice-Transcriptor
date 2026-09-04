@@ -41,6 +41,7 @@
     "productName": "Transcriptor",
     "afterPack": "./afterPack.js",
     "afterAllArtifactBuild": "./afterAllArtifactBuild.js",
+    "publish": null,
     "files": [
       "main.js",
       "accelerator.js",

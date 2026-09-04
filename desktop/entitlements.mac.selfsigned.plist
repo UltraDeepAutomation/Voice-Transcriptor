@@ -3,6 +3,13 @@
 <plist version="1.0">
 <dict>
 	<!--
+		Self-signed profile — INTERNAL builds only.
+
+		Selected by afterPack.js when the signing identity is not a
+		"Developer ID Application: …" certificate. The public,
+		notarized profile is entitlements.mac.plist and deliberately
+		omits the two relaxations below.
+
 		Hardened runtime + self-signed Team ID workaround.
 
 		When the app is signed with a self-signed certificate (i.e. any
@@ -18,7 +25,7 @@
 		    different Team IDs
 
 		at launch, even though Transcriptor.app and Electron Framework
-		are both signed by the same AntigravityTelegramDev certificate.
+		are both signed by the same self-signed certificate.
 
 		The official Apple-sanctioned way to opt out of library
 		validation is the com.apple.security.cs.disable-library-
@@ -29,11 +36,11 @@
 		documentation recommends this entitlement when shipping
 		outside a notarized Developer ID workflow.
 
-			Keeping this entitlement here is the SSOT for the top-level app.
-			afterPack.js passes entitlements.mac.plist to Transcriptor.app
-			and entitlements.mac.inherit.plist to nested helpers/frameworks,
-			because each helper also loads Electron Framework under the
-			same hardened-runtime library-validation path.
+		afterPack.js passes this file to Transcriptor.app and
+		entitlements.mac.selfsigned.inherit.plist to nested helpers,
+		frameworks and the bundled Python runtime, because each helper
+		also loads Electron Framework under the same hardened-runtime
+		library-validation path.
 	-->
 	<key>com.apple.security.cs.disable-library-validation</key>
 	<true/>

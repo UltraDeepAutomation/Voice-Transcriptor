@@ -54,6 +54,40 @@ cleanup_release_output
 cleanup_stale_install_backups "/Applications"
 cleanup_stale_install_backups "$HOME/Applications"
 
+# ---------------------------------------------------------------------------
+#  Signing mode - stated, never guessed
+# ---------------------------------------------------------------------------
+#  The build hooks have no built-in signing identity any more: the name of
+#  a specific developer's self-signed key used to be the DEFAULT in two
+#  source files, so ./BUILD.command could not run on any other machine and
+#  a "release" it produced was quietly self-signed, un-notarized, and
+#  installable only by stripping the quarantine attribute.
+#
+#    TRANSCRIPTOR_SIGNING_IDENTITY="Developer ID Application: ..."  public release
+#    TRANSCRIPTOR_SIGNING_IDENTITY="<keychain identity>"            internal build
+#    TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1                                throwaway local build
+#
+#  Default when nothing is set: the internal identity below, which is what
+#  this repository's own machine has. It is named here, once, instead of
+#  being embedded in the signing code.
+INTERNAL_SIGNING_IDENTITY="AntigravityTelegramDev"
+if [ "${TRANSCRIPTOR_ALLOW_ADHOC_SIGN:-}" != "1" ]; then
+  export TRANSCRIPTOR_SIGNING_IDENTITY="${TRANSCRIPTOR_SIGNING_IDENTITY:-$INTERNAL_SIGNING_IDENTITY}"
+  case "$TRANSCRIPTOR_SIGNING_IDENTITY" in
+    "Developer ID Application: "*)
+      echo "Signing identity: $TRANSCRIPTOR_SIGNING_IDENTITY (public release)"
+      echo "Remember to notarize before distributing: npm --prefix desktop run notarize:dmg"
+      ;;
+    *)
+      echo "Signing identity: $TRANSCRIPTOR_SIGNING_IDENTITY (internal build)"
+      echo "WARNING: this artifact is NOT notarized. Gatekeeper will refuse it on"
+      echo "         another Mac unless the installer strips the quarantine attribute."
+      echo "         For a public release set TRANSCRIPTOR_SIGNING_IDENTITY to a"
+      echo '         "Developer ID Application: ..." certificate and run notarize:dmg.'
+      ;;
+  esac
+fi
+
 npm --prefix frontend ci
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm --prefix desktop ci
 
@@ -173,14 +207,21 @@ create_release_package() {
       "$internal_zip_base" \
       "$install_zip_base" \
       "INSTALL_ON_OTHER_MAC.command" \
-      "INSTALL_OTHER_MAC.md" \
+      "$(basename "$INSTALL_DOC")" \
       "$RELEASE_MANIFEST_NAME" \
       > SHA256SUMS.txt
   )
-  # The root-level INTERNAL_ZIP is a build-time intermediate: the release
-  # directory already embeds its own copy inside the install kit. Drop the
-  # root duplicate so a finished build leaves DMG + kit (~470 MB), not
-  # three full copies of the same version (~715 MB).
+  # Drop the dist/ copy of the internal zip: release/ already has one.
+  #
+  # NOTE, measured: release/ still holds three full copies of this
+  # version - the DMG, the internal zip (the installer's fallback when a
+  # quarantined DMG will not mount) and the install kit zip, which
+  # embeds the DMG again. About 750 MB, not the ~470 MB an earlier
+  # comment here claimed on the strength of the kit embedding the
+  # internal zip - it never did; the kit is built from the DMG, the
+  # installer, the doc and the manifest. Which artifacts a release ships
+  # is a product decision, so it is left as it is and recorded in the
+  # debt ledger rather than changed here.
   cleanup_path "$INTERNAL_ZIP"
   echo "Created release package in $RELEASE_DIR"
 }

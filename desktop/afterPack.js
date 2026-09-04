@@ -67,10 +67,10 @@ const {
   makeBundledPythonImportsReadOnly,
   normalizeMacPrivacyUsageDescriptions,
   preSignRuntimeBinaries,
+  resolveSigningPlan,
+  selfSignedEntitlementsPath,
   shouldIgnoreOsxSignPath,
 } = require("./scripts/macos-signing-utils");
-
-const DEFAULT_INTERNAL_SIGNING_IDENTITY = "AntigravityTelegramDev";
 
 exports.default = async function afterPack(context) {
   // electron-builder invokes afterPack for every platform. Only
@@ -89,23 +89,31 @@ exports.default = async function afterPack(context) {
   }
 
   const projectDir = context.packager.info.projectDir;
-  const entitlements = path.join(projectDir, isMas ? "entitlements.mas.plist" : "entitlements.mac.plist");
-  const inheritEntitlements = path.join(
-    projectDir,
-    isMas ? "entitlements.mas.inherit.plist" : "entitlements.mac.inherit.plist",
-  );
-  if (!existsSync(entitlements)) {
-    throw new Error(`afterPack: entitlements plist missing at ${entitlements}`);
-  }
-  if (!existsSync(inheritEntitlements)) {
-    throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
+  // desktop/package.json is the SSOT for which entitlements and which
+  // usage descriptions this build carries. `identity: null` keeps
+  // electron-builder itself out of the signing path (this hook signs
+  // instead), and that ALSO makes it skip reading build.mac.entitlements
+  // / entitlementsInherit / extendInfo — so those keys looked like the
+  // obvious place to edit while changing nothing at all, and the real
+  // values were retyped here and in macos-signing-utils.js. The hook
+  // reads them instead of naming files of its own.
+  const platformCfg = context.packager.platformSpecificBuildOptions || {};
+  const declaredEntitlements = platformCfg.entitlements;
+  const declaredInherit = platformCfg.entitlementsInherit;
+  if (!declaredEntitlements || !declaredInherit) {
+    throw new Error(
+      `afterPack: build.${isMas ? "mas" : "mac"}.entitlements and .entitlementsInherit ` +
+        "must be declared in desktop/package.json — they are the SSOT for this build's entitlements.",
+    );
   }
   hardenAppTransportSecurity(appPath, {
     log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
   });
   normalizeMacPrivacyUsageDescriptions(appPath, {
+    extendInfo: platformCfg.extendInfo,
     log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
   });
+
   if (isMas) {
     assertNoBundledBytecode(appPath);
     if (process.env.TRANSCRIPTOR_MAS_EXTERNAL_SIGN !== "1") {
@@ -123,21 +131,43 @@ exports.default = async function afterPack(context) {
     return;
   }
 
-  const requestedIdentity = String(
-    process.env.TRANSCRIPTOR_SIGNING_IDENTITY || DEFAULT_INTERNAL_SIGNING_IDENTITY,
-  ).trim();
-  const useAdhocIdentity = process.env.TRANSCRIPTOR_ALLOW_ADHOC_SIGN === "1";
-  const hasRequestedIdentity = !useAdhocIdentity && hasSigningIdentity(requestedIdentity);
-  const isDeveloperIdIdentity = !useAdhocIdentity && /^Developer ID Application:/i.test(requestedIdentity);
-  if (!useAdhocIdentity && !hasRequestedIdentity) {
+  // One signing decision, shared with afterAllArtifactBuild.js — which
+  // identity, is it a Developer ID, and therefore which timestamp policy
+  // and which entitlements profile. Both hooks used to derive this
+  // separately, each with its own hardcoded default identity name.
+  const plan = resolveSigningPlan(process.env);
+  const { identity, requestedIdentity, adhoc: useAdhocIdentity, developerId: isDeveloperIdIdentity } = plan;
+  const runtimeTimestampArg = plan.timestampArg;
+  if (!useAdhocIdentity && !hasSigningIdentity(requestedIdentity)) {
     throw new Error(
       `afterPack: missing signing identity "${requestedIdentity}". ` +
         "Set TRANSCRIPTOR_SIGNING_IDENTITY to a valid keychain identity, " +
         "or set TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 only for explicit local ad-hoc builds.",
     );
   }
-  const identity = useAdhocIdentity ? "-" : requestedIdentity;
-  const runtimeTimestampArg = isDeveloperIdIdentity ? "--timestamp" : "--timestamp=none";
+
+  // A self-signed certificate has an EMPTY Team ID, which makes dyld4
+  // reject cross-image loads under hardened-runtime library validation;
+  // the two relaxations that work around it must not travel into a
+  // public Developer ID build, where they would permanently disable
+  // library validation in the shipped binary for a reason that does not
+  // apply to it. The profile follows from the identity, so neither can
+  // be used for the wrong kind of build.
+  const entitlements = path.join(
+    projectDir,
+    plan.entitlementsProfile === "developer-id" ? declaredEntitlements : selfSignedEntitlementsPath(declaredEntitlements),
+  );
+  const inheritEntitlements = path.join(
+    projectDir,
+    plan.entitlementsProfile === "developer-id" ? declaredInherit : selfSignedEntitlementsPath(declaredInherit),
+  );
+  if (!existsSync(entitlements)) {
+    throw new Error(`afterPack: entitlements plist missing at ${entitlements}`);
+  }
+  if (!existsSync(inheritEntitlements)) {
+    throw new Error(`afterPack: inherit entitlements missing at ${inheritEntitlements}`);
+  }
+  console.log(`[afterPack] Entitlements profile: ${plan.entitlementsProfile}`);
 
   if (!useAdhocIdentity) {
     console.log(

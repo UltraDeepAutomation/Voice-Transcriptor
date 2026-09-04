@@ -137,8 +137,17 @@ async function main() {
     throw new Error(`Built MAS bundle id "${actualBundleId}" does not match "${appId}".`);
   }
 
-  const entitlements = path.join(projectDir, "entitlements.mas.plist");
-  const inheritEntitlements = path.join(projectDir, "entitlements.mas.inherit.plist");
+  // package.json build.mas is the SSOT for the MAS entitlements and the
+  // permission-prompt strings, the same as build.mac is for afterPack.js.
+  const masBuildCfg = (packageJson.build && packageJson.build.mas) || {};
+  if (!masBuildCfg.entitlements || !masBuildCfg.entitlementsInherit) {
+    throw new Error(
+      "desktop/package.json build.mas.entitlements and .entitlementsInherit must be declared — " +
+        "they are the SSOT for the MAS build's entitlements.",
+    );
+  }
+  const entitlements = path.join(projectDir, masBuildCfg.entitlements);
+  const inheritEntitlements = path.join(projectDir, masBuildCfg.entitlementsInherit);
   for (const file of [entitlements, inheritEntitlements]) {
     if (!fs.existsSync(file)) throw new Error(`Missing MAS entitlements file: ${file}`);
   }
@@ -147,6 +156,7 @@ async function main() {
     log: (message) => console.log(message.replace("[macos-signing]", "[mas-sign]")),
   });
   normalizeMacPrivacyUsageDescriptions(appPath, {
+    extendInfo: masBuildCfg.extendInfo,
     log: (message) => console.log(message.replace("[macos-signing]", "[mas-sign]")),
   });
   assertNoBundledBytecode(appPath);
