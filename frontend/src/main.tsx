@@ -7019,6 +7019,7 @@ function setRecordingsSearchQuery(next: string): void {
   const normalized = String(next || "").trim().toLowerCase();
   if (normalized === recordingsSearchQuery) return;
   recordingsSearchQuery = normalized;
+  invalidateFilteredRecordings();
   resetRecordingsWindow();
 }
 
@@ -7147,10 +7148,31 @@ function syncLatestSavedAudioFromRecordings(): void {
   });
 }
 
+/**
+ * The filtered archive, memoised.
+ *
+ * Recomputing it is an O(N) pass that concatenates six fields, lowercases
+ * the result and substring-searches it, over an archive `list-window.ts`
+ * itself sizes at ~5900 entries. It was being recomputed on every scroll
+ * event — first line of the scroll handler, ahead of the cheap geometry
+ * test that answers "is there anything to do?" — and twice per frame
+ * whenever the window actually grew, which is the exact cost the
+ * windowing exists to avoid. It ran twice per keystroke while searching,
+ * too.
+ *
+ * Only two things change the answer, and both invalidate here: the
+ * payload of a completed load, and the search query.
+ */
+let filteredRecordingsCache: RecordingItem[] | null = null;
+
+function invalidateFilteredRecordings(): void {
+  filteredRecordingsCache = null;
+}
+
 function getFilteredRecordings(): RecordingItem[] {
+  if (filteredRecordingsCache) return filteredRecordingsCache;
   const query = recordingsSearchQuery.trim().toLowerCase();
-  if (!query) return recordingItems;
-  return recordingItems.filter((item) => {
+  const result = !query ? recordingItems : recordingItems.filter((item) => {
     const haystack = [
       item.display_name,
       item.source_file || "",
@@ -7161,6 +7183,8 @@ function getFilteredRecordings(): RecordingItem[] {
     ].join(" ").toLowerCase();
     return haystack.includes(query);
   });
+  filteredRecordingsCache = result;
+  return result;
 }
 
 function setRecordingsUiLoading(nextLoading: boolean): void {
@@ -7530,9 +7554,11 @@ function renderRecordingsWindowStatus(rendered: number, total: number): void {
  * down rows the user just passed.
  */
 function handleRecordingsListScroll(): void {
+  // Geometry first: it is three property reads and answers "is there
+  // anything to do?" for all but a handful of the events this handler
+  // receives. `{passive: true}` keeps the compositor free, not the main
+  // thread, so what runs here still runs on every scroll tick.
   const list = $("recordingsList");
-  const total = getFilteredRecordings().length;
-  if (recordingsWindowSize >= total) return;
   if (!shouldGrowWindow({
     scrollTop: list.scrollTop,
     clientHeight: list.clientHeight,
@@ -7540,6 +7566,8 @@ function handleRecordingsListScroll(): void {
   })) {
     return;
   }
+  const total = getFilteredRecordings().length;
+  if (recordingsWindowSize >= total) return;
   recordingsWindowSize = grownWindowSize(recordingsWindowSize, total);
   renderRecordingsList();
 }
@@ -7593,6 +7621,7 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
     const r = await apiGet<{ items: RecordingItem[]; directory: string }>("/api/recordings");
     if (requestSeq !== recordingsLoadRequestSeq) return;
     recordingItems = r.items || [];
+    invalidateFilteredRecordings();
     activeResolvedRecordingsDir = String(r.directory || "").trim();
     // A load that REPLACES the list invalidates the window; a load that
     // refreshes it does not. Resetting unconditionally meant the
