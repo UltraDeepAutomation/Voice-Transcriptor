@@ -29,8 +29,6 @@ const {
   PASTE_BUDGET,
   PASTE_MAX_ATTEMPTS,
   PASTE_POST_STOP_DEADLINE_MS,
-  PASTE_TRANSIENT_TYPE,
-  PASTE_TRANSIENT_TYPE_SUPPORTED,
   pasteBudgetFor,
   pasteAttemptDelayMs,
   pasteMethodTimeoutMs,
@@ -324,15 +322,6 @@ test("attempt delays are clamped, never undefined past the last attempt", () => 
   assert.equal(pasteAttemptDelayMs("darwin", 2), 125);
   assert.equal(pasteAttemptDelayMs("darwin", 99), 125);
   assert.equal(pasteAttemptDelayMs("darwin", -1), 45);
-});
-
-test("marking the transcript transient is documented as impossible here, not silently skipped", () => {
-  // Electron 42.4.1: clipboard.write takes a fixed Data shape with no
-  // custom-UTI key, and clipboard.writeBuffer REPLACES the pasteboard
-  // rather than adding a type to it. Doing this properly needs
-  // NSPasteboard, i.e. a native addon.
-  assert.equal(PASTE_TRANSIENT_TYPE, "org.nspasteboard.TransientType");
-  assert.equal(PASTE_TRANSIENT_TYPE_SUPPORTED, false);
 });
 
 // ── modifier release ─────────────────────────────────────────────

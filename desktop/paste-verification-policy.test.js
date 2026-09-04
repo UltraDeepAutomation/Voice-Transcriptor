@@ -204,3 +204,40 @@ test("two markers in one pipe chunk report 0, not a negative or a guess", () => 
   assert.deepEqual(summary.reads, [{ label: "before", ms: 0 }]);
   assert.equal(summary.unfinished, false);
 });
+
+test("main.js actually supplies the bundle id the key prefers", () => {
+  // pasteVerificationKey has always preferred bundleId, and main.js never
+  // passed one — `grep -c bundleId desktop/main.js` was 0. The promise that
+  // "a renamed app cannot inherit another app's verdict" was therefore not
+  // kept: the key was the display name, so two apps called "Notes" shared
+  // one verdict and a rename lost it.
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+
+  // Read in the same Apple Event as the name and the pid — no extra
+  // round trip on the capture path — and guarded, because a faceless
+  // process may not have one.
+  assert.match(source, /set b to bundle identifier of p/);
+  assert.match(source, /bundleId: String\(bundleId \|\| ""\)\.trim\(\)/);
+  // Carried on the captured target...
+  assert.match(source, /bundleId: String\(src\.bundleId \|\| ""\)\.trim\(\)/);
+  assert.match(source, /bundleId: front\?\.bundleId/);
+  // ...and handed to the key, ahead of the display name.
+  assert.match(
+    source,
+    /pasteVerificationKey\(\{\s*\n\s*bundleId: effectiveTarget\.bundleId \|\| frontBefore\.bundleId \|\| "",/,
+  );
+});
+
+test("a missing bundle id still keys on the display name", () => {
+  // Windows and Linux have no bundle id at all, and a faceless macOS
+  // process may not have one either. The key must not become empty.
+  assert.equal(pasteVerificationKey({ bundleId: "", appName: "Sublime Text" }), "sublime text");
+  assert.equal(pasteVerificationKey({ appName: "Sublime Text" }), "sublime text");
+  // ...and two apps with the same name are only separated when the id is there.
+  assert.notEqual(
+    pasteVerificationKey({ bundleId: "com.a.notes", appName: "Notes" }),
+    pasteVerificationKey({ bundleId: "com.b.notes", appName: "Notes" }),
+  );
+});

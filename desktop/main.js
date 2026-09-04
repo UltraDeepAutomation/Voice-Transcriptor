@@ -15,7 +15,7 @@ const { migrateShortcutPair } = require("./shortcut-migration");
 // wmctrl -x joins X11's two WM_CLASS strings with a dot and gives no way to
 // tell where the join is — see desktop/linux-wm-class.js.
 const { parseLinuxWmClass } = require("./linux-wm-class");
-const { formatConsoleMirrorLine } = require("./renderer-console");
+const { formatConsoleMirrorLine, createConsoleMirrorLimiter } = require("./renderer-console");
 // SSOT for "did this paste attempt actually succeed, and is it verified
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
 // 2026-09-03 §6.1/§6.4/§6.6) — unit-tested by desktop/paste-result.test.js.
@@ -226,7 +226,9 @@ function _relocateUserDataOffOneDrive() {
   const marker = path.join(newDir, ".migrated-from-onedrive");
   try {
     if (!fs.existsSync(marker) && fs.existsSync(oldDir)) {
-      // `cpSync` landed in Node 16.7 / Electron 30 ships Node 20.x.
+      // `cpSync` landed in Node 16.7; the pinned Electron (see
+      // devDependencies) is far past that, and package.json engines
+      // requires Node >=22.12 for the dev path.
       // Copy only the user-facing subset — skip bundled-runtime caches,
       // .venv, anything else that is safe to regenerate.
       let allCopied = true;
@@ -2755,6 +2757,11 @@ function emptyCapturedPasteTarget() {
     hwnd: "",
     className: "",
     instanceName: "",
+    // macOS only: the target's CFBundleIdentifier. It is what
+    // pasteVerificationKey keys the per-app verification memory on, so a
+    // renamed app does not inherit another app's verdict and two apps
+    // called "Notes" do not share one.
+    bundleId: "",
   };
 }
 
@@ -2768,6 +2775,7 @@ function normalizeCapturedPasteTarget(target) {
     hwnd: normalizeWindowsHwnd(src.hwnd || ""),
     className: String(src.className || "").trim(),
     instanceName: String(src.instanceName || "").trim(),
+    bundleId: String(src.bundleId || "").trim(),
   };
 }
 
@@ -2803,12 +2811,13 @@ function capturePasteTargetFromFrontInfo(front) {
     hwnd: front?.hwnd,
     className: front?.className,
     instanceName: front?.instanceName,
+    bundleId: front?.bundleId,
   });
 }
 
 function pasteTargetSummary(target) {
   const normalized = normalizeCapturedPasteTarget(target);
-  return `app="${normalized.appName}" pid=${normalized.pid} windowTitle="${compactLogText(normalized.windowTitle, 80)}" windowId="${normalized.windowId}" hwnd="${normalized.hwnd}" class="${normalized.className}" instance="${normalized.instanceName}"`;
+  return `app="${normalized.appName}" pid=${normalized.pid} windowTitle="${compactLogText(normalized.windowTitle, 80)}" windowId="${normalized.windowId}" hwnd="${normalized.hwnd}" class="${normalized.className}" instance="${normalized.instanceName}" bundleId="${normalized.bundleId}"`;
 }
 
 function getLastTranscriptPath() {
@@ -3508,6 +3517,12 @@ async function getFrontmostAppInfo() {
   if (process.platform === "linux") {
     return getLinuxFrontmostAppInfo();
   }
+  // `bundle identifier` is read in the SAME Apple Event as the name and the
+  // pid: it is one more property of a process this script already has, so it
+  // costs nothing on the capture path and gives pasteVerificationKey a key
+  // that survives a rename and separates two apps with the same name. It is
+  // wrapped in its own `try` because a faceless/background process may not
+  // have one, and a missing bundle id must not lose the name and the pid.
   const script = `
     tell application "System Events"
       set p to first process whose frontmost is true
@@ -3518,17 +3533,22 @@ async function getFrontmostAppInfo() {
       try
         set w to name of front window of p
       end try
-      return (n as text) & d & (u as text) & d & (w as text)
+      set b to ""
+      try
+        set b to bundle identifier of p
+      end try
+      return (n as text) & d & (u as text) & d & (w as text) & d & (b as text)
     end tell
   `;
   const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
   if (!res.ok) return { name: "", pid: 0 };
   const raw = String(res.stdout || "").trim();
-  const [name, pidText, windowTitle] = raw.split(String.fromCharCode(30));
+  const [name, pidText, windowTitle, bundleId] = raw.split(String.fromCharCode(30));
   return {
     name: String(name || "").trim(),
     pid: Number.parseInt(String(pidText || "0").trim(), 10) || 0,
     windowTitle: String(windowTitle || "").trim(),
+    bundleId: String(bundleId || "").trim(),
   };
 }
 
@@ -4608,8 +4628,8 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       // operations in the same millisecond (chained autosend, dual
       // hotkey press) collided on the same temp filename, and the
       // first's `unlinkSync` could delete the second's script
-      // mid-execution. crypto.randomUUID is in Node 14.17+ so it's
-      // safe in our Electron 30 build.
+      // mid-execution. crypto.randomUUID is in Node 14.17+, well below
+      // both the pinned Electron's Node and the >=22.12 engines floor.
       const vbsPath = path.join(
         app.getPath("temp"),
         `transcriptor_paste_${require("crypto").randomUUID()}.vbs`,
@@ -4886,6 +4906,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     // per app; ./paste-script emits a script with no read in it at all
     // when the answer is no (BUGS_AUDIT §6.6 / hotfix A3).
     const verificationKey = pasteVerificationKey({
+      bundleId: effectiveTarget.bundleId || frontBefore.bundleId || "",
       appName: effectiveTarget.appName || frontBefore.name || "",
     });
     const verifyPaste = pasteVerificationPolicy.shouldAttemptVerification(verificationKey);
@@ -7805,8 +7826,8 @@ async function createWindow(options = {}) {
   // media permissions and clipboard-write. Clipboard-read stays
   // denied; copy buttons only need writeText. Without this check, a
   // navigation race or a
-  // shared-session future (Electron 30+ shares the default session
-  // across BrowserWindow instances) could let any other origin
+  // shared-session future (Electron shares the default session across
+  // BrowserWindow instances) could let any other origin
   // inherit our microphone / clipboard grants. Tightened to ``_isBackendOrigin``
   // so the renderer must be on http://127.0.0.1:<our-port> to be
   // allowed.
@@ -7922,9 +7943,14 @@ async function createWindow(options = {}) {
   // signatures live in ./renderer-console.js (pure, unit-tested); this
   // handler only forwards. See that module for why nothing the renderer
   // logged had ever reached main.log.
+  // One limiter per window: a reload gets a fresh budget, and two windows
+  // cannot spend each other's.
+  const consoleMirrorLimiter = createConsoleMirrorLimiter();
   win.webContents.on("console-message", (a, b) => {
     const line = formatConsoleMirrorLine(a, b, MIRROR_RENDERER_TRACE_LOGS);
-    if (line) appendMainLog(line);
+    // appendMainLog is synchronous, and the renderer is loudest exactly
+    // when the user is waiting for a transcript.
+    for (const out of consoleMirrorLimiter(line, Date.now())) appendMainLog(out);
   });
   win.webContents.on("render-process-gone", (_event, details) => {
     const reason = String(details?.reason || "unknown");

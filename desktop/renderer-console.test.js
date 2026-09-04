@@ -14,6 +14,7 @@ const assert = require("node:assert/strict");
 
 const {
   MAX_MESSAGE_CHARS,
+  createConsoleMirrorLimiter,
   formatConsoleMirrorLine,
   normalizeConsoleMessage,
   shouldMirrorConsoleMessage,
@@ -196,4 +197,72 @@ test("the real failure that went unlogged now produces a line", () => {
     /* mirrorTraceLogs */ false,
   );
   assert.equal(line, "[renderer WARN] Recovery promote failed for cd98fa10: HTTP 409");
+});
+
+// ── rate limit ────────────────────────────────────────────────────────
+
+test("the mirror is bounded per window, and says what it dropped", () => {
+  // "error/warning are low volume by definition" holds for a renderer
+  // behaving itself. A fetch retry loop is the case that matters, and each
+  // mirrored line is a SYNCHRONOUS appendMainLog while the user waits for a
+  // transcript.
+  const admit = createConsoleMirrorLimiter({ maxLinesPerWindow: 3, windowMs: 1000 });
+  const emitted = [];
+  for (let i = 0; i < 50; i++) emitted.push(...admit(`[renderer ERROR] fetch failed #${i}`, 0));
+  assert.equal(emitted.length, 3, "the window's budget is the budget");
+  assert.deepEqual(emitted, [
+    "[renderer ERROR] fetch failed #0",
+    "[renderer ERROR] fetch failed #1",
+    "[renderer ERROR] fetch failed #2",
+  ]);
+
+  // Next window: the drop count is reported, then normal service resumes.
+  const after = admit("[renderer ERROR] fetch failed #50", 1000);
+  assert.deepEqual(after, [
+    "[renderer WARN] console mirror dropped 47 message(s) in the previous 1000 ms",
+    "[renderer ERROR] fetch failed #50",
+  ]);
+  // ...and nothing is re-reported.
+  assert.deepEqual(admit("[renderer ERROR] again", 1001), ["[renderer ERROR] again"]);
+});
+
+test("a renderer under the limit is mirrored unchanged, forever", () => {
+  const admit = createConsoleMirrorLimiter({ maxLinesPerWindow: 20, windowMs: 1000 });
+  for (let second = 0; second < 100; second++) {
+    for (let i = 0; i < 5; i++) {
+      assert.deepEqual(admit(`[renderer WARN] tick ${second}.${i}`, second * 1000 + i), [
+        `[renderer WARN] tick ${second}.${i}`,
+      ]);
+    }
+  }
+});
+
+test("a varying message defeats a dedup, which is why the bound is a window", () => {
+  // A retry loop varies its text — attempt numbers, URLs, timestamps — so
+  // suppressing only IDENTICAL consecutive lines would let it straight
+  // through.
+  const admit = createConsoleMirrorLimiter({ maxLinesPerWindow: 2, windowMs: 100 });
+  const out = [];
+  for (let i = 0; i < 10; i++) out.push(...admit(`[renderer ERROR] GET /api/x?attempt=${i}`, 0));
+  assert.equal(out.length, 2);
+});
+
+test("a dropped line is a dropped line, but an empty decision is not counted", () => {
+  const admit = createConsoleMirrorLimiter({ maxLinesPerWindow: 1, windowMs: 1000 });
+  assert.deepEqual(admit("", 0), [], "formatConsoleMirrorLine's 'drop it' answer costs nothing");
+  assert.deepEqual(admit("[renderer ERROR] a", 0), ["[renderer ERROR] a"]);
+  assert.deepEqual(admit("", 0), []);
+  assert.deepEqual(admit("[renderer ERROR] b", 0), []);
+  assert.deepEqual(admit("[renderer ERROR] c", 1000), [
+    "[renderer WARN] console mirror dropped 1 message(s) in the previous 1000 ms",
+    "[renderer ERROR] c",
+  ]);
+});
+
+test("main.js routes the mirror through the limiter", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(source, /createConsoleMirrorLimiter\(\)/);
+  assert.match(source, /for \(const out of consoleMirrorLimiter\(line, Date\.now\(\)\)\) appendMainLog\(out\)/);
 });

@@ -165,9 +165,67 @@ function formatConsoleMirrorLine(a, b, mirrorTraceLogs) {
   return `[renderer ${level}] ${clipped}`;
 }
 
+// ── Rate limit ────────────────────────────────────────────────────────
+//
+// "error / warning are low volume by definition" is true of a renderer
+// behaving itself and false of the one case that matters: a fetch retry
+// loop, a failing recovery poll, an AudioWorklet erroring per buffer. Each
+// mirrored line is a SYNCHRONOUS appendMainLog on the main process, and the
+// renderer is loudest exactly when the user is waiting for a transcript —
+// so the mirror could turn a renderer fault into main-process stalls on the
+// latency-critical path.
+//
+// The bound is a rolling window rather than a per-message dedup, because a
+// retry loop varies its text (URLs, attempt numbers) and a dedup would let
+// it through. Nothing is silently lost: the count of what was dropped is
+// reported on the next window, which is the fact a support log needs.
+const MIRROR_RATE_LIMIT = Object.freeze({ maxLinesPerWindow: 20, windowMs: 1000 });
+
+/**
+ * @param {{maxLinesPerWindow: number, windowMs: number}} [limit]
+ * @returns {(line: string, now: number) => string[]} the lines to append —
+ *   none, the line, or a suppression summary followed by the line.
+ */
+function createConsoleMirrorLimiter(limit = MIRROR_RATE_LIMIT) {
+  const maxLinesPerWindow = Math.max(1, Number(limit.maxLinesPerWindow) || 1);
+  const windowMs = Math.max(1, Number(limit.windowMs) || 1);
+  let windowStartedAt = -Infinity;
+  let emitted = 0;
+  let suppressed = 0;
+
+  return function admit(line, now) {
+    if (!line) return [];
+    const at = Number(now) || 0;
+    const out = [];
+    if (at - windowStartedAt >= windowMs) {
+      if (suppressed > 0) {
+        out.push(
+          `[renderer WARN] console mirror dropped ${suppressed} message(s) in the previous ${windowMs} ms`,
+        );
+      }
+      windowStartedAt = at;
+      emitted = 0;
+      suppressed = 0;
+    }
+    // The summary does NOT count against the window's budget: it is emitted
+    // at most once per window by construction, so it cannot become a log
+    // source of its own, and charging for it would starve the very line the
+    // budget exists to let through when the budget is small.
+    if (emitted >= maxLinesPerWindow) {
+      suppressed += 1;
+      return out;
+    }
+    emitted += 1;
+    out.push(line);
+    return out;
+  };
+}
+
 module.exports = {
   ALWAYS_MIRRORED_PREFIXES,
   MAX_MESSAGE_CHARS,
+  MIRROR_RATE_LIMIT,
+  createConsoleMirrorLimiter,
   formatConsoleMirrorLine,
   normalizeConsoleMessage,
   shouldMirrorConsoleMessage,

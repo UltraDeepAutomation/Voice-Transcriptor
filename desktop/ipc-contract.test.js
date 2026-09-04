@@ -29,10 +29,22 @@ test("system-suspend is sent by main and subscribed to by the renderer bridge", 
   assert.match(mainSource, /webContents\.send\("system-suspend"/);
   assert.match(preloadSource, /ipcRenderer\.on\("system-suspend"/);
   assert.match(preloadSource, /onSystemSuspend:/, "the bridge is what the renderer actually calls");
+  // What this guarantees is that the bridge OFFERS a way off, not that the
+  // renderer takes it — a renderer reload destroys the preload world and
+  // its listeners with it, so the reload was never the leak. The leak that
+  // IS possible is a renderer that subscribes more than once in one page
+  // lifetime and never unsubscribes, which is what the returned function is
+  // for. frontend/src/main.tsx currently discards it; that is a renderer
+  // change and it is in the debt ledger.
   assert.match(
     preloadSource,
     /ipcRenderer\.removeListener\("system-suspend"/,
-    "a subscription with no way off leaks across renderer reloads",
+    "the bridge must hand back a way to unsubscribe",
+  );
+  assert.match(
+    preloadSource,
+    /return \(\) => \{/,
+    "onSystemSuspend must RETURN the unsubscribe, not just define one",
   );
 });
 

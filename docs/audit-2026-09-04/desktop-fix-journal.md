@@ -1040,3 +1040,85 @@ pattern before matching.
 
 **Not done in this commit:** nothing from this group.
 
+---
+## Commit 18 — symbols that were not capabilities, and a log that was not bounded
+
+**IDs:** D-031 (P2, deferred from commit 4), D-051 (P2), D-052 (P2),
+D-053 (P2, desktop half), D-059 (P2), D-082 (P2).
+
+**Files:** `desktop/main.js`, `desktop/renderer-console.js`,
+`desktop/renderer-console.test.js`, `desktop/paste-capability.js`,
+`desktop/paste-capability.test.js`,
+`desktop/paste-verification-policy.test.js`, `desktop/ipc-contract.test.js`,
+`desktop/unlockDist.js`.
+
+**Re-verified on current code before fixing:** yes.
+`grep -c bundleId desktop/main.js` -> `0`; `grep -n "Electron 30"` -> three
+comments against a manifest pinning `electron 42.4.1`; `PASTE_TRANSIENT_TYPE`
+imported by nothing but its own test.
+
+**Verification — measured on this Mac, not reasoned**
+- **D-031**. The amended frontmost read, run live:
+  ```
+  Telegram Lite|87282|n8n Чат & Сообщество @ Leo Erdman (594978)|org.telegram.desktop
+  ```
+  The bundle id is read in the SAME Apple Event as the name and the pid, so
+  it is not a second round trip. Measured, 8 runs each:
+  ```
+  without bundle id, ms: 205 250 258 275 276 283 286 367 | median 276
+  with    bundle id, ms: 239 239 269 269 282 290 303 337 | median 282
+  median delta: 6 ms (declared bound 5000 ms)
+  ```
+  `applescript.test.js` compiles the amended script (3 pass, on macOS).
+- **D-082**, the bound, asserted as behaviour: 50 error lines in one window
+  with a budget of 3 produce exactly 3 lines; the next window opens with
+  `console mirror dropped 47 message(s) in the previous 1000 ms` and then
+  resumes. A renderer under the limit is mirrored unchanged across 100
+  simulated seconds. A varying message (`?attempt=0`, `?attempt=1`, …) is
+  still bounded — which is why the bound is a window and not a dedup.
+- **D-059**, both versions run against a `dist/` subtree that cannot be
+  listed:
+  ```
+  OLD exit=0 | stdout: ""  | stderr: ""
+  NEW exit=1 | stdout: ""  | stderr: "[unlockDist] Could not unlock 1 path(s); electron-builder will fail on them:   …/dist/opaque: EACCES"
+  ```
+  The old `catch { return; }` made "this path is gone" and "this path cannot
+  be read" the same event, and the build died later inside electron-builder
+  with an EACCES that pointed at a file rather than at the pass that skipped
+  it.
+- `npm --prefix desktop test` -> `tests 253 / pass 253 / fail 0` (was 247).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *D-031, chosen:* read the bundle id in the existing Apple Event rather than
+  add one. Commit 4 deferred this expecting an extra event; there is a
+  process property to hand, and it measures at 6 ms.
+- *D-052, chosen:* delete the two constants, KEEP the twenty lines of
+  analysis. The reasoning (why `clipboard.write` and `clipboard.writeBuffer`
+  both cannot add a UTI to an existing pasteboard item) is what stops the
+  next reader spending a day rediscovering it; the constants were a symbol
+  pretending to be a capability, and the test asserted a literal against
+  itself.
+- *D-082, chosen:* a rolling window, not a per-message dedup — a retry loop
+  varies its text, so a dedup would pass it straight through. One limiter
+  per window, so a reload gets a fresh budget and two windows cannot spend
+  each other's. The suppression summary is NOT charged against the budget:
+  it is at most one line per window by construction, so it cannot become a
+  log source of its own, and charging for it would starve the line the
+  budget exists to let through.
+- *D-059, chosen:* `process.exitCode = 1` rather than throwing. The npm
+  script chain is `&&`-joined, so a non-zero exit stops the build at the
+  step that knows why — but the paths that WERE unlocked stay unlocked, so
+  a rerun after fixing permissions has less to do.
+- *D-051, chosen:* justify the APIs by the floor that is actually enforced
+  (`engines.node >= 22.12`, and the pinned Electron in devDependencies)
+  rather than by a version number in prose that goes stale on every bump.
+
+**Not done**
+- **D-053, the renderer half.** `preload.js`'s `onSystemSuspend` returns an
+  unsubscribe and `frontend/src/main.tsx` discards it. The test's stated
+  reason was also wrong — a renderer reload destroys the preload world and
+  its listeners, so the reload was never the leak; the reachable one is a
+  second subscription in one page lifetime. The reason is corrected and the
+  renderer change is in "долг".
+

@@ -575,9 +575,14 @@ function pasteAutoSendTimeoutMs(platform) {
 //     text removes the text; writing it before, the text removes the
 //     marker. There is no API to add a type to the item already there.
 // Doing it properly needs NSPasteboard directly, which means a native
-// addon — out of scope here. Documented, and skipped.
-const PASTE_TRANSIENT_TYPE = "org.nspasteboard.TransientType";
-const PASTE_TRANSIENT_TYPE_SUPPORTED = false;
+// addon. Recorded in the debt ledger; the analysis stays here because it is
+// what stops the next reader spending a day rediscovering it.
+//
+// It used to be recorded as two exported constants —
+// PASTE_TRANSIENT_TYPE = "org.nspasteboard.TransientType" and
+// PASTE_TRANSIENT_TYPE_SUPPORTED = false — imported by nothing and asserted
+// equal to their own literals by a test. A constant no code reads is not a
+// record of a decision, it is a symbol pretending to be a capability.
 
 // ── Modifier-release race ─────────────────────────────────────────
 //
@@ -741,8 +746,6 @@ module.exports = {
   PASTE_BUDGET,
   PASTE_MAX_ATTEMPTS,
   PASTE_POST_STOP_DEADLINE_MS,
-  PASTE_TRANSIENT_TYPE,
-  PASTE_TRANSIENT_TYPE_SUPPORTED,
   pasteBudgetFor,
   pasteAttemptDelayMs,
   pasteMethodTimeoutMs,
