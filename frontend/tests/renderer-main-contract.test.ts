@@ -24,9 +24,15 @@ describe("__transcriptorFinishedRecords depth", () => {
   });
 
   it("matches the depth desktop/main.js trims to when it reads the list", () => {
+    // The main process names its own copy now
+    // (RENDERER_FINISHED_RECORDS_LIMIT), and interpolates it into the
+    // injected script — so read the constant, not the call site.
     const block = desktopMain.slice(desktopMain.indexOf("__transcriptorFinishedRecords"));
-    const desktopDepth = /\.slice\(-(\d+)\)/.exec(block)?.[1];
-    expect(desktopDepth, "no .slice(-N) found after the finished-records read").toBeTruthy();
+    const usesNamedLimit = /\.slice\(-\$\{RENDERER_FINISHED_RECORDS_LIMIT\}\)/.test(block);
+    const desktopDepth = usesNamedLimit
+      ? /RENDERER_FINISHED_RECORDS_LIMIT\s*=\s*(\d+)/.exec(desktopMain)?.[1]
+      : /\.slice\(-(\d+)\)/.exec(block)?.[1];
+    expect(desktopDepth, "no finished-records trim depth found in desktop/main.js").toBeTruthy();
     expect(Number(desktopDepth)).toBe(Number(declared));
   });
 });
