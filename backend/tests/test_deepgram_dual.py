@@ -392,6 +392,14 @@ class _FakeLiveSession:
     send_error: Optional[Exception] = None
     drain_error: Optional[Exception] = None
     drain_delay: float = 0.0
+    # What ``partial_result()`` returns — the facade's fallback when this
+    # session's own ``drain_transcript()`` is still running past the
+    # primary's announced budget. Defaults to the full ``drain_result``
+    # so a test that doesn't care about the partial-vs-full distinction
+    # doesn't have to set it twice; tests exercising the timeout path set
+    # this to something genuinely SHORTER than ``drain_result`` to prove
+    # the facade used the snapshot, not the (never-returned) full drain.
+    partial_result_data: Optional[dict] = None
     stats: _FakeStats = field(default_factory=_FakeStats)
     is_closed: bool = False
     last_error: Optional[str] = None
@@ -417,6 +425,13 @@ class _FakeLiveSession:
 
     def coverage_hole_spans(self):
         return list(self.holes)
+
+    def partial_result(self) -> dict:
+        return dict(
+            self.partial_result_data
+            if self.partial_result_data is not None
+            else self.drain_result
+        )
 
     def report_fatal(self, message: str) -> None:
         self.last_fatal = True
@@ -583,6 +598,10 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, [(2.0, False)])
 
     async def test_a_dead_secondary_degrades_to_single_stream(self):
+        # A hard failure (the socket dropped, an exception) is NOT the
+        # same shape as merely running late (see the "blows the budget"
+        # test below) — there is no partial result worth trusting here,
+        # so this keeps the "drop to single-stream" behaviour.
         primary = _primary()
         secondary = _secondary(drain_error=RuntimeError("socket dropped"))
         dual = DualLiveSession(primary, secondary, secondary_language="ru")
@@ -592,16 +611,41 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(envelope["stats"]["dual_stream"], False)
         self.assertTrue(dual.secondary_failed)
 
-    async def test_a_secondary_that_blows_the_budget_degrades_to_single_stream(self):
+    async def test_a_secondary_that_blows_the_budget_merges_its_partial_result(self):
+        # (c) primary done + covered, secondary still draining: the
+        # facade must not wait past the primary's announced budget, but
+        # discarding the secondary entirely throws away real committed
+        # words its recv loop already has — merge in the SNAPSHOT
+        # (``partial_result()``) instead of dropping to single-stream.
         primary = _primary()
-        secondary = _secondary(drain_delay=10.0)
+        secondary = _secondary(
+            drain_delay=10.0,
+            # What the secondary's recv loop had actually committed by
+            # the time the primary's budget ran out — shorter than its
+            # (never-returned) full ``drain_result`` of "before hole
+            # after", proving the facade used the snapshot.
+            partial_result_data={
+                "text": "before",
+                "segments": [_segment([_w("before", 0.0, 1.0)])],
+                "streamedSec": 1.0,
+                "coveredEndSec": 1.0,
+            },
+        )
         dual = DualLiveSession(primary, secondary, secondary_language="ru")
-        with self.assertLogs("backend.deepgram_dual", level="WARNING"):
+        with self.assertLogs("backend.deepgram_dual", level="WARNING") as logs:
             envelope = await dual.drain_transcript(
                 on_budget=lambda b, more: None
             )
+        self.assertTrue(
+            any("secondary late, merged partial" in m for m in logs.output),
+            logs.output,
+        )
+        # The partial secondary only re-confirms "before" (already in the
+        # primary); "after" comes from the primary alone. Nothing is
+        # dropped, and this genuinely is a (partial) merge.
         self.assertEqual(envelope["text"], "before after")
-        self.assertIs(envelope["stats"]["dual_stream"], False)
+        self.assertIs(envelope["stats"]["dual_stream"], True)
+        self.assertFalse(dual.secondary_failed)
 
     async def test_uncovered_speech_is_measured_on_the_merged_words(self):
         primary = _primary(holes=[(2.0, 2.5)])

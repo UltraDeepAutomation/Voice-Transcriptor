@@ -76,13 +76,31 @@ DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
 # transcript and pay nothing extra.
 FINALIZE_FLUSH_WAIT_SEC = 3.0
 
-# Tail guard: if the streamed audio runs this many seconds past the last
-# finalized segment, the trailing words are still unflushed upstream. One
-# extra Finalize round-trip is cheaper than silently dropping everything
-# the user said after the last periodic flush (2026-08-24 log: 19
-# sessions exited on the first timeout; all benign by luck — every one
-# had a flush landing exactly at Stop. This guard removes the "by luck").
-TAIL_GUARD_MIN_SEC = 0.75
+# Tail guard: raw elapsed audio past the last finalized segment used to be
+# enough, on its own, to justify a second Finalize round trip (2026-08-24
+# log: 19 sessions exited on the first timeout; all benign by luck — every
+# one had a flush landing exactly at Stop). That protected against a real
+# loss (2026-08-24: a session with ``gap=4.01s speech_in_gap=0.00`` where
+# Deepgram had gone quiet 3.7 s before Stop and never flushed a genuine
+# trailing sentence) — but session f94121ae, 2026-09-04T12:26:33Z, showed
+# the cost side of that trade: the ``multi`` reading logged ``0.91s of
+# audio past last final (0.05s of it recognised speech)``, retried, and
+# took 6010 ms to close, while the same recording's ``ru`` reading (no
+# retry, tail genuinely covered) delivered the correct transcript in
+# 378 ms — the merged envelope shipped 6 s after Stop because the facade
+# waits for the slower reading. Audit §5 measured the retry's hit rate
+# directly: 1 of 84 uncovered-but-unvoiced tails ever produced a
+# transcript, at 3 s apiece.
+#
+# So elapsed time alone is retired as evidence. What is left is REAL
+# evidence that Deepgram is sitting on unflushed speech: either an interim
+# already recognised words there, or Deepgram's own decode window is still
+# reaching past the last final well beyond its configured endpointing
+# silence — see ``_tail_needs_flush``. ``TAIL_GUARD_MIN_SPEECH_SEC`` is the
+# first of those two signals' threshold, sized from the same production
+# line: one short recognised word runs about this long, and 0.05 s (the
+# f94121ae case) is not a word — it is decoder noise.
+TAIL_GUARD_MIN_SPEECH_SEC = 0.25
 
 # Wait budget when the streamed audio is ALREADY fully covered by
 # finalized segments at Finalize time — i.e. Finalize has nothing left to
@@ -113,10 +131,11 @@ FINALIZE_COVERED_WAIT_SEC = 0.75
 # segment-boundary jitter.
 #
 # Applying this window to the whole "no retry needed" band was a mistake,
-# and it cost a user real words. ``_tail_needs_flush`` tolerates up to
-# TAIL_GUARD_MIN_SEC (0.75 s) of uncovered audio before it asks for a
-# RETRY — which is a different question from whether anything is left to
-# flush at all. Production, 2026-08-25 14:33:16: ``gap=0.50s
+# and it cost a user real words. Whether a tail is worth a RETRY
+# (``_tail_needs_flush``) is a different question from whether anything is
+# left to flush at all — this window answers the second one, for the
+# "nothing but a boundary sliver" case specifically. Production, 2026-08-25
+# 14:33:16: ``gap=0.50s
 # speech_in_gap=0.00``, the stream closed 0.25 s after Finalize, and the
 # sentence arrived ending "…чтобы никуда не не". Half a second of audio past
 # the last final that no interim had decoded either — which is precisely
@@ -989,6 +1008,19 @@ class DeepgramLiveSession:
         # blind. Silence produces no interims, so ordinary pauses do not
         # register here.
         self._interim_speech_spans: list[tuple[float, float]] = []
+        # The most recent interim's own decode window end (start +
+        # duration), on the session timeline. Every ``Results`` message
+        # that reaches the interim branch already carries non-empty text
+        # (messages with none return earlier — see
+        # ``_process_deepgram_message``), so this is exactly "the newest
+        # window Deepgram reported, with non-empty text" — the raw signal
+        # ``_tail_needs_flush`` rule 2 reads, distinct from
+        # ``_interim_speech_spans`` (which measures RECOGNISED WORDS, not
+        # the window Deepgram is still working). A final only ever
+        # shrinks the gap this is compared against (``covered_end``), so a
+        # stale window value from earlier in the recording harmlessly
+        # stops mattering once its ground is finalized — no reset needed.
+        self._latest_interim_window_end: float = 0.0
         # Retained word-level hypotheses from interims: {word, start, end}.
         #
         # Deepgram can emit a final that stops short of what its own
@@ -1507,7 +1539,7 @@ class DeepgramLiveSession:
             # Three cases, not two. "Needs a retry" and "has nothing left to
             # flush" are different questions, and collapsing them applied a
             # window measured on empty tails to tails that were merely small.
-            needs_flush = self._tail_needs_flush(tail_gap, tail_speech)
+            needs_flush = self._tail_needs_flush(tail_gap, tail_speech, covered_end)
             if needs_flush:
                 flush_wait = FINALIZE_FLUSH_WAIT_SEC
             elif tail_gap <= COVERAGE_GAP_MIN_SEC:
@@ -1572,7 +1604,7 @@ class DeepgramLiveSession:
                 self._final_arrived.clear()
                 finals_seen += 1
                 streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
-                if not self._tail_awaits_more_finals(tail_gap, tail_speech):
+                if not self._tail_awaits_more_finals(tail_gap, tail_speech, covered_end):
                     flush_covered_tail = True
                     break
             waited_ms = (time.perf_counter() - wait_started) * 1000.0
@@ -1596,13 +1628,15 @@ class DeepgramLiveSession:
                 # segments while we were on our way here, which can
                 # close a gap that was open a moment ago.
                 streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
-                if self._tail_needs_flush(tail_gap, tail_speech):
+                if self._tail_needs_flush(tail_gap, tail_speech, covered_end):
                     logger.warning(
                         "deepgram-live: tail guard: %.2fs of audio past last final "
-                        "(%.2fs of it recognised speech) after %d post-Finalize "
-                        "final(s) in %.0fms; retrying Finalize once",
+                        "(%.2fs of it recognised speech, window_overhang=%.2fs) "
+                        "after %d post-Finalize final(s) in %.0fms; retrying "
+                        "Finalize once",
                         tail_gap,
                         tail_speech,
+                        self._latest_interim_window_end - covered_end,
                         finals_seen,
                         waited_ms,
                     )
@@ -2377,36 +2411,59 @@ class DeepgramLiveSession:
             tail_gap = max(0.0, utterance_end - covered_end)
         return streamed_sec, covered_end, tail_gap, tail_speech
 
-    def _tail_needs_flush(self, tail_gap: float, tail_speech: float) -> bool:
+    def _tail_needs_flush(
+        self, tail_gap: float, tail_speech: float, covered_end: float
+    ) -> bool:
         """Is the trailing region worth waiting — and retrying — for?
 
-        UNCOVERED AUDIO decides. Recognised speech in the gap is an
-        additional reason to retry, never a reason not to.
+        A tail is "unflushed speech" ONLY when there is actual EVIDENCE of
+        it — never from elapsed time alone. Two kinds of evidence, either
+        is enough:
 
-        This briefly gated on speech alone, on the reasoning that with
-        ``interim_results`` on a region producing no interim produced no
-        words, so a Finalize could not flush what was never decoded.
-        That premise is false in exactly the case the guard exists for.
-        Measured in production, one stop after it shipped:
+        1. an interim already recognised at least
+           ``TAIL_GUARD_MIN_SPEECH_SEC`` worth of WORDS somewhere in the
+           uncovered span (``tail_speech``); or
+        2. the newest interim's own decode WINDOW — regardless of how many
+           words it has produced — still reaches past ``covered_end`` by
+           more than the session's configured endpointing silence window.
+           Deepgram reporting a window that long past the last final,
+           with non-empty text, is the provider itself saying it is still
+           working that audio; a window that has caught up to (or fallen
+           behind) the last final is not.
 
-            streamed=20.08s covered=16.07s gap=4.01s speech_in_gap=0.00s
+        This used to gate on UNCOVERED AUDIO instead — ``tail_gap`` alone,
+        reasoning that with ``interim_results`` on, a region producing no
+        interim produced no words, so absence of an interim was itself
+        suspicious. That was true once: a 2026-08-24 production session
+        showed ``gap=4.01s speech_in_gap=0.00s`` where Deepgram had gone
+        quiet 3.7 s before Stop and never flushed a genuine trailing
+        sentence — a provider that goes quiet and a user who stops
+        talking looked identical on any speech-only signal.
 
-        Four seconds of the user's speech, and the speech signal read
-        zero — because Deepgram had stopped emitting interims 3.7 s
-        before Stop and then never flushed the final either. A provider
-        that goes quiet and a user who stops talking look identical to
-        this signal, and the first is precisely the failure mode that
-        loses a tail. Absence of interims is not evidence of absence of
-        speech.
+        But gap-alone is a proxy, and audit §5 measured what the proxy
+        actually cost across 84 such uncovered-but-unvoiced tails: 1
+        produced a transcript. The other 83 paid the full retry — 3 s
+        each — for nothing. Session f94121ae, 2026-09-04T12:26:33Z, is
+        one of the 83: ``0.91s of audio past last final (0.05s of it
+        recognised speech)``, retried, 6010 ms to close — while the same
+        recording's other reading, with a genuinely covered tail, closed
+        in 378 ms. The merged envelope is only as fast as the slower of
+        the two, so this one retry cost the user 5.6 s of extra wait for
+        a transcript the retry never improved.
 
-        So the signal can only add confidence, never remove it. The cost
-        is that a pause before Stop still pays the retry path; losing
-        the user's closing sentence is not a trade worth three seconds.
-        ``speech_in_gap`` stays measured and logged — it is genuinely
-        useful for telling the two shapes apart after the fact, which is
-        how this was caught.
+        Rule 2 is what keeps the 2026-08-24 case from regressing without
+        reintroducing gap-alone: it does not require RECOGNISED words (the
+        thing the 2026-08-24 session had none of), only that Deepgram's
+        own decoder is still visibly reaching into that audio. A tail
+        that is silent all the way down — no interim ever touched it,
+        recognised words or not — is exactly what audit §5 shows waiting
+        cannot help.
         """
-        return tail_gap >= TAIL_GUARD_MIN_SEC or tail_speech >= TAIL_GUARD_MIN_SEC
+        if tail_speech >= TAIL_GUARD_MIN_SPEECH_SEC:
+            return True
+        endpointing_window_sec = self._cfg.endpointing_ms / 1000.0
+        window_overhang = self._latest_interim_window_end - covered_end
+        return window_overhang > endpointing_window_sec
 
     def _last_final_ended_the_utterance(self) -> bool:
         """Did the newest final claim to end where the speaker stopped?
@@ -2425,7 +2482,9 @@ class DeepgramLiveSession:
             return True
         return bool(self._finalized_segments[-1].get("speech_final"))
 
-    def _tail_awaits_more_finals(self, tail_gap: float, tail_speech: float) -> bool:
+    def _tail_awaits_more_finals(
+        self, tail_gap: float, tail_speech: float, covered_end: float
+    ) -> bool:
         """Is the post-Finalize flush still incomplete?
 
         Asked after each final that lands during the flush wait, to
@@ -2445,7 +2504,7 @@ class DeepgramLiveSession:
         the wait whatever ``speech_final`` said — otherwise every stop
         landing mid-utterance would burn its whole budget on a sliver.
         """
-        if self._tail_needs_flush(tail_gap, tail_speech):
+        if self._tail_needs_flush(tail_gap, tail_speech, covered_end):
             return True
         if tail_gap <= COVERAGE_GAP_MIN_SEC:
             return False
@@ -2690,6 +2749,43 @@ class DeepgramLiveSession:
         return self._join_segment_texts(
             drop_repeated_seam_ngrams(merge_seam_fragments(list(self._finalized_segments)))
         )
+
+    def partial_result(self) -> dict:
+        """Best-effort envelope from whatever is finalized RIGHT NOW.
+
+        For a caller that cannot afford to wait for THIS session's own
+        ``drain_transcript()`` to finish — the dual-stream facade
+        (``backend.deepgram_dual.DualLiveSession``), when the secondary
+        reading is still draining after the primary's announced budget
+        has run out. The recv loop appends to ``_finalized_segments``
+        independently of ``drain_transcript()``'s own Finalize/wait dance,
+        so whatever has arrived by the time the caller gives up is real,
+        committed transcript — not a guess — and merging it in is strictly
+        better than discarding a reading that was only ever late, never
+        wrong.
+
+        Same seam-merge/dedup pipeline and same envelope shape
+        ``drain_transcript()`` produces, built from a snapshot instead of
+        after a flush, so a partial and a full result can never describe
+        the same audio differently (C6). Never sends Finalize and never
+        waits — purely a read of state already held.
+        """
+        merged_segments = drop_repeated_seam_ngrams(
+            merge_seam_fragments(list(self._finalized_segments))
+        )
+        duration_sec = 0.0
+        if merged_segments:
+            duration_sec = float(max(s.get("end", 0.0) for s in merged_segments))
+        streamed_sec = self._streamed_seconds(self.stats.bytes_sent)
+        return {
+            "text": self._join_segment_texts(merged_segments),
+            "segments": merged_segments,
+            "durationSec": round(duration_sec, 3),
+            "stats": self.stats.as_dict(),
+            "uncoveredSpeechSec": round(self._uncovered_speech_sec(), 3),
+            "streamedSec": round(streamed_sec, 3),
+            "coveredEndSec": round(duration_sec, 3),
+        }
 
     # ----- Internals --------------------------------------------------------
 
@@ -3109,6 +3205,15 @@ class DeepgramLiveSession:
             }
 
         self.stats.segments_interim += 1
+        # ``text`` is already guaranteed non-empty here (the empty-text
+        # guard at the top of this method returns before either branch is
+        # reached), so recording this window unconditionally is exactly
+        # ``_tail_needs_flush`` rule 2's "an interim's window ... with
+        # non-empty text" — the provider's own claim that it is still
+        # decoding audio out to ``end``, independent of how many words (if
+        # any) that hypothesis has produced so far.
+        if end > start:
+            self._latest_interim_window_end = end
         # Retain this hypothesis's words for hole-splicing at finalize.
         # An interim is a ROLLING re-decode of recent audio, so each new
         # one supersedes every stored word that overlaps its range —

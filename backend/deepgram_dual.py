@@ -103,10 +103,9 @@ DUAL_SECONDARY_LANGUAGE_DEFAULT = "ru"
 # both repeat runs.
 #
 # 0.3 s is a pause a decoder can absorb into the preceding word without
-# the next word being a different utterance; it is well under the
-# 0.75 s this codebase already treats as a real gap
-# (``TAIL_GUARD_MIN_SEC``) and comfortably over the few tens of ms a
-# re-decode normally shifts a boundary by.
+# the next word being a different utterance; it is comfortably over the
+# few tens of ms a re-decode normally shifts a boundary by, and well
+# under any real inter-word pause.
 ADJACENT_SAME_STEM_MAX_GAP_SEC = 0.3
 
 # Merged words further apart than ``INTERIM_WORD_GAP_SPLIT_SEC`` start a
@@ -602,7 +601,13 @@ class DualLiveSession:
         recording, the same stop, and the renderer is owed one deadline.
         The secondary is drained concurrently so it costs no extra wall
         time, and is given the primary's own budget as a hard ceiling:
-        it must never be the reason a stop runs long.
+        it must never be the reason a stop runs long. That budget is
+        already the honest one for BOTH shapes of stop — an uncovered
+        primary tail announces a larger ceiling (``on_budget``'s
+        ``worst_case``, which includes the retry) than a covered one, so
+        this method does not need to ask separately whether the primary's
+        own tail was covered before deciding how long the secondary may
+        run: the ceiling already says so.
         """
         secondary = self.secondary
         secondary_task: Optional[asyncio.Task] = None
@@ -631,7 +636,26 @@ class DualLiveSession:
                 )
             except asyncio.TimeoutError:
                 secondary_task.cancel()
-                self._fail_secondary("drain exceeded the announced stop budget")
+                # The secondary is LATE, not WRONG: its own recv loop has
+                # been appending finalized segments the whole time,
+                # independently of its (now-abandoned) drain_transcript()
+                # call, so whatever it committed before the primary's
+                # announced budget ran out is real transcript — discarding
+                # it would throw away words the user actually gets to keep
+                # under the single-stream path. Snapshotting it is what
+                # keeps the envelope inside the announced bound without
+                # also reverting to "drop the secondary entirely" for a
+                # reading that only ran long, never failed — that is
+                # ``_fail_secondary``'s case, not this one, so it is not
+                # called here and ``stats.dual_stream`` stays true.
+                secondary_result = secondary.partial_result()
+                logger.warning(
+                    "dual-stream: secondary late, merged partial "
+                    "(budget=%.2fs, secondary reached %.2fs of %.2fs streamed)",
+                    ceiling,
+                    float(secondary_result.get("coveredEndSec") or 0.0),
+                    float(secondary_result.get("streamedSec") or 0.0),
+                )
             except Exception as e:
                 self._fail_secondary(f"drain failed: {e}")
 
@@ -683,9 +707,14 @@ class DualLiveSession:
         )
         # Wire contract with the renderer: ``stats.dual_stream`` is the
         # boolean it reads to know this envelope came from the merged
-        # path. It is FALSE when the secondary reading failed or timed
-        # out, because then the text is a single reading and saying
-        # otherwise would misdescribe what the user received.
+        # path. It is FALSE only when the secondary reading genuinely
+        # failed (``_fail_secondary`` — no usable transcript exists),
+        # because then the text is a single reading and saying otherwise
+        # would misdescribe what the user received. A secondary that ran
+        # past the announced budget is NOT that case: ``drain_transcript``
+        # merges in whatever it had committed by then
+        # (``DeepgramLiveSession.partial_result``), so the text genuinely
+        # is a merge, just of a shorter secondary reading.
         merged_path = secondary_result is not None and not self._secondary_failed
         stats = dict(primary_result.get("stats") or {})
         stats["dual_stream"] = bool(merged_path)

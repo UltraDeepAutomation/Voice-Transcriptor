@@ -260,19 +260,22 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
             f"tail guard must retry Finalize; frames were {ws.types}",
         )
 
-    async def test_uncovered_audio_retries_even_with_no_interim_speech(self):
-        # The regression this pins. The guard briefly closed fast when no
-        # interim had heard words in the gap, on the reasoning that a
-        # Finalize cannot flush what was never decoded. Measured in
-        # production one stop later:
-        #
-        #   streamed=20.08s covered=16.07s gap=4.01s speech_in_gap=0.00s
-        #
-        # Four seconds of the user's speech, reported as zero, because
-        # Deepgram had stopped emitting interims 3.7 s before Stop and
-        # then never flushed the final either. A provider going quiet and
-        # a user falling silent are indistinguishable to that signal, and
-        # the first is exactly the failure mode the guard exists for.
+    async def test_uncovered_audio_with_no_interim_speech_does_not_retry(self):
+        # This test used to pin the OPPOSITE behaviour — gap-alone was
+        # treated as sufficient evidence, on the reasoning that a provider
+        # gone quiet and a user gone silent look identical to a
+        # speech-only signal (production, 2026-08-24:
+        # ``streamed=20.08s covered=16.07s gap=4.01s speech_in_gap=0.00s``,
+        # a genuine trailing sentence lost). That trade was reversed once
+        # the cost was measured directly: audit §5 found the retry this
+        # produced a transcript in 1 of 84 such uncovered-but-unvoiced
+        # tails, and session f94121ae (2026-09-04T12:26:33Z) is one of the
+        # 83 — ``0.91s of audio past last final (0.05s of it recognised
+        # speech)``, retried, 6010 ms to close a dual-stream stop whose
+        # OTHER reading had already finished in 378 ms. No interim ever
+        # touched this gap at all (not even 0.05 s of it), so under the
+        # current rule (``_tail_needs_flush``) there is no evidence here
+        # to retry for.
         session = _session()
         ws = session._ws
         assert ws is not None
@@ -290,9 +293,9 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
             await session.finalize(wait_timeout=0.2)
         finally:
             blocker.cancel()
-        self.assertGreaterEqual(
-            ws.types.count("Finalize"), 2,
-            f"uncovered audio must retry regardless of the speech signal; "
+        self.assertEqual(
+            ws.types.count("Finalize"), 1,
+            f"no voiced evidence at all: nothing to retry for; "
             f"frames were {ws.types}",
         )
         self.assertIn("CloseStream", ws.types)
