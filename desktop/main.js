@@ -58,6 +58,10 @@ const {
 // unit-tested by desktop/recording-final-slot.test.js.
 const { createRecordingFinalSlot } = require("./recording-final-slot");
 
+// SSOT for "which system power events the app reacts to, and what each
+// one means" — subscribed exactly once from app.whenReady below.
+const { subscribePowerEvents } = require("./power-events");
+
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
   process.env.NODE_ENV === "development";
@@ -8692,38 +8696,7 @@ app.whenReady().then(async () => {
     if (!shortcutsSuspendedForCapture) return;
     shortcutsSuspendedForCapture = false;
     appendMainLog(`[shortcuts] settings capture aborted by ${reason}; restoring registered shortcuts`);
-  registerGlobalShortcuts();
-
-  // Re-claim global shortcuts after system resume (BUG-81): while the
-  // machine slept, another application may have registered the same
-  // accelerators and the OS may have dropped ours. registerGlobalShortcuts
-  // is idempotent (unregister-then-register), so a resume re-claim is
-  // safe and restores hotkeys that silently died with the sleep cycle.
-  const { powerMonitor } = require("electron");
-  powerMonitor.on("resume", () => {
-    appendMainLog("[power] resume — re-registering global shortcuts");
-    try {
-      registerGlobalShortcuts();
-    } catch (e) {
-      appendMainLog(`[power] shortcut re-register failed: ${e?.message || e}`);
-    }
-  });
-
-  // The renderer holds a microphone capture warm for a while after a
-  // recording so the next one starts instantly, and it has no way to
-  // learn that the machine is about to sleep or lock: powerMonitor lives
-  // in the main process. A warm capture carried across a suspend comes
-  // back attached to a device that may no longer exist, so main tells
-  // the renderer to let it go. Sent on both events, because a lock does
-  // not always become a suspend and a suspend does not always announce a
-  // lock first; the renderer's handler is idempotent by construction
-  // (release what is warm, or nothing).
-  for (const reason of ["suspend", "lock-screen"]) {
-    powerMonitor.on(reason, () => {
-      appendMainLog(`[power] ${reason} — notifying renderer to release any warm capture`);
-      notifyRendererSystemSuspend(reason);
-    });
-  }
+    registerGlobalShortcuts();
   }
 
   /**
@@ -8914,6 +8887,19 @@ app.whenReady().then(async () => {
   }
 
   registerGlobalShortcuts();
+
+  // System power transitions, subscribed ONCE at app scope. These two
+  // handlers used to be nested inside restoreShortcutsAfterCaptureAbort,
+  // which only runs when the user aborts a hotkey capture in Settings —
+  // so in a normal session nothing was subscribed and both shipped fixes
+  // (BUG-81 resume re-claim, and the 1.6.0 warm-microphone release on
+  // sleep) never ran. The event → action mapping is now data in
+  // ./power-events, which is also what makes it testable.
+  subscribePowerEvents(require("electron").powerMonitor, {
+    reclaimShortcuts: () => registerGlobalShortcuts(),
+    releaseWarmCapture: (reason) => notifyRendererSystemSuspend(reason),
+    log: appendMainLog,
+  });
 
   shortcutBridgeHandler = handleShortcutBridgeMessage;
   shortcutCaptureAbortHandler = restoreShortcutsAfterCaptureAbort;

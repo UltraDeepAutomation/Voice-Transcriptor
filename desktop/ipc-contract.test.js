@@ -36,22 +36,105 @@ test("system-suspend is sent by main and subscribed to by the renderer bridge", 
   );
 });
 
-test("main notifies on BOTH suspend and lock-screen", () => {
-  // A lock does not always become a suspend, and a suspend does not
-  // always announce a lock first.
-  assert.match(mainSource, /for \(const reason of \["suspend", "lock-screen"\]\)/);
-  assert.match(mainSource, /powerMonitor\.on\(reason/);
+test("main subscribes the power events at app scope, not inside another handler", () => {
+  // Both power handlers once lived physically inside
+  // restoreShortcutsAfterCaptureAbort — a function that returns early
+  // unless the user aborts a hotkey capture in Settings. Nothing was
+  // subscribed in a normal session, so BUG-81's resume re-claim and the
+  // 1.6.0 warm-microphone release never ran, and the old version of this
+  // test stayed green because it matched a source string rather than
+  // asking where that string sat.
+  assert.match(mainSource, /subscribePowerEvents\(require\("electron"\)\.powerMonitor/);
+  assert.match(mainSource, /require\("\.\/power-events"\)/);
+
+  const body = functionBody(mainSource, "restoreShortcutsAfterCaptureAbort");
+  assert.ok(body, "restoreShortcutsAfterCaptureAbort must still exist");
+  for (const forbidden of ["powerMonitor", "subscribePowerEvents", "notifyRendererSystemSuspend"]) {
+    assert.ok(
+      !body.includes(forbidden),
+      `aborting a hotkey capture must not touch ${forbidden} — that nesting is the bug`,
+    );
+  }
+
+  // And the events themselves are declared once, as data, in the module.
+  const { POWER_EVENTS } = require("./power-events");
+  assert.deepEqual([...POWER_EVENTS].sort(), ["lock-screen", "resume", "suspend"]);
 });
+
+/**
+ * The source text of one top-level-ish `function name(...) { ... }` body,
+ * found by brace matching so the assertion survives reformatting.
+ */
+function functionBody(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  if (start < 0) return "";
+  const open = source.indexOf("{", start);
+  if (open < 0) return "";
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(open + 1, i);
+    }
+  }
+  return "";
+}
 
 test("the preload exposes fixed channels only — never raw ipcRenderer", () => {
   // A bridge that hands the renderer `ipcRenderer` (or a send that takes
   // the channel as an argument) gives it every channel in the app.
-  assert.ok(
-    !/exposeInMainWorld\([^)]*ipcRenderer\s*\)/.test(preloadSource),
-    "ipcRenderer itself must never cross the bridge",
-  );
-  for (const call of preloadSource.match(/ipcRenderer\.(send|on|invoke|removeListener)\(([^,)]*)/g) || []) {
-    const channel = call.split("(")[1].trim();
+  //
+  // The old assertion used /exposeInMainWorld\([^)]*ipcRenderer\)/, which
+  // cannot cross a ")" — so the realistic leak,
+  // `exposeInMainWorld("bad", { raw: ipcRenderer })`, matched nothing and
+  // the test passed. Scan each exposeInMainWorld call's whole argument
+  // list by brace/paren matching instead.
+  const exposed = exposeCalls(preloadSource);
+  assert.ok(exposed.length >= 1, "the preload must expose at least one bridge");
+  for (const call of exposed) {
+    assert.ok(
+      !/(^|[^.\w])ipcRenderer(\s*[,}\])]|\s*$)/.test(call),
+      `ipcRenderer itself must never cross the bridge: ${call.slice(0, 120)}`,
+    );
+  }
+
+  // Every ipcRenderer method that names a channel must name a literal —
+  // `once`, `sendSync`, `postMessage` and `sendTo` included, not just the
+  // four the first version of this test happened to list.
+  const CHANNEL_METHODS = "send|sendSync|sendTo|postMessage|on|once|off|invoke|removeListener|removeAllListeners";
+  const calls = preloadSource.match(new RegExp(`ipcRenderer\\.(?:${CHANNEL_METHODS})\\(([^,)]*)`, "g")) || [];
+  assert.ok(calls.length >= 3, "no ipcRenderer channel calls found — the scan matched nothing");
+  for (const call of calls) {
+    const channel = call.slice(call.indexOf("(") + 1).trim();
     assert.match(channel, /^"[a-z][a-z0-9:-]*"$/, `channel must be a literal, got ${channel}`);
   }
 });
+
+/** The full argument text of every `contextBridge.exposeInMainWorld(...)` call. */
+function exposeCalls(source) {
+  const out = [];
+  const marker = "exposeInMainWorld(";
+  let from = 0;
+  for (;;) {
+    const at = source.indexOf(marker, from);
+    if (at < 0) return out;
+    const open = at + marker.length - 1;
+    let depth = 0;
+    for (let i = open; i < source.length; i += 1) {
+      const ch = source[i];
+      if (ch === "(" || ch === "{" || ch === "[") depth += 1;
+      else if (ch === ")" || ch === "}" || ch === "]") {
+        depth -= 1;
+        if (depth === 0) {
+          out.push(source.slice(open + 1, i));
+          from = i;
+          break;
+        }
+      }
+      if (i === source.length - 1) from = source.length;
+    }
+    if (from <= at) return out;
+  }
+}

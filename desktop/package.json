@@ -51,6 +51,7 @@
       "paste-script.js",
       "paste-verification-policy.js",
       "recording-final-slot.js",
+      "power-events.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",
