@@ -5354,10 +5354,20 @@ async function runPostStopQueue() {
 }
 
 // Second-line dedup: tracks recordingIds that have ACTUALLY been pasted.
-// Even if ``_enqueuedRecordingIds`` somehow lets a duplicate through
-// (future bug, edge race, recordingId==0 legacy path), this gate
-// blocks the second paste before it reaches the AppleScript / VBS /
-// xdotool key-injection. Belt-and-braces over the enqueue dedup.
+//
+// The two gates are not one guard written twice. `_enqueuedRecordingIds`
+// is an idempotency key at queue ADMISSION — it stops the duplicate work
+// (a transcript poll, a clipboard write) before it is done. This one sits
+// at the IRREVERSIBLE boundary: injecting keystrokes into another
+// application cannot be taken back, and the only cost of a guard there is
+// a Set lookup. `postStopQueue.push` happens at exactly one site today, so
+// this gate should never fire; that is the point of putting it in front of
+// the one action a future third entry point could not undo.
+//
+// It does NOT cover the legacy `recordingId === 0` path, and an earlier
+// version of this comment claimed it did: an id of 0 is exempt from BOTH
+// gates by the same rule, because a renderer old enough not to send an id
+// cannot be deduplicated at all.
 const _pastedRecordingIds = new Set();
 const _PASTED_RECORDING_IDS_CAP = 4096;
 function _markRecordingPasted(recordingId) {
@@ -5371,11 +5381,11 @@ function _markRecordingPasted(recordingId) {
 
 async function processPostStopTask(task) {
   const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
-  // SECOND-LINE DEDUP — even if the same recordingId reaches this
-  // function through some path that bypassed _enqueuedRecordingIds
-  // (defensive against future regressions, the legacy recordingId==0
-  // exemption path, or any race that pushes directly into postStop
-  // Queue), refuse to paste a recording that already produced one.
+  // SECOND-LINE DEDUP — the guard in front of the irreversible action. If
+  // the same recordingId reaches this function through any path that
+  // bypassed the admission gate, refuse to paste a recording that already
+  // produced one. (Not the `recordingId === 0` path: an id of 0 is exempt
+  // from both gates, because there is nothing to key on.)
   if (task.recordingId > 0 && _pastedRecordingIds.has(task.recordingId)) {
     appendMainLog(
       `[post-stop-paste] dedup-skipped rec=${task.recordingId} ` +
