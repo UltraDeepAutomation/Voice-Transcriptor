@@ -55,9 +55,10 @@ import {
 import {
   candidateConfirmsTranscriptCoverage,
   joinTranscriptSegments,
+  mergeReadings,
   richerTranscript,
   textFromEnvelope,
-  unionTranscripts,
+  type Reading,
 } from "./transcript-merge";
 import {
   boundRecoveredTail,
@@ -277,12 +278,29 @@ const RECORDING_COLLECTIONS = {
 type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
 const RECORDING_VIEWER_AUDIO_READY_TIMEOUT_MS = 1500;
 
+interface TranscriptWord {
+  start: number;
+  end: number;
+  text: string;
+}
+
 interface TranscriptSegment {
   start: number;
   end: number;
   text: string;
   /** Deepgram diarization index when enabled. undefined otherwise. */
   speaker?: number;
+  /**
+   * Per-word times, when the provider sent them.
+   *
+   * The backend attaches them to every final segment
+   * (``normalize_words`` in ``remote_deepgram_live``) so the seam-time
+   * merge can place a reading word by word instead of by the span its
+   * decode window happened to have. Absent on interim segments and on
+   * providers that do not report word times — which is exactly the
+   * condition ``mergeReadings`` reads to choose its strategy.
+   */
+  words?: TranscriptWord[];
 }
 
 interface LocalTranscriptionResult {
@@ -2474,6 +2492,32 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   return cleaned.length > 800 ? fallback : cleaned;
 }
 
+/**
+ * Per-word times as the backend sends them (``{word, start, end}``),
+ * shifted onto the same axis as the segment that carries them.
+ *
+ * All or nothing: a list where any entry is missing its text or its
+ * times cannot place a reading, and half a word list would place SOME of
+ * a segment's words honestly and leave the rest to be guessed at. The
+ * segment's own span is the fallback, and it is a truthful one.
+ */
+function normalizeTranscriptWords(raw: unknown, timeOffsetSec: number): TranscriptWord[] | null {
+  if (!Array.isArray(raw) || !raw.length) return null;
+  const out: TranscriptWord[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") return null;
+    const source = entry as { word?: unknown; punctuated_word?: unknown; text?: unknown; start?: unknown; end?: unknown };
+    const text = normalizeTranscriptWhitespace(
+      String(source.punctuated_word ?? source.word ?? source.text ?? ""),
+    );
+    const start = Number(source.start) + timeOffsetSec;
+    const end = Number(source.end) + timeOffsetSec;
+    if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+    out.push({ start: Math.max(0, start), end: Math.max(0, end), text });
+  }
+  return out.length ? out : null;
+}
+
 function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): TranscriptSegment | null {
   if (!raw || typeof raw !== "object") return null;
   const source = raw as { start?: unknown; end?: unknown; text?: unknown; speaker?: unknown };
@@ -2482,6 +2526,11 @@ function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): Transcript
   const end = Math.max(start, Number(source.end || 0) + timeOffsetSec);
   if (!text || !Number.isFinite(start) || !Number.isFinite(end)) return null;
   const segment: TranscriptSegment = { start, end, text };
+  const words = normalizeTranscriptWords(
+    (raw as { words?: unknown }).words,
+    timeOffsetSec,
+  );
+  if (words) segment.words = words;
   if (source.speaker !== undefined && source.speaker !== null) {
     const speakerIndex = Number(source.speaker);
     if (Number.isFinite(speakerIndex) && speakerIndex >= 0) {
@@ -8974,18 +9023,37 @@ function getSessionCanonicalLiveSourceText(token: string): string {
  * (no ``await`` happened) is a harmless no-op — ``unionTranscripts``
  * degrades to returning the unchanged side when the two are identical.
  *
- * ``thirdText`` is deliberately generic: it might be the same-stream
- * final envelope (aligns cleanly with the splice) or an independent
- * full-audio decode from a different engine (recovery). Uniting those
- * is still correct — ``unionTranscripts`` falls back to picking
+ * ``third`` is deliberately generic: it might be the same-stream final
+ * envelope (aligns cleanly with the splice, and carries per-word times)
+ * or an independent full-audio decode from a different engine
+ * (recovery), which arrives as a bare string. Combining those is still
+ * correct — ``mergeReadings`` chooses its strategy from the data and
+ * falls back to the text union, which itself falls back to picking
  * whichever text is richer when the two don't look like the same
- * speech, which is exactly the old ``richerTranscript`` behaviour the
- * race used deliberately. This helper is therefore safe to use
- * uniformly; it does not silently interleave two unrelated decodes.
+ * speech. This helper is therefore safe to use uniformly; it does not
+ * silently interleave two unrelated decodes.
+ *
+ * Debt item (d): the combination goes through ``mergeReadings`` rather
+ * than ``unionTranscripts`` so that the one case where BOTH readings are
+ * timed — the live buffer's committed segments against the envelope's
+ * segments and their words — is decided at a seam in time instead of by
+ * text similarity. Everything else takes the same union it always did.
  */
-function composeStopTranscript(floor: string, sessionToken: string, thirdText: string): string {
-  const withCurrentBuffer = unionTranscripts(floor, getSessionCanonicalLiveSourceText(sessionToken));
-  return unionTranscripts(withCurrentBuffer, thirdText);
+function composeStopTranscript(
+  floor: string,
+  sessionToken: string,
+  third: string | Reading,
+): string {
+  // The buffer's committed segments are the held reading's time axis.
+  // They are read here, not passed in, for the same reason the text is:
+  // the buffer is live and may have grown during an await.
+  const heldSegments = getLiveTranscriptBuffer(sessionToken)?.segments;
+  const withCurrentBuffer = mergeReadings(
+    { text: floor },
+    { text: getSessionCanonicalLiveSourceText(sessionToken), segments: heldSegments },
+  );
+  const thirdReading: Reading = typeof third === "string" ? { text: third } : third;
+  return mergeReadings({ text: withCurrentBuffer, segments: heldSegments }, thirdReading);
 }
 
 function appendSegmentsToBuffer(
@@ -11849,7 +11917,10 @@ async function stopLive(
         // the splice's holes. ``composeStopTranscript`` aligns them and
         // also re-reads the live session buffer, which may have grown
         // since ``instantTranscript`` was captured above.
-        const opportunisticTranscript = composeStopTranscript(transcriptRaw, sessionUiToken, opportunisticEnvelopeText);
+        const opportunisticTranscript = composeStopTranscript(transcriptRaw, sessionUiToken, {
+          text: opportunisticEnvelopeText,
+          segments: alreadyResolvedEnvelope?.segments,
+        });
         if (opportunisticTranscript !== transcriptRaw) {
           transcriptRaw = opportunisticTranscript;
           console.log(`[trace stopLive] opportunistic-envelope used ${traceTextStats("transcript", transcriptRaw)}`);
@@ -11883,7 +11954,10 @@ async function stopLive(
           const env = await waitForLiveEnvelopeWithAnnouncedBudget(sessionUiToken);
           const envText = textFromEnvelope(env);
           const before = transcriptRaw;
-          transcriptRaw = composeStopTranscript(transcriptRaw, sessionUiToken, envText);
+          transcriptRaw = composeStopTranscript(transcriptRaw, sessionUiToken, {
+            text: envText,
+            segments: env?.segments,
+          });
           console.log(
             `[trace tail-gap] interim-covered: envelope ` +
             `${transcriptRaw !== before ? "upgraded" : "confirmed"} instant transcript ` +

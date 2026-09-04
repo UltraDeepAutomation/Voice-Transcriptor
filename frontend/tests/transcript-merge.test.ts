@@ -3,9 +3,11 @@ import { describe, it, expect } from "vitest";
 import {
   candidateConfirmsTranscriptCoverage,
   joinTranscriptSegments,
+  mergeReadings,
   unionTranscripts,
   richerTranscript,
   textFromEnvelope,
+  type Reading,
 } from "../src/transcript-merge";
 
 describe("transcript-merge SSOT", () => {
@@ -255,5 +257,230 @@ describe("transcript-merge SSOT", () => {
       // A fallback pick could contain at most one of the two clauses.
       expect(merged).not.toBe(richerTranscript(held, authoritative));
     });
+  });
+});
+
+// ── Seam-time merge (debt registry item (d)) ─────────────────────────
+
+/**
+ * A segment whose words are spread evenly across its span.
+ *
+ * The FIXTURE may interpolate; the production code deliberately does not
+ * (see ``timedTokens``). This is how the backend's real envelopes look —
+ * ``normalize_words`` puts a start/end on every word of every final — and
+ * writing them out by hand for a ninety-word evidence text would be
+ * noise, not fidelity.
+ */
+function wordTimed(text: string, start: number, end: number) {
+  const words = text.split(/\s+/).filter(Boolean);
+  const step = words.length ? (end - start) / words.length : 0;
+  return {
+    text,
+    start,
+    end,
+    words: words.map((word, i) => ({
+      word,
+      start: Number((start + i * step).toFixed(3)),
+      end: Number((start + (i + 1) * step).toFixed(3)),
+    })),
+  };
+}
+
+/** A segment with a span and no per-word times — the live buffer's shape. */
+function spanTimed(text: string, start: number, end: number) {
+  return { text, start, end };
+}
+
+function reading(segments: Array<{ text: string }>, text?: string): Reading {
+  return {
+    text: text ?? segments.map((s) => s.text).join(" "),
+    segments,
+  };
+}
+
+describe("mergeReadings — strategy is chosen by the data", () => {
+  it("falls back to the text union when either reading has no timestamps", () => {
+    const held = "старая база данных Я ж тебе скинул";
+    const authoritative = "старая база данных отклоняет пароли. Я ж тебе скинул.";
+    expect(mergeReadings({ text: held }, { text: authoritative })).toBe(
+      unionTranscripts(held, authoritative),
+    );
+    // One side timed is not enough: a seam needs one axis, not half of one.
+    expect(
+      mergeReadings(
+        { text: held, segments: [spanTimed(held, 0, 4)] },
+        { text: authoritative },
+      ),
+    ).toBe(unionTranscripts(held, authoritative));
+  });
+
+  it("falls back to the text union when the two readings are not the same speech", () => {
+    const held = reading([spanTimed("один два три четыре пять шесть", 0, 3)]);
+    const authoritative = reading([wordTimed("совершенно другая запись про другое дело", 0, 3)]);
+    expect(mergeReadings(held, authoritative)).toBe(
+      unionTranscripts(String(held.text), String(authoritative.text)),
+    );
+  });
+
+  it("returns the other side when one reading is empty", () => {
+    expect(mergeReadings({ text: "" }, { text: "только это" })).toBe("только это");
+    expect(mergeReadings({ text: "только это" }, { text: "" })).toBe("только это");
+  });
+
+  it("takes the authoritative spelling when the two readings agree word for word", () => {
+    const text = "проверка связи раз два три четыре";
+    const held = reading([spanTimed(text, 0, 3)]);
+    const authoritative = reading([wordTimed(text, 0, 3)]);
+    expect(mergeReadings(held, authoritative)).toBe(text);
+  });
+});
+
+describe("mergeReadings — 2026-09-03 23:49:57 duplication, decided in time", () => {
+  // The same evidence pair as the union fixture above, placed on the
+  // clock the live stream actually gave it: the held reading's last
+  // segment is the live splice's own RE-DECODE of the clause before it
+  // (that is why it repeats it), so it overlaps that clause in time,
+  // while the envelope states the clause once with per-word times.
+  const PREFIX =
+    "Так, слушай. Если тебе нужно, я вот сейчас описываю прямо сейчас голосовой сообщение, оно останется " +
+    "hello, hello everybody that's close up agents workflow that we are sub the issues inside my text lab de " +
+    "la capitale de la France. На французском я обычно не говорю, но тем не менее Возможно, в чанках, проблема " +
+    "в том что происходит после нажатия кнопки возможно проблема в обрезках, я не знаю, тебе нужно " +
+    "самостоятельно это все изучить, может ты уже нашел истинные причины и can fix them them sub agents sub " +
+    "agents c источник истины вот такой вот длины";
+  const AUTHORITATIVE_TAIL = "prompt я наговорил, ты можешь посмотреть WAV файлы через логи прямо сейчас";
+  const HELD_TAIL_FIRST = "prompt я наговорил, ты можешь посмотреть WAV";
+  const HELD_TAIL_REDECODE = "prompt я наговорил, можешь посмотреть WAV файлы через логи прямо сейчас";
+
+  const held = reading([
+    spanTimed(PREFIX, 0, 39.5),
+    spanTimed(HELD_TAIL_FIRST, 40.2, 43),
+    spanTimed(HELD_TAIL_REDECODE, 41.5, 47),
+  ]);
+  const authoritative = reading([
+    wordTimed(PREFIX, 0, 39.5),
+    wordTimed(AUTHORITATIVE_TAIL, 40.2, 47),
+  ]);
+
+  it("does not deliver the re-decoded clause twice", () => {
+    const merged = mergeReadings(held, authoritative);
+    expect((merged.match(/можешь посмотреть WAV/g) || []).length).toBe(1);
+  });
+
+  it("keeps the envelope's reading of that clause intact", () => {
+    expect(mergeReadings(held, authoritative)).toContain(
+      "ты можешь посмотреть WAV файлы через логи прямо сейчас",
+    );
+  });
+
+  it("loses nothing else from either reading", () => {
+    expect(mergeReadings(held, authoritative)).toBe(`${PREFIX} ${AUTHORITATIVE_TAIL}`);
+  });
+});
+
+describe("mergeReadings — a two-sided divergence the text union mishandles", () => {
+  // Two readings of one utterance, differing over the SAME span, with a
+  // 0.8 s pause in the middle of it. The union aligns them by their
+  // shared words and takes the longer run out of each gap, so it emits a
+  // sentence that exists in neither reading; the seam merge cuts once at
+  // the pause and each reading is delivered whole on its own side of it.
+  const HELD_TEXT = "мы поехали в магазин за молоком и хлебом";
+  const AUTHORITATIVE_TEXT = "мы пошли в лавку за хлебом";
+  const held = reading([
+    spanTimed("мы поехали в магазин", 0, 1.6),
+    spanTimed("за молоком и хлебом", 2.4, 4.2),
+  ], HELD_TEXT);
+  const authoritative = reading([
+    wordTimed("мы пошли в лавку", 0, 1.6),
+    wordTimed("за хлебом", 2.4, 4.2),
+  ], AUTHORITATIVE_TEXT);
+
+  it("the text union invents a sentence neither reading contains", () => {
+    const united = unionTranscripts(HELD_TEXT, AUTHORITATIVE_TEXT);
+    expect(united).not.toBe(HELD_TEXT);
+    expect(united).not.toBe(AUTHORITATIVE_TEXT);
+    expect(united).toContain("лавку за молоком");
+  });
+
+  it("the seam merge cuts at the pause and mixes nothing inside a clause", () => {
+    const merged = mergeReadings(held, authoritative);
+    expect(merged).toBe("мы поехали в магазин за хлебом");
+  });
+});
+
+describe("mergeReadings — a phrase genuinely said twice is kept twice", () => {
+  // The n-gram guard collapses a repeat only when the two runs occupy
+  // the SAME seconds of audio. Here the speaker says "это очень важно"
+  // at 1 s and again at 30 s: same words, different audio, both kept.
+  const REPEAT = "это очень важно";
+  const held = reading([
+    spanTimed(`Слушай ${REPEAT} и запомни`, 0.5, 3.5),
+    spanTimed("потом были другие дела и разговоры", 10, 14),
+    spanTimed(`а в конце я повторил ${REPEAT}`, 29, 32),
+  ]);
+  const authoritative = reading([
+    wordTimed(`Слушай ${REPEAT} и запомни`, 0.5, 3.5),
+    wordTimed("потом были другие дела, разговоры и встречи", 10, 14),
+    wordTimed(`а в конце я повторил ${REPEAT}`, 29, 32),
+  ]);
+
+  it("keeps both occurrences", () => {
+    const merged = mergeReadings(held, authoritative);
+    expect((merged.match(/это очень важно/g) || []).length).toBe(2);
+  });
+});
+
+describe("mergeReadings — a word straddling the seam takes the authoritative spelling", () => {
+  // The seam falls in the 0.9 s pause at ~4.5 s. "субагента" is spoken
+  // across it; the live splice heard "сунагента" and the full-context
+  // decode heard "субагента". It must appear once, spelled the
+  // authoritative way — the alignment inside the ±1 s window is what
+  // decides that, not the cut.
+  const held = reading([
+    spanTimed("нам нужно проверить как работает", 1, 4.05),
+    spanTimed("сунагента", 4.05, 4.95),
+    spanTimed("в этом сценарии подробно", 4.95, 7),
+  ]);
+  const authoritative = reading([
+    wordTimed("нам нужно проверить как работает", 1, 4),
+    wordTimed("субагента", 4.1, 5),
+    wordTimed("в этом сценарии подробнее", 5, 7),
+  ]);
+
+  it("spells the straddling word the authoritative way, exactly once", () => {
+    const merged = mergeReadings(held, authoritative);
+    expect((merged.match(/агента/g) || []).length).toBe(1);
+    expect(merged).toContain("субагента");
+    expect(merged).not.toContain("сунагента");
+  });
+});
+
+describe("mergeReadings — the held reading's uncommitted tail always survives", () => {
+  it("does not append the whole transcript when the held text also differs mid-way", () => {
+    // The held text the stop path composes is NOT always its committed
+    // text plus a suffix: an earlier envelope merge can have put words in
+    // the middle of it. A prefix rule would call the entire text "the
+    // tail" and append the transcript to itself.
+    const held: Reading = {
+      text: "первая часть и вторая, уточнённая, часть плюс незакрытый хвост",
+      segments: [spanTimed("первая часть и вторая часть", 0, 3)],
+    };
+    const authoritative = reading([wordTimed("первая часть и вторая часть", 0, 3)]);
+    const merged = mergeReadings(held, authoritative);
+    expect((merged.match(/первая часть/g) || []).length).toBe(1);
+    expect(merged).toContain("плюс незакрытый хвост");
+  });
+
+  it("emits interim words no committed segment accounts for", () => {
+    const held: Reading = {
+      // What the live view holds: the committed segments PLUS the
+      // interim hypothesis for audio nothing has finalized yet.
+      text: "первая часть и вторая часть плюс незакрытый хвост",
+      segments: [spanTimed("первая часть и вторая часть", 0, 3)],
+    };
+    const authoritative = reading([wordTimed("первая часть и вторая часть", 0, 3)]);
+    expect(mergeReadings(held, authoritative)).toBe(
+      "первая часть и вторая часть плюс незакрытый хвост",
+    );
   });
 });
