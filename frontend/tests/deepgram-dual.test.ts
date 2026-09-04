@@ -6,8 +6,14 @@ import { describe, it, expect } from "vitest";
 import {
   DUAL_SECONDARY_LANGUAGE_DEFAULT,
   DUAL_STREAM_DEFAULT,
+  dualStreamTradeOffText,
   resolveDualStreamPreference,
 } from "../src/deepgram-dual";
+
+// ``process.cwd()`` is the vitest root (frontend/); the jsdom
+// environment gives ``import.meta.url`` an http origin, so it cannot be
+// resolved to a file path here.
+const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
 
 const offered = ["ru", "en"];
 
@@ -80,11 +86,6 @@ describe("resolveDualStreamPreference", () => {
 });
 
 describe("the markup default agrees with the documented backend default (R-006)", () => {
-  // ``process.cwd()`` is the vitest root (frontend/); the jsdom
-  // environment gives ``import.meta.url`` an http origin, so it cannot
-  // be resolved to a file path here.
-  const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
-
   /**
    * A checkbox's markup default is not a display detail. There are two
    * ways ``preferences.deepgram.dual_stream`` can be absent when the
@@ -101,5 +102,36 @@ describe("the markup default agrees with the documented backend default (R-006)"
     const tag = /<input[^>]*id="deepgramDualStreamCheck"[^>]*>/.exec(html)?.[0];
     expect(tag, "#deepgramDualStreamCheck is missing from index.html").toBeTruthy();
     expect(/\bchecked\b/.test(String(tag))).toBe(DUAL_STREAM_DEFAULT);
+  });
+});
+
+/**
+ * The trade-off sentence. Two surfaces state it — the Settings note and
+ * the Record view's Auto hint — and they stated it in two wordings, so
+ * a correction landed on one of them.
+ */
+describe("dualStreamTradeOffText", () => {
+  it("states the gain and the price in one sentence", () => {
+    const text = dualStreamTradeOffText();
+    expect(text).toContain("multilingual model drops");
+    expect(text).toContain("twice the Deepgram minutes");
+  });
+
+  it("names the second stream's language when the caller knows it", () => {
+    expect(dualStreamTradeOffText("ru")).toContain("A second RU stream");
+    expect(dualStreamTradeOffText(" en ")).toContain("A second EN stream");
+  });
+
+  it("says the same thing about gain and price either way", () => {
+    const withLang = dualStreamTradeOffText("ru");
+    expect(withLang).toContain("phrases the multilingual model drops, at twice the Deepgram minutes.");
+    expect(dualStreamTradeOffText()).toContain("phrases the multilingual model drops, at twice the Deepgram minutes.");
+  });
+
+  it("is the only place the markup's note comes from", () => {
+    const note = new DOMParser().parseFromString(html, "text/html")
+      .getElementById("deepgramDualStreamNote");
+    expect(note, "#deepgramDualStreamNote missing").toBeTruthy();
+    expect(note?.textContent?.trim()).toBe("");
   });
 });

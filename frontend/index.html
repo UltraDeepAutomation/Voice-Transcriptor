@@ -223,15 +223,18 @@
             </div>
             <div class="upload-droplarge" id="uploadLargeDrop" tabindex="0" role="button"
               aria-label="Drop audio or video files here, or click to browse">
-              <input id="uploadLargeFileInput" type="file" accept="audio/*,video/*" multiple hidden />
+              <input id="uploadLargeFileInput" type="file" multiple hidden />
               <div class="upload-droplarge-icon" aria-hidden="true">↑</div>
               <div class="upload-droplarge-title">Drop audio or video files</div>
               <div class="upload-droplarge-sub">
                 or click to browse
               </div>
-              <div class="upload-droplarge-formats">
-                WAV · MP3 · M4A · FLAC · OGG · AAC · MP4 · WEBM · MOV · MKV
-              </div>
+              <!--
+                Filled by renderAcceptedFormatsHint() from the extension
+                list the backend reports; hidden until it has. Typed out
+                here it was ten of the backend's eighteen.
+              -->
+              <div class="upload-droplarge-formats" id="uploadAcceptedFormats" hidden></div>
               <div class="upload-droplarge-hint" id="uploadProviderHint"></div>
             </div>
           </div>
@@ -249,12 +252,10 @@
               </div>
             </div>
             <ul class="upload-queue-list" id="uploadQueueList" aria-live="polite"></ul>
+            <!-- Copy written at boot by applyStaticUiCopy (src/ui-copy.ts). -->
             <div class="upload-empty-state" id="uploadEmptyState">
-              <div class="upload-empty-state-title">No files yet</div>
-              <div class="upload-empty-state-sub">
-                Drop audio or video on the left.<br>
-                Each completed file is saved to <b>History</b> automatically.
-              </div>
+              <div class="upload-empty-state-title"></div>
+              <div class="upload-empty-state-sub"></div>
             </div>
           </div>
           <!--
@@ -435,7 +436,7 @@
               <span class="session-notice-text" id="recordSessionNoticeText"></span>
             </div>
 
-            <pre class="out" id="finalOutput" data-placeholder="Transcription will appear here..."></pre>
+            <pre class="out" id="finalOutput"></pre>
 
             <div class="pane-footer current-audio-row" id="currentRecordingAudioRow">
               <!-- Custom app-styled player (native <audio controls>
@@ -443,9 +444,9 @@
                    hidden as the media engine; controls below drive it. -->
               <div class="custom-player" id="currentRecordingPlayer">
                 <button class="cp-btn cp-play" id="cpPlayBtn" type="button" aria-label="Play">▶</button>
-                <span class="cp-time" id="cpCurrentTime">0:00</span>
+                <span class="cp-time" id="cpCurrentTime"></span>
                 <input type="range" class="cp-seek" id="cpSeek" min="0" max="1000" value="0" aria-label="Seek" />
-                <span class="cp-time cp-dur" id="cpDuration">0:00</span>
+                <span class="cp-time cp-dur" id="cpDuration"></span>
                 <audio id="currentRecordingAudio" preload="auto" style="display:none"></audio>
               </div>
               <button class="icon-btn icon-btn-compact" id="retranscribeBtn" type="button"
@@ -572,7 +573,7 @@
             <div class="pane-header recordings-viewer-header">
               <div class="recording-title-block">
                 <span class="pane-title">Transcript</span>
-                <strong class="recording-viewer-title" id="recordingTitleLabel">Choose a recording</strong>
+                <strong class="recording-viewer-title" id="recordingTitleLabel"></strong>
                 <span class="pane-badge" id="recordingMeta"></span>
               </div>
               <div class="recording-header-actions">
@@ -589,7 +590,7 @@
             <div class="pane-footer current-audio-row" id="recordingAudioRow" hidden>
               <audio id="recordingAudio" controls preload="metadata"></audio>
             </div>
-            <pre class="out" id="recordingContent" data-placeholder="Choose a recording from the left list..."></pre>
+            <pre class="out" id="recordingContent"></pre>
           </div>
         </div>
       </section>
@@ -700,10 +701,8 @@
                   <span class="lbl">Second language</span>
                   <select id="deepgramDualSecondaryLang"></select>
                 </label>
-                <p class="settings-note" id="deepgramDualStreamNote">
-                  Fills phrases the multilingual model drops; costs 2×
-                  Deepgram minutes.
-                </p>
+                <!-- Written at boot from dualStreamTradeOffText(). -->
+                <p class="settings-note" id="deepgramDualStreamNote"></p>
               </div>
               <label class="field">
                 <span class="lbl">OpenRouter</span>

@@ -483,3 +483,54 @@ and `.gitignore:13` forbade the one file that could hold it.
 - `desktop/engine-deps.js:52` and two `main.js` comments still say "3.12" while
   narrating a past bug; the one path-shaped comment was generalised, the
   historical ones are prose about what happened and are left as written.
+---
+## Commit 10 — dependency pins SSOT
+
+**IDs:** D-026 (P1).
+
+**Files:** `desktop/package.json`, `desktop/main.js`,
+`.github/workflows/tests.yml`, `desktop/packaging.test.js`, `AGENTS.md`.
+
+**Re-verified on current code before fixing:** yes, and on the SHIPPED app.
+`ls /Applications/Transcriptor.app/Contents/Resources/` (installed 1.6.0):
+```
+ENABLE_GIGAAM
+requirements-gigaam.txt
+requirements.txt
+```
+— `requirements.runtime-lock.txt` is not there, so the on-device repair
+install could not have applied it even if it had tried.
+
+**Verification (pre-fix behaviour replayed from `git show HEAD:`)**
+```
+OLD backend pip calls: 2
+   "-m","pip","install","-r",requirementsPath                                  | has constraints: false
+   "-m","pip","install","--user","--break-system-packages","-r",requirementsPath | has constraints: false
+OLD CI applies the lock: false
+OLD extraResources destinations: backend, frontend, requirements.txt, .python-version, requirements-gigaam.txt, ENABLE_GIGAAM
+```
+Three installers, one of them applying the lock. After the fix all three do,
+and the two new packaging tests assert each of the three by its own text.
+- `npm --prefix desktop test` -> `tests 215 / pass 215 / fail 0` (was 213).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *Chosen:* one `constraintArgs` array, built once and spread into both pip
+  invocations. The report's suggested edit touched only the first call; a
+  retry that installs a different version set than the attempt it replaces is
+  a second source of truth reachable only from a failure.
+- *Chosen:* a missing lock **warns and continues** here, unlike
+  `prepare-runtime.sh`, which dies. The build must not produce an unlocked
+  bundle; a user whose Resources are damaged is better served by dependencies
+  installed loosely than by an app that refuses to repair itself.
+- *Chosen:* the optional-engine install (`requirements-gigaam.txt` into a
+  staging site) is deliberately NOT constrained by the runtime lock, and the
+  test says so. It is a different dependency set, and `engine-deps.js` already
+  reconciles it against the bundle by its own rules; constraining it here
+  would be a behaviour change to the engine path that no finding asks for.
+- *Chosen:* `requirements.txt` keeps its five deliberate ranges. The lock is
+  the release rendering of them, not a replacement — the header of the lock
+  file states that policy and it is unchanged.
+
+**Not done in this commit:** nothing from this group.
+

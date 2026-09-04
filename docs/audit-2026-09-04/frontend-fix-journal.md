@@ -638,3 +638,106 @@ $ typecheck / lint / build — чисто, ✓ built
   структурные контейнеры. Снятие id с разметки ради чистоты — это churn в
   файле, который параллельно правят, при нулевой пользе и ненулевом риске
   (ссылки `aria-*`, будущие стили). Не дефект.
+
+---
+
+# Сессия 2026-09-05 (продолжение с W-9)
+
+Базовая точка: `1a12c3c`. `git diff main...origin/wip/ultra-audit-2026-09-04 -- frontend`
+— пусто (предыдущий агент коммитил по группам, незакоммиченного фронтенда нет).
+Базовая верификация до правок: `typecheck` ok, `lint` ok,
+`test` **281 passed (24 files)**, `build` ok.
+
+Нумерация индексов костылей: в журнале предыдущего агента `W-n` — это индекс
+**региона C** (W-1…W-18). Общее «49 позиций» складывается из четырёх индексов:
+регион F (11 строк), регион U (K-1…K-10), регион R (10 строк), регион C
+(W-1…W-18) = 49. Ниже они разбираются все; ссылки даю как `C/W-n`, `U/K-n`,
+`R/n`, `F/n`.
+
+---
+
+## Коммит `<A>` — SSOT, копия, которую показывают две поверхности
+
+**Заголовок:** Every string the user reads on two surfaces is written in one place, and the accepted-formats line is the list the app actually enforces
+
+**Находки / строки индексов:** `R`-индекс SSOT — «Choose a recording from the
+left list...» (×3), «No recordings match the current search.» (×3), «Choose a
+recording» (×2), «Transcription will appear here...» (×2), «costs 2× Deepgram
+minutes» (×2); `U`-индекс SSOT — H-7 (список расширений: 10 против 18 у
+бэкенда), H-8 (`accept` ×2), H-9 (пустое состояние Upload ×2 + `innerHTML`);
+`C`-индекс — S-22 в оставшейся части (третий форматтер времени `fmt` в IIFE
+плеера, литерал `"0:00"` ×4).
+
+**Перепроверка на текущем коде.** Все открыты дословно:
+`index.html:438/575/592` против `main.tsx:7212/7213/7616/7798/7937/8157`;
+`index.html:226` + `main.tsx:14368`; `index.html:221` (10 расширений) против
+`ACCEPTED_AUDIO_VIDEO_EXTS`, заполняемого из `accepted_audio_exts` бэкенда;
+`index.html:252-257` против `renderUploadQueue` (перезапись `innerHTML` на
+каждый рендер); `index.html:446/448` + `main.tsx:2416/2417` + локальная `fmt`
+(формат `m:ss` против `mm:ss` у `fmtTime`).
+
+**Файлы:** `frontend/src/ui-copy.ts` (новый), `frontend/tests/ui-copy.test.ts`
+(новый, 14 тестов), `frontend/src/deepgram-dual.ts`
+(`dualStreamTradeOffText`), `frontend/tests/deepgram-dual.test.ts` (+4),
+`frontend/src/main.tsx`, `frontend/index.html`.
+
+**Что сделано.**
+* Правило: **разметка не несёт собственной копии**. `applyStaticUiCopy(document)`
+  пишет её на бутстрапе — тот же приём, что уже применён к числам
+  (`applyAutoStopSilenceBounds`), к списку языков (`#uploadLanguage` из
+  `#language`) и к селекту провайдеров.
+* `renderAcceptedFormatsHint` рисует строку форматов из списка бэкенда; пока
+  список неизвестен, строка **скрыта**, а не заполнена догадкой.
+* `dualStreamTradeOffText(secondary?)` — один факт «что даёт и чего стоит второй
+  поток» на обе поверхности; языковой аргумент — единственное, чем они
+  отличаются, потому что только Record-вид знает выбранный язык.
+* `PLAYER_TIME_ZERO = fmtTime(0)`; локальная `fmt` плеера стала `fmtTime`.
+* Перезапись пустого состояния Upload на каждом рендере (вместе с
+  единственным содержательным `innerHTML` в файле) удалена: копия теперь
+  пишется один раз.
+
+**Верификация.**
+
+```
+$ npm --prefix frontend test
+ Test Files  25 passed (25)
+      Tests  299 passed (299)
+$ typecheck / lint / build — чисто, ✓ built
+```
+
+Доказательство «падало до, проходит после»:
+
+```
+$ git stash push index.html && npx vitest run tests/ui-copy.test.ts
+     × does not repeat the result placeholder
+     × does not repeat the History viewer placeholder
+     × does not repeat the History viewer title
+     × does not repeat the Upload empty-state title
+     × does not repeat the Upload empty-state lead
+     × leaves the file dialog's filter to ui-copy
+     × does not claim a list of accepted formats the backend has not reported
+     … 10 failed
+$ git stash pop && npx vitest run tests/ui-copy.test.ts
+      Tests  14 passed (14)
+```
+
+**Решения.**
+* Выбрано: пустая разметка + запись на бутстрапе. Отвергнуто: оставить копию в
+  разметке и читать её из неё в рендерере — это меняет направление дрейфа, но
+  не убирает его: значение по умолчанию у параметра функции всё равно надо
+  где-то написать, а разметка не типизируется.
+* Отвергнуто: одна строка на обе формулировки dual-stream. Хуже: Record-вид
+  называет язык («A second RU stream…»), Settings — нет; склейка в один литерал
+  дала бы либо безличную фразу на Record-виде, либо язык там, где он неизвестен.
+  Общий у них ровно факт — он и вынесен.
+* Список форматов: отвергнуто «оставить десять как fallback». Это ровно та
+  копия, которая уже разошлась (нет `oga, opus, wma, m4v, avi, mpg, mpeg, 3gp`);
+  показывать пользователю список, который не совпадает с проверкой в
+  `uploadFileValidationError`, — врать в интерфейсе.
+* Плеер теперь показывает `00:42`, а не `0:42`. Это осознанная смена
+  представления: в приложении один формат часов, и живой таймер записи всегда
+  показывал `mm:ss`.
+* `#deepgramDualStreamNote` и `#uploadAcceptedFormats` перестали быть id без
+  потребителей (`C/W-9` в этой части закрыт кодом, а не отговоркой).
+
+**Не сделано:** —

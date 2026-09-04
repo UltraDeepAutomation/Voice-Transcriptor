@@ -66,3 +66,20 @@ export function resolveDualStreamPreference(input: DualStreamPreferenceInput): D
     secondaryLanguage,
   };
 }
+
+/**
+ * The one sentence that states what the second stream buys and costs.
+ *
+ * Two surfaces show this fact — the Settings note under the toggle and
+ * the Auto hint on the Record view — and they stated it in two
+ * different wordings ("costs 2× Deepgram minutes" against "for twice
+ * the Deepgram minutes"), so a correction to the price or the claim
+ * landed on one of them. It is one fact, so it is written once; the
+ * language argument is the only thing the two surfaces disagree about,
+ * because only the Record view knows which language is configured.
+ */
+export function dualStreamTradeOffText(secondaryLanguage = ""): string {
+  const code = String(secondaryLanguage || "").trim().toUpperCase();
+  const subject = code ? `A second ${code} stream fills` : "Fills";
+  return `${subject} phrases the multilingual model drops, at twice the Deepgram minutes.`;
+}

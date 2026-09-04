@@ -11,7 +11,8 @@ repository.
 4. Preserve SSOT boundaries. Product vision lives in `PRODUCT.md`; release
    environment variables live in `.env.example`; app version lives in
    `desktop/package.json`; the Python version lives in `.python-version`
-   and the Node version in `.nvmrc`.
+   and the Node version in `.nvmrc`; the exact dependency versions the
+   shipped runtime is built with live in `requirements.runtime-lock.txt`.
 5. Before edits, check `git status` and `git worktree list`, then keep changes
    atomic and commit only verified code.
 

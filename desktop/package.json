@@ -88,6 +88,10 @@
         "to": "requirements.txt"
       },
       {
+        "from": "../requirements.runtime-lock.txt",
+        "to": "requirements.runtime-lock.txt"
+      },
+      {
         "from": "../.python-version",
         "to": ".python-version"
       },

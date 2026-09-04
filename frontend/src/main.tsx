@@ -33,8 +33,10 @@ import {
 import {
   DUAL_SECONDARY_LANGUAGE_DEFAULT,
   DUAL_STREAM_DEFAULT,
+  dualStreamTradeOffText,
   resolveDualStreamPreference,
 } from "./deepgram-dual";
+import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint } from "./ui-copy";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
 import { installErrorAwareConsole, isGenericFetchFailure } from "./error-text";
@@ -791,6 +793,14 @@ const fmtDateTime = (iso: string): string => {
  * places for `mm:ss` to become something else.
  */
 const fmtDur = fmtTime;
+/**
+ * What both player time labels read before any audio is attached.
+ *
+ * Typed out as "0:00" in two elements of the markup and two assignments
+ * in the reset path — a fifth format, in a build where the clock says
+ * ``00:00``.
+ */
+const PLAYER_TIME_ZERO = fmtTime(0);
 const fmtMs = (ms: number): string => {
   const n = Math.max(0, Number(ms) || 0);
   if (n < 1000) return `${Math.round(n)} ms`;
@@ -1994,6 +2004,7 @@ function applyBackendRuntimeConfig(payload: unknown): void {
     if (nextExts.length > 0) {
       ACCEPTED_AUDIO_VIDEO_EXTS.clear();
       for (const ext of nextExts) ACCEPTED_AUDIO_VIDEO_EXTS.add(ext);
+      renderAcceptedFormatsHint(document, ACCEPTED_AUDIO_VIDEO_EXTS);
     }
   }
 }
@@ -2413,8 +2424,8 @@ async function renderLatestSavedAudio(): Promise<void> {
     const curEl = document.getElementById("cpCurrentTime") as HTMLSpanElement | null;
     const durEl = document.getElementById("cpDuration") as HTMLSpanElement | null;
     if (seekEl) seekEl.value = "0";
-    if (curEl) curEl.textContent = "0:00";
-    if (durEl) durEl.textContent = "0:00";
+    if (curEl) curEl.textContent = PLAYER_TIME_ZERO;
+    if (durEl) durEl.textContent = PLAYER_TIME_ZERO;
     return;
   }
 
@@ -2551,12 +2562,12 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
   const cur = document.getElementById("cpCurrentTime") as HTMLSpanElement | null;
   const dur = document.getElementById("cpDuration") as HTMLSpanElement | null;
   if (!audio || !playBtn || !seek || !cur || !dur) return;
-  const fmt = (t: number): string => {
-    if (!Number.isFinite(t)) return "0:00";
-    const m = Math.floor(t / 60);
-    const sec = Math.floor(t % 60);
-    return `${m}:${String(sec).padStart(2, "0")}`;
-  };
+  // One clock for the whole app: this used to be a third formatter
+  // with a fourth format (``m:ss`` against fmtTime's ``mm:ss``), so the
+  // player and the live timer disagreed about the same duration.
+  // fmtTime coerces a non-finite duration — an <audio> element that has
+  // no metadata yet reports NaN — to the same zero the labels start at.
+  const fmt = fmtTime;
   const syncPlayIcon = (): void => {
     playBtn.textContent = audio.paused ? "▶" : "❚❚";
     playBtn.setAttribute("aria-label", audio.paused ? "Play" : "Pause");
@@ -3353,6 +3364,25 @@ function applyAutoStopSilenceBounds(): void {
   }
   const enabled = document.getElementById("autoStopSilenceEnabled") as HTMLInputElement | null;
   if (enabled) enabled.checked = t.defaultEnabled;
+}
+
+/**
+ * Write every string that appears on two surfaces into the markup.
+ *
+ * The counterpart of ``applyAutoStopSilenceBounds`` for copy: the
+ * declarations live in ``ui-copy.ts`` (static strings), in
+ * ``deepgram-dual.ts`` (the one sentence about what the second stream
+ * costs) and in the backend's own extension list.
+ */
+function applyStaticCopyToMarkup(): void {
+  applyStaticUiCopy(document);
+  renderAcceptedFormatsHint(document, ACCEPTED_AUDIO_VIDEO_EXTS);
+  const dualNote = document.getElementById("deepgramDualStreamNote");
+  if (dualNote) dualNote.textContent = dualStreamTradeOffText();
+  const curEl = document.getElementById("cpCurrentTime");
+  if (curEl) curEl.textContent = PLAYER_TIME_ZERO;
+  const durEl = document.getElementById("cpDuration");
+  if (durEl) durEl.textContent = PLAYER_TIME_ZERO;
 }
 
 function keyInput(provider: KeyProvider): HTMLInputElement {
@@ -7209,8 +7239,8 @@ function updateRecordingCopyState(): void {
   btn.disabled = !hasText;
 }
 
-function resetRecordingViewer(placeholder = "Choose a recording from the left list..."): void {
-  $("recordingTitleLabel").textContent = "Choose a recording";
+function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPlaceholder): void {
+  $("recordingTitleLabel").textContent = UI_COPY.recordings.viewerTitlePlaceholder;
   $("recordingMeta").textContent = "";
   $("recordingContent").setAttribute("aria-busy", "false");
   $("recordingContent").setAttribute("data-placeholder", placeholder);
@@ -7613,7 +7643,7 @@ function renderRecordingsList(): void {
   }
   if (!filteredItems.length) {
     list.replaceChildren(
-      renderRecordingsEmptyState("No recordings match the current search.", "Clear Search", () => {
+      renderRecordingsEmptyState(UI_COPY.recordings.noSearchMatches, "Clear Search", () => {
         setRecordingsSearchQuery("");
         const input = $("recordingsSearchInput") as HTMLInputElement;
         input.value = "";
@@ -7795,7 +7825,9 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
         });
       }
     } else {
-      resetRecordingViewer(recordingsSearchQuery ? "No recordings match the current search." : "Choose a recording from the left list...");
+      resetRecordingViewer(recordingsSearchQuery
+        ? UI_COPY.recordings.noSearchMatches
+        : UI_COPY.recordings.viewerPlaceholder);
     }
   } finally {
     // Always clear loading state — even for superseded requests. The
@@ -7934,7 +7966,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingTitleLabel").textContent = displayName;
     $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}`;
     $("recordingContent").setAttribute("aria-busy", "false");
-    $("recordingContent").setAttribute("data-placeholder", "Transcription will appear here...");
+    $("recordingContent").setAttribute("data-placeholder", UI_COPY.resultPlaceholder);
     $("recordingContent").textContent = (r as { display_text?: string }).display_text || r.content || "";
     const player = $("recordingAudio") as HTMLAudioElement;
     if (r.has_audio) {
@@ -8154,7 +8186,7 @@ $("recordingsSearchInput").addEventListener("input", (ev) => {
     if (selectedRecordingName) {
       void openRecording(selectedRecordingName, selectedRecordingArchiveDir);
     } else {
-      resetRecordingViewer("No recordings match the current search.");
+      resetRecordingViewer(UI_COPY.recordings.noSearchMatches);
     }
     return;
   }
@@ -8725,8 +8757,7 @@ function syncAutoLanguageUi(): void {
     } else if (readDeepgramDualStream()) {
       const secondary = readDeepgramDualSecondaryLanguage().toUpperCase();
       dualHint.textContent =
-        ` Two-stream Auto is ON: a second ${secondary} stream fills what the` +
-        " multilingual model drops, for twice the Deepgram minutes" +
+        ` Two-stream Auto is ON: ${dualStreamTradeOffText(secondary)}` +
         " (Settings › API Keys).";
     } else {
       dualHint.textContent =
@@ -12954,6 +12985,10 @@ applyBackendBootstrap();
 // beside installAppearanceStateClasses() without hitting its temporal
 // dead zone.
 applyAutoStopSilenceBounds();
+// Copy that two surfaces show — the markup carries none of it. Runs
+// after applyBackendBootstrap so the accepted-formats line is written
+// from the extension list the backend actually enforces.
+applyStaticCopyToMarkup();
 
 void loadCfgOnce()
   .then(async () => {
@@ -14365,7 +14400,7 @@ function pickUploadRetryFile(): Promise<File | null> {
   return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "audio/*,video/*";
+    input.accept = UI_COPY.upload.fileAccept;
     input.style.position = "fixed";
     input.style.left = "-9999px";
     input.style.top = "0";
@@ -14463,13 +14498,11 @@ function renderUploadQueue(): void {
     // "Reveal in folder" button still bound to it.
     uploadSelectedId = null;
     list.innerHTML = "";
+    // The empty state's own copy is written once, at boot, by
+    // applyStaticUiCopy — this branch only shows it. It used to
+    // re-assign the title and an innerHTML sub-line on every render,
+    // which was the second copy of both strings.
     empty.hidden = false;
-    const emptyTitle = empty.querySelector(".upload-empty-state-title");
-    const emptySub = empty.querySelector(".upload-empty-state-sub");
-    if (emptyTitle) emptyTitle.textContent = "No files yet";
-    if (emptySub) {
-      emptySub.innerHTML = "Drop audio or video on the left.<br>Each completed file is saved to <b>History</b> automatically.";
-    }
     clearBtn.hidden = true;
     if (hideBtn) hideBtn.hidden = true;
     if (titleEl) titleEl.textContent = "Queue";
