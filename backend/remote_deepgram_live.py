@@ -74,6 +74,28 @@ DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
 # segment and the tail was lost. The ceiling only bites on exactly such
 # slow/cross-region sessions; healthy ones end the wait at first
 # transcript and pay nothing extra.
+#
+# THE one wait budget, for every shape of tail. There used to be three,
+# chosen by a coverage verdict, and all three were sized on the same
+# false premise: that on most stops Deepgram answers a Finalize with
+# nothing at all. It always answers — with an ``is_final`` carrying an
+# empty transcript when there is nothing left to flush — and that
+# message was being deleted by the empty-text guard in
+# ``_process_deepgram_message`` before it could arm anything (B-005).
+# The 267-of-410 stops that "burned the full ceiling waiting for a
+# message that was never coming", and the 9-of-9 that "waited out their
+# whole window and Deepgram sent nothing", were measuring the dropped
+# answer, not the provider. So the two shortened windows measured a
+# symptom of a bug in this file and are gone with it.
+#
+# What is left is derived from the protocol rather than from a
+# population: the wait ends when Deepgram has answered — words, or the
+# empty final that says there are none — and this number is only the
+# bound on how long that answer may take. Sized from the round trips of
+# the 411 stops that did receive one (median 0.26 s, p90 0.36 s, p95
+# 0.49 s) with the 2026-08-24 slow session's >1.5 s as the case the
+# ceiling exists for. A healthy stop now pays its actual round trip on
+# EVERY shape of tail, not just on the uncovered ones.
 FINALIZE_FLUSH_WAIT_SEC = 3.0
 
 # Tail guard: raw elapsed audio past the last finalized segment used to be
@@ -102,48 +124,6 @@ FINALIZE_FLUSH_WAIT_SEC = 3.0
 # f94121ae case) is not a word — it is decoder noise.
 TAIL_GUARD_MIN_SPEECH_SEC = 0.25
 
-# Wait budget when the streamed audio is ALREADY fully covered by
-# finalized segments at Finalize time — i.e. Finalize has nothing left to
-# flush and, in the overwhelming majority of such sessions, Deepgram
-# answers with nothing at all.
-#
-# Measured over 410 real stops in main.log: 267 (65 %) ended in exactly
-# this state, each having first burned the full FINALIZE_FLUSH_WAIT_SEC
-# ceiling waiting for a message that was never coming — 608 s of stop
-# latency in total, almost all of it here. The coverage that proves
-# nothing is missing used to be computed only INSIDE the timeout
-# handler, so the answer arrived strictly after the cost had been paid.
-#
-# Sized from the round trips of sessions that DID receive a post-Finalize
-# transcript (411 of them: median 0.26 s, p90 0.36 s, p95 0.49 s). It sits
-# above p95 with margin, so a tail whose final IS coming still gets it,
-# while a tail with nothing behind it does not pay the full ceiling.
-#
-# An UNCOVERED tail keeps the full ceiling and the retry — that is the
-# case where a truncated wait would cost the user real words.
-FINALIZE_COVERED_WAIT_SEC = 0.75
-
-# Nothing at all past the last finalized segment — a boundary sliver, not a
-# tail. This is the ONE population where waiting has never once produced
-# anything: 9 of 9 such stops in the log waited out their whole window and
-# Deepgram sent nothing, at 962-1011 ms per finalize. Their measured gaps
-# were 0.06-0.24 s, which is exactly what COVERAGE_GAP_MIN_SEC calls
-# segment-boundary jitter.
-#
-# Applying this window to the whole "no retry needed" band was a mistake,
-# and it cost a user real words. Whether a tail is worth a RETRY
-# (``_tail_needs_flush``) is a different question from whether anything is
-# left to flush at all — this window answers the second one, for the
-# "nothing but a boundary sliver" case specifically. Production, 2026-08-25
-# 14:33:16: ``gap=0.50s
-# speech_in_gap=0.00``, the stream closed 0.25 s after Finalize, and the
-# sentence arrived ending "…чтобы никуда не не". Half a second of audio past
-# the last final that no interim had decoded either — which is precisely
-# what Finalize exists to force, and the answer takes a round trip this
-# window is too short to receive.
-#
-# Scoped to the population it was measured on, and no wider.
-FINALIZE_EMPTY_TAIL_WAIT_SEC = 0.25
 
 # C3 (audit §2.5): the announced budget used to describe only the flush
 # wait, leaving out everything drain_transcript() still does after the
@@ -1230,10 +1210,42 @@ def intersect_spans(
     return union_spans(out)
 
 
+def confirmed_silence_gap(
+    covered_end: float,
+    streamed_sec: float,
+    utterance_end: Optional[float],
+    speech_spans: "Iterable[tuple[float, float]]",
+) -> float:
+    """The trailing gap, less any silence Deepgram itself confirmed.
+
+    C7 (audit §3.5): ``UtteranceEnd`` is Deepgram's affirmative claim
+    that the utterance ended at ``last_word_end``, and it is a much
+    stronger signal than "no interim has spoken up recently" — the
+    absence of interims is ambiguous, because a quiet provider and a
+    quiet user look identical. When one falls inside the current tail
+    and nothing since has recognised speech past it, the audio beyond it
+    is CONFIRMED silence rather than an unflushed tail, so the honest
+    gap is only the part before the confirmation. A later interim
+    carrying speech past the UtteranceEnd means the utterance resumed
+    and the whole gap stands.
+
+    Module level because the stop and the recovery pass both need it:
+    the evidence would otherwise be applied on one path and ignored on
+    the other, which is how a stop comes to declare a tail silent that
+    the recovery then pays a REST call to re-decode.
+    """
+    gap = max(0.0, streamed_sec - covered_end)
+    if utterance_end is None or not (covered_end <= utterance_end < streamed_sec):
+        return gap
+    if any(end > utterance_end for _start, end in speech_spans):
+        return gap
+    return max(0.0, utterance_end - covered_end)
+
+
 def tail_needs_flush(
     tail_speech: float, window_overhang: float, endpointing_sec: float
 ) -> bool:
-    """Is a trailing region worth waiting — and retrying — for?
+    """Is a trailing region worth a SECOND ``Finalize``?
 
     A tail is "unflushed speech" ONLY when there is actual EVIDENCE of
     it — never from elapsed time alone. Two kinds of evidence, either is
@@ -1242,18 +1254,64 @@ def tail_needs_flush(
     or Deepgram's newest decode WINDOW still reaches past the last final
     by more than the session's configured endpointing silence.
 
-    Module level because the stop and the REST recovery both ask it:
-    ``DeepgramLiveSession._tail_needs_flush`` decides whether to spend a
-    second Finalize, and ``backend.deepgram_recovery`` decides whether
-    the tail that survived that Finalize is worth re-decoding. Two
-    implementations would let the stop wait for a tail the recovery then
-    declares silent, or the reverse. See
-    ``DeepgramLiveSession._tail_needs_flush`` for the measurement this
-    rule was sized from (audit §5).
+    Both signals say the provider is still working that audio, which is
+    the only condition under which asking it again can pay. Audit §5
+    measured what asking on elapsed time alone cost: of 84 uncovered but
+    unvoiced tails, 1 produced a transcript and 83 paid the full retry
+    ceiling for nothing — session f94121ae paid 5.6 s of extra stop for
+    0.05 s of decoder noise. A provider that has gone SILENT is a
+    different problem with a different answer; see
+    ``tail_needs_recovery``.
     """
     if tail_speech >= TAIL_GUARD_MIN_SPEECH_SEC:
         return True
     return window_overhang > endpointing_sec
+
+
+def tail_needs_recovery(
+    tail_gap: float,
+    tail_speech: float,
+    window_overhang: float,
+    endpointing_sec: float,
+    utterance_end_sec: float,
+) -> bool:
+    """Is a trailing region worth RE-DECODING from the audio spool?
+
+    Everything ``tail_needs_flush`` fires on — the two evidence rules —
+    plus the one shape neither of them can see, which is the shape that
+    lost a user their last sentence.
+
+    Rule 3, from the 2026-08-24 production session: ``gap=4.01s
+    speech_in_gap=0.00``, Deepgram silent for 3.7 s before Stop, a
+    genuine trailing sentence never flushed. Rules 1 and 2 both read
+    signals a silent provider cannot produce, so neither of them keeps
+    that case from regressing — the docstring here used to claim rule 2
+    did, and a reproduction of that exact shape returned ``False``
+    (B-007). What separates "the user stopped talking" from "the
+    provider stopped answering" is Deepgram's own ``UtteranceEnd``: it
+    owes one after ``utterance_end_ms`` of silence, so a gap longer than
+    that with no UtteranceEnd inside it (``confirmed_silence_gap`` has
+    already subtracted any that arrived) is the provider failing to send
+    a signal it promised. That is unexplained, and the audio is sitting
+    in this backend's own spool.
+
+    The threshold is the session's configured ``utterance_end_ms`` and
+    not a number of its own, because it IS that promise: below it
+    Deepgram owes nothing yet, above it the silence should have been
+    announced.
+
+    Deliberately NOT the retry rule. A second ``Finalize`` to a provider
+    that has gone quiet burns the full flush ceiling to be answered with
+    the same silence, which is audit §5's 83-of-84. Re-decoding the span
+    through the REST endpoint costs a bounded, announced budget and
+    returns the words — so an unexplained gap is the recovery's business
+    (``backend.deepgram_recovery`` rule (b)) and never the retry's. The
+    recovery's answer is a superset of the retry's by construction, so
+    the two can never disagree about a tail the stop DID wait for.
+    """
+    if tail_needs_flush(tail_speech, window_overhang, endpointing_sec):
+        return True
+    return tail_gap > max(0.0, utterance_end_sec)
 
 
 def resolve_live_language(language: str) -> str:
@@ -1295,6 +1353,14 @@ class DeepgramLiveStats:
     bytes_offered: int = 0
     chunks_sent: int = 0
     segments_final: int = 0
+    # ``is_final`` messages with an EMPTY transcript — Deepgram's answer
+    # to Finalize when nothing is buffered, and its answer to a window
+    # of silence. Counted apart from ``segments_final`` on purpose: that
+    # field means "committed transcript segments" and is what decides
+    # whether a send failure is fatal, so an answer carrying no words
+    # must not make a session that produced no transcript look like one
+    # that did. See ``_note_empty_final``.
+    empty_finals: int = 0
     segments_interim: int = 0
     keepalives_sent: int = 0
     connect_ms: Optional[float] = None
@@ -1317,6 +1383,7 @@ class DeepgramLiveStats:
             "bytes_offered": self.bytes_offered,
             "chunks_sent": self.chunks_sent,
             "segments_final": self.segments_final,
+            "empty_finals": self.empty_finals,
             "segments_interim": self.segments_interim,
             "keepalives_sent": self.keepalives_sent,
             "connect_ms": self.connect_ms,
@@ -1475,6 +1542,32 @@ class DeepgramLiveSession:
         # flushed trailing transcript has a chance to come back before
         # the stream is closed. See ``FINALIZE_FLUSH_WAIT_SEC``.
         self._final_arrived = asyncio.Event()
+        # ---- Deepgram's answer to Finalize when nothing is buffered ----
+        #
+        # It is an ``is_final`` with an EMPTY transcript, and it used to
+        # be thrown away by the "no text, nothing to report" guard at the
+        # top of ``_process_deepgram_message`` — above the is_final
+        # branch, so it armed nothing (B-005). That is why the flush wait
+        # ran to its ceiling on two thirds of all stops: the answer was
+        # arriving and being deleted one line before it counted. Three
+        # empirically-tuned wait windows were built on top of that
+        # symptom; with the answer recorded they are not needed and are
+        # gone.
+        #
+        # An empty final is not a transcript segment — it carries no
+        # words and no text, so it must not enter ``_finalized_segments``
+        # where it would extend ``durationSec`` and shadow real interim
+        # words. It IS two facts: the flush has been answered, and the
+        # window it names was decoded and found to contain nothing.
+        # ``_empty_final_end`` is the furthest point of the second fact;
+        # ``_empty_final_arrived`` is the first, cleared at each Finalize
+        # so it always means "answered THIS flush".
+        self._empty_final_end: float = 0.0
+        self._empty_final_arrived = False
+        # ``speech_final`` of the newest final of EITHER kind. The old
+        # rule read it off the last finalized SEGMENT, so an empty final
+        # closing the utterance after a forced-out one could not be seen.
+        self._last_final_speech_final: Optional[bool] = None
         # ``last_word_end`` from the most recent Deepgram ``UtteranceEnd``
         # message (C7, audit §3.5) — an affirmative "the utterance ended
         # here" signal, fed into ``_tail_coverage`` as evidence distinct
@@ -1879,7 +1972,16 @@ class DeepgramLiveSession:
             # RTT, up to the 5 s send timeout) used to be erased by the
             # post-send clear(), forcing the full flush wait below even
             # though the answer was already in hand.
+            #
+            # ``_empty_final_arrived`` is armed the same way and for the
+            # same reason: it must mean "Deepgram answered THIS
+            # Finalize", so a mid-stream empty final (a window of
+            # silence, sent while the user was still talking) cannot end
+            # the wait before the flush has been answered — and an empty
+            # final that lands while the frame is still in flight must
+            # not be erased by a clear placed after the send.
             self._final_arrived.clear()
+            self._empty_final_arrived = False
             try:
                 await asyncio.wait_for(
                     self._ws.send(json.dumps({"type": "Finalize"})),
@@ -1914,24 +2016,25 @@ class DeepgramLiveSession:
             # Bounded, and short-circuited the instant the flush covers
             # the tail, so a well-behaved stream pays only its actual
             # round trip. (The clear moved ABOVE the send — BUG-68.)
-            # Decide the wait budget BEFORE waiting, from what we already
-            # know. Coverage is a property of state we hold locally — how
-            # much audio we streamed versus how much is represented in
-            # finalized segments — so there is no reason to learn it only
-            # after a timeout has elapsed. Measuring it first is what
-            # turns "wait 3 s, then discover nothing was missing" into
-            # "notice nothing is missing, wait 0.75 s to confirm".
+            #
+            # ONE ceiling, and the wait ends on Deepgram's answer rather
+            # than on it. Three ceilings used to be chosen here by a
+            # coverage verdict, and the two short ones existed only
+            # because the answer to a Finalize with nothing buffered — an
+            # ``is_final`` with an empty transcript — was being dropped
+            # before it could end the wait (B-005). With that message
+            # recorded there is nothing left for a shortened window to
+            # buy: a covered tail is answered in a round trip and the
+            # wait ends there, and a tail that needs the full ceiling is
+            # exactly the one that always did.
+            #
+            # Coverage is still measured BEFORE the wait, because it
+            # decides two other things: whether a retry is possible (and
+            # so what the honest worst case is), and what the renderer is
+            # told to expect.
             streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
-            # Three cases, not two. "Needs a retry" and "has nothing left to
-            # flush" are different questions, and collapsing them applied a
-            # window measured on empty tails to tails that were merely small.
-            needs_flush = self._tail_needs_flush(tail_gap, tail_speech, covered_end)
-            if needs_flush:
-                flush_wait = FINALIZE_FLUSH_WAIT_SEC
-            elif tail_gap <= COVERAGE_GAP_MIN_SEC:
-                flush_wait = FINALIZE_EMPTY_TAIL_WAIT_SEC
-            else:
-                flush_wait = FINALIZE_COVERED_WAIT_SEC
+            needs_flush = self._tail_needs_flush(tail_speech, covered_end)
+            flush_wait = FINALIZE_FLUSH_WAIT_SEC
             if on_budget is not None:
                 # Worst case, not the expected case: an uncovered tail may
                 # also pay a retry of the same ceiling. The consumer needs
@@ -2014,7 +2117,7 @@ class DeepgramLiveSession:
                 # segments while we were on our way here, which can
                 # close a gap that was open a moment ago.
                 streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
-                if self._tail_needs_flush(tail_gap, tail_speech, covered_end):
+                if self._tail_needs_flush(tail_speech, covered_end):
                     logger.warning(
                         "deepgram-live: tail guard: %.2fs of audio past last final "
                         "(%.2fs of it recognised speech, window_overhang=%.2fs) "
@@ -2030,6 +2133,7 @@ class DeepgramLiveSession:
                     # landing while the frame is in flight must be seen
                     # by the wait below, not erased by a post-send clear.
                     self._final_arrived.clear()
+                    self._empty_final_arrived = False
                     try:
                         await asyncio.wait_for(
                             self._ws.send(json.dumps({"type": "Finalize"})),
@@ -2562,16 +2666,25 @@ class DeepgramLiveSession:
         streamed_sec = self._streamed_seconds(
             max(self.stats.bytes_offered, self.stats.bytes_sent)
         )
+        # Deepgram has ANSWERED for the audio up to here — with words in
+        # a final, or with an empty final saying that window held none.
+        # The second kind is coverage just as much as the first: audio
+        # the decoder looked at and reported nothing in is not an
+        # unflushed tail, and counting it as one is what kept a stop
+        # waiting for words the provider had already denied (B-005).
         covered_end = max(
-            (float(seg.get("end", 0.0) or 0.0) for seg in self._finalized_segments),
-            default=0.0,
+            max(
+                (float(seg.get("end", 0.0) or 0.0) for seg in self._finalized_segments),
+                default=0.0,
+            ),
+            self._empty_final_end,
         )
-        tail_gap = streamed_sec - covered_end
+        raw_tail_gap = streamed_sec - covered_end
         # Recognised speech lying past the last final. Spans are clipped
         # to the uncovered region and merged, so overlapping interims
         # (a rolling re-decode emits many) cannot be counted twice.
         tail_speech = 0.0
-        if tail_gap > 0 and self._interim_speech_spans:
+        if raw_tail_gap > 0 and self._interim_speech_spans:
             clipped = sorted(
                 (max(start, covered_end), min(end, streamed_sec))
                 for start, end in self._interim_speech_spans
@@ -2585,31 +2698,19 @@ class DeepgramLiveSession:
                 if end > start:
                     tail_speech += end - start
                     merged_end = end
-        # UtteranceEnd evidence (C7, audit §3.5): Deepgram's own signal
-        # that the utterance ended at ``last_word_end``, distinct from
-        # (and stronger than) "no interim has spoken up recently" — the
-        # absence of interims is ambiguous (a quiet provider looks the
-        # same as a quiet user), but an UtteranceEnd is an affirmative
-        # claim. When it falls inside the current tail AND nothing since
-        # has recognised speech past it, the audio beyond it is confirmed
-        # silence, not an unflushed tail — shrink the gap to only the
-        # confirmed-uncertain span. A later interim carrying speech past
-        # the UtteranceEnd (the utterance resumed) leaves tail_gap alone.
-        utterance_end = self._last_utterance_end
-        if (
-            utterance_end is not None
-            and covered_end <= utterance_end < streamed_sec
-            and not any(
-                sp_end > utterance_end for _sp_start, sp_end in self._interim_speech_spans
-            )
-        ):
-            tail_gap = max(0.0, utterance_end - covered_end)
+        # UtteranceEnd evidence (C7, audit §3.5) — one implementation,
+        # shared with the recovery pass so a signal collected here is not
+        # silently ignored there. See ``confirmed_silence_gap``.
+        tail_gap = confirmed_silence_gap(
+            covered_end,
+            streamed_sec,
+            self._last_utterance_end,
+            self._interim_speech_spans,
+        )
         return streamed_sec, covered_end, tail_gap, tail_speech
 
-    def _tail_needs_flush(
-        self, tail_gap: float, tail_speech: float, covered_end: float
-    ) -> bool:
-        """Is the trailing region worth waiting — and retrying — for?
+    def _tail_needs_flush(self, tail_speech: float, covered_end: float) -> bool:
+        """Is the trailing region worth a SECOND ``Finalize``?
 
         A tail is "unflushed speech" ONLY when there is actual EVIDENCE of
         it — never from elapsed time alone. Two kinds of evidence, either
@@ -2646,18 +2747,38 @@ class DeepgramLiveSession:
         the two, so this one retry cost the user 5.6 s of extra wait for
         a transcript the retry never improved.
 
-        Rule 2 is what keeps the 2026-08-24 case from regressing without
-        reintroducing gap-alone: it does not require RECOGNISED words (the
-        thing the 2026-08-24 session had none of), only that Deepgram's
-        own decoder is still visibly reaching into that audio. A tail
-        that is silent all the way down — no interim ever touched it,
-        recognised words or not — is exactly what audit §5 shows waiting
-        cannot help.
+        Rule 2 was CLAIMED to keep the 2026-08-24 case from regressing
+        without reintroducing gap-alone, on the grounds that it does not
+        require RECOGNISED words (the thing that session had none of),
+        only that Deepgram's decoder is still visibly reaching into that
+        audio. It does not: a provider that has gone quiet emits no
+        interim either, so its decode window never overhangs and rule 2
+        returns ``False`` on exactly the shape it was said to protect —
+        reproduced, B-007. The ``tail_gap`` parameter this method took
+        and never read was the other half of that unfinished transition.
+
+        A silent provider is a real loss and it is answered where it can
+        be answered — by re-decoding the span from this backend's own
+        audio spool (``tail_needs_recovery``, rule 3), not by asking a
+        mute socket a second time. This method stays the RETRY question
+        and stays on evidence only.
         """
         return tail_needs_flush(
             tail_speech,
             self._latest_interim_window_end - covered_end,
             self.endpointing_sec,
+        )
+
+    def _tail_needs_recovery(
+        self, tail_gap: float, tail_speech: float, covered_end: float
+    ) -> bool:
+        """Is the trailing region worth re-decoding? See ``tail_needs_recovery``."""
+        return tail_needs_recovery(
+            tail_gap,
+            tail_speech,
+            self._latest_interim_window_end - covered_end,
+            self.endpointing_sec,
+            self.utterance_end_sec,
         )
 
     def _last_final_ended_the_utterance(self) -> bool:
@@ -2672,10 +2793,16 @@ class DeepgramLiveSession:
         this to decide whether to keep waiting, and "we have heard
         nothing at all" is a question ``_tail_needs_flush`` answers on
         the audio, which is the stronger signal.
+
+        Read off the newest final of EITHER kind, not off the newest
+        finalized SEGMENT: an empty final never becomes a segment
+        (``_note_empty_final``), so an utterance closed by one used to
+        be judged on the forced-out final before it and read as "more is
+        coming" forever.
         """
-        if not self._finalized_segments:
+        if self._last_final_speech_final is None:
             return True
-        return bool(self._finalized_segments[-1].get("speech_final"))
+        return bool(self._last_final_speech_final)
 
     def _tail_awaits_more_finals(
         self, tail_gap: float, tail_speech: float, covered_end: float
@@ -2699,8 +2826,16 @@ class DeepgramLiveSession:
         the wait whatever ``speech_final`` said — otherwise every stop
         landing mid-utterance would burn its whole budget on a sliver.
         """
-        if self._tail_needs_flush(tail_gap, tail_speech, covered_end):
+        if self._tail_needs_flush(tail_speech, covered_end):
             return True
+        if self._empty_final_arrived:
+            # Deepgram answered THIS Finalize with "nothing buffered".
+            # That is the end of the flush, stated by the only party
+            # that can state it — there is no second final still owed,
+            # whatever ``speech_final`` said on the one before it. The
+            # evidence test above still overrides, so a tail with real
+            # unflushed speech in it is not closed by this.
+            return False
         if tail_gap <= COVERAGE_GAP_MIN_SEC:
             return False
         return not self._last_final_ended_the_utterance()
@@ -2939,6 +3074,27 @@ class DeepgramLiveSession:
     def endpointing_sec(self) -> float:
         """The configured endpointing silence window, in seconds."""
         return self._cfg.endpointing_ms / 1000.0
+
+    @property
+    def utterance_end_sec(self) -> float:
+        """After this much silence Deepgram owes an ``UtteranceEnd``.
+
+        The configured ``utterance_end_ms``, which is what makes it the
+        threshold for "this silence is unexplained" — see
+        ``tail_needs_recovery`` rule 3.
+        """
+        return self._cfg.utterance_end_ms / 1000.0
+
+    @property
+    def last_utterance_end(self) -> Optional[float]:
+        """``last_word_end`` of the newest ``UtteranceEnd``, or ``None``.
+
+        Public because the recovery pass measures the same tail this
+        session does and must subtract the same confirmed silence
+        (``confirmed_silence_gap``); a signal collected on one path and
+        unreadable on the other is how the two come to disagree.
+        """
+        return self._last_utterance_end
 
     @property
     def streamed_sec(self) -> float:
@@ -3288,6 +3444,35 @@ class DeepgramLiveSession:
         except asyncio.CancelledError:
             raise
 
+    def _note_empty_final(self, msg: dict) -> None:
+        """Record Deepgram's "the flush is done, there was nothing" answer.
+
+        An ``is_final`` with an empty transcript is the normal reply to
+        ``Finalize`` when no audio is left buffered, and it is also what
+        Deepgram sends for a window of silence mid-stream. It produces no
+        transcript, so it is not a segment — but it is two facts worth
+        exactly as much as a segment:
+
+        * the flush has been ANSWERED (``_empty_final_arrived``), which
+          is what ends the post-Finalize wait; and
+        * the window it names was decoded and found empty
+          (``_empty_final_end``), which is genuine coverage — the
+          transcript is complete out to there, and treating it as an
+          unflushed tail is what made a stop keep waiting for words
+          Deepgram had already said do not exist.
+
+        Dropping this message is B-005, the root cause the three
+        empirically-sized wait windows were built to work around.
+        """
+        start = _as_float(msg.get("start")) + self._audio_offset_sec
+        end = start + _as_float(msg.get("duration"))
+        self.stats.empty_finals += 1
+        if end > self._empty_final_end:
+            self._empty_final_end = end
+        self._empty_final_arrived = True
+        self._last_final_speech_final = bool(msg.get("speech_final"))
+        self._final_arrived.set()
+
     def _process_deepgram_message(self, msg: dict) -> Optional[dict]:
         mtype = msg.get("type")
 
@@ -3341,6 +3526,8 @@ class DeepgramLiveSession:
             return None
         text = str(alt.get("transcript") or "").strip()
         if not text:
+            if bool(msg.get("is_final")):
+                self._note_empty_final(msg)
             return None
 
         # Defensive numeric coercion (module-level ``_as_float``): a
@@ -3402,6 +3589,10 @@ class DeepgramLiveSession:
             segment["words"] = message_words
             self._finalized_segments.append(segment)
             self.stats.segments_final += 1
+            # Read by ``_last_final_ended_the_utterance``. Kept here as
+            # well as on the segment because an EMPTY final can be the
+            # newest one, and it never becomes a segment.
+            self._last_final_speech_final = speech_final
             self._final_arrived.set()
             # This final is authoritative for the words it CONTAINS, not
             # for its time range. A final that says "три на или если
@@ -3604,5 +3795,9 @@ __all__ = [
     "join_segment_texts",
     "nearest_segment_word",
     "splice_words_into_segments",
+    # The tail: what a stop may retry for, what a recovery may re-decode,
+    # and the UtteranceEnd subtraction both of them apply first.
+    "confirmed_silence_gap",
     "tail_needs_flush",
+    "tail_needs_recovery",
 ]

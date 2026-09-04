@@ -141,7 +141,7 @@ class DrainTranscriptShutdownSplitTests(unittest.IsolatedAsyncioTestCase):
         ws = session._ws
         assert ws is not None
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             result = await session.drain_transcript()
         self.assertEqual(ws.types, ["Finalize"], "CloseStream must not be sent yet")
@@ -166,7 +166,7 @@ class DrainTranscriptShutdownSplitTests(unittest.IsolatedAsyncioTestCase):
         try:
             started = time.perf_counter()
             with mock.patch(
-                "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.05
+                "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
             ):
                 await session.drain_transcript()
             elapsed = time.perf_counter() - started
@@ -201,7 +201,7 @@ class DrainTranscriptShutdownSplitTests(unittest.IsolatedAsyncioTestCase):
 
         session._recv_task = asyncio.create_task(real_recv_drain())
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             await session.drain_transcript()
         await session.shutdown(wait_timeout=1.0)
@@ -218,7 +218,7 @@ class DrainTranscriptShutdownSplitTests(unittest.IsolatedAsyncioTestCase):
         ws = session._ws
         assert ws is not None
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             result = await session.finalize(wait_timeout=0.3)
         self.assertIn("CloseStream", ws.types)

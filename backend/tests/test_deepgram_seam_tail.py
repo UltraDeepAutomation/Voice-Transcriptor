@@ -339,7 +339,7 @@ class EnvelopeTextSegmentsAgreeTests(unittest.IsolatedAsyncioTestCase):
         session.stats.bytes_sent = int(22.22 * 2 * session._cfg.sample_rate)
         session.stats.bytes_offered = session.stats.bytes_sent
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             result = await session.drain_transcript()
 

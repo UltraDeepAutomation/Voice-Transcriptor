@@ -25,9 +25,12 @@ Four shapes, and they are different failures, not four guesses at one:
     carried, and regions no final reached at all
     (``DeepgramLiveSession.coverage_hole_spans``, audit §3.1-§3.4);
 (b) an unflushed TAIL past the last final, when there is evidence
-    something is in it (``tail_needs_flush`` — the same rule the stop
-    uses to decide whether a second ``Finalize`` is worth sending, so
-    the stop and the recovery cannot disagree about what a live tail is);
+    something is in it — everything the stop retries a ``Finalize`` for
+    (``tail_needs_flush``), plus the one shape a second Finalize cannot
+    help with: a provider that went silent without sending the
+    ``UtteranceEnd`` it owes (``tail_needs_recovery`` rule 3, the
+    2026-08-24 loss). The retry rule is a strict subset of this one, so
+    a tail the stop waited for is always a tail this re-decodes;
 (c) everything after the upstream socket DIED (``stream_death_sec``).
     Those bytes were captured by the app and never seen by Deepgram, so
     no amount of waiting can produce them (audit §3.6/§3.7);
@@ -69,11 +72,12 @@ from backend.remote_deepgram_live import (
     intersect_spans,
     join_segment_texts,
     normalize_words,
+    confirmed_silence_gap,
     resolve_live_language,
     segment_word_records,
     splice_words_into_segments,
     subtract_spans,
-    tail_needs_flush,
+    tail_needs_recovery,
     union_spans,
 )
 from backend.remote_deepgram_live import _as_float, _segment_words  # noqa: E402
@@ -152,6 +156,16 @@ class InterimEvidence:
     interim_window_end: float = 0.0
     # The session's configured endpointing silence window, in seconds.
     endpointing_sec: float = 0.3
+    # ``last_word_end`` of the newest ``UtteranceEnd``, or ``None``.
+    # Deepgram's affirmative "the utterance ended here" — the only signal
+    # that tells a user who stopped talking apart from a provider that
+    # stopped answering, which is what rule (b)'s third clause turns on.
+    # Collected by the live session and, before this carried it, unread
+    # anywhere but there (B-007).
+    utterance_end: Optional[float] = None
+    # After this much silence Deepgram OWES an ``UtteranceEnd``; a gap
+    # longer than it with none inside is the unexplained one.
+    utterance_end_sec: float = 2.0
 
 
 def evidence_from_session(session: Any) -> InterimEvidence:
@@ -166,6 +180,8 @@ def evidence_from_session(session: Any) -> InterimEvidence:
         speech_spans=tuple(session.interim_speech_spans()),
         interim_window_end=float(session.interim_window_end or 0.0),
         endpointing_sec=float(session.endpointing_sec or 0.3),
+        utterance_end=session.last_utterance_end,
+        utterance_end_sec=float(session.utterance_end_sec or 2.0),
     )
 
 
@@ -222,26 +238,48 @@ def missing_spans(
         return []
     covered = covered_spans(segments)
     covered_end = max((end for _s, end in covered), default=0.0)
+    # Where the reading stopped REPORTING — the end of the last committed
+    # segment, which is the same measure ``_tail_coverage`` takes on the
+    # live side. The tail begins there and not at the last committed
+    # WORD: audio inside a segment the provider did finalize is not an
+    # unflushed tail, it is at most a word-level hole, and that is rule
+    # (a)'s business. Measuring the tail from the last word instead made
+    # every final whose closing words were quiet look like a provider
+    # that had stopped answering.
+    reported_end = max(
+        covered_end,
+        max((_as_float(seg.get("end")) for seg in segments or []), default=0.0),
+    )
 
     candidates: list[tuple[float, float]] = []
 
     # (a) What the reading itself says it missed.
     candidates.extend(evidence.hole_spans)
 
-    # (b) The tail past the last committed word, when there is evidence
-    #     something is in it. Same predicate the stop uses to decide
-    #     whether a second Finalize is worth sending, so a tail the stop
-    #     waited for and did not get is exactly the tail this re-decodes.
-    tail = (covered_end, min(limit, max(covered_end, float(streamed_sec or 0.0))))
+    # (b) The tail past the last committed segment, when there is
+    #     evidence something is in it — the stop's own retry rule, plus
+    #     the silent-provider shape a second Finalize cannot answer.
+    tail = (reported_end, min(limit, max(reported_end, float(streamed_sec or 0.0))))
     if tail[1] > tail[0]:
         tail_speech = sum(
             end - start
             for start, end in intersect_spans(evidence.speech_spans, [tail])
         )
-        if tail_needs_flush(
+        # The same UtteranceEnd subtraction the stop applies before it
+        # judges its own tail (``confirmed_silence_gap``): silence
+        # Deepgram itself announced is not an unexplained gap, and
+        # measuring it here without that subtraction would send a REST
+        # call after every recording that ends with the user pausing
+        # before the hotkey.
+        tail_gap = confirmed_silence_gap(
+            reported_end, tail[1], evidence.utterance_end, evidence.speech_spans
+        )
+        if tail_needs_recovery(
+            tail_gap,
             tail_speech,
-            evidence.interim_window_end - covered_end,
+            evidence.interim_window_end - reported_end,
             evidence.endpointing_sec,
+            evidence.utterance_end_sec,
         ):
             candidates.append(tail)
 

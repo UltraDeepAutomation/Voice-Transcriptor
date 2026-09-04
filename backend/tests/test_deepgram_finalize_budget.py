@@ -1,20 +1,23 @@
-"""The post-Finalize wait budget is chosen from tail coverage.
+"""The post-Finalize wait, and what actually ends it.
 
 Measured over 410 real stops in main.log: 267 (65 %) ended with the
-streamed audio ALREADY fully covered by finalized segments — Finalize
-had nothing left to flush and Deepgram answered with nothing — yet each
-had first burned the full ``FINALIZE_FLUSH_WAIT_SEC`` ceiling. Total
-stop-side latency was 608 s, almost all of it spent waiting for messages
-that were never coming.
+streamed audio ALREADY fully covered by finalized segments and burned
+the full ``FINALIZE_FLUSH_WAIT_SEC`` ceiling anyway — 608 s of stop
+latency, almost all of it here. The conclusion drawn at the time was
+that Deepgram answers such a Finalize with nothing, and two shorter
+ceilings were sized on that conclusion.
 
-The information that proves nothing is missing (bytes streamed vs the
-end of the last finalized segment) is local state we hold the whole
-time. It used to be consulted only inside the timeout handler, i.e.
-strictly after the cost had been paid. Now it picks the budget up front:
+It answers. The answer to "Finalize with nothing buffered" is an
+``is_final`` carrying an empty transcript, and it was being deleted by
+the empty-text guard at the top of ``_process_deepgram_message``, above
+the is_final branch, so it armed nothing (B-005). The 608 s measured a
+bug in this backend, not a silent provider.
 
-  * uncovered tail -> full ceiling, then the retry. Truncating here would
-    cost the user real words.
-  * covered tail   -> a short confirmation window.
+So there is ONE ceiling again, and the wait ends on Deepgram's answer
+rather than on a timer: words, or the empty final that says there are
+none. Coverage is still measured before the wait, because it decides
+whether a RETRY is possible and therefore what worst case the renderer
+is told to expect.
 """
 
 from __future__ import annotations
@@ -28,11 +31,12 @@ from unittest import mock
 from backend.remote_deepgram_live import (
     COVERAGE_GAP_MIN_SEC,
     FINALIZE_ASSEMBLY_ALLOWANCE_SEC,
-    FINALIZE_COVERED_WAIT_SEC,
-    FINALIZE_EMPTY_TAIL_WAIT_SEC,
     FINALIZE_FLUSH_WAIT_SEC,
     TAIL_GUARD_MIN_SPEECH_SEC,
     DeepgramLiveSession,
+    confirmed_silence_gap,
+    tail_needs_flush,
+    tail_needs_recovery,
 )
 
 
@@ -78,7 +82,11 @@ def _session(
     # bytes_sent is the only input to streamed_sec: 16 kHz, 16-bit mono.
     session.stats.bytes_sent = int(streamed_sec * 2 * session._cfg.sample_rate)
     if covered_end > 0:
-        session._finalized_segments = [{"start": 0.0, "end": covered_end, "text": "x"}]
+        session._finalized_segments = [
+            {"start": 0.0, "end": covered_end, "text": "x", "speech_final": True}
+        ]
+        # What the recv loop would have recorded alongside the segment.
+        session._last_final_speech_final = True
     if tail_speech_sec > 0:
         session._interim_speech_spans = [
             (covered_end, covered_end + tail_speech_sec)
@@ -115,7 +123,34 @@ def _deliver_final(
         }
     )
     session.stats.segments_final += 1
+    session._last_final_speech_final = speech_final
     session._final_arrived.set()
+
+
+def _deliver_empty_final(
+    session: DeepgramLiveSession,
+    start: float,
+    duration: float,
+    *,
+    speech_final: bool = True,
+) -> None:
+    """Deepgram's answer to a Finalize with nothing left buffered.
+
+    Driven through ``_process_deepgram_message`` rather than by poking
+    fields, because the defect this pins (B-005) was in that method: the
+    message was parsed, found to have no transcript, and dropped before
+    the is_final branch could see it.
+    """
+    session._process_deepgram_message(
+        {
+            "type": "Results",
+            "is_final": True,
+            "speech_final": speech_final,
+            "start": start,
+            "duration": duration,
+            "channel": {"alternatives": [{"transcript": "", "words": []}]},
+        }
+    )
 
 
 class TailCoverageTests(unittest.TestCase):
@@ -232,22 +267,37 @@ class TailCoverageTests(unittest.TestCase):
 
 
 class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
-    async def test_an_empty_tail_uses_the_short_confirmation_window(self):
-        # 0.1 s past the last final is a segment boundary, not a tail.
-        # Nothing is unflushed, so the ceiling buys nothing.
+    async def test_an_empty_tail_ends_the_wait_on_deepgrams_own_answer(self):
+        """B-005, the root cause the two short ceilings were built over.
+
+        0.1 s past the last final is a segment boundary, not a tail, so
+        Finalize has nothing to flush — and Deepgram says so, with an
+        ``is_final`` carrying an empty transcript. Dropping that message
+        is what made this stop sit out its whole window; with it
+        recorded the wait ends on the answer and the full ceiling (5 s
+        here) is never approached.
+        """
         session = _session(streamed_sec=90.0, covered_end=89.9)
         ws = session._ws
+
+        async def answer():
+            await asyncio.sleep(0.02)
+            _deliver_empty_final(session, 89.9, 0.1)
+
         started = time.perf_counter()
+        task = asyncio.create_task(answer())
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
-        ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.12
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 5.0
         ):
             await session.finalize(wait_timeout=0.5)
+        await task
         elapsed = time.perf_counter() - started
         self.assertIn("CloseStream", ws.types)
-        self.assertGreaterEqual(elapsed, 0.12)
-        self.assertLess(elapsed, 1.0, f"covered tail waited {elapsed:.2f}s")
+        self.assertLess(
+            elapsed, 1.0,
+            f"the flush was answered and the wait still ran {elapsed:.2f}s",
+        )
+        self.assertEqual(session.stats.empty_finals, 1)
 
     async def test_uncovered_tail_still_gets_the_full_ceiling(self):
         # Real unflushed speech: truncating the wait here would cost the
@@ -257,8 +307,6 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         started = time.perf_counter()
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.25
-        ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
         ):
             await session.finalize(wait_timeout=0.5)
         elapsed = time.perf_counter() - started
@@ -307,22 +355,21 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(speech, 0.0)
         self.assertGreater(gap, COVERAGE_GAP_MIN_SEC)
         # No voiced evidence at all (no interim ever touched this ground),
-        # so this tail does NOT ask for a retry — it still gets the
-        # "small but real" confirmation window rather than the empty-tail
-        # one, which is the thing this test actually verifies below.
-        self.assertFalse(session._tail_needs_flush(gap, speech, 23.86))
+        # so this tail does NOT ask for a RETRY.
+        self.assertFalse(session._tail_needs_flush(speech, 23.86))
 
+        # It does get the full round-trip ceiling, and it waits for the
+        # answer: half a second of audio Finalize has to flush is exactly
+        # what a truncated window used to throw away.
         started = time.perf_counter()
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.01
-        ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.30
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.30
         ):
             await session.finalize(wait_timeout=0.5)
         elapsed = time.perf_counter() - started
         self.assertGreaterEqual(
             elapsed, 0.30,
-            f"a 0.50 s tail was given the jitter window ({elapsed:.2f}s)",
+            f"a 0.50 s tail was given a truncated window ({elapsed:.2f}s)",
         )
 
     async def test_empty_tail_never_triggers_the_retry(self):
@@ -331,7 +378,7 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         session = _session(streamed_sec=90.0, covered_end=89.95)
         ws = session._ws
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1)
@@ -350,9 +397,7 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         session = _session(streamed_sec=52.99, covered_end=52.08, tail_speech_sec=0.05)
         ws = session._ws
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
-        ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1, "no retry — nothing was voiced")
@@ -365,8 +410,6 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         ws = session._ws
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
-        ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.01
         ):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 2)
@@ -377,9 +420,7 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         session = _session(streamed_sec=90.0, covered_end=89.9)
         ws = session._ws
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 3.0
-        ), mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
             await session.finalize(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1)
@@ -391,19 +432,15 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         # audit §5 measured this shape's hit rate at 1 in 84). A large
         # raw gap with no interim evidence at all is silence.
         session = _session(streamed_sec=54.0, covered_end=52.0)
-        self.assertFalse(session._tail_needs_flush(5.0, 0.0, 52.0))
+        self.assertFalse(session._tail_needs_flush(0.0, 52.0))
         # Recognised speech (rule 1) is enough on its own, gap aside.
         self.assertTrue(
-            session._tail_needs_flush(0.0, TAIL_GUARD_MIN_SPEECH_SEC, 52.0)
+            session._tail_needs_flush(TAIL_GUARD_MIN_SPEECH_SEC, 52.0)
         )
         # Below the speech threshold and no interim window reaching past
         # ``covered_end``: neither rule fires.
         self.assertFalse(
-            session._tail_needs_flush(
-                TAIL_GUARD_MIN_SPEECH_SEC - 0.01,
-                TAIL_GUARD_MIN_SPEECH_SEC - 0.01,
-                52.0,
-            )
+            session._tail_needs_flush(TAIL_GUARD_MIN_SPEECH_SEC - 0.01, 52.0)
         )
 
     def test_an_interim_window_past_the_endpointing_gap_asks_for_a_retry(self):
@@ -416,7 +453,7 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
             covered_end=52.0,
             interim_window_overhang_sec=endpointing_sec + 0.05,
         )
-        self.assertTrue(session._tail_needs_flush(2.0, 0.0, 52.0))
+        self.assertTrue(session._tail_needs_flush(0.0, 52.0))
 
     def test_an_interim_window_within_the_endpointing_gap_does_not_retry(self):
         # The same signal, but the overhang is inside the configured
@@ -428,7 +465,7 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
             covered_end=52.0,
             interim_window_overhang_sec=endpointing_sec - 0.05,
         )
-        self.assertFalse(session._tail_needs_flush(2.0, 0.0, 52.0))
+        self.assertFalse(session._tail_needs_flush(0.0, 52.0))
 
 
 class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
@@ -466,7 +503,7 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         session = _session(streamed_sec=90.0, covered_end=89.95)
         seen: list[tuple[float, bool]] = []
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             await session.finalize(
                 wait_timeout=0.3,
@@ -474,19 +511,21 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(seen), 1)
         budget, expects_more = seen[0]
+        # No retry is possible, so the announced bound is ONE ceiling and
+        # not two. ``expects_more`` is the coverage verdict, unchanged.
         self.assertFalse(expects_more)
         self.assertAlmostEqual(
             budget, 0.02 + FINALIZE_ASSEMBLY_ALLOWANCE_SEC, places=3
         )
 
-    async def test_a_voiceless_uncovered_tail_announces_the_short_window(self):
+    async def test_a_voiceless_uncovered_tail_does_not_announce_a_retry(self):
         # (a) session f94121ae's exact shape: 0.91 s uncovered, 0.05 s of
         # it recognised — below TAIL_GUARD_MIN_SPEECH_SEC, so this is not
         # "unflushed speech" and must not announce the retry ceiling.
         session = _session(streamed_sec=52.99, covered_end=52.08, tail_speech_sec=0.05)
         seen: list[tuple[float, bool]] = []
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.10
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.10
         ):
             await session.finalize(
                 wait_timeout=0.5,
@@ -495,9 +534,8 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1)
         budget, expects_more = seen[0]
         self.assertFalse(expects_more, "no voiced evidence: nothing more is expected")
-        # The short confirmation window, not the retry ceiling doubled —
-        # this is the entire point: 0.9 s instead of the 6010 ms the same
-        # shape cost in production.
+        # One ceiling, not two: the retry is what cost this exact session
+        # 6010 ms in production and it is not announced here.
         self.assertAlmostEqual(
             budget, 0.10 + FINALIZE_ASSEMBLY_ALLOWANCE_SEC, places=3
         )
@@ -531,7 +569,7 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("consumer is broken")
 
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             await session.finalize(wait_timeout=0.3, on_budget=explode)
         self.assertIn("CloseStream", ws.types, "the stop completed anyway")
@@ -540,7 +578,7 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         session = _session(streamed_sec=90.0, covered_end=89.95)
         ws = session._ws   # finalize() releases the socket on its way out
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             await session.finalize(wait_timeout=0.3)
         self.assertIn("CloseStream", ws.types)
@@ -576,7 +614,7 @@ class BudgetIsAnHonestEnvelopeBoundTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_covered_tail_budget_covers_the_wall_time(self):
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
             budget, elapsed = await self._measure(
                 streamed_sec=90.0, covered_end=89.5,
@@ -585,7 +623,7 @@ class BudgetIsAnHonestEnvelopeBoundTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_tail_budget_covers_the_wall_time(self):
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_EMPTY_TAIL_WAIT_SEC", 0.02
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
             budget, elapsed = await self._measure(
                 streamed_sec=90.0, covered_end=89.95,
@@ -603,11 +641,11 @@ class BudgetIsAnHonestEnvelopeBoundTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_voiceless_uncovered_tail_budget_covers_the_wall_time(self):
         # (d) session f94121ae's shape: uncovered but unvoiced, so this
-        # takes the short "covered" window rather than the retry ceiling
-        # — the announced number must still be an honest upper bound on
+        # pays one ceiling and never the retry — the announced number
+        # must still be an honest upper bound on
         # that shorter wait.
         with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_COVERED_WAIT_SEC", 0.05
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
             budget, elapsed = await self._measure(
                 streamed_sec=52.99, covered_end=52.08, tail_speech_sec=0.05,
@@ -778,10 +816,26 @@ class MultiFinalFlushTests(unittest.IsolatedAsyncioTestCase):
 class AwaitsMoreFinalsTests(unittest.TestCase):
     """The predicate that decides whether a flush is finished."""
 
-    def test_an_uncovered_tail_is_still_owed_finals(self):
-        session = _session(streamed_sec=14.26, covered_end=10.85)
+    def test_an_uncovered_tail_with_evidence_in_it_is_still_owed_finals(self):
+        # 3.41 s past the last final and an interim recognised words in
+        # it: the flush has not reached the end of the streamed audio.
+        session = _session(
+            streamed_sec=14.26, covered_end=10.85, tail_speech_sec=3.41
+        )
         _s, covered, gap, speech = session._tail_coverage()
         self.assertTrue(session._tail_awaits_more_finals(gap, speech, covered))
+
+    def test_an_uncovered_but_silent_tail_after_a_closed_utterance_is_not(self):
+        # The same 3.41 s with nothing recognised in it and a final that
+        # said it closed the utterance. Waiting cannot produce words the
+        # provider never decoded — this is audit §5's 83-of-84, and the
+        # ground is the recovery pass's to re-decode, not the wait's.
+        session = _session(streamed_sec=14.26, covered_end=10.85)
+        _s, covered, gap, speech = session._tail_coverage()
+        self.assertEqual(speech, 0.0)
+        self.assertTrue(session._last_final_ended_the_utterance())
+        self.assertFalse(session._tail_awaits_more_finals(gap, speech, covered))
+        self.assertTrue(session._tail_needs_recovery(gap, speech, covered))
 
     def test_a_covered_tail_is_finished(self):
         session = _session(streamed_sec=14.26, covered_end=14.26)
@@ -798,9 +852,10 @@ class AwaitsMoreFinalsTests(unittest.TestCase):
         session._finalized_segments = [
             {"start": 0.0, "end": 13.86, "text": "x", "speech_final": False}
         ]
+        session._last_final_speech_final = False
         _s, covered, gap, speech = session._tail_coverage()
         self.assertGreater(gap, COVERAGE_GAP_MIN_SEC)
-        self.assertFalse(session._tail_needs_flush(gap, speech, covered))
+        self.assertFalse(session._tail_needs_flush(speech, covered))
         self.assertTrue(session._tail_awaits_more_finals(gap, speech, covered))
 
     def test_the_same_final_with_only_jitter_past_it_is_finished(self):
@@ -810,6 +865,7 @@ class AwaitsMoreFinalsTests(unittest.TestCase):
         session._finalized_segments = [
             {"start": 0.0, "end": 14.16, "text": "x", "speech_final": False}
         ]
+        session._last_final_speech_final = False
         _s, covered, gap, speech = session._tail_coverage()
         self.assertLessEqual(gap, COVERAGE_GAP_MIN_SEC)
         self.assertFalse(session._tail_awaits_more_finals(gap, speech, covered))
@@ -819,6 +875,7 @@ class AwaitsMoreFinalsTests(unittest.TestCase):
         session._finalized_segments = [
             {"start": 0.0, "end": 13.86, "text": "x", "speech_final": True}
         ]
+        session._last_final_speech_final = True
         _s, covered, gap, speech = session._tail_coverage()
         self.assertFalse(session._tail_awaits_more_finals(gap, speech, covered))
 
@@ -828,30 +885,28 @@ class AwaitsMoreFinalsTests(unittest.TestCase):
 
 
 class BudgetConstantTests(unittest.TestCase):
-    def test_the_short_window_covers_only_empty_tails(self):
-        # The 0.25 s window is measured on stops whose gap was 0.06-0.24 s
-        # — nothing past the last final but boundary jitter. It was once
-        # applied to every tail that did not need a RETRY — at the time, a
-        # band up to 0.75 s wide (the old gap-alone retry threshold, since
-        # retired) — and it cost a user real words: production 2026-08-25
-        # 14:33:16, gap=0.50 s, the stream closed 0.25 s after Finalize and
-        # the sentence was delivered ending mid-clause.
-        #
-        # The short window must not reach past what jitter means.
-        self.assertLessEqual(FINALIZE_EMPTY_TAIL_WAIT_SEC, COVERAGE_GAP_MIN_SEC)
-        # And a tail that is small but real gets a window sized from
-        # actual round trips (p95 0.49 s), not from the empty case.
-        self.assertGreater(FINALIZE_COVERED_WAIT_SEC, 0.49)
-        self.assertGreater(FINALIZE_COVERED_WAIT_SEC, FINALIZE_EMPTY_TAIL_WAIT_SEC)
+    def test_there_is_exactly_one_wait_ceiling(self):
+        """The two shorter windows measured a bug in this file.
 
-    def test_confirmation_window_is_shorter_than_the_full_ceiling(self):
-        self.assertLess(FINALIZE_COVERED_WAIT_SEC, FINALIZE_FLUSH_WAIT_SEC)
+        ``FINALIZE_COVERED_WAIT_SEC`` (0.75 s) and
+        ``FINALIZE_EMPTY_TAIL_WAIT_SEC`` (0.25 s) were sized on stops
+        that "waited out their whole window and Deepgram sent nothing".
+        Deepgram sent an empty final every time; it was dropped before
+        the is_final branch (B-005). With the answer recorded, a
+        shortened window can only truncate a flush that IS coming, which
+        is exactly what cost a user the end of a sentence on 2026-08-25.
+        """
+        import backend.remote_deepgram_live as live
 
-    def test_the_ceiling_covers_the_measured_multi_final_flush(self):
-        # Session 62115e77: the second final of the flush arrived 2.7 s
-        # after the first. The multi-final wait is bounded by the SAME
-        # budget as before — so the ceiling is what decides whether that
-        # sentence is reachable at all, and it must stay above 2.7 s.
+        self.assertFalse(hasattr(live, "FINALIZE_COVERED_WAIT_SEC"))
+        self.assertFalse(hasattr(live, "FINALIZE_EMPTY_TAIL_WAIT_SEC"))
+
+    def test_the_ceiling_covers_the_measured_round_trips(self):
+        # 411 stops that received a post-Finalize transcript: median
+        # 0.26 s, p95 0.49 s. The ceiling has to clear p95 with room, and
+        # session 62115e77's second final arrived 2.7 s after the first,
+        # so it must stay above that too.
+        self.assertGreater(FINALIZE_FLUSH_WAIT_SEC, 0.49)
         self.assertGreater(FINALIZE_FLUSH_WAIT_SEC, 2.7)
 
     def test_the_speech_threshold_is_about_one_short_word(self):
@@ -861,6 +916,166 @@ class BudgetConstantTests(unittest.TestCase):
         # genuine speech in the tail is never mistaken for noise either.
         self.assertGreater(TAIL_GUARD_MIN_SPEECH_SEC, 0.05)
         self.assertLess(TAIL_GUARD_MIN_SPEECH_SEC, 0.5)
+
+
+class EmptyFinalIsTheAnswerTests(unittest.IsolatedAsyncioTestCase):
+    """B-005: an empty ``is_final`` is a protocol fact, not noise.
+
+    ``_process_deepgram_message`` returned at ``if not text`` above the
+    is_final branch, so Deepgram's normal answer to a Finalize with
+    nothing buffered armed nothing, updated no coverage and ended no
+    wait. Every one of the three wait budgets that used to live in
+    ``remote_deepgram_live`` was sized around that missing answer.
+    """
+
+    def test_an_empty_final_arms_the_wait(self):
+        session = _session(streamed_sec=10.0, covered_end=10.0)
+        self.assertFalse(session._final_arrived.is_set())
+        _deliver_empty_final(session, 10.0, 0.0)
+        self.assertTrue(session._final_arrived.is_set())
+        self.assertEqual(session.stats.empty_finals, 1)
+
+    def test_an_empty_final_is_not_a_transcript_segment(self):
+        """It carries no words, so it must not become one: a segment
+        would extend ``durationSec`` and shadow real interim words."""
+        session = _session(streamed_sec=10.0, covered_end=9.0)
+        before = list(session._finalized_segments)
+        _deliver_empty_final(session, 9.0, 1.0)
+        self.assertEqual(session._finalized_segments, before)
+        self.assertEqual(session.stats.segments_final, 0)
+
+    def test_an_empty_final_covers_the_window_it_names(self):
+        """Audio the decoder looked at and reported nothing in is
+        covered — not an unflushed tail."""
+        session = _session(streamed_sec=10.0, covered_end=9.0)
+        _streamed, _covered, gap_before, _speech = session._tail_coverage()
+        self.assertAlmostEqual(gap_before, 1.0, places=2)
+        _deliver_empty_final(session, 9.0, 1.0)
+        _streamed, covered, gap_after, _speech = session._tail_coverage()
+        self.assertAlmostEqual(covered, 10.0, places=2)
+        self.assertAlmostEqual(gap_after, 0.0, places=2)
+
+    def test_an_empty_final_closes_the_utterance_it_says_it_closed(self):
+        session = _session(streamed_sec=14.0, covered_end=13.0)
+        session._last_final_speech_final = False
+        self.assertFalse(session._last_final_ended_the_utterance())
+        _deliver_empty_final(session, 13.0, 0.0, speech_final=True)
+        self.assertTrue(session._last_final_ended_the_utterance())
+
+    async def test_the_flush_wait_is_not_ended_by_a_stale_empty_final(self):
+        """``_empty_final_arrived`` means "answered THIS flush".
+
+        Deepgram sends empty finals for windows of silence while the user
+        is still talking; one of those must not close a wait that has not
+        been answered yet. The flag is cleared at the Finalize send, in
+        front of it, so an answer in flight is still seen.
+        """
+        session = _session(streamed_sec=14.0, covered_end=10.0, tail_speech_sec=2.0)
+        self.assertFalse(session._empty_final_arrived)
+        _deliver_empty_final(session, 10.0, 0.0)   # mid-stream silence
+        session._final_arrived.clear()
+        ws = session._ws
+        started = time.perf_counter()
+        with mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.12
+        ):
+            await session.drain_transcript()
+        elapsed = time.perf_counter() - started
+        self.assertGreaterEqual(
+            elapsed, 0.12,
+            "a mid-stream empty final must not answer the flush",
+        )
+        self.assertEqual(ws.types.count("Finalize"), 2, "the tail guard still retried")
+
+
+class UnexplainedTailTests(unittest.TestCase):
+    """B-007: what a silent provider looks like, and who answers it.
+
+    The retry rule's docstring claimed rule 2 kept the 2026-08-24 loss
+    from regressing. It does not — a provider that has gone quiet emits
+    no interim, so its decode window never overhangs — and a
+    reproduction of that exact shape returned ``False``. The ``tail_gap``
+    argument the rule took and never read was the other half of the
+    unfinished transition.
+
+    The answer is split by cost. A second ``Finalize`` to a mute socket
+    burns the ceiling (audit §5: 83 of 84 retries produced nothing), so
+    the retry stays on evidence. Re-decoding the span from this
+    backend's own spool returns the words for a bounded, announced
+    budget, so the unexplained gap is the recovery's business.
+    """
+
+    # The 2026-08-24 production session, verbatim: 14.01 s streamed,
+    # the last final ended at 10.00, no interim ever touched the tail,
+    # and Deepgram had been silent for 3.7 s before Stop.
+    EIGHT_24 = dict(streamed_sec=14.01, covered_end=10.00)
+
+    def test_the_2026_08_24_shape_does_not_retry(self):
+        session = _session(**self.EIGHT_24)
+        _s, covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 4.01, places=2)
+        self.assertEqual(speech, 0.0)
+        self.assertFalse(session._tail_needs_flush(speech, covered))
+
+    def test_the_2026_08_24_shape_is_recovered_instead(self):
+        session = _session(**self.EIGHT_24)
+        _s, covered, gap, speech = session._tail_coverage()
+        self.assertTrue(
+            session._tail_needs_recovery(gap, speech, covered),
+            "the loss this rule exists for must be re-decodable",
+        )
+
+    def test_an_utterance_end_inside_the_tail_explains_the_silence(self):
+        """The signal that tells a quiet user from a quiet provider.
+
+        Deepgram owes an ``UtteranceEnd`` after ``utterance_end_ms`` of
+        silence. One that arrived means the silence is announced, and
+        ``confirmed_silence_gap`` shrinks the tail to it — so a user who
+        finished a sentence and reached for the hotkey costs nothing.
+        """
+        session = _session(**self.EIGHT_24)
+        session._last_utterance_end = 10.10
+        _s, covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 0.10, places=2)
+        self.assertFalse(session._tail_needs_recovery(gap, speech, covered))
+
+    def test_the_f94121ae_shape_neither_retries_nor_recovers(self):
+        # 0.91 s of audio past the last final, 0.05 s of it decoder
+        # noise. This shape cost 6010 ms in production and audit §5 put
+        # its hit rate at 1 in 84; it is below the utterance_end promise,
+        # so nothing is unexplained about it either.
+        session = _session(streamed_sec=52.99, covered_end=52.08, tail_speech_sec=0.05)
+        _s, covered, gap, speech = session._tail_coverage()
+        self.assertAlmostEqual(gap, 0.91, places=2)
+        self.assertFalse(session._tail_needs_flush(speech, covered))
+        self.assertFalse(session._tail_needs_recovery(gap, speech, covered))
+
+    def test_the_threshold_is_the_configured_utterance_end_promise(self):
+        session = _session(streamed_sec=10.0, covered_end=0.0)
+        promise = session.utterance_end_sec
+        self.assertAlmostEqual(promise, 2.0, places=3)
+        self.assertFalse(tail_needs_recovery(promise, 0.0, 0.0, 0.3, promise))
+        self.assertTrue(tail_needs_recovery(promise + 0.01, 0.0, 0.0, 0.3, promise))
+
+    def test_recovery_never_declines_a_tail_the_stop_waited_for(self):
+        """The retry rule is a strict subset, by construction."""
+        for speech, overhang in ((0.5, 0.0), (0.0, 1.0), (0.5, 1.0)):
+            self.assertTrue(tail_needs_flush(speech, overhang, 0.3))
+            self.assertTrue(tail_needs_recovery(0.0, speech, overhang, 0.3, 2.0))
+
+    def test_a_confirmed_utterance_end_that_speech_outran_still_counts(self):
+        # A later interim carrying words past the UtteranceEnd means the
+        # utterance resumed: the whole gap stands.
+        self.assertAlmostEqual(
+            confirmed_silence_gap(10.0, 14.0, 10.5, [(11.0, 12.0)]), 4.0, places=3
+        )
+        self.assertAlmostEqual(
+            confirmed_silence_gap(10.0, 14.0, 10.5, [(9.0, 10.2)]), 0.5, places=3
+        )
+        self.assertAlmostEqual(
+            confirmed_silence_gap(10.0, 14.0, None, []), 4.0, places=3
+        )
+
 
 
 if __name__ == "__main__":

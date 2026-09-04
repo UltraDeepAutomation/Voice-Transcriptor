@@ -701,6 +701,30 @@ class DualLiveSession:
         return self.primary.endpointing_sec
 
     @property
+    def utterance_end_sec(self) -> float:
+        """Both readings run the same config (``secondary_config``)."""
+        return self.primary.utterance_end_sec
+
+    @property
+    def last_utterance_end(self) -> Optional[float]:
+        """The furthest point EITHER reading has confirmed as an utterance end.
+
+        Same shape as ``interim_window_end``: either decoder saying "the
+        utterance ended here" is evidence about the recording, and the
+        later claim is the one that describes the tail. A reading that
+        never sent one contributes nothing rather than ``None`` for both.
+        """
+        ends = [
+            value
+            for value in (
+                self.primary.last_utterance_end,
+                self.secondary.last_utterance_end if self.secondary is not None else None,
+            )
+            if value is not None
+        ]
+        return max(ends) if ends else None
+
+    @property
     def streamed_sec(self) -> float:
         """The recording's streamed position — both readings are fed the
         same bytes, so the furthest either got is the recording's."""
