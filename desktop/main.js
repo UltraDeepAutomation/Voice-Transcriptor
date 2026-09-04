@@ -81,6 +81,14 @@ const { createRecordingFinalSlot } = require("./recording-final-slot");
 // one means" — subscribed exactly once from app.whenReady below.
 const { subscribePowerEvents } = require("./power-events");
 
+// SSOT for "what state is the recording capsule in": one kind, from
+// which the capsule's mode and tone are both derived.
+const {
+  RECORDING_STATUS_KIND,
+  recordingStatusIsLive,
+  recordingStatusPresentation,
+} = require("./recording-status");
+
 // SSOT for how a child process's text output is produced and decoded —
 // the PowerShell UTF-8 prelude and the `cscript //U` UTF-16LE receipt.
 const { childStreamEncoding, stripBom, withUtf8OutputPrelude } = require("./child-io");
@@ -1143,6 +1151,10 @@ const RECORDING_STATUS_LEVEL_MAX_STALE_MS = 600;
 
 const recordingStatusCapsuleState = {
   status: "",
+  // The producer's own answer to "what state is this?", when it has one.
+  // Empty means "classify the text" (the renderer's statuses arrive that
+  // way) — see ./recording-status.
+  kind: "",
   startedAt: 0,
   elapsedMs: 0,
   timerRunning: false,
@@ -1241,62 +1253,10 @@ function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
   applyRecordingStatusCapsuleWindowSize();
 }
 
-function recordingStatusMode(status) {
-  const text = String(status || "").trim().toLowerCase();
-  if (!text) return "idle";
-  if (
-    text.startsWith("recording completed") ||
-    text.startsWith("final transcript is ready") ||
-    text.startsWith("transcript is ready")
-  ) {
-    return "ok";
-  }
-  if (
-    text === "starting" ||
-    text === "recording" ||
-    text.startsWith("recording.") ||
-    text.startsWith("recording with ") ||
-    text.startsWith("recording audio only") ||
-    text.startsWith("recording exceeds ")
-  ) {
-    return "recording";
-  }
-  if (text.includes("auto stop")) return "autostop";
-  if (text.includes("upscal")) return "upscaling";
-  if (text.includes("transcrib") || text.includes("processing") || text.includes("pasting")) return "transcribing";
-  if (text.includes("pasted") || text.includes("sent") || text.includes("saved") || text.includes("done") || text.includes("no speech detected")) return "ok";
-  if (text.includes("in clipboard")) return "fail";
-  if (text.includes("access") || text.includes("loading") || text.includes("fail") || text.includes("error") || text.includes("no text")) return "fail";
-  return "transcribing";
-}
-
-function recordingStatusTone(status) {
-  const text = String(status || "").trim().toLowerCase();
-  if (!text) return "neutral";
-  if (
-    text.startsWith("recording completed") ||
-    text.startsWith("final transcript is ready") ||
-    text.startsWith("transcript is ready") ||
-    text.includes("no speech detected")
-  ) {
-    return "success";
-  }
-  if (
-    text === "recording" ||
-    text.startsWith("recording.") ||
-    text.startsWith("recording with ") ||
-    text.startsWith("recording audio only") ||
-    text.startsWith("recording exceeds ")
-  ) {
-    return "recording";
-  }
-  if (text.includes("transcrib") || text.includes("upscal") || text.includes("processing")) return "processing";
-  if (text.includes("pasted") || text.includes("sent") || text.includes("saved")) return "success";
-  if (text.includes("in clipboard")) return "warning";
-  if (text.includes("access") || text.includes("loading") || text.includes("ready")) return "warning";
-  if (text.includes("fail") || text.includes("error") || text.includes("no text")) return "error";
-  return "neutral";
-}
+// The two substring ladders that used to live here — one for the mode,
+// one for the tone — are gone. A status now carries its kind, and both
+// views come from ./recording-status. See that module for the drift the
+// copies had accumulated.
 
 function recordingStatusCapsuleHtml() {
   const t = RECORDING_STATUS_CAPSULE;
@@ -1721,7 +1681,12 @@ function recordingStatusCapsuleHtml() {
       document.title = "__recording_capsule_pointer__" + Date.now();
     }, true);
     document.getElementById("core").addEventListener("click", (event) => {
-      if (waveMode === "recording") {
+      // "autostop" too: the capsule is amber and counting down, but the
+      // recording IS still running, so a click on it must still stop it.
+      // Leaving it out would make the one state where the user is most
+      // likely to reach for the capsule the one where clicking does
+      // nothing.
+      if (waveMode === "recording" || waveMode === "autostop") {
         event.stopPropagation();
         document.title = "__recording_capsule_stop__";
       }
@@ -1882,11 +1847,12 @@ async function updateRecordingStatusCapsule(patch = {}) {
     hideRecordingStatusCapsule();
     return;
   }
-  const mode = recordingStatusMode(status);
+  const presentation = recordingStatusPresentation(status, recordingStatusCapsuleState.kind);
+  const mode = presentation.mode;
   const now = Date.now();
   const startedAt = Number(recordingStatusCapsuleState.startedAt || 0);
   const previousTimerRunning = !!recordingStatusCapsuleState.timerRunning;
-  const timerCanRun = (mode === "recording" || mode === "autostop") && startedAt > 0;
+  const timerCanRun = recordingStatusIsLive(presentation.kind) && startedAt > 0;
   if (timerCanRun) {
     recordingStatusCapsuleState.timerRunning = true;
     recordingStatusCapsuleState.elapsedMs = Math.max(0, now - startedAt);
@@ -1914,7 +1880,7 @@ async function updateRecordingStatusCapsule(patch = {}) {
   const payload = {
     status,
     mode,
-    tone: recordingStatusTone(status),
+    tone: presentation.tone,
     startedAt: recordingStatusCapsuleState.startedAt,
     elapsedMs: Math.max(0, Number(recordingStatusCapsuleState.elapsedMs || 0)),
     timerRunning: !!recordingStatusCapsuleState.timerRunning,
@@ -2083,6 +2049,19 @@ function startRecordingStateMonitor() {
           if (consideredSilent) {
             if (!recordingSilenceStartedAt) {
               recordingSilenceStartedAt = now;
+              // Announce the countdown. The capsule has always had a
+              // dedicated "autostop" look — amber icon, amber wave, timer
+              // still running — and nothing ever reached it, because the
+              // only way in was a status text containing "auto stop" and
+              // no producer wrote one. So a recording was killed by a
+              // pause in the user's thought with no warning and no way to
+              // cancel it except by noticing it had happened. Now the
+              // capsule turns amber and says how long is left, and the
+              // countdown is cancelled by speaking again.
+              void publishRecordingStatus(
+                `Auto stop in ${Math.ceil(Number(cfg.seconds))}s`,
+                RECORDING_STATUS_KIND.AUTOSTOP,
+              ).catch(() => { });
             }
             const silentElapsed = now - recordingSilenceStartedAt;
             if (silentElapsed >= Number(cfg.seconds) * 1000) {
@@ -2093,6 +2072,10 @@ function startRecordingStateMonitor() {
               guardedStopFromRecordingStatus("autostop");
             }
           } else {
+            // The user spoke again: cancel the countdown and say so.
+            if (recordingSilenceStartedAt) {
+              void publishRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING).catch(() => { });
+            }
             recordingSilenceStartedAt = 0;
           }
         }
@@ -2134,7 +2117,7 @@ async function beginRecordingStatusSession() {
   recordingSeenAudioFrames = false;
   recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   startRecordingStateMonitor();
-  await setRecordingStatus("Recording");
+  await setRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING);
   // Guarded by the same generation counter the monitor's own refresh
   // uses: this await crosses a renderer round-trip, and a session that
   // was reset while it was in flight must not have the PREVIOUS take's
@@ -2144,10 +2127,10 @@ async function beginRecordingStatusSession() {
   if (gen === recordingAutoStopConfigGen) recordingAutoStopConfig = cfg;
 }
 
-async function publishRecordingStatus(status) {
+async function publishRecordingStatus(status, kind = "") {
   const text = String(status || "").trim();
   if (!text) return;
-  await setRecordingStatus(text);
+  await setRecordingStatus(text, kind);
 }
 
 function resetRecordingStatusState() {
@@ -2182,10 +2165,20 @@ async function setRendererMainStatus(text) {
   );
 }
 
-async function setRecordingStatus(text) {
+/**
+ * Publish a status to the capsule and to the main window.
+ *
+ * `kind` is the producer's own answer to "what state is this?" — pass it
+ * whenever the caller knows, which is everywhere in this file. It is
+ * what stops a terminal error ("Mic Not Started") from being drawn as
+ * work in progress because its wording happened to miss two substring
+ * ladders. Omitting it falls back to classifying the text, which is what
+ * renderer-authored statuses need.
+ */
+async function setRecordingStatus(text, kind = "") {
   const status = String(text || "").trim();
   if (!status) return;
-  await updateRecordingStatusCapsule({ status });
+  await updateRecordingStatusCapsule({ status, kind: String(kind || "") });
   await setRendererMainStatus(status);
 }
 
@@ -2308,7 +2301,7 @@ async function toggleRecordingFromShortcut() {
     await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
-      await setRecordingStatus("App Not Ready");
+      await setRecordingStatus("App Not Ready", RECORDING_STATUS_KIND.WARN);
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "window-not-ready" });
       return;
@@ -2341,7 +2334,7 @@ async function toggleRecordingFromShortcut() {
     }
     if (!result?.ok || !result.uiReady) {
       traceStep(trace, "renderer_not_ready", { result: result || null });
-      await setRecordingStatus("App Loading");
+      await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-not-ready" });
       return;
@@ -2403,7 +2396,7 @@ async function toggleRecordingFromShortcut() {
       const micGranted = await requestMacMicrophonePermissionOnce();
       if (!micGranted) {
         traceStep(trace, "mic_permission_denied", {});
-        await setRecordingStatus("Grant Access");
+        await setRecordingStatus("Grant Access", RECORDING_STATUS_KIND.WARN);
         resetRecordingStatusState();
         traceEnd(trace, "failed", { reason: "mic-permission-denied" });
         return;
@@ -2411,7 +2404,7 @@ async function toggleRecordingFromShortcut() {
       result = await dispatchRendererTogglePress(true);
       if (!result?.dispatched) {
         traceStep(trace, "renderer_toggle_failed", { result: result || null });
-        await setRecordingStatus("App Loading");
+        await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
         resetRecordingStatusState();
         traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
         return;
@@ -2431,7 +2424,7 @@ async function toggleRecordingFromShortcut() {
           recordingId: Number(confirmedStart.recordingId || 0),
           timeoutMs: RENDERER_RECORDING_START_CONFIRM_TIMEOUT_MS,
         });
-        await setRecordingStatus("Mic Not Started");
+        await setRecordingStatus("Mic Not Started", RECORDING_STATUS_KIND.FAIL);
         await sleep(RECORDING_STATUS_TERMINAL_DWELL_MS);
         resetRecordingStatusState();
         traceEnd(trace, "failed", { reason: "recording-start-not-confirmed" });
@@ -2479,7 +2472,7 @@ async function toggleRecordingFromShortcut() {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       // Kill recording monitor immediately — recording is done.
       stopRecordingStateMonitor();
-      await setRecordingStatus("Saved To App");
+      await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
       resetRecordingStatusState();
     }
     traceEnd(trace, "done", {});
@@ -2573,7 +2566,7 @@ async function stopRecordingFromMainProcess() {
 
     if (!result) {
       appendMainLog("[recording-stop] renderer stop request timed out");
-      await setRecordingStatus("App Loading");
+      await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
       resetRecordingStatusState();
     } else if (result?.stale) {
       appendMainLog(
@@ -2590,7 +2583,7 @@ async function stopRecordingFromMainProcess() {
       // rest of the take. Restoring the status here without restoring
       // the monitor was half the recovery.
       startRecordingStateMonitor();
-      await setRecordingStatus("Recording");
+      await setRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING);
     } else if (result?.ok) {
       if (result.auto) {
         enqueuePostStopTask({
@@ -2602,11 +2595,11 @@ async function stopRecordingFromMainProcess() {
         });
         stopRecordingStateMonitor();
       } else {
-        await setRecordingStatus("Saved To App");
+        await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
         resetRecordingStatusState();
       }
     } else {
-      await setRecordingStatus("Saved To App");
+      await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
       resetRecordingStatusState();
     }
   } finally {
@@ -5263,7 +5256,7 @@ function enqueuePostStopTask(options = {}) {
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
   appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
-  void setRecordingStatus("Transcribing").catch((e) => {
+  void setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING).catch((e) => {
     appendMainLog(`[post-stop-queue] status-publish failed: ${compactLogText(e?.message || e)}`);
   });
   void runPostStopQueue();
@@ -5288,14 +5281,14 @@ async function runPostStopQueue() {
           taskResult = await processPostStopTask(task);
         } catch (e) {
           appendMainLog(`[post-stop-queue] task-error rec=${task.recordingId} err="${compactLogText(e?.message || e)}"`);
-          await setRecordingStatus("Saved To App").catch(() => { });
+          await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK).catch(() => { });
           taskResult = { dwellMs: RECORDING_STATUS_TERMINAL_DWELL_MS };
         }
       } finally {
         pendingTranscriptionCount = Math.max(0, pendingTranscriptionCount - 1);
       }
       if (pendingTranscriptionCount > 0) {
-        await setRecordingStatus("Transcribing").catch(() => { });
+        await setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING).catch(() => { });
       } else {
         const dwellMs = Math.max(0, Number(taskResult?.dwellMs || 0));
         if (dwellMs > 0) await sleep(dwellMs);
@@ -5347,7 +5340,7 @@ async function processPostStopTask(task) {
     traceEnd(trace, "skipped", { reason: "already-pasted" });
     return { dwellMs: 0 };
   }
-  await setRecordingStatus("Transcribing").catch((e) => {
+  await setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING).catch((e) => {
     appendMainLog(`[post-stop] transcribing-status failed: ${compactLogText(e?.message || e)}`);
   });
   // Bound post-stop wait to the renderer's live-recovery SLA. Fast paths
@@ -5520,10 +5513,10 @@ async function processPostStopTask(task) {
     const statusLower = String(state.status || "").trim().toLowerCase();
     if (!state.isRec) {
       if (statusLower === "upscaling" && recordingStatusPhase !== "upscaling") {
-        await setRecordingStatus("Upscaling");
+        await setRecordingStatus("Upscaling", RECORDING_STATUS_KIND.UPSCALING);
         recordingStatusPhase = "upscaling";
       } else if ((statusLower === "processing" || statusLower === "transcribing") && recordingStatusPhase !== "transcribing") {
-        await setRecordingStatus("Transcribing");
+        await setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING);
         recordingStatusPhase = "transcribing";
       }
     }
@@ -5679,6 +5672,9 @@ async function processPostStopTask(task) {
   }
 
   let recordingStatusText = "Saved To App";
+  // The kind travels with the text all the way to setRecordingStatus, so
+  // the capsule never has to guess a terminal state from its wording.
+  let recordingStatusKind = RECORDING_STATUS_KIND.OK;
   if (transcript) {
     traceStep(trace, "transcript_ready", {
       len: transcript.length,
@@ -5746,7 +5742,7 @@ async function processPostStopTask(task) {
       // other: adding a path can only mean filling in ``transcript``.
       _markRecordingPasted(task.recordingId);
       // Show success immediately once the paste actually happened.
-      await setRecordingStatus("Pasted");
+      await setRecordingStatus("Pasted", RECORDING_STATUS_KIND.OK);
     }
     let autoSendResult = null;
     if (pasted.ok && task.autoSendEnter) {
@@ -5766,9 +5762,9 @@ async function processPostStopTask(task) {
         `[cmd-enter] ${pasteTargetSummary(effectiveTarget)} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
       );
       if (sent.ok) {
-        await setRecordingStatus("Sent");
+        await setRecordingStatus("Sent", RECORDING_STATUS_KIND.OK);
       } else {
-        await setRecordingStatus(recordingStatusForAutoSendFailure(sent.reason));
+        await setRecordingStatus(recordingStatusForAutoSendFailure(sent.reason), RECORDING_STATUS_KIND.FAIL);
       }
       if (!sent.ok && needsMacPastePermissionPrompt(sent.reason)) {
         scheduleMacPastePermissionsPrompt(sent.reason);
@@ -5781,12 +5777,17 @@ async function processPostStopTask(task) {
       recordingStatusText = autoSendResult?.ok
         ? "Sent"
         : recordingStatusForAutoSendFailure(autoSendResult?.reason);
+      recordingStatusKind = autoSendResult?.ok ? RECORDING_STATUS_KIND.OK : RECORDING_STATUS_KIND.FAIL;
     } else {
       recordingStatusText = pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason);
+      // A failed paste always leaves the transcript on the clipboard, so
+      // it is a warning the user can act on, not an error.
+      recordingStatusKind = pasted.ok ? RECORDING_STATUS_KIND.OK : RECORDING_STATUS_KIND.WARN;
     }
   } else {
     if (terminalWithoutPasteStatus) {
       recordingStatusText = terminalWithoutPasteStatus;
+      recordingStatusKind = RECORDING_STATUS_KIND.OK;
     } else {
       // BUGS_AUDIT §6.9: the poll deadline expired with no ready signal
       // at all — previously this branch did nothing (no clipboard write,
@@ -5807,13 +5808,14 @@ async function processPostStopTask(task) {
         reason: "no-final-or-live-text-before-deadline",
         bestKnownLen: bestKnownText.length,
       });
-      recordingStatusText = await handlePostStopTranscriptTimeout(trace, bestKnownText);
+      ({ text: recordingStatusText, kind: recordingStatusKind } =
+        await handlePostStopTranscriptTimeout(trace, bestKnownText));
     }
   }
 
   const isRecNow = await isRendererRecording();
   if (!isRecNow) {
-    await setRecordingStatus(recordingStatusText);
+    await setRecordingStatus(recordingStatusText, recordingStatusKind);
   }
   traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
   return {
@@ -5869,12 +5871,19 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
       digest: textDigest(recovered),
       source: fromBestKnown ? "best_known_text" : "latest_transcript_lookup",
     });
-    return pasteAccel
-      ? `Timed out, but transcript is on your clipboard — press ${pasteAccel} to paste it.`
-      : "Timed out, but transcript is on your clipboard.";
+    // WARN, not "still working": this IS the final answer, and it says
+    // the transcript survived. It used to fall through both substring
+    // ladders into "transcribing"/neutral, so the recovery status looked
+    // like unfinished processing and the user went on waiting.
+    return {
+      text: pasteAccel
+        ? `Timed out, but transcript is on your clipboard — press ${pasteAccel} to paste it.`
+        : "Timed out, but transcript is on your clipboard.",
+      kind: RECORDING_STATUS_KIND.WARN,
+    };
   }
   traceStep(trace, "transcript_unrecoverable_after_timeout", {});
-  return "Timed out with no transcript to recover.";
+  return { text: "Timed out with no transcript to recover.", kind: RECORDING_STATUS_KIND.FAIL };
 }
 
 async function getLatestTranscriptText() {
@@ -5921,7 +5930,7 @@ async function pasteLatestTranscriptFromShortcut() {
     const text = await getLatestTranscriptText();
     if (!text) {
       traceStep(trace, "no_text_available", {});
-      await setRecordingStatus("No Text");
+      await setRecordingStatus("No Text", RECORDING_STATUS_KIND.FAIL);
       await sleep(RECORDING_STATUS_TERMINAL_DWELL_MS);
       resetRecordingStatusState();
       clearCapturedPasteTarget();
@@ -5954,7 +5963,10 @@ async function pasteLatestTranscriptFromShortcut() {
     appendMainLog(
       `[paste-last] ${pasteTargetSummary(shortcutPasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
-    await setRecordingStatus(pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason));
+    await setRecordingStatus(
+      pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason),
+      pasted.ok ? RECORDING_STATUS_KIND.OK : RECORDING_STATUS_KIND.WARN,
+    );
     if (!pasted.ok) {
       if (needsMacPastePermissionPrompt(pasted.reason)) {
         scheduleMacPastePermissionsPrompt(pasted.reason);

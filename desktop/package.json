@@ -55,6 +55,7 @@
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",
+      "recording-status.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",
