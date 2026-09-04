@@ -1886,6 +1886,15 @@ textarea:focus-visible,
   letter-spacing: 0.01em;
 }
 
+/* Shown in place of nothing when the stats read fails: the panel used
+   to keep its markup zeroes, telling a user who could see a list of
+   recordings that there were none. */
+.recordings-stats-error {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--danger-text);
+}
+
 .recordings-list {
   flex: 1;
   min-height: 0;

@@ -40,7 +40,11 @@ import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle 
 import { flashButtonFeedback } from "./button-feedback";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
-import { installErrorAwareConsole, isGenericFetchFailure } from "./error-text";
+import {
+  explainNetworkError,
+  installErrorAwareConsole,
+  isGenericFetchFailure,
+} from "./error-text";
 import {
   RECORDINGS_WINDOW_MINIMUM,
   grownWindowSize,
@@ -2159,7 +2163,21 @@ let recordingViewerAudioObjectUrl = "";
 let activeLiveSessionId = "";
 let activeLiveArchiveDir = "";
 let activeLiveSessionSnapshot: LiveSessionSnapshot | null = null;
-let activeUiSessionToken = "";
+/**
+ * Who owns the result pane right now.
+ *
+ * Non-empty from the first line of the app: "nothing has been recorded
+ * yet" is a UI session like any other, and giving it a real token is
+ * what lets a scoped write be checked by plain equality in that state
+ * too. It used to start as "", which ``isCurrentUiSession`` reads as
+ * "unscoped, always current" — so the guard re-transcribe relies on was
+ * inert on the commonest path of all (cold open → open a recording →
+ * re-transcribe), and re-transcribe worked around it by minting a token
+ * for itself, installing it globally and removing it again in a
+ * ``finally``. ``createClientSessionId`` is a function declaration, so
+ * it is hoisted above this initialiser.
+ */
+let activeUiSessionToken = createClientSessionId();
 let currentRecordingSummary: CurrentRecordingSummary | null = null;
 let latestSavedAudioState: LatestSavedAudioState | null = null;
 let recordSessionNoticeTimer: number | null = null;
@@ -2282,6 +2300,15 @@ function waitForRecordingViewerAudioReady(player: HTMLAudioElement): Promise<voi
   });
 }
 
+/**
+ * May a write tagged with this token still land?
+ *
+ * An empty token means the write is UNSCOPED — the caller did not claim
+ * a session, so nothing can supersede it. Any other token must equal
+ * the session that owns the pane; a live session started since then
+ * makes the write stale, and stale writes are dropped rather than
+ * allowed to clobber the fresh session's output.
+ */
 function isCurrentUiSession(token = ""): boolean {
   if (!token) return true;
   return token === activeUiSessionToken;
@@ -2767,6 +2794,21 @@ function providerLabel(provider: string): string {
  * ``providerLabel`` and by the ``Provider`` type.
  */
 const PROVIDER_DISPLAY_ORDER: ReadonlyArray<string> = ["local", "openrouter", "deepgram"];
+
+/**
+ * Whether a provider name recorded in the archive is one this build has.
+ *
+ * The archive spans versions: recordings made before a provider was
+ * removed still carry its name, under whatever spellings that provider
+ * ever used ("fal", "fal.ai", "falai" for the one removed so far). They
+ * are not errors and not worth a chart entry.
+ */
+const RETIRED_PROVIDER_NAMES: ReadonlySet<string> = new Set(["fal", "fal.ai", "falai"]);
+
+function isKnownProviderName(name: string): boolean {
+  const key = String(name || "").trim().toLowerCase();
+  return !!key && !RETIRED_PROVIDER_NAMES.has(key);
+}
 
 function normalizeProviderSelection(value: unknown, fallback: Provider = "local"): Provider {
   const provider = String(value ?? "").trim();
@@ -3594,59 +3636,6 @@ function syncKeyActionButton(provider: RemoteProvider): void {
  * (3) is our local backend dead. This helper inspects the error and
  * surfaces one of those three actionable diagnoses.
  */
-function explainNetworkError(err: unknown, context = ""): string {
-  const raw = String((err as Error)?.message || err || "").trim();
-  const low = raw.toLowerCase();
-  // Provider-specific branches before the generic fetch-fail catch.
-  // Catch ANY message whose payload starts with "Deepgram " — the
-  // backend emits ~8 different RemoteError shapes from
-  // remote_deepgram_live.py and remote_deepgram.py, not just the
-  // three from the pass-13 fix. Branch on HTTP sub-status first
-  // so each failure mode gets its most actionable message; fall
-  // through to the generic region-block hint for everything else.
-  if (low.startsWith("deepgram ")) {
-    const base = context ? `${context}: ` : "";
-    // Missing API key takes precedence over all HTTP / network
-    // branches. Backend emits "Deepgram API key is not configured"
-    // (from remote_deepgram.py + main.py) or "Deepgram API key is
-    // required" (from remote_deepgram_live.py). These are
-    // configuration problems, not network/region problems — a VPN
-    // would NOT help. The user needs to open Settings → API Keys.
-    if (low.includes("api key is not configured") ||
-        low.includes("api key is required") ||
-        low.includes("api key is missing")) {
-      return `${base}Deepgram API key is not configured. Open Settings → API Keys → Deepgram and paste your key, or switch Provider to "local" in Settings.`;
-    }
-    if (/\bhttp\s*40[12]\b/.test(low) || low.includes("rejected the api key")) {
-      return `${base}Deepgram rejected the API key. Open Settings → API Keys → Deepgram and verify your key.`;
-    }
-    if (/\bhttp\s*429\b/.test(low) || low.includes("rate limit")) {
-      return `${base}Deepgram rate limit exceeded. Wait a moment and try again, or switch Provider to "local".`;
-    }
-    if (/\bhttp\s*402\b/.test(low) || low.includes("insufficient credits") || low.includes("out of credits")) {
-      return `${base}Deepgram account is out of credits. Top up, or switch Provider to "local".`;
-    }
-    if (/\bhttp\s*5\d{2}\b/.test(low)) {
-      return `${base}Deepgram is temporarily unavailable (provider-side error). Try again in a minute, or switch Provider to "local".`;
-    }
-    // Generic: unreachable / timeout / handshake / upstream-closed —
-    // most likely a regional block. Point to VPN or local fallback.
-    return `${base}Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to "local" in Settings.`;
-  }
-  if (!isGenericFetchFailure(low)) return raw;
-  const online = typeof navigator !== "undefined" ? navigator.onLine : true;
-  if (!online) {
-    return context
-      ? `${context}: the computer appears to be offline. Check your internet connection and try again.`
-      : "The computer appears to be offline. Check your internet connection and try again.";
-  }
-  // Online but request failed — could be our backend, or the provider
-  // (Deepgram/OpenRouter). Give the user the most likely fix.
-  return context
-    ? `${context}: the network request failed. If this is a remote provider (Deepgram/OpenRouter), it may be unreachable from your region — try a VPN, or switch Provider to "local" in Settings.`
-    : "Network request failed. If this is a remote provider, it may be unreachable from your region — try a VPN, or switch Provider to \"local\" in Settings.";
-}
-
 async function parseError(r: Response): Promise<string> {
   // 1.1.25 fix: previously called ``await r.json()`` then on failure
   // ``await r.text()``. ``Response`` body is a one-shot stream — once
@@ -5072,6 +5061,8 @@ function parseViewName(value: string): ViewName {
 
 function switchView(view: ViewName): void {
   if (view === "settings") void refreshLocalModels();
+  // A popover belongs to the view that opened it.
+  setTranscribeSettingsOpen(false);
   document.querySelectorAll(".view").forEach((el) => {
     const node = el as HTMLElement;
     node.hidden = node.dataset.view !== view;
@@ -7347,6 +7338,17 @@ function resetRecordingsWindow(): void {
 let recordingsLoadRequestSeq = 0;
 let recordingOpenRequestSeq = 0;
 let recordingsStatsRequestSeq = 0;
+/**
+ * How many foreground archive reads are in flight.
+ *
+ * A boolean here meant the ``finally`` of a SUPERSEDED request cleared
+ * the state a newer one had set — the alternative to the original bug,
+ * where only the winner cleared it and an error on a superseded request
+ * left History disabled forever. A count has neither failure: every
+ * request clears its own, and the controls come back when the last one
+ * is done.
+ */
+let recordingsForegroundLoads = 0;
 let recordingsUiLoading = false;
 let configuredRecordingsDir = "";
 let activeResolvedRecordingsDir = "";
@@ -7372,10 +7374,11 @@ function syncRecordingsStatsVisibility(): void {
 }
 
 async function refreshRecordingsStatsIfVisible(): Promise<void> {
-  if (!recordingsStatsOpen) {
-    recordingsStatsRequestSeq += 1;
-    return;
-  }
+  // No request, so nothing to cancel: this used to bump the request
+  // sequence here, which is the cancellation mechanism, from the branch
+  // that makes no request. Closing the panel is what cancels an
+  // in-flight read, and that is where the bump lives now.
+  if (!recordingsStatsOpen) return;
   await loadRecordingsStats();
 }
 
@@ -7510,7 +7513,7 @@ function setRecordingsUiLoading(nextLoading: boolean): void {
   $("recordingsList").setAttribute("aria-busy", recordingsUiLoading ? "true" : "false");
   ($("recordingsRefreshBtn") as HTMLButtonElement).disabled = recordingsUiLoading;
   ($("recordingsSearchInput") as HTMLInputElement).disabled = recordingsUiLoading;
-  ($("recordingsSearchClearBtn") as HTMLButtonElement).disabled = recordingsUiLoading || !recordingsSearchQuery.trim();
+  syncRecordingsSearchControls();
 }
 
 async function writeTextToClipboard(text: string): Promise<boolean> {
@@ -7716,7 +7719,11 @@ function updateRecordingItemButton(btn: HTMLElement, it: RecordingItem): void {
 
 function syncRecordingBadges(container: HTMLElement, it: RecordingItem): void {
   const wanted: Array<[string, string]> = [];
-  if (it.provider && it.provider !== "unknown") {
+  // No ``!== "unknown"`` guard: the recordings payload writes "" for an
+  // unknown provider (``_build_recordings_list_payload``), and the only
+  // producer of the literal "unknown" is the stats payload, which never
+  // reaches a badge.
+  if (it.provider) {
     wanted.push(["rec-provider rec-provider-provider", providerLabel(it.provider)]);
   }
   if (it.language) {
@@ -7778,6 +7785,11 @@ function renderRecordingsList(): void {
         switchView("record");
       })
     );
+    // "Showing 200 of 5900" is written at the END of this function, past
+    // both early returns, so an archive that emptied — a deleted
+    // directory, a search that matches nothing — kept the previous
+    // count hanging over an empty list.
+    renderRecordingsWindowStatus(0, 0);
     return;
   }
   if (!filteredItems.length) {
@@ -7794,6 +7806,7 @@ function renderRecordingsList(): void {
         }
       })
     );
+    renderRecordingsWindowStatus(0, 0);
     return;
   }
 
@@ -7926,6 +7939,7 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
     .map(recordingItemKey);
   const previousResolvedDir = activeResolvedRecordingsDir;
   if (!options.background) {
+    recordingsForegroundLoads += 1;
     setRecordingsUiLoading(true);
   }
   try {
@@ -7969,13 +7983,39 @@ async function loadRecordings(optionsOrKeepSelection: boolean | LoadRecordingsOp
         : UI_COPY.recordings.viewerPlaceholder);
     }
   } finally {
-    // Always clear loading state — even for superseded requests. The
-    // old code only cleared when requestSeq matched, which left the UI
-    // in a permanent loading state when a superseded request errored.
     if (!options.background) {
-      setRecordingsUiLoading(false);
+      recordingsForegroundLoads = Math.max(0, recordingsForegroundLoads - 1);
+      setRecordingsUiLoading(recordingsForegroundLoads > 0);
     }
   }
+}
+
+/**
+ * Say that the numbers could not be read, instead of showing zeroes.
+ *
+ * The counters keep whatever they last showed — a stale number the user
+ * has already seen is honest as long as the panel says the refresh
+ * failed; replacing them with zeroes is not.
+ */
+function showRecordingsStatsUnavailable(message: string): void {
+  setRecordingsStatsError(message);
+}
+
+function setRecordingsStatsError(message: string): void {
+  const panel = document.getElementById("recordingsStatsPanel");
+  if (!panel) return;
+  let node = panel.querySelector<HTMLElement>(".recordings-stats-error");
+  if (!message) {
+    node?.remove();
+    return;
+  }
+  if (!node) {
+    node = document.createElement("div");
+    node.className = "recordings-stats-error hint";
+    node.setAttribute("role", "status");
+    panel.prepend(node);
+  }
+  if (node.textContent !== message) node.textContent = message;
 }
 
 async function loadRecordingsStats(): Promise<void> {
@@ -7986,10 +8026,17 @@ async function loadRecordingsStats(): Promise<void> {
   } catch (e) {
     // Stats are decorative — a backend error must not abort the caller
     // (loadRecordings) or leave the panel in a permanent loading state.
+    // But it must not read as an empty archive either: the panel used to
+    // keep its markup zeroes, so a user looking at a list of recordings
+    // was told "Recordings 0, Words 0".
     console.warn("loadRecordingsStats: stats fetch failed (non-fatal)", e);
+    if (requestSeq === recordingsStatsRequestSeq) {
+      showRecordingsStatsUnavailable(sanitizeUiErrorMessage(e, "Statistics are unavailable."));
+    }
     return;
   }
   if (requestSeq !== recordingsStatsRequestSeq) return;
+  setRecordingsStatsError("");
   $("statsTotal").textContent = String(s.total_recordings || 0);
   $("statsWords").textContent = String(s.total_words || 0);
   $("statsChars").textContent = String(s.total_chars || 0);
@@ -8018,7 +8065,11 @@ async function loadRecordingsStats(): Promise<void> {
   const providerTotals = new Map<string, number>();
   (s.providers || []).forEach((p) => {
     const key = String(p.name || "").trim().toLowerCase();
-    if (!key || key === "fal" || key === "fal.ai" || key === "falai") return;
+    // Archive entries older than the removal of the fal.ai provider name
+    // it under three spellings. The filter belongs to the one function
+    // that decides which providers this build knows about, not inline in
+    // a chart renderer.
+    if (!isKnownProviderName(key)) return;
     providerTotals.set(key, (providerTotals.get(key) || 0) + Number(p.count || 0));
   });
   PROVIDER_DISPLAY_ORDER.forEach((key) => {
@@ -8088,12 +8139,18 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     const params = new URLSearchParams();
     if (effectiveArchiveDir) params.set("archive_dir", effectiveArchiveDir);
     const suffix = params.toString() ? `?${params.toString()}` : "";
+    // ``display_text`` is written by ``_read_recording_payload`` on every
+    // response (``display or raw``) — it was read through a cast that
+    // bypassed this very declaration, so the type said the field did not
+    // exist while the code depended on it. ``content`` is the raw file
+    // including the Title/Saved-at header; only the export path wants it.
     const r = await apiGet<{
       name: string;
       archive_dir?: string;
       modified_at: string;
       size_bytes: number;
       content: string;
+      display_text: string;
       source_file?: string;
       has_audio?: boolean;
       audio_name?: string;
@@ -8107,7 +8164,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}`;
     $("recordingContent").setAttribute("aria-busy", "false");
     $("recordingContent").setAttribute("data-placeholder", UI_COPY.resultPlaceholder);
-    $("recordingContent").textContent = (r as { display_text?: string }).display_text || r.content || "";
+    $("recordingContent").textContent = r.display_text || r.content || "";
     const player = $("recordingAudio") as HTMLAudioElement;
     if (r.has_audio) {
       const keepExistingAudio = options.silent && previousSelectedKey === requestKey && !!player.getAttribute("src");
@@ -8163,8 +8220,13 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingTitleLabel").textContent = pendingDisplayName;
     $("recordingMeta").textContent = "Load failed";
     $("recordingContent").setAttribute("aria-busy", "false");
-    $("recordingContent").setAttribute("data-placeholder", "Recording failed to load.");
-    $("recordingContent").textContent = message;
+    // The message goes in the placeholder, NOT the body. The body is
+    // what "Copy recording text" copies and what updateRecordingCopyState
+    // measures to decide whether that button is even enabled — writing
+    // the failure there put "Could not open this recording…" on the
+    // user's clipboard as if it were their transcript.
+    $("recordingContent").setAttribute("data-placeholder", message);
+    $("recordingContent").textContent = "";
     const player = $("recordingAudio") as HTMLAudioElement;
     player.pause();
     revokeRecordingViewerAudioUrl();
@@ -8403,6 +8465,9 @@ $("recordingsSearchClearBtn").addEventListener("click", () => {
 });
 $("recordingsStatsBtn").addEventListener("click", () => {
   recordingsStatsOpen = !recordingsStatsOpen;
+  // Closing the panel abandons whatever read is in flight: its response
+  // must not paint into a panel the user has dismissed.
+  if (!recordingsStatsOpen) recordingsStatsRequestSeq += 1;
   syncRecordingsStatsVisibility();
   void refreshRecordingsStatsIfVisible();
 });
@@ -8422,38 +8487,14 @@ $("retranscribeBtn").addEventListener("click", async () => {
     $("finalOutput").textContent = "No saved audio to re-transcribe.";
     return;
   }
-  // Capture the UI session token at the START of the retranscribe job.
-  // If the user presses F9 mid-retranscribe, `activeUiSessionToken`
-  // advances and all our DOM writes after that point must be gated by
-  // `isCurrentUiSession(capturedToken)` — otherwise the stale retranscribe
-  // clobbers the fresh live session's final output / upscale placeholder.
-  //
-  // If no live session has ever started, `activeUiSessionToken` is "" —
-  // but `isCurrentUiSession("")` has a legacy short-circuit that returns
-  // TRUE unconditionally (see ``isCurrentUiSession``, which treats empty
-  // as "no scope, always current"). That short-circuit makes our gate
-  // INERT in the most common
-  // retranscribe path (cold open → import recording → retranscribe → F9).
-  // Generate a dedicated retranscribe token so the gate always evaluates
-  // real equality and the fix actually prevents stale writes.
-  const capturedToken = activeUiSessionToken || createClientSessionId();
-  // Adopt the token as the current UI session for retranscribe's
-  // duration. Without this, `isCurrentUiSession(capturedToken)` would
-  // be false from the start (capturedToken vs the still-empty
-  // `activeUiSessionToken`), and EVERY write during retranscribe would
-  // be silently dropped. Adoption is idempotent — if a prior live
-  // session already set `activeUiSessionToken`, this is a no-op; if
-  // a new live session starts mid-retranscribe, it overwrites
-  // `activeUiSessionToken` and our guard starts blocking stale writes
-  // (which is exactly the data-loss case we care about).
-  //
-  // 1.1.25 fix: track whether WE adopted the token. The cleanup at
-  // function end releases ours-only — never a token a real live
-  // session put in place — so a phantom token doesn't survive after
-  // re-transcribe and cause future deferred writes to incorrectly
-  // pass `isCurrentUiSession` when no real session is active.
-  const adoptedToken = !activeUiSessionToken;
-  if (adoptedToken) activeUiSessionToken = capturedToken;
+  // What re-transcribe needs from a guard is one thing: "has a live
+  // session begun since I started?" — plain equality against the token
+  // as it was at the start. That works in every state now that
+  // ``activeUiSessionToken`` is never empty (see its declaration); the
+  // phantom token this function used to mint, install and release is
+  // gone with the state it was invented for.
+  const capturedToken = activeUiSessionToken;
+  const stillOwnsResultPane = (): boolean => activeUiSessionToken === capturedToken;
   btn.disabled = true;
   btn.classList.add("is-busy");
   // Visible-progress writer. The user reported the re-transcribe job
@@ -8470,7 +8511,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
   // assignments below already use, so a fresh live session that
   // started DURING re-transcribe never gets stomped by a stale status.
   const setRetranscribeStatus = (text: string): void => {
-    if (isCurrentUiSession(capturedToken)) {
+    if (stillOwnsResultPane()) {
       $("finalOutput").textContent = text;
     }
   };
@@ -8567,7 +8608,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
       // Session-gated writes: if the user started a new live recording
       // while we were transcribing, the new session owns `finalOutput`
       // and we must NOT overwrite it.
-      if (isCurrentUiSession(capturedToken)) {
+      if (stillOwnsResultPane()) {
         $("finalOutput").textContent = text;
       }
       // Persist the new transcript over the previous save so the
@@ -8610,7 +8651,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
         // preserved for the user.
         console.warn("Re-transcribe: upscale step failed:", upscaleErr);
       }
-      if (isCurrentUiSession(capturedToken)) {
+      if (stillOwnsResultPane()) {
         if (archiveSaveFailureMessage) {
           patchCurrentRecordingSummary({
             status: `Re-transcribed, but History save failed: ${archiveSaveFailureMessage}`,
@@ -8626,13 +8667,13 @@ $("retranscribeBtn").addEventListener("click", async () => {
         }
       }
     } else {
-      if (isCurrentUiSession(capturedToken)) {
+      if (stillOwnsResultPane()) {
         const tried = triedProviders.length ? ` (tried: ${triedProviders.join(", ")})` : "";
         $("finalOutput").textContent = `Re-transcribe returned empty result${tried}.`;
       }
     }
   } catch (e) {
-    if (isCurrentUiSession(capturedToken)) {
+    if (stillOwnsResultPane()) {
       // Build a precise error message that names what was tried.
       // The default ``explainNetworkError`` hint suggested "switch
       // Provider to local in Settings" — misleading here because the
@@ -8641,13 +8682,11 @@ $("retranscribeBtn").addEventListener("click", async () => {
       // user understands the local fallback ran and also failed; the
       // suggestion to "switch to local" is suppressed when local is
       // in the tried list.
-      let msg = explainNetworkError(e, "Re-transcribe failed");
-      if (triedProviders.some((p) => p.startsWith("local"))) {
-        // Strip the "switch Provider to local" tail — local already
-        // failed, so the suggestion is actively unhelpful.
-        msg = msg.replace(/, or switch Provider to "local" in Settings\.?$/i, ".");
-        msg = msg.replace(/ or switch Provider to "local" in Settings\.?$/i, ".");
-      }
+      const msg = explainNetworkError(e, "Re-transcribe failed", {
+        // Local already ran, under the hood, and failed: telling the
+        // user to switch to it is actively unhelpful.
+        suggestLocalFallback: !triedProviders.some((p) => p.startsWith("local")),
+      });
       const triedSuffix = triedProviders.length ? ` Tried: ${triedProviders.join(", ")}.` : "";
       // Surface the FIRST upstream error (typically the Deepgram
       // failure) when both providers were attempted. Previously the
@@ -8672,16 +8711,6 @@ $("retranscribeBtn").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.classList.remove("is-busy");
-    // 1.1.25 fix: release the token only if WE adopted it AND no
-    // real live session has taken over. This is the symmetric
-    // counterpart of the adoption above; without it, the phantom
-    // capturedToken kept ``activeUiSessionToken`` non-empty after
-    // re-transcribe, and any deferred async write keyed on the
-    // captured token would pass ``isCurrentUiSession(capturedToken)``
-    // forever — silent data corruption hazard.
-    if (adoptedToken && activeUiSessionToken === capturedToken) {
-      activeUiSessionToken = "";
-    }
   }
 });
 
@@ -8767,16 +8796,34 @@ document.addEventListener("keydown", (ev) => {
 });
 
 // ── Transcribe settings gear popup ──
+//
+// Three things were missing and one was dead. The outside-click handler
+// tested ``e.target !== transcribeSettingsBtn``, which can never be
+// false: the button's own handler stops the event before it reaches
+// the document. The button never announced whether the popup was open,
+// Escape did not close it, and leaving the view did not either — so the
+// popup stayed up over History.
 const transcribeSettingsBtn = $("transcribeSettingsBtn") as HTMLButtonElement;
 const transcribeSettingsPopup = $("transcribeSettingsPopup") as HTMLElement;
+
+function setTranscribeSettingsOpen(open: boolean): void {
+  transcribeSettingsPopup.hidden = !open;
+  transcribeSettingsBtn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+setTranscribeSettingsOpen(false);
 transcribeSettingsBtn.addEventListener("click", (e) => {
   e.stopPropagation();
-  transcribeSettingsPopup.hidden = !transcribeSettingsPopup.hidden;
+  setTranscribeSettingsOpen(!!transcribeSettingsPopup.hidden);
 });
 document.addEventListener("click", (e) => {
-  if (!transcribeSettingsPopup.hidden && !transcribeSettingsPopup.contains(e.target as Node) && e.target !== transcribeSettingsBtn) {
-    transcribeSettingsPopup.hidden = true;
+  if (!transcribeSettingsPopup.hidden && !transcribeSettingsPopup.contains(e.target as Node)) {
+    setTranscribeSettingsOpen(false);
   }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || transcribeSettingsPopup.hidden) return;
+  setTranscribeSettingsOpen(false);
+  transcribeSettingsBtn.focus();
 });
 
 syncRecordingsStatsVisibility();

@@ -151,3 +151,80 @@ export function isGenericFetchFailure(raw: string): boolean {
   ];
   return embedded.some((needle) => low.includes(needle));
 }
+
+/**
+ * Turn a thrown value into advice the user can act on.
+ *
+ * Lived in ``main.tsx``, where its copy rules — which of eight Deepgram
+ * failure shapes gets which sentence, and when suggesting the local
+ * fallback still helps — could not be tested, and where the one caller
+ * that needed a different ending edited the finished sentence with two
+ * regular expressions instead.
+ *
+ * @param options.suggestLocalFallback whether "or switch Provider to
+ *   local" is still useful advice. Re-transcribe passes false once it
+ *   has ALREADY fallen back to local and local is what failed — it used
+ *   to strip that clause back out with two regular expressions over the
+ *   finished sentence, which is editing another function's prose from
+ *   the outside and breaks the moment the prose changes.
+ */
+export function explainNetworkError(
+  err: unknown,
+  context = "",
+  options: { suggestLocalFallback?: boolean } = {},
+): string {
+  const raw = String((err as Error)?.message || err || "").trim();
+  const low = raw.toLowerCase();
+  const suggestLocal = options.suggestLocalFallback !== false;
+  /** ", or switch Provider to …" — omitted when local is not an option any more. */
+  const orLocal = (clause: string): string => (suggestLocal ? clause : "");
+  // Provider-specific branches before the generic fetch-fail catch.
+  // Catch ANY message whose payload starts with "Deepgram " — the
+  // backend emits ~8 different RemoteError shapes from
+  // remote_deepgram_live.py and remote_deepgram.py, not just the
+  // three from the pass-13 fix. Branch on HTTP sub-status first
+  // so each failure mode gets its most actionable message; fall
+  // through to the generic region-block hint for everything else.
+  if (low.startsWith("deepgram ")) {
+    const base = context ? `${context}: ` : "";
+    // Missing API key takes precedence over all HTTP / network
+    // branches. Backend emits "Deepgram API key is not configured"
+    // (from remote_deepgram.py + main.py) or "Deepgram API key is
+    // required" (from remote_deepgram_live.py). These are
+    // configuration problems, not network/region problems — a VPN
+    // would NOT help. The user needs to open Settings → API Keys.
+    if (low.includes("api key is not configured") ||
+        low.includes("api key is required") ||
+        low.includes("api key is missing")) {
+      return `${base}Deepgram API key is not configured. Open Settings → API Keys → Deepgram and paste your key${orLocal(', or switch Provider to "local" in Settings')}.`;
+    }
+    if (/\bhttp\s*40[12]\b/.test(low) || low.includes("rejected the api key")) {
+      return `${base}Deepgram rejected the API key. Open Settings → API Keys → Deepgram and verify your key.`;
+    }
+    if (/\bhttp\s*429\b/.test(low) || low.includes("rate limit")) {
+      return `${base}Deepgram rate limit exceeded. Wait a moment and try again${orLocal(', or switch Provider to "local"')}.`;
+    }
+    if (/\bhttp\s*402\b/.test(low) || low.includes("insufficient credits") || low.includes("out of credits")) {
+      return `${base}Deepgram account is out of credits. Top up${orLocal(', or switch Provider to "local"')}.`;
+    }
+    if (/\bhttp\s*5\d{2}\b/.test(low)) {
+      return `${base}Deepgram is temporarily unavailable (provider-side error). Try again in a minute${orLocal(', or switch Provider to "local"')}.`;
+    }
+    // Generic: unreachable / timeout / handshake / upstream-closed —
+    // most likely a regional block. Point to VPN or local fallback.
+    return `${base}Deepgram is unreachable. It may be blocked in your region — try a VPN${orLocal(', or switch Provider to "local" in Settings')}.`;
+  }
+  if (!isGenericFetchFailure(low)) return raw;
+  const online = typeof navigator !== "undefined" ? navigator.onLine : true;
+  if (!online) {
+    return context
+      ? `${context}: the computer appears to be offline. Check your internet connection and try again.`
+      : "The computer appears to be offline. Check your internet connection and try again.";
+  }
+  // Online but request failed — could be our backend, or the provider
+  // (Deepgram/OpenRouter). Give the user the most likely fix.
+  const tail = `it may be unreachable from your region — try a VPN${orLocal(', or switch Provider to "local" in Settings')}.`;
+  return context
+    ? `${context}: the network request failed. If this is a remote provider (Deepgram/OpenRouter), ${tail}`
+    : `Network request failed. If this is a remote provider, ${tail}`;
+}

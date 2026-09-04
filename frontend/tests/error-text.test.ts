@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   MAX_ERROR_TEXT,
   describeError,
+  explainNetworkError,
   installErrorAwareConsole,
   isGenericFetchFailure,
   needsErrorText,
@@ -152,5 +153,53 @@ describe("isGenericFetchFailure", () => {
     expect(isGenericFetchFailure("  FAILED TO FETCH  ")).toBe(true);
     expect(isGenericFetchFailure("")).toBe(false);
     expect(isGenericFetchFailure("   ")).toBe(false);
+  });
+});
+
+/**
+ * The advice rules, now that they live where they can be checked.
+ */
+describe("explainNetworkError", () => {
+  it("names the configuration problem rather than the network for a missing key", () => {
+    const msg = explainNetworkError(new Error("Deepgram API key is not configured"));
+    expect(msg).toContain("Settings");
+    expect(msg).not.toContain("VPN");
+  });
+
+  it("does not offer local when local is what just failed", () => {
+    const err = new Error("Deepgram is unreachable");
+    expect(explainNetworkError(err, "Re-transcribe failed"))
+      .toContain('switch Provider to "local"');
+    const withoutLocal = explainNetworkError(err, "Re-transcribe failed", {
+      suggestLocalFallback: false,
+    });
+    expect(withoutLocal).not.toContain("switch Provider");
+    expect(withoutLocal.endsWith("try a VPN.")).toBe(true);
+  });
+
+  it("drops the clause from every branch, not only the last one", () => {
+    const cases = [
+      "Deepgram API key is not configured",
+      "Deepgram HTTP 429 rate limit",
+      "Deepgram HTTP 402 insufficient credits",
+      "Deepgram HTTP 503",
+      "Deepgram is unreachable",
+      "TypeError: Failed to fetch",
+    ];
+    for (const raw of cases) {
+      const msg = explainNetworkError(new Error(raw), "", { suggestLocalFallback: false });
+      expect(msg, raw).not.toContain("switch Provider");
+      expect(msg, raw).not.toMatch(/,\s*\./);
+    }
+  });
+
+  it("keeps a message it has no advice for exactly as it was", () => {
+    const raw = "failed to load model 'large-v3': file not found";
+    expect(explainNetworkError(new Error(raw))).toBe(raw);
+  });
+
+  it("prefixes the context when one is given", () => {
+    expect(explainNetworkError(new Error("Deepgram HTTP 429"), "Upload failed"))
+      .toMatch(/^Upload failed: /);
   });
 });

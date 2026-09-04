@@ -88,12 +88,11 @@ export function reconcileRecordingsList<T extends RecordingRow>(
       refNode = node.nextSibling;
     } else {
       list.insertBefore(node, refNode);
-      if (freshNode) {
-        // freshly-created nodes always go through insertBefore; do not
-        // count that as a "move" (move = existing node repositioned).
-      } else {
-        stats.moved++;
-      }
+      // A freshly created node always goes through insertBefore, so
+      // that is placement, not movement: "moved" counts an EXISTING
+      // node being repositioned, which is the number that says whether
+      // reconciling was worth it.
+      if (!freshNode) stats.moved++;
     }
   });
 
