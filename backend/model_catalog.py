@@ -103,6 +103,25 @@ DUAL_STREAM_DEFAULT: bool = True
 # which is why it is configurable rather than fixed.
 DUAL_SECONDARY_LANGUAGE_DEFAULT: str = "ru"
 
+#: The languages the LIVE path offers, "auto" first.
+#:
+#: Written here rather than in the renderer's markup because both sides
+#: need it and only one of them can own it: the renderer fills the LANG
+#: picker (and, from it, the Upload and dual-stream pickers) from this
+#: list, and ``deepgram_dual.dual_secondary_language`` validates the
+#: stored preference against it. While the list lived only in
+#: ``frontend/index.html`` those two answers could disagree — a stored
+#: ``dual_secondary_language`` the picker could not offer was shown as
+#: "ru" and streamed as something else.
+LIVE_LANGUAGE_OPTIONS: tuple[str, ...] = ("auto", "ru", "en")
+
+#: What a SECOND, monolingual reading may be run in: everything the live
+#: path offers except "auto". An Auto secondary would be the multilingual
+#: stream twice, at twice the price and with nothing added.
+DUAL_SECONDARY_LANGUAGE_OPTIONS: tuple[str, ...] = tuple(
+    code for code in LIVE_LANGUAGE_OPTIONS if code != "auto"
+)
+
 REMOTE_TRANSCRIPTION_PROVIDERS: tuple[str, ...] = ("openrouter", "deepgram")
 #: The provider a request that names none is served by. First of the
 #: tuple above, in the same shape ``DEFAULT_LIVE_PREVIEW_LOCAL_MODEL``

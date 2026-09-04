@@ -695,6 +695,8 @@ hello everybody that's close up agents workflow that we говорю прост�
 | D-08 | **B-025 / B-059**: `desktop/main.js` читает `config.json` в обход миграции и перетирает `TRANSCRIPTOR_DATA_DIR` | вне периметра — desktop-агенту |
 | D-09 | `PROJECT_STRUCTURE` не знает о трёх новых модулях: `backend/async_tasks.py`, `backend/deepgram_language.py`, `backend/deepgram_recovery.py` (и о двух новых тестовых) | обновить на шаге релиза 1.6.1 (§5 хендоффа), файл вне периметра бэкенд-агента |
 | D-10 | Первая версия теста B-021 (до подмены `HOME`) один раз создала `~/.transcriptor/.encryption_key` на машине | файл ничем не читается, пока `TRANSCRIPTOR_DATA_DIR` доступен; удалить может пользователь |
+| ~~D-11~~ | **R-016 / S-04 / S-05 / S-06** — закрыто в этом же коммите (см. раздел «Дополнение к этому же коммиту» выше): S-04/R-016/S-05 перенесены в bootstrap-payload, S-06 опровергнут как ложный дубликат и задокументирован | — |
+| D-12 | Задание «Швы» пункты 4–6 (D-015/D-009/D-013/D-053 desktop-журнала, единый эпилог `stopLive`, изоляция тестов от `HOME`/`TRANSCRIPTOR_DATA_DIR`) не начаты | требуют отдельного прочтения `frontend-fix-journal.md` и `desktop-fix-journal.md`; каждый — свой коммит с тестами на обеих сторонах, как и B-027 выше |
 
 ---
 
@@ -748,3 +750,142 @@ hello everybody that's close up agents workflow that we говорю прост�
 **По уровням:** P0 — 2 из 2; P1 — 21 из 23 (B-011 «не баг», B-025 вне периметра), то есть 100 % достижимого и 91 % от объявленных; P2 — 60 из 65 закрыто, 1 частично, 4 в долге.
 
 **Дополнительно, сверх отчёта:** R-001…R-006 в `backend/deepgram_recovery.py` — модуль появился после снимка discovery и в отчёт не входил (коммит 15).
+
+---
+
+## Швы (2026-09-05)
+
+Кросс-доменный агент, продолжающий работу после `52dab76` (единая схема
+конверта `final`, закрывает **D-01 / B-038** из раздела выше). Задание —
+`docs/NEXT_SESSION_2026-09-04b.md` §2, §7; журналы `frontend-fix-journal.md`
+/ `desktop-fix-journal.md` (разделы «долг» / «не сделано»).
+
+### Коммит: B-027 / R-016 — дефолты dual-stream, backend SSOT
+
+**IDs:** B-027 (третья копия, → закрывает **D-03** выше), R-016 (частично —
+только dual-stream/секондари; остальные факты R-016/S-04/S-05/S-06 см.
+«не сделано» ниже).
+
+**Файлы:**
+- `backend/model_catalog.py` — `LIVE_LANGUAGE_OPTIONS = ("auto", "ru", "en")`,
+  `DUAL_SECONDARY_LANGUAGE_OPTIONS` (тот же список без `"auto"`).
+- `backend/deepgram_dual.py` — `dual_secondary_language()` теперь
+  ВАЛИДИРУЕТ сохранённое значение по `DUAL_SECONDARY_LANGUAGE_OPTIONS`, а
+  не просто приводит к нижнему регистру: значение не из списка (старая
+  сборка, ручная правка конфига) больше не может рассинхронизировать
+  «что показывает Settings» и «что реально стримится».
+- `backend/main.py` — `_frontend_runtime_payload()["live_defaults"]`:
+  `languages`, `dual_stream`, `dual_secondary_language`,
+  `dual_secondary_languages`, `keyterm_token_budget` (из
+  `deepgram_keyterms.MAX_KEYTERM_TOKENS`); плюс `audio_ext_to_mime`
+  (инверсия для рендерера, S-04 — см. «не сделано», факт уже переехал,
+  читатель ещё не описан тестом на стороне рендерера кроме source-level
+  проверки).
+- `frontend/src/deepgram-dual.ts` — `DUAL_STREAM_DEFAULT` /
+  `DUAL_SECONDARY_LANGUAGE_DEFAULT` УДАЛЕНЫ; `resolveDualStreamPreference`
+  принимает `fallback: DualStreamDefaults`, приходящий из бэкенда.
+- `frontend/src/main.tsx` — `backendLiveDefaults` (заполняется из
+  `live_defaults` один раз, до `loadCfg`); `readDeepgramDualStream()` /
+  `readDeepgramDualSecondaryLanguage()` возвращают `undefined`, если
+  бэкенд ещё не ответил, и `buildUiPreferencesSavePlan()` в этом случае
+  НЕ пишет ключ вовсе (config.py делает deep-merge, отсутствующий ключ
+  не трогает то, что уже на диске) — это и есть «отсутствующее значение
+  не может быть автосохранено как off». Также: `applyAudioMimeMap`
+  (инверсия `audio_ext_to_mime` → `MIME_TO_AUDIO_EXT`, было 12
+  хардкоженных записей против 19 бэкендных), `applyLiveLanguageOptions`
+  (переписывает `#language` из `live_defaults.languages`),
+  `applyKeytermBudgetNote`.
+- Исправлен реальный баг в незакоммиченном черновике: `applyBackendRuntimeConfig`
+  типизировал `root` без полей `audio_ext_to_mime`/`live_defaults` —
+  `tsc --noEmit` падал (TS2339) на обеих строках, где они читались.
+  Дописан тип.
+
+**Тесты (фикстура по образцу `52dab76`):**
+- `backend/tests/test_live.py::FrontendLiveDefaultsFixtureTests` строит
+  `contracts/live-defaults.json` из `_frontend_runtime_payload()`
+  (языки, dual-дефолты, keyterm-бюджет, `audio_ext_to_mime`);
+  `WebSocketAuthTokenTests.test_bootstrap_live_defaults_match_the_model_catalog_ssot`
+  проверяет, что payload и есть константы `model_catalog.py` /
+  `deepgram_keyterms.py`, а не отдельная копия.
+- `frontend/tests/deepgram-dual.test.ts` переписан: больше не импортирует
+  удалённые константы, читает `contracts/live-defaults.json` и передаёт
+  его как `fallback` во все вызовы `resolveDualStreamPreference`;
+  проверка дефолта чекбокса в разметке сверяется с `liveDefaults.dual_stream`
+  из фикстуры, а не с константой модуля.
+- `frontend/tests/renderer-main-contract.test.ts` — новый блок
+  «live-path defaults have no renderer-owned copy»: source-level проверка,
+  что `readDeepgramDualStream`/`readDeepgramDualSecondaryLanguage` читают
+  `backendLiveDefaults`, а не литерал; что в `main.tsx` нет собственных
+  `const DUAL_STREAM_DEFAULT` / `const DUAL_SECONDARY_LANGUAGE_DEFAULT`;
+  что список `<option>` в `#language` (до гидратации) совпадает со
+  списком языков из фикстуры; что заметка о keyterm-бюджете строится
+  функцией, а не хардкодит число.
+- `backend/tests/test_deepgram_dual.py::DualSecondaryLanguageTests` —
+  старый `test_reads_and_normalizes_the_configured_value` проверял, что
+  `"ES"` проходит как `"es"`; это больше не так (см. выше), тест
+  переписан на `"EN"`/`"ru"`; добавлен
+  `test_a_value_this_build_cannot_offer_falls_back_to_the_default`
+  (`"es"`, `"auto"`, `"fr"` → `"ru"`).
+
+**Проверка:**
+```
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 -m unittest discover -s backend/tests
+# Ran 815 tests — OK (было 812 в 52dab76 + 3 новых теста здесь)
+npm --prefix frontend run typecheck && npm --prefix frontend run lint && npm --prefix frontend test && npm --prefix frontend run build
+# typecheck: чисто; lint: чисто; test: 351 passed (было 347 в 52dab76 + 4 новых); build: ok
+npm --prefix desktop test && node --check desktop/main.js && node --check desktop/preload.js
+# 255 passed, оба чека чистые (домен не тронут этим коммитом, прогнан по правилу «все три сьюта перед коммитом»)
+```
+
+**Решения:**
+- Валидация `dual_secondary_language` теперь по списку опций, а не
+  просто по типу/непустоте — намеренное ужесточение поведения (было:
+  любая непустая строка проходила как есть). Это меняет то, что
+  возвращает `dual_secondary_language()` для значения вроде `"es"`,
+  оставшегося в конфиге от гипотетической будущей опции или ручной
+  правки: теперь `"ru"` (дефолт), а не `"es"` буквально. Соответствует
+  докстрингу, который уже был в черновике; решение принято, так как это
+  и есть суть шва — сторона рендерера физически не может предложить
+  `"es"` в пикере, значит и сторона бэкенда не должна тихо стримить его.
+- Фикстура — JSON, не Python/TS модуль: тот же формат, что
+  `contracts/live-final-envelope.json`, для единообразия и потому что
+  обе стороны уже умеют его парсить.
+- `_validate_config_shape` (`backend/config.py`) НЕ ужесточён тем же
+  списком опций — он остаётся проверкой формы (строка непустая), а не
+  семантики. Семантическая проверка — работа `dual_secondary_language()`,
+  вызываемого на пути чтения. Разделение уже было в коде до этого шва;
+  сохранено, а не продублирован список опций во второй функции.
+
+**Дополнение к этому же коммиту — R-016 / S-04 / S-05 / S-06 (задание, пункт 3):**
+
+`frontend-fix-journal.md` строка 1432 называет три подозреваемых дубликата
+знания, живущего в бэкенде:
+
+1. **R-016 / S-05** — дефолты dual-stream (`deepgram-dual.ts` против
+   `config.py`). Закрыто ЭТИМ коммитом (см. выше).
+2. **S-04** — карта MIME ↔ расширение (`main.tsx`, 12 записей, против
+   `audio_mime.py`, 19). Закрыто ЭТИМ коммитом: `audio_ext_to_mime` в
+   bootstrap-payload, `applyAudioMimeMap` в `main.tsx`.
+3. **S-06** — эпсилон «два сегмента — один момент»
+   (`UI_TOKENS.finalize.segmentEpsilonSec = 0.08` против `live.py`'s
+   `emit_epsilon_sec = 0.05`). Журнал называет это гипотезой
+   («нужен бэкенд», не подтверждённым дубликатом). Проверено: это НЕ
+   дубликат. `segmentEpsilonSec` дедуплицирует уже ОТПРАВЛЕННЫЕ сегменты
+   в превью рендерера, от любого провайдера (`mergeTranscriptSegments`,
+   `frontend/src/main.tsx`); `emit_epsilon_sec` — это порог «уже
+   отправленной отметки» ВНУТРИ одной Whisper-сессии `LiveSession между
+   двумя перекрывающимися проходами инференса (`backend/live.py`,
+   `LiveConfig`), Deepgram эта сессия вообще не касается. Объединение
+   означало бы, что свойство таймстемпов Whisper решает, как дедуплицируется
+   пара сегментов Deepgram на экране. Решение — задокументировать обе
+   константы (уже было в `live.py` от предыдущего агента; дописан
+   парный комментарий в `main.tsx`) и закрепить тестом, что оба
+   комментария называют друг друга (`renderer-main-contract.test.ts`,
+   describe "segmentEpsilonSec vs. live.py's emit_epsilon_sec"), чтобы
+   один нельзя было удалить, не тронув другой.
+
+Все четыре ID из пункта 3 задания закрыты (три перенесены/задокументированы,
+один опровергнут как ложный дубликат и закреплён тестом).
+
+**Не сделано:** пункты 4–6 задания (D-015/D-009/D-013/D-053, эпилог
+`stopLive`, изоляция тестов от `HOME`) не начаты в рамках этого коммита.

@@ -26,6 +26,22 @@ class LiveConfig:
     overlap_sec: float = 1.0
     min_step_sec: float = 1.0
     min_audio_sec: float = 0.7
+    # Tolerance of the ALREADY-EMITTED WATERMARK: a word whose second
+    # reading (this session re-feeds ``overlap_sec`` at every window
+    # head) ends within this much of the last emitted end has already
+    # been sent, and is dropped rather than repeated.
+    #
+    # NOT the renderer's ``UI_TOKENS.finalize.segmentEpsilonSec`` (0.08),
+    # and deliberately not derived from it — the two look alike and are
+    # different questions (S-04…S-06 named the pair as an unexplained
+    # divergence, which it was; the explanation is here and in the token's
+    # own comment). This one governs what this session EMITS and its
+    # value is a property of Whisper's word timestamps across two passes
+    # over overlapping audio. The renderer's governs whether two segments
+    # ALREADY SENT — by any provider, including Deepgram, which this
+    # module never touches — describe the same moment in its preview
+    # pane. Tying them together would make a Whisper timestamp property
+    # decide how a Deepgram interim is deduplicated.
     emit_epsilon_sec: float = 0.05
     # Extra seconds retained in the ring beyond ``window_sec``. This is
     # the catch-up budget: when one inference pass runs longer than

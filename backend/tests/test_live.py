@@ -9,10 +9,14 @@ import re
 import sys
 import tempfile
 import time
+from pathlib import Path
 from unittest import mock
 
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
 from backend.live import LiveConfig, LiveSession
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LIVE_DEFAULTS_FIXTURE_PATH = REPO_ROOT / "contracts" / "live-defaults.json"
 
 
 class IsolatedBackendMainImportMixin:
@@ -174,6 +178,81 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             "runtime_limits",
         ):
             self.assertEqual(bootstrap_payload[key], health_payload[key])
+
+    def test_bootstrap_live_defaults_match_the_model_catalog_ssot(self):
+        # B-027 / R-016: the renderer has no copy of these values left.
+        # It reads them from the bootstrap payload, so the payload has to
+        # actually be built from the same constants deepgram_dual.py
+        # validates a stored preference against — otherwise Settings and
+        # the live path could still disagree, just one hop further away.
+        payload = self.main._frontend_runtime_payload()
+        live_defaults = payload["live_defaults"]
+        self.assertEqual(live_defaults["languages"], list(self.main.LIVE_LANGUAGE_OPTIONS))
+        self.assertEqual(live_defaults["dual_stream"], self.main.DUAL_STREAM_DEFAULT)
+        self.assertEqual(
+            live_defaults["dual_secondary_language"],
+            self.main.DUAL_SECONDARY_LANGUAGE_DEFAULT,
+        )
+        self.assertEqual(
+            live_defaults["dual_secondary_languages"],
+            list(self.main.DUAL_SECONDARY_LANGUAGE_OPTIONS),
+        )
+        self.assertEqual(live_defaults["keyterm_token_budget"], self.main.MAX_KEYTERM_TOKENS)
+        # Every accepted extension has a MIME, and the map's key order —
+        # ``audio_ext_to_mime`` is what the renderer inverts, first
+        # extension wins on a shared MIME (S-04).
+        self.assertEqual(
+            set(payload["audio_ext_to_mime"].keys()),
+            {ext.lstrip(".") for ext in self.main.ALLOWED_AUDIO_EXTS},
+        )
+
+
+class FrontendLiveDefaultsFixtureTests(IsolatedBackendMainImportMixin, unittest.TestCase):
+    """Produces the fixture ``frontend/tests/deepgram-dual.test.ts`` reads.
+
+    Same pattern as ``backend/tests/test_live_envelope.py`` /
+    ``contracts/live-final-envelope.json``: the fixture is written here,
+    by the backend's own bootstrap payload builder, and committed. The
+    frontend suite parses it rather than restating the defaults, so a
+    changed default or a changed live-language list turns the frontend
+    suite red instead of leaving it silently stale.
+
+    Regenerate after an intentional change:
+
+        UPDATE_CONTRACT_FIXTURES=1 python -m unittest \
+            backend.tests.test_live.FrontendLiveDefaultsFixtureTests
+    """
+
+    def test_fixture_matches_the_bootstrap_payload(self):
+        payload = self.main._frontend_runtime_payload()
+        expected = {
+            "languages": payload["live_defaults"]["languages"],
+            "dual_stream": payload["live_defaults"]["dual_stream"],
+            "dual_secondary_language": payload["live_defaults"]["dual_secondary_language"],
+            "dual_secondary_languages": payload["live_defaults"]["dual_secondary_languages"],
+            "keyterm_token_budget": payload["live_defaults"]["keyterm_token_budget"],
+            "audio_ext_to_mime": payload["audio_ext_to_mime"],
+        }
+        if os.environ.get("UPDATE_CONTRACT_FIXTURES") == "1":
+            LIVE_DEFAULTS_FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LIVE_DEFAULTS_FIXTURE_PATH.write_text(
+                json.dumps(expected, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        self.assertTrue(
+            LIVE_DEFAULTS_FIXTURE_PATH.exists(),
+            f"{LIVE_DEFAULTS_FIXTURE_PATH} is missing — regenerate with "
+            "UPDATE_CONTRACT_FIXTURES=1",
+        )
+        actual = json.loads(LIVE_DEFAULTS_FIXTURE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            actual,
+            expected,
+            "contracts/live-defaults.json is stale. frontend/tests/"
+            "deepgram-dual.test.ts parses this file, so regenerate it "
+            "(UPDATE_CONTRACT_FIXTURES=1) and teach the renderer the new "
+            "shape in the SAME commit.",
+        )
 
 
 class LiveSessionTailTests(unittest.IsolatedAsyncioTestCase):

@@ -87,14 +87,23 @@ class DualSecondaryLanguageTests(unittest.TestCase):
         self.assertEqual(DUAL_SECONDARY_LANGUAGE_DEFAULT, "ru")
 
     def test_reads_and_normalizes_the_configured_value(self):
-        self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language="ES")), "es")
+        self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language="EN")), "en")
         self.assertEqual(
-            dual_secondary_language(_cfg(dual_secondary_language="  fr  ")), "fr"
+            dual_secondary_language(_cfg(dual_secondary_language="  ru  ")), "ru"
         )
 
     def test_a_blank_or_wrong_typed_value_falls_back_to_the_default(self):
         self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language="")), "ru")
         self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language=3)), "ru")
+
+    def test_a_value_this_build_cannot_offer_falls_back_to_the_default(self):
+        # Validated against DUAL_SECONDARY_LANGUAGE_OPTIONS, not merely
+        # lowercased (B-027 / R-016): a stored code the live-language
+        # picker cannot show would otherwise stream something the user
+        # never chose while Settings displayed the default.
+        self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language="es")), "ru")
+        self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language="auto")), "ru")
+        self.assertEqual(dual_secondary_language(_cfg(dual_secondary_language="fr")), "ru")
 
 
 class ConfigDefaultsTests(unittest.TestCase):

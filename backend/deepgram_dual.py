@@ -58,6 +58,7 @@ from backend.async_tasks import cancel_and_await
 # the two sides of the preference.
 from backend.model_catalog import (
     DUAL_SECONDARY_LANGUAGE_DEFAULT,
+    DUAL_SECONDARY_LANGUAGE_OPTIONS,
     DUAL_STREAM_DEFAULT,
 )
 # The merge has to answer the same questions the single-stream splice
@@ -157,10 +158,21 @@ def dual_stream_enabled(cfg: Any, language: str) -> bool:
 
 
 def dual_secondary_language(cfg: Any) -> str:
-    """The language of the second reading — one place, one answer."""
+    """The language of the second reading — one place, one answer.
+
+    Validated against ``DUAL_SECONDARY_LANGUAGE_OPTIONS``, not merely
+    lowercased. The renderer's picker can only offer those codes and its
+    autosave writes back what the picker shows, so a stored value outside
+    the list is a leftover from an older build or a hand-edited config —
+    and accepting it here made the two sides disagree in the one way the
+    user cannot see: Settings displayed the default while the stream ran
+    something else.
+    """
     value = _deepgram_prefs(cfg).get("dual_secondary_language")
-    if isinstance(value, str) and value.strip():
-        return value.strip().lower()
+    if isinstance(value, str):
+        code = value.strip().lower()
+        if code in DUAL_SECONDARY_LANGUAGE_OPTIONS:
+            return code
     return DUAL_SECONDARY_LANGUAGE_DEFAULT
 
 
@@ -1086,6 +1098,7 @@ class DualLiveSession:
 __all__ = [
     "ADJACENT_SAME_STEM_MAX_GAP_SEC",
     "DUAL_SECONDARY_LANGUAGE_DEFAULT",
+    "DUAL_SECONDARY_LANGUAGE_OPTIONS",
     "DUAL_STREAM_DEFAULT",
     "DualLiveSession",
     "MergedReading",

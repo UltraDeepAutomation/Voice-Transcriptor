@@ -34,10 +34,9 @@ import {
   type WarmHoldLifecycleRelease,
 } from "./capture-warm";
 import {
-  DUAL_SECONDARY_LANGUAGE_DEFAULT,
-  DUAL_STREAM_DEFAULT,
   dualStreamTradeOffText,
   resolveDualStreamPreference,
+  type DualStreamDefaults,
 } from "./deepgram-dual";
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
 import { flashButtonFeedback } from "./button-feedback";
@@ -551,16 +550,40 @@ type ModelCatalogPayload = {
   upscale?: { openrouter_models?: unknown; default_model?: unknown };
 };
 
+type BackendLiveDefaultsPayload = {
+  languages?: unknown;
+  dual_stream?: unknown;
+  dual_secondary_language?: unknown;
+  dual_secondary_languages?: unknown;
+  keyterm_token_budget?: unknown;
+};
+
 type BackendBootstrapPayload = {
   max_upload_bytes?: unknown;
   accepted_audio_exts?: unknown;
+  audio_ext_to_mime?: unknown;
   live_sample_rate_hz?: unknown;
+  live_defaults?: BackendLiveDefaultsPayload;
   model_catalog?: ModelCatalogPayload;
   runtime_limits?: {
     upload_queue_max_parallel?: unknown;
     upload_queue_max_persisted_items?: unknown;
   };
 };
+
+/**
+ * What the backend says its live path defaults to. ``null`` until the
+ * bootstrap payload lands.
+ *
+ * The renderer has no opinion of its own here (B-027 / R-016): these two
+ * values used to be declared in ``deepgram-dual.ts`` as a third copy of
+ * ``backend/model_catalog.py``, and because the renderer's resolution of
+ * an absent preference is what the next autosave persists, a copy that
+ * disagreed with the backend would rewrite the backend's own default on
+ * disk. ``null`` here means "not known", and nothing writes a
+ * not-known value — see ``buildUiPreferencesSavePlan``.
+ */
+let backendLiveDefaults: DualStreamDefaults | null = null;
 
 // Compile-time injected by vite.config.ts from desktop/package.json's
 // ``version`` field. SSOT for the version label rendered in the
@@ -1078,6 +1101,20 @@ const UI_TOKENS = {
     fallbackWindowSec: 60 * 120,
   },
   finalize: {
+    // Tolerance for "these two segments describe the same moment" in
+    // ``mergeTranscriptSegments`` below — the renderer's own dedup of
+    // segments ALREADY SENT, by any provider, in its preview pane.
+    //
+    // NOT ``backend/live.py``'s ``LiveConfig.emit_epsilon_sec`` (0.05),
+    // and deliberately not derived from it (S-06) — the two look alike
+    // and are different questions, explained on that constant's own
+    // comment. This one is a property of how close two providers' word
+    // timestamps for the same instant can land after their own
+    // rounding; the backend one is a property of Whisper's timestamps
+    // across two overlapping inference passes and governs what a
+    // single session EMITS, before anything reaches this renderer.
+    // Tying them together would make a Whisper-only value decide how a
+    // Deepgram segment pair is deduplicated on screen.
     segmentEpsilonSec: 0.08,
     /**
      * How long the stop waits for the backend's ``final`` envelope
@@ -1999,7 +2036,9 @@ function applyBackendRuntimeConfig(payload: unknown): void {
   const root = payload as {
     max_upload_bytes?: unknown;
     accepted_audio_exts?: unknown;
+    audio_ext_to_mime?: unknown;
     live_sample_rate_hz?: unknown;
+    live_defaults?: BackendLiveDefaultsPayload;
   };
   const uploadBytes = Number(root.max_upload_bytes);
   if (Number.isFinite(uploadBytes) && uploadBytes > 0) {
@@ -2026,6 +2065,108 @@ function applyBackendRuntimeConfig(payload: unknown): void {
       renderAcceptedFormatsHint(document, ACCEPTED_AUDIO_VIDEO_EXTS);
     }
   }
+  applyAudioMimeMap(root.audio_ext_to_mime);
+  applyBackendLiveDefaults(root.live_defaults);
+}
+
+/**
+ * Invert the backend's ext → MIME map into the renderer's MIME → ext one.
+ *
+ * First extension wins: several MIMEs are shared by two extensions
+ * (``audio/ogg`` by ogg and oga, ``video/mp4`` by mp4 and m4v,
+ * ``video/mpeg`` by mpg and mpeg) and the backend's map lists the
+ * canonical one first, which is why insertion order is preserved on the
+ * way here rather than sorted.
+ */
+function applyAudioMimeMap(raw: unknown): void {
+  if (!raw || typeof raw !== "object") return;
+  const entries = Object.entries(raw as Record<string, unknown>)
+    .map(([ext, mime]) => [
+      String(ext || "").trim().toLowerCase().replace(/^\./, ""),
+      String(mime || "").trim().toLowerCase(),
+    ] as const)
+    .filter(([ext, mime]) => /^[a-z0-9]+$/.test(ext) && /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(mime));
+  if (!entries.length) return;
+  for (const key of Object.keys(MIME_TO_AUDIO_EXT)) delete MIME_TO_AUDIO_EXT[key];
+  for (const [ext, mime] of entries) {
+    if (!MIME_TO_AUDIO_EXT[mime]) MIME_TO_AUDIO_EXT[mime] = ext;
+  }
+}
+
+/**
+ * Adopt the live path's backend-owned facts: which languages it offers,
+ * what it defaults the second stream to, and the keyterm token budget it
+ * enforces.
+ *
+ * The LANG picker's option list is rewritten from ``languages`` — the
+ * Upload picker and the dual-stream picker are both filled FROM that
+ * picker, so all three follow one list. The markup keeps the same three
+ * options as the pre-hydration state (``frontend/tests/renderer-main-contract.test.ts``
+ * checks that it still agrees with the backend), and this replaces them
+ * the moment the payload lands.
+ */
+function applyBackendLiveDefaults(raw: BackendLiveDefaultsPayload | undefined): void {
+  if (!raw || typeof raw !== "object") return;
+  const languages = Array.isArray(raw.languages)
+    ? raw.languages.map((code) => String(code || "").trim().toLowerCase()).filter(Boolean)
+    : [];
+  if (languages.length) applyLiveLanguageOptions(languages);
+  const secondary = String(raw.dual_secondary_language || "").trim().toLowerCase();
+  if (typeof raw.dual_stream === "boolean" && secondary) {
+    const first = backendLiveDefaults === null;
+    backendLiveDefaults = { dualStream: raw.dual_stream, secondaryLanguage: secondary };
+    // The markup default becomes the BACKEND's default, before loadCfg
+    // reads the stored preference over the top of it. Without this the
+    // checked attribute in index.html would be a second answer to the
+    // same question rather than a pre-hydration placeholder.
+    //
+    // ONCE, on the first payload only: this function is also reached
+    // from the periodic /api/health poll, and re-applying the default
+    // there would tick a box the user had just unticked.
+    const dualCheck = first ? dualStreamCheckbox() : null;
+    if (dualCheck) {
+      dualCheck.defaultChecked = raw.dual_stream;
+      dualCheck.checked = raw.dual_stream;
+    }
+  }
+  const budget = Number(raw.keyterm_token_budget);
+  if (Number.isFinite(budget) && budget > 0) applyKeytermBudgetNote(Math.trunc(budget));
+}
+
+/**
+ * Rewrite ``#language``'s options from the backend's list, keeping the
+ * current selection when it survives. Runs before ``loadCfg``, so the
+ * stored language is applied against the list the backend actually
+ * offers rather than against whatever the markup happened to carry.
+ */
+function applyLiveLanguageOptions(codes: ReadonlyArray<string>): void {
+  const select = document.getElementById("language") as HTMLSelectElement | null;
+  if (!select) return;
+  const existing = Array.from(select.options).map((option) => option.value);
+  if (existing.length === codes.length && existing.every((code, i) => code === codes[i])) return;
+  const selected = select.value;
+  select.replaceChildren();
+  for (const code of codes) {
+    const option = document.createElement("option");
+    option.value = code;
+    option.textContent = code === "auto" ? "Auto" : code.toUpperCase();
+    select.appendChild(option);
+  }
+  if (codes.includes(selected)) select.value = selected;
+}
+
+/**
+ * State the keyterm budget the backend actually enforces, next to the
+ * field that spends it. ``normalize_keyterms`` drops terms once the
+ * running token estimate passes this number, and the note used to
+ * describe the field without ever saying so.
+ */
+function applyKeytermBudgetNote(budget: number): void {
+  const note = document.getElementById("deepgramKeytermsNote");
+  if (!note) return;
+  const sentence = ` Up to ${budget} tokens in total — terms past that are dropped.`;
+  const base = (note.textContent || "").replace(/\s+Up to \d+ tokens in total[^]*$/, "").trimEnd();
+  note.textContent = base + sentence;
 }
 
 function applyRuntimeLimits(limits: unknown): void {
@@ -2272,25 +2413,28 @@ function latestRecordingAudioUrl(savedName = "", archiveDir = ""): string {
   return `/api/recordings/${encodeURIComponent(safeName)}/audio${qs ? `?${qs}` : ""}`;
 }
 
-// MIME → canonical extension mapping. Used when the backend's
-// ``Content-Disposition`` header is absent or unparseable and we have
-// to synthesize a filename from the saved-name stem. The backend's
-// audio MIME handling is backend-owned; this map only recovers a useful
-// extension for the rare header-missing playback/download path.
-const MIME_TO_AUDIO_EXT: Record<string, string> = {
-  "audio/wav": "wav",
-  "audio/x-wav": "wav",
-  "audio/wave": "wav",
-  "audio/mpeg": "mp3",
-  "audio/mp4": "m4a",
-  "audio/x-m4a": "m4a",
-  "audio/flac": "flac",
-  "audio/x-flac": "flac",
-  "audio/ogg": "ogg",
-  "audio/webm": "webm",
-  "audio/aac": "aac",
-  "audio/opus": "opus",
-};
+/**
+ * MIME → canonical extension, INVERTED FROM THE BACKEND'S OWN MAP.
+ *
+ * Used when the backend's ``Content-Disposition`` header is absent or
+ * unparseable and a filename has to be synthesised from the saved-name
+ * stem. The mapping is the backend's (``backend/audio_mime.py``), and it
+ * arrives in the bootstrap payload as ``audio_ext_to_mime`` (S-04).
+ *
+ * It used to be a hand-written 12-entry table here against the
+ * backend's 19: it knew no video container and no ``.oga``, so a
+ * screen recording played back through the header-missing path was
+ * named ``.bin``, and it invented four MIME spellings
+ * (``audio/x-wav``, ``audio/wave``, ``audio/x-m4a``, ``audio/x-flac``)
+ * that this backend cannot emit — an import-time assert in
+ * ``backend/main.py`` requires every accepted extension to have an
+ * explicit MIME, so the fallback that produced those spellings is
+ * unreachable for a served recording.
+ *
+ * Empty until the payload lands, which is before any recording can be
+ * fetched; an unknown MIME falls back to ``bin`` exactly as before.
+ */
+const MIME_TO_AUDIO_EXT: Record<string, string> = {};
 
 // RFC 6266 Content-Disposition filename parser.
 // Handles:
@@ -5761,15 +5905,30 @@ function dualSecondaryLanguageSelect(): HTMLSelectElement | null {
   return document.getElementById("deepgramDualSecondaryLang") as HTMLSelectElement | null;
 }
 
-function readDeepgramDualStream(): boolean {
+/**
+ * The dual-stream preference the autosave will persist, or ``undefined``
+ * when this renderer genuinely does not know it.
+ *
+ * It used to fall back to a ``DUAL_STREAM_DEFAULT`` written in the
+ * renderer — a third copy of a backend constant (B-027 / R-016), and the
+ * dangerous kind: the value returned here is written back to the config
+ * on the next debounced autosave, so a renderer copy that ever said
+ * "off" where the backend says "on" would switch the feature off on
+ * disk, permanently and invisibly. There is no renderer copy now. With
+ * the control present its state is the answer; without it, the backend's
+ * own default (from the bootstrap payload) is; and if neither is
+ * available the key is simply not written, which leaves whatever is
+ * stored alone.
+ */
+function readDeepgramDualStream(): boolean | undefined {
   const el = dualStreamCheckbox();
-  return el ? el.checked : DUAL_STREAM_DEFAULT;
+  return el ? el.checked : backendLiveDefaults?.dualStream;
 }
 
 function readDeepgramDualSecondaryLanguage(): string {
   const el = dualSecondaryLanguageSelect();
   const value = (el?.value || "").trim();
-  return value || DUAL_SECONDARY_LANGUAGE_DEFAULT;
+  return value || backendLiveDefaults?.secondaryLanguage || "";
 }
 
 /**
@@ -6575,6 +6734,8 @@ function buildUiPreferencesSavePlan() {
   const remoteProvider = provider === "openrouter" || provider === "deepgram" ? provider : "openrouter";
   const openrouterModel = (remoteModelByProvider.openrouter || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;
   const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
+  const dualStreamPref = readDeepgramDualStream();
+  const dualSecondaryPref = readDeepgramDualSecondaryLanguage();
   return {
     nextRecordingsDir,
     shouldRefreshRecordingsArchive: nextRecordingsDir !== configuredRecordingsDir,
@@ -6591,10 +6752,14 @@ function buildUiPreferencesSavePlan() {
         // as every other preference, so a stale backend that doesn't
         // yet know this key still round-trips it via config.py's
         // deep-merge (unvalidated keys pass through untouched).
+        // A key this renderer cannot answer for is NOT written: config.py
+        // deep-merges the update, so an omitted key leaves the stored
+        // value untouched. Writing a guess instead is what would make an
+        // absent backend payload switch a backend default off on disk.
         deepgram: {
           keyterms: readDeepgramKeyterms(),
-          dual_stream: readDeepgramDualStream(),
-          dual_secondary_language: readDeepgramDualSecondaryLanguage(),
+          ...(dualStreamPref === undefined ? {} : { dual_stream: dualStreamPref }),
+          ...(dualSecondaryPref ? { dual_secondary_language: dualSecondaryPref } : {}),
         },
         ui: collectUiPreferences(),
       },
@@ -6712,17 +6877,28 @@ async function loadCfg(): Promise<void> {
     // be nothing to select it from.
     fillDualSecondaryLanguageOptions();
     const dualLangSel = dualSecondaryLanguageSelect();
-    const dualPrefs = resolveDualStreamPreference({
-      dualStream: deepgramPrefs.dual_stream,
-      secondaryLanguage: deepgramPrefs.dual_secondary_language,
-      availableLanguages: dualLangSel
-        ? Array.from(dualLangSel.options).map((o) => o.value)
-        : [DUAL_SECONDARY_LANGUAGE_DEFAULT],
-    });
     const dualCheck = dualStreamCheckbox();
-    if (dualCheck) dualCheck.checked = dualPrefs.dualStream;
-    if (dualLangSel && Array.from(dualLangSel.options).some((o) => o.value === dualPrefs.secondaryLanguage)) {
-      dualLangSel.value = dualPrefs.secondaryLanguage;
+    if (backendLiveDefaults) {
+      const dualPrefs = resolveDualStreamPreference({
+        dualStream: deepgramPrefs.dual_stream,
+        secondaryLanguage: deepgramPrefs.dual_secondary_language,
+        availableLanguages: dualLangSel
+          ? Array.from(dualLangSel.options).map((o) => o.value)
+          : [backendLiveDefaults.secondaryLanguage],
+        // The backend's answer to "what does an absent preference mean",
+        // not the renderer's (B-027 / R-016).
+        fallback: backendLiveDefaults,
+      });
+      if (dualCheck) dualCheck.checked = dualPrefs.dualStream;
+      if (dualLangSel && Array.from(dualLangSel.options).some((o) => o.value === dualPrefs.secondaryLanguage)) {
+        dualLangSel.value = dualPrefs.secondaryLanguage;
+      }
+    } else if (typeof deepgramPrefs.dual_stream === "boolean" && dualCheck) {
+      // No bootstrap payload reached this renderer, so what an ABSENT
+      // preference means is unknown and must not be invented — only an
+      // explicitly stored value may move the control. Anything the
+      // renderer showed here would be persisted by the next autosave.
+      dualCheck.checked = deepgramPrefs.dual_stream;
     }
     const ui = (cfg.preferences || {}).ui || {};
     remoteModelByProvider.openrouter = String(ui.remote_model_openrouter || cfgOpenrouterModel || "").trim() || DEFAULT_OPENROUTER_AUDIO_MODEL;

@@ -62,6 +62,10 @@ from backend.model_catalog import (
     DEFAULT_OPENROUTER_AUDIO_MODEL,
     DEFAULT_OPENROUTER_UPSCALE_MODEL,
     DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
+    DUAL_SECONDARY_LANGUAGE_DEFAULT,
+    DUAL_SECONDARY_LANGUAGE_OPTIONS,
+    DUAL_STREAM_DEFAULT,
+    LIVE_LANGUAGE_OPTIONS,
     LOCAL_TRANSCRIPTION_MODELS,
     OPENROUTER_UPSCALE_FALLBACK_MODELS,
     REMOTE_TRANSCRIPTION_PROVIDERS,
@@ -95,7 +99,7 @@ from backend.live_envelope import (
 from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
-from backend.deepgram_keyterms import configured_keyterms
+from backend.deepgram_keyterms import MAX_KEYTERM_TOKENS, configured_keyterms
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
 from backend.deepgram_dual import (
     DualLiveSession,
@@ -1563,10 +1567,50 @@ def index():
 
 
 def _frontend_runtime_payload() -> dict[str, Any]:
+    """What the renderer is told about this backend, before it asks.
+
+    Injected into ``GET /`` and repeated by ``/api/health``. Everything
+    here is a fact the BACKEND owns and the renderer would otherwise have
+    to restate — and a restated fact is one that drifts. The dual-stream
+    defaults are the clearest case (B-027 / R-016): the renderer resolves
+    an absent preference to *something* in order to show a control, that
+    resolution is what the next debounced autosave writes to disk, and a
+    renderer guessing "off" would therefore switch a backend default off
+    behind the user's back, permanently and silently.
+    """
     return {
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "accepted_audio_exts": sorted(ext.lstrip(".") for ext in ALLOWED_AUDIO_EXTS),
+        # The canonical Content-Type for each accepted extension. The
+        # renderer inverts it to name a downloaded/played file when the
+        # backend's ``Content-Disposition`` is missing (S-04); it used to
+        # keep its own 12-entry map against these 19, missing every video
+        # container and inventing four MIME spellings this backend cannot
+        # produce — an import-time assert below guarantees every accepted
+        # extension is mapped, so the inverse of this map is complete.
+        # Declaration order is preserved deliberately: several MIMEs are
+        # shared by two extensions (``audio/ogg`` by ogg and oga,
+        # ``video/mp4`` by mp4 and m4v, ``video/mpeg`` by mpg and mpeg),
+        # and the map lists the canonical one FIRST, so "first wins" is
+        # the rule that gives the renderer's inverse the right answer.
+        "audio_ext_to_mime": {
+            ext.lstrip("."): mime for ext, mime in AUDIO_EXT_TO_MIME.items()
+        },
         "live_sample_rate_hz": LIVE_SAMPLE_RATE_HZ,
+        # What the live path defaults to and what it can offer. The
+        # renderer fills its LANG picker from ``languages`` (and from
+        # that picker, the Upload and dual-stream pickers), resolves an
+        # absent preference with ``dual_stream``/``dual_secondary_language``
+        # instead of a constant of its own, and states the keyterm budget
+        # this backend actually enforces rather than a number copied into
+        # the markup.
+        "live_defaults": {
+            "languages": list(LIVE_LANGUAGE_OPTIONS),
+            "dual_stream": DUAL_STREAM_DEFAULT,
+            "dual_secondary_language": DUAL_SECONDARY_LANGUAGE_DEFAULT,
+            "dual_secondary_languages": list(DUAL_SECONDARY_LANGUAGE_OPTIONS),
+            "keyterm_token_budget": MAX_KEYTERM_TOKENS,
+        },
         "model_catalog": health_model_catalog(),
         "runtime_limits": {
             "upload_queue_max_parallel": jobs.max_workers,

@@ -17,12 +17,24 @@
  * behind the user's back. Absent therefore means the documented default,
  * never off.
  *
+ * The defaults themselves are NOT written here (B-027 / R-016). They
+ * used to be — ``DUAL_STREAM_DEFAULT = true`` and
+ * ``DUAL_SECONDARY_LANGUAGE_DEFAULT = "ru"``, a third copy beside
+ * ``backend/model_catalog.py`` and ``backend/config.py`` — and the copy
+ * was dangerous in exactly the direction described above: if this file
+ * ever said "off" where the backend said "on", the next autosave made
+ * the backend wrong too. They now arrive in the backend's bootstrap
+ * payload (``live_defaults``) and are passed in as ``fallback``.
+ *
  * Pure: no DOM, no fetch. Unit-tested in tests/deepgram-dual.test.ts.
  */
 
-/** Backend defaults, restated here because the renderer must resolve absence without asking. */
-export const DUAL_STREAM_DEFAULT = true;
-export const DUAL_SECONDARY_LANGUAGE_DEFAULT = "ru";
+export interface DualStreamDefaults {
+  /** ``live_defaults.dual_stream`` — what the backend does when unset. */
+  dualStream: boolean;
+  /** ``live_defaults.dual_secondary_language`` — its partner language. */
+  secondaryLanguage: string;
+}
 
 export interface DualStreamPreferenceInput {
   /** ``preferences.deepgram.dual_stream`` exactly as the config had it. */
@@ -31,9 +43,12 @@ export interface DualStreamPreferenceInput {
   secondaryLanguage?: unknown;
   /**
    * Language codes this build can actually offer for the second stream —
-   * the live language picker's own options, minus "auto".
+   * the live language picker's own options, minus "auto". The picker is
+   * itself filled from the backend's ``live_defaults.languages``.
    */
   availableLanguages: ReadonlyArray<string>;
+  /** What the BACKEND does with an absent preference. Not a guess. */
+  fallback: DualStreamDefaults;
 }
 
 export interface DualStreamPreference {
@@ -52,17 +67,19 @@ export interface DualStreamPreference {
  * the multilingual stream twice at twice the price.
  */
 export function resolveDualStreamPreference(input: DualStreamPreferenceInput): DualStreamPreference {
+  const fallbackLanguage = String(input.fallback.secondaryLanguage || "").trim().toLowerCase();
   const offered = input.availableLanguages
     .map((code) => String(code || "").trim().toLowerCase())
     .filter((code) => code && code !== "auto");
   const stored = String(input.secondaryLanguage ?? "").trim().toLowerCase();
   const secondaryLanguage = offered.includes(stored)
     ? stored
-    : offered.includes(DUAL_SECONDARY_LANGUAGE_DEFAULT)
-      ? DUAL_SECONDARY_LANGUAGE_DEFAULT
-      : offered[0] || DUAL_SECONDARY_LANGUAGE_DEFAULT;
+    : offered.includes(fallbackLanguage)
+      ? fallbackLanguage
+      : offered[0] || fallbackLanguage;
   return {
-    dualStream: typeof input.dualStream === "boolean" ? input.dualStream : DUAL_STREAM_DEFAULT,
+    dualStream:
+      typeof input.dualStream === "boolean" ? input.dualStream : input.fallback.dualStream,
     secondaryLanguage,
   };
 }
