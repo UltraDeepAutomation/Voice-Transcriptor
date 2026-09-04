@@ -70,6 +70,7 @@ from backend.remote_deepgram_live import (
     join_segment_texts,
     normalize_words,
     resolve_live_language,
+    segment_word_records,
     splice_words_into_segments,
     subtract_spans,
     tail_needs_flush,
@@ -175,18 +176,15 @@ def covered_spans(segments: Iterable[dict]) -> list[tuple[float, float]]:
     WORDS, not of message windows, which is the whole finding of audit
     §3.1 — and the segment's own span where it does not, because for
     such a segment its span is the only thing knowable about what it
-    contains.
+    contains. Both halves come from ``segment_word_records``, the one
+    rule for what a final without a word list accounts for, shared with
+    the live session's own coverage and with the dual-stream merge.
     """
-    spans: list[tuple[float, float]] = []
-    for seg in segments or []:
-        words = _segment_words(seg)
-        if words:
-            spans.extend(
-                (_as_float(w.get("start")), _as_float(w.get("end"))) for w in words
-            )
-            continue
-        spans.append((_as_float(seg.get("start")), _as_float(seg.get("end"))))
-    return union_spans(spans)
+    return union_spans(
+        (_as_float(w.get("start")), _as_float(w.get("end")))
+        for seg in (segments or [])
+        for w in segment_word_records(seg)
+    )
 
 
 def missing_spans(

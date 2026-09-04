@@ -46,6 +46,7 @@ What this module owns
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
@@ -57,7 +58,10 @@ from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveSession,
     DeepgramLiveStats,
+    SPANLESS_WORD_FLAG,
+    intersect_spans,
     resolve_live_language,
+    segment_word_records,
     subtract_spans,
     union_spans,
 )
@@ -68,7 +72,6 @@ from backend.remote_deepgram_live import (
 # what a duplicate is. These are that module's own rules, imported
 # rather than restated.
 from backend.remote_deepgram_live import (  # noqa: E402  (deliberate reuse)
-    _segment_words,
     _time_overlap,
     _token_stem,
     _word_core,
@@ -200,27 +203,146 @@ class MergedReading:
 
 
 def flatten_words(segments: Iterable[dict], source: str) -> list[dict]:
-    """Finalized segments to one time-ordered word list, tagged."""
+    """Finalized segments to one time-ordered word list, tagged.
+
+    Reads every segment through ``segment_word_records`` — the ONE rule
+    for a final that arrived without a word list (B-001). This function
+    used to take ``_segment_words`` alone, so such a final contributed
+    nothing at all: since ``merged.text`` is built from words, the whole
+    clause disappeared from the transcript of a recording running the
+    default Auto mode, with no error and no log line. The single-stream
+    path had named that case three times over (``_spanless_coverage``,
+    ``_word_covered_by_spanless_final``, the wordless branch of
+    ``_process_deepgram_message``); the merge is the fourth asker and
+    now shares their answer instead of inventing a fourth.
+    """
     out: list[dict] = []
     for seg in segments or []:
-        for w in _segment_words(seg):
+        for w in segment_word_records(seg):
             token = str(w.get("word") or "")
             if not token:
                 continue
-            out.append(
-                {
-                    "word": token,
-                    "start": float(w.get("start") or 0.0),
-                    "end": float(w.get("end") or 0.0),
-                    "source": source,
-                }
-            )
+            record = {
+                "word": token,
+                "start": float(w.get("start") or 0.0),
+                "end": float(w.get("end") or 0.0),
+                "source": source,
+            }
+            if w.get(SPANLESS_WORD_FLAG):
+                record[SPANLESS_WORD_FLAG] = True
+            out.append(record)
     out.sort(key=lambda w: (w["start"], w["end"]))
     return out
 
 
+# How much of a clause-level record's span the OTHER reading has to
+# transcribe with real words before that clause is dropped in its
+# favour. Half: below it the clause is the only reading of most of that
+# ground and dropping it would lose text (which is B-001 all over
+# again); above it the other reading is the same audio, positioned word
+# by word, and keeping the blob beside it would print the clause twice.
+SPANLESS_SHADOW_MIN_FRACTION = 0.5
+
+
+def _reconcile_spanless(
+    primary: list[dict], secondary: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Decide, per span of ground, between a clause blob and real words.
+
+    A final without a word list becomes ONE record spanning its whole
+    segment (``segment_word_records``). That record is a real reading of
+    that ground — dropping it outright is B-001, a whole clause deleted
+    from the transcript — but it is the coarsest possible one, and it
+    cannot be merged word by word with anything. So exactly one of the
+    two readings owns any ground a blob covers, and it is decided here,
+    once, before any pairing:
+
+    1. A blob whose span the OTHER reading transcribes with real words
+       over at least ``SPANLESS_SHADOW_MIN_FRACTION`` of it loses: those
+       words are the same audio, positioned, and the blob beside them
+       would print the clause twice.
+    2. Under any blob that survives, the other reading's real words lose
+       instead — the blob already says what was spoken there, and
+       keeping both is the same double-printing from the other side.
+       "Inside" is the centre rule ``_word_covered_by_spanless_final``
+       uses on the single-stream path, so "this word is answered for by
+       a wordless final" means one thing in this product.
+    """
+    if not any(
+        w.get(SPANLESS_WORD_FLAG) for w in (*primary, *secondary)
+    ):
+        # The common case by far: both readings came with word timings,
+        # and there is no blob for either side to lose ground to.
+        return primary, secondary
+    kept_primary = _drop_shadowed_spanless(primary, secondary)
+    kept_secondary = _drop_shadowed_spanless(secondary, kept_primary)
+    return (
+        _drop_words_under_spanless(kept_primary, kept_secondary),
+        _drop_words_under_spanless(kept_secondary, kept_primary),
+    )
+
+
+def _spanless_spans(words: Iterable[dict]) -> list[tuple[float, float]]:
+    return union_spans(
+        (w["start"], w["end"]) for w in words if w.get(SPANLESS_WORD_FLAG)
+    )
+
+
+def _drop_shadowed_spanless(
+    words: list[dict], other: list[dict]
+) -> list[dict]:
+    """Step 1 of ``_reconcile_spanless``: blobs the other reading beat."""
+    covered = union_spans(
+        (w["start"], w["end"]) for w in other if not w.get(SPANLESS_WORD_FLAG)
+    )
+    if not covered:
+        return words
+    kept: list[dict] = []
+    for word in words:
+        if not word.get(SPANLESS_WORD_FLAG):
+            kept.append(word)
+            continue
+        span = max(0.0, word["end"] - word["start"])
+        if span <= 0.0:
+            kept.append(word)
+            continue
+        overlap = sum(
+            end - start
+            for start, end in intersect_spans([(word["start"], word["end"])], covered)
+        )
+        if overlap / span < SPANLESS_SHADOW_MIN_FRACTION:
+            kept.append(word)
+    return kept
+
+
+def _drop_words_under_spanless(
+    words: list[dict], other: list[dict]
+) -> list[dict]:
+    """Step 2 of ``_reconcile_spanless``: words a surviving blob answers for."""
+    blobs = _spanless_spans(other)
+    if not blobs:
+        return words
+    kept: list[dict] = []
+    for word in words:
+        if word.get(SPANLESS_WORD_FLAG):
+            kept.append(word)
+            continue
+        center = (word["start"] + word["end"]) / 2.0
+        if not any(start < center < end for start, end in blobs):
+            kept.append(word)
+    return kept
+
+
 def _same_audio(a: dict, b: dict) -> bool:
     """Do these two words describe the same moment of the recording?
+
+    The yes/no reading of ``_pair_overlap``; see it for the rules.
+    """
+    return _pair_overlap(a, b) is not None
+
+
+def _pair_overlap(a: dict, b: dict) -> Optional[float]:
+    """Their time overlap when they are the same moment, else ``None``.
 
     Overlap first — the measured rule, ``SPLICE_COVERAGE_OVERLAP_FRACTION``
     of EITHER word, the same threshold the single-stream splice uses.
@@ -233,18 +355,38 @@ def _same_audio(a: dict, b: dict) -> bool:
     consecutive words: "да да" said twice stays two words only if the
     times really are disjoint by more than the gap, and a real repeat
     ("subagents, subagents") is spoken over a longer span than 0.3 s.
+
+    A clause-level record (``SPANLESS_WORD_FLAG`` — a final that arrived
+    without word timings) is not a spoken word, so it is never paired
+    with one: doing so would let a single word's spelling win
+    ``_resolve`` against a whole clause and delete the clause. Which of
+    the two survives is decided before any pairing, by
+    ``_drop_shadowed_spanless``. Two clause records of the same ground
+    ARE comparable, and are compared on overlap alone — a stem match
+    between two multi-word blobs means nothing.
+
+    Returns the overlap rather than a boolean because ``_pairs`` needs
+    both the verdict and the same number as its ranking key, and
+    computing it twice was a measurable share of the merge on a long
+    dictation.
     """
+    a_spanless = bool(a.get(SPANLESS_WORD_FLAG))
+    b_spanless = bool(b.get(SPANLESS_WORD_FLAG))
+    if a_spanless != b_spanless:
+        return None
     overlap = _time_overlap(a, b)
     if overlap > 0 and (
         overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(a)
         or overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(b)
     ):
-        return True
+        return overlap
+    if a_spanless:
+        return None
     stem = _token_stem(a["word"])
     if not stem or stem != _token_stem(b["word"]):
-        return False
+        return None
     gap = max(a["start"], b["start"]) - min(a["end"], b["end"])
-    return gap <= ADJACENT_SAME_STEM_MAX_GAP_SEC
+    return overlap if gap <= ADJACENT_SAME_STEM_MAX_GAP_SEC else None
 
 
 def _pairs(
@@ -256,15 +398,55 @@ def _pairs(
     before a weaker candidate can. Pairs accepted with no overlap at all
     (the same-stem neighbour rule) rank last, which is right: they are
     the weakest evidence of sameness and must not outbid a real overlap.
+
+    Linear in the number of words, by a time sweep. This used to rescan
+    the WHOLE secondary list from index 0 for every primary word — the
+    early ``break`` bounded the tail of the scan but not its head — which
+    is O(P x S) on a path that runs synchronously between the user's
+    Stop and their text: measured 2.8 s for a 7-minute dictation and
+    30.8 s for a 20-minute one, all of it inside the event loop, and all
+    of it outside the budget this stop had already announced to the
+    renderer (B-002).
+
+    Both lists are time-sorted, so a secondary word can only match a
+    window of primary words that moves forward with the cursor. The
+    active set holds exactly the secondary words whose span can still
+    reach the current primary word: anything ending more than
+    ``ADJACENT_SAME_STEM_MAX_GAP_SEC`` before it can match neither this
+    primary word nor any later one (later ones start no earlier), so it
+    is retired for good — a heap keyed on ``end`` is what makes "the
+    earliest-ending word still in play" the only one that has to be
+    examined to decide that. Words are admitted by ``start``, in order,
+    and never re-examined once retired, so every word enters and leaves
+    once.
     """
     candidates: list[tuple[float, int, int]] = []
+    active: list[tuple[float, int]] = []  # heap of (end, secondary index)
+    next_secondary = 0
+    total_secondary = len(secondary)
     for pi, pw in enumerate(primary):
-        for si, sw in enumerate(secondary):
-            if sw["start"] > pw["end"] + ADJACENT_SAME_STEM_MAX_GAP_SEC:
-                break
-            if _same_audio(pw, sw):
-                candidates.append((_time_overlap(pw, sw), pi, si))
-    candidates.sort(key=lambda t: -t[0])
+        admit_until = pw["end"] + ADJACENT_SAME_STEM_MAX_GAP_SEC
+        while (
+            next_secondary < total_secondary
+            and secondary[next_secondary]["start"] <= admit_until
+        ):
+            heapq.heappush(
+                active,
+                (secondary[next_secondary]["end"], next_secondary),
+            )
+            next_secondary += 1
+        retire_before = pw["start"] - ADJACENT_SAME_STEM_MAX_GAP_SEC
+        while active and active[0][0] < retire_before:
+            heapq.heappop(active)
+        for _end, si in active:
+            overlap = _pair_overlap(pw, secondary[si])
+            if overlap is not None:
+                candidates.append((overlap, pi, si))
+    # Explicit tie-break on (pi, si) rather than sort stability: the
+    # sweep visits the active set in heap order, so insertion order is
+    # no longer the source order, and two candidates with identical
+    # overlap have to resolve the same way every run.
+    candidates.sort(key=lambda t: (-t[0], t[1], t[2]))
     used_p: set[int] = set()
     used_s: set[int] = set()
     paired: list[tuple[dict, dict]] = []
@@ -407,6 +589,15 @@ def merge_readings(
             secondary_word_count=0,
         )
 
+    # What each reading actually delivered, before the merge starts
+    # discarding from either — the stop line reports the readings, not
+    # the merge's working set.
+    primary_count = len(primary)
+    secondary_count = len(secondary)
+    # Clause-level records first, before anything is paired: a final
+    # that arrived without word timings cannot be merged word by word,
+    # so exactly one reading owns the ground it covers.
+    primary, secondary = _reconcile_spanless(primary, secondary)
     paired, only_primary, only_secondary = _pairs(primary, secondary)
     merged = [_resolve(pw, sw) for pw, sw in paired]
     merged.extend(dict(w) for w in only_primary)
@@ -417,8 +608,8 @@ def merge_readings(
         words=merged,
         segments=_segments_from_words(merged),
         text=" ".join(w["word"] for w in merged),
-        primary_word_count=len(primary),
-        secondary_word_count=len(secondary),
+        primary_word_count=primary_count,
+        secondary_word_count=secondary_count,
         filled_from_secondary=len(only_secondary),
         filled_from_primary=len(only_primary),
         duplicates_removed=duplicates,

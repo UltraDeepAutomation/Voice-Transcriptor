@@ -434,6 +434,55 @@ def _segment_words(segment: dict) -> list[dict]:
     return [w for w in words if isinstance(w, dict)]
 
 
+# A word record synthesised from a segment that carried no word list.
+# Flagged so the merge can tell "one spoken word" from "a whole clause
+# we only know the span of" — see ``_same_audio`` in
+# ``backend.deepgram_dual``.
+SPANLESS_WORD_FLAG = "spanless"
+
+
+def segment_word_records(segment: dict) -> list[dict]:
+    """A segment as word records — the ONE rule for a final without words.
+
+    Deepgram may finalize a segment with a transcript and no ``words``
+    array at all. Three parts of this product have to answer "what does
+    that segment account for?", and they used to answer it three ways:
+    ``_spanless_coverage`` here took its span, ``covered_spans`` in
+    ``backend.deepgram_recovery`` took its span, and
+    ``backend.deepgram_dual.flatten_words`` took NOTHING — which deleted
+    the clause from the merged transcript of every Auto recording it
+    happened on (B-001, a silent, total loss of text).
+
+    One rule, and it is the one the other two already implied: such a
+    segment reads as a SINGLE word record covering its span and carrying
+    its text, because the span is the only placement knowable about it
+    and the text is what was said. A segment that carries real words
+    reads as those words, unchanged and uncopied.
+
+    The synthesised record is flagged ``spanless`` so a consumer that
+    cares about the difference — the dual merge, which must not let one
+    reading's single word stand in for the other's whole clause — can
+    see it. Consumers that only ask "what ground is accounted for" do
+    not need to care, and do not.
+    """
+    words = _segment_words(segment)
+    if words:
+        return words
+    text = str(segment.get("text") or "").strip()
+    if not text:
+        return []
+    start = _as_float(segment.get("start"))
+    end = max(start, _as_float(segment.get("end")))
+    return [
+        {
+            "word": text,
+            "start": start,
+            "end": end,
+            SPANLESS_WORD_FLAG: True,
+        }
+    ]
+
+
 def _provider_split_token(prev: dict, nxt: dict) -> Optional[bool]:
     """Did Deepgram itself cut one spoken word across this seam?
 
@@ -2284,11 +2333,15 @@ class DeepgramLiveSession:
 
         Their span is the only thing knowable about what they contain,
         so it stays the coverage test for them — and only for them.
+        Read through ``segment_word_records``, the one rule for what such
+        a final accounts for, so this module, the dual merge and the
+        recovery pass cannot answer that question differently.
         """
         return self._union(
-            (_as_float(s.get("start")), _as_float(s.get("end")))
-            for s in self._finalized_segments
-            if not _segment_words(s)
+            (record["start"], record["end"])
+            for seg in self._finalized_segments
+            for record in segment_word_records(seg)
+            if record.get(SPANLESS_WORD_FLAG)
         )
 
     def _host_final_for(self, word: dict) -> Optional[dict]:
@@ -3531,7 +3584,9 @@ __all__ = [
     "final_words_cover",
     "merge_seam_fragments",
     "normalize_words",
+    "segment_word_records",
     "word_accounted_for",
+    "SPANLESS_WORD_FLAG",
     # Shared with ``backend.deepgram_dual``, which merges two readings
     # of one recording: what "auto" means as a Deepgram language, and
     # the span arithmetic behind "is this still a hole?".

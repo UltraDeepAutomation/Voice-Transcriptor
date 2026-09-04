@@ -12,6 +12,7 @@ docstring for the measurement this is built on):
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from dataclasses import dataclass, field
 from typing import Optional
@@ -159,8 +160,38 @@ class FlattenWordsTests(unittest.TestCase):
         self.assertEqual([w["word"] for w in out], ["one", "two"])
         self.assertTrue(all(w["source"] == "primary" for w in out))
 
-    def test_a_wordless_segment_contributes_nothing(self):
-        self.assertEqual(flatten_words([{"text": "hi", "start": 0, "end": 1}], "primary"), [])
+    def test_a_wordless_segment_reads_as_one_record_over_its_span(self):
+        """B-001: a final without a word list is still a reading.
+
+        This used to assert the opposite — that such a segment
+        contributes nothing — which is exactly the defect: since
+        ``merged.text`` is built from words, a wordless final deleted
+        its whole clause from the transcript of an Auto recording, with
+        no error and no log line. The single-stream path had already
+        named this case three times (``_spanless_coverage``,
+        ``_word_covered_by_spanless_final``, the wordless branch of
+        ``_process_deepgram_message``): its span is the only placement
+        knowable and its text is what was said.
+        """
+        out = flatten_words([{"text": "hi there", "start": 0, "end": 1}], "primary")
+        self.assertEqual(
+            out,
+            [
+                {
+                    "word": "hi there",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "source": "primary",
+                    "spanless": True,
+                }
+            ],
+        )
+
+    def test_a_wordless_segment_with_no_text_contributes_nothing(self):
+        """Nothing said, nothing known — the one case that IS empty."""
+        self.assertEqual(
+            flatten_words([{"text": "", "start": 0, "end": 1}], "primary"), []
+        )
 
 
 class MergeReadingsTests(unittest.TestCase):
@@ -687,6 +718,124 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("filled_from_ru=1", line)
         self.assertIn("filled_from_multi=0", line)
         self.assertIn("dups_removed=0", line)
+
+
+# ---------------------------------------------------------------------
+# B-001 / B-002: a final without words, and the cost of the merge
+# ---------------------------------------------------------------------
+
+
+class WordlessFinalMergeTests(unittest.TestCase):
+    """A final Deepgram sent without a word list must still be read.
+
+    ``merge_readings`` builds its text from words, so a wordless final
+    used to disappear from the merged transcript entirely — total,
+    silent loss of a clause on the path Auto takes by default (B-001).
+    The rule now is the one the single-stream path always used: such a
+    segment is ONE record over its span, carrying its text.
+    """
+
+    def test_a_wordless_primary_final_survives_the_merge(self):
+        primary = [{"start": 0.0, "end": 3.0, "text": "это весь мой текст"}]
+        secondary = [_segment([_w("это", 0.4, 0.7)])]
+        self.assertEqual(
+            merge_readings(primary, secondary).text, "это весь мой текст"
+        )
+
+    def test_a_wordless_primary_final_survives_with_no_secondary(self):
+        """The ``if not secondary`` branch promises the primary reading
+        UNTOUCHED, and this is the case where it used to be emptied."""
+        primary = [{"start": 0.0, "end": 3.0, "text": "это весь мой текст"}]
+        self.assertEqual(merge_readings(primary, []).text, "это весь мой текст")
+
+    def test_the_other_reading_wins_the_ground_when_it_has_the_words(self):
+        """A blob loses to real words over most of its own span: those
+        words are the same audio, positioned, and printing both would
+        say the clause twice."""
+        primary = [{"start": 0.0, "end": 1.0, "text": "раз два три"}]
+        secondary = [
+            _segment([_w("раз", 0.0, 0.3), _w("два", 0.35, 0.65), _w("три", 0.7, 1.0)])
+        ]
+        self.assertEqual(merge_readings(primary, secondary).text, "раз два три")
+
+    def test_a_blob_and_the_words_under_it_are_never_both_printed(self):
+        """The symmetric half: when the blob survives, the other
+        reading's words inside it do not also appear."""
+        primary = [{"start": 0.0, "end": 4.0, "text": "целая длинная фраза"}]
+        secondary = [_segment([_w("фраза", 3.5, 3.9)])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.text, "целая длинная фраза")
+
+    def test_two_wordless_finals_of_the_same_ground_are_not_doubled(self):
+        primary = [{"start": 0.0, "end": 2.0, "text": "one two three"}]
+        secondary = [{"start": 0.0, "end": 2.0, "text": "one two free"}]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(len(merged.words), 1)
+
+    def test_a_wordless_final_still_counts_as_covered_ground(self):
+        primary = [{"start": 0.0, "end": 3.0, "text": "это весь мой текст"}]
+        merged = merge_readings(primary, [])
+        self.assertEqual(merged.covered_spans(), [(0.0, 3.0)])
+        self.assertEqual(merged.covered_end_sec(), 3.0)
+
+
+class MergeCostTests(unittest.TestCase):
+    """B-002: the merge runs synchronously between Stop and the text.
+
+    Pairing used to rescan the whole secondary reading from index 0 for
+    every primary word — O(P x S) — which cost a measured 2.8 s on a
+    7-minute dictation and 30.8 s on a 20-minute one, inside the event
+    loop and outside the budget the stop had already announced to the
+    renderer.
+
+    Asserted on CPU time, not wall time: what the defect did was OCCUPY
+    the event loop, and CPU time is the only measure of that which a
+    loaded CI machine cannot distort into a false red.
+    """
+
+    @staticmethod
+    def _reading(count: int, jitter: float) -> list[dict]:
+        words = [
+            _w(f"w{i}", round(i * 0.35 + jitter, 3), round(i * 0.35 + jitter + 0.3, 3))
+            for i in range(count)
+        ]
+        return [_segment(words[i:i + 10]) for i in range(0, count, 10)]
+
+    @staticmethod
+    def _cpu_ms(primary: list[dict], secondary: list[dict]) -> float:
+        started = time.process_time()
+        merge_readings(primary, secondary)
+        return (time.process_time() - started) * 1000.0
+
+    def test_two_long_readings_merge_in_well_under_the_assembly_allowance(self):
+        # 3000 words per reading is a 20-minute dictation — the shape
+        # that measured 30.8 s before the sweep replaced the rescan.
+        cost_ms = min(
+            self._cpu_ms(self._reading(3000, 0.0), self._reading(3000, 0.02))
+            for _ in range(3)
+        )
+        self.assertLess(
+            cost_ms, 100.0,
+            f"merge_readings spent {cost_ms:.0f} ms of CPU on 3000x3000 words",
+        )
+
+    def test_the_cost_grows_with_the_words_and_not_with_their_square(self):
+        """The property, not the number: quadratic growth would be ~16x
+        for 4x the words, linear is ~4x. Anything under 8x is linear
+        with room for measurement noise."""
+        small = min(
+            self._cpu_ms(self._reading(750, 0.0), self._reading(750, 0.02))
+            for _ in range(3)
+        )
+        large = min(
+            self._cpu_ms(self._reading(3000, 0.0), self._reading(3000, 0.02))
+            for _ in range(3)
+        )
+        self.assertLess(
+            large, max(small, 0.5) * 8.0,
+            f"750x750 cost {small:.1f} ms, 3000x3000 cost {large:.1f} ms",
+        )
+
 
 
 if __name__ == "__main__":
