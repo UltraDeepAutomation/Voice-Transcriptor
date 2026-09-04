@@ -12,6 +12,11 @@ const {
   PASTE_PROBE_ACTIVE_TTL_MS,
   PASTE_PROBE_RECHECK_MS,
   PASTE_PROBE_COMMAND,
+  PASTE_PROBE_TIMEOUT_MS,
+  PASTE_PERMISSION_ROUTE,
+  classifyPastePermissionFailure,
+  pasteActivationTimeoutMs,
+  pasteAutoSendTimeoutMs,
   SILENT_FAILURES_BEFORE_BROKEN,
   initialPasteCapability,
   applyProbeResult,
@@ -225,6 +230,45 @@ test("the paste ladder's worst case fits inside the post-stop deadline on every 
   }
 });
 
+test("the table owns EVERY wall-clock bound the ladder spends, activation included", () => {
+  // The comment above pasteBudgetWorstCaseMs claimed a single answer to
+  // "how long can a paste take". Three things were outside it: the
+  // target-activation ladder (three PowerShell spawns per attempt on
+  // Windows, at 5000 ms each), the pre-paste capability probe, and the
+  // spawn allowance the modifier wait adds on top of its own deadline.
+  // On Windows that made the real worst case ~2x the computed one.
+  for (const platform of Object.keys(PASTE_BUDGET)) {
+    const b = pasteBudgetFor(platform);
+    for (const key of ["activationTimeoutMs", "activationLadderSteps", "autoSendTimeoutMs"]) {
+      assert.equal(typeof b[key], "number", `${platform}.${key}`);
+    }
+    assert.ok(b.activationTimeoutMs > 0, platform);
+    assert.equal(pasteActivationTimeoutMs(platform), b.activationTimeoutMs);
+    assert.equal(pasteAutoSendTimeoutMs(platform), b.autoSendTimeoutMs);
+    assert.ok(
+      pasteBudgetWorstCaseMs(platform) >=
+      b.maxAttempts * b.activationLadderSteps * b.activationTimeoutMs,
+      `${platform}: the activation ladder must be counted`,
+    );
+  }
+  // macOS activates once BEFORE the ladder, so its attempts spend none.
+  assert.equal(pasteBudgetFor("darwin").activationLadderSteps, 0);
+});
+
+test("the darwin preflight covers what is really spent before the ladder", () => {
+  // preflightMs claimed to be the modifier wait's deadline, but the wait
+  // is spawned with deadline + spawn allowance, and the capability probe
+  // runs before the ladder too. The old test compared the plan's
+  // deadline against preflightMs (500 <= 500) — the script's bound, not
+  // the spawn's.
+  const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
+  const spent = modifierReleaseCommand(plan).timeoutMs + PASTE_PROBE_TIMEOUT_MS;
+  assert.ok(
+    spent <= pasteBudgetFor("darwin").preflightMs,
+    `preflight really costs ${spent}ms but the table budgets ${pasteBudgetFor("darwin").preflightMs}ms`,
+  );
+});
+
 test("macOS honours the paste contract: at most 5 attempts, one delay each", () => {
   for (const platform of Object.keys(PASTE_BUDGET)) {
     const b = pasteBudgetFor(platform);
@@ -295,9 +339,22 @@ test("only the hotkey path with a modifier chord waits for modifiers", () => {
   assert.equal(planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "auto" }).needed, false);
   // A bare key has no modifiers to inherit.
   assert.equal(planModifierRelease({ platform: "darwin", accelerator: "F10", trigger: "hotkey" }).needed, false);
-  // Windows SendKeys does not inherit physical flags the same way; R5
-  // keeps that path untouched.
-  assert.equal(planModifierRelease({ platform: "win32", accelerator: "Control+Alt+Shift+V", trigger: "hotkey" }).needed, false);
+  // Windows and Linux need the wait too: their paste-last default is
+  // Control+Alt+Shift+V, so SendKeys "^v" fires while three modifiers are
+  // physically down and the target receives Ctrl+Alt+Shift+V. What they
+  // lack is the instrument, not the problem — no NSEvent.modifierFlags to
+  // poll — so they get the fixed floor and macOS gets the floor plus a
+  // poll for the flags to actually clear.
+  const win = planModifierRelease({ platform: "win32", accelerator: "Control+Alt+Shift+V", trigger: "hotkey" });
+  assert.equal(win.needed, true);
+  assert.equal(win.canPoll, false);
+  assert.equal(win.deadlineMs, win.holdMs, "with nothing to poll, the floor IS the wait");
+  const linux = planModifierRelease({ platform: "linux", accelerator: "Control+Alt+Shift+V", trigger: "hotkey" });
+  assert.equal(linux.needed, true);
+  assert.equal(linux.canPoll, false);
+  // A bare key still has nothing to wait for, on any platform.
+  assert.equal(planModifierRelease({ platform: "win32", accelerator: "F10", trigger: "hotkey" }).needed, false);
+  assert.equal(planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" }).canPoll, true);
 });
 
 test("the wait borrows Handy's chord hold and local-speak's deadline", () => {
@@ -308,10 +365,7 @@ test("the wait borrows Handy's chord hold and local-speak's deadline", () => {
   assert.ok(plan.pollIntervalMs > 0);
 });
 
-test("the wait plan's ceiling is inside the darwin preflight budget", () => {
-  const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
-  assert.ok(plan.deadlineMs <= pasteBudgetFor("darwin").preflightMs);
-});
+
 
 test("the modifier script polls in ONE spawn and carries the plan's numbers", () => {
   const plan = planModifierRelease({ platform: "darwin", accelerator: "Alt+Shift+V", trigger: "hotkey" });
@@ -354,4 +408,38 @@ test("held flags decode to the modifier names the log prints", () => {
   const flags = NS_EVENT_MODIFIER_FLAGS.option | NS_EVENT_MODIFIER_FLAGS.shift;
   assert.deepEqual(heldModifiersFromFlags(flags).sort(), ["option", "shift"]);
   assert.deepEqual(heldModifiersFromFlags(0), []);
+});
+
+// ── permission classification ─────────────────────────────────────────
+
+test("one classifier decides which macOS permission a failure is asking for", () => {
+  // This used to be two independent substring ladders over the same
+  // string — one for the status line, one for the prompt trigger. When
+  // the capability preflight started refusing BEFORE the ladder could
+  // produce ERR:no-accessibility, only the status line was taught its
+  // new verdict, and the app's ONLY Accessibility prompt stopped firing:
+  // a first run on a machine that had never granted the permission was
+  // never asked for it.
+  const R = PASTE_PERMISSION_ROUTE;
+  assert.equal(classifyPastePermissionFailure("ERR:no-accessibility"), R.ACCESSIBILITY);
+  assert.equal(
+    classifyPastePermissionFailure(`paste-capability-${PASTE_CAPABILITY.UNTRUSTED}`),
+    R.ACCESSIBILITY,
+    "the preflight's own refusal must reach the prompt",
+  );
+  assert.equal(
+    classifyPastePermissionFailure(`paste-capability-${PASTE_CAPABILITY.BROKEN}`),
+    R.ACCESSIBILITY,
+    "a grant that survived a re-signed install is repaired in the same pane",
+  );
+
+  assert.equal(classifyPastePermissionFailure("Not authorized to send Apple events"), R.AUTOMATION);
+  assert.equal(classifyPastePermissionFailure("System Events got an error: (-1743)"), R.AUTOMATION);
+
+  // States that are NOT a permission problem must not raise a dialog.
+  assert.equal(classifyPastePermissionFailure(`paste-capability-${PASTE_CAPABILITY.ACTIVE}`), R.NONE);
+  assert.equal(classifyPastePermissionFailure("ERR:no-focus"), R.NONE);
+  assert.equal(classifyPastePermissionFailure("timed out"), R.NONE);
+  assert.equal(classifyPastePermissionFailure(""), R.NONE);
+  assert.equal(classifyPastePermissionFailure(null), R.NONE);
 });

@@ -50,6 +50,10 @@ const MAC_VERIFICATION_TO_POLICY_OUTCOME = Object.freeze({
 // by desktop/paste-capability.test.js.
 const {
   PASTE_CAPABILITY,
+  PASTE_PERMISSION_ROUTE,
+  classifyPastePermissionFailure,
+  pasteActivationTimeoutMs,
+  pasteAutoSendTimeoutMs,
   PASTE_PROBE_COMMAND,
   PASTE_POST_STOP_DEADLINE_MS,
   initialPasteCapability,
@@ -2906,14 +2910,18 @@ function shouldUsePasteTarget(front) {
   return true;
 }
 
-function looksLikeAutomationPermissionError(reason) {
-  const r = String(reason || "").toLowerCase();
-  return (
-    r.includes("not authorized") ||
-    r.includes("not permitted") ||
-    r.includes("system events got an error") ||
-    r.includes("-1743")
-  );
+/**
+ * Does this failure name a macOS permission the user has to grant?
+ *
+ * The classification itself lives in ./paste-capability, so the trigger
+ * below and the dialog's route are one decision. They used to be two
+ * ladders over the same string: when the capability preflight began
+ * refusing before the ladder could produce ERR:no-accessibility, the
+ * status line learned its new verdict and this trigger did not, and the
+ * app's only Accessibility prompt stopped firing.
+ */
+function needsMacPastePermissionPrompt(reason) {
+  return classifyPastePermissionFailure(reason) !== PASTE_PERMISSION_ROUTE.NONE;
 }
 
 /**
@@ -2962,13 +2970,13 @@ function recordingStatusBadgeForPasteFailure(r) {
   if (r.includes("secure-field")) return "In Clipboard · Secure Field";
   if (r.includes("no-target") || r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) return "In Clipboard · No Focus";
   if (r.includes("clipboard")) return "Clipboard Error";
-  if (looksLikeAutomationPermissionError(r)) return "In Clipboard · Automation";
+  if (classifyPastePermissionFailure(r) === PASTE_PERMISSION_ROUTE.AUTOMATION) return "In Clipboard · Automation";
   return "In Clipboard";
 }
 
 function recordingStatusForAutoSendFailure(reason) {
   const r = String(reason || "").toLowerCase();
-  if (looksLikeAutomationPermissionError(r)) return "Send Failed · Automation";
+  if (classifyPastePermissionFailure(r) === PASTE_PERMISSION_ROUTE.AUTOMATION) return "Send Failed · Automation";
   if (r.includes("no-target") || r.includes("no-focus") || r.includes("not-editable") || r.includes("ax-failed")) {
     return "Send Failed · No Focus";
   }
@@ -3141,18 +3149,20 @@ async function findLinuxWindowByName(name) {
 async function activateLinuxWindowById(windowId) {
   const normalizedId = normalizeLinuxWindowId(windowId);
   if (!normalizedId || !hasLinuxX11Session()) return false;
-  const wmctrlRes = await runCommand("wmctrl", ["-ia", normalizedId], { timeoutMs: 1500 });
+  const wmctrlRes = await runCommand("wmctrl", ["-ia", normalizedId], {
+    timeoutMs: activationTimeoutMs(),
+  });
   if (wmctrlRes.ok) {
-    await sleep(180);
+    await sleep(X11_ACTIVATION_SETTLE_MS);
     return true;
   }
   const decimalId = linuxWindowIdToDecimal(normalizedId);
   if (!decimalId) return false;
   const xdotoolRes = await runCommand("xdotool", ["windowactivate", "--sync", decimalId], {
-    timeoutMs: 1500
+    timeoutMs: activationTimeoutMs(),
   });
   if (!xdotoolRes.ok) return false;
-  await sleep(180);
+  await sleep(X11_ACTIVATION_SETTLE_MS);
   return true;
 }
 
@@ -3478,6 +3488,27 @@ async function getFrontmostAppInfoWithTimeout(timeoutMs = 1200) {
   }
 }
 
+// How long an activation is given to take effect before the caller acts
+// on it. Distinct per mechanism because they differ by an order of
+// magnitude: a Win32 SetForegroundWindow is asynchronous and the shell
+// needs a moment to repaint, while an X11 activation is acknowledged by
+// the call itself.
+const WIN_ACTIVATION_SETTLE_MS = 350;
+// Auto-send re-raises the target before firing its chord; this is the
+// pause between that activation and the keystroke.
+const AUTO_SEND_ACTIVATION_SETTLE_MS = 110;
+const X11_ACTIVATION_SETTLE_MS = 180;
+
+/** Wall-clock bound for one target-activation child, from PASTE_BUDGET. */
+function activationTimeoutMs() {
+  return pasteActivationTimeoutMs(process.platform);
+}
+
+/** Wall-clock bound for the one auto-send child, from PASTE_BUDGET. */
+function autoSendTimeoutMs() {
+  return pasteAutoSendTimeoutMs(process.platform);
+}
+
 async function activateAppByName(name) {
   const appName = String(name || "").trim();
   if (!appName || isBadActivationTarget(appName)) return false;
@@ -3501,13 +3532,30 @@ async function activateAppByName(name) {
 "@
       $proc = Get-Process -Name '${escapedName}' -ErrorAction SilentlyContinue | Select-Object -First 1
       if ($proc -and $proc.MainWindowHandle) {
-        [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
-        Write-Output "1"
+        # Same rule as activateWindowsWindowByHwnd (BUGS_AUDIT 6.2):
+        # Win32 refuses SetForegroundWindow from a process that does not
+        # own the foreground lock, which a spawned PowerShell child never
+        # does. Piping the result to Out-Null and printing "1" reported
+        # "the process has a main window", not "it came forward".
+        $activated = [Window]::SetForegroundWindow($proc.MainWindowHandle)
+        if ($activated) { Write-Output "1" } else { Write-Output "0" }
       } else { Write-Output "0" }
     `;
-    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], {
+      timeoutMs: activationTimeoutMs(),
+    });
+    // A zero exit code says PowerShell ran, not that a window came
+    // forward. The script prints "1"/"0" precisely so the caller can
+    // tell those apart, and the two sibling activators on this same
+    // ladder — activateAppByPid and activateWindowsWindowByHwnd — both
+    // read it. This one did not, so the last rung always reported
+    // success, `activateCapturedPasteTarget` never returned false, the
+    // "we could not restore the target" branch in processPostStopTask
+    // was unreachable, and SendKeys went to whatever was frontmost —
+    // usually Transcriptor itself.
     if (!res.ok) return false;
-    await sleep(350);
+    if (String(res.stdout || "").trim() !== "1") return false;
+    await sleep(WIN_ACTIVATION_SETTLE_MS);
     return true;
   }
   if (process.platform === "linux") {
@@ -3517,10 +3565,10 @@ async function activateAppByName(name) {
   }
   const escaped = escapeAppleScriptString(appName);
   const res = await runCommand("osascript", ["-e", `tell application "${escaped}" to activate`], {
-    timeoutMs: 5000
+    timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(350);
+  await sleep(WIN_ACTIVATION_SETTLE_MS);
   return true;
 }
 
@@ -3538,11 +3586,18 @@ async function activateAppByPid(pid) {
 "@
       $proc = Get-Process -Id ${Math.trunc(n)} -ErrorAction SilentlyContinue
       if ($proc -and $proc.MainWindowHandle) {
-        [Window]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
-        Write-Output "1"
+        # Same rule as activateWindowsWindowByHwnd (BUGS_AUDIT 6.2):
+        # Win32 refuses SetForegroundWindow from a process that does not
+        # own the foreground lock, which a spawned PowerShell child never
+        # does. Piping the result to Out-Null and printing "1" reported
+        # "the process has a main window", not "it came forward".
+        $activated = [Window]::SetForegroundWindow($proc.MainWindowHandle)
+        if ($activated) { Write-Output "1" } else { Write-Output "0" }
       } else { Write-Output "0" }
     `;
-    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+    const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], {
+      timeoutMs: activationTimeoutMs(),
+    });
     if (!res.ok) return false;
     return String(res.stdout || "").trim() === "1";
   }
@@ -3560,7 +3615,7 @@ async function activateAppByPid(pid) {
       return "0"
     end tell
   `;
-  const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
+  const res = await runCommand("osascript", ["-e", script], { timeoutMs: activationTimeoutMs() });
   if (!res.ok) return false;
   return String(res.stdout || "").trim() === "1";
 }
@@ -3596,9 +3651,11 @@ async function activateWindowsWindowByHwnd(hwnd) {
       Write-Output "0"
     }
   `;
-  const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 5000 });
+  const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], {
+    timeoutMs: activationTimeoutMs(),
+  });
   if (!res.ok) return false;
-  await sleep(180);
+  await sleep(X11_ACTIVATION_SETTLE_MS);
   return String(res.stdout || "").trim() === "1";
 }
 
@@ -3647,7 +3704,7 @@ async function activateMacCapturedWindow(target) {
       return "1"
     end tell
   `;
-  const res = await runCommand("osascript", ["-e", script], { timeoutMs: 5000 });
+  const res = await runCommand("osascript", ["-e", script], { timeoutMs: activationTimeoutMs() });
   if (!res.ok) return false;
   return String(res.stdout || "").trim() === "1";
 }
@@ -3878,22 +3935,28 @@ async function promptMacPastePermissions(reason = "") {
   macPastePermissionPromptAt = now;
   const cleanReason = String(reason || "").trim();
   const normalizedReason = cleanReason.toLowerCase();
-  const accessibilityFailure = normalizedReason.includes("no-accessibility");
-  const automationFailure = looksLikeAutomationPermissionError(normalizedReason);
+  const classified = classifyPastePermissionFailure(normalizedReason);
+  const accessibilityFailure = classified === PASTE_PERMISSION_ROUTE.ACCESSIBILITY;
+  // `{ prompt: true }` is what raises the system TCC dialog, and this is
+  // the only place in the app that passes it. Before the capability
+  // preflight existed, an Accessibility failure always arrived here as
+  // ERR:no-accessibility; the preflight's own verdicts now reach the
+  // same branch, so a first run on a machine that has never granted the
+  // permission is asked for it instead of being told to go and find it.
   const accessibilityTrusted = refreshMacAccessibilityTrustState({ prompt: accessibilityFailure });
   const route = accessibilityFailure || !accessibilityTrusted
-    ? "accessibility"
-    : automationFailure
-      ? "automation"
+    ? PASTE_PERMISSION_ROUTE.ACCESSIBILITY
+    : classified === PASTE_PERMISSION_ROUTE.AUTOMATION
+      ? PASTE_PERMISSION_ROUTE.AUTOMATION
       : "permissions";
-  const message = route === "accessibility"
+  const message = route === PASTE_PERMISSION_ROUTE.ACCESSIBILITY
     ? "Enable Accessibility for Transcriptor"
-    : route === "automation"
+    : route === PASTE_PERMISSION_ROUTE.AUTOMATION
       ? "Enable Automation for Transcriptor"
       : "Enable permissions for auto-paste";
-  const instruction = route === "accessibility"
+  const instruction = route === PASTE_PERMISSION_ROUTE.ACCESSIBILITY
     ? "To auto-paste transcript into other apps, allow Transcriptor in Privacy & Security -> Accessibility."
-    : route === "automation"
+    : route === PASTE_PERMISSION_ROUTE.AUTOMATION
       ? "To auto-paste via System Events, allow Transcriptor to control System Events in Privacy & Security -> Automation."
       : "To auto-paste transcript into any app, allow Transcriptor in Accessibility and Automation (System Events).";
   const detail = cleanReason ? `${instruction}\n\nmacOS response:\n${cleanReason}` : instruction;
@@ -3907,7 +3970,7 @@ async function promptMacPastePermissions(reason = "") {
     detail
   });
   if (res.response === 0) {
-    if (route === "automation") {
+    if (route === PASTE_PERMISSION_ROUTE.AUTOMATION) {
       openPrivacyAutomationSettings();
     } else {
       openPrivacyAccessibilitySettings();
@@ -4265,6 +4328,14 @@ async function awaitModifierRelease(options = {}) {
     trigger: options.trigger || "",
   });
   if (!plan.needed) return null;
+  if (!plan.canPoll) {
+    // Windows/Linux: no NSEvent.modifierFlags to poll, so the plan is
+    // the fixed floor alone. Waiting it out is the whole wait — there is
+    // nothing to spawn and nothing to parse.
+    await sleep(plan.holdMs);
+    appendMainLog(`[paste-modifiers] fixed hold ${plan.holdMs}ms (no modifier-flag poll on ${process.platform})`);
+    return { ok: true, cleared: false, flags: 0, waitedMs: plan.holdMs };
+  }
   const command = modifierReleaseCommand(plan);
   const startedAt = Date.now();
   const res = await runCommand(command.cmd, command.args, { timeoutMs: command.timeoutMs });
@@ -4687,19 +4758,21 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       // Build ordered cascade for the detected session type.
       // Wayland (pure or hybrid): wtype → ydotool → xdotool (for XWayland apps).
       // X11 only: xdotool → ydotool (fallback).
+      // No timeoutMs here: the loop below fills it from PASTE_BUDGET.
+      // The entries used to carry a literal 2000 that was immediately
+      // overwritten — a second source of truth for a number this file
+      // had already promised came from one table.
       const attempts = [];
       if (isWayland) {
         attempts.push({
           method: "wtype",
           cmd: "wtype",
           args: ["-M", "ctrl", "v", "-m", "ctrl"],
-          timeoutMs: 2000,
         });
         attempts.push({
           method: "ydotool",
           cmd: "ydotool",
           args: ["key", "29:1", "47:1", "47:0", "29:0"],
-          timeoutMs: 2000,
         });
         // On XWayland hybrid sessions the target may be an X11 app —
         // xdotool works for those even inside a Wayland compositor.
@@ -4708,7 +4781,6 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
             method: "xdotool",
             cmd: "xdotool",
             args: ["key", "--clearmodifiers", "ctrl+v"],
-            timeoutMs: 2000,
           });
         }
       } else {
@@ -4717,13 +4789,11 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
           method: "xdotool",
           cmd: "xdotool",
           args: ["key", "--clearmodifiers", "ctrl+v"],
-          timeoutMs: 2000,
         });
         attempts.push({
           method: "ydotool",
           cmd: "ydotool",
           args: ["key", "29:1", "47:1", "47:0", "29:0"],
-          timeoutMs: 2000,
         });
       }
 
@@ -5001,7 +5071,7 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
   const normalized = normalizeCapturedPasteTarget(target);
   if (hasCapturedPasteTarget(normalized)) {
     await activateCapturedPasteTarget(normalized);
-    await sleep(110);
+    await sleep(AUTO_SEND_ACTIVATION_SETTLE_MS);
   }
   
   if (process.platform === "win32") {
@@ -5009,7 +5079,9 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.SendKeys]::SendWait("^{ENTER}")
       `;
-      const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], { timeoutMs: 3200 });
+      const res = await runCommand("powershell", ["-NoProfile", "-Command", pwsh], {
+        timeoutMs: autoSendTimeoutMs(),
+      });
       if (res.ok) {
         return { ok: true, reason: "powershell-ctrl-enter-sent" };
       }
@@ -5023,20 +5095,20 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
         method: "wtype-ctrl-enter",
         cmd: "wtype",
         args: ["-M", "ctrl", "-P", "Return", "-p", "Return", "-m", "ctrl"],
-        timeoutMs: 2000,
+        timeoutMs: autoSendTimeoutMs(),
       });
       attempts.push({
         method: "ydotool-ctrl-enter",
         cmd: "ydotool",
         args: ["key", "29:1", "28:1", "28:0", "29:0"],
-        timeoutMs: 2000,
+        timeoutMs: autoSendTimeoutMs(),
       });
       if (hasLinuxX11Session()) {
         attempts.push({
           method: "xdotool-ctrl-enter",
           cmd: "xdotool",
           args: ["key", "--clearmodifiers", "ctrl+Return"],
-          timeoutMs: 2000,
+          timeoutMs: autoSendTimeoutMs(),
         });
       }
     } else {
@@ -5044,13 +5116,13 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
         method: "xdotool-ctrl-enter",
         cmd: "xdotool",
         args: ["key", "--clearmodifiers", "ctrl+Return"],
-        timeoutMs: 2000,
+        timeoutMs: autoSendTimeoutMs(),
       });
       attempts.push({
         method: "ydotool-ctrl-enter",
         cmd: "ydotool",
         args: ["key", "29:1", "28:1", "28:0", "29:0"],
-        timeoutMs: 2000,
+        timeoutMs: autoSendTimeoutMs(),
       });
     }
 
@@ -5065,36 +5137,29 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
     return { ok: false, reason: lastReason };
   }
 
-  const primary = `
-    tell application "System Events"
-      keystroke return using {command down, control down}
-    end tell
-  `;
-  const res1 = await runCommand("osascript", ["-e", primary], { timeoutMs: 5000 });
-  if (res1.ok) {
-    return { ok: true, reason: "cmd-ctrl-return-sent" };
-  }
-  const primaryReason = String(res1.stderr || res1.stdout || "cmd-ctrl-return-failed").trim();
-  // The keycode fallback below can only help when the FIRST attempt
-  // failed for a reason a different keystroke encoding could fix. The
-  // dominant failure mode — Accessibility / Automation not granted —
-  // fails both attempts identically, so retrying just burned a second
-  // 5 s osascript timeout while the post-stop queue (and the status
-  // capsule) sat blocked. Bail out early on a permission failure.
-  if (looksLikeAutomationPermissionError(primaryReason)) {
-    return { ok: false, reason: primaryReason };
-  }
-  const fallback = `
+  // Cmd+Enter is the "send" chord in every target this feature exists
+  // for — Telegram, Slack, Messages, Discord, most web composers — and
+  // is what this function is named after. It used to be reached only as
+  // a fallback behind Cmd+CONTROL+Return, which is not "send" in any of
+  // them: `keystroke` reports success as soon as the event is posted, so
+  // the first attempt practically always "succeeded", the fallback was
+  // unreachable, and the capsule said "Sent" for a message that was
+  // still sitting unsent in the composer.
+  //
+  // There is exactly one attempt, because there is no second thing to
+  // try: neither `keystroke` nor `key code` gives any feedback about
+  // whether the target acted on the event, so a second chord would be a
+  // guess reported as a result. `key code 36` rather than
+  // `keystroke return` for the same reason the paste uses `key code 9` —
+  // it does not depend on the active keyboard layout.
+  const sendChord = `
     tell application "System Events"
       key code 36 using command down
     end tell
   `;
-  const res2 = await runCommand("osascript", ["-e", fallback], { timeoutMs: 5000 });
-  if (res2.ok) {
-    return { ok: true, reason: "cmd-enter-keycode-sent" };
-  }
-  const reason = String(res2.stderr || res2.stdout || primaryReason || "cmd-enter-failed").trim();
-  return { ok: false, reason };
+  const res = await runCommand("osascript", ["-e", sendChord], { timeoutMs: autoSendTimeoutMs() });
+  if (res.ok) return { ok: true, reason: "cmd-enter-keycode-sent" };
+  return { ok: false, reason: String(res.stderr || res.stdout || "cmd-enter-failed").trim() };
 }
 
 // Tracks recordingIds that have already been enqueued or processed
@@ -5660,11 +5725,11 @@ async function processPostStopTask(task) {
       } else {
         await setRecordingStatus(recordingStatusForAutoSendFailure(sent.reason));
       }
-      if (!sent.ok && looksLikeAutomationPermissionError(sent.reason)) {
+      if (!sent.ok && needsMacPastePermissionPrompt(sent.reason)) {
         scheduleMacPastePermissionsPrompt(sent.reason);
       }
     }
-    if (!pasted.ok && (looksLikeAutomationPermissionError(pasted.reason) || String(pasted.reason || "").includes("no-accessibility"))) {
+    if (!pasted.ok && needsMacPastePermissionPrompt(pasted.reason)) {
       scheduleMacPastePermissionsPrompt(pasted.reason);
     }
     if (pasted.ok && task.autoSendEnter) {
@@ -5846,7 +5911,7 @@ async function pasteLatestTranscriptFromShortcut() {
     );
     await setRecordingStatus(pasted.ok ? "Paste Sent" : recordingStatusForPasteFailure(pasted.reason));
     if (!pasted.ok) {
-      if (String(pasted.reason || "").includes("no-accessibility") || looksLikeAutomationPermissionError(pasted.reason)) {
+      if (needsMacPastePermissionPrompt(pasted.reason)) {
         scheduleMacPastePermissionsPrompt(pasted.reason);
       }
       appendMainLog(`[paste-last] failed: ${pasted.reason || "unknown"}`);

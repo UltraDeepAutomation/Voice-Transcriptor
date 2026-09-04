@@ -56,6 +56,13 @@ const PASTE_CAPABILITY = Object.freeze({
   BROKEN: "broken",
 });
 
+/** Which Privacy & Security pane a paste permission failure points at. */
+const PASTE_PERMISSION_ROUTE = Object.freeze({
+  NONE: "",
+  ACCESSIBILITY: "accessibility",
+  AUTOMATION: "automation",
+});
+
 /** An `active` verdict is believed this long before it is re-checked. */
 const PASTE_PROBE_ACTIVE_TTL_MS = 60000;
 /** Any non-`active` verdict is re-checked this often, so a user who
@@ -195,6 +202,46 @@ function classifyPasteFailure(reason) {
     return "silent";
   }
   return "other";
+}
+
+/**
+ * Which macOS permission a paste failure is asking the user to grant —
+ * ONE classifier, for the trigger and the dialog alike.
+ *
+ * These two decisions used to be separate substring ladders over the
+ * same string, and they drifted: when the capability preflight started
+ * refusing BEFORE the ladder could ever produce `ERR:no-accessibility`,
+ * its `paste-capability-untrusted` verdict was taught to the status line
+ * and not to the prompt trigger — so the app's only Accessibility prompt
+ * stopped firing entirely and a first run on a new Mac never asked for
+ * the permission it cannot work without.
+ *
+ * @returns {""|"accessibility"|"automation"}
+ */
+function classifyPastePermissionFailure(reason) {
+  const r = String(reason || "").toLowerCase();
+  if (!r) return PASTE_PERMISSION_ROUTE.NONE;
+  // The script got far enough to answer, and the answer was "no grant".
+  if (r.includes("no-accessibility")) return PASTE_PERMISSION_ROUTE.ACCESSIBILITY;
+  // The preflight refused before the script could run. `untrusted` is no
+  // grant at all; `broken` is a grant that survived a re-signed install
+  // and no longer works — both are repaired in Privacy & Security ->
+  // Accessibility, and both need the TCC prompt raised.
+  if (
+    r.includes(`paste-capability-${PASTE_CAPABILITY.UNTRUSTED}`) ||
+    r.includes(`paste-capability-${PASTE_CAPABILITY.BROKEN}`)
+  ) {
+    return PASTE_PERMISSION_ROUTE.ACCESSIBILITY;
+  }
+  if (
+    r.includes("not authorized") ||
+    r.includes("not permitted") ||
+    r.includes("system events got an error") ||
+    r.includes("-1743")
+  ) {
+    return PASTE_PERMISSION_ROUTE.AUTOMATION;
+  }
+  return PASTE_PERMISSION_ROUTE.NONE;
 }
 
 /** Two silent failures in a row on a trusted system = stale grant. */
@@ -349,7 +396,30 @@ function pasteCapabilityMessage(state) {
 //                        ladder is exhausted (macOS menu-paste).
 //   preflightMs        — worst case spent before the ladder starts:
 //                        waiting for the paste-last hotkey's own
-//                        modifiers to come up (see planModifierRelease).
+//                        modifiers to come up (see planModifierRelease),
+//                        INCLUDING the spawn allowance the wait carries
+//                        (modifierReleaseCommand's own timeout), plus the
+//                        capability probe.
+//   activationTimeoutMs — bound for ONE target-activation child. The
+//                        ladder in activateCapturedPasteTarget may spawn
+//                        up to activationLadderSteps of them per attempt
+//                        (window handle, then pid, then app name).
+//   activationLadderSteps — how many of those one attempt may spend.
+//   autoSendTimeoutMs  — bound for the one auto-send child (Cmd+Enter /
+//                        Ctrl+Enter), which runs after a successful
+//                        paste when the user enabled auto-send.
+//
+// These last three used to be bare 5000 / 2000 literals scattered across
+// main.js while the comment above pasteBudgetWorstCaseMs claimed every
+// wall-clock bound came from this table. On Windows, with an
+// unreachable target, that made the real worst case far larger than the
+// computed one.
+const MODIFIER_HOLD_MS = 150;
+const MODIFIER_WAIT_DEADLINE_MS = 500;
+const MODIFIER_POLL_INTERVAL_MS = 25;
+/** osascript + JXA startup measured at ~240 ms; 600 ms is that with room. */
+const MODIFIER_SPAWN_ALLOWANCE_MS = 600;
+
 const PASTE_MAX_ATTEMPTS = 5;
 
 const PASTE_BUDGET = Object.freeze({
@@ -364,11 +434,26 @@ const PASTE_BUDGET = Object.freeze({
     activationSettleMs: 0,
     preflightSettleMs: 80,
     tailFallbackTimeoutMs: 4500,
-    preflightMs: 500,
+    // The modifier wait's deadline (500) plus the spawn allowance
+    // modifierReleaseCommand adds on top of it (600), plus the
+    // capability probe that runs before the ladder.
+    preflightMs: MODIFIER_WAIT_DEADLINE_MS + MODIFIER_SPAWN_ALLOWANCE_MS + PASTE_PROBE_TIMEOUT_MS,
+    // macOS activates the captured window once BEFORE the ladder, not
+    // per attempt, so the ladder itself spends none of this.
+    activationTimeoutMs: 1500,
+    activationLadderSteps: 0,
+    autoSendTimeoutMs: 5000,
   }),
   win32: Object.freeze({
-    maxAttempts: 3,
-    attemptDelaysMs: Object.freeze([30, 60, 90]),
+    // Two, not three. With the target-activation ladder finally counted
+    // (three PowerShell spawns per attempt, each with an Add-Type
+    // compile), three attempts put the honest worst case at ~65 s — far
+    // past the deadline the user is actually waiting in, and past what
+    // the ladder was ever believed to cost. Two attempts still means up
+    // to four injections, because every attempt runs the VBS paste and
+    // then the PowerShell fallback.
+    maxAttempts: 2,
+    attemptDelaysMs: Object.freeze([30, 60]),
     // cscript (Defender can spend 1-3 s scanning it) then the
     // PowerShell SendKeys fallback, which now runs after every VBS
     // failure rather than only on the last attempt.
@@ -378,6 +463,12 @@ const PASTE_BUDGET = Object.freeze({
     preflightSettleMs: 0,
     tailFallbackTimeoutMs: 0,
     preflightMs: 0,
+    // PowerShell with an Add-Type compile is the slow one here; this is
+    // the value the three Windows activators have always used, now named
+    // and counted.
+    activationTimeoutMs: 2500,
+    activationLadderSteps: 3,
+    autoSendTimeoutMs: 2000,
   }),
   linux: Object.freeze({
     maxAttempts: 3,
@@ -390,6 +481,11 @@ const PASTE_BUDGET = Object.freeze({
     preflightSettleMs: 0,
     tailFallbackTimeoutMs: 0,
     preflightMs: 0,
+    // wmctrl / xdotool / a bare osascript-free activation are all fast;
+    // nothing here compiles C# on the way in.
+    activationTimeoutMs: 1200,
+    activationLadderSteps: 3,
+    autoSendTimeoutMs: 2000,
   }),
 });
 
@@ -437,13 +533,28 @@ function pasteBudgetWorstCaseMs(platform) {
   const b = pasteBudgetFor(platform);
   const delays = b.attemptDelaysMs.slice(0, b.maxAttempts).reduce((a, x) => a + x, 0);
   const perAttemptMethods = b.methodTimeoutsMs.reduce((a, x) => a + x, 0) + b.verificationAllowanceMs;
+  // The activation ladder is spawned INSIDE each attempt on the
+  // platforms that re-activate per attempt, and it is real wall clock
+  // the user waits through. Leaving it out is what made the "one table,
+  // one answer" claim above false.
+  const perAttemptActivation = b.activationLadderSteps * b.activationTimeoutMs;
   return (
     b.preflightMs +
     b.preflightSettleMs +
     delays +
-    b.maxAttempts * (perAttemptMethods + b.activationSettleMs) +
+    b.maxAttempts * (perAttemptMethods + perAttemptActivation + b.activationSettleMs) +
     b.tailFallbackTimeoutMs
   );
+}
+
+/** Bound for ONE target-activation child on this platform. */
+function pasteActivationTimeoutMs(platform) {
+  return pasteBudgetFor(platform).activationTimeoutMs;
+}
+
+/** Bound for the one auto-send (Cmd+Enter / Ctrl+Enter) child. */
+function pasteAutoSendTimeoutMs(platform) {
+  return pasteBudgetFor(platform).autoSendTimeoutMs;
 }
 
 // ── Marking the transcript as transient ────────────────────────────────
@@ -485,11 +596,6 @@ const PASTE_TRANSIENT_TYPE_SUPPORTED = false;
 // give up after 500 ms, and never inject sooner than 150 ms after the
 // hotkey (≥ CHORD_HOLD_MS, so the user's own chord has finished being
 // delivered to whatever else is listening).
-const MODIFIER_HOLD_MS = 150;
-const MODIFIER_WAIT_DEADLINE_MS = 500;
-const MODIFIER_POLL_INTERVAL_MS = 25;
-/** osascript + JXA startup measured at ~240 ms; 600 ms is that with room. */
-const MODIFIER_SPAWN_ALLOWANCE_MS = 600;
 
 /** NSEventModifierFlags bits we care about (AppKit). */
 const NS_EVENT_MODIFIER_FLAGS = Object.freeze({
@@ -512,18 +618,30 @@ const NS_EVENT_MODIFIER_MASK =
 function planModifierRelease({ platform = "", accelerator = "", trigger = "" } = {}) {
   const none = {
     needed: false,
+    canPoll: false,
     holdMs: 0,
     deadlineMs: 0,
     pollIntervalMs: MODIFIER_POLL_INTERVAL_MS,
   };
-  if (platform !== "darwin") return none;
   if (trigger !== "hotkey") return none;
   const accel = String(accelerator || "");
   if (!accel.includes("+")) return none;
+  // Windows and Linux are NOT immune to this. The section above was
+  // written when the paste-last default on those platforms was a bare
+  // F10, which carries no modifiers — but the same wave that added this
+  // wait changed the default to Control+Alt+Shift+V (see
+  // shortcut-defaults.json), so `SendKeys "^v"` now fires while
+  // Ctrl+Alt+Shift are physically down and the target receives
+  // Ctrl+Alt+Shift+V. What they lack is not the problem, it is the
+  // INSTRUMENT: there is no NSEvent.modifierFlags to poll, so they get
+  // the fixed floor — never inject sooner than MODIFIER_HOLD_MS after
+  // the hotkey — while macOS additionally waits for the flags to clear.
+  const canPoll = platform === "darwin";
   return {
     needed: true,
+    canPoll,
     holdMs: MODIFIER_HOLD_MS,
-    deadlineMs: MODIFIER_WAIT_DEADLINE_MS,
+    deadlineMs: canPoll ? MODIFIER_WAIT_DEADLINE_MS : MODIFIER_HOLD_MS,
     pollIntervalMs: MODIFIER_POLL_INTERVAL_MS,
   };
 }
@@ -603,6 +721,10 @@ function heldModifiersFromFlags(flags) {
 }
 
 module.exports = {
+  PASTE_PERMISSION_ROUTE,
+  pasteActivationTimeoutMs,
+  pasteAutoSendTimeoutMs,
+  classifyPastePermissionFailure,
   PASTE_CAPABILITY,
   PASTE_PROBE_ACTIVE_TTL_MS,
   PASTE_PROBE_RECHECK_MS,
