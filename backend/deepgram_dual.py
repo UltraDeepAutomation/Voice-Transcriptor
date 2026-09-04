@@ -52,6 +52,23 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
 from backend.async_tasks import cancel_and_await
+# The shipped defaults, from the one module that owns them —
+# ``backend.config`` builds ``DEFAULT_CONFIG`` from the same two names,
+# so "dual is on, and its partner is ru" cannot mean different things on
+# the two sides of the preference.
+from backend.model_catalog import (
+    DUAL_SECONDARY_LANGUAGE_DEFAULT,
+    DUAL_STREAM_DEFAULT,
+)
+# The merge has to answer the same questions the single-stream splice
+# already answers — "are these two records the same spoken word?", "how
+# much of this word's time does that one occupy?" — and answering them
+# a second way is how two parts of one product come to disagree about
+# what a duplicate is. These are that module's own rules, imported
+# rather than restated; ``word_core``/``word_duration``/``time_overlap``/
+# ``token_stem`` are part of its public API for exactly that reason
+# (they used to be imported through their leading underscore, which
+# said the opposite of what the import was doing).
 from backend.remote_deepgram_live import (
     CROSS_FINAL_NGRAM_MAX_WORDS,
     INTERIM_WORD_GAP_SPLIT_SEC,
@@ -63,36 +80,17 @@ from backend.remote_deepgram_live import (
     intersect_spans,
     resolve_live_language,
     segment_word_records,
+    segment_words,
     subtract_spans,
+    time_overlap,
+    token_stem,
     union_spans,
-)
-# The merge has to answer the same questions the single-stream splice
-# already answers — "are these two records the same spoken word?", "how
-# much of this word's time does that one occupy?" — and answering them
-# a second way is how two parts of one product come to disagree about
-# what a duplicate is. These are that module's own rules, imported
-# rather than restated.
-from backend.remote_deepgram_live import (  # noqa: E402  (deliberate reuse)
-    _time_overlap,
-    _token_stem,
-    _word_core,
-    _word_duration,
+    word_core,
+    word_duration,
 )
 
 logger = logging.getLogger(__name__)
 
-
-# The user pays twice the Deepgram seconds for this, so it is a
-# preference — but it defaults ON because what it buys is the words the
-# user actually said, and the failure it fixes is silent: a dropped
-# clause looks exactly like a clause that was never spoken.
-DUAL_STREAM_DEFAULT = True
-
-# The second reading's language. Russian is what the measurement was
-# made on and what this user dictates; a different primary language
-# would want a different partner, which is why it is configurable rather
-# than hard-coded — and why it is read from ONE place.
-DUAL_SECONDARY_LANGUAGE_DEFAULT = "ru"
 
 # Two words with the same stem, this close in time, are one spoken word
 # whose boundaries the two decoders placed differently.
@@ -208,7 +206,7 @@ def flatten_words(segments: Iterable[dict], source: str) -> list[dict]:
 
     Reads every segment through ``segment_word_records`` — the ONE rule
     for a final that arrived without a word list (B-001). This function
-    used to take ``_segment_words`` alone, so such a final contributed
+    used to take ``segment_words`` alone, so such a final contributed
     nothing at all: since ``merged.text`` is built from words, the whole
     clause disappeared from the transcript of a recording running the
     default Auto mode, with no error and no log line. The single-stream
@@ -375,16 +373,16 @@ def _pair_overlap(a: dict, b: dict) -> Optional[float]:
     b_spanless = bool(b.get(SPANLESS_WORD_FLAG))
     if a_spanless != b_spanless:
         return None
-    overlap = _time_overlap(a, b)
+    overlap = time_overlap(a, b)
     if overlap > 0 and (
-        overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(a)
-        or overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(b)
+        overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(a)
+        or overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(b)
     ):
         return overlap
     if a_spanless:
         return None
-    stem = _token_stem(a["word"])
-    if not stem or stem != _token_stem(b["word"]):
+    stem = token_stem(a["word"])
+    if not stem or stem != token_stem(b["word"]):
         return None
     gap = max(a["start"], b["start"]) - min(a["end"], b["end"])
     return overlap if gap <= ADJACENT_SAME_STEM_MAX_GAP_SEC else None
@@ -477,8 +475,8 @@ def _resolve(primary_word: dict, secondary_word: dict) -> dict:
       Measured side effect: this is what deleted the documented "Локи"
       hallucination from the 83 s recording.
     """
-    core_p = _word_core(primary_word)
-    if core_p and core_p == _word_core(secondary_word):
+    core_p = word_core(primary_word)
+    if core_p and core_p == word_core(secondary_word):
         return dict(primary_word)
     if _has_latin(primary_word["word"]) or _has_latin(secondary_word["word"]):
         winner = (
@@ -514,8 +512,8 @@ def _drop_duplicate_runs(words: list[dict]) -> tuple[list[dict], int]:
         for n in range(min(CROSS_FINAL_NGRAM_MAX_WORDS, i, len(out) - i), 0, -1):
             tail = out[i - n:i]
             head = out[i:i + n]
-            tail_stems = [_token_stem(w["word"]) for w in tail]
-            head_stems = [_token_stem(w["word"]) for w in head]
+            tail_stems = [token_stem(w["word"]) for w in tail]
+            head_stems = [token_stem(w["word"]) for w in head]
             if not all(tail_stems) or tail_stems != head_stems:
                 continue
             if all(_same_audio(t, h) for t, h in zip(tail, head)):

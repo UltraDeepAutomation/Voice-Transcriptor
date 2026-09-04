@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from backend.audio_mime import audio_content_type
 from backend.deepgram_keyterms import keyterm_query_pairs
+from backend.deepgram_language import rest_language_params
 from backend.deepgram_words import deepgram_word_text
 from backend.deepgram_format import shared_format_params
 from backend.http_retry import RemoteError, request_with_retry
@@ -188,10 +189,13 @@ def deepgram_transcribe(
         # List-valued entry: ``requests`` encodes it as one repeated
         # ``keyterm=`` per element rather than a single joined value.
         params["keyterm"] = [term for _, term in kt_pairs]
-    if language and language.lower() not in ("auto", ""):
-        params["language"] = language
-    else:
-        params["detect_language"] = "true"
+    # What "auto" means on THIS endpoint, from the one module that owns
+    # the question for both of them (``backend.deepgram_language``).
+    # The live endpoint answers it differently — it has no
+    # ``detect_language`` — and that difference is a fact about
+    # Deepgram, written down once with its reason instead of being an
+    # unexplained divergence between two files.
+    params.update(rest_language_params(language))
 
     content_type = audio_content_type(filename)
 

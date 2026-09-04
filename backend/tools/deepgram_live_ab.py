@@ -78,8 +78,8 @@ from backend.deepgram_recovery import (  # noqa: E402
 )
 from backend.deepgram_warm import DeepgramWarmPool  # noqa: E402
 from backend.remote_deepgram_live import (  # noqa: E402
-    DeepgramLiveConfig,
     DeepgramLiveError,
+    live_config,
 )
 
 # One code path for opening a live session, in the app and here alike:
@@ -162,7 +162,11 @@ async def _run_one(
     run_index: int,
     dual_language: str = "",
 ) -> RunResult:
-    cfg = DeepgramLiveConfig(model=model, language=language, keyterms=keyterms)
+    # The app's own builder. Constructing a ``DeepgramLiveConfig``
+    # directly here meant this tool measured a socket opened with
+    # slightly different parameters than the app opens — and the warm
+    # pool keys on exactly that query string.
+    cfg = live_config(model=model, language=language, keyterms=keyterms)
     try:
         session = (await _POOL.acquire(api_key, cfg)).session
         if dual_language:

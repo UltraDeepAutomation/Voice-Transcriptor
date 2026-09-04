@@ -71,6 +71,28 @@ LOCAL_LIVE_ASSIST_MODELS: tuple[str, ...] = LOCAL_TRANSCRIPTION_MODELS
 LOCAL_LIVE_PREVIEW_MODELS: tuple[str, ...] = (WHISPER_LOCAL_MODELS[0],)
 DEFAULT_LIVE_PREVIEW_LOCAL_MODEL = LOCAL_LIVE_PREVIEW_MODELS[0]
 
+# ---- Dual-stream reading ---------------------------------------------
+#
+# A dual-stream recording reads the same audio twice, in two languages,
+# and merges the two by word time (``backend.deepgram_dual``). These are
+# the shipped defaults, and they live HERE — beside the other "what does
+# this app default to" values — because three files need them:
+# ``backend.config`` puts them in ``DEFAULT_CONFIG`` and validates
+# against them, ``backend.deepgram_dual`` falls back to them when the
+# preference is absent, and the renderer receives them through the
+# config payload. ``deepgram_dual``'s own comment already claimed the
+# secondary language "is read from ONE place" while being the second of
+# two literals.
+#
+# ON by default: the user pays twice the Deepgram seconds, but what it
+# buys is the words they actually said, and the failure it fixes is
+# silent — a dropped clause looks exactly like a clause never spoken.
+DUAL_STREAM_DEFAULT: bool = True
+# Russian is what the measurement was made on and what this user
+# dictates; a different primary language would want a different partner,
+# which is why it is configurable rather than fixed.
+DUAL_SECONDARY_LANGUAGE_DEFAULT: str = "ru"
+
 REMOTE_TRANSCRIPTION_PROVIDERS: tuple[str, ...] = ("openrouter", "deepgram")
 #: The provider a request that names none is served by. First of the
 #: tuple above, in the same shape ``DEFAULT_LIVE_PREVIEW_LOCAL_MODEL``

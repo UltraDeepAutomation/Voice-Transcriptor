@@ -20,7 +20,7 @@ import logging
 import threading
 from typing import Any, Dict, Optional
 
-from backend.model_catalog import GIGAAM_MODELS, WHISPER_LOCAL_MODELS
+from backend.model_catalog import GIGAAM_MODEL_PREFIX, WHISPER_LOCAL_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ def list_local_models() -> list[dict[str, Any]]:
     engine_ok_gigaam = gigaam_available()
     rows: list[dict[str, Any]] = []
     for model_id in LOCAL_TRANSCRIPTION_MODELS:
-        if model_id.startswith("gigaam-"):
+        if model_id.startswith(GIGAAM_MODEL_PREFIX):
             engine = "gigaam"
             downloaded = engine_ok_gigaam
             note = "" if engine_ok_gigaam else "engine not installed"
@@ -161,7 +161,7 @@ def delete_model(model_id: str) -> Dict[str, Any]:
 
     if model_id not in LOCAL_TRANSCRIPTION_MODELS:
         raise KeyError(model_id)
-    if model_id.startswith("gigaam-"):
+    if model_id.startswith(GIGAAM_MODEL_PREFIX):
         raise ModelDeleteError(
             "GigaAM is an engine, not a downloadable model. Remove it from "
             "Settings → Local models → engine controls."
@@ -298,7 +298,7 @@ def start_download(model_id: str) -> Dict[str, Any]:
     if model_id not in LOCAL_TRANSCRIPTION_MODELS:
         raise KeyError(model_id)
 
-    if model_id.startswith("gigaam-"):
+    if model_id.startswith(GIGAAM_MODEL_PREFIX):
         if gigaam_available():
             return {"status": "done", "progress": 100.0}
         reason = gigaam_import_error() or "package not installed"

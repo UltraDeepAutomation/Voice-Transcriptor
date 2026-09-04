@@ -444,3 +444,36 @@ OK
 **Не сделано:**
 
 * **B-038** (три формы одного wire-типа `final`). Закрыть его — значит поменять форму конверта локального пути и парсер рендерера ОДНИМ коммитом: `frontend/src/main.tsx` читает плоские `complete/coveredSec/totalSec/droppedSec/uncoveredTailSec` и прямо документирует «coverage присутствует только у local-assist». Рендерер в этой сессии ведёт другой агент; менять его отсюда нельзя, а односторонняя правка либо ломает парсер, либо добавляет ЧЕТВЁРТУЮ форму. → долг с готовой рекомендацией.
+
+---
+
+## Коммит 11 — движки, языки и общий словарный API
+
+**Заголовок:** «"auto" means one thing per endpoint and says why, the live config has one builder, and the predicates two modules share stop being private»
+
+**ID:** B-027 (P2), B-033 (P2), B-034 (P2), B-035 (P2), B-036 (P2), B-039 (P2), B-040 (P2), B-041 (P2).
+
+**Файлы:** `backend/deepgram_language.py` (новый), `backend/remote_deepgram.py`, `backend/remote_deepgram_live.py`, `backend/deepgram_dual.py`, `backend/deepgram_recovery.py`, `backend/model_catalog.py`, `backend/config.py`, `backend/models_manager.py`, `backend/transcribe.py`, `backend/transcribe_gigaam.py`, `backend/main.py`, `backend/tools/deepgram_live_ab.py`, тесты: `test_deepgram_language.py` (новый), `test_deepgram_dual.py`, `test_transcribe_gigaam.py`, `test_live.py`.
+
+**Верификация.**
+```
+Ran 742 tests in 54.591s
+OK
+```
+(719 → 742.)
+
+**Решения.**
+
+* **B-039.** *Выбрано:* новый листовой модуль `backend/deepgram_language.py` владеет обоими ответами: `resolve_live_language` (переехал из `remote_deepgram_live`, реэкспортируется оттуда — ни один импортёр не тронут) и новый `rest_language_params`.
+  *Поведение НЕ изменено намеренно:* REST по-прежнему шлёт `detect_language=true`. Измерение 2026-09-03 (память проекта) говорит, что `multi` теряет русские клаузы; REST-проход используется как «полное прочтение», и переводить его на `multi` — регрессия качества, а не унификация. Дефект был в том, что расхождение нигде не объяснено; теперь оно записано один раз, с причиной, и обе стороны читают его из одного места.
+  *Исключение, которое не исключение:* `deepgram_recovery` намеренно шлёт `resolve_live_language` — она чинит дыру в чтении, сделанном стримом, и дыра не должна вернуться на другом языке, чем текст вокруг.
+* **B-041.** `live_config()` переехал к типу конфигурации (`remote_deepgram_live`); `main._live_config` — привязка к нему (тесты зовут по этому имени), A/B-инструмент вызывает его же. Тест проверяет тождество объектов и что инструмент больше не может собрать конфиг сам.
+* **B-033.** Пять имён (`_word_core`, `_word_duration`, `_time_overlap`, `_token_stem`, `_segment_words`) и шестое, найденное по ходу (`_as_float`, импортировался в `deepgram_recovery` отдельной строкой с `# noqa`), переименованы в публичные и внесены в `__all__`. Тест сканирует `backend/*.py` и запрещает импорт любого имени с подчёркиванием из этого модуля.
+* **B-027.** `DUAL_STREAM_DEFAULT` / `DUAL_SECONDARY_LANGUAGE_DEFAULT` переехали в `model_catalog` — листовой модуль, который уже владеет «чем приложение пользуется по умолчанию» и который импортируют обе стороны.
+  *Отвергнуто:* `deepgram_dual` импортирует `config` — тогда импорт модуля слияния создавал бы каталог данных (side effect на импорте) в любом тесте, который его трогает.
+  *Не сделано:* третья копия в `frontend/src/deepgram-dual.ts` — фронтенд ведёт другой агент. В долг.
+* **B-034/B-035.** `LIVE_SAMPLE_RATE_HZ` в четырёх местах GigaAM-адаптера; `GIGAAM_MODEL_PREFIX` в трёх местах `models_manager` вместо литерала, а неиспользуемый импорт `GIGAAM_MODELS` убран. Оба закреплены тестами, которые ищут литерал в исходнике.
+* **B-036.** `_MIN_DECODABLE_WAV_BYTES` + `_undecodable_wav_result(path)`, спрошенный ДО диспетчеризации движка и до загрузки модели. Попутно закрыто названное в находке расхождение: пустой результат файловых входов сообщал жёсткий `0.0`, тогда как `transcribe_audio` считал реальную длительность; теперь считают все.
+* **B-040.** Тест читает `main._FINALIZE_DRAIN_CEILING_SEC`, а не помнит `0.24`.
+
+**Не сделано:** —

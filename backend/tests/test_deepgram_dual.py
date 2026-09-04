@@ -867,5 +867,70 @@ class MergeCostTests(unittest.TestCase):
 
 
 
+class DualDefaultsSsotTests(unittest.TestCase):
+    """One place says "dual is on, and its partner is ru" (B-027).
+
+    The pair was written out in ``config.DEFAULT_CONFIG`` and again in
+    ``deepgram_dual`` — whose own comment claimed the secondary language
+    "is read from ONE place" while being the second of two literals —
+    and a third time in the renderer. The renderer copy is the dangerous
+    one: a wrong "absent" default there is PERSISTED by the next
+    autosave, so a mismatch silently turns the feature off on disk.
+    """
+
+    def test_the_module_reads_the_catalog_defaults(self):
+        import backend.deepgram_dual as dual
+        from backend.model_catalog import (
+            DUAL_SECONDARY_LANGUAGE_DEFAULT,
+            DUAL_STREAM_DEFAULT,
+        )
+
+        self.assertIs(dual.DUAL_STREAM_DEFAULT, DUAL_STREAM_DEFAULT)
+        self.assertIs(
+            dual.DUAL_SECONDARY_LANGUAGE_DEFAULT, DUAL_SECONDARY_LANGUAGE_DEFAULT
+        )
+
+    def test_the_config_default_is_the_same_pair(self):
+        import importlib
+        import os
+        import sys
+        import tempfile
+
+        from backend.model_catalog import (
+            DUAL_SECONDARY_LANGUAGE_DEFAULT,
+            DUAL_STREAM_DEFAULT,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            old = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = td
+            sys.modules.pop("backend.config", None)
+            try:
+                cfg_mod = importlib.import_module("backend.config")
+                dg = cfg_mod.DEFAULT_CONFIG["preferences"]["deepgram"]
+                self.assertEqual(dg["dual_stream"], DUAL_STREAM_DEFAULT)
+                self.assertEqual(
+                    dg["dual_secondary_language"], DUAL_SECONDARY_LANGUAGE_DEFAULT
+                )
+            finally:
+                sys.modules.pop("backend.config", None)
+                if old is None:
+                    os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+                else:
+                    os.environ["TRANSCRIPTOR_DATA_DIR"] = old
+
+    def test_an_absent_preference_falls_back_to_the_shipped_default(self):
+        from backend.model_catalog import (
+            DUAL_SECONDARY_LANGUAGE_DEFAULT,
+            DUAL_STREAM_DEFAULT,
+        )
+
+        self.assertEqual(
+            dual_stream_enabled({}, "auto"), DUAL_STREAM_DEFAULT
+        )
+        self.assertEqual(
+            dual_secondary_language({}), DUAL_SECONDARY_LANGUAGE_DEFAULT
+        )
+
 if __name__ == "__main__":
     unittest.main()

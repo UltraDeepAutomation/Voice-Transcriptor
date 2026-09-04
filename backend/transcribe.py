@@ -17,7 +17,7 @@ import soundfile as sf
 # cold-import (ctranslate2 + tokenizers + huggingface_hub, ~1 s) does NOT
 # block backend startup. /api/health becomes responsive seconds earlier,
 # and any crash-restart loop pays the import only on first transcription.
-from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.audio_constants import LIVE_PCM_BYTES_PER_SEC, LIVE_SAMPLE_RATE_HZ
 from backend.model_catalog import GIGAAM_MODEL_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -100,6 +100,31 @@ def _is_empty_sequence_transcribe_error(exc: Exception) -> bool:
     if "max()" not in msg:
         return False
     return ("empty sequence" in msg) or ("iterable argument is empty" in msg)
+
+
+# A WAV this small holds no decodable audio: a 44-byte RIFF header plus
+# a handful of samples. Named because the number decided the same thing
+# in two places, and moved ABOVE the model load because paying up to a
+# 3 GB model load to be told a 12-byte file is empty is the whole cost
+# of asking in the wrong order.
+_MIN_DECODABLE_WAV_BYTES = 64
+
+
+def _undecodable_wav_result(path: str) -> Optional[Dict[str, Any]]:
+    """An empty result for a WAV too small to decode, else ``None``.
+
+    Reports the file's REAL duration rather than a hard 0.0: the two
+    file entry points returned zero while ``transcribe_audio`` computed
+    it, so the same empty recognition described a different recording
+    depending on which door it came through.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size > _MIN_DECODABLE_WAV_BYTES:
+        return None
+    return _empty_transcribe_result(size / float(LIVE_PCM_BYTES_PER_SEC))
 
 
 def _empty_transcribe_result(duration: float = 0.0) -> Dict[str, Any]:
@@ -563,6 +588,12 @@ def transcribe_file(
     if not os.path.exists(path_wav_16k_mono):
         raise FileNotFoundError(path_wav_16k_mono)
 
+    # Asked BEFORE the engine dispatch and before any model load: a file
+    # too small to hold audio needs neither.
+    empty = _undecodable_wav_result(path_wav_16k_mono)
+    if empty is not None:
+        return empty
+
     # Engine dispatch (same SSOT branch as transcribe_audio): file jobs,
     # sync transcribe and re-transcribe accept every catalog id, so a
     # gigaam id must reach the GigaAM engine instead of WhisperModel.
@@ -574,8 +605,6 @@ def transcribe_file(
         return result
 
     model = _model(model_name)
-    if os.path.getsize(path_wav_16k_mono) <= 64:
-        return _empty_transcribe_result(0.0)
     try:
         segments, info = model.transcribe(
             path_wav_16k_mono,
@@ -608,8 +637,6 @@ def _transcribe_file_gigaam(
     a rate outside the contract is a pipeline bug and must fail loudly
     rather than be silently resampled with lossy math.
     """
-    if os.path.getsize(path_wav_16k_mono) <= 64:
-        return _empty_transcribe_result(0.0)
     audio, sr = sf.read(path_wav_16k_mono, dtype="float32", always_2d=True)
     if sr != LIVE_SAMPLE_RATE_HZ:
         raise ValueError(

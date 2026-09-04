@@ -51,6 +51,8 @@ from backend.audio_mime import AUDIO_EXT_TO_MIME
 from backend.model_catalog import (
     DEFAULT_OPENROUTER_AUDIO_MODEL,
     DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
+    DUAL_SECONDARY_LANGUAGE_DEFAULT,
+    DUAL_STREAM_DEFAULT,
     REMOTE_TRANSCRIPTION_PROVIDERS,
 )
 from backend.storage import atomic_copy_file, atomic_write_bytes, atomic_write_json, rotate_backup
@@ -590,8 +592,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # loss is silent — and applies ONLY when the recording
             # actually resolves to multilingual, so a user who picked a
             # single language is never billed twice for one reading.
-            "dual_stream": True,
-            "dual_secondary_language": "ru",
+            "dual_stream": DUAL_STREAM_DEFAULT,
+            "dual_secondary_language": DUAL_SECONDARY_LANGUAGE_DEFAULT,
         },
     },
 }

@@ -68,19 +68,20 @@ from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 from backend.remote_deepgram import deepgram_transcribe
 from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
+    as_float,
+    confirmed_silence_gap,
     covering_final_word,
     intersect_spans,
     join_segment_texts,
     normalize_words,
-    confirmed_silence_gap,
     resolve_live_language,
     segment_word_records,
+    segment_words,
     splice_words_into_segments,
     subtract_spans,
     tail_needs_recovery,
     union_spans,
 )
-from backend.remote_deepgram_live import _as_float, _segment_words  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +198,7 @@ def covered_spans(segments: Iterable[dict]) -> list[tuple[float, float]]:
     the live session's own coverage and with the dual-stream merge.
     """
     return union_spans(
-        (_as_float(w.get("start")), _as_float(w.get("end")))
+        (as_float(w.get("start")), as_float(w.get("end")))
         for seg in (segments or [])
         for w in segment_word_records(seg)
     )
@@ -248,7 +249,7 @@ def missing_spans(
     # that had stopped answering.
     reported_end = max(
         covered_end,
-        max((_as_float(seg.get("end")) for seg in segments or []), default=0.0),
+        max((as_float(seg.get("end")) for seg in segments or []), default=0.0),
     )
 
     candidates: list[tuple[float, float]] = []
@@ -517,7 +518,7 @@ def splice_recovered_words(
       this pass.
     """
     committed = [
-        w for seg in segments for w in _segment_words(seg)
+        w for seg in segments for w in segment_words(seg)
     ]
     fresh = [
         word for word in words

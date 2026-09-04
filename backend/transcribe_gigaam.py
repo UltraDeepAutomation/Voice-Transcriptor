@@ -34,6 +34,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import soundfile as sf
 
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
 from backend.transcribe import _env_int
 
 logger = logging.getLogger(__name__)
@@ -155,8 +156,12 @@ def _write_wav(audio_16k_mono: np.ndarray) -> Path:
     handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     handle.close()
     path = Path(handle.name)
-    sf.write(str(path), np.asarray(audio_16k_mono, dtype=np.float32), 16000,
-             subtype="PCM_16")
+    sf.write(
+        str(path),
+        np.asarray(audio_16k_mono, dtype=np.float32),
+        LIVE_SAMPLE_RATE_HZ,
+        subtype="PCM_16",
+    )
     return path
 
 
@@ -264,7 +269,7 @@ def transcribe_gigaam(
     if audio_16k_mono.ndim == 2 and audio_16k_mono.shape[1] == 1:
         audio_16k_mono = audio_16k_mono[:, 0]
     audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
-    total_sec = len(audio) / 16000.0
+    total_sec = len(audio) / float(LIVE_SAMPLE_RATE_HZ)
     if total_sec <= 0:
         # Same full result contract as the normal path below: callers
         # read ``text``/``language_probability`` directly (BUG-38 class),
@@ -282,8 +287,8 @@ def transcribe_gigaam(
     chunk_word_lists: list[list[dict]] = []
     chunk_texts: list[str] = []
     for start, end in bounds:
-        lo = int(start * 16000)
-        hi = int(end * 16000)
+        lo = int(start * LIVE_SAMPLE_RATE_HZ)
+        hi = int(end * LIVE_SAMPLE_RATE_HZ)
         chunk_path = _write_wav(audio[lo:hi])
         try:
             result = model.transcribe(str(chunk_path), word_timestamps=True)

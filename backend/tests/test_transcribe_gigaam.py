@@ -428,5 +428,105 @@ class GigaAMFileDispatchTests(unittest.TestCase):
         self.assertGreaterEqual(stats["loaded_ms"], 0)
 
 
+class SampleRateAndThresholdSsotTests(unittest.TestCase):
+    """16000 and 64 are named, once each (B-034, B-036).
+
+    ``audio_constants``'s docstring names duplicated sample rates as the
+    reason that module exists; the GigaAM adapter wrote 16000 out four
+    times while its own caller validated the input against the constant.
+    The "too small to decode" threshold was a bare 64 in two places, and
+    in one of them it was asked AFTER the model load — so a 12-byte WAV
+    paid a multi-second, up-to-3 GB model load to be told it was empty.
+    """
+
+    def test_the_adapter_writes_wavs_at_the_shared_rate(self):
+        import inspect
+
+        import backend.transcribe_gigaam as gigaam
+        from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+
+        self.assertIs(gigaam.LIVE_SAMPLE_RATE_HZ, LIVE_SAMPLE_RATE_HZ)
+        source = inspect.getsource(gigaam)
+        self.assertNotIn("16000", source, "the rate is written out by hand")
+
+    def test_the_undecodable_threshold_is_named_once(self):
+        import inspect
+
+        from backend import transcribe
+
+        self.assertEqual(transcribe._MIN_DECODABLE_WAV_BYTES, 64)
+        source = inspect.getsource(transcribe)
+        self.assertNotIn("<= 64", source)
+
+    def test_a_tiny_wav_is_refused_before_any_model_is_loaded(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from backend import transcribe
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "tiny.wav"
+            path.write_bytes(b"RIFF" + b"\x00" * 8)
+            with mock.patch.object(
+                transcribe, "_model", side_effect=AssertionError("model loaded")
+            ):
+                out = transcribe.transcribe_file(str(path), "small")
+        self.assertEqual(out["text"], "")
+        self.assertEqual(out["segments"], [])
+
+    def test_the_empty_result_reports_the_files_real_duration(self):
+        # Both file entry points hard-coded 0.0 while ``transcribe_audio``
+        # computed it, so the same empty recognition described a
+        # different recording depending on which door it came through.
+        import tempfile
+        from pathlib import Path
+
+        from backend import transcribe
+        from backend.audio_constants import LIVE_PCM_BYTES_PER_SEC
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "tiny.wav"
+            payload = b"\x00" * 64
+            path.write_bytes(payload)
+            out = transcribe.transcribe_file(str(path), "small")
+        self.assertAlmostEqual(
+            out["duration"], len(payload) / float(LIVE_PCM_BYTES_PER_SEC), places=6
+        )
+
+    def test_a_gigaam_id_is_also_refused_before_the_engine_is_reached(self):
+        import tempfile
+        from pathlib import Path
+
+        from backend import transcribe
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "tiny.wav"
+            path.write_bytes(b"RIFF")
+            out = transcribe.transcribe_file(str(path), "gigaam-v3-rnnt")
+        self.assertEqual(out["text"], "")
+
+
+class EnginePrefixSsotTests(unittest.TestCase):
+    """The engine prefix is a constant, not a literal (B-035)."""
+
+    def test_models_manager_reads_the_catalog_prefix(self):
+        import inspect
+
+        import backend.models_manager as mm
+        from backend.model_catalog import GIGAAM_MODEL_PREFIX
+
+        self.assertIs(mm.GIGAAM_MODEL_PREFIX, GIGAAM_MODEL_PREFIX)
+        source = inspect.getsource(mm)
+        self.assertNotIn('startswith("gigaam-")', source)
+
+    def test_it_no_longer_imports_a_name_it_does_not_use(self):
+        import inspect
+
+        import backend.models_manager as mm
+
+        source = inspect.getsource(mm)
+        self.assertNotIn("GIGAAM_MODELS", source)
+
 if __name__ == "__main__":
     unittest.main()

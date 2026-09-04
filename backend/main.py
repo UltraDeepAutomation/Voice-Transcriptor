@@ -117,6 +117,7 @@ from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveError,
     DeepgramLiveSession,
+    live_config,
     resolve_live_language,
 )
 from backend.transcribe import (
@@ -4620,29 +4621,12 @@ _WARM_PROBE_POLL_SEC = 0.1
 _WARM_REPLAY_MAX_BYTES = 8 * LIVE_PCM_BYTES_PER_SEC
 
 
-def _live_config(
-    *,
-    model: str,
-    language: str,
-    diarize: bool,
-    keyterms: tuple[str, ...],
-) -> DeepgramLiveConfig:
-    """Build the live config — the ONE place backend.main constructs one.
-
-    The warm pool keys its socket on ``to_query_string()``, so a second
-    construction site that forgot a field would silently hand a
-    recording a socket opened with different parameters. One builder
-    makes that impossible: the boot pre-warm and the WebSocket handler
-    produce the same string for the same inputs by construction.
-    """
-    return DeepgramLiveConfig(
-        model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
-        language=language or "auto",
-        sample_rate=LIVE_SAMPLE_RATE_HZ,
-        interim_results=True,
-        diarize=bool(diarize),
-        keyterms=tuple(keyterms or ()),
-    )
+# The live-config builder now lives with the config type
+# (``remote_deepgram_live.live_config``) so the A/B tool, which drives
+# the same warm pool, builds the same query string this handler does —
+# the pool keys its socket on that string. Bound to the old private name
+# because this module and its tests refer to it by that name.
+_live_config = live_config
 
 
 def _new_live_session(

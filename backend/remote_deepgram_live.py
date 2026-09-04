@@ -65,6 +65,7 @@ from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
 from backend.deepgram_format import shared_format_params
 from backend.deepgram_keyterms import keyterm_query_pairs
+from backend.deepgram_language import resolve_live_language
 from backend.deepgram_words import deepgram_word_text
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 
@@ -246,7 +247,7 @@ def _has_vowel(core: str) -> bool:
     return any(ch.lower() in _SEAM_VOWELS for ch in core)
 
 
-def _as_float(value: object, default: float = 0.0) -> float:
+def as_float(value: object, default: float = 0.0) -> float:
     """Numeric coercion that never raises.
 
     A malformed upstream message (non-numeric ``start``/``duration``)
@@ -278,15 +279,15 @@ def normalize_words(raw: object) -> list[dict]:
         token = deepgram_word_text(item)
         if not token:
             continue
-        start = _as_float(item.get("start"))
-        end = _as_float(item.get("end"))
+        start = as_float(item.get("start"))
+        end = as_float(item.get("end"))
         if end <= start:
             continue
         out.append({"word": token, "start": round(start, 3), "end": round(end, 3)})
     return out
 
 
-def _word_core(word: dict) -> str:
+def word_core(word: dict) -> str:
     """Case-folded alphabetic core of a word record.
 
     Punctuation and capitalisation are formatting — ``punctuated_word``
@@ -304,20 +305,20 @@ def _word_stem(word: dict) -> str:
     match survives the kind of respelling a re-decode produces
     ("слушаю" next to "слушай", "WAV" next to "WAB") without matching
     unrelated words that merely share a prefix. Full-core equality
-    (``_word_core(a) == _word_core(b)``) is a special case of this, so
+    (``word_core(a) == word_core(b)``) is a special case of this, so
     nothing that used to be caught stops being caught.
     """
-    return _word_core(word)[:_SPLICE_STEM_LETTERS]
+    return word_core(word)[:_SPLICE_STEM_LETTERS]
 
 
-def _time_overlap(a: dict, b: dict) -> float:
-    return min(_as_float(a.get("end")), _as_float(b.get("end"))) - max(
-        _as_float(a.get("start")), _as_float(b.get("start"))
+def time_overlap(a: dict, b: dict) -> float:
+    return min(as_float(a.get("end")), as_float(b.get("end"))) - max(
+        as_float(a.get("start")), as_float(b.get("start"))
     )
 
 
-def _word_duration(word: dict) -> float:
-    return max(_as_float(word.get("end")) - _as_float(word.get("start")), 1e-6)
+def word_duration(word: dict) -> float:
+    return max(as_float(word.get("end")) - as_float(word.get("start")), 1e-6)
 
 
 def _same_spoken_word(a: dict, b: dict) -> bool:
@@ -331,11 +332,11 @@ def _same_spoken_word(a: dict, b: dict) -> bool:
     orphan dedupe and is now the single definition used everywhere
     (audit §3.1/§3.2).
     """
-    core = _word_core(a)
-    if not core or core != _word_core(b):
+    core = word_core(a)
+    if not core or core != word_core(b):
         return False
-    shortest = min(_word_duration(a), _word_duration(b))
-    return _time_overlap(a, b) > 0.5 * shortest
+    shortest = min(word_duration(a), word_duration(b))
+    return time_overlap(a, b) > 0.5 * shortest
 
 
 def word_accounted_for(word: dict, others: Iterable[dict]) -> bool:
@@ -403,16 +404,16 @@ def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dic
     0.6 s word still does not amount to having transcribed it either
     way, so the fraction is checked both ways rather than dropped.
     """
-    duration = _word_duration(word)
+    duration = word_duration(word)
     for other in final_words:
         if _same_spoken_word(word, other):
             return other
-        overlap = _time_overlap(word, other)
+        overlap = time_overlap(word, other)
         if overlap <= 0:
             continue
         if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * duration:
             return other
-        if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(other):
+        if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(other):
             return other
     return None
 
@@ -426,7 +427,7 @@ def final_words_cover(word: dict, final_words: Iterable[dict]) -> bool:
     return covering_final_word(word, final_words) is not None
 
 
-def _segment_words(segment: dict) -> list[dict]:
+def segment_words(segment: dict) -> list[dict]:
     words = segment.get("words")
     if not isinstance(words, list):
         return []
@@ -464,14 +465,14 @@ def segment_word_records(segment: dict) -> list[dict]:
     see it. Consumers that only ask "what ground is accounted for" do
     not need to care, and do not.
     """
-    words = _segment_words(segment)
+    words = segment_words(segment)
     if words:
         return words
     text = str(segment.get("text") or "").strip()
     if not text:
         return []
-    start = _as_float(segment.get("start"))
-    end = max(start, _as_float(segment.get("end")))
+    start = as_float(segment.get("start"))
+    end = max(start, as_float(segment.get("end")))
     return [
         {
             "word": text,
@@ -504,21 +505,21 @@ def _provider_split_token(prev: dict, nxt: dict) -> Optional[bool]:
     the heuristic that did not read "в" as a word glued it to the next
     one.
     """
-    p_words = _segment_words(prev)
-    n_words = _segment_words(nxt)
+    p_words = segment_words(prev)
+    n_words = segment_words(nxt)
     if not p_words or not n_words:
         return None
     last = p_words[-1]
     first = n_words[0]
-    gap = _as_float(first.get("start")) - _as_float(last.get("end"))
+    gap = as_float(first.get("start")) - as_float(last.get("end"))
     if abs(gap) > SEAM_MERGE_MAX_GAP_SEC:
         return False
     p_tokens = str(prev.get("text") or "").split()
     n_tokens = str(nxt.get("text") or "").split()
     if not p_tokens or not n_tokens:
         return False
-    prev_whole = _token_alpha_core(p_tokens[-1]).casefold() == _word_core(last)
-    next_whole = _token_alpha_core(n_tokens[0]).casefold() == _word_core(first)
+    prev_whole = _token_alpha_core(p_tokens[-1]).casefold() == word_core(last)
+    next_whole = _token_alpha_core(n_tokens[0]).casefold() == word_core(first)
     return not (prev_whole and next_whole)
 
 
@@ -597,8 +598,8 @@ def merge_seam_fragments(
         # mutated for the same reason: ``dict(segment)`` is shallow, so
         # the list object is still the caller's.
         prev["text"] = " ".join(p_tokens[:-1] + [p_tokens[-1] + n_tokens[0]])
-        p_words = _segment_words(prev)
-        n_words = _segment_words(nxt)
+        p_words = segment_words(prev)
+        n_words = segment_words(nxt)
         if p_words and n_words:
             fused = {
                 "word": str(p_words[-1].get("word") or "")
@@ -612,7 +613,7 @@ def merge_seam_fragments(
         if nxt_rest:
             merged_nxt = dict(nxt)
             merged_nxt["text"] = nxt_rest
-            if _segment_words(nxt):
+            if segment_words(nxt):
                 merged_nxt["words"] = n_words
             out.append(merged_nxt)
         # else: next contributed only the fragment tail — fully absorbed.
@@ -630,7 +631,7 @@ CROSS_FINAL_NGRAM_MAX_WORDS = 5
 CROSS_FINAL_NGRAM_MAX_GAP_SEC = 1.0
 
 
-def _token_stem(token: str) -> str:
+def token_stem(token: str) -> str:
     """Same rule as ``_word_stem``, for a raw text token with no word
     record (a segment that arrived with ``text`` but no ``words``)."""
     return _token_alpha_core(token).casefold()[:_SPLICE_STEM_LETTERS]
@@ -656,7 +657,7 @@ def drop_repeated_seam_ngrams(segments: list[dict]) -> list[dict]:
     For each consecutive pair, the LARGEST ``i`` from 1 to
     ``CROSS_FINAL_NGRAM_MAX_WORDS`` is found such that the last ``i``
     words of ``prev`` and the first ``i`` words of ``next`` match by
-    STEM (``_word_stem``/``_token_stem`` — the same rule the splice
+    STEM (``_word_stem``/``token_stem`` — the same rule the splice
     guard uses, so a re-spelling like "слушаю"/"слушай" is caught, not
     only an exact repeat). That leading run is then dropped from
     ``next``.
@@ -684,33 +685,33 @@ def drop_repeated_seam_ngrams(segments: list[dict]) -> list[dict]:
         nxt = dict(raw_nxt)
         p_tokens = str(prev.get("text") or "").split()
         n_tokens = str(nxt.get("text") or "").split()
-        p_words = _segment_words(prev)
-        n_words = _segment_words(nxt)
+        p_words = segment_words(prev)
+        n_words = segment_words(nxt)
         drop = 0
         if p_tokens and n_tokens:
             max_n = min(CROSS_FINAL_NGRAM_MAX_WORDS, len(p_tokens), len(n_tokens))
             if p_words and n_words:
                 for i in range(max_n, 0, -1):
-                    tail = [_token_stem(t) for t in p_tokens[-i:]]
-                    head = [_token_stem(t) for t in n_tokens[:i]]
+                    tail = [token_stem(t) for t in p_tokens[-i:]]
+                    head = [token_stem(t) for t in n_tokens[:i]]
                     if not (all(tail) and tail == head):
                         continue
                     same_moment = all(
-                        _time_overlap(pw, nw)
-                        >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(pw)
-                        or _time_overlap(pw, nw)
-                        >= SPLICE_COVERAGE_OVERLAP_FRACTION * _word_duration(nw)
+                        time_overlap(pw, nw)
+                        >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(pw)
+                        or time_overlap(pw, nw)
+                        >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(nw)
                         for pw, nw in zip(p_words[-i:], n_words[:i])
                     )
                     if same_moment:
                         drop = i
                         break
             else:
-                gap = _as_float(nxt.get("start")) - _as_float(prev.get("end"))
+                gap = as_float(nxt.get("start")) - as_float(prev.get("end"))
                 if gap <= CROSS_FINAL_NGRAM_MAX_GAP_SEC:
                     for i in range(max_n, 0, -1):
-                        tail = [_token_stem(t) for t in p_tokens[-i:]]
-                        head = [_token_stem(t) for t in n_tokens[:i]]
+                        tail = [token_stem(t) for t in p_tokens[-i:]]
+                        head = [token_stem(t) for t in n_tokens[:i]]
                         if all(tail) and tail == head:
                             drop = i
                             break
@@ -761,11 +762,11 @@ def host_segment_for(word: dict, segments: "Iterable[dict]") -> Optional[dict]:
     one, its span is the only thing knowable about what it contains, and
     inserting into a text we cannot position against would guess.
     """
-    center = (_as_float(word.get("start")) + _as_float(word.get("end"))) / 2.0
+    center = (as_float(word.get("start")) + as_float(word.get("end"))) / 2.0
     for seg in segments:
-        if not _segment_words(seg):
+        if not segment_words(seg):
             continue
-        if _as_float(seg.get("start")) < center < _as_float(seg.get("end")):
+        if as_float(seg.get("start")) < center < as_float(seg.get("end")):
             return seg
     return None
 
@@ -782,16 +783,16 @@ def nearest_segment_word(
     """
     best: Optional[dict] = None
     for seg in segments:
-        for w in _segment_words(seg):
+        for w in segment_words(seg):
             if before:
-                if _as_float(w.get("end")) <= time and (
-                    best is None or _as_float(w.get("end")) > _as_float(best.get("end"))
+                if as_float(w.get("end")) <= time and (
+                    best is None or as_float(w.get("end")) > as_float(best.get("end"))
                 ):
                     best = w
             else:
-                if _as_float(w.get("start")) >= time and (
+                if as_float(w.get("start")) >= time and (
                     best is None
-                    or _as_float(w.get("start")) < _as_float(best.get("start"))
+                    or as_float(w.get("start")) < as_float(best.get("start"))
                 ):
                     best = w
     return best
@@ -811,11 +812,11 @@ def fits_beside(
     if stem and stem == _word_stem(neighbour):
         return False
     gap = (
-        _as_float(word.get("start")) - _as_float(neighbour.get("end"))
+        as_float(word.get("start")) - as_float(neighbour.get("end"))
         if neighbour_before
-        else _as_float(neighbour.get("start")) - _as_float(word.get("end"))
+        else as_float(neighbour.get("start")) - as_float(word.get("end"))
     )
-    return gap >= _word_duration(word) - SPLICE_GAP_SLACK_SEC
+    return gap >= word_duration(word) - SPLICE_GAP_SLACK_SEC
 
 
 def insert_word_into_segment(segment: dict, word: dict) -> bool:
@@ -848,9 +849,9 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
     ``source`` travels with the word when it carries one, so a merged or
     recovered word stays attributable in the envelope's word list.
     """
-    seg_words = _segment_words(segment)
+    seg_words = segment_words(segment)
     index = sum(
-        1 for w in seg_words if _as_float(w.get("start")) <= _as_float(word.get("start"))
+        1 for w in seg_words if as_float(w.get("start")) <= as_float(word.get("start"))
     )
     stem = _word_stem(word)
     neighbours = seg_words[max(0, index - 1):index + 1]
@@ -859,12 +860,12 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
     prev_word = seg_words[index - 1] if index > 0 else None
     next_word = seg_words[index] if index < len(seg_words) else None
     before_bound = (
-        _as_float(prev_word.get("end")) if prev_word else _as_float(segment.get("start"))
+        as_float(prev_word.get("end")) if prev_word else as_float(segment.get("start"))
     )
     after_bound = (
-        _as_float(next_word.get("start")) if next_word else _as_float(segment.get("end"))
+        as_float(next_word.get("start")) if next_word else as_float(segment.get("end"))
     )
-    if after_bound - before_bound < _word_duration(word) - SPLICE_GAP_SLACK_SEC:
+    if after_bound - before_bound < word_duration(word) - SPLICE_GAP_SLACK_SEC:
         return False
     tokens = str(segment.get("text") or "").split()
     tokens.insert(min(index, len(tokens)), str(word.get("word") or ""))
@@ -929,7 +930,7 @@ def splice_words_into_segments(
     """
     out = list(segments)
     ordered = sorted(
-        words, key=lambda w: (_as_float(w.get("start")), _as_float(w.get("end")))
+        words, key=lambda w: (as_float(w.get("start")), as_float(w.get("end")))
     )
     if not ordered:
         return SpliceOutcome(segments=out)
@@ -949,7 +950,7 @@ def splice_words_into_segments(
     groups: list[list[dict]] = [[outside[0]]]
     for prev, cur in zip(outside, outside[1:]):
         if (
-            _as_float(cur.get("start")) - _as_float(prev.get("end"))
+            as_float(cur.get("start")) - as_float(prev.get("end"))
             > INTERIM_WORD_GAP_SPLIT_SEC
         ):
             groups.append([cur])
@@ -961,13 +962,13 @@ def splice_words_into_segments(
         group = list(group)
         while group:
             prev_word = nearest_segment_word(
-                out, _as_float(group[0].get("start")), before=True
+                out, as_float(group[0].get("start")), before=True
             )
             if not fits_beside(group[0], prev_word, neighbour_before=True):
                 group.pop(0)
                 continue
             next_word = nearest_segment_word(
-                out, _as_float(group[-1].get("end")), before=False
+                out, as_float(group[-1].get("end")), before=False
             )
             if not fits_beside(group[-1], next_word, neighbour_before=False):
                 group.pop()
@@ -980,8 +981,8 @@ def splice_words_into_segments(
 
     fallback_segments = [
         {
-            "start": round(_as_float(group[0].get("start")), 3),
-            "end": round(max(_as_float(w.get("end")) for w in group), 3),
+            "start": round(as_float(group[0].get("start")), 3),
+            "end": round(max(as_float(w.get("end")) for w in group), 3),
             "text": " ".join(str(w.get("word") or "") for w in group),
             "confidence": 0.0,
             "is_final": True,
@@ -999,7 +1000,7 @@ def splice_words_into_segments(
     ]
     out = sorted(
         [*out, *fallback_segments],
-        key=lambda s: (_as_float(s.get("start")), _as_float(s.get("end"))),
+        key=lambda s: (as_float(s.get("start")), as_float(s.get("end"))),
     )
     return SpliceOutcome(
         segments=out,
@@ -1328,21 +1329,31 @@ def tail_needs_recovery(
     return tail_gap > max(0.0, utterance_end_sec)
 
 
-def resolve_live_language(language: str) -> str:
-    """The Deepgram ``language`` value a configured language maps to.
+def live_config(
+    *,
+    model: str = "",
+    language: str = "",
+    diarize: bool = False,
+    keyterms: "Iterable[str]" = (),
+) -> "DeepgramLiveConfig":
+    """Build a live config — the ONE builder, for every caller.
 
-    "auto" is a UI word, not a Deepgram one: Nova-3's live endpoint has
-    no ``detect_language``, it has ``language=multi``. Blank and "auto"
-    therefore both resolve to "multi", and anything else is passed
-    through lowercased.
-
-    Extracted because a SECOND question now depends on the same
-    mapping — ``backend.deepgram_dual`` runs a second reading only when
-    the recording is actually multilingual — and two places deciding
-    what "auto" means is exactly how they would come to disagree.
+    ``DeepgramWarmPool`` keys its socket on ``to_query_string()``, so a
+    second construction site that forgets a field silently hands a
+    recording a socket opened with different parameters. It used to live
+    in ``backend.main`` with a docstring saying "the ONE place
+    backend.main constructs one" — and ``tools/deepgram_live_ab.py``,
+    whose whole purpose is to measure what the app does, built its own
+    through the same pool.
     """
-    lang = (language or "").strip().lower()
-    return "multi" if lang in ("", "auto", "multi") else lang
+    return DeepgramLiveConfig(
+        model=model or DEFAULT_DEEPGRAM_AUDIO_MODEL,
+        language=language or "auto",
+        sample_rate=LIVE_SAMPLE_RATE_HZ,
+        interim_results=True,
+        diarize=bool(diarize),
+        keyterms=tuple(keyterms or ()),
+    )
 
 
 def _bool(value: bool) -> str:
@@ -2414,7 +2425,7 @@ class DeepgramLiveSession:
         it is about to discard, not merely know that one exists.
         """
         for seg in self._finalized_segments:
-            seg_words = _segment_words(seg)
+            seg_words = segment_words(seg)
             if not seg_words:
                 continue
             owner = covering_final_word(word, seg_words)
@@ -2430,7 +2441,7 @@ class DeepgramLiveSession:
         which neither of them covers on its own. There is no covering
         WORD to name in this case, only a span.
         """
-        center = (_as_float(word.get("start")) + _as_float(word.get("end"))) / 2.0
+        center = (as_float(word.get("start")) + as_float(word.get("end"))) / 2.0
         return any(
             c_start < center < c_end for c_start, c_end in self._spanless_coverage()
         )
@@ -2457,11 +2468,11 @@ class DeepgramLiveSession:
         to notice. Copies are stored so a later splice into the host
         segment cannot rewrite the record.
         """
-        core = _word_core(word)
+        core = word_core(word)
         # An owner found by identity shares the core by construction
         # (``_same_spoken_word``), so this keeps exactly the
         # overlap-clause cases — the ones where a word went missing.
-        if not core or core == _word_core(owner):
+        if not core or core == word_core(owner):
             return
         self._overruled_total += 1
         self._overruled_words.append((dict(word), dict(owner)))
@@ -2646,13 +2657,13 @@ class DeepgramLiveSession:
             for word, owner in overruled[:_HOLE_REPORT_MAX_OVERRULED]:
                 lines.append(
                     "    overruled interim "
-                    f"[{_as_float(word.get('start')):.2f}-"
-                    f"{_as_float(word.get('end')):.2f}] "
+                    f"[{as_float(word.get('start')):.2f}-"
+                    f"{as_float(word.get('end')):.2f}] "
                     f"{str(word.get('word') or '')!r} → final "
-                    f"[{_as_float(owner.get('start')):.2f}-"
-                    f"{_as_float(owner.get('end')):.2f}] "
+                    f"[{as_float(owner.get('start')):.2f}-"
+                    f"{as_float(owner.get('end')):.2f}] "
                     f"{str(owner.get('word') or '')!r} "
-                    f"(overlap {max(0.0, _time_overlap(word, owner)):.2f}s)"
+                    f"(overlap {max(0.0, time_overlap(word, owner)):.2f}s)"
                 )
             not_shown = self._overruled_total - min(
                 len(overruled), _HOLE_REPORT_MAX_OVERRULED
@@ -2899,7 +2910,7 @@ class DeepgramLiveSession:
 
     def _final_coverage(self) -> list[tuple[float, float]]:
         return self._union(
-            (_as_float(s.get("start")), _as_float(s.get("end")))
+            (as_float(s.get("start")), as_float(s.get("end")))
             for s in self._finalized_segments
         )
 
@@ -2913,7 +2924,7 @@ class DeepgramLiveSession:
         as speech still carries real words).
         """
         return self._union(
-            (_as_float(w.get("start")), _as_float(w.get("end")))
+            (as_float(w.get("start")), as_float(w.get("end")))
             for w in (*self._interim_words, *self._orphan_interim_words)
             if not self._word_covered_by_finals(w)
         )
@@ -3538,8 +3549,8 @@ class DeepgramLiveSession:
         Dropping this message is B-005, the root cause the three
         empirically-sized wait windows were built to work around.
         """
-        start = _as_float(msg.get("start")) + self._audio_offset_sec
-        end = start + _as_float(msg.get("duration"))
+        start = as_float(msg.get("start")) + self._audio_offset_sec
+        end = start + as_float(msg.get("duration"))
         self.stats.empty_finals += 1
         if end > self._empty_final_end:
             self._empty_final_end = end
@@ -3604,18 +3615,18 @@ class DeepgramLiveSession:
                 self._note_empty_final(msg)
             return None
 
-        # Defensive numeric coercion (module-level ``_as_float``): a
+        # Defensive numeric coercion (module-level ``as_float``): a
         # malformed upstream message (non-numeric
         # ``start``/``duration``/``confidence``) must NEVER crash the
         # recv loop, because that would terminate the whole recording
         # session over a single stray frame. Invalid numerics degrade to
         # 0.0 and the segment still renders.
-        start = _as_float(msg.get("start")) + self._audio_offset_sec
-        duration = _as_float(msg.get("duration"))
+        start = as_float(msg.get("start")) + self._audio_offset_sec
+        duration = as_float(msg.get("duration"))
         end = start + duration
         is_final = bool(msg.get("is_final"))
         speech_final = bool(msg.get("speech_final"))
-        confidence = _as_float(alt.get("confidence"))
+        confidence = as_float(alt.get("confidence"))
 
         # When diarization is enabled, Deepgram populates ``words`` with a
         # per-word ``speaker`` index (0, 1, 2, ...). We expose the
@@ -3844,18 +3855,26 @@ __all__ = [
     # definitions the rest of the module — and its tests — reason about:
     # what a word record is, when two of them are the same spoken word,
     # and when a final already accounts for one.
+    "as_float",
     "covering_final_word",
     "drop_repeated_seam_ngrams",
     "final_words_cover",
     "merge_seam_fragments",
     "normalize_words",
     "segment_word_records",
+    "segment_words",
+    "time_overlap",
+    "token_stem",
     "word_accounted_for",
+    "word_core",
+    "word_duration",
     "SPANLESS_WORD_FLAG",
     # Shared with ``backend.deepgram_dual``, which merges two readings
     # of one recording: what "auto" means as a Deepgram language, and
     # the span arithmetic behind "is this still a hole?".
+    "INTERIM_FALLBACK_SOURCE",
     "intersect_spans",
+    "live_config",
     "resolve_live_language",
     "subtract_spans",
     "union_spans",

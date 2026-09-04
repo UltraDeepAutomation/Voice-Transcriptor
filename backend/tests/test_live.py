@@ -650,7 +650,13 @@ class DeepgramLiveFinalizeDrainTests(IsolatedBackendMainImportMixin, unittest.Is
             await asyncio.wait_for(task, timeout=1.0)
             elapsed = time.perf_counter() - started
 
-        self.assertGreaterEqual(elapsed, 0.24)
+        # Read from the constant, not remembered as a literal: 0.24 was
+        # ``_FINALIZE_DRAIN_CEILING_SEC`` minus a hair, so lowering the
+        # ceiling would have failed this test for no reason and raising
+        # it would have made the test assert nothing (B-040).
+        self.assertGreaterEqual(
+            elapsed, self.main._FINALIZE_DRAIN_CEILING_SEC - 0.01
+        )
 
 
 if __name__ == "__main__":
