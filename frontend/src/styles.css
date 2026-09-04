@@ -22,17 +22,12 @@ body {
   --bg-3: #252525;
   --bg-4: #1f1f1f;
   --bg-5: #232323;
-  --bg-6: #272727;
-  --bg-7: #282828;
   --bg-8: #292929;
   --bg-9: #2e2e2e;
-  --bg-10: #323232;
-  --bg-11: #353535;
   --line: #363636;
   --line-2: #4a4a4a;
   --line-3: #6f6f6f;
   --line-4: #757575;
-  --line-5: #7d7d7d;
   --text: #f1f1f1;
   --text-2: #c4c4c4;
   --text-3: #9a9a9a;
@@ -42,8 +37,6 @@ body {
   --surface-2: var(--bg-3);
   --surface-3: var(--bg-9);
   --status-error: var(--danger-text);
-  --text-mute-strong: #e0e0e0;
-  --icon-stroke: #d8d8d8;
   --status-neutral: #a1a1a1;
   --status-rec: #dcdcdc;
   --status-done: #cccccc;
@@ -55,7 +48,6 @@ body {
   --overlay-backdrop: rgba(0, 0, 0, 0.55);
   --glass-bg: rgba(34, 34, 34, 0.72);
   --glass-bg-strong: rgba(30, 30, 30, 0.86);
-  --glass-bg-opaque: var(--bg-3);
   --glass-control-bg: rgba(44, 44, 44, 0.72);
   --glass-control-bg-subtle: rgba(255, 255, 255, 0.018);
   --glass-control-bg-hover: rgba(54, 54, 54, 0.82);
@@ -75,8 +67,6 @@ body {
   --shadow-popover: var(--glass-shadow-popover);
   --accent-soft-bg: rgba(64, 96, 146, 0.16);
   --accent-soft-border: rgba(108, 144, 198, 0.3);
-  --accent-strong-bg: rgba(64, 96, 146, 0.18);
-  --accent-strong-border: rgba(108, 144, 198, 0.34);
   --success-soft-bg: rgba(94, 150, 112, 0.16);
   --success-soft-border: rgba(126, 192, 145, 0.3);
   --warning-soft-bg: rgba(154, 133, 85, 0.16);
@@ -102,10 +92,18 @@ body {
      Neutral, not accent blue: the ring belongs to the same surface
      family as the plate it sits on, which is what keeps a focused
      control looking like the same component it was a moment ago. The
-     forced-colors blocks below still map both tokens to `Highlight`,
-     so high-contrast users keep a system-strength indicator. */
-  --focus-ring: rgba(255, 255, 255, 0.34);
+     forced-colors blocks below map it to `Highlight`, so high-contrast
+     users keep a system-strength indicator. (There used to be a second,
+     stronger `--focus-ring` beside it, mapped in both of those blocks
+     and read by no rule at all — the promise of "both tokens" described
+     a token nothing painted.) */
   --focus-ring-soft: rgba(255, 255, 255, 0.14);
+  /* Length of the status pill, in characters. The same number the
+     renderer abbreviates to (STATUS_PILL_MAX_CHARS in main.tsx, which
+     also decides WHICH part of a long message survives); the two are
+     pinned together by tests/styles-tokens.test.ts because neither
+     layer can import the other. */
+  --status-pill-max-chars: 42;
   --focus-ring-width: 2px;
   --focus-border: var(--glass-border-strong);
   --state-info-text: #cddfff;
@@ -131,32 +129,19 @@ body {
   --role-upscale-ring: rgba(156, 108, 204, 0.22);
   --action-success-bg: rgba(98, 199, 123, 0.14);
   --action-success-border: rgba(98, 199, 123, 0.65);
-  --send-active-bg: rgba(68, 118, 82, 0.5);
-  --send-active-border: rgba(112, 190, 132, 0.7);
   --shortcut-capture-ring: rgba(108, 144, 198, 0.2);
   --shortcut-capture-ring-strong: rgba(108, 144, 198, 0.35);
   --recording-chip-provider-text: #d6e3ff;
   --boot-spinner-start: var(--role-upscale-track);
   --boot-spinner-end: var(--role-upscale-border);
   --boot-spinner-error-start: #c56060;
-  --panel-soft: #222222;
-  --interactive-hover: #2f2f2f;
   --recording-active-bg: #2c2c2c;
   --progress-track: #383838;
   --progress-fill-color: #bcbcbc;
-  --drag-active-border: #858585;
-  --record-stop-dot: #d36d6d;
-  --record-stop-hover-border: #878787;
   --record-stop-hover-bg: #2f2f2f;
-  --record-stop-active-border: #ad5151;
-  --record-stop-active-top: #582b2b;
-  --record-stop-active-bottom: #432020;
-  --record-stop-icon: #f4f4f4;
   --toggle-track-on: #1f7a49;
   --toggle-track-on-border: #32ae69;
   --notice-error-bg: rgba(122, 54, 54, 0.2);
-  --summary-top-bg: rgba(31, 31, 31, 0.96);
-  --summary-bottom-bg: rgba(26, 26, 26, 0.96);
   --toggle-track: #2e2e2e;
   --toggle-track-border: #6b6b6b;
   --toggle-thumb: #f0f0f0;
@@ -165,9 +150,6 @@ body {
   --control-check-accent: #b0b0b0;
   --scrollbar-thumb: #3d3d3d;
   --scrollbar-thumb-hover: #4c4c4c;
-  --vu-low: #b3b3b3;
-  --vu-mid: #949494;
-  --vu-high: #757575;
   --radius-xs: 6px;
   --radius-sm: 8px;
   --radius-md: 10px;
@@ -179,9 +161,7 @@ body {
   --h-chip: 28px;
   --surface-bg: var(--bg-2);
   --surface-bg-muted: var(--bg-3);
-  --surface-header-bg: var(--bg-4);
   --surface-border: var(--line);
-  --surface-border-strong: var(--line-2);
   --control-bg: var(--glass-control-bg);
   --control-bg-hover: var(--glass-control-bg-hover);
   --control-border: var(--glass-border);
@@ -192,25 +172,16 @@ body {
   --page-gutter: 16px;
   --page-gutter-screen: 18px;
   --layout-gap-grid: 14px;
-  --layout-gap-stack: 12px;
-  --layout-gap-tight: 8px;
-  --layout-gap-micro: 6px;
   --toolbar-row-gap: 12px;
   --toolbar-group-gap: 8px;
   --toolbar-upscale-gap: 6px;
   --record-col: minmax(0, 1fr);
-  --stack-card: 12px;
-  --pane-context-lines: 1;
-  --summary-text-lines: 1;
-  --helper-text-lines: 1;
   --recordings-list-col: 288px;
   --audio-play-control-width: 32px;
   --audio-time-control-width: 58px;
-  --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
-  --space-5: 20px;
   --dur-fast: 100ms;
   --dur-base: 120ms;
   --dur-slow: 140ms;
@@ -572,7 +543,15 @@ body.platform-darwin .sidebar {
 
 .window-status-pill {
   margin-left: auto;
-  max-width: min(360px, 42vw);
+  /*
+    The same length the renderer abbreviates to (STATUS_PILL_MAX_CHARS,
+    published at boot by applyStatusPillBounds). It used to be an
+    unrelated 360px, so on a wide window this bound never fired and on a
+    narrow one it ellipsised a string JavaScript had already ellipsised.
+    The vw term still wins on a narrow window — that is the case the
+    renderer cannot see.
+  */
+  max-width: min(calc(var(--status-pill-max-chars) * 1ch), 42vw);
 }
 
 .window-status-dot {
@@ -3024,9 +3003,7 @@ canvas {
     --bg-4: Canvas;
     --surface-bg: Canvas;
     --surface-bg-muted: Canvas;
-    --surface-header-bg: Canvas;
     --surface-border: ButtonBorder;
-    --surface-border-strong: ButtonText;
     --control-bg: ButtonFace;
     --control-bg-hover: ButtonFace;
     --control-border: ButtonBorder;
@@ -3034,7 +3011,6 @@ canvas {
     --chip-border: ButtonBorder;
     --glass-bg: Canvas;
     --glass-bg-strong: Canvas;
-    --glass-bg-opaque: Canvas;
     --glass-control-bg: ButtonFace;
     --glass-control-bg-subtle: ButtonFace;
     --glass-control-bg-hover: ButtonFace;
@@ -3054,7 +3030,6 @@ canvas {
     --text: CanvasText;
     --text-2: CanvasText;
     --text-3: GrayText;
-    --focus-ring: Highlight;
     --focus-ring-soft: Highlight;
   }
 
@@ -3105,9 +3080,7 @@ canvas {
   --bg-4: Canvas;
   --surface-bg: Canvas;
   --surface-bg-muted: Canvas;
-  --surface-header-bg: Canvas;
   --surface-border: ButtonBorder;
-  --surface-border-strong: ButtonText;
   --control-bg: ButtonFace;
   --control-bg-hover: ButtonFace;
   --control-border: ButtonBorder;
@@ -3115,7 +3088,6 @@ canvas {
   --chip-border: ButtonBorder;
   --glass-bg: Canvas;
   --glass-bg-strong: Canvas;
-  --glass-bg-opaque: Canvas;
   --glass-control-bg: ButtonFace;
   --glass-control-bg-subtle: ButtonFace;
   --glass-control-bg-hover: ButtonFace;
@@ -3135,7 +3107,6 @@ canvas {
   --text: CanvasText;
   --text-2: CanvasText;
   --text-3: GrayText;
-  --focus-ring: Highlight;
   --focus-ring-soft: Highlight;
 }
 

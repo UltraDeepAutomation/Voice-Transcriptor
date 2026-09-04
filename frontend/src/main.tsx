@@ -59,6 +59,7 @@ import {
   wireProviderForGroup,
   type TranscriptionGroupId,
   type TranscriptionGroup,
+  type WireProvider,
 } from "./transcription-catalog";
 import {
   countWords,
@@ -84,9 +85,25 @@ declare global {
   }
 }
 
-type Provider = "local" | "openrouter" | "deepgram" | "";
-type RemoteProvider = "openrouter" | "deepgram";
-type KeyProvider = "openrouter" | "deepgram";
+/**
+ * The provider a transcription is sent to, in the shape the wire uses.
+ *
+ * Declared once, by the catalogue that also maps UI groups onto it —
+ * ``WireProvider`` was exported there and imported by nobody while this
+ * file declared the same four members again and bridged the two with a
+ * cast at every boundary.
+ */
+type Provider = WireProvider;
+/**
+ * A provider that is not on this machine.
+ *
+ * There is no second concept here: a remote provider is exactly a
+ * provider that needs an API key, which is why ``RemoteProvider`` and
+ * ``RemoteProvider`` were byte-identical unions used as the key of two
+ * different ``Record``s. One name, so a fourth provider cannot be added
+ * to one of them and not the other.
+ */
+type RemoteProvider = Exclude<Provider, "local" | "">;
 // Installed before any of THIS module's code can throw or log, which is
 // where startup failures actually happen — a failure during startup is
 // exactly the one you cannot reproduce, and it must not be recorded as
@@ -375,7 +392,7 @@ type LiveWsMode = "none" | "local-assist" | "deepgram-stream";
  * ``LiveSession.finalize_envelope`` and absent for every other transport
  * (Deepgram streams its own transcript and has no notion of windows).
  */
-interface LiveFinalEnvelope {
+interface LiveFinalEnvelopeFields {
   text: string;
   segments: TranscriptSegment[];
   durationSec: number;
@@ -402,6 +419,14 @@ interface LiveFinalEnvelope {
 }
 
 /**
+ * ``LiveCoverage`` is re-exported from ``./live-coverage``, which owns
+ * both the shape and the policy that reads it. Emitted by the backend's
+ * ``LiveSession.finalize_envelope`` and absent for every other transport
+ * (Deepgram streams its own transcript and has no notion of windows).
+ */
+type LiveFinalEnvelope = Omit<Extract<LiveWsMessage, { type: "final" }>, "type">;
+
+/**
  * The slice of the backend's ``stats`` dict the renderer reads.
  *
  * The envelope has carried a full ``stats`` object all along
@@ -421,14 +446,12 @@ interface LiveFinalEnvelope {
  * Only these fields are parsed, and only as numbers/booleans: anything
  * else in ``stats`` is the backend's business.
  *
- * NOTE (2026-09-04): ``backend/deepgram_dual.py`` had not landed when
- * the dual-stream field was written, and ``backend/deepgram_recovery.py``
- * had not landed when the recovery fields were. The names here are the
- * contract this renderer implements — ``stats.dual_stream`` (boolean),
- * ``stats.recovery.spans_sec`` and ``stats.recovery.ms`` (numbers). If
- * the backend reports them under other names, this is the single place
- * to correct; a missing or malformed field reads as absent, never as a
- * fact and never as a crash.
+ * The wire names, verified against the code that writes them:
+ * ``stats.dual_stream`` (boolean, ``backend/deepgram_dual.py``),
+ * ``stats.recovery.spans_sec`` and ``stats.recovery.ms`` (numbers,
+ * ``backend/deepgram_recovery.py``). This is the single place to
+ * correct if they ever move; a missing or malformed field reads as
+ * absent, never as a fact and never as a crash.
  */
 interface LiveFinalStats {
   dualStream?: boolean;
@@ -454,19 +477,12 @@ type LiveWsMessage =
   // mismatch that only stayed harmless because there was no reader.
   | { type: "segments"; segments: TranscriptSegment[] }
   | { type: "interim"; segment: TranscriptSegment }
-  | {
-      type: "final";
-      text: string;
-      segments: TranscriptSegment[];
-      durationSec: number;
-      source: string;
-      error?: string;
-      coverage?: LiveCoverage;
-      uncoveredSpeechSec?: number;
-      streamedSec?: number;
-      coveredEndSec?: number;
-      stats?: LiveFinalStats;
-    }
+  /**
+   * The stop envelope. ``LiveFinalEnvelope`` is this branch minus its
+   * ``type`` tag — the two used to be ten fields written out twice,
+   * where adding a field to one of them was a silent no-op on the other.
+   */
+  | ({ type: "final" } & LiveFinalEnvelopeFields)
   | { type: "error"; error: string; fatal: boolean }
   /**
    * The backend's stop deadline, sent the moment it is chosen and
@@ -1471,7 +1487,7 @@ function readProviderGroup(): TranscriptionGroupId | "" {
 }
 
 function readProviderSelection(): Provider {
-  return wireProviderForGroup(uiProviderGroup) as Provider;
+  return wireProviderForGroup(uiProviderGroup);
 }
 
 // Canonical reader of the user's local-model choice: every flow that
@@ -2144,7 +2160,7 @@ const remoteModelByProvider: Record<RemoteProvider, string> = {
 // action button — the value is never sent anywhere, so its length
 // carries no information about the real key.
 const MASKED_KEY_VALUE = "••••••••••••••••••••••••";
-const keySavedState: Record<KeyProvider, boolean> = {
+const keySavedState: Record<RemoteProvider, boolean> = {
   openrouter: false,
   deepgram: false,
 };
@@ -2741,7 +2757,7 @@ const PROVIDER_DISPLAY_ORDER: ReadonlyArray<string> = ["local", "openrouter", "d
 function normalizeProviderSelection(value: unknown, fallback: Provider = "local"): Provider {
   const provider = String(value ?? "").trim();
   if (provider === "" || provider === "local" || provider === "openrouter" || provider === "deepgram") {
-    return provider as Provider;
+    return provider;
   }
   return fallback;
 }
@@ -3327,11 +3343,27 @@ function statusKindToDotClass(kind: StatusKind): string {
   return kind || "idle";
 }
 
-/** Maximum length for a status line that fits the pill without
- *  truncation at the current column width. Longer messages are
- *  abbreviated in the pill and shown in full via the hover title and
- *  the session notice banner. */
+/**
+ * Maximum length of the status line, in characters.
+ *
+ * Two mechanisms used to truncate this one string with two unrelated
+ * numbers: this cap, and `max-width: min(360px, 42vw)` plus
+ * `text-overflow: ellipsis` in the stylesheet. 42 characters at the
+ * pill's 10px font is roughly 250px, so on a wide window the CSS bound
+ * never fired and on a narrow one it ellipsised an already-ellipsised
+ * string — two "…" in a row.
+ *
+ * The stylesheet now bounds the pill in `ch` from
+ * `--status-pill-max-chars`, so both layers describe the same length;
+ * a stylesheet cannot import this file, so the two are pinned together
+ * by `tests/styles-tokens.test.ts` — the same arrangement the
+ * auto-stop bounds use for `desktop/main.js`. JavaScript still owns
+ * WHICH part survives: it prefers the phrase before the first ":" or em
+ * dash, which no stylesheet can do, and the full text stays in the
+ * hover title and the aria-label.
+ */
 const STATUS_PILL_MAX_CHARS = 42;
+
 
 function abbreviateForStatusPill(text: string): string {
   const t = (text || "").trim();
@@ -3459,11 +3491,11 @@ function applyStaticCopyToMarkup(): void {
   if (durEl) durEl.textContent = PLAYER_TIME_ZERO;
 }
 
-function keyInput(provider: KeyProvider): HTMLInputElement {
+function keyInput(provider: RemoteProvider): HTMLInputElement {
   return $(provider === "openrouter" ? "orKey" : "deepgramKey") as HTMLInputElement;
 }
 
-function keyActionButton(provider: KeyProvider): HTMLButtonElement {
+function keyActionButton(provider: RemoteProvider): HTMLButtonElement {
   return $(provider === "openrouter" ? "orKeyActionBtn" : "deepgramKeyActionBtn") as HTMLButtonElement;
 }
 
@@ -3493,7 +3525,7 @@ function isMaskedKeyInput(el: HTMLInputElement): boolean {
  * ``readOnly`` stays while masked so the placeholder dots cannot be
  * partially edited into a corrupt key; the focus handler lifts it.
  */
-function markKeyMasked(provider: KeyProvider, saved: boolean): void {
+function markKeyMasked(provider: RemoteProvider, saved: boolean): void {
   const el = keyInput(provider);
   const isSaved = !!saved;
   keySavedState[provider] = isSaved;
@@ -3514,7 +3546,7 @@ function markKeyMasked(provider: KeyProvider, saved: boolean): void {
  * Idempotent, and safe to call from focus, pointerdown or input — all
  * three are "the user is about to type here".
  */
-function clearMaskedKeyOnEdit(provider: KeyProvider): void {
+function clearMaskedKeyOnEdit(provider: RemoteProvider): void {
   const el = keyInput(provider);
   if (!isMaskedKeyInput(el)) return;
   el.value = "";
@@ -3522,7 +3554,7 @@ function clearMaskedKeyOnEdit(provider: KeyProvider): void {
   el.readOnly = false;
 }
 
-function syncKeyActionButton(provider: KeyProvider): void {
+function syncKeyActionButton(provider: RemoteProvider): void {
   const btn = keyActionButton(provider);
   const input = keyInput(provider);
   const masked = isMaskedKeyInput(input);
@@ -5087,10 +5119,16 @@ function localFallbackReason(preferred: Provider): string {
 
 async function refreshNetworkState(): Promise<void> {
   try {
+    // The one request that does NOT go through ``apiGet``, on purpose:
+    // /api/health is the liveness probe, it is answered before the API
+    // token exists, and a non-ok answer here is the boot signal this
+    // function is built around rather than an error to throw upward.
     const health = await fetch("/api/health");
     if (!health.ok) throw new Error(`health ${health.status}`);
     try {
-      const healthJson = (await health.clone().json()) as BackendBootstrapPayload;
+      // Read once. This used to ``clone()`` the response for a single
+      // read, which buffers the whole body a second time for nothing.
+      const healthJson = (await health.json()) as BackendBootstrapPayload;
       applyBackendRuntimeConfig(healthJson);
       applyHealthModelCatalog(healthJson?.model_catalog);
       applyRuntimeLimits(healthJson?.runtime_limits);
@@ -6931,7 +6969,7 @@ function validateProviderKey(raw: string): { ok: true; value: string } | { ok: f
   return { ok: true, value: v };
 }
 
-async function saveProviderKey(provider: KeyProvider): Promise<void> {
+async function saveProviderKey(provider: RemoteProvider): Promise<void> {
   const input = keyInput(provider);
   const raw = isMaskedKeyInput(input) ? "" : input.value;
   if (!raw && isMaskedKeyInput(input)) {
@@ -6961,7 +6999,7 @@ async function saveProviderKey(provider: KeyProvider): Promise<void> {
   syncKeyActionButton(provider);
 }
 
-async function deleteProviderKey(provider: KeyProvider): Promise<void> {
+async function deleteProviderKey(provider: RemoteProvider): Promise<void> {
   await apiPost<{ ok: boolean }>("/api/config", {
     providers: {
       [provider]: { key: "" },
@@ -6976,7 +7014,7 @@ async function deleteProviderKey(provider: KeyProvider): Promise<void> {
   syncKeyActionButton(provider);
 }
 
-async function handleKeyAction(provider: KeyProvider): Promise<void> {
+async function handleKeyAction(provider: RemoteProvider): Promise<void> {
   const btn = keyActionButton(provider);
   if (btn.classList.contains("delete")) {
     await deleteProviderKey(provider);
@@ -7013,7 +7051,7 @@ async function handleKeyAction(provider: KeyProvider): Promise<void> {
   queueUiPreferencesSave();
 });
 ["openrouter", "deepgram"].forEach((providerName) => {
-  const provider = providerName as KeyProvider;
+  const provider = providerName as RemoteProvider;
   const input = keyInput(provider);
   const btn = keyActionButton(provider);
   input.addEventListener("focus", () => {
@@ -13785,7 +13823,10 @@ function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): 
       completedAt: typeof src.completedAt === "number"
         ? src.completedAt
         : (interrupted ? Date.now() : undefined),
-      provider: (src.provider || "") as Provider,
+      // A restored snapshot is untrusted input: normalize it through the
+      // same predicate as the requested provider rather than asserting
+      // the type is whatever the file said.
+      provider: normalizeProviderSelection(src.provider, ""),
       model: String(src.model || ""),
       language: String(src.language || ""),
       audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),

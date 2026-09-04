@@ -21,20 +21,18 @@ const DESKTOP_DIR = resolve(HERE, "../desktop");
 // repo at the parent's sibling, and is part of the release
 // pipeline. ``frontend/package.json`` is package metadata only, not
 // the shipped application version SSOT.
-const PKG_VERSION: string = (() => {
-  const pkgPath = resolve(DESKTOP_DIR, "package.json");
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-  return String(pkg.version || "0.0.0");
-})();
+const DESKTOP_MANIFEST = JSON.parse(
+  readFileSync(resolve(DESKTOP_DIR, "package.json"), "utf8"),
+) as { version?: string; repository?: { url?: string } };
+
+const PKG_VERSION: string = String(DESKTOP_MANIFEST.version || "0.0.0");
 
 // Update-check coordinates, derived from the SAME manifest that owns the
 // version — repository.url is the single source of truth for where
 // releases live, so a repo move updates the checker without a second
 // edit. Parsed down to a bare "owner/repo" slug for the GitHub API.
 const APP_UPDATE_META: { version: string; repoSlug: string } = (() => {
-  const pkgPath = resolve(DESKTOP_DIR, "package.json");
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-  const url: string = String(pkg.repository?.url || "");
+  const url: string = String(DESKTOP_MANIFEST.repository?.url || "");
   // github.com/<owner>/<repo>(.git), tolerating scheme/case variants.
   const m = url.match(/github\.com[/:]([^/]+)\/([^/.?#]+?)(?:\.git)?\/?$/i);
   return {
@@ -86,6 +84,14 @@ export default defineConfig({
     // Electron ships Chromium; keep CSS output aligned with that runtime
     // so production builds preserve unprefixed properties like backdrop-filter.
     cssTarget: "chrome142",
+    // CSS ships unminified deliberately. This is a desktop app: the
+    // stylesheet is read from disk by the local backend, never over a
+    // network, so the ~60 KB minification would save costs nothing to
+    // keep — and it buys the one thing that matters when a rendering
+    // bug is reported from a packaged build, which is that the shipped
+    // stylesheet can be read and matched against src/styles.css line
+    // for line. Arrived unexplained with the Liquid Glass surface
+    // system (bd6ba23); stated here rather than left as a bare flag.
     cssMinify: false,
   },
   define: {

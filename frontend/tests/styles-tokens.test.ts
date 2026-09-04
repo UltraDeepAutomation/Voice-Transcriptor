@@ -81,3 +81,40 @@ describe("styles.css is the only stylesheet", () => {
     expect(css).toContain(".update-check-status[data-tone=\"new\"]");
   });
 });
+
+describe("every declared token is read by something", () => {
+  /**
+   * 38 tokens were declared and never read — among them a whole
+   * seven-token `--record-stop-*` palette for a state the stylesheet
+   * actually paints with `--danger-*`, three `--vu-*` colours for a
+   * meter that does not exist in the markup, and a `--focus-ring` that
+   * two forced-colors blocks carefully mapped to `Highlight` while no
+   * rule painted with it. A token nothing reads is not a decision the
+   * product has made; it is a decision a reader will believe it has.
+   *
+   * The renderer publishes one token from JavaScript
+   * (`--status-pill-max-chars`), so that path counts as a read too.
+   */
+  const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
+  const mainTsx = readFileSync(resolve(process.cwd(), "src/main.tsx"), "utf8");
+
+  it("declares nothing the app never paints with", () => {
+    const declared = declaredTokens(css);
+    const read = new Set<string>(
+      tokenReferences(css + html + mainTsx).map((r) => r.token),
+    );
+    for (const m of mainTsx.matchAll(/setProperty\(\s*"(--[A-Za-z0-9-]+)"/g)) read.add(m[1]);
+    expect([...declared].filter((t) => !read.has(t)).sort()).toEqual([]);
+  });
+
+  it("bounds the status pill by the same number the renderer abbreviates to", () => {
+    // Two mechanisms used to truncate one string with two unrelated
+    // numbers, so a narrow window showed two ellipses in a row.
+    const fromCss = /--status-pill-max-chars:\s*(\d+)/.exec(css)?.[1];
+    const fromRenderer = /const STATUS_PILL_MAX_CHARS = (\d+);/.exec(mainTsx)?.[1];
+    expect(fromCss, "--status-pill-max-chars missing from styles.css").toBeTruthy();
+    expect(fromRenderer, "STATUS_PILL_MAX_CHARS missing from main.tsx").toBeTruthy();
+    expect(fromCss).toBe(fromRenderer);
+    expect(css).toContain("calc(var(--status-pill-max-chars) * 1ch)");
+  });
+});
