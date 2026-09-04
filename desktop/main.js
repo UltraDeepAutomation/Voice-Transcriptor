@@ -319,8 +319,10 @@ let lastShortcutStatus = null;
 // running for the life of the process to feed it. The state that DOES
 // drive behaviour is `pasteCapability`, and every probe of it
 // (`probePasteCapability`: boot, window focus, pre-paste, and after a
-// failed paste) refreshes this value on the way through. Surfacing it to
-// the user is a renderer change; see the debt ledger.
+// failed paste) refreshes this value on the way through. Surfaced to the
+// user via the invoke-only `paste-capability:get-status` handler below
+// (D-009) — the renderer pulls a snapshot instead of main pushing a
+// global.
 let lastAccessibilityTrusted = null;
 // Ring buffer of the last ~4 KB of backend stderr. When the fallback
 // HTML fires "Backend did not start in time" / "exited with code N
@@ -8745,6 +8747,33 @@ app.whenReady().then(async () => {
       setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, { reason });
       return { ok: false, status: "error", error: reason, ...engineInstallSnapshot() };
     }
+  });
+
+  // Accessibility/paste-capability status (D-009). Invoke-only, same
+  // shape as the engine bridge above: the renderer pulls a snapshot
+  // rather than main pushing one.
+  //
+  // `pasteCapability` used to be surfaced only reactively, inside a
+  // recording-status string AFTER a paste had already failed
+  // (pasteCapabilityStatusText, used by recordingStatusForPasteFailure)
+  // — so a stale or missing grant was invisible until the user tried to
+  // dictate something and the paste silently went nowhere. An earlier
+  // attempt at a proactive surface pushed
+  // `window.__transcriptorAccessibilityStatus` via `executeJavaScript`
+  // on a 30-second interval; nothing in frontend/ ever read the global,
+  // so it was deleted (see the comment on `lastAccessibilityTrusted`
+  // above) rather than built on. This handler is the renderer-owned
+  // surface that was missing, using the SAME invoke pattern as
+  // `engine:get-status` instead of another injected global.
+  //
+  // `ensurePasteCapabilityFresh` probes only when the cached verdict is
+  // stale (see paste-capability.js `shouldProbe`), so a renderer that
+  // asks right after `probePasteCapability("boot")` already ran gets the
+  // cached answer for free; the very first ask of a session pays for one
+  // probe so the badge is never a beat behind the first recording.
+  ipcMain.handle("paste-capability:get-status", async () => {
+    const cap = await ensurePasteCapabilityFresh("renderer-query");
+    return { state: cap.state, ...pasteCapabilityMessage(cap.state) };
   });
 
   // Transcript hand-off from the renderer (BUGS_AUDIT §6.7). Registered

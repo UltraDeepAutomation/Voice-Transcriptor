@@ -41,6 +41,16 @@ import {
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
 import { flashButtonFeedback } from "./button-feedback";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
+// D-015: the ONE retired-shortcut-pair rule, shared with desktop/main.js
+// rather than re-derived here. See the module's own docstring for why —
+// two hand-written copies of "this stored pair is retired" drifted when
+// a third migration was added to one side and not the other, so on
+// Windows the main process registered the migrated accelerator while
+// Settings kept displaying the retired one. Pure CommonJS, zero Node
+// dependencies (no `require`, no `fs`), so it is exactly as safe to
+// bundle into the renderer as ``shortcut-defaults.json``'s data already
+// is (see ``__SHORTCUT_DEFAULTS__`` below).
+import { migrateShortcutPair } from "../../desktop/shortcut-migration.js";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
 import {
   explainNetworkError,
@@ -643,6 +653,21 @@ declare global {
     __transcriptorEngine?: {
       getStatus: () => Promise<EngineInstallStatus>;
       install: () => Promise<EngineInstallStatus & { ok?: boolean; status?: string }>;
+    };
+    /**
+     * Accessibility/paste-capability bridge (Electron main process,
+     * D-009). Absent in browser dev preview and on non-macOS desktop
+     * shells — every consumer must feature-check.
+     *
+     * ``state`` is one of "unknown" / "untrusted" / "active" / "broken"
+     * (desktop/paste-capability.js); ``title``/``fix`` are non-empty
+     * exactly when there is something the user can act on. This used to
+     * reach the renderer only reactively, folded into a recording-status
+     * string AFTER a paste had already failed — so a stale or missing
+     * grant was invisible until a dictation silently went nowhere.
+     */
+    __transcriptorPasteCapability?: {
+      getStatus: () => Promise<{ state: string; title: string; fix: string }>;
     };
     /**
      * Recording-output bridge (Electron preload → main). Absent in
@@ -3561,6 +3586,30 @@ function setSettingsArchiveStatus(message: string, tone: UiTone = "neutral"): vo
   el.className = `settings-save-status settings-save-status-${tone}`;
 }
 
+/**
+ * D-009: pull the Accessibility/paste-capability verdict and show it, or
+ * hide the note when there is nothing to act on.
+ *
+ * Absent bridge (browser dev preview, non-macOS desktop shell) leaves
+ * the note exactly as the markup declared it: hidden. A rejected/failed
+ * call is swallowed rather than shown, the same call this file already
+ * makes for the analogous network probe — a transient IPC hiccup is not
+ * evidence of a broken permission and must not flash a false warning.
+ */
+async function refreshPasteCapabilityNote(): Promise<void> {
+  const el = document.getElementById("pasteCapabilityNote");
+  if (!el) return;
+  try {
+    const status = await window.__transcriptorPasteCapability?.getStatus();
+    const fix = String(status?.fix || "").trim();
+    const title = String(status?.title || "").trim();
+    el.textContent = fix ? `${title} ${fix}` : "";
+    el.hidden = !fix;
+  } catch (e) {
+    console.debug("paste-capability status unavailable", e);
+  }
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -5984,7 +6033,6 @@ const _isMacRenderer = (() => {
 const DEFAULT_SHORTCUTS = _isMacRenderer
   ? __SHORTCUT_DEFAULTS__.platformDefaults.darwin
   : __SHORTCUT_DEFAULTS__.platformDefaults.default;
-const LEGACY_SHORTCUTS = __SHORTCUT_DEFAULTS__.legacy;
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: ShortcutPair = currentShortcuts): void {
@@ -6989,39 +7037,34 @@ async function loadCfg(): Promise<void> {
 
     // Load keyboard shortcuts. Defaults are platform-specific
     // (DEFAULT_SHORTCUTS at module scope) — Mac=Option+Left/Shift+V,
-    // Win/Linux=F9/F10.
+    // Win/Linux=Control+Alt+Shift+R/V.
     //
-    // One-time migration paths for users carrying forward stale
-    // values from earlier builds:
-    //   1. `Alt+Shift+7` (any platform) → platform default's paste.
-    //      Literally unpressable on US/UK layouts (Shift+7=`&`)
-    //      and collides with Win Alt+Shift = input-language switch.
-    //   2. `F9` / `F10` ON MACOS → Mac default Alt+Left / Alt+Shift+V.
-    //      Pass-15 set F9/F10 as the cross-platform default; on Mac
-    //      F9 is Mission Control and F10 is Notification Center, so
-    //      a Mac user saved an effectively non-functional shortcut
-    //      via the default. We rewrite ONLY the exact F9/F10 pair —
-    //      a Mac user who DELIBERATELY chose F11 / Cmd+Shift+T / etc.
-    //      is left untouched.
-    let rawRecord = String(ui.shortcut_record || "").trim();
-    let rawPaste = String(ui.shortcut_paste || "").trim();
-    let didMigrate = false;
-    // Migration 1: broken paste shortcut.
-    if (rawPaste === LEGACY_SHORTCUTS.unpressablePaste) {
-      rawPaste = DEFAULT_SHORTCUTS.paste;
-      didMigrate = true;
-    }
-    // Migration 2: Mac users with the stale F9/F10 cross-platform
-    // pair. Both must match exactly; partial matches mean the user
-    // customised one half and we leave both alone.
-    if (
-      _isMacRenderer &&
-      rawRecord === LEGACY_SHORTCUTS.macFunctionPair.record &&
-      rawPaste === LEGACY_SHORTCUTS.macFunctionPair.paste
-    ) {
-      rawRecord = DEFAULT_SHORTCUTS.record;  // Alt+Left
-      rawPaste = DEFAULT_SHORTCUTS.paste;    // Alt+Shift+V
-      didMigrate = true;
+    // Retired-pair rewrites are ONE rule now (D-015),
+    // ``desktop/shortcut-migration.js``'s ``migrateShortcutPair``,
+    // driven by ``shortcut-defaults.json``'s ``legacy`` entries — the
+    // same rule desktop/main.js runs on the SAME data before this
+    // renderer ever reads the config. This used to be two hand-written
+    // `if` blocks here, one migration behind main.js's three: the
+    // Windows/Linux F9/F10 retirement (BUGS_AUDIT §6.10) was added to
+    // main.js alone, so on Windows the main process registered
+    // `Control+Alt+Shift+R` while Settings kept displaying `F9` and the
+    // next autosave wrote `F9`/`F10` back to disk. Calling the shared
+    // rule instead of re-deriving it is what keeps that from happening
+    // again the next time a pair is retired.
+    const stored = {
+      record: String(ui.shortcut_record || "").trim(),
+      paste: String(ui.shortcut_paste || "").trim(),
+    };
+    const migrated = migrateShortcutPair(stored, {
+      manifest: __SHORTCUT_DEFAULTS__,
+      defaults: DEFAULT_SHORTCUTS,
+      platform: _isMacRenderer ? "darwin" : "other",
+    }) as { record: string; paste: string; applied: Array<{ id: string; from: string; to: string }> };
+    const rawRecord: string = migrated.record;
+    const rawPaste: string = migrated.paste;
+    const didMigrate = migrated.applied.length > 0;
+    for (const step of migrated.applied) {
+      console.log(`[trace shortcuts] migrated stale ${step.from} → ${step.to} (${step.id})`);
     }
     if (rawRecord) currentShortcuts.record = rawRecord;
     if (rawPaste) currentShortcuts.paste = rawPaste;
@@ -9804,23 +9847,48 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") releaseWarmCaptureOnLifecycle("window-hidden");
 });
 window.addEventListener("pagehide", () => releaseWarmCaptureOnLifecycle("pagehide"));
-// Sleep and lock-screen. Subscribed ONCE, at renderer boot, and never
-// unsubscribed: the hold outlives every recording, so the release has to
-// outlive them too. The renderer cannot see this event on its own —
-// ``setTimeout`` does not run while the machine is asleep, so the hold's
-// TTL timer cannot fire, and the OS may hand the microphone to another
-// application while we are not looking. A shell without the bridge (an
-// older desktop build, or the app opened in a plain browser) is not
-// broken by its absence: ``decideWarmReuse`` re-checks the wall clock at
-// the next press and refuses a hold that slept through.
-try {
-  window.transcriptor?.onSystemSuspend?.(({ reason }) => {
-    console.log(`[trace warmCapture] system suspend (${reason || "unknown"}) — releasing the hold`);
-    releaseWarmCaptureOnLifecycle("system-suspend");
-  });
-} catch (e) {
-  console.debug("warm capture: system-suspend bridge unavailable", e);
+// Holds the unsubscribe ``onSystemSuspend`` returns, so
+// ``subscribeToSystemSuspend`` (see its own doc comment, D-053) can
+// retire its own prior listener before installing a new one.
+let systemSuspendUnsubscribe: (() => void) | null = null;
+
+/**
+ * Sleep and lock-screen. Called once at renderer boot and meant to
+ * outlive every recording — the hold outlives them too, so the release
+ * has to as well. The renderer cannot see this event on its own —
+ * ``setTimeout`` does not run while the machine is asleep, so the hold's
+ * TTL timer cannot fire, and the OS may hand the microphone to another
+ * application while we are not looking. A shell without the bridge (an
+ * older desktop build, or the app opened in a plain browser) is not
+ * broken by its absence: ``decideWarmReuse`` re-checks the wall clock at
+ * the next press and refuses a hold that slept through.
+ *
+ * D-053: ``onSystemSuspend`` returns an unsubscribe, and the call site
+ * used to discard it inline at the top level — meaning if this function
+ * (or the top-level script that used to inline it) ever ran a second
+ * time in one page lifetime, the previous listener stayed registered
+ * and a second one stacked on top of it, so one real suspend fired
+ * ``releaseWarmCaptureOnLifecycle`` twice. A Vite dev-server HMR update
+ * is exactly that kind of re-run: it re-executes top-level code WITHOUT
+ * a page reload, which is the only thing that tears down the preload
+ * world's listeners. Harmless by luck (the release function is
+ * idempotent) rather than by design. Retiring the prior subscription
+ * first, unconditionally, makes a second call — from HMR or any future
+ * refactor that invokes this more than once — safe by construction
+ * instead of by luck.
+ */
+function subscribeToSystemSuspend(): void {
+  try {
+    systemSuspendUnsubscribe?.();
+    systemSuspendUnsubscribe = window.transcriptor?.onSystemSuspend?.(({ reason }) => {
+      console.log(`[trace warmCapture] system suspend (${reason || "unknown"}) — releasing the hold`);
+      releaseWarmCaptureOnLifecycle("system-suspend");
+    }) ?? null;
+  } catch (e) {
+    console.debug("warm capture: system-suspend bridge unavailable", e);
+  }
 }
+subscribeToSystemSuspend();
 
 /**
  * The stream this session's device watchers are already attached to.
@@ -13348,6 +13416,14 @@ populateUpscaleModelOptions();
 // the helper and never block app startup.
 void cleanupOrphanPcmSpool();
 void refreshNetworkState();
+// D-009: one query at boot, and one every time the window regains focus
+// — the second is what notices a grant the user just fixed in System
+// Settings and switched straight back from. Mirrors the main process's
+// own re-probe cadence (boot + window focus; see
+// desktop/main.js ensurePasteCapabilityFresh), so the renderer's badge
+// is never more than one focus away from what main already knows.
+void refreshPasteCapabilityNote();
+window.addEventListener("focus", () => { void refreshPasteCapabilityNote(); });
 // Network-state poll. The Online/Offline pill lives in the topbar, so
 // this runs on every view — but not while the window is hidden: the
 // /api/network probe plus the /api/health round-trip is wasted work

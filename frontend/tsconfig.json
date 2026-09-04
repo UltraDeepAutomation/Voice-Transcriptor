@@ -9,7 +9,13 @@
     "noUnusedParameters": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["vite/client", "node"]
+    "types": ["vite/client", "node"],
+    // Renderer-only: lets frontend/src/main.tsx import the ONE migration
+    // rule desktop/main.js also uses (desktop/shortcut-migration.js,
+    // pure CommonJS, zero Node dependencies) instead of re-deriving it
+    // (D-015). Does not enable checkJs, so no .js file's contents are
+    // type-checked — only import resolution is affected.
+    "allowJs": true
   },
   "include": ["src", "tests", "vite.config.ts", "vitest.config.ts"]
 }

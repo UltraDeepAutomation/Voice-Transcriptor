@@ -19,6 +19,17 @@ contextBridge.exposeInMainWorld("__transcriptorEngine", {
   install: () => ipcRenderer.invoke("engine:install"),
 });
 
+// Accessibility/paste-capability bridge (D-009). Same invoke-only shape
+// as the engine bridge above: `getStatus()` resolves
+// `{ state, title, fix }` — `state` is one of "unknown" / "untrusted" /
+// "active" / "broken" (desktop/paste-capability.js), and `title`/`fix`
+// are non-empty exactly when there is something the user can act on
+// (empty for "active"/"unknown", so an idle renderer badge can hide on
+// an empty `fix` without inspecting `state` itself).
+contextBridge.exposeInMainWorld("__transcriptorPasteCapability", {
+  getStatus: () => ipcRenderer.invoke("paste-capability:get-status"),
+});
+
 // Transcript hand-off bridge (BUGS_AUDIT_2026-09-03 §6.7/§6.8).
 //
 // The renderer knows the instant a recording's text exists; the main

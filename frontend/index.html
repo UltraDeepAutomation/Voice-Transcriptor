@@ -789,6 +789,18 @@
               <div class="btn-row">
                 <button class="btn btn-ghost" id="resetShortcutsBtn" type="button">Reset to Default</button>
               </div>
+              <!--
+                D-009: whether macOS Accessibility actually lets this app
+                paste — not merely whether it is granted on paper. Hidden
+                unless the desktop bridge reports something the user can
+                act on (state "untrusted" or "broken"); populated by
+                refreshPasteCapabilityNote in main.tsx, which is the only
+                writer. Absent on non-macOS shells and in the browser
+                (no window.__transcriptorPasteCapability there), and
+                stays hidden until the first status arrives so it never
+                flashes a stale claim.
+              -->
+              <div class="settings-save-status settings-save-status-warning" id="pasteCapabilityNote" hidden></div>
             </div>
           </div>
         </div>

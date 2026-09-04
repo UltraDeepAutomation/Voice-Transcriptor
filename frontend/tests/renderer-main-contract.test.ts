@@ -3,10 +3,18 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+// D-015: the same shared module main.tsx imports (see the describe block
+// below) — executed here too, so this suite proves vitest can actually
+// RUN the shared rule, not merely that main.tsx's source text mentions it.
+import { migrateShortcutPair } from "../../desktop/shortcut-migration.js";
+
 const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
 const liveDefaultsFixture = JSON.parse(
   readFileSync(resolve(process.cwd(), "../contracts/live-defaults.json"), "utf-8"),
 ) as { languages: string[]; keyterm_token_budget: number };
+const shortcutDefaultsManifest = JSON.parse(
+  readFileSync(resolve(process.cwd(), "../desktop/shortcut-defaults.json"), "utf-8"),
+);
 
 /**
  * `window.__transcriptorFinishedRecords` is a two-process contract: the
@@ -197,5 +205,133 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     // helper's doc comment for why that one is deliberately left alone.
     expect(helperCalls.length).toBe(6);
     expect(stopLiveBody).toContain("const releaseStopEpilogueBookkeeping = (): void =>");
+  });
+});
+
+/**
+ * D-053 (desktop-fix-journal.md, commit 18 "Not done"): ``preload.js``'s
+ * ``onSystemSuspend`` returns an unsubscribe function; the renderer used
+ * to discard it at a top-level call site, so a second run of that
+ * top-level code in one page lifetime (a Vite dev-server HMR update,
+ * which re-executes top-level code WITHOUT the page reload that would
+ * otherwise tear down the preload world's listeners) stacked a second
+ * listener instead of replacing the first. Fixed by moving the
+ * subscribe into a named function that retires its own prior
+ * subscription before installing a new one — safe by construction on
+ * any re-run, not merely on the first one.
+ */
+describe("system-suspend subscription retires its own prior listener (D-053)", () => {
+  it("subscribeToSystemSuspend unsubscribes before resubscribing, using a module-level handle", () => {
+    expect(mainTsx).toMatch(/let systemSuspendUnsubscribe:\s*\(\(\)\s*=>\s*void\)\s*\|\s*null\s*=\s*null;/);
+    const fnBlock = /function subscribeToSystemSuspend\(\): void \{([\s\S]*?)\n\}/.exec(mainTsx)?.[1];
+    expect(fnBlock, "subscribeToSystemSuspend not found").toBeTruthy();
+    const body = String(fnBlock);
+    // Unsubscribe must run BEFORE the new subscription is installed.
+    const unsubIndex = body.indexOf("systemSuspendUnsubscribe?.();");
+    const resubIndex = body.indexOf("systemSuspendUnsubscribe = window.transcriptor");
+    expect(unsubIndex).toBeGreaterThanOrEqual(0);
+    expect(resubIndex).toBeGreaterThan(unsubIndex);
+  });
+
+  it("is actually called at module load, not merely declared", () => {
+    expect(mainTsx).toMatch(/\nsubscribeToSystemSuspend\(\);/);
+  });
+});
+
+/**
+ * D-009 (desktop-fix-journal.md, commit 18 "Not done"): the renderer
+ * badge for a broken/missing macOS Accessibility grant. desktop/main.js
+ * already exposed `paste-capability:get-status`; this pins the
+ * renderer's consumption of it — a hidden-by-default note, populated on
+ * boot and on window focus (matching main's own re-probe cadence), and
+ * never invented as a second markup surface.
+ */
+describe("paste-capability note is wired to the bridge (D-009)", () => {
+  it("#pasteCapabilityNote exists in the markup and starts hidden", () => {
+    const tag = /<div[^>]*id="pasteCapabilityNote"[^>]*>/.exec(html)?.[0];
+    expect(tag, "#pasteCapabilityNote is missing from index.html").toBeTruthy();
+    expect(String(tag)).toMatch(/\bhidden\b/);
+  });
+
+  it("refreshPasteCapabilityNote reads __transcriptorPasteCapability.getStatus and toggles hidden off fix, not state", () => {
+    const fnBlock = /async function refreshPasteCapabilityNote\(\): Promise<void> \{([\s\S]*?)\n\}/.exec(mainTsx)?.[1];
+    expect(fnBlock, "refreshPasteCapabilityNote not found").toBeTruthy();
+    const body = String(fnBlock);
+    expect(body).toContain("window.__transcriptorPasteCapability?.getStatus()");
+    expect(body).toMatch(/el\.hidden\s*=\s*!fix/);
+  });
+
+  it("is queried at boot and on every window focus", () => {
+    expect(mainTsx).toMatch(/\nvoid refreshPasteCapabilityNote\(\);/);
+    expect(mainTsx).toMatch(
+      /window\.addEventListener\("focus", \(\) => \{ void refreshPasteCapabilityNote\(\); \}\);/,
+    );
+  });
+});
+
+/**
+ * D-015 (desktop-fix-journal.md, commit 14 "Not done, the renderer
+ * half"): the renderer used to re-derive migrations 1 and 2
+ * (unpressablePaste, macFunctionPair) by hand and never implemented
+ * migration 3 (winLinuxFunctionPair, BUGS_AUDIT §6.10) — so on a
+ * Windows/Linux config still carrying the retired F9/F10 pair, main.js
+ * registered the migrated accelerator while Settings kept showing F9
+ * and the next autosave wrote F9/F10 back to disk, forever. Fixed by
+ * importing desktop/shortcut-migration.js's migrateShortcutPair instead
+ * of re-deriving the rule — it is pure CommonJS with zero Node
+ * dependencies, so it bundles into the renderer exactly like
+ * shortcut-defaults.json's data already does.
+ */
+describe("the renderer runs the SAME shortcut migration rule as desktop/main.js (D-015)", () => {
+  it("main.tsx imports migrateShortcutPair from the shared module, not a re-derived copy", () => {
+    expect(mainTsx).toMatch(
+      /import \{ migrateShortcutPair \} from "\.\.\/\.\.\/desktop\/shortcut-migration\.js";/,
+    );
+    expect(mainTsx).toContain("migrateShortcutPair(stored, {");
+    // The two hand-written `if` blocks this replaced are gone — a
+    // returning copy of either would mean the rule has two homes again.
+    expect(mainTsx).not.toMatch(/LEGACY_SHORTCUTS\.unpressablePaste/);
+    expect(mainTsx).not.toMatch(/LEGACY_SHORTCUTS\.macFunctionPair/);
+  });
+
+  it("migrateShortcutPair, imported the same way main.tsx imports it, migrates all three retired pairs", () => {
+    // Migration 3 (winLinuxFunctionPair) — the one the renderer never
+    // implemented by hand. Proven here on Windows/Linux platform.
+    const win = migrateShortcutPair(
+      { record: "F9", paste: "F10" },
+      {
+        manifest: shortcutDefaultsManifest,
+        defaults: shortcutDefaultsManifest.platformDefaults.default,
+        platform: "other",
+      },
+    );
+    expect(win.record).toBe(shortcutDefaultsManifest.platformDefaults.default.record);
+    expect(win.paste).toBe(shortcutDefaultsManifest.platformDefaults.default.paste);
+    expect(win.applied.map((s: { id: string }) => s.id)).toContain("winLinuxFunctionPair");
+
+    // Migration 2 (macFunctionPair) — still exercised through the same
+    // shared call the renderer now makes.
+    const mac = migrateShortcutPair(
+      { record: "F9", paste: "F10" },
+      {
+        manifest: shortcutDefaultsManifest,
+        defaults: shortcutDefaultsManifest.platformDefaults.darwin,
+        platform: "darwin",
+      },
+    );
+    expect(mac.record).toBe(shortcutDefaultsManifest.platformDefaults.darwin.record);
+    expect(mac.applied.map((s: { id: string }) => s.id)).toContain("macFunctionPair");
+
+    // A user's own choice is left alone.
+    const custom = migrateShortcutPair(
+      { record: "F11", paste: "Control+Alt+Shift+V" },
+      {
+        manifest: shortcutDefaultsManifest,
+        defaults: shortcutDefaultsManifest.platformDefaults.default,
+        platform: "other",
+      },
+    );
+    expect(custom.applied).toEqual([]);
+    expect(custom.record).toBe("F11");
   });
 });

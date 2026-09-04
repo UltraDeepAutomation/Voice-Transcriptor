@@ -696,7 +696,8 @@ hello everybody that's close up agents workflow that we говорю прост�
 | D-09 | `PROJECT_STRUCTURE` не знает о трёх новых модулях: `backend/async_tasks.py`, `backend/deepgram_language.py`, `backend/deepgram_recovery.py` (и о двух новых тестовых) | обновить на шаге релиза 1.6.1 (§5 хендоффа), файл вне периметра бэкенд-агента |
 | D-10 | Первая версия теста B-021 (до подмены `HOME`) один раз создала `~/.transcriptor/.encryption_key` на машине | файл ничем не читается, пока `TRANSCRIPTOR_DATA_DIR` доступен; удалить может пользователь |
 | ~~D-11~~ | **R-016 / S-04 / S-05 / S-06** — закрыто в этом же коммите (см. раздел «Дополнение к этому же коммиту» выше): S-04/R-016/S-05 перенесены в bootstrap-payload, S-06 опровергнут как ложный дубликат и задокументирован | — |
-| D-12 | Задание «Швы» пункты 4–6 (D-015/D-009/D-013/D-053 desktop-журнала, единый эпилог `stopLive`, изоляция тестов от `HOME`/`TRANSCRIPTOR_DATA_DIR`) не начаты | требуют отдельного прочтения `frontend-fix-journal.md` и `desktop-fix-journal.md`; каждый — свой коммит с тестами на обеих сторонах, как и B-027 выше |
+| ~~D-12~~ | Задание «Швы» пункты 4–6 — закрыты в последующих коммитах этой же сессии: пункт 4 (D-009/D-015/D-053 рендерер-половины), пункт 5 (F/7 частично + инвариант доставки), пункт 6 (изоляция тестов) — см. записи ниже. Остаток → **D-13** и **D-14** | — |
+| D-14 | **D-013** (desktop-журнал) — рендерер уже отдаёт `statusKind` (`__transcriptorLiveStatusSnapshot`), главный процесс его читает и ИГНОРИРУЕТ, классифицируя заново по тексту в поллинг-цикле восстановления стопа (`queryRendererState`, `desktop/main.js` ~5563-5576) — словари `StatusKind` (рендерер, 7 значений) и `RECORDING_STATUS_KIND` (desktop, различает UPSCALING/TRANSCRIBING отдельно) не совпадают | нужен либо более гранулярный `StatusKind` на рендерере, либо таблица соответствия; оба варианта трогают тот же чувствительный поллинг-цикл, что и F/7 — верификация на живых записях нужна и здесь |
 
 ---
 
@@ -1073,3 +1074,127 @@ GPU/HTTP-кэш живого процесса), НИ ОДИН файл конф�
 **Не сделано:** пункт 4 задания (D-015/D-009/D-013/D-053, desktop-журнал)
 не начат — из пяти пунктов задания «Швы» это единственный, требующий
 чтения desktop-журнала и правок в `desktop/`, не начатых в этой сессии.
+
+### Коммит: рендерер-половинки D-009 / D-015 / D-053 (задание, пункт 4 — 3 из 4)
+
+**IDs:** D-009 (рендерер-половина), D-015 (рендерер-половина), D-053
+(рендерер-половина). D-013 — см. «Не сделано» ниже, найдена причина,
+почему это не тривиальная правка.
+
+**D-053 — рендерер отписывается от `system-suspend`.**
+`preload.js`'s `onSystemSuspend` возвращает функцию отписки;
+`frontend/src/main.tsx` вызывал её один раз на верхнем уровне модуля и
+отбрасывал результат. При повторном выполнении этого верхнеуровневого
+кода в ОДНОМ и том же жизненном цикле страницы (Vite dev-server HMR —
+именно это: переисполняет код верхнего уровня БЕЗ перезагрузки
+страницы, которая единственная рвёт слушателей preload-мира) второй
+подписчик наслаивался на первый. Безвредно по везению (функция снятия
+холда идемпотентна), не по конструкции. Правка: подписка вынесена в
+именованную функцию `subscribeToSystemSuspend()`, которая ПЕРВЫМ делом
+снимает свою же предыдущую подписку через модульный `let
+systemSuspendUnsubscribe`. TS control-flow narrowing не позволял
+написать это как голый top-level код (`Type 'never' has no call
+signatures]` — переменная типа `T | null`, инициализированная `null` на
+верхнем уровне модуля, статически сужается ДО `null` в первом же месте
+использования, потому что TS видит линейный проход один раз; функция —
+единственный способ заставить TS учитывать повторные вызовы).
+
+**D-009 — бейдж «Accessibility сломан».** `desktop/paste-capability.js`
+уже различал 4 состояния (`unknown`/`untrusted`/`active`/`broken`) и
+знал точный текст исправления (`pasteCapabilityMessage`), но это было
+видно пользователю ТОЛЬКО реактивно — внутри строки статуса капсулы
+ПОСЛЕ того, как вставка уже провалилась. Добавлен invoke-only мост
+(`ipcMain.handle("paste-capability:get-status", ...)` /
+`contextBridge.exposeInMainWorld("__transcriptorPasteCapability", ...)`)
+— та же форма, что уже используется `__transcriptorEngine` — вместо
+воскрешения удалённого коммитом 14 паттерна `executeJavaScript`-инъекции
+глобала, который никто не читал. Рендерер: `#pasteCapabilityNote` рядом
+с карточкой Shortcuts в Settings, скрыт по умолчанию, заполняется
+`refreshPasteCapabilityNote()` при загрузке и на каждый фокус окна
+(тот же ритм, что уже держит главный процесс —
+`ensurePasteCapabilityFresh("focus")` на `win.on("focus")`).
+
+**D-015 — рендерер выполняет ТУ ЖЕ миграцию хоткеев, что и главный
+процесс.** `frontend/src/main.tsx`'s `loadCfg` вручную повторял
+миграции 1 и 2 (`unpressablePaste`, `macFunctionPair`) и не реализовывал
+миграцию 3 (`winLinuxFunctionPair`, BUGS_AUDIT §6.10) — на
+Windows/Linux-конфиге с сохранённой парой F9/F10 главный процесс
+регистрировал `Control+Alt+Shift+R`, а Settings продолжали показывать
+`F9`, и следующий автосейв записывал F9/F10 обратно на диск НАВСЕГДА.
+Правка: `frontend/src/main.tsx` теперь импортирует
+`migrateShortcutPair` НАПРЯМУЮ из `desktop/shortcut-migration.js` —
+модуль чистый CommonJS без зависимостей Node (`require`/`fs` не
+используются), поэтому Vite/esbuild собирает его в рендерер-бандл так
+же, как уже собирались бы любые чистые JS-модули (`shortcut-defaults.json`
+уже читался на этапе сборки для тех же данных — теперь и правило едет
+тем же путём, только через рантайм-импорт, а не через `vite.config.ts`).
+Потребовалась одна опция компилятора: `"allowJs": true` в
+`frontend/tsconfig.json` (НЕ `checkJs` — содержимое `.js`-файлов
+по-прежнему не типизируется, только разрешение импорта). Собранный бандл
+проверен на присутствие `winLinuxFunctionPair` (`grep` по
+`dist/assets/index-*.js`) — миграция реально попала в поставляемый код,
+не просто резолвится на этапе типов.
+
+**Файлы:**
+- `frontend/src/main.tsx` — все три правки выше.
+- `frontend/tsconfig.json` — `allowJs: true`.
+- `frontend/index.html` — `#pasteCapabilityNote`.
+- `desktop/main.js` — `ipcMain.handle("paste-capability:get-status", ...)`;
+  обновлён устаревший комментарий у `lastAccessibilityTrusted`.
+- `desktop/preload.js` — `__transcriptorPasteCapability` мост.
+- `desktop/ipc-contract.test.js` — новый тест на канал
+  `paste-capability:get-status`; исправлен устаревший комментарий про
+  D-053 (говорил «рендерер отбрасывает — в долге», больше не так).
+- `frontend/tests/renderer-main-contract.test.ts` — три новых блока:
+  system-suspend retire-before-resubscribe (D-053); markup + wiring
+  бейджа Accessibility (D-009); импорт и реальное исполнение
+  `migrateShortcutPair` из `desktop/shortcut-migration.js`, включая
+  миграцию 3 (D-015).
+
+**Проверка:**
+```
+npm --prefix frontend run typecheck && npm --prefix frontend run lint && npm --prefix frontend test && npm --prefix frontend run build
+# typecheck/lint: чисто; test: 363 passed (было 356); build: 30 модулей
+# (было 29 — shortcut-migration.js реально вошёл в бандл), grep по
+# dist/assets/index-*.js подтверждает "winLinuxFunctionPair" в поставке
+npm --prefix desktop test && node --check desktop/main.js && node --check desktop/preload.js
+# 256 passed (было 255), оба чека чистые
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 -m unittest discover -s backend/tests
+# не тронуто этим коммитом; 819 passed
+```
+
+**Решения:**
+- Импорт `desktop/shortcut-migration.js` напрямую в `frontend/src`, а не
+  копирование или переписывание правила на TS — единственный способ
+  СВЯЗАТЬ обе стороны так, что расхождение снова невозможно; модуль уже
+  был спроектирован как чистый (никакого Node), что и сделало это
+  безопасным.
+- `paste-capability:get-status` — invoke-only (рендерер тянет), а не
+  push через `executeJavaScript` — рекомендация отчёта прямо называла
+  push-паттерн причиной провала прошлой попытки (глобал, который никто
+  не читал); используется УЖЕ существующий в кодовой базе паттерн
+  моста (`__transcriptorEngine`), а не третий.
+- `subscribeToSystemSuspend` вынесена в функцию не ради стиля — это
+  единственный способ, которым TypeScript'а control-flow analysis
+  корректно типизирует «отписаться, если уже подписан» для module-level
+  `let`.
+
+**Не сделано — D-013 («рендерер шлёт свой `statusKind`»), с находкой:**
+При чтении `desktop/main.js`'s `queryRendererState()`/поллинг-цикла
+восстановления (~5563-5576) выяснилось, что рендерер УЖЕ отдаёт
+`statusKind` через `window.__transcriptorLiveStatusSnapshot()`, и
+главный процесс его УЖЕ читает в `state.statusKind` — но игнорирует,
+классифицируя заново по тексту (`statusLower === "upscaling"` /
+`"processing"` / `"transcribing"`). Это не тривиальная замена «читай
+поле вместо текста»: словари не совпадают. Рендерер's `StatusKind`
+(`frontend/src/main.tsx:326`) — `idle | recording | processing | done |
+error | warning | info`, ОДНО значение `processing` на оба случая;
+`desktop/recording-status.js`'s `RECORDING_STATUS_KIND` различает
+`UPSCALING` и `TRANSCRIBING` отдельно, и именно это различие использует
+поллинг-цикл. Закрытие D-013 требует либо (а) более гранулярного
+словаря на стороне рендерера (новое поле или расширение `StatusKind`,
+влияющее на `statusKindToDotClass` и всё, что уже читает `StatusKind`),
+либо (б) таблицы соответствия между двумя словарями — обе имеют
+собственный blast radius в код, который эта сессия не может проверить
+на живой записи (тот же поллинг-цикл восстановления стопа, что и у
+F/7). В долг, с точной находкой вместо общего «не сделано».

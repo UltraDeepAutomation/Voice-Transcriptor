@@ -32,10 +32,13 @@ test("system-suspend is sent by main and subscribed to by the renderer bridge", 
   // What this guarantees is that the bridge OFFERS a way off, not that the
   // renderer takes it — a renderer reload destroys the preload world and
   // its listeners with it, so the reload was never the leak. The leak that
-  // IS possible is a renderer that subscribes more than once in one page
+  // WAS possible is a renderer that subscribes more than once in one page
   // lifetime and never unsubscribes, which is what the returned function is
-  // for. frontend/src/main.tsx currently discards it; that is a renderer
-  // change and it is in the debt ledger.
+  // for. frontend/src/main.tsx's subscribeToSystemSuspend (D-053) now
+  // retires its own prior subscription before installing a new one, so a
+  // second run of that top-level code (a Vite dev-server HMR update, which
+  // re-executes top-level code without a page reload) cannot stack a
+  // second listener.
   assert.match(
     preloadSource,
     /ipcRenderer\.removeListener\("system-suspend"/,
@@ -45,6 +48,22 @@ test("system-suspend is sent by main and subscribed to by the renderer bridge", 
     preloadSource,
     /return \(\) => \{/,
     "onSystemSuspend must RETURN the unsubscribe, not just define one",
+  );
+});
+
+test("paste-capability:get-status is invoked by the renderer bridge and handled by main (D-009)", () => {
+  // Accessibility trust was probed and decided in main
+  // (desktop/paste-capability.js) but never reached the renderer as
+  // anything but a message AFTER a paste had already failed. An earlier
+  // attempt pushed a global via executeJavaScript on a 30-second
+  // interval that nothing in frontend/ read; this is the invoke-only
+  // replacement, same shape as the engine bridge.
+  assert.match(preloadSource, /getStatus: \(\) => ipcRenderer\.invoke\("paste-capability:get-status"\)/);
+  assert.match(mainSource, /ipcMain\.handle\("paste-capability:get-status"/);
+  assert.match(
+    preloadSource,
+    /exposeInMainWorld\("__transcriptorPasteCapability"/,
+    "must be its own named bridge, not folded into an unrelated one",
   );
 });
 
