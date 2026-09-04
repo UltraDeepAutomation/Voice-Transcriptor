@@ -22,7 +22,7 @@ export interface LivePaneInput {
   recording: boolean;
   /** The first capture frame has been timestamped (startAt > 0). */
   started: boolean;
-  /** Elapsed time formatted by the app's single clock, e.g. "0:42". */
+  /** Elapsed time formatted by the app's single clock (``fmtTime``), e.g. "00:42". */
   timerText: string;
 }
 

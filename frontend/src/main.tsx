@@ -37,7 +37,7 @@ import {
 } from "./deepgram-dual";
 import { acceleratorToDisplayTokens } from "./shortcut-display";
 import { createGatedPoll, type GatedPoll } from "./gated-poll";
-import { installErrorAwareConsole } from "./error-text";
+import { installErrorAwareConsole, isGenericFetchFailure } from "./error-text";
 import {
   RECORDINGS_WINDOW_MINIMUM,
   grownWindowSize,
@@ -84,9 +84,12 @@ declare global {
 type Provider = "local" | "openrouter" | "deepgram" | "";
 type RemoteProvider = "openrouter" | "deepgram";
 type KeyProvider = "openrouter" | "deepgram";
-// Installed before any other module-level code can throw or log: a
-// failure during startup is exactly the one you cannot reproduce, and it
-// must not be recorded as "[object DOMException]".
+// Installed before any of THIS module's code can throw or log, which is
+// where startup failures actually happen — a failure during startup is
+// exactly the one you cannot reproduce, and it must not be recorded as
+// "[object DOMException]". It cannot be earlier than this: in an ES
+// module the importing body runs after every import has been evaluated.
+// That is harmless here because all twenty of them are pure.
 installErrorAwareConsole(console);
 
 type ViewName = "upload" | "record" | "recordings" | "settings";
@@ -442,7 +445,12 @@ interface LiveFinalStats {
  * every consumer should use its narrowed output.
  */
 type LiveWsMessage =
-  | { type: "segments"; segments: TranscriptSegment[]; isFinal: boolean; speechFinal: boolean }
+  // No ``isFinal``/``speechFinal``: they were parsed from ``is_final``
+  // and ``speech_final`` and read by nobody (``case "segments"`` ignored
+  // them), while ``backend/live.py`` does not send them at all — so for
+  // the local-assist path they were silently ``false``, a contract
+  // mismatch that only stayed harmless because there was no reader.
+  | { type: "segments"; segments: TranscriptSegment[] }
   | { type: "interim"; segment: TranscriptSegment }
   | {
       type: "final";
@@ -520,12 +528,7 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
     const segments = rawSegs
       .map((s) => normalizeTranscriptSegment(s))
       .filter((s): s is TranscriptSegment => !!s);
-    return {
-      type: "segments",
-      segments,
-      isFinal: !!obj.is_final,
-      speechFinal: !!obj.speech_final,
-    };
+    return { type: "segments", segments };
   }
 
   if (type === "interim") {
@@ -782,10 +785,12 @@ const fmtDateTime = (iso: string): string => {
   if (Number.isNaN(d.getTime())) return iso || "-";
   return d.toLocaleString();
 };
-const fmtDur = (sec: number): string => {
-  const s = Math.max(0, Math.floor(Number(sec) || 0));
-  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
-};
+/**
+ * Durations are formatted by the same clock as elapsed time. These were
+ * two byte-identical implementations under two names, which is two
+ * places for `mm:ss` to become something else.
+ */
+const fmtDur = fmtTime;
 const fmtMs = (ms: number): string => {
   const n = Math.max(0, Number(ms) || 0);
   if (n < 1000) return `${Math.round(n)} ms`;
@@ -1134,6 +1139,41 @@ const LEGACY_UPLOAD_QUEUE_STORAGE_KEY = "transcriptor.uploadQueue.v1";
 let uploadQueueServerVersion = 1;
 const LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX = "transcriptor.uploadQueue.corrupt.";
 const UPLOAD_QUEUE_SAVE_DEBOUNCE_MS = 180;
+/**
+ * How many quarantined payloads are kept per prefix.
+ *
+ * A snapshot that fails to parse, or that carries a schema version this
+ * build does not understand, is copied aside rather than thrown away —
+ * it is the only evidence of what went wrong, and it may be a
+ * recoverable transcript. But nothing ever read those keys and nothing
+ * ever removed them, so each incident left a full JSON payload in
+ * localStorage permanently. Keeping the most recent few preserves the
+ * salvage and bounds the cost; the keys are timestamped, so "most
+ * recent" is a lexical sort.
+ */
+const QUARANTINE_SNAPSHOTS_KEPT = 3;
+
+/**
+ * Copy a payload aside under a timestamped key, then prune the prefix.
+ */
+function quarantineCorruptSnapshot(prefix: string, raw: string): void {
+  try {
+    localStorage.setItem(`${prefix}${Date.now()}`, raw);
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) keys.push(key);
+    }
+    keys.sort();
+    for (const key of keys.slice(0, Math.max(0, keys.length - QUARANTINE_SNAPSHOTS_KEPT))) {
+      localStorage.removeItem(key);
+    }
+  } catch (e) {
+    // Quota or private mode. The salvage is best-effort by nature: the
+    // parse has already failed and the caller falls back regardless.
+    console.warn(`Quarantine of a corrupt snapshot under ${prefix} failed`, e);
+  }
+}
 let uploadQueueMaxPersistedItems = Number.MAX_SAFE_INTEGER;
 let uploadQueueMaxParallel = 1;
 let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
@@ -1910,7 +1950,7 @@ function applyHealthModelCatalog(catalog: unknown): void {
     }
   }
 
-  invalidateTranscriptionCatalog(); renderTranscriptionSelectors();
+  invalidateTranscriptionCatalog();
   renderTranscriptionSelectors();
   populateUpscaleModelOptions();
 }
@@ -2061,24 +2101,29 @@ function base64UrlEncodeUtf8(value: string): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+/**
+ * Escape a value for use inside an attribute selector.
+ *
+ * The hand-written fallback that used to stand here was unreachable —
+ * `CSS.escape` has shipped in every Chromium the shell can run on — and
+ * wrong where it was not: its `^-?\d` alternative matched TWO characters
+ * on a leading hyphen while the callback escaped only the first, so
+ * `"-5abc"` came out as `"\2d abc"` with the digit dropped, and its
+ * `\w` had no `u` flag, so it split surrogate pairs. Dead code that
+ * would misbehave if it ever ran is worse than no code: it reads as a
+ * guarantee.
+ *
+ * The one real caller passes a `data-recording-key`, which is already
+ * `encodeURIComponent`'d, so what remains is a formality that costs
+ * nothing.
+ */
 function cssEscape(value: string): string {
   const nativeEscape = globalThis.CSS?.escape;
-  if (typeof nativeEscape === "function") {
-    return nativeEscape(value);
-  }
-  return String(value).replace(/[\0-\x1f\x7f]|^-?\d|^-$|[^\w-]/g, (char, offset) => {
-    if (char === "\0") return "\uFFFD";
-    const code = char.charCodeAt(0);
-    const needsCodePointEscape =
-      code < 0x20 ||
-      code === 0x7f ||
-      (offset === 0 && /[0-9]/.test(char)) ||
-      (offset === 1 && value.charAt(0) === "-" && /[0-9]/.test(char));
-    if (needsCodePointEscape) {
-      return `\\${code.toString(16)} `;
-    }
-    return `\\${char}`;
-  });
+  if (typeof nativeEscape === "function") return nativeEscape(String(value));
+  // Quoted attribute-selector context: a backslash before every
+  // character that could end the string or the selector is sufficient
+  // and, unlike the previous attempt, cannot lose one.
+  return String(value).replace(/["'\\\]]/g, (char) => `\\${char}`);
 }
 
 function websocketAuthProtocols(): string[] {
@@ -2709,24 +2754,8 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   // VPN-needed message BEFORE the sanitize pass would filter them
   // as generic "TypeError".
   const lowRaw = raw.toLowerCase();
-  // "Load failed" is Safari/WebKit's generic message for an aborted
-  // or CORS-blocked fetch — but it ALSO appears inside legitimate
-  // backend errors like "failed to load model 'large-v3': file not
-  // found". Substring-matching the phrase wrongly redirected a model-
-  // missing error into the "offline, try VPN" explainer. Gate it on
-  // a full-string match instead so only the real generic WebKit
-  // network failure gets promoted.
-  const isGenericNetworkFail =
-    lowRaw === "failed to fetch" ||
-    lowRaw === "load failed" ||
-    lowRaw === "networkerror when attempting to fetch resource.";
   if (
-    isGenericNetworkFail ||
-    lowRaw.includes("typeerror: failed to fetch") ||
-    lowRaw.includes("err_internet_disconnected") ||
-    lowRaw.includes("err_name_not_resolved") ||
-    lowRaw.includes("err_connection_refused") ||
-    lowRaw.includes("err_connection_reset") ||
+    isGenericFetchFailure(lowRaw) ||
     // Any Deepgram-shaped backend error — file-transcription path
     // (via sanitizeUiErrorMessage) must get the same VPN/region
     // guidance as the live-stream path. Without this, Deepgram
@@ -2891,7 +2920,9 @@ function formatSegmentsForDisplay(segments: TranscriptSegment[], separator: stri
     if (seg.speaker !== undefined && seg.speaker !== lastSpeaker) {
       // New speaker — add a speaker-prefixed chunk.
       if (parts.length) parts.push("\n");
-      parts.push(`Speaker ${seg.speaker}: ${t}`);
+      // Deepgram numbers speakers from 0. "Speaker 0:" is an array
+      // index shown to a person; the first speaker is Speaker 1.
+      parts.push(`Speaker ${seg.speaker + 1}: ${t}`);
       lastSpeaker = seg.speaker;
     } else {
       if (parts.length && parts[parts.length - 1] !== "\n") {
@@ -3082,14 +3113,19 @@ function isMainProcessRecordingStatusActive(status = mainProcessRecordingStatus)
   return !!value && value !== "idle";
 }
 
-function scheduleDeferredRecordingsRefresh(_reason = "save", delayMs = 160): void {
+/**
+ * @param reason why the refresh was scheduled. Traced, not branched on —
+ *   five call sites compute a distinct label and it used to be received
+ *   as `_reason` and dropped, so the labels described nothing.
+ */
+function scheduleDeferredRecordingsRefresh(reason = "save", delayMs = 160): void {
   if (!deferredRecordingsRefreshPending) return;
   if (deferredRecordingsRefreshTimer) {
     window.clearTimeout(deferredRecordingsRefreshTimer);
   }
   deferredRecordingsRefreshTimer = window.setTimeout(() => {
     deferredRecordingsRefreshTimer = 0;
-    void flushDeferredRecordingsRefresh("timer");
+    void flushDeferredRecordingsRefresh(reason);
   }, Math.max(0, delayMs));
 }
 
@@ -3193,24 +3229,17 @@ function setRecordButton(recording: boolean): void {
   }
 }
 
+/**
+ * The status dot's modifier class.
+ *
+ * This was a nineteen-line `switch` mapping each `StatusKind` to a
+ * string equal to itself. The class names ARE the kinds — that is the
+ * contract with `styles.css`, and spelling it out twice only created a
+ * place for the two to disagree. `idle` deliberately has no rule there:
+ * the base `.window-status-dot` is the idle appearance.
+ */
 function statusKindToDotClass(kind: StatusKind): string {
-  switch (kind) {
-    case "recording":
-      return "recording";
-    case "processing":
-      return "processing";
-    case "done":
-      return "done";
-    case "error":
-      return "error";
-    case "warning":
-      return "warning";
-    case "info":
-      return "info";
-    case "idle":
-    default:
-      return "idle";
-  }
+  return kind || "idle";
 }
 
 /** Maximum length for a status line that fits the pill without
@@ -3454,22 +3483,7 @@ function explainNetworkError(err: unknown, context = ""): string {
     // most likely a regional block. Point to VPN or local fallback.
     return `${base}Deepgram is unreachable. It may be blocked in your region — try a VPN, or switch Provider to "local" in Settings.`;
   }
-  const isFetchFail =
-    low === "failed to fetch" ||
-    low.includes("networkerror") ||
-    low.includes("typeerror: fetch") ||
-    // "Load failed" is WebKit's generic fetch-failure message. Match
-    // it ONLY as a whole message or paired with TypeError — as a
-    // substring it wrongly catches backend errors like "failed to
-    // load model 'large-v3'" and tells the user to turn on a VPN.
-    // Must stay in lockstep with sanitizeUiErrorMessage above.
-    low === "load failed" ||
-    low === "typeerror: load failed" ||
-    low.includes("err_internet_disconnected") ||
-    low.includes("err_name_not_resolved") ||
-    low.includes("err_connection_refused") ||
-    low.includes("err_connection_reset");
-  if (!isFetchFail) return raw;
+  if (!isGenericFetchFailure(low)) return raw;
   const online = typeof navigator !== "undefined" ? navigator.onLine : true;
   if (!online) {
     return context
@@ -3915,7 +3929,7 @@ class OpfsPcmSink implements PcmSink {
 
     if (this.lastWriteError) {
       // 1.1.25 fix: previously returned an empty WAV here even though
-      // ``flushPending``'s catch branch (line ~1789) deliberately
+      // ``flushPending``'s catch branch deliberately
       // re-enqueues failed chunks into ``pendingChunks`` so finalize
       // can salvage them from RAM. Returning empty discarded the bytes
       // and forced the lower-fidelity WebM fallback for what was
@@ -5539,11 +5553,7 @@ function readLegacyLiveDraft(): PersistedLiveDraft | null {
   if (!raw) return null;
   const draft = parsePersistedLiveDraft(raw);
   if (!draft) {
-    try {
-      localStorage.setItem(`${LEGACY_LIVE_DRAFT_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
-    } catch (backupErr) {
-      console.warn("live draft: corrupt legacy backup failed", backupErr);
-    }
+    quarantineCorruptSnapshot(LEGACY_LIVE_DRAFT_CORRUPT_STORAGE_PREFIX, raw);
     clearLegacyLiveDraft();
     return null;
   }
@@ -6355,7 +6365,7 @@ async function runUpscaleIfEnabled(
         friendly = "OpenRouter is temporarily unavailable (provider-side error).\n\nTry again in a minute, or switch upscale model in Settings → Upscale.\n\nUsing original transcript.";
       } else if (low.includes("content filter") || low.includes("content policy") || low.includes("refused to")) {
         friendly = "Upscale model refused to process this text (content filter).\n\nThe original transcript is used as-is.";
-      } else if (low.includes("failed to fetch") || low.includes("networkerror") || low === "load failed") {
+      } else if (isGenericFetchFailure(low)) {
         friendly = "Upscale request failed: the OpenRouter API is unreachable.\n\nCheck your internet connection or try a VPN. OpenRouter is sometimes blocked in certain regions.\n\nUsing original transcript.";
       } else if (low.includes("unsupported upscale preset")) {
         friendly = "Upscale preset is missing.\n\nOpen Settings → Upscale and re-select a preset.";
@@ -8248,8 +8258,9 @@ $("retranscribeBtn").addEventListener("click", async () => {
   //
   // If no live session has ever started, `activeUiSessionToken` is "" —
   // but `isCurrentUiSession("")` has a legacy short-circuit that returns
-  // TRUE unconditionally (line ~457, treating empty as "no scope, always
-  // current"). That short-circuit makes our gate INERT in the most common
+  // TRUE unconditionally (see ``isCurrentUiSession``, which treats empty
+  // as "no scope, always current"). That short-circuit makes our gate
+  // INERT in the most common
   // retranscribe path (cold open → import recording → retranscribe → F9).
   // Generate a dedicated retranscribe token so the gate always evaluates
   // real equality and the fix actually prevents stale writes.
@@ -10276,7 +10287,11 @@ function resetOutputs(): void {
   $("upscaleLatency").textContent = "--";
   liveTimerText = "00:00";
   $("progressRow").hidden = true;
-  $("downloadRow").hidden = true;
+  // ``#downloadRow`` was removed from the markup: it was hidden here on
+  // every boot and never shown again, and its two <a href="#"> links had
+  // neither a click handler nor a CSS rule, so "Exports TXT / JSON"
+  // advertised a feature that did not exist and scrolled the pane when
+  // clicked. Export lives in History, on a recording that has been saved.
   $("progressFill").style.width = "0%";
   $("progressText").textContent = "0%";
   // Clear stale audio from the previous recording so the user
@@ -12081,7 +12096,7 @@ async function stopLive(
     releaseStopTransitionAfterCaptureDetach();
     return;
   }
-  // (transcribeStartedAt is captured at the top of stopLive — line ~6510)
+  // (``transcribeStartedAt`` is captured at the top of ``stopLive``)
   if (isCurrentUiSession(sessionUiToken)) {
     $("progressRow").hidden = false;
   }
@@ -12107,7 +12122,7 @@ async function stopLive(
     // InputFile``. The in-memory file is the lazy ``Blob([header,
     // OPFS-spool])`` from ``OpfsPcmSink.finalize()``; once
     // ``deferredSinkDestroy.destroy()`` runs (which already happened
-    // earlier in this function, around line 6754), the spool is gone
+    // earlier in this function), the spool is gone
     // and the lazy blob reads as zero bytes — uploads succeed with a
     // 200 status but the backend gets an empty payload, ffmpeg
     // raises "invalid data", and BOTH provider paths fail
@@ -13714,11 +13729,7 @@ function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | n
     parsed = JSON.parse(raw) as Partial<UploadQueueStoragePayload>;
   } catch (e) {
     console.warn("Legacy upload queue snapshot parse failed", e);
-    try {
-      localStorage.setItem(`${LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
-    } catch (backupErr) {
-      console.warn("Legacy upload queue corrupt snapshot backup failed", backupErr);
-    }
+    quarantineCorruptSnapshot(LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX, raw);
     return null;
   }
   // Schema gate (BUG-73): a snapshot from a NEWER schema must take the
@@ -13728,11 +13739,7 @@ function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | n
     console.warn(
       `Legacy upload queue snapshot version ${storedVersion} > supported ${uploadQueueServerVersion}, quarantining`,
     );
-    try {
-      localStorage.setItem(`${LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX}${Date.now()}`, raw);
-    } catch (backupErr) {
-      console.warn("Legacy upload queue future-version backup failed", backupErr);
-    }
+    quarantineCorruptSnapshot(LEGACY_UPLOAD_QUEUE_CORRUPT_STORAGE_PREFIX, raw);
     return null;
   }
   return parsed;
@@ -13952,9 +13959,9 @@ function setupUploadView(): void {
   if (browseBtn) {
     browseBtn.addEventListener("click", () => fileInput.click());
   }
-  // (Earlier ``provider.addEventListener("change", ...)`` block already
-  // wires both queueUiPreferencesSave AND updateUploadProviderHint at
-  // line ~8237. A duplicate listener here was attaching ANOTHER hint
+  // (The earlier ``provider.addEventListener("change", ...)`` block
+  // already wires both queueUiPreferencesSave AND
+  // updateUploadProviderHint. A duplicate listener here attached ANOTHER hint
   // refresh on every change, which leaked one stale-DOM-read closure
   // into the listener list per renderer reload. Removed.)
   // Provider is restored from /api/config in loadCfg(), after provider-key

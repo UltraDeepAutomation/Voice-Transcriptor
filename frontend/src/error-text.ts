@@ -106,3 +106,48 @@ export function installErrorAwareConsole(target: ConsoleLike): void {
   }
   marked.__transcriptorErrorAware = true;
 }
+
+/**
+ * "Is this the browser's generic 'the request did not happen' error?"
+ *
+ * One question, and it was being answered in three places with three
+ * different lists that had already drifted: `sanitizeUiErrorMessage`
+ * matched `"networkerror when attempting to fetch resource."` as a whole
+ * string, `explainNetworkError` matched `"networkerror"` as a substring
+ * and additionally knew `"typeerror: load failed"`, and the upscale
+ * error branch knew a third, shorter set. A comment on the second one
+ * asked for it to be kept "in lockstep" with the first, which is the
+ * request this function makes unnecessary.
+ *
+ * Two rules are load-bearing and easy to get wrong, so they are stated
+ * once here:
+ *
+ *   * "Load failed" — WebKit's generic message — matches only as a
+ *     WHOLE message. As a substring it catches real backend errors like
+ *     `failed to load model 'large-v3': file not found` and answers them
+ *     with advice to try a VPN.
+ *   * The `ERR_*` codes are Chromium's, and are matched as substrings
+ *     because they arrive embedded in longer messages.
+ *
+ * @param raw the message, in any case; it is lowercased here
+ */
+export function isGenericFetchFailure(raw: string): boolean {
+  const low = String(raw || "").trim().toLowerCase();
+  if (!low) return false;
+  const wholeMessage = [
+    "failed to fetch",
+    "load failed",
+    "typeerror: failed to fetch",
+    "typeerror: load failed",
+    "networkerror when attempting to fetch resource.",
+  ];
+  if (wholeMessage.includes(low)) return true;
+  const embedded = [
+    "typeerror: failed to fetch",
+    "err_internet_disconnected",
+    "err_name_not_resolved",
+    "err_connection_refused",
+    "err_connection_reset",
+  ];
+  return embedded.some((needle) => low.includes(needle));
+}

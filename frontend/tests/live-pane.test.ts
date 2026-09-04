@@ -14,11 +14,11 @@ describe("livePaneDisplayText", () => {
   });
 
   it("shows the status line once capture is live", () => {
-    const text = livePaneDisplayText({ ...base, recording: true, started: true, timerText: "0:42" });
+    const text = livePaneDisplayText({ ...base, recording: true, started: true, timerText: "00:42" });
     expect(text).toBe(
-      `${LIVE_PANE_STATUS_PREFIX} 0:42 — live preview is off; the transcript will appear here after Stop.`,
+      `${LIVE_PANE_STATUS_PREFIX} 00:42 — live preview is off; the transcript will appear here after Stop.`,
     );
-    expect(text).toContain("0:42");
+    expect(text).toContain("00:42");
     expect(text).toContain("after Stop");
   });
 

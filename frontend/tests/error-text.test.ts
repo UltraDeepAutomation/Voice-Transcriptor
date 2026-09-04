@@ -4,6 +4,7 @@ import {
   MAX_ERROR_TEXT,
   describeError,
   installErrorAwareConsole,
+  isGenericFetchFailure,
   needsErrorText,
 } from "../src/error-text";
 
@@ -115,5 +116,41 @@ describe("installErrorAwareConsole", () => {
     installErrorAwareConsole(c);
     c.warn("just", "strings", 5);
     expect(original).toHaveBeenCalledWith("just", "strings", 5);
+  });
+});
+
+describe("isGenericFetchFailure", () => {
+  it("recognises the browsers' generic fetch failures", () => {
+    for (const raw of [
+      "Failed to fetch",
+      "TypeError: Failed to fetch",
+      "Load failed",
+      "TypeError: Load failed",
+      "NetworkError when attempting to fetch resource.",
+    ]) {
+      expect(isGenericFetchFailure(raw), raw).toBe(true);
+    }
+  });
+
+  it("recognises Chromium's ERR_ codes inside a longer message", () => {
+    expect(isGenericFetchFailure("POST /api/config: net::ERR_CONNECTION_REFUSED")).toBe(true);
+    expect(isGenericFetchFailure("ERR_NAME_NOT_RESOLVED")).toBe(true);
+    expect(isGenericFetchFailure("something ERR_INTERNET_DISCONNECTED something")).toBe(true);
+    expect(isGenericFetchFailure("ERR_CONNECTION_RESET")).toBe(true);
+  });
+
+  it("does not treat a backend error that merely contains the words as a network failure", () => {
+    // The reason "load failed" is matched only as a whole message: this
+    // one used to be redirected into the "you are offline, try a VPN"
+    // explainer.
+    expect(isGenericFetchFailure("failed to load model 'large-v3': file not found")).toBe(false);
+    expect(isGenericFetchFailure("Deepgram HTTP 402: insufficient credits")).toBe(false);
+    expect(isGenericFetchFailure("Model load failed for gigaam-v2")).toBe(false);
+  });
+
+  it("is case- and whitespace-insensitive, and says no to nothing", () => {
+    expect(isGenericFetchFailure("  FAILED TO FETCH  ")).toBe(true);
+    expect(isGenericFetchFailure("")).toBe(false);
+    expect(isGenericFetchFailure("   ")).toBe(false);
   });
 });
