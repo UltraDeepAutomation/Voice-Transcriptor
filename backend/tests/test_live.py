@@ -90,14 +90,28 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
         self.assertEqual(raised.exception.status_code, 401)
 
     def test_http_header_token_authenticates(self):
-        request = type("FakeRequest", (), {})()
-        request.url = type("FakeURL", (), {"path": "/api/config"})()
-        request.headers = {"x-api-token": self.main.API_TOKEN}
-        request.query_params = {}
-        request.method = "GET"
-        request.client = type("FakeClient", (), {"host": "127.0.0.1"})()
+        # The positive case, asserted rather than merely executed: the
+        # test used to call the dependency and check nothing, so a
+        # short-circuit before the comparison — or an accept of the
+        # WRONG token — would have passed exactly the same way.
+        def _request(token: str):
+            request = type("FakeRequest", (), {})()
+            request.url = type("FakeURL", (), {"path": "/api/config"})()
+            request.headers = {"x-api-token": token}
+            request.query_params = {}
+            request.method = "GET"
+            request.client = type("FakeClient", (), {"host": "127.0.0.1"})()
+            return request
 
-        asyncio.run(self.main._require_api_auth(request))
+        self.assertIsNone(
+            asyncio.run(self.main._require_api_auth(_request(self.main.API_TOKEN)))
+        )
+
+        with self.assertRaises(self.main.HTTPException) as raised:
+            asyncio.run(
+                self.main._require_api_auth(_request(self.main.API_TOKEN + "x"))
+            )
+        self.assertEqual(raised.exception.status_code, 401)
 
     def test_network_probe_requires_token_but_health_does_not(self):
         # Asserted where the rule LIVES — on the route declarations.

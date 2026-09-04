@@ -35,13 +35,18 @@ logger = logging.getLogger(__name__)
 # it can emit a multi-MB stderr that we DON'T need beyond the first
 # few hundred bytes for diagnostics. Without this cap, a crash-loop
 # upload could OOM the backend.
-_FFMPEG_STDERR_CAP_BYTES = 64 * 1024
+_FFMPEG_STDERR_CAP_CHARS = 64 * 1024
 _REMOTE_COMPACT_TIMEOUT_SEC = 1800
 # The ceiling for a straight decode-to-16 kHz-WAV conversion, which is
 # what every LOCAL transcription starts with. Written out as ``300``
 # twice, next to a named ceiling for the remote path, so a change to one
 # left the other behind.
 _LOCAL_CONVERT_TIMEOUT_SEC = 300
+# Frames per block when splitting a stereo WAV into two mono files.
+# 262144 frames of int16 stereo is ~1 MB — enough that the per-block
+# overhead disappears, small enough that a two-hour recording never
+# becomes a resident array.
+_SPLIT_BLOCK_FRAMES = 1 << 18
 _FFMPEG_DECODE_ERROR_PATTERNS = (
     "partial file",
     "input buffer exhausted",
@@ -63,7 +68,13 @@ def _ffmpeg_stderr_has_decode_error(stderr_text: str) -> bool:
 
 
 def _bounded_stderr_reader(pipe, cap: int) -> list[str]:
-    """Read lines off *pipe* until EOF, keeping at most *cap* bytes.
+    """Read lines off *pipe* until EOF, keeping at most *cap* CHARACTERS.
+
+    Characters, not bytes: the pipe is opened in text mode, so ``len``
+    of a line counts code points and a UTF-8 diagnostic can occupy up to
+    four times the cap on disk. The cap exists to stop a multi-MB stderr
+    from a corrupt input reaching the heap, and it does that either way
+    — the name is what was wrong.
 
     Continues consuming past the cap so the writer (ffmpeg) is not
     blocked on a full OS pipe buffer — dropping beyond-cap bytes
@@ -129,6 +140,23 @@ def _describe_ffmpeg_file(path: Optional[str]) -> str:
         return name
 
 
+def _kill_and_reap(proc: "subprocess.Popen", why: str) -> None:
+    """Kill ffmpeg and collect it; say so if it will not go.
+
+    A ``TimeoutExpired`` after ``kill()`` used to be swallowed, which
+    leaves the child unreaped — a zombie for the life of the backend,
+    and no record that one exists.
+    """
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "ffmpeg did not exit within 5s of SIGKILL (%s); pid=%s left unreaped",
+            why, proc.pid,
+        )
+
+
 def _run_ffmpeg(
     cmd: list[str],
     timeout_sec: int,
@@ -170,7 +198,7 @@ def _run_ffmpeg(
     collected: list[str] = []
     reader = threading.Thread(
         target=lambda: collected.extend(
-            _bounded_stderr_reader(proc.stderr, _FFMPEG_STDERR_CAP_BYTES)
+            _bounded_stderr_reader(proc.stderr, _FFMPEG_STDERR_CAP_CHARS)
         ),
         name="ffmpeg-stderr-reader",
         daemon=True,
@@ -181,11 +209,7 @@ def _run_ffmpeg(
             deadline = time.monotonic() + timeout_sec
             while True:
                 if cancel_event is not None and cancel_event.is_set():
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    _kill_and_reap(proc, "cancelled")
                     raise AudioError("ffmpeg conversion cancelled")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -196,14 +220,19 @@ def _run_ffmpeg(
                 except subprocess.TimeoutExpired:
                     continue
         except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            _kill_and_reap(proc, "timed out")
             raise AudioError(f"ffmpeg conversion timed out after {timeout_sec}s")
-        reader.join(timeout=5)
     finally:
+        # The reader thread is joined on EVERY exit — success, timeout
+        # and cancellation alike. It used to be joined only on success,
+        # so the two failure paths read ``collected`` while the thread
+        # could still be appending to it, and the diagnostic string
+        # those paths exist to produce could come out truncated or
+        # interleaved. It is also the only place stderr is drained, so
+        # closing the pipe before joining races the reader.
+        reader.join(timeout=5)
+        if reader.is_alive():
+            logger.warning("ffmpeg stderr reader did not finish within 5s")
         try:
             if proc.stderr is not None and not proc.stderr.closed:
                 proc.stderr.close()
@@ -555,14 +584,11 @@ def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
 
     Returns (ch1_path, ch2_path). If mono, returns (mono_path, None) with mono_path=None (caller can use original).
     """
-    data, sr = load_wav(path_wav_16k)
-    if sr != LIVE_SAMPLE_RATE_HZ:
-        raise AudioError(f"Expected {LIVE_SAMPLE_RATE_HZ} Hz WAV input")
-    ch = data.shape[1]
-    if ch == 1:
-        return None, None
-    if ch < 2:
-        return None, None
+    with sf.SoundFile(path_wav_16k) as probe:
+        if probe.samplerate != LIVE_SAMPLE_RATE_HZ:
+            raise AudioError(f"Expected {LIVE_SAMPLE_RATE_HZ} Hz WAV input")
+        if probe.channels < 2:
+            return None, None
 
     base, _ = os.path.splitext(path_wav_16k)
     ch1 = base + ".ch1.wav"
@@ -573,8 +599,33 @@ def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
     # ch1/ch2.wav that no orphan sweep recognised.
     tmp_ch1 = f"{ch1}.tmp-{uuid.uuid4().hex}"
     tmp_ch2 = f"{ch2}.tmp-{uuid.uuid4().hex}"
-    write_wav(tmp_ch1, data[:, 0:1], LIVE_SAMPLE_RATE_HZ)
-    write_wav(tmp_ch2, data[:, 1:2], LIVE_SAMPLE_RATE_HZ)
+    # STREAMED, in blocks. ``load_wav`` returns float32, so a two-hour
+    # 16 kHz stereo file was 921 MB resident plus a contiguous copy per
+    # channel — on a path this module has already converted to streaming
+    # everywhere else, with a docstring saying why ("OOM-kills 8-16 GB
+    # hosts"). This was the one place it had not been applied.
+    try:
+        with sf.SoundFile(path_wav_16k) as src, \
+                sf.SoundFile(
+                    tmp_ch1, "w", samplerate=LIVE_SAMPLE_RATE_HZ,
+                    channels=1, subtype="PCM_16", format="WAV",
+                ) as dst1, \
+                sf.SoundFile(
+                    tmp_ch2, "w", samplerate=LIVE_SAMPLE_RATE_HZ,
+                    channels=1, subtype="PCM_16", format="WAV",
+                ) as dst2:
+            for block in src.blocks(
+                blocksize=_SPLIT_BLOCK_FRAMES, dtype="int16", always_2d=True
+            ):
+                dst1.write(block[:, 0])
+                dst2.write(block[:, 1])
+    except BaseException:
+        for tmp in (tmp_ch1, tmp_ch2):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
     os.replace(tmp_ch1, ch1)
     os.replace(tmp_ch2, ch2)
     return ch1, ch2

@@ -780,7 +780,10 @@ _ws_windows: dict[str, deque[float]] = defaultdict(deque)
 # the successful result for ``_LIVE_PROMOTE_CACHE_TTL_SEC`` so retries
 # observe the same response.
 _live_promote_lock = threading.Lock()
-_live_promote_session_locks: dict[str, threading.Lock] = {}
+# session id -> (lock, number of callers currently holding a reference).
+# The count is what makes an entry safe to remove: see
+# _acquire_session_promote_lock.
+_live_promote_session_locks: dict[str, tuple[threading.Lock, int]] = {}
 _live_promote_cache: dict[str, tuple[float, dict]] = {}
 _LIVE_PROMOTE_CACHE_TTL_SEC = 60.0
 
@@ -1207,25 +1210,44 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
 
 
 def _acquire_session_promote_lock(session_id: str) -> threading.Lock:
-    """Return a stable per-session lock.
+    """Return a stable per-session lock, and count this holder.
 
     The registry dict is protected by ``_live_promote_lock`` so two
     concurrent callers never race to create their own lock instance.
+
+    The COUNT is what makes the registry entry safe to remove. It used
+    to be popped unconditionally when a caller finished, while a second
+    caller could still be blocked on that very object — so a THIRD
+    caller found nothing, created a fresh ``Lock`` and entered the body
+    beside the second. The idempotency cache hides that on the happy
+    path; the paths that cache nothing (404/400/413/409) do not, and two
+    promotes of one session could then run at once.
     """
     with _live_promote_lock:
-        lock = _live_promote_session_locks.get(session_id)
+        lock, waiters = _live_promote_session_locks.get(
+            session_id, (None, 0)
+        )
         if lock is None:
             lock = threading.Lock()
-            _live_promote_session_locks[session_id] = lock
+        _live_promote_session_locks[session_id] = (lock, waiters + 1)
         return lock
 
 
 def _release_session_promote_lock(session_id: str) -> None:
-    """Drop the per-session lock once the session has been fully
-    promoted (or proven absent). The cache entry survives the lock so
-    retries still hit a fast idempotent path."""
+    """Drop this holder, and the registry entry once nobody is left.
+
+    The idempotency cache entry survives either way, so retries still
+    hit the fast path.
+    """
     with _live_promote_lock:
-        _live_promote_session_locks.pop(session_id, None)
+        entry = _live_promote_session_locks.get(session_id)
+        if entry is None:
+            return
+        lock, waiters = entry
+        if waiters <= 1:
+            _live_promote_session_locks.pop(session_id, None)
+        else:
+            _live_promote_session_locks[session_id] = (lock, waiters - 1)
 
 
 def _lookup_live_promote_cache(session_id: str) -> Optional[dict]:

@@ -7,11 +7,21 @@ for first render and repeats it through /api/health for refreshes.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from importlib.util import find_spec
 
 
+@lru_cache(maxsize=1)
 def gigaam_available() -> bool:
-    """True when the GigaAM engine can be imported in this runtime."""
+    """True when the GigaAM engine can be imported in this runtime.
+
+    Cached, because the answer cannot change inside one process and the
+    question is asked on a POLLED path: ``/api/health`` reaches it
+    through ``health_model_catalog`` roughly every ten seconds, and for
+    a module that is NOT installed ``find_spec`` walks the whole
+    ``sys.path`` before saying so. ``cache_clear()`` is available to a
+    test that installs or removes the package under it.
+    """
     return find_spec("gigaam") is not None and find_spec("torch") is not None
 
 

@@ -8,6 +8,10 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 TERMINAL_JOB_PRUNE_GRACE = timedelta(minutes=15)
+# How far above ``max_jobs`` the store may grow before unobserved
+# terminal jobs are evicted anyway. Three times leaves ample room for a
+# client that is merely slow, and bounds a client that never polls.
+_HARD_JOB_LIMIT_FACTOR = 3
 
 # ── Why the lifecycle is logged HERE ────────────────────────────────────
 #
@@ -94,6 +98,36 @@ class JobStore:
         drop = len(self._jobs) - self.max_jobs
         for job in evictable[:drop]:
             self._jobs.pop(job.id, None)
+
+        # The soft cap above has a HARD one behind it. A client that
+        # never polls — a closed renderer, a fire-and-forget script —
+        # leaves every job unobserved and therefore unevictable, and each
+        # one holds its full ``result``, raw provider payload included,
+        # for the life of the process. Above this ceiling the oldest
+        # TERMINAL jobs go whether they were observed or not: their
+        # results are already unreachable in practice, and the
+        # alternative is unbounded growth. Running jobs are never
+        # touched — evicting one loses a transcription in progress.
+        if len(self._jobs) <= self.max_jobs * _HARD_JOB_LIMIT_FACTOR:
+            return
+        terminal = sorted(
+            [
+                j for j in self._jobs.values()
+                if j.status in ("done", "error", "cancelled")
+            ],
+            key=lambda j: (j.terminal_observed_at or j.created_at, j.created_at),
+        )
+        overflow = len(self._jobs) - self.max_jobs
+        dropped = 0
+        for job in terminal[:overflow]:
+            if self._jobs.pop(job.id, None) is not None:
+                dropped += 1
+        if dropped:
+            logger.warning(
+                "job store above its hard ceiling (%d jobs, cap %d); evicted "
+                "%d unobserved terminal job(s) — a client is not polling",
+                len(self._jobs) + dropped, self.max_jobs, dropped,
+            )
 
     def create(self, job_id: str) -> Job:
         with self._lock:

@@ -157,12 +157,21 @@ def _write_wav(audio_16k_mono: np.ndarray) -> Path:
     handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     handle.close()
     path = Path(handle.name)
-    sf.write(
-        str(path),
-        np.asarray(audio_16k_mono, dtype=np.float32),
-        LIVE_SAMPLE_RATE_HZ,
-        subtype="PCM_16",
-    )
+    try:
+        sf.write(
+            str(path),
+            np.asarray(audio_16k_mono, dtype=np.float32),
+            LIVE_SAMPLE_RATE_HZ,
+            subtype="PCM_16",
+        )
+    except BaseException:
+        # The file EXISTS from the moment NamedTemporaryFile returns, so
+        # a write that raises (disk full, a bad dtype) leaves it behind
+        # with no caller holding a path to unlink — and it does not match
+        # this project's ``.tmp-<hex>`` convention, so no sweeper finds
+        # it either. One zero-byte file in the system temp per failure.
+        path.unlink(missing_ok=True)
+        raise
     return path
 
 

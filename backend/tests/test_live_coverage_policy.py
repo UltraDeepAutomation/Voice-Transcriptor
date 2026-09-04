@@ -122,10 +122,23 @@ class LiveTranscriptAdoptionPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         node = shutil.which("node")
+        # These are the ONLY tests for this module, and a silent skip on
+        # a runner without the frontend installed is exactly where the
+        # cover is needed most — a fresh clone, or CI. Under ``CI`` the
+        # missing toolchain is a FAILURE of the run, not an absence of
+        # the test (B-089).
+        missing = ""
         if not node:
-            raise unittest.SkipTest("node is not installed")
-        if not TSC.exists():
-            raise unittest.SkipTest("frontend/node_modules is not installed")
+            missing = "node is not installed"
+        elif not TSC.exists():
+            missing = "frontend/node_modules is not installed (npm --prefix frontend ci)"
+        if missing:
+            if os.environ.get("CI"):
+                raise AssertionError(
+                    f"{missing} — this module is the only cover for "
+                    f"{POLICY_SOURCE.name}, so CI must not skip it"
+                )
+            raise unittest.SkipTest(missing)
 
         cls._tmp = tempfile.TemporaryDirectory()
         work = Path(cls._tmp.name)

@@ -547,6 +547,55 @@ def _preserve_redacted_provider_keys(update: Dict[str, Any], current: Dict[str, 
     return update
 
 
+def _adopt_legacy_encryption_key() -> None:
+    """Take the legacy install's Fernet key, when ours protects nothing.
+
+    Called only from ``_migrate_legacy_data``, and only on the branch
+    where there is no local ``config.json`` — so the key this process
+    generated at import has not encrypted anything yet and losing it
+    loses nothing. Everything else about the keyfile rule is unchanged:
+    a key with local data behind it is never replaced.
+    """
+    global _FERNET_KEY, _FERNET
+
+    if not _HAS_CRYPTO:
+        return
+    legacy_key_path = LEGACY_DATA_DIR / _KEYFILE.name
+    try:
+        raw = legacy_key_path.read_bytes().strip()
+    except OSError:
+        return
+    if not raw:
+        return
+    try:
+        cipher = Fernet(raw)
+    except Exception as e:
+        logger.warning(
+            "legacy encryption keyfile at %s is not usable (%s); the migrated "
+            "config's provider keys will not decrypt",
+            legacy_key_path, e,
+        )
+        return
+    try:
+        _KEYFILE.unlink(missing_ok=True)
+        fd = os.open(str(_KEYFILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        logger.error(
+            "could not adopt the legacy encryption keyfile at %s: %s — the "
+            "migrated config's provider keys will not decrypt",
+            legacy_key_path, e,
+        )
+        return
+    _FERNET_KEY = raw
+    _FERNET = cipher
+    logger.info("adopted the legacy encryption key from %s", LEGACY_DATA_DIR)
+
+
 def _migrate_legacy_data() -> None:
     # Packaged app previously stored data inside app resources; migrate once
     # to a stable user directory.
@@ -555,9 +604,22 @@ def _migrate_legacy_data() -> None:
     if not LEGACY_DATA_DIR.exists() or not LEGACY_DATA_DIR.is_dir():
         return
     try:
-        # Copy config if new config is missing.
+        # Copy config if new config is missing — AND the key that
+        # decrypts it. ``config.json`` stores provider keys as ``enc:``
+        # ciphertext, so moving the config alone produced one whose
+        # secrets decrypt to "" on the first read: the user migrates and
+        # silently finds every API key blank.
+        #
+        # The keyfile at this point is one THIS boot generated moments
+        # ago (``_load_or_create_fernet_key`` runs at import), and since
+        # there is no local ``config.json`` yet it protects nothing —
+        # which is the one condition under which the "never replace an
+        # existing keyfile" rule has nothing to protect. The legacy key
+        # is adopted only then, only if it is a real Fernet key, and the
+        # module's cipher is rebuilt from it before the config lands.
         legacy_cfg = LEGACY_DATA_DIR / "config.json"
         if legacy_cfg.exists() and not CONFIG_PATH.exists():
+            _adopt_legacy_encryption_key()
             atomic_copy_file(legacy_cfg, CONFIG_PATH)
 
         # Copy recordings if destination is empty.

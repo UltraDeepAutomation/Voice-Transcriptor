@@ -153,8 +153,18 @@ class RemoteChunkingTests(unittest.TestCase):
         self.assertEqual(models, ["nova-3", "legacy-nova"])
 
     def test_live_recovery_helpers_are_optional(self):
-        self.main._record_recovery_chunk(None, b"pcm")
-        self.main._mark_recovery_error(None)
+        # A session with no recovery spool must be a NO-OP: not a crash,
+        # not an implicitly created spool, and not a warning about a
+        # spool nobody asked for. The test used to call both helpers and
+        # assert nothing at all, so a helper that started fabricating a
+        # recovery dict out of ``None`` — or swallowing a real error —
+        # would have stayed green.
+        self.assertIsNone(self.main._record_recovery_chunk(None, b"pcm"))
+        self.assertIsNone(self.main._mark_recovery_error(None))
+        with mock.patch.object(self.main.logger, "warning") as warn:
+            self.main._record_recovery_chunk(None, b"pcm")
+            self.main._mark_recovery_error(None)
+        warn.assert_not_called()
 
     def test_live_recovery_write_failure_is_latched(self):
         class FailingPcmFile:

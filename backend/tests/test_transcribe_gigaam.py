@@ -239,15 +239,29 @@ class GigaAMDispatchTests(unittest.TestCase):
         self.assertAlmostEqual(starts[2], 37.7, places=6)
 
     def test_unavailable_engine_reports_reason_not_crash(self):
+        # Forced, not hoped for. Popping ``sys.modules`` does not stop an
+        # import from disk, so on a machine WITH the package installed
+        # this asked ``assertIsInstance(None, str)`` and failed; on a
+        # machine without it, an empty string would have satisfied
+        # "reports a reason". ``{"gigaam": None}`` makes the import
+        # raise, which is the state under test.
+        from unittest import mock as _mock
+
         from backend import transcribe_gigaam
 
-        saved = sys.modules.pop("gigaam", None)
-        try:
+        with _mock.patch.dict(sys.modules, {"gigaam": None}):
             reason = transcribe_gigaam.gigaam_import_error()
-            self.assertIsInstance(reason, str)
-        finally:
-            if saved is not None:
-                sys.modules["gigaam"] = saved
+        self.assertIsInstance(reason, str)
+        self.assertTrue(reason.strip(), "no reason was reported")
+        self.assertIn("Error", reason)
+
+    def test_an_available_engine_reports_no_reason(self):
+        from unittest import mock as _mock
+
+        from backend import transcribe_gigaam
+
+        with _mock.patch.dict(sys.modules, {"gigaam": _mock.Mock()}):
+            self.assertIsNone(transcribe_gigaam.gigaam_import_error())
 
 
 class GigaAMWordConventionTests(unittest.TestCase):

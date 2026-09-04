@@ -233,6 +233,22 @@ def _session() -> DeepgramLiveSession:
 
 
 class TailGuardTests(unittest.IsolatedAsyncioTestCase):
+    """What the stop retries a Finalize for, and what it does not.
+
+    These cases are about the DECISION, never about how long the wait
+    is — so they must not pay the real ceiling. Each of the three used
+    to sleep through ``FINALIZE_FLUSH_WAIT_SEC`` (3 s) twice with the
+    upstream deliberately silent, which is most of this module's twelve
+    seconds and the wall-clock style B-024 came out of.
+    """
+
+    def setUp(self) -> None:
+        patcher = mock.patch(
+            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_retry_fires_when_recognised_speech_runs_past_last_final(self):
         session = _session()
         ws = session._ws
