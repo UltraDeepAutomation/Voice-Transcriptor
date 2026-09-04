@@ -439,6 +439,8 @@ class _FakeLiveSession:
     close_called: bool = False
     discard_called: bool = False
     undelivered: list = field(default_factory=list)
+    drain_running: bool = False
+    drain_running_at_snapshot: Optional[bool] = None
 
     async def send_pcm(self, chunk: bytes) -> None:
         if self.send_error is not None:
@@ -448,8 +450,15 @@ class _FakeLiveSession:
     async def drain_transcript(self, on_budget=None) -> dict:
         if on_budget is not None:
             on_budget(2.0, False)
-        if self.drain_delay:
-            await asyncio.sleep(self.drain_delay)
+        self.drain_running = True
+        try:
+            if self.drain_delay:
+                await asyncio.sleep(self.drain_delay)
+        finally:
+            # Set only once the coroutine has actually unwound — the
+            # facade must not snapshot or shut down while it is still
+            # between these two lines.
+            self.drain_running = False
         if self.drain_error is not None:
             raise self.drain_error
         return dict(self.drain_result)
@@ -458,6 +467,7 @@ class _FakeLiveSession:
         return list(self.holes)
 
     def partial_result(self) -> dict:
+        self.drain_running_at_snapshot = self.drain_running
         return dict(
             self.partial_result_data
             if self.partial_result_data is not None
@@ -677,6 +687,25 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(envelope["text"], "before after")
         self.assertIs(envelope["stats"]["dual_stream"], True)
         self.assertFalse(dual.secondary_failed)
+
+    async def test_a_late_secondary_is_awaited_before_it_is_snapshotted(self):
+        # B-011: the timeout path cancelled the secondary's drain and
+        # went straight on to ``partial_result()`` and, one line later
+        # in the caller, ``shutdown()``. The abandoned coroutine is
+        # still appending its interim-splice fallback segments to the
+        # very list being snapshotted, and still holds the socket
+        # ``shutdown()`` is about to send ``CloseStream`` on. Cancelling
+        # is a request; only awaiting is the answer.
+        primary = _primary()
+        secondary = _secondary(drain_delay=10.0)
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        with self.assertLogs("backend.deepgram_dual", level="WARNING"):
+            await dual.drain_transcript(on_budget=lambda b, more: None)
+        self.assertIs(
+            secondary.drain_running_at_snapshot,
+            False,
+            "the secondary's drain was still running when it was snapshotted",
+        )
 
     async def test_uncovered_speech_is_measured_on_the_merged_words(self):
         primary = _primary(holes=[(2.0, 2.5)])

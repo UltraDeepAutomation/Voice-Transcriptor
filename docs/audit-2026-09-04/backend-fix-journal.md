@@ -173,3 +173,53 @@ OK
 * *Попутно:* провал первичного коннекта теперь закрывает уже открытый сокет второго чтения (`_discard_secondary_acquire`) — раньше его просто не существовало, потому что второй `acquire` начинался после успеха первого.
 
 **Не сделано:** —
+
+---
+
+## Коммит 5 — отмена, управляющие кадры и порядок стопа
+
+**Заголовок:** «A cancelled stop stops, a control frame is never cancelled mid-write, and a socket swap can no longer be pulled out from under the finalize»
+
+**ID:** B-008 (P1), B-009 (P1), B-011 (P1, «не баг» — см. решения), B-012 (P1), B-083 (P2, вторая половина — импорты посреди модуля).
+
+**Файлы:** `backend/async_tasks.py` (новый), `backend/main.py`, `backend/remote_deepgram_live.py`, `backend/deepgram_dual.py`, `backend/deepgram_warm.py`, `backend/tests/test_live_teardown.py` (новый), `backend/tests/test_deepgram_warm.py`, `backend/tests/test_deepgram_dual.py`.
+
+**Верификация.**
+
+```
+$ grep -rn "except (asyncio.CancelledError, Exception)" backend --include="*.py" | grep -v tests | wc -l
+ДО: 11    ПОСЛЕ: 0
+```
+(в отчёте было 13 — два места закрыты коммитами `3b8f5a8`/`ea25b4f`.)
+
+Новые тесты на коде ДО правки:
+```
+FAIL: test_a_swap_in_flight_is_waited_for_before_the_drain
+AssertionError: True is not false : the stop finalized on the socket the swap was about to discard
+```
+(проверено на `ea25b4f` c добавленным `_WARM_SWAP_GRACE_SEC = 0.0`, иначе `mock.patch.object` не к чему прицепиться.)
+
+Полный набор:
+```
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 -m unittest discover -s backend/tests
+Ran 675 tests in 36.970s
+OK
+```
+(662 → 675.)
+
+**Решения.**
+
+* **B-008.** *Выбрано:* один помощник `backend/async_tasks.py` (`await_cancelled`, `cancel_and_await`, `cancel_and_collect`) вместо одиннадцати копий идиомы.
+  *Важная поправка к предложенному в отчёте коду:* проверки `if not task.cancelled(): raise` **недостаточно**. Отмена корутины, которая ждёт другую задачу, отменяет и ту задачу, поэтому `task.cancelled()` истинно и в «нашем» случае тоже. Тест `test_our_own_cancellation_propagates` падал ровно на этом. Решающий вопрос — `asyncio.current_task().cancelling() > 0` (счётчик запросов отмены на НАС); он задаётся первым, `task.cancelled()` остаётся вторым.
+  *Отвергнуто:* `contextlib.suppress(asyncio.CancelledError)` — то же самое подавление, только короче.
+* **B-009.** *Выбрано:* `DeepgramLiveSession._send_control` — запись не отменяется никогда; зависшая ограничивается закрытием сокета, что и освобождает запись. Это дословно то правило, которое `send_pcm` уже формулирует и применяет к аудио-пути. Порог — новая именованная `CONTROL_SEND_WEDGE_SEC = 5.0`, те же 5 с, что были у `wait_for`, чтобы момент обнаружения не сдвинулся.
+  *Плюс:* при отмене НАС управляющая запись тоже не отменяется — сокет закрывается, запись собирается, отмена пробрасывается.
+* **B-012.** *Выбрано:* заявка на замену снимается ПЕРЕД ожиданием sender'а (раньше `warm_probe` отменялся после — слишком поздно, чтобы помешать замене начаться), а уже начатой замене даётся её собственный бюджет коннекта: `_WARM_SWAP_GRACE_SEC = DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC + DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC`.
+  *Почему выведено, а не выбрано числом:* замена ждёт коннект, значит её отсрочка — это бюджет коннекта; отдельная константа отстала бы от изменения любой из двух.
+  *Отвергнуто:* «блокировать замену флагом и продолжать стоп немедленно» — тогда стоп финализируется на сокете, который замена уже признала мёртвым, то есть тот же потерянный транскрипт другой дорогой.
+  *Оставлено:* если замена не уложилась и в grace, это `logger.error` с явным текстом — потеря будет объяснимой, а не загадочной.
+* **B-011 — «не баг» (измерено).** `asyncio.wait_for` в Python 3.12 сам отменяет и **дожидается** внутреннюю задачу перед тем, как поднять `TimeoutError` (`_cancel_and_wait`), поэтому к моменту `partial_result()` вторичный drain уже завершён. Написанный по находке тест (`test_a_late_secondary_is_awaited_before_it_is_snapshotted`) проходит и ДО правки. Замена `secondary_task.cancel()` на `cancel_and_await` оставлена: она делает инвариант явным и не зависит от того, останется ли эта деталь `wait_for` в следующей версии Python.
+* **B-083 (вторая половина).** Шесть импортов из `remote_deepgram_live` переехали с 1000-й строки в начало файла; `# noqa: E402` больше не нужны. Все шесть — листовые модули, цикла нет (проверено импортом).
+* *Попутно:* `_WarmFakeUpstream` дополнен `stream_death_sec`, чтобы путь восстановления в тестах обработчика исполнялся целиком.
+
+**Не сделано:** —

@@ -93,6 +93,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from backend.async_tasks import cancel_and_collect
 from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveError,
@@ -559,17 +560,9 @@ class DeepgramWarmPool:
             if session is not None:
                 await _quiet_close(session)
             return
-        task.cancel()
-        session = None
-        try:
-            session = await task
-        except asyncio.CancelledError:
-            # Only the cancellation OF THAT TASK is expected here. Our
-            # own — the pool being closed with the app — must propagate.
-            if not task.cancelled():
-                raise
-        except Exception as e:
-            logger.debug("deepgram-live: cancelled warm connect ended with %s", e)
+        session = await cancel_and_collect(
+            task, what="deepgram warm connect", log=logger
+        )
         if session is not None:
             # ``cancel()`` lost the race: the connect had already
             # returned past its last await, so this is a live, billed

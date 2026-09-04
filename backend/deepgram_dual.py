@@ -51,6 +51,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
+from backend.async_tasks import cancel_and_await
 from backend.remote_deepgram_live import (
     CROSS_FINAL_NGRAM_MAX_WORDS,
     INTERIM_WORD_GAP_SPLIT_SEC,
@@ -943,7 +944,16 @@ class DualLiveSession:
                     secondary_task, timeout=max(0.1, ceiling)
                 )
             except asyncio.TimeoutError:
-                secondary_task.cancel()
+                # Wait for the cancellation to LAND before snapshotting.
+                # The abandoned ``drain_transcript`` is still mutating
+                # the secondary's ``_finalized_segments`` (its interim
+                # splice appends fallback segments), and the caller runs
+                # ``shutdown()`` the moment this method returns — two
+                # coroutines writing one socket, one of them sending
+                # ``Finalize`` while the other sends ``CloseStream``.
+                await cancel_and_await(
+                    secondary_task, what="dual-stream secondary drain", log=logger
+                )
                 # The secondary is LATE, not WRONG: its own recv loop has
                 # been appending finalized segments the whole time,
                 # independently of its (now-abandoned) drain_transcript()

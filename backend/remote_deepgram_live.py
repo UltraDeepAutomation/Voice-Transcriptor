@@ -56,11 +56,30 @@ import websockets
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
+# All leaf modules — no import cycle, which is why these no longer sit
+# 950 lines down behind six ``# noqa: E402`` markers. ``DEEPGRAM_LIVE_URL``
+# comes from the same centralised host as the REST module, so a regional
+# override (``TRANSCRIPTOR_DEEPGRAM_HOST``) sets both at once.
+from backend.async_tasks import await_cancelled, cancel_and_await
+from backend.audio_constants import LIVE_PCM_BYTES_PER_SEC, LIVE_SAMPLE_RATE_HZ
+from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
+from backend.deepgram_format import shared_format_params
+from backend.deepgram_keyterms import keyterm_query_pairs
+from backend.deepgram_words import deepgram_word_text
+from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
+
 logger = logging.getLogger(__name__)
 
 
 DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC = 8.0
 DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
+# How long a CONTROL frame (Finalize, CloseStream) may sit unwritten
+# before the socket carrying it is declared wedged and closed. The same
+# 5 s the old ``wait_for`` used, so a stuck socket is reported no later
+# than it used to be — but by closing the connection, which releases the
+# write, rather than by cancelling the write and leaving the connection
+# in the undefined state ``send_pcm``'s docstring documents.
+CONTROL_SEND_WEDGE_SEC = 5.0
 # How long ``close()`` waits, after sending ``Finalize``, for Deepgram to
 # return the transcript that Finalize flushed — before sending
 # ``CloseStream``. The wait ends the moment the transcript arrives, so
@@ -996,17 +1015,6 @@ def join_segment_texts(segments: "Iterable[dict]") -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-# 1.1.25 SSOT: imported from ``backend.deepgram_endpoints``. Same
-# centralised host as the REST module so a regional override sets
-# both at once via TRANSCRIPTOR_DEEPGRAM_HOST.
-from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
-from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
-from backend.deepgram_format import shared_format_params  # noqa: E402
-from backend.deepgram_keyterms import keyterm_query_pairs  # noqa: E402
-from backend.deepgram_words import deepgram_word_text  # noqa: E402
-from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
-
-
 @dataclass
 class DeepgramLiveConfig:
     """Typed configuration for a Deepgram live streaming session.
@@ -1801,6 +1809,70 @@ class DeepgramLiveSession:
         if nbytes > 0:
             self.stats.bytes_offered += int(nbytes)
 
+    async def _send_control(self, frame: dict, *, what: str) -> bool:
+        """Send a control frame, never cancelling the write.
+
+        The rule ``send_pcm`` states and follows: ``websockets``
+        documents that cancelling a ``send()`` mid-frame leaves the
+        connection in an undefined state, and the 5 s ``wait_for`` that
+        used to wrap the audio path is the most plausible explanation
+        for the runs of consecutive hangs in audit §3.6. The same
+        ``wait_for`` stayed around all three CONTROL frames, where it is
+        worse: ``Finalize`` is sent at the exact moment this session
+        still has to READ the transcript back off that connection.
+
+        So a wedged write is bounded the way the audio path bounds it —
+        by CLOSING the socket, which makes the pending write raise —
+        rather than by cancelling the write and reading from whatever is
+        left. Returns whether the frame reached the wire.
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        send = asyncio.ensure_future(ws.send(json.dumps(frame)))
+        guard = asyncio.ensure_future(asyncio.sleep(CONTROL_SEND_WEDGE_SEC))
+        try:
+            await asyncio.wait(
+                {send, guard}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            # Our own cancellation. The write is still in flight and
+            # must not be interrupted; close the socket so it raises,
+            # and let the cancellation through.
+            guard.cancel()
+            await self._close_wedged_socket(ws, send, what)
+            raise
+        if not send.done():
+            logger.warning(
+                "deepgram-live: %s send wedged (>%.1fs); closing the socket",
+                what,
+                CONTROL_SEND_WEDGE_SEC,
+            )
+            await self._close_wedged_socket(ws, send, what)
+            return False
+        guard.cancel()
+        try:
+            send.result()
+        except ConnectionClosed:
+            logger.info("deepgram-live: %s skipped (already closed)", what)
+            return False
+        except (OSError, WebSocketException) as e:
+            logger.warning("deepgram-live: %s send failed: %s", what, e)
+            return False
+        return True
+
+    @staticmethod
+    async def _close_wedged_socket(ws, send: "asyncio.Future", what: str) -> None:
+        """Close ``ws`` to release a write that will not complete."""
+        try:
+            await ws.close()
+        except Exception as e:  # pragma: no cover - teardown is best-effort
+            logger.debug("deepgram-live: closing a wedged socket: %s", e)
+        # The write raises now that the socket is gone. Collected so it
+        # is never an unretrieved task exception.
+        await asyncio.gather(send, return_exceptions=True)
+        logger.info("deepgram-live: %s write released by closing the socket", what)
+
     async def send_pcm(self, chunk: bytes) -> None:
         """Forward a PCM16LE mono chunk to Deepgram.
 
@@ -1982,23 +2054,15 @@ class DeepgramLiveSession:
             # not be erased by a clear placed after the send.
             self._final_arrived.clear()
             self._empty_final_arrived = False
-            try:
-                await asyncio.wait_for(
-                    self._ws.send(json.dumps({"type": "Finalize"})),
-                    timeout=5.0,
+            if await self._send_control({"type": "Finalize"}, what="Finalize"):
+                self._finalize_sent = True
+                logger.info(
+                    "deepgram-live: Finalize sent (forces trailing is_final flush)"
                 )
+            elif self._ws is None or self.is_closed:
+                # The socket is gone — "Finalize need not happen"; flag
+                # it so a second call does not try again.
                 self._finalize_sent = True
-                logger.info("deepgram-live: Finalize sent (forces trailing is_final flush)")
-            except asyncio.TimeoutError:
-                logger.warning("deepgram-live: Finalize send timed out (>5s)")
-            except ConnectionClosed:
-                # Connection was already closed — treat as "Finalize
-                # need not happen", flag accordingly so a second call
-                # doesn't try again.
-                self._finalize_sent = True
-                logger.info("deepgram-live: Finalize skipped (already closed)")
-            except WebSocketException as e:
-                logger.warning("deepgram-live: Finalize send failed: %s", e)
 
             # Give Deepgram a moment to return the transcript that
             # ``Finalize`` just flushed, BEFORE closing the stream.
@@ -2134,14 +2198,9 @@ class DeepgramLiveSession:
                     # by the wait below, not erased by a post-send clear.
                     self._final_arrived.clear()
                     self._empty_final_arrived = False
-                    try:
-                        await asyncio.wait_for(
-                            self._ws.send(json.dumps({"type": "Finalize"})),
-                            timeout=5.0,
-                        )
-                    except (asyncio.TimeoutError, ConnectionClosed, WebSocketException) as e:
-                        logger.warning("deepgram-live: tail-guard Finalize failed: %s", e)
-                    else:
+                    if await self._send_control(
+                        {"type": "Finalize"}, what="tail-guard Finalize"
+                    ):
                         try:
                             await asyncio.wait_for(
                                 self._final_arrived.wait(),
@@ -2285,29 +2344,14 @@ class DeepgramLiveSession:
         invokes this, likely already on the wire to the client (C4).
         """
         if self._ws is not None and self._needs_close_stream:
-            try:
-                # Same 5-second bound as send_pcm — a wedged TCP socket
-                # mustn't hang shutdown indefinitely. The CloseStream
-                # frame is tiny so the timeout only fires when the
-                # underlying socket is genuinely stuck.
-                await asyncio.wait_for(
-                    self._ws.send(json.dumps({"type": "CloseStream"})),
-                    timeout=5.0,
-                )
+            if await self._send_control(
+                {"type": "CloseStream"}, what="CloseStream"
+            ):
                 logger.info("deepgram-live: CloseStream sent")
-            except asyncio.TimeoutError:
-                logger.warning("deepgram-live: CloseStream send timed out (>5s)")
-            except ConnectionClosed:
-                logger.info("deepgram-live: CloseStream skipped (already closed)")
-            except WebSocketException as e:
-                logger.warning("deepgram-live: CloseStream send failed: %s", e)
 
-        if self._keepalive_task is not None and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await cancel_and_await(
+            self._keepalive_task, what="deepgram keepalive loop", log=logger
+        )
 
         if self._recv_task is not None:
             try:
@@ -2316,11 +2360,9 @@ class DeepgramLiveSession:
                 logger.warning(
                     "deepgram-live: recv drain timeout (%.2fs)", wait_timeout
                 )
-                self._recv_task.cancel()
-                try:
-                    await self._recv_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                await cancel_and_await(
+                    self._recv_task, what="deepgram receive loop", log=logger
+                )
 
         await self.close()
 
@@ -3002,12 +3044,9 @@ class DeepgramLiveSession:
         self._close_ran = True
         self._closed = True
 
-        if self._keepalive_task is not None and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await cancel_and_await(
+            self._keepalive_task, what="deepgram keepalive loop", log=logger
+        )
 
         ws = self._ws
         self._ws = None

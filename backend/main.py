@@ -41,6 +41,11 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.async_tasks import (
+    await_cancelled,
+    cancel_and_await,
+    cancel_and_collect,
+)
 from backend.audio_constants import (
     LIVE_PCM_BYTES_PER_SEC,
     LIVE_RECOVERY_MIN_BYTES,
@@ -100,6 +105,8 @@ from backend.deepgram_warm import (
     pcm_has_voice,
 )
 from backend.remote_deepgram_live import (
+    DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC,
+    DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC,
     DeepgramLiveConfig,
     DeepgramLiveError,
     DeepgramLiveSession,
@@ -377,12 +384,7 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 
     yield
 
-    if not warm_boot.done():
-        warm_boot.cancel()
-    try:
-        await warm_boot
-    except (asyncio.CancelledError, Exception):
-        pass
+    await cancel_and_await(warm_boot, what="deepgram boot pre-warm", log=logger)
     # Shutdown: drain in-flight transcription jobs before the process
     # exits so Electron's SIGTERM (killBackendHard, 1500 ms hard deadline)
     # doesn't interrupt mid-write result files. Without this, the worker
@@ -4422,11 +4424,8 @@ async def _run_local_live_session(
         for task in (rx, tx):
             if not task.done():
                 task.cancel()
-        for task in (rx, tx):
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        for task, what in ((rx, "local live receiver"), (tx, "local live transcriber")):
+            await await_cancelled(task, what=what, log=logger)
         # Best-effort final emit in case transcriber missed the tail.
         # Bounded (BUG-69): maybe_transcribe(force=True) awaits any
         # in-flight pass, and a wedged inference thread has no internal
@@ -4542,6 +4541,15 @@ _SEND_WEDGE_POLL_SEC = 0.5
 # _SEND_WEDGE_TIMEOUT_SEC and releases this wait early, so the full
 # budget is only ever spent by a stream that is slow rather than dead.
 _SEND_FLUSH_DEADLINE_SEC = _SEND_WEDGE_TIMEOUT_SEC + 1.0
+# Extra grace given to the send flush when a warm-socket swap is already
+# running: the swap is inside the sender, and what it is waiting on is a
+# connect. Derived from the connect budget itself
+# (``DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC`` + one retry) rather than picked, so
+# it cannot fall behind a change to either. Only ever spent on the rare
+# stop that lands in the middle of a replacement.
+_WARM_SWAP_GRACE_SEC = (
+    DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC + DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC
+)
 # Rides the same queue as the audio, so "Finalize is applied after every
 # byte already captured" holds by construction rather than by a sleep.
 _SEND_FINALIZE_SENTINEL = object()
@@ -4647,18 +4655,10 @@ async def _discard_secondary_acquire(task: "Optional[asyncio.Task]") -> None:
     concurrency limit, which is the same hole the warm pool's
     ``_cancel_pending`` had.
     """
-    if task is None:
-        return
-    if not task.done():
-        task.cancel()
-    try:
-        acquisition = await task
-    except asyncio.CancelledError:
-        if not task.cancelled():
-            raise
-        return
-    except Exception as e:
-        logger.info("dual-stream: second reading discarded after %s", e)
+    acquisition = await cancel_and_collect(
+        task, what="dual-stream second reading acquire", log=logger
+    )
+    if acquisition is None:
         return
     try:
         await acquisition.session.discard()
@@ -4941,11 +4941,7 @@ async def _run_deepgram_live_session(
                 e,
             )
 
-    pre_task.cancel()
-    try:
-        await pre_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
 
     stop = asyncio.Event()
     upstream_fatal = False
@@ -5418,12 +5414,7 @@ async def _run_deepgram_live_session(
             await rx
     finally:
         stop.set()
-        if not rx.done():
-            rx.cancel()
-        try:
-            await rx
-        except (asyncio.CancelledError, Exception):
-            pass
+        await cancel_and_await(rx, what="deepgram websocket receiver", log=logger)
 
         # Finalize must reach Deepgram AFTER every byte the renderer
         # sent (audit §3.6). The receiver has now stopped, so everything
@@ -5438,29 +5429,42 @@ async def _run_deepgram_live_session(
             # the audio behind the bound is already accounted for as
             # undelivered, and the sender is cancelled below.
             logger.warning("deepgram send queue full at finalize; sentinel dropped")
+        # A swap OWNS the session object: it connects a replacement,
+        # rebinds ``session`` and then ``discard()``s the old one — the
+        # very socket ``drain_transcript`` is about to send ``Finalize``
+        # on. ``_swap_warm_socket``'s docstring calls the sender "the
+        # only writer to the upstream socket", and that stops being true
+        # the moment the wait below gives up on the sender. So the
+        # request is withdrawn FIRST (the watchdog used to be cancelled
+        # after this wait, which is too late to prevent one starting),
+        # and a swap already running is given the connect budget it can
+        # legitimately need before the stop proceeds without it.
+        await cancel_and_await(warm_probe, what="deepgram warm probe", log=logger)
+        warm_swap_requested = False
+        send_flush_deadline = _SEND_FLUSH_DEADLINE_SEC + (
+            _WARM_SWAP_GRACE_SEC if warm_swap_in_progress else 0.0
+        )
         # Deliberately not ``wait_for``: that cancels the task, and the
         # task may be inside ``ws.send``.
-        _done, _still = await asyncio.wait({snd}, timeout=_SEND_FLUSH_DEADLINE_SEC)
+        _done, _still = await asyncio.wait({snd}, timeout=send_flush_deadline)
         if _still:
             logger.warning(
                 "deepgram send queue did not drain within %.1fs "
                 "(%d bytes still queued); finalizing anyway",
-                _SEND_FLUSH_DEADLINE_SEC,
+                send_flush_deadline,
                 queued_bytes,
             )
-        if not wd.done():
-            wd.cancel()
-        try:
-            await wd
-        except (asyncio.CancelledError, Exception):
-            pass
-        if warm_probe is not None:
-            if not warm_probe.done():
-                warm_probe.cancel()
-            try:
-                await warm_probe
-            except (asyncio.CancelledError, Exception):
-                pass
+        if warm_swap_in_progress:
+            # The replacement is still being connected. Whatever
+            # ``session`` names now is what the drain runs on, and the
+            # swap may still discard it under the drain — say so, rather
+            # than reporting a lost transcript as an unexplained one.
+            logger.error(
+                "deepgram warm-socket swap still running at finalize after "
+                "%.1fs; the drain may lose the socket under it",
+                send_flush_deadline,
+            )
+        await cancel_and_await(wd, what="deepgram stop watchdog", log=logger)
 
         final_payload: dict
         finalize_error: Optional[str] = None
@@ -5639,22 +5643,15 @@ async def _run_deepgram_live_session(
         # took the last frame. The socket is closed by now, so the
         # pending write has already raised inside ``send_pcm`` and this
         # cancel cannot land mid-frame.
-        if not snd.done():
-            snd.cancel()
-        try:
-            await snd
-        except (asyncio.CancelledError, Exception):
-            pass
+        await cancel_and_await(snd, what="deepgram sender", log=logger)
 
         if not fw.done():
             try:
                 await asyncio.wait_for(fw, timeout=0.25)
             except asyncio.TimeoutError:
-                fw.cancel()
-                try:
-                    await fw
-                except (asyncio.CancelledError, Exception):
-                    pass
+                await cancel_and_await(
+                    fw, what="deepgram event forwarder", log=logger
+                )
 
         streamed_sec = session.stats.bytes_sent / float(2 * LIVE_SAMPLE_RATE_HZ)
         logger.info(

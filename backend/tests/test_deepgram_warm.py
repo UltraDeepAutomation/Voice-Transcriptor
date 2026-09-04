@@ -674,6 +674,7 @@ class _WarmFakeUpstream:
         self._closed = False
         self.last_error = None
         self.last_fatal = False
+        self.drain_called = False
         self._events: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
         _WarmFakeUpstream.instances.append(self)
 
@@ -710,6 +711,7 @@ class _WarmFakeUpstream:
             yield event
 
     async def drain_transcript(self, on_budget=None):
+        self.drain_called = True
         return {
             "text": "ok", "segments": [], "durationSec": 0.0, "stats": {},
             "uncoveredSpeechSec": 0.0, "streamedSec": 0.0, "coveredEndSec": 0.0,
@@ -742,6 +744,10 @@ class _WarmFakeUpstream:
     def utterance_end_sec(self) -> float:
         return 2.0
 
+    @property
+    def stream_death_sec(self):
+        return None
+
     async def shutdown(self, wait_timeout: float = 3.0) -> None:
         await self.close()
 
@@ -760,6 +766,22 @@ class _WarmFakeUpstream:
     @property
     def sent_bytes(self) -> bytes:
         return b"".join(self.sent_pcm)
+
+
+class _GatedConnectUpstream(_WarmFakeUpstream):
+    """Like ``_WarmFakeUpstream``, but the SECOND socket connects slowly.
+
+    The first instance is the adopted (dead) socket; the second is the
+    replacement a warm-socket swap connects, and gating it is how a swap
+    is made to still be running when the stop arrives.
+    """
+
+    gate: "Optional[asyncio.Event]" = None
+
+    async def connect(self) -> None:
+        gate = _GatedConnectUpstream.gate
+        if gate is not None and len(_WarmFakeUpstream.instances) > 1:
+            await gate.wait()
 
 
 class _WarmFakeWebSocket:
@@ -1025,6 +1047,79 @@ class WarmSessionLivenessTests(_WarmHandlerCase):
                 keys,
             )
             await pool.close_all()
+
+
+class WarmSwapAtFinalizeTests(_WarmHandlerCase):
+    """A swap in flight OWNS the session the stop is about to drain (B-012).
+
+    ``_swap_warm_socket`` connects a replacement, rebinds ``session``
+    and then ``discard()``s the old one. Its docstring justifies that by
+    calling the sender "the only writer to the upstream socket" — which
+    stops being true the moment the finalize path gives up waiting for
+    the sender and calls ``drain_transcript()`` on whatever ``session``
+    names right then.
+    """
+
+    async def test_a_swap_in_flight_is_waited_for_before_the_drain(self):
+        from unittest import mock as _mock
+
+        gate = asyncio.Event()
+        _GatedConnectUpstream.gate = gate
+        self.addCleanup(setattr, _GatedConnectUpstream, "gate", None)
+        ws = _WarmFakeWebSocket()
+        with _mock.patch.object(
+            self.main, "DeepgramLiveSession", _GatedConnectUpstream
+        ), _mock.patch.object(self.main, "_WARM_PROBE_TIMEOUT_SEC", 0.05), \
+                _mock.patch.object(self.main, "_WARM_PROBE_POLL_SEC", 0.01), \
+                _mock.patch.object(self.main, "_SEND_FLUSH_DEADLINE_SEC", 0.02), \
+                _mock.patch.object(self.main, "_WARM_SWAP_GRACE_SEC", 2.0):
+            pool = await self._armed_pool()
+            task = self._run(ws, self._recovery())
+            await asyncio.sleep(0.02)
+            await ws.messages.put(
+                {"type": "websocket.receive", "bytes": _voiced(1600)}
+            )
+            # The probe expires, the sender starts a swap, and the
+            # replacement's connect does not return yet.
+            await asyncio.sleep(0.15)
+            self.assertEqual(
+                len(_WarmFakeUpstream.instances), 2, "no swap was started"
+            )
+            # Released well after the send-flush deadline, so a stop
+            # that does not wait for the swap finalizes on the old
+            # socket long before the replacement exists.
+            releaser = asyncio.get_running_loop().create_task(
+                self._release(gate, 0.5)
+            )
+            with self.assertNoLogs("backend.main", level="ERROR"):
+                await self._finish(ws, task)
+            await releaser
+            await pool.close_all()
+
+        adopted, replacement = _WarmFakeUpstream.instances[:2]
+        # The discriminating pair. Before the stop waited for an
+        # in-flight swap, the drain ran on ``session`` as it stood when
+        # the send flush gave up — the OLD socket, the one the swap was
+        # about to discard out from under it.
+        self.assertFalse(
+            adopted.drain_called,
+            "the stop finalized on the socket the swap was about to discard",
+        )
+        self.assertTrue(
+            replacement.drain_called, "the stop did not drain the replacement"
+        )
+        self.assertTrue(
+            adopted.discarded,
+            "the swap never completed, so the dead socket was never released",
+        )
+        self.assertTrue(
+            replacement.sent_pcm,
+            "the replay never reached the replacement the drain then used",
+        )
+
+    async def _release(self, gate: asyncio.Event, after: float) -> None:
+        await asyncio.sleep(after)
+        gate.set()
 
 
 class DualStreamWarmingTests(_WarmHandlerCase):
