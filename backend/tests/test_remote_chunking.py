@@ -17,6 +17,7 @@ def _fresh_main_module(data_dir: str):
 
 class RemoteChunkingTests(unittest.TestCase):
     def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         self._tmp = tempfile.TemporaryDirectory()
         self.main = _fresh_main_module(self._tmp.name)
 
@@ -27,7 +28,10 @@ class RemoteChunkingTests(unittest.TestCase):
             pass
         for name in ("backend.main", "backend.config"):
             sys.modules.pop(name, None)
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
         os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
         self._tmp.cleanup()
 

@@ -967,3 +967,109 @@ npm --prefix desktop test && node --check desktop/main.js && node --check deskto
 | ID | Что | Рекомендация |
 |---|---|---|
 | D-13 | F/7 / U-022 полностью — `finishStopWithoutTranscript({domText, kind, status, tone, statusScope})`, объединяющий сохранение+патч+статус, а не только тройку bookkeeping | нужна верификация на живых записях по всем семи веткам (тишина, ключ не настроен, нет провайдера, транскрипция выключена, сорванный старт, усечённая запись, catch-ветка); делать отдельным коммитом с ручной проверкой перед пушем, как предупреждал предыдущий агент |
+
+### Коммит: изоляция сьюта от `HOME` / `TRANSCRIPTOR_DATA_DIR` (задание, пункт 6)
+
+**Находка при чтении `backend/config.py`:** `DATA_DIR = _resolve_data_dir()`
+выполняется НА ИМПОРТЕ модуля (строка уровня модуля, не внутри функции) и
+СОЗДАЁТ директорию как побочный эффект импорта. `unittest discover`
+импортирует ВСЕ тестовые модули (в момент построения сьюта) ДО того, как
+у любого теста выполнится `setUp`. Три тестовых файла
+(`test_access_log_filter.py`, `test_deepgram_keyterms.py`,
+`test_deepgram_dual.py`) делают `from backend.main import ...` /
+`from backend.config import ...` НА УРОВНЕ МОДУЛЯ — то есть до того, как
+чья-либо изоляция в `setUp` успевает подменить `TRANSCRIPTOR_DATA_DIR`
+или `HOME`. Если ни то ни другое не задано в окружающей оболочке (обычное
+состояние — `HOME` есть практически всегда, но не факт, что задан
+`TRANSCRIPTOR_DATA_DIR`), `_resolve_data_dir()` резолвится на РЕАЛЬНЫЙ
+`~/Library/Application Support/Transcriptor` (macOS) — ту же директорию,
+которой пользуется установленное приложение (конфиг, ключи, архив
+записей). Ровно это уже случилось один раз (см. долг **D-10** выше:
+`~/.transcriptor/.encryption_key`, созданный на этой машине 2026-09-05 —
+файл не тронут по прямому указанию задания, «пользовательский, не
+трогать»).
+
+**Механизм закрытия:** `backend/tests/__init__.py` — пакет, который
+Python обязан импортировать ПЕРЕД любым `backend.tests.test_x`
+(это гарантия языка, а не порядок обхода `unittest discover`). На уровне
+модуля создаётся один временный каталог на весь процесс сьюта и
+БЕЗУСЛОВНО (не `setdefault` — `HOME` есть почти всегда, `setdefault` его
+бы не тронул) перенаправляет `TRANSCRIPTOR_DATA_DIR`, `HOME`,
+`USERPROFILE`, `APPDATA` внутрь него, до импорта первого тестового файла.
+`atexit` подчищает каталог. Отдельные тесты по-прежнему свободны
+перенаправлять эти переменные дальше в СВОИ временные каталоги (большинство
+уже так делает) — это только страховка для первого импорта и для любого
+файла, который изоляцию не делает вовсе.
+
+**Побочная находка при верификации (тем же коммитом, тот же корень
+проблемы):** пять файлов делали `os.environ.pop("TRANSCRIPTOR_DATA_DIR",
+None)` в `tearDown` БЕЗ сохранения предыдущего значения в `setUp` —
+рабочий, но небрежный паттерн: после такого теста переменная остаётся
+ПОЛНОСТЬЮ снятой до конца прогона (или до следующего теста, который её
+переустановит), в отличие от корректного паттерна (`self._old_data_dir =
+os.environ.get(...)` в `setUp`, условное восстановление в `tearDown`),
+уже использованного в большинстве файлов сьюта. Это не течь наружу (`HOME`
+из `backend/tests/__init__.py` всё равно ловит откат на реальный каталог),
+но воспроизводимая нестабильность: тест `test_suite_home_isolation.py`,
+добавленный этим коммитом, сначала падал именно на этом (см. «Проверка»)
+— TRANSCRIPTOR_DATA_DIR оказывался пуст на момент его выполнения из-за
+чужого `tearDown`. Найденное — исправлено по корню, а не подстройкой
+теста под баг: `test_config.py` (5 классов:
+`TestConfigLifecycle`, `SchemaStampTests`,
+`OpenRouterPreferenceValidationTests`, `EmptyKeyfileTests`,
+`DataDirFallbackTests`), `test_audio_retention.py`,
+`test_live_recovery_liveness.py`, `test_remote_chunking.py`,
+`test_recording_names.py` — все теперь сохраняют и восстанавливают
+`TRANSCRIPTOR_DATA_DIR` тем же паттерном, что уже был в `test_live.py` /
+`test_live_draft_state.py` / `test_deepgram_warm.py` и других.
+
+**Файлы:**
+- `backend/tests/__init__.py` — суть коммита, см. выше.
+- `backend/tests/test_suite_home_isolation.py` — новый: пин инварианта
+  (`HOME`/`USERPROFILE`/`APPDATA` уводятся из-под реального аккаунта,
+  `TRANSCRIPTOR_DATA_DIR` — временный каталог МЕЖДУ тестами всегда,
+  «голый» реимпорт `backend.config` резолвит `DATA_DIR` внутри
+  временного корня).
+- `backend/tests/test_config.py`, `test_audio_retention.py`,
+  `test_live_recovery_liveness.py`, `test_remote_chunking.py`,
+  `test_recording_names.py` — исправлен паттерн `tearDown` (см. выше).
+
+**Проверка:**
+```
+# До фикса пяти файлов: test_suite_home_isolation падал (TRANSCRIPTOR_DATA_DIR == "")
+# на 1-2 из 3 последовательных прогонов — воспроизведено, зафиксировано, исправлено по корню.
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 -m unittest discover -s backend/tests
+# Ran 819 tests — OK, три прогона подряд без единого падения (было 815 до этого коммита)
+npm --prefix frontend run typecheck && npm --prefix frontend run lint && npm --prefix frontend test && npm --prefix frontend run build
+# не тронуто этим коммитом; 356 passed, чисто, build ok
+npm --prefix desktop test && node --check desktop/main.js && node --check desktop/preload.js
+# не тронуто; 255 passed, чисто
+```
+**Верификация побочного эффекта (не тест, ручная проверка):** снят
+слепок `mtime` всех файлов под `~/.transcriptor` и
+`~/Library/Application Support/Transcriptor` до и после полного прогона
+сьюта — единственные изменившиеся файлы принадлежат реально запущенному
+Electron-приложению (`DawnGraphiteCache`, `GPUCache`, `Cache_Data` —
+GPU/HTTP-кэш живого процесса), НИ ОДИН файл конфига/ключей/записей не
+изменился. `~/.transcriptor/.encryption_key` не тронут (сохранён по
+прямому указанию задания).
+
+**Решения:**
+- Перенаправление в `backend/tests/__init__.py` — БЕЗУСЛОВНОЕ, не
+  `os.environ.setdefault`: `HOME` присутствует практически в любой
+  реальной оболочке, `setdefault` его бы не заменил и вся защита была
+  бы бесполезна для самого частого случая.
+- `atexit`-очистка, а не оставление временного каталога — гигиена, не
+  требование безопасности (временные каталоги и так подчищаются ОС).
+- Не удалён и не тронут `~/.transcriptor/.encryption_key` — прямое
+  указание задания («пользовательский файл, не трогать»); D-10 остаётся
+  открытым как «оставить пользователю».
+- Пять файлов с `tearDown`-паттерном без восстановления — исправлены
+  ПОЛНОСТЬЮ (root cause), а не просто ослаблением нового теста под их
+  поведение; ослабленная версия теста (allow-unset) была написана первой,
+  найдена неудовлетворительной при чтении собственного кода (не пинает
+  реальный инвариант) и заменена на строгую версию ПОСЛЕ фикса.
+
+**Не сделано:** пункт 4 задания (D-015/D-009/D-013/D-053, desktop-журнал)
+не начат — из пяти пунктов задания «Швы» это единственный, требующий
+чтения desktop-журнала и правок в `desktop/`, не начатых в этой сессии.

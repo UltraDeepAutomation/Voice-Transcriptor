@@ -41,6 +41,7 @@ SESSION = "cd98fa10-04dd-4185-a56c-df0b9d09a130"
 class LiveRecoveryLivenessTests(unittest.TestCase):
     def setUp(self) -> None:
         self._old_home = os.environ.get("HOME")
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         self._home = tempfile.TemporaryDirectory()
         os.environ["HOME"] = self._home.name
         self._tmp = tempfile.TemporaryDirectory(dir=self._home.name)
@@ -54,7 +55,10 @@ class LiveRecoveryLivenessTests(unittest.TestCase):
             pass
         for name in ("backend.main", "backend.config"):
             sys.modules.pop(name, None)
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
         os.environ.pop("TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG", None)
         self._tmp.cleanup()
         self._home.cleanup()

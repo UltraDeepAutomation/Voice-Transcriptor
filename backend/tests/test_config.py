@@ -40,13 +40,17 @@ def _reload_config_module(data_dir: str):
 
 class TestConfigLifecycle(unittest.TestCase):
     def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         self._tmp = tempfile.TemporaryDirectory()
         self.data_dir = self._tmp.name
         self.config_mod = _reload_config_module(self.data_dir)
 
     def tearDown(self):
         self._tmp.cleanup()
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
 
     def test_fresh_load_returns_defaults(self):
         cfg = self.config_mod.load_config()
@@ -296,13 +300,17 @@ class SchemaStampTests(unittest.TestCase):
     """
 
     def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         self._tmp = tempfile.TemporaryDirectory()
         self.data_dir = self._tmp.name
         self.config_mod = _reload_config_module(self.data_dir)
 
     def tearDown(self):
         self._tmp.cleanup()
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
 
     def _write(self, payload: dict) -> None:
         self.config_mod.CONFIG_PATH.write_text(
@@ -363,12 +371,16 @@ class OpenRouterPreferenceValidationTests(unittest.TestCase):
     """``preferences.openrouter`` is repaired like ``preferences.deepgram`` (B-019)."""
 
     def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         self._tmp = tempfile.TemporaryDirectory()
         self.config_mod = _reload_config_module(self._tmp.name)
 
     def tearDown(self):
         self._tmp.cleanup()
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
 
     def test_a_string_where_the_block_belongs_is_reset(self):
         self.config_mod.save_config({"preferences": {"openrouter": "oops"}})
@@ -414,12 +426,16 @@ class EmptyKeyfileTests(unittest.TestCase):
     """
 
     def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         self._tmp = tempfile.TemporaryDirectory()
         self.data_dir = self._tmp.name
 
     def tearDown(self):
         self._tmp.cleanup()
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
 
     def test_an_empty_keyfile_is_replaced_and_secrets_work_again(self):
         from pathlib import Path
@@ -458,12 +474,16 @@ class DataDirFallbackTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._old_home = os.environ.get("HOME")
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
         # The fallback is ``~/.transcriptor``; HOME is redirected so the
         # test cannot leave a stray key directory in the real one.
         os.environ["HOME"] = self._tmp.name
 
     def tearDown(self):
-        os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
         if self._old_home is None:
             os.environ.pop("HOME", None)
         else:
