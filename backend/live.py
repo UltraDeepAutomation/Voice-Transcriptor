@@ -160,7 +160,6 @@ class LiveSession:
         self._dropped_sec_total = 0.0
         self._last_emitted_end = 0.0
         self._consecutive_errors = 0
-        self._last_error_signature: Optional[str] = None
         # 1.1.25: accumulator of every emitted segment so the
         # ``finalize_envelope`` method below can return the full
         # transcript at session end. Without this, the WS handler's
@@ -170,11 +169,20 @@ class LiveSession:
         # recovery REST round-trip.
         self._emitted_segments: list[dict] = []
 
-    def _emitted_tail_text(self) -> str:
-        """The last few emitted segments, for overlap comparison."""
-        if not self._emitted_segments:
+    def _emitted_tail_text(self, pending: "Optional[list[dict]]" = None) -> str:
+        """The last few emitted segments, for overlap comparison.
+
+        ``pending`` is what THIS pass has produced so far and has not
+        committed yet. Without it the guard compared segment k against
+        the transcript as it stood BEFORE the pass, so a decoder that
+        emitted a boundary clause as two adjacent segments in one window
+        sailed through — the very duplication this function exists to
+        stop, one level down.
+        """
+        pool = self._emitted_segments + list(pending or [])
+        if not pool:
             return ""
-        tail = self._emitted_segments[-3:]
+        tail = pool[-3:]
         return " ".join(str(s.get("text") or "") for s in tail).strip()
 
     def _get_last_samples(self, n: int) -> np.ndarray:
@@ -291,14 +299,25 @@ class LiveSession:
             need_sec = max(0.0, total_sec - uncovered_from_sec)
             max_window_sec = self._max_window_sec()
             if need_sec > max_window_sec:
-                dropped = need_sec - max_window_sec
-                self._dropped_sec_total += dropped
-                logger.warning(
-                    "live assist fell behind by %.2fs (window capped at %.2fs); "
-                    "%.2fs of audio dropped this pass, %.2fs total. The saved "
-                    "recording still holds the full audio.",
-                    need_sec, max_window_sec, dropped, self._dropped_sec_total,
-                )
+                # Only audio the model NEVER SAW is dropped. ``need_sec``
+                # includes the overlap head, which is re-fed on purpose
+                # and was already decoded, so subtracting it from the
+                # cap counted covered audio as lost — overstating the
+                # loss by exactly ``overlap_sec`` on every truncation
+                # and accumulating that error in the total the envelope
+                # and the user-facing warning both report.
+                window_start_sec = total_sec - max_window_sec
+                dropped = max(0.0, window_start_sec - self._covered_sec)
+                if dropped > 0.0:
+                    self._dropped_sec_total += dropped
+                    logger.warning(
+                        "live assist fell behind by %.2fs (window capped at "
+                        "%.2fs); %.2fs of audio dropped this pass, %.2fs "
+                        "total. The saved recording still holds the full "
+                        "audio.",
+                        need_sec, max_window_sec, dropped,
+                        self._dropped_sec_total,
+                    )
             win_sec = min(max(need_sec, self.cfg.min_audio_sec), max_window_sec)
             win = int(win_sec * sr)
             audio_window = self._get_last_samples(win)
@@ -370,7 +389,6 @@ class LiveSession:
             # transcribe failures (bounded retries before fatal).
             self._consecutive_errors += 1
             signature = "LocalTranscribeTimeout: inference exceeded 60 s"
-            self._last_error_signature = signature
             logger.error(
                 "transcribe timeout (%d/%d consecutive)",
                 self._consecutive_errors,
@@ -389,7 +407,6 @@ class LiveSession:
             # than watching a silent dead session.
             self._consecutive_errors += 1
             signature = f"{type(e).__name__}: {e}"
-            self._last_error_signature = signature
             logger.error(
                 "transcribe error (%d/%d consecutive): %s",
                 self._consecutive_errors,
@@ -406,17 +423,20 @@ class LiveSession:
 
         # Reset on any successful inference pass — transient hiccups
         # should not count against us forever.
+        # Escalation is by COUNT of consecutive failures, which is what
+        # ``_LIVE_MAX_CONSECUTIVE_ERRORS`` documents. A
+        # ``_last_error_signature`` field was written on both error paths
+        # and cleared here, and read nowhere: the deduplication it was
+        # meant for was never built, and gating the counter on a repeated
+        # signature would be worse than not — a session flapping between
+        # two different failures would never escalate at all.
         self._consecutive_errors = 0
-        self._last_error_signature = None
         # Coverage advances only on a pass that actually reached the
         # model. On the error paths above it stays put so the same audio
         # is retried in the next window instead of being skipped.
         self._covered_sec = max(self._covered_sec, total_sec)
 
         new_segments = []
-        # Everything at or before this instant was already emitted by a
-        # previous pass; only strictly-new audio may cross it.
-        cutoff = self._last_emitted_end + self.cfg.emit_epsilon_sec
         for s in result.get("segments", []):
             g_end = offset_sec + float(s.get("end", 0.0) or 0.0)
             text = (s.get("text") or "").strip()
@@ -481,14 +501,20 @@ class LiveSession:
             else:
                 # No word data available (alignment unsupported, or
                 # ``word_timestamps`` disabled): fall back to the
-                # segment-end watermark heuristic.
-                if g_end <= cutoff:
+                # segment-end watermark heuristic. Read LIVE, like the
+                # word branch above: a snapshot taken before the loop
+                # answered "was this already emitted" without knowing
+                # about anything this pass had just emitted, so the two
+                # branches disagreed by exactly one pass.
+                if g_end <= self._last_emitted_end + self.cfg.emit_epsilon_sec:
                     continue
                 g_start = offset_sec + float(s.get("start", 0.0) or 0.0)
             # Text-level overlap guard. The timestamp trim above cannot
             # see a word whose re-decode drifted past the watermark; the
             # words themselves can.
-            trimmed = trim_repeated_prefix(self._emitted_tail_text(), text)
+            trimmed = trim_repeated_prefix(
+                self._emitted_tail_text(new_segments), text
+            )
             if not trimmed:
                 # The whole segment re-states committed speech.
                 self._last_emitted_end = max(self._last_emitted_end, g_end)
@@ -500,6 +526,14 @@ class LiveSession:
                     trimmed[:60],
                 )
                 text = trimmed
+                # Move the event's start past the committed watermark,
+                # for the reason the word branch states two branches up:
+                # reporting the untrimmed start makes the frontend's
+                # time-ordered merge believe this event overlaps content
+                # it already holds. The word branch anchors on the first
+                # surviving word; there are no words here, so the only
+                # anchor available is the watermark itself.
+                g_start = max(g_start, min(self._last_emitted_end, g_end))
             new_segments.append({"start": g_start, "end": g_end, "text": text})
             self._last_emitted_end = max(self._last_emitted_end, g_end)
 

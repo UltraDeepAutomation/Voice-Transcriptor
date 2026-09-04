@@ -265,5 +265,154 @@ class DeepgramEventOrderingTests(unittest.TestCase):
         self.assertIn(session._QUEUE_SENTINEL, drained)
 
 
+class DroppedSecondsAccountingTests(unittest.TestCase):
+    """``droppedSec`` counts audio the model never saw (B-068).
+
+    ``need_sec`` includes the overlap head, which is re-fed on purpose
+    and was already decoded. Subtracting it from the window cap counted
+    covered audio as lost, overstating the loss by exactly
+    ``overlap_sec`` on every truncation — an error that accumulates in
+    the total the envelope reports and the user-facing warning prints,
+    and the existing test only asserted "> 0.0".
+    """
+
+    def _session(self, **over) -> LiveSession:
+        cfg = dict(window_sec=8.0, overlap_sec=1.0, ring_slack_sec=10.0)
+        cfg.update(over)
+        return LiveSession(model_name="tiny", language=None, config=LiveConfig(**cfg))
+
+    @staticmethod
+    def _segments_for(audio, *_args, **_kwargs):
+        end = audio.shape[0] / float(LIVE_SAMPLE_RATE_HZ)
+        return {"segments": [{"start": 0.0, "end": end, "text": "hello"}]}
+
+    def test_the_drop_is_the_audio_before_the_window_and_after_coverage(self):
+        session = self._session()
+
+        async def run():
+            await _feed(session, 40.0)
+            with mock.patch("backend.live.transcribe_audio", self._segments_for):
+                await session.maybe_transcribe(force=True)
+
+        asyncio.run(run())
+        env = session.finalize_envelope()
+        max_window = session._max_window_sec()
+        total = env["total_sec"]
+        # Nothing was covered before this pass, so everything before the
+        # window's start is the loss — and not a second more.
+        self.assertAlmostEqual(
+            env["dropped_sec"], max(0.0, total - max_window), places=3
+        )
+
+    def test_a_second_truncation_does_not_double_count_the_overlap(self):
+        session = self._session()
+
+        async def run():
+            await _feed(session, 40.0)
+            with mock.patch("backend.live.transcribe_audio", self._segments_for):
+                await session.maybe_transcribe(force=True)
+                first = session._dropped_sec_total
+                await _feed(session, 40.0)
+                await session.maybe_transcribe(force=True)
+                return first, session._dropped_sec_total
+
+        first, second = asyncio.run(run())
+        max_window = session._max_window_sec()
+        # The second pass loses the audio between where the first pass
+        # finished and where the second window starts. With the overlap
+        # counted in, each pass reported a full ``overlap_sec`` more.
+        self.assertAlmostEqual(second - first, 40.0 - max_window, places=3)
+
+    def test_a_session_that_keeps_up_reports_no_drop_at_all(self):
+        session = self._session()
+
+        async def run():
+            await _feed(session, 3.0)
+            with mock.patch("backend.live.transcribe_audio", self._segments_for):
+                await session.maybe_transcribe(force=True)
+
+        asyncio.run(run())
+        self.assertEqual(session.finalize_envelope()["dropped_sec"], 0.0)
+
+
+class OverlapGuardWithinOnePassTests(unittest.TestCase):
+    """The repeat guard sees what THIS pass has already emitted (B-069).
+
+    ``_emitted_tail_text`` read only the committed segments, and this
+    pass's segments are committed after the loop — so segment k was
+    compared against the transcript as it stood before the pass, and a
+    decoder that split a boundary clause into two adjacent segments in
+    ONE window sailed straight through.
+    """
+
+    def _session(self) -> LiveSession:
+        return LiveSession(
+            model_name="tiny",
+            language=None,
+            config=LiveConfig(
+                window_sec=8.0,
+                overlap_sec=1.0,
+                ring_slack_sec=10.0,
+                word_timestamps=False,
+            ),
+        )
+
+    def test_a_repeat_inside_one_pass_is_trimmed(self):
+        session = self._session()
+
+        def segments(audio, *_a, **_k):
+            return {
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": "починить очень важно"},
+                    {"start": 1.0, "end": 2.0, "text": "починить очень важно снова"},
+                ]
+            }
+
+        async def run():
+            await _feed(session, 3.0)
+            with mock.patch("backend.live.transcribe_audio", segments):
+                return await session.maybe_transcribe(force=True)
+
+        out = asyncio.run(run())
+        texts = [seg["text"] for seg in out["segments"]]
+        self.assertEqual(texts, ["починить очень важно", "снова"])
+
+    def test_a_text_trimmed_segment_moves_its_start_past_the_watermark(self):
+        # B-071: the word branch re-anchors a trimmed event so the
+        # frontend's time-ordered merge does not see it overlap
+        # committed content; the text branch left the start where it was.
+        session = self._session()
+
+        def segments(audio, *_a, **_k):
+            return {
+                "segments": [
+                    {"start": 0.0, "end": 1.5, "text": "первая часть"},
+                    {"start": 0.5, "end": 2.5, "text": "первая часть вторая"},
+                ]
+            }
+
+        async def run():
+            await _feed(session, 3.0)
+            with mock.patch("backend.live.transcribe_audio", segments):
+                return await session.maybe_transcribe(force=True)
+
+        out = asyncio.run(run())
+        first, second = out["segments"]
+        self.assertEqual(second["text"], "вторая")
+        self.assertGreaterEqual(
+            second["start"],
+            first["end"],
+            "a trimmed segment still reports a start inside committed audio",
+        )
+
+
+class ErrorEscalationTests(unittest.TestCase):
+    def test_escalation_is_by_count_and_keeps_no_write_only_state(self):
+        # B-078: ``_last_error_signature`` was written on both error
+        # paths and cleared on success, and read nowhere.
+        session = LiveSession(model_name="tiny", language=None)
+        self.assertFalse(hasattr(session, "_last_error_signature"))
+
+
 if __name__ == "__main__":
     unittest.main()
