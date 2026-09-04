@@ -1,12 +1,28 @@
 "use strict";
 
 // Executable specification for desktop/shortcut-defaults.json — the SSOT
-// data source readShortcutsFromConfig() (desktop/main.js) reads at
-// startup. BUGS_AUDIT 2026-09-03 §6.10: the old Windows/Linux default
-// pair (F9/F10) collided with the Win32 menu-mnemonic-activation key and
-// with debugger run/step keys in Visual Studio, VS Code and JetBrains
-// IDEs. These assertions pin the replacement so a future edit cannot
-// silently reintroduce a colliding default.
+// data source readShortcutsFromConfig() (desktop/main.js) reads at startup
+// and frontend/vite.config.ts injects into the renderer as
+// __SHORTCUT_DEFAULTS__.
+//
+// The rationale below used to live in the manifest as an "_comment" key.
+// The manifest is stringified whole into the production renderer bundle,
+// so 845 characters of prose shipped to every user. It belongs with the
+// assertions it justifies:
+//
+// BUGS_AUDIT 2026-09-03 §6.10: the old default/default pair (F9/F10)
+// collides with Win32 menu-mnemonic activation (F10) and with the debugger
+// run/step keys in Visual Studio, VS Code and JetBrains IDEs
+// (F5/F8/F9/F10/F11), plus Excel's F9 recalculate-now. Registering a global
+// hotkey does not stop the OS or a focused app from also acting on the same
+// key, so those presses either did nothing (globalShortcut.register still
+// returned true) or fired both actions at once. Control+Alt+Shift+<letter>
+// avoids all of that: it is not a single- or double-modifier combo any of
+// those surfaces claim (e.g. Ctrl+Alt+V is Office's 'Paste Special', but
+// adding Shift makes it a different accelerator), and it still registers as
+// a 3-modifier chord on every Windows/Linux desktop environment tested.
+// darwin keeps its existing Alt+Left/Alt+Shift+V defaults unchanged.
+//
 // Run: node --test desktop/  (or npm test in desktop/).
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -106,4 +122,22 @@ test("the documented Windows/Linux hotkeys are the ones the app registers", () =
       );
     }
   }
+});
+
+test("the manifest carries data only — it is stringified into the renderer bundle", () => {
+  // frontend/vite.config.ts does `__SHORTCUT_DEFAULTS__: JSON.stringify(...)`,
+  // so every byte of this file ships to every user. Prose belongs in this
+  // file, next to the assertions it explains.
+  const walk = (node, at) => {
+    if (node === null || typeof node !== "object") {
+      assert.equal(typeof node, "string", `${at}: only accelerator strings belong here`);
+      assert.ok(node.length <= 40, `${at}: ${node.length} characters is prose, not an accelerator`);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      assert.ok(!key.startsWith("_"), `${at}.${key}: no comment keys — they ship to users`);
+      walk(value, `${at}.${key}`);
+    }
+  };
+  walk(manifest, "manifest");
 });

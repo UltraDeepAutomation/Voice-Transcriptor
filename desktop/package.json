@@ -115,7 +115,6 @@
       "hardenedRuntime": true,
       "identity": null,
       "extendInfo": {
-        "NSHumanReadableCopyright": "Copyright (c) 2026 Leo Erdman. Licensed under the MIT License.",
         "NSMicrophoneUsageDescription": "Transcriptor records microphone audio when you start a live transcription.",
         "NSAppleEventsUsageDescription": "Transcriptor uses Apple Events to paste transcripts into the app you are working in."
       },
@@ -168,7 +167,6 @@
       "hardenedRuntime": true,
       "preAutoEntitlements": true,
       "extendInfo": {
-        "NSHumanReadableCopyright": "Copyright (c) 2026 Leo Erdman. Licensed under the MIT License.",
         "NSMicrophoneUsageDescription": "Transcriptor records microphone audio when you start a live transcription.",
         "NSAppleEventsUsageDescription": "Transcriptor uses Apple Events to paste transcripts into the app you are working in."
       },

@@ -289,3 +289,64 @@ test("the DMG artwork is drawn around the icon positions the manifest declares",
   assert.equal(pkg.build.dmg.background, "build/dmg-background.png");
   assert.ok(fs.existsSync(path.join(__dirname, "build", "dmg-background.png")));
 });
+
+test("the identity strings that appear outside the manifest are locked to it", () => {
+  // These four values have to be spelled out in places that cannot read
+  // desktop/package.json — a bash installer, two READMEs, the release
+  // env template. That is legitimate; what is not legitimate is nobody
+  // noticing when one of them stops matching. The manifest stays the SSOT
+  // and this test is what makes the copies followers rather than peers.
+  const root = path.join(__dirname, "..");
+  const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
+  const readmes = ["README.md", "README.en.md"];
+
+  // appId — the installer refuses to install a bundle whose id it does not
+  // recognise, and the READMEs quote it in the `tccutil reset` recipe.
+  const installer = read("INSTALL_ON_OTHER_MAC.command");
+  assert.match(
+    installer,
+    new RegExp(`DEFAULT_EXPECTED_BUNDLE_ID="${pkg.build.appId.replace(/\./g, "\\.")}"`),
+    "the installer's expected bundle id must be the one the manifest builds",
+  );
+  for (const name of readmes) {
+    assert.ok(read(name).includes(pkg.build.appId), `${name} quotes a different bundle id`);
+  }
+
+  // productName — the installer names the .app it copies.
+  assert.match(installer, new RegExp(`PRODUCT_NAME="${pkg.build.productName}"`));
+  assert.match(installer, new RegExp(`APP_NAME="${pkg.build.productName}\\.app"`));
+
+  // The backend port default: `.env.example` is the SSOT for release
+  // environment variables (AGENTS.md rule 4), main.js holds the fallback
+  // used when the variable is unset, and the READMEs tell the user which
+  // port to expect.
+  const envPort = /^#\s*TRANSCRIPTOR_PORT=(\d+)$/m.exec(read(".env.example"));
+  assert.ok(envPort, ".env.example must document the default port");
+  const mainSource = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(
+    mainSource,
+    new RegExp(`const DEFAULT_BACKEND_PORT = ${envPort[1]};`),
+    `main.js's fallback port must be the one .env.example documents (${envPort[1]})`,
+  );
+  for (const name of readmes) {
+    assert.ok(read(name).includes(envPort[1]), `${name} names a different port`);
+  }
+
+  // copyright — declared once. electron-builder writes
+  // NSHumanReadableCopyright from build.copyright unconditionally
+  // (macPackager: `appPlist.NSHumanReadableCopyright = appInfo.copyright`)
+  // and then deep-assigns extendInfo over it, so the two extendInfo copies
+  // were the same string overriding itself in two more places.
+  const manifestSource = fs.readFileSync(path.join(__dirname, "package.json"), "utf8");
+  assert.equal(
+    manifestSource.split(pkg.build.copyright).length - 1,
+    1,
+    "the copyright is declared once, in build.copyright",
+  );
+  for (const platform of ["mac", "mas"]) {
+    assert.ok(
+      !("NSHumanReadableCopyright" in (pkg.build[platform].extendInfo || {})),
+      `build.${platform}.extendInfo must not restate the copyright`,
+    );
+  }
+});

@@ -1,5 +1,4 @@
 {
-  "_comment": "BUGS_AUDIT 2026-09-03 §6.10: the old default/default pair (F9/F10) collides with Win32 menu-mnemonic activation (F10) and with the debugger run/step keys in Visual Studio, VS Code and JetBrains IDEs (F5/F8/F9/F10/F11), plus Excel's F9 recalculate-now. Registering a global hotkey does not stop the OS or a focused app from also acting on the same key, so those presses either did nothing (globalShortcut.register still returned true) or fired both actions at once. Control+Alt+Shift+<letter> avoids all of that: it is not a single- or double-modifier combo any of those surfaces claim (e.g. Ctrl+Alt+V is Office's 'Paste Special', but adding Shift makes it a different accelerator), and it still registers as a 3-modifier chord on every Windows/Linux desktop environment tested. darwin keeps its existing Alt+Left/Alt+Shift+V defaults unchanged.",
   "platformDefaults": {
     "darwin": {
       "record": "Alt+Left",

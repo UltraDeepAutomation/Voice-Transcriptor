@@ -931,3 +931,55 @@ D-084 (P2). D-045 verified as **already fixed** in `19b0235`.
   `` `${siteDir}/…` `` concatenation went with it. `grep` finds one
   remaining `siteDir}` and it is inside a log message, not a path.
 
+---
+## Commit 16 — the identity strings the manifest owns
+
+**IDs:** D-081 (P2), plus the four "хардкод → SSOT" rows the discovery report
+listed without an ID: appId, productName, port 8321, copyright.
+
+**Files:** `desktop/package.json`, `desktop/shortcut-defaults.json`,
+`desktop/shortcut-defaults.test.js`, `desktop/packaging.test.js`.
+
+**Re-verified on current code before fixing:** yes.
+```
+appId  local.transcriptor.app  — package.json:40, INSTALL_ON_OTHER_MAC.command:20, README.md:136, README.en.md:143
+port   8321                    — main.js DEFAULT_BACKEND_PORT, .env.example:12, README.md:137, README.en.md:146
+copyright                      — package.json:39 and twice more in mac/mas extendInfo
+```
+
+**Verification**
+- The copyright duplication is provably a no-op override, read from the
+  installed builder: `app-builder-lib/out/macPackager.js:400` does
+  `appPlist.NSHumanReadableCopyright = appInfo.copyright` and only then
+  `deepAssign(appPlist, extendInfo)`. So the two `extendInfo` copies wrote
+  the same string over itself. One declaration left; the test fails if a
+  second appears.
+- D-081, measured:
+  ```
+  OLD bytes shipped to the renderer: 1152
+  NEW bytes shipped to the renderer:  293
+  data identical apart from _comment: true
+  ```
+  The 845-character rationale moved verbatim into
+  `shortcut-defaults.test.js`, next to the assertions it justifies, and a
+  new test walks the manifest and fails on any `_`-prefixed key or any
+  string too long to be an accelerator.
+- `npm --prefix desktop test` -> `tests 245 / pass 245 / fail 0` (was 243).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *Chosen:* a test that locks the copies to the manifest, rather than
+  generating them. A bash installer, two prose READMEs and an env template
+  legitimately have to spell these values out; what was missing is anything
+  that notices when one stops matching. The manifest stays the SSOT and the
+  copies become followers.
+- *Chosen:* `.env.example` is read as the SSOT for the port (AGENTS.md rule
+  4) and `main.js`'s `DEFAULT_BACKEND_PORT` is checked against it, not the
+  other way round — main.js's own comment calls itself the SSOT, and rule 4
+  says otherwise.
+- *Chosen:* delete the copyright duplicates outright rather than have the
+  hook derive them. electron-builder already derives them; a hook doing it
+  again would be a third mechanism.
+
+**Not done in this commit:** nothing from this group.
+
