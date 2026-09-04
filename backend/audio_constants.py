@@ -27,6 +27,18 @@ LIVE_SAMPLE_RATE_HZ: int = 16_000
 # in live-recovery.
 LIVE_PCM_BYTES_PER_SEC: int = LIVE_SAMPLE_RATE_HZ * 2
 
+# Bytes per second of mono PCM16 at an ARBITRARY rate. The live pipeline
+# is 16 kHz everywhere and uses the constant above; a Deepgram live
+# session takes its rate from its own config, so the one place that has
+# to work for any rate asks here rather than writing "2 * rate" a fifth
+# time.
+PCM16_BYTES_PER_SAMPLE: int = 2
+
+
+def pcm16_bytes_per_sec(sample_rate: int) -> int:
+    """Bytes/second of mono PCM16 at ``sample_rate`` Hz."""
+    return max(1, int(sample_rate)) * PCM16_BYTES_PER_SAMPLE
+
 # Minimum bytes for a live recovery to be considered "had real audio"
 # rather than a session that started + immediately stopped. ~1 second
 # at the canonical rate. Drives the prune-on-finalize threshold.

@@ -223,3 +223,57 @@ OK
 * *Попутно:* `_WarmFakeUpstream` дополнен `stream_death_sec`, чтобы путь восстановления в тестах обработчика исполнялся целиком.
 
 **Не сделано:** —
+
+---
+
+## Коммит 6 — числа конверта
+
+**Заголовок:** «`coveredEndSec` stops repeating `durationSec`, so a spliced tail word can no longer make an incomplete envelope look complete»
+
+**ID:** B-006 (P1), B-010 (P1), B-026 (P2).
+
+**Файлы:** `backend/remote_deepgram_live.py`, `backend/deepgram_dual.py`, `backend/deepgram_recovery.py`, `backend/audio_constants.py`, `backend/main.py`, `backend/tests/test_deepgram_interim_splice.py`, `backend/tests/test_deepgram_warm.py`, `backend/tests/test_audio.py`.
+
+**Верификация.**
+
+B-006, тот же сеанс, ДО и ПОСЛЕ (финал 0–1 с + вставленное interim-слово 3.0–3.5 с):
+```
+BEFORE: durationSec=3.5 coveredEndSec=3.5
+AFTER:  durationSec=3.5 coveredEndSec=1.0
+```
+
+B-010, тест на коде ДО правки:
+```
+AssertionError: 'streamed_sec=0.0' not found in
+  'ws deepgram session complete: bytes=3200 streamed_sec=0.1 …'
+```
+(запись со сменой сокета: конверт нёс 0.0, лог печатал 0.1 — два разных числа об одном.)
+
+B-026:
+```
+$ grep -rn "2 \* LIVE_SAMPLE_RATE_HZ\|2 \* max(1" backend/*.py
+ДО: 5 совпадений    ПОСЛЕ: 0
+```
+
+Полный набор:
+```
+/Applications/Transcriptor.app/Contents/Resources/runtime/python/bin/python3 -m unittest discover -s backend/tests
+Ran 683 tests in 39.007s
+OK
+```
+(675 → 683.)
+
+**Решения.**
+
+* **B-006.** *Выбрано:* `_committed_end_sec()` — максимум по сегментам БЕЗ поля `source`, читается ДО сплайса. Правило «провайдерский финал», а не «не interim»: сегмент от REST-восстановления (`source="recovery"`) тоже не покрытие живого чтения, и тест это фиксирует.
+  *Отвергнуто:* фильтровать по конкретной строке `"interim-fallback"` — тогда следующий источник вставки снова врал бы в это поле.
+  *Строка `"interim-fallback"` названа константой* `INTERIM_FALLBACK_SOURCE` — её теперь читают два места.
+* **B-006, dual.** *Выбрано:* `coveredEndSec` объединённого конверта — максимум из двух `coveredEndSec` чтений, а не конец объединённых слов. *Почему:* объединение включает вставленные interim обеих сторон; каждое чтение уже измеряет своё покрытие правильно, и дальнейшее из двух — это ground, который хотя бы одно чтение зафиксировало.
+* **B-010.** *Выбрано:* лог-строка стопа читает `final_payload["streamedSec"]` — то самое число, которое ушло рендереру.
+  *Отвергнуто (сначала сделано, потом откачено):* публичный `session.streamed_seconds()`. Он потребовал бы метода на пяти тестовых фейках и на фасаде, а главное — оставил бы ДВА выражения (метод сессии и вызов в main) там, где нужен один источник. Конверт уже содержит ответ.
+* **B-026.** *Выбрано:* `LIVE_PCM_BYTES_PER_SEC` в четырёх местах `main.py` с фиксированной частотой и новая `pcm16_bytes_per_sec(rate)` в двух местах, где частота приходит из конфигурации (`_streamed_seconds`, `run_recovery`).
+  *Почему функция, а не ещё одна константа:* live-сессия берёт частоту из своего `DeepgramLiveConfig`; константа 16 кГц там была бы неверна, а `2 * rate` — пятой копией правила.
+  *Плюс:* `pcm16_bytes_per_sec` не может вернуть 0 (это делитель).
+  *Тест* `test_the_expression_is_no_longer_written_out_by_hand` ищет обе формы по всему `backend/*.py`, поэтому шестая копия не появится молча.
+
+**Не сделано:** —

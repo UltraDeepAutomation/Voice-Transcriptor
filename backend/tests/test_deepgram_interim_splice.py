@@ -17,6 +17,7 @@ from __future__ import annotations
 import unittest
 
 from backend.remote_deepgram_live import (
+    INTERIM_FALLBACK_SOURCE,
     INTERIM_WORD_GAP_SPLIT_SEC,
     DeepgramLiveSession,
 )
@@ -147,3 +148,71 @@ class InterimSpliceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoveredEndSecTests(unittest.IsolatedAsyncioTestCase):
+    """``coveredEndSec`` is committed finals only (B-006).
+
+    The renderer decides whether a stop's envelope covers the recording
+    by comparing ``coveredEndSec`` with ``streamedSec``
+    (``envelopeCoversRecording``, added so an incomplete envelope could
+    not end the race). The backend put ``durationSec`` in both fields,
+    so a single spliced interim word in the tail made the envelope look
+    complete and suppressed the recovery that would have filled the
+    hole — the exact defect that check was written for.
+    """
+
+    def _session(self):
+        session = DeepgramLiveSession(api_key="k")
+        return session
+
+    def test_a_spliced_tail_word_extends_duration_but_not_coverage(self):
+        session = self._session()
+        session._finalized_segments = [
+            {"start": 0.0, "end": 1.0, "text": "committed"},
+            {
+                "start": 3.0,
+                "end": 3.5,
+                "text": "spliced",
+                "source": INTERIM_FALLBACK_SOURCE,
+            },
+        ]
+        self.assertEqual(session._committed_end_sec(), 1.0)
+        envelope = session.partial_result()
+        self.assertEqual(envelope["durationSec"], 3.5)
+        self.assertEqual(
+            envelope["coveredEndSec"],
+            1.0,
+            "a spliced hypothesis was reported as committed coverage",
+        )
+
+    def test_the_two_fields_agree_when_nothing_was_spliced(self):
+        session = self._session()
+        session._finalized_segments = [
+            {"start": 0.0, "end": 2.25, "text": "committed"},
+        ]
+        envelope = session.partial_result()
+        self.assertEqual(envelope["durationSec"], 2.25)
+        self.assertEqual(envelope["coveredEndSec"], 2.25)
+
+    def test_a_transcript_of_only_spliced_words_covers_nothing(self):
+        session = self._session()
+        session._finalized_segments = [
+            {
+                "start": 0.0,
+                "end": 4.0,
+                "text": "all guesswork",
+                "source": INTERIM_FALLBACK_SOURCE,
+            },
+        ]
+        self.assertEqual(session.partial_result()["coveredEndSec"], 0.0)
+
+    def test_a_recovered_segment_is_not_committed_coverage_either(self):
+        # ``deepgram_recovery`` stamps what it splices with its own
+        # source; the rule is "a provider final", not "not interim".
+        session = self._session()
+        session._finalized_segments = [
+            {"start": 0.0, "end": 1.0, "text": "committed"},
+            {"start": 5.0, "end": 6.0, "text": "re-decoded", "source": "recovery"},
+        ]
+        self.assertEqual(session.partial_result()["coveredEndSec"], 1.0)

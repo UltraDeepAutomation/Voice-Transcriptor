@@ -1019,7 +1019,19 @@ class DualLiveSession:
         envelope["segments"] = merged.segments
         envelope["words"] = merged.words
         envelope["durationSec"] = round(merged.covered_end_sec(), 3)
-        envelope["coveredEndSec"] = round(merged.covered_end_sec(), 3)
+        # NOT the merged end: the merge includes each reading's spliced
+        # interim fallback, and ``coveredEndSec`` means "committed
+        # provider finals up to here" on both sides of the wire. Each
+        # reading already measures its own (``_committed_end_sec``), so
+        # the merged answer is the further of the two — a hole one
+        # reading committed past is committed ground for this envelope.
+        envelope["coveredEndSec"] = round(
+            max(
+                float(primary_result.get("coveredEndSec") or 0.0),
+                float((secondary_result or {}).get("coveredEndSec") or 0.0),
+            ),
+            3,
+        )
         envelope["streamedSec"] = round(streamed_sec, 3)
         envelope["uncoveredSpeechSec"] = round(
             self._merged_uncovered_speech_sec(), 3

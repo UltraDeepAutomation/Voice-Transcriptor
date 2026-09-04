@@ -973,13 +973,26 @@ class WarmSessionLivenessTests(_WarmHandlerCase):
                 )
                 await asyncio.sleep(0.02)
             await asyncio.sleep(0.3)
-            await self._finish(ws, task)
+            with self.assertLogs("backend.main", level="INFO") as logs:
+                await self._finish(ws, task)
             await pool.close_all()
 
         replacement = _WarmFakeUpstream.instances[1]
         # 3200 bytes of 16 kHz PCM16 is 0.1 s.
         self.assertAlmostEqual(replacement.audio_offset_sec, 0.1, places=6)
         self.assertEqual(len(replacement.sent_bytes), 3200)
+        # B-010: the completion log states the number the ENVELOPE
+        # carries. It used to recompute it from ``bytes_sent`` with its
+        # own arithmetic, which omitted the offset the swap introduced —
+        # so a socket-swapped recording was logged as having streamed
+        # less than the renderer was told it had.
+        envelope = next(m for m in ws.sent if m.get("type") == "final")
+        complete = next(
+            line for line in logs.output if "session complete" in line
+        )
+        self.assertIn(
+            "streamed_sec=%.1f" % float(envelope["streamedSec"]), complete
+        )
 
     async def test_silence_alone_never_arms_the_probe(self):
         # Deepgram is entitled to answer silence with nothing, so a slow

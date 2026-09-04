@@ -16,7 +16,11 @@ from backend.audio import (
     ensure_wav_16k,
     ensure_wav_16k_preserve_channels,
 )
-from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.audio_constants import (
+    LIVE_PCM_BYTES_PER_SEC,
+    LIVE_SAMPLE_RATE_HZ,
+    pcm16_bytes_per_sec,
+)
 
 
 class AudioCommandTests(unittest.TestCase):
@@ -168,3 +172,41 @@ class AudioCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PcmBytesPerSecondTests(unittest.TestCase):
+    """One conversion from PCM bytes to seconds (B-026).
+
+    ``audio_constants``'s own docstring forbids the form this replaces:
+    "the bytes/sec value (16000 x 2 = 32000) ... appeared at four
+    different sites in main.py alone". The constant it introduced was
+    imported and used once while the expression came back to all four,
+    plus a fifth site that needs an arbitrary rate.
+    """
+
+    def test_the_constant_is_the_helper_at_the_live_rate(self):
+        self.assertEqual(
+            LIVE_PCM_BYTES_PER_SEC, pcm16_bytes_per_sec(LIVE_SAMPLE_RATE_HZ)
+        )
+
+    def test_an_arbitrary_rate_is_two_bytes_a_sample(self):
+        self.assertEqual(pcm16_bytes_per_sec(8000), 16000)
+        self.assertEqual(pcm16_bytes_per_sec(48000), 96000)
+
+    def test_a_nonsense_rate_never_divides_by_zero(self):
+        # This feeds a division in ``_streamed_seconds``; a config that
+        # somehow carried 0 must not take the stop down with it.
+        self.assertEqual(pcm16_bytes_per_sec(0), 2)
+        self.assertEqual(pcm16_bytes_per_sec(-5), 2)
+
+    def test_the_expression_is_no_longer_written_out_by_hand(self):
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        offenders = []
+        for path in sorted(root.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            if re.search(r"2 \* LIVE_SAMPLE_RATE_HZ|2 \* max\(1, int\(", text):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [])

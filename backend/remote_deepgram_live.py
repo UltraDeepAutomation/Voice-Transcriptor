@@ -61,7 +61,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 # comes from the same centralised host as the REST module, so a regional
 # override (``TRANSCRIPTOR_DEEPGRAM_HOST``) sets both at once.
 from backend.async_tasks import await_cancelled, cancel_and_await
-from backend.audio_constants import LIVE_PCM_BYTES_PER_SEC, LIVE_SAMPLE_RATE_HZ
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
 from backend.deepgram_format import shared_format_params
 from backend.deepgram_keyterms import keyterm_query_pairs
@@ -899,6 +899,12 @@ class SpliceOutcome:
     @property
     def total(self) -> int:
         return self.inserted + self.appended
+
+
+# What a segment created by the interim splice is stamped with. Read
+# back by ``_committed_end_sec``: a spliced hypothesis extends the
+# transcript but must never be reported as committed coverage.
+INTERIM_FALLBACK_SOURCE = "interim-fallback"
 
 
 def splice_words_into_segments(
@@ -2253,6 +2259,8 @@ class DeepgramLiveSession:
         # (audit §3.9). After the splice the words are in the
         # transcript and the evidence is gone.
         holes_before_splice = self.coverage_hole_spans()
+        # BEFORE the splice, which is the only moment it can be read.
+        committed_end_sec = self._committed_end_sec()
         spliced_words = self._splice_uncovered_interim_words()
         # C6 (audit §3.8): merge seams exactly once and derive BOTH
         # ``text`` and ``segments`` from the same merged list. Previously
@@ -2322,10 +2330,12 @@ class DeepgramLiveSession:
             # captured N seconds" from "Deepgram actually processed N
             # seconds" without guessing from ``durationSec`` alone.
             "streamedSec": round(streamed_sec, 3),
-            # End of the last finalized segment (post seam-merge) — the
-            # point up to which the transcript is a committed final, as
-            # opposed to spliced interim fallback or nothing at all.
-            "coveredEndSec": round(duration_sec, 3),
+            # End of the last COMMITTED final — the point up to which
+            # the transcript is a provider final, as opposed to spliced
+            # interim fallback or nothing at all. Measured before the
+            # splice by ``_committed_end_sec``; it is deliberately NOT
+            # ``durationSec``, and the renderer compares the two.
+            "coveredEndSec": round(committed_end_sec, 3),
         }
 
     async def shutdown(self, wait_timeout: float = 3.0) -> None:
@@ -2554,7 +2564,7 @@ class DeepgramLiveSession:
         # WHICH hypotheses deserve placing, which is what everything
         # above does.
         outcome = splice_words_into_segments(
-            self._finalized_segments, survivors, source="interim-fallback"
+            self._finalized_segments, survivors, source=INTERIM_FALLBACK_SOURCE
         )
         self._finalized_segments = outcome.segments
         if outcome.appended:
@@ -2664,7 +2674,7 @@ class DeepgramLiveSession:
         ``streamedSec``, so they cannot drift apart.
         """
         return self._audio_offset_sec + byte_count / float(
-            2 * max(1, int(self._cfg.sample_rate))
+            pcm16_bytes_per_sec(self._cfg.sample_rate)
         )
 
     def _tail_coverage(self) -> tuple[float, float, float, float]:
@@ -3194,6 +3204,31 @@ class DeepgramLiveSession:
             drop_repeated_seam_ngrams(merge_seam_fragments(list(self._finalized_segments)))
         )
 
+    def _committed_end_sec(self) -> float:
+        """Where the COMMITTED transcript ends, on the recording's timeline.
+
+        Native finals only, and therefore read before the interim
+        splice runs. This is what ``coveredEndSec`` has always been
+        documented as — "the point up to which the transcript is a
+        committed final, AS OPPOSED TO spliced interim fallback" — in
+        its own comment, in the WS handler's field documentation and in
+        this method's callers. It was never computed: the envelope put
+        ``durationSec`` in both fields, so one recovered interim word in
+        the tail made the two equal and the renderer's
+        ``envelopeCoversRecording()`` read an incomplete envelope as
+        complete, which suppresses the recovery that would have filled
+        the hole. ``durationSec`` still counts everything, because the
+        transcript genuinely is that long.
+        """
+        return max(
+            (
+                float(seg.get("end") or 0.0)
+                for seg in self._finalized_segments
+                if not seg.get("source")
+            ),
+            default=0.0,
+        )
+
     def partial_result(self) -> dict:
         """Best-effort envelope from whatever is finalized RIGHT NOW.
 
@@ -3228,7 +3263,7 @@ class DeepgramLiveSession:
             "stats": self.stats.as_dict(),
             "uncoveredSpeechSec": round(self._uncovered_speech_sec(), 3),
             "streamedSec": round(streamed_sec, 3),
-            "coveredEndSec": round(duration_sec, 3),
+            "coveredEndSec": round(self._committed_end_sec(), 3),
         }
 
     # ----- Internals --------------------------------------------------------

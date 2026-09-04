@@ -63,7 +63,7 @@ import wave
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from backend.audio_constants import LIVE_SAMPLE_RATE_HZ
+from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 from backend.remote_deepgram import deepgram_transcribe
 from backend.remote_deepgram_live import (
@@ -624,7 +624,7 @@ async def run_recovery(
     if audio_sec is None:
         if audio is None:
             audio = pcm()  # type: ignore[operator]
-        audio_sec = len(audio) / float(2 * max(1, int(sample_rate)))
+        audio_sec = len(audio) / float(pcm16_bytes_per_sec(sample_rate))
 
     spans = uncovered_spans(
         streamed_sec,

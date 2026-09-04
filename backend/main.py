@@ -4160,7 +4160,7 @@ def _recovery_spool_seconds(recovery: Optional[dict]) -> float:
         size = Path(pcm_path).stat().st_size
     except OSError:
         return 0.0
-    return (size - size % 2) / float(2 * LIVE_SAMPLE_RATE_HZ)
+    return (size - size % 2) / float(LIVE_PCM_BYTES_PER_SEC)
 
 
 def _finalizing_payload(budget_sec: float, expects_more: bool) -> dict:
@@ -4577,7 +4577,7 @@ _WARM_PROBE_POLL_SEC = 0.1
 # the true beginning of the recording rather than from the moment the
 # swap completed. Bounded at 8 s of 16 kHz PCM16 — the probe window plus
 # a worst-case connect, with room to spare.
-_WARM_REPLAY_MAX_BYTES = 8 * 2 * LIVE_SAMPLE_RATE_HZ
+_WARM_REPLAY_MAX_BYTES = 8 * LIVE_PCM_BYTES_PER_SEC
 
 
 def _live_config(
@@ -5071,7 +5071,7 @@ async def _run_deepgram_live_session(
         warm_swap_in_progress = True
         old = session
         replay = bytes(warm_replay)
-        offset_sec = warm_replay_dropped / float(2 * LIVE_SAMPLE_RATE_HZ)
+        offset_sec = warm_replay_dropped / float(LIVE_PCM_BYTES_PER_SEC)
         logger.warning(
             "deepgram-live: discarded warm socket after adoption reason=no "
             "results within %.1fs of the first voiced audio; reconnecting "
@@ -5653,7 +5653,14 @@ async def _run_deepgram_live_session(
                     fw, what="deepgram event forwarder", log=logger
                 )
 
-        streamed_sec = session.stats.bytes_sent / float(2 * LIVE_SAMPLE_RATE_HZ)
+        # The number the ENVELOPE carries, not a second computation of
+        # it. ``DeepgramLiveSession._streamed_seconds`` is the one
+        # conversion — it is also the only one that applies
+        # ``audio_offset_sec``, so recomputing it here from
+        # ``bytes_sent`` logged every socket-swapped recording as having
+        # streamed less than it did, and logged a different number from
+        # the one the renderer was sent (B-010).
+        streamed_sec = float(final_payload.get("streamedSec") or 0.0)
         logger.info(
             "ws deepgram session complete: bytes=%d streamed_sec=%.1f chunks=%d "
             "final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s text_len=%d",
