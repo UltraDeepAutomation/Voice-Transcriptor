@@ -30,35 +30,70 @@ export interface LatestRelease {
   htmlUrl: string;
 }
 
-/** Compare two dotted numeric versions ("1.10.0" vs "1.9.2"). Non-numeric segments compare lexically. Returns >0 if a is newer. */
+/**
+ * Split a version into its numeric segments and its pre-release tag.
+ *
+ * "1.3.0-rc1" is 1.3.0 with the tag "rc1". Written out because the
+ * segment-wise compare below used to see the string "0-rc1", whose
+ * ``Number()`` is NaN, fall into the lexical branch, and conclude that
+ * "1.3.0-rc1" is NEWER than "1.3.0" — offering the user a downgrade
+ * from their release to a release candidate.
+ */
+function splitVersion(value: string): { numbers: number[]; pre: string } {
+  const raw = String(value || "").trim();
+  const cut = raw.search(/[-+]/);
+  const core = cut === -1 ? raw : raw.slice(0, cut);
+  const pre = cut === -1 ? "" : raw.slice(cut + 1);
+  return { numbers: core.split(".").map((seg) => Number(seg)), pre };
+}
+
+/**
+ * Compare two versions ("1.10.0" vs "1.9.2"). Returns >0 if a is newer.
+ *
+ * A pre-release is older than the release it leads to
+ * ("1.3.0-rc1" < "1.3.0"), and two pre-releases of one version compare
+ * lexically. A segment that is not a number compares lexically too.
+ */
 export function compareVersions(a: string, b: string): number {
-  const pa = String(a || "").trim().split(".");
-  const pb = String(b || "").trim().split(".");
-  const len = Math.max(pa.length, pb.length);
+  const va = splitVersion(a);
+  const vb = splitVersion(b);
+  const len = Math.max(va.numbers.length, vb.numbers.length);
   for (let i = 0; i < len; i++) {
-    const sa = pa[i] ?? "0";
-    const sb = pb[i] ?? "0";
-    const na = Number(sa);
-    const nb = Number(sb);
+    const na = va.numbers[i] ?? 0;
+    const nb = vb.numbers[i] ?? 0;
     if (Number.isFinite(na) && Number.isFinite(nb)) {
       if (na !== nb) return na - nb;
       continue;
     }
+    const sa = String(va.numbers[i] ?? "0");
+    const sb = String(vb.numbers[i] ?? "0");
     if (sa !== sb) return sa < sb ? -1 : 1;
   }
-  return 0;
+  if (va.pre === vb.pre) return 0;
+  if (!va.pre) return 1;
+  if (!vb.pre) return -1;
+  return va.pre < vb.pre ? -1 : 1;
 }
 
 /**
  * Extract {version, htmlUrl} from a GitHub /releases/latest payload.
- * Drafts and prereleases never appear in that endpoint; a missing tag
- * name or html_url yields null so callers can treat it as "unknown"
- * rather than "up to date".
+ *
+ * Drafts and pre-releases are not supposed to reach that endpoint, and
+ * both are refused here anyway — the previous code said "drafts and
+ * prereleases" in its comment and checked only ``draft``, so the one
+ * field that documents the case it did not check was the one it did not
+ * read. A missing tag name or html_url yields null so callers treat it
+ * as "unknown" rather than "up to date".
  */
 export function parseLatestRelease(payload: unknown): LatestRelease | null {
   if (!payload || typeof payload !== "object") return null;
-  const obj = payload as { tag_name?: unknown; html_url?: unknown; draft?: unknown };
-  if (obj.draft === true) return null;
+  const obj = payload as {
+    tag_name?: unknown;
+    html_url?: unknown;
+    draft?: unknown;
+    prerelease?: unknown;
+  };
+  if (obj.draft === true || obj.prerelease === true) return null;
   const rawTag = typeof obj.tag_name === "string" ? obj.tag_name.trim() : "";
   const htmlUrl = typeof obj.html_url === "string" ? obj.html_url : "";
   if (!rawTag || !htmlUrl) return null;
@@ -121,8 +156,19 @@ export async function checkForUpdate(
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
-/** Throttle rule for the passive boot-time check: at most once per day. */
+/**
+ * Throttle rule for the passive boot-time check: at most once per day.
+ *
+ * A stamp in the FUTURE is not a throttle, it is a broken clock — a
+ * machine whose time was set forward and then corrected, or a timezone
+ * change on a system that stores local time. The stamp outlives
+ * restarts in localStorage, so treating "now minus a future stamp" as a
+ * negative interval switched the background check off permanently. The
+ * first line of this function already refused NaN and zero; a stamp
+ * that cannot have happened yet is the third way of being unusable.
+ */
 export function shouldAutoCheck(nowMs: number, lastCheckedMs: number): boolean {
   if (!Number.isFinite(lastCheckedMs) || lastCheckedMs <= 0) return true;
+  if (lastCheckedMs > nowMs) return true;
   return nowMs - lastCheckedMs >= CHECK_INTERVAL_MS;
 }

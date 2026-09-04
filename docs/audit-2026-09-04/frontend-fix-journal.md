@@ -843,7 +843,7 @@ $ typecheck / lint / build — чисто, ✓ built
 
 ---
 
-## Коммит `<C>` — SSOT, типы и стили
+## Коммит `a52e976` — SSOT, типы и стили
 
 **Заголовок:** One declaration per type and per design token, and one number bounds the status pill
 
@@ -926,3 +926,88 @@ $ git stash pop && npx vitest run tests/styles-tokens.test.ts
   есть причина; причина записана.
 
 **Не сделано:** —
+
+---
+
+## Коммит `<D>` — костыли: слушатели, таймеры и часы, живущие дольше своего повода
+
+**Заголовок:** Nothing the renderer starts outlives what started it, and a clock set backwards no longer switches the update check off for good
+
+**Находки / строки индексов:** `U`-индекс костылей — K-3
+(`pickUploadRetryFile`: «отмену» определял `focus` + 250 мс, `{once:true}`
+слушатель висел до произвольного будущего фокуса), K-4 (глобальные
+`dragover`/`drop` внутри `setupUploadView`), K-6 = **U-019** (`PUT` на выгрузке
+без `keepalive`), K-8 = `R`-индекс 10 (`Promise.race` с неотменяемым
+`setTimeout`); `U`-индекс SSOT — H-13 = **U-016** (поэкземплярный teardown
+опросов). Плюс P2: **U-012**, **U-017**.
+
+**Перепроверка на текущем коде.** Все открыты дословно. `K-4` оказался не
+утечкой (`setupUploadView` вызывается один раз), но регистрация процессного
+guard'а изнутри setup-функции — именно то, что делает его похожим на забытый
+слушатель и ломается на втором вызове; поднят на уровень модуля с объяснением.
+
+**Файлы:** `frontend/src/main.tsx`, `frontend/src/update-check.ts`,
+`frontend/tests/update-check.test.ts` (+6 тестов).
+
+**Что сделано.**
+* `stopGatedPolls()` над реестром `gatedPolls` и один `pagehide`-слушатель.
+  Реестр существовал ровно для того, чтобы вызывающий не знал, какие опросы
+  есть, — и использовался только для `sync`; у `local-models` boilerplate'а не
+  написали, и он продолжал тикать после `pagehide`.
+* Таймаут гонки бутстрапа гасится в `finally`. Проигравший в `Promise.race` не
+  отменяется победой: таймер оставался взведённым все 15 с после бутстрапа,
+  который занял 40 мс.
+* `pickUploadRetryFile` слушает событие `cancel` самого `<input type=file>`
+  вместо `focus` + `setTimeout(250)`; ни висящего слушателя, ни догадки.
+* `apiPut(url, body, {keepalive})`; выгрузочный сброс снапшота очереди просит
+  `keepalive`, а `apiPut` снимает флаг, если тело не влезает в 64 KiB
+  (иначе запрос отклоняется целиком — это хуже, чем прерванный).
+* Глобальный `dragover`/`drop` guard поднят из `setupUploadView` на уровень
+  модуля.
+* `update-check.ts`: `prerelease` теперь читается (комментарий обещал «drafts
+  **and prereleases**», код проверял только `draft`); `compareVersions`
+  разбирает предрелизный суффикс — `1.3.0-rc1` уходил в лексическую ветку через
+  `Number("0-rc1") = NaN` и объявлялся **новее** `1.3.0`, то есть пользователю
+  предлагали даунгрейд; штамп из будущего (часы переставили вперёд и вернули)
+  больше не выключает фоновую проверку навсегда.
+
+**Верификация.**
+
+```
+$ npm --prefix frontend test
+ Test Files  26 passed (26)
+      Tests  320 passed (320)
+$ typecheck / lint / build — чисто, ✓ built
+```
+
+```
+$ git stash push src/update-check.ts && npx vitest run tests/update-check.test.ts
+     × orders a release candidate below the release
+     × refuses a payload marked prerelease, as its comment always claimed
+     × checks when the stored stamp is in the future
+      Tests  3 failed | 14 passed (17)
+```
+
+**Решения.**
+* `keepalive`: отвергнуто `navigator.sendBeacon` — он не даёт поставить
+  заголовок с API-токеном, а бэкенд его требует. Отвергнуто и «слать
+  `keepalive` всегда»: браузер отклоняет тело больше 64 KiB, а снапшот с
+  двумя сотнями транскриптов его превышает; тогда сохранение не «пострадало
+  бы», а не состоялось вовсе.
+* K-3: отвергнуто «оставить фолбэк на `focus` для старых движков». Приложение
+  везде Chromium (`cssTarget: "chrome142"`), `cancel` есть с 113; второй путь
+  вернул бы ровно ту догадку, ради устранения которой правка делается.
+* Опросы: отвергнуто «дописать `localModelsPoll.stop()` третьей строкой». Это
+  четвёртая копия boilerplate'а вместо использования реестра, который для
+  этого и заведён.
+
+**Не сделано (в этом коммите):**
+* **K-2** (`_stageCrossoverDelay` — придуманный переход «uploading →
+  processing» по таймеру `size/10000`) — в долг. Честный источник прогресса
+  тела запроса существует (`XMLHttpRequest.upload.onprogress`), но это замена
+  транспорта загрузки целиком, вместе с отменой и заголовками; отдельная
+  задача, не побочная правка. Комментарий у кода причину признаёт.
+* **K-5 / U-020** (восстановление reveal-целей сопоставлением обрезанного
+  превью с `display_name`, неограниченные последовательные `apiGet` на старте)
+  — в долг: это одноразовая миграция легаси-снапшотов, и переписывать её надо
+  вместе с решением, храним ли мы вообще reveal-цель отдельно от `savedName`.

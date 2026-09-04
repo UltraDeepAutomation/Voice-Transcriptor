@@ -145,6 +145,20 @@ function syncGatedPolls(): void {
   for (const poll of gatedPolls) poll.sync();
 }
 
+/**
+ * Stop every registered poll.
+ *
+ * Teardown used to be written per instance, beside each poll, so the
+ * registry that exists precisely to spare callers that knowledge was
+ * used for ``sync`` and not for ``stop`` — and the one poll whose
+ * author did not write the boilerplate (``local-models``) simply kept
+ * running after ``pagehide``, through Electron reloads and dev hot
+ * reloads. One listener, over the registry, at the bottom of this file.
+ */
+function stopGatedPolls(): void {
+  for (const poll of gatedPolls) poll.stop();
+}
+
 type UiTone = "neutral" | "info" | "success" | "warning" | "error";
 
 interface NetworkStatusResponse {
@@ -3682,11 +3696,28 @@ async function apiPost<T>(url: string, body: unknown): Promise<T> {
   return (await r.json()) as T;
 }
 
-async function apiPut<T>(url: string, body: unknown): Promise<T> {
+/**
+ * Browsers cap the body of a ``keepalive`` request at 64 KiB across all
+ * in-flight keepalive requests; over that the fetch rejects outright.
+ * A queue snapshot carrying two hundred transcripts can exceed it, and
+ * a rejected save is worse than an interrupted one, so the flag is
+ * dropped for a payload that would not fit.
+ */
+const KEEPALIVE_MAX_BODY_BYTES = 60_000;
+
+async function apiPut<T>(
+  url: string,
+  body: unknown,
+  options: { keepalive?: boolean } = {},
+): Promise<T> {
+  const payload = JSON.stringify(body);
+  const keepalive = !!options.keepalive
+    && new TextEncoder().encode(payload).length <= KEEPALIVE_MAX_BODY_BYTES;
   const r = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify(body),
+    body: payload,
+    keepalive,
   });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as T;
@@ -6061,7 +6092,6 @@ window.addEventListener("pagehide", () => {
   if (activeShortcutBtn) {
     stopShortcutRecording(true);
   }
-  _shortcutConflictPoll.stop();
 }, { once: true });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden" && activeShortcutBtn) {
@@ -13154,27 +13184,34 @@ syncGatedPolls();
 // An OS-level connectivity change is news now, not in ten seconds.
 window.addEventListener("online", () => _networkPoll.refreshNow());
 window.addEventListener("offline", () => _networkPoll.refreshNow());
-// Symmetric cleanup so dev hot-reloads / explicit teardown paths
-// don't leave stale handles behind.
-window.addEventListener("pagehide", () => {
-  _networkPoll.stop();
-}, { once: true });
+// Symmetric cleanup so dev hot-reloads / explicit teardown paths don't
+// leave stale handles behind — for every registered poll, not for the
+// two whose authors remembered to write it.
+window.addEventListener("pagehide", stopGatedPolls, { once: true });
 // Race bootstrap against a 15-second wall-clock timeout so a stalled
 // network mount or slow FS does not hang the boot overlay forever — the
 // promise must settle for any caller that `await recordingsBootstrapPromise`
 // to resume. On timeout the recordings list stays empty; the user can still
 // record and the list reloads on the next manual refresh.
+let recordingsBootstrapTimeoutHandle = 0;
 recordingsBootstrapPromise = Promise.race([
   initRecordingsBootstrap(),
-  new Promise<void>((_, rej) =>
-    setTimeout(
+  new Promise<void>((_, rej) => {
+    recordingsBootstrapTimeoutHandle = window.setTimeout(
       () => rej(new Error(`recordings bootstrap timeout (${UI_TOKENS.recordings.bootstrapTimeoutMs} ms)`)),
       UI_TOKENS.recordings.bootstrapTimeoutMs,
-    )
-  ),
+    );
+  }),
 ])
   .catch((e) => { console.warn("[bootstrap]", e?.message ?? e); })
-  .finally(() => { recordingsBootstrapPromise = null; });
+  .finally(() => {
+    // The loser of a race is not cancelled by winning it. Without this
+    // the timer stayed armed for the full 15 s after a bootstrap that
+    // finished in 40 ms, holding its closure and keeping the process
+    // from going idle.
+    window.clearTimeout(recordingsBootstrapTimeoutHandle);
+    recordingsBootstrapPromise = null;
+  });
 // Platform marker on <body> so the stylesheet can gate macOS-specific
 // chrome offsets (traffic-light padding under hiddenInset). Without
 // this, Windows/Linux users see a 42px dead zone at the top of the
@@ -13840,7 +13877,17 @@ function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): 
   }
 }
 
-async function flushUploadQueueSnapshotNow(): Promise<void> {
+/**
+ * Write the queue snapshot now.
+ *
+ * ``unloading`` marks the call made from ``pagehide``/``beforeunload``:
+ * the browser cancels an ordinary request when the document goes away,
+ * and terminal statuses are set precisely as the user closes the
+ * window, so the last debounce window's changes were the ones most
+ * likely to be lost. ``keepalive`` is the one flag that lets the
+ * request outlive the document.
+ */
+async function flushUploadQueueSnapshotNow(unloading = false): Promise<void> {
   if (!uploadQueueSnapshotLoaded) return;
   if (uploadQueueSaveTimer !== null) {
     window.clearTimeout(uploadQueueSaveTimer);
@@ -13851,7 +13898,11 @@ async function flushUploadQueueSnapshotNow(): Promise<void> {
   uploadQueueSaveInFlight = uploadQueueSaveInFlight
     .catch(() => undefined)
     .then(async () => {
-      await apiPut<UploadQueueStoragePayload & { ok?: boolean }>("/api/ui/upload-queue", payload);
+      await apiPut<UploadQueueStoragePayload & { ok?: boolean }>(
+        "/api/ui/upload-queue",
+        payload,
+        { keepalive: unloading },
+      );
       uploadQueueLastSaveOk = true;
     })
     .catch((e) => {
@@ -13861,7 +13912,7 @@ async function flushUploadQueueSnapshotNow(): Promise<void> {
   await uploadQueueSaveInFlight;
   if (uploadQueueSavePending) {
     uploadQueueSavePending = false;
-    await flushUploadQueueSnapshotNow();
+    await flushUploadQueueSnapshotNow(unloading);
   }
 }
 
@@ -13978,7 +14029,7 @@ function afterUploadQueueSnapshotLoaded(action: () => void): void {
 }
 
 function flushUploadQueueSnapshotBestEffort(): void {
-  void flushUploadQueueSnapshotNow();
+  void flushUploadQueueSnapshotNow(true);
 }
 
 window.addEventListener("pagehide", flushUploadQueueSnapshotBestEffort, { capture: true });
@@ -13995,6 +14046,25 @@ function enqueueUploadFiles(files: File[]): void {
     files.forEach(enqueueUploadFile);
   });
 }
+
+/**
+ * Stop the window from navigating away when a file is dropped OUTSIDE
+ * the drop zone — browsers open a dropped file by default, on every
+ * view, which would discard an unsaved recording.
+ *
+ * Installed here rather than inside ``setupUploadView`` because it is
+ * process-wide and deliberately permanent: registered from inside a
+ * setup function it read as a listener somebody had forgotten to
+ * remove, and a second call would have installed it twice.
+ */
+["dragover", "drop"].forEach((ev) => {
+  window.addEventListener(ev, (e) => {
+    // Inside the drop zone the per-element listeners already handle it.
+    if ((e.target as HTMLElement)?.closest("#uploadLargeDrop")) return;
+    e.preventDefault();
+    e.stopPropagation();
+  });
+});
 
 function setupUploadView(): void {
   const dropZone = document.getElementById("uploadLargeDrop");
@@ -14073,18 +14143,6 @@ function setupUploadView(): void {
     const dt = e.dataTransfer;
     if (!dt) return;
     enqueueUploadFiles(Array.from(dt.files));
-  });
-  // Block the entire window from navigating away if a file is
-  // dropped OUTSIDE the drop zone. Browsers navigate to dropped
-  // files by default, including when the user is on Live/History/
-  // Settings. Enqueue remains owned solely by `#uploadLargeDrop`.
-  ["dragover", "drop"].forEach((ev) => {
-    window.addEventListener(ev, (e) => {
-      // Inside the drop zone the per-element listeners already handle it.
-      if ((e.target as HTMLElement)?.closest("#uploadLargeDrop")) return;
-      e.preventDefault();
-      e.stopPropagation();
-    });
   });
   const clearBtn = document.getElementById("uploadQueueClearBtn") as HTMLButtonElement | null;
   if (clearBtn) {
@@ -14540,13 +14598,13 @@ function pickUploadRetryFile(): Promise<File | null> {
     input.addEventListener("change", () => {
       finish(input.files?.[0] || null);
     }, { once: true });
-    window.addEventListener("focus", () => {
-      window.setTimeout(() => {
-        if (!settled && (!input.files || input.files.length === 0)) {
-          finish(null);
-        }
-      }, 250);
-    }, { once: true });
+    // "The user closed the dialog without choosing" used to be inferred
+    // from a window ``focus`` plus a 250 ms wait — a guess that also
+    // left a ``{once:true}`` listener and its closure alive until some
+    // arbitrary later focus. The file input answers the question
+    // itself; ``cancel`` has been in Chromium since 113 and this app
+    // ships Chromium (see ``cssTarget`` in vite.config.ts).
+    input.addEventListener("cancel", () => finish(null), { once: true });
     document.body.appendChild(input);
     input.click();
   });

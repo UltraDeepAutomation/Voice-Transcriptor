@@ -78,3 +78,44 @@ describe("shouldAutoCheck", () => {
     expect(shouldAutoCheck(25 * 3600 * 1000, 3600 * 1000)).toBe(true);
   });
 });
+
+/**
+ * Three ways the checker used to answer wrongly, all of them silent.
+ */
+describe("a pre-release is never newer than its release (U-012)", () => {
+  it("orders a release candidate below the release", () => {
+    expect(compareVersions("1.3.0-rc1", "1.3.0")).toBeLessThan(0);
+    expect(compareVersions("1.3.0", "1.3.0-rc1")).toBeGreaterThan(0);
+  });
+
+  it("still orders by the numbers first", () => {
+    expect(compareVersions("1.4.0-rc1", "1.3.0")).toBeGreaterThan(0);
+    expect(compareVersions("1.2.9", "1.3.0-rc1")).toBeLessThan(0);
+  });
+
+  it("orders two candidates of one version among themselves", () => {
+    expect(compareVersions("1.3.0-rc1", "1.3.0-rc2")).toBeLessThan(0);
+    expect(compareVersions("1.3.0-rc2", "1.3.0-rc2")).toBe(0);
+  });
+
+  it("refuses a payload marked prerelease, as its comment always claimed", () => {
+    expect(parseLatestRelease({
+      tag_name: "v1.4.0",
+      html_url: "https://example.invalid/r",
+      prerelease: true,
+    })).toBeNull();
+  });
+});
+
+describe("a clock that went backwards does not switch the check off (U-017)", () => {
+  it("checks when the stored stamp is in the future", () => {
+    const now = 1_700_000_000_000;
+    expect(shouldAutoCheck(now, now + 60_000)).toBe(true);
+    expect(shouldAutoCheck(now, now + 400 * 24 * 3600 * 1000)).toBe(true);
+  });
+
+  it("still throttles a stamp from a minute ago", () => {
+    const now = 1_700_000_000_000;
+    expect(shouldAutoCheck(now, now - 60_000)).toBe(false);
+  });
+});
