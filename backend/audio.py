@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 # upload could OOM the backend.
 _FFMPEG_STDERR_CAP_BYTES = 64 * 1024
 _REMOTE_COMPACT_TIMEOUT_SEC = 1800
+# The ceiling for a straight decode-to-16 kHz-WAV conversion, which is
+# what every LOCAL transcription starts with. Written out as ``300``
+# twice, next to a named ceiling for the remote path, so a change to one
+# left the other behind.
+_LOCAL_CONVERT_TIMEOUT_SEC = 300
 _FFMPEG_DECODE_ERROR_PATTERNS = (
     "partial file",
     "input buffer exhausted",
@@ -150,6 +155,14 @@ def _run_ffmpeg(
     src_path, dst_path = _ffmpeg_io_paths(cmd)
     proc = subprocess.Popen(
         cmd,
+        # ffmpeg reads its interactive console from stdin. Inherited, it
+        # steals bytes from the parent's stdio channel — which is how
+        # Electron talks to this backend — and a backgrounded process
+        # reading an inherited terminal takes SIGTTIN on POSIX. The
+        # ``-nostdin`` flag on the argv says the same thing, and it was
+        # on two of the four commands that reach here; this covers all
+        # of them, including any added later.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -440,6 +453,7 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             "ffmpeg",
             "-y",
             "-hide_banner",
+            "-nostdin",
             "-loglevel",
             "error",
             "-i",
@@ -453,7 +467,11 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             path_out,
         ]
         try:
-            _run_ffmpeg(cmd, timeout_sec=300, fail_on_decode_error=True)
+            _run_ffmpeg(
+                cmd,
+                timeout_sec=_LOCAL_CONVERT_TIMEOUT_SEC,
+                fail_on_decode_error=True,
+            )
         except AudioError:
             try:
                 os.unlink(path_out)
@@ -513,6 +531,7 @@ def ensure_wav_16k_preserve_channels(path_in: str, path_out: str) -> str:
             "ffmpeg",
             "-y",
             "-hide_banner",
+            "-nostdin",
             "-loglevel",
             "error",
             "-i",
@@ -529,7 +548,11 @@ def ensure_wav_16k_preserve_channels(path_in: str, path_out: str) -> str:
             path_out,
         ]
         try:
-            _run_ffmpeg(cmd, timeout_sec=300, fail_on_decode_error=True)
+            _run_ffmpeg(
+                cmd,
+                timeout_sec=_LOCAL_CONVERT_TIMEOUT_SEC,
+                fail_on_decode_error=True,
+            )
         except AudioError:
             try:
                 os.unlink(path_out)

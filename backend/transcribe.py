@@ -200,8 +200,23 @@ def _touch_model(model_name: str) -> None:
     statement.
     """
     with _MODEL_LOCK:
-        if model_name in _MODEL_CACHE:
+        # GigaAM ids are recorded too: their weights live in the other
+        # engine's cache, but the idle window is one policy for both and
+        # ``release_idle_models`` needs an age for anything it may drop.
+        if model_name in _MODEL_CACHE or model_name.startswith(GIGAAM_MODEL_PREFIX):
             _MODEL_LAST_USED[model_name] = time.monotonic()
+
+
+def _gigaam_module():
+    """The GigaAM adapter IF it has already been imported, else ``None``.
+
+    Never imports it: the whole point of the lazy engine is that a user
+    who does not run GigaAM never pays for its (torch) import, and a
+    residency or release question must not be what triggers it. A module
+    that was never imported holds no models, which is the correct answer
+    to both questions.
+    """
+    return sys.modules.get("backend.transcribe_gigaam")
 
 
 def model_is_resident(model_name: str) -> bool:
@@ -217,7 +232,7 @@ def model_is_resident(model_name: str) -> bool:
         # to answer a residency question would defeat the purpose of
         # lazy loading, so treat "module never imported" as "not
         # resident" without touching sys.modules ordering.
-        module = sys.modules.get("backend.transcribe_gigaam")
+        module = _gigaam_module()
         if module is None:
             return False
         return model_name in getattr(module, "_MODEL_CACHE", {})
@@ -232,6 +247,18 @@ def release_model(model_name: str) -> bool:
     loaded instance in memory would keep serving transcriptions for a
     model the rest of the app reports as absent.
     """
+    if model_name.startswith(GIGAAM_MODEL_PREFIX):
+        # The same dispatch ``model_is_resident`` makes. Without it this
+        # function answered "it was not loaded" for a model that was,
+        # and the deleted-from-disk model kept serving transcriptions.
+        module = _gigaam_module()
+        existed = bool(module and module.release_gigaam(model_name))
+        with _MODEL_LOCK:
+            _MODEL_LAST_USED.pop(model_name, None)
+            _MODEL_WARM_STATE.pop(model_name, None)
+        if existed:
+            logger.info("gigaam model released on request: model=%s", model_name)
+        return existed
     with _MODEL_LOCK:
         existed = _MODEL_CACHE.pop(model_name, None) is not None
         _MODEL_LAST_USED.pop(model_name, None)
@@ -252,9 +279,19 @@ def release_idle_models(now: Optional[float] = None) -> List[str]:
     if _MODEL_IDLE_UNLOAD_SEC <= 0:
         return []
     stamp = time.monotonic() if now is None else now
+    gigaam = _gigaam_module()
     released: List[str] = []
+    gigaam_expired: List[str] = []
     with _MODEL_LOCK:
-        for name in list(_MODEL_CACHE.keys()):
+        # BOTH engines. ``model_is_resident`` already knew about the
+        # GigaAM cache while this function did not, so the ~1 GB torch
+        # model — the heaviest thing this app loads, and the reason
+        # ``_MODEL_IDLE_UNLOAD_SEC`` exists — was the one model that
+        # never came back out of memory until the process exited.
+        resident = list(_MODEL_CACHE.keys())
+        if gigaam is not None:
+            resident.extend(gigaam.resident_gigaam_models())
+        for name in resident:
             last = _MODEL_LAST_USED.get(name)
             if last is None:
                 # No timestamp recorded (model inserted by an older code
@@ -264,13 +301,23 @@ def release_idle_models(now: Optional[float] = None) -> List[str]:
                 continue
             if stamp - last < _MODEL_IDLE_UNLOAD_SEC:
                 continue
-            _MODEL_CACHE.pop(name, None)
             _MODEL_LAST_USED.pop(name, None)
             _MODEL_WARM_STATE.pop(name, None)
+            if name.startswith(GIGAAM_MODEL_PREFIX):
+                gigaam_expired.append(name)
+            else:
+                _MODEL_CACHE.pop(name, None)
             released.append(name)
+    # Outside ``_MODEL_LOCK``: the GigaAM cache has its own lock, and
+    # taking one while holding the other is how two locks become a
+    # deadlock.
+    for name in gigaam_expired:
+        if gigaam is not None:
+            gigaam.release_gigaam(name)
     for name in released:
         logger.info(
-            "whisper model released after %ds idle: model=%s",
+            "%s model released after %ds idle: model=%s",
+            "gigaam" if name.startswith(GIGAAM_MODEL_PREFIX) else "whisper",
             _MODEL_IDLE_UNLOAD_SEC,
             name,
         )
@@ -327,6 +374,11 @@ def warm_model(model_name: str, probe: bool = False) -> Dict[str, float]:
         from backend.transcribe_gigaam import warm_gigaam
 
         warm_gigaam(model_name)
+        # ``_model()`` records the whisper side; the GigaAM adapter has
+        # no view of the idle window, so warming is recorded here. Left
+        # unrecorded, a warmed model reached the sweeper with no age and
+        # spent one whole window being stamped instead of aged.
+        _touch_model(model_name)
     else:
         _model(model_name)
     load_ms = int((time.perf_counter() - started) * 1000)
@@ -467,11 +519,13 @@ def transcribe_audio(
     if model_name.startswith(GIGAAM_MODEL_PREFIX):
         from backend.transcribe_gigaam import transcribe_gigaam
 
-        return transcribe_gigaam(
+        result = transcribe_gigaam(
             audio_16k_mono,
             model_name,
             word_timestamps=word_timestamps,
         )
+        _touch_model(model_name)
+        return result
 
     model = _model(model_name)
     try:
@@ -513,9 +567,11 @@ def transcribe_file(
     # sync transcribe and re-transcribe accept every catalog id, so a
     # gigaam id must reach the GigaAM engine instead of WhisperModel.
     if model_name.startswith(GIGAAM_MODEL_PREFIX):
-        return _transcribe_file_gigaam(
+        result = _transcribe_file_gigaam(
             path_wav_16k_mono, model_name, word_timestamps=word_timestamps
         )
+        _touch_model(model_name)
+        return result
 
     model = _model(model_name)
     if os.path.getsize(path_wav_16k_mono) <= 64:

@@ -102,5 +102,90 @@ class TestIdleModelUnload(unittest.TestCase):
                 sys.modules["backend.transcribe_gigaam"] = saved
 
 
+class GigaAmIdleUnloadTests(unittest.TestCase):
+    """The idle window covers BOTH engines (B-015).
+
+    ``model_is_resident`` already reached into the GigaAM cache to
+    answer "is it loaded"; both releasing functions knew only about the
+    whisper cache. So the heaviest model this app loads — a ~1 GB torch
+    Conformer — was the one thing the unload window could never
+    reclaim, which is the OOM scenario the window was introduced for,
+    and deleting its weights from disk left the instance in memory
+    still serving transcriptions.
+    """
+
+    MODEL = "gigaam-v3-rnnt"
+
+    def setUp(self) -> None:
+        from backend import transcribe_gigaam
+
+        self.gigaam = transcribe_gigaam
+        self._saved_idle = transcribe._MODEL_IDLE_UNLOAD_SEC
+        transcribe._MODEL_CACHE.clear()
+        transcribe._MODEL_LAST_USED.clear()
+        transcribe._MODEL_WARM_STATE.clear()
+        self.gigaam._MODEL_CACHE.clear()
+
+    def tearDown(self) -> None:
+        transcribe._MODEL_IDLE_UNLOAD_SEC = self._saved_idle
+        transcribe._MODEL_CACHE.clear()
+        transcribe._MODEL_LAST_USED.clear()
+        transcribe._MODEL_WARM_STATE.clear()
+        self.gigaam._MODEL_CACHE.clear()
+
+    def _seed(self, last_used: float) -> None:
+        self.gigaam._MODEL_CACHE[self.MODEL] = _FakeModel()
+        transcribe._MODEL_LAST_USED[self.MODEL] = last_used
+
+    def test_an_idle_gigaam_model_is_released(self) -> None:
+        transcribe._MODEL_IDLE_UNLOAD_SEC = 600
+        self._seed(last_used=0.0)
+        self.assertTrue(transcribe.model_is_resident(self.MODEL))
+
+        released = transcribe.release_idle_models(now=601.0)
+
+        self.assertEqual(released, [self.MODEL])
+        self.assertFalse(transcribe.model_is_resident(self.MODEL))
+        self.assertNotIn(self.MODEL, self.gigaam._MODEL_CACHE)
+
+    def test_a_recently_used_gigaam_model_is_kept(self) -> None:
+        transcribe._MODEL_IDLE_UNLOAD_SEC = 600
+        self._seed(last_used=100.0)
+
+        self.assertEqual(transcribe.release_idle_models(now=601.0), [])
+        self.assertTrue(transcribe.model_is_resident(self.MODEL))
+
+    def test_release_model_evicts_gigaam_too(self) -> None:
+        # Called when the weights are deleted from disk. Answering
+        # "it was not loaded" for a model that was left it transcribing
+        # for a model the rest of the app reports as absent.
+        self._seed(last_used=0.0)
+
+        self.assertTrue(transcribe.release_model(self.MODEL))
+        self.assertFalse(transcribe.model_is_resident(self.MODEL))
+        self.assertFalse(transcribe.release_model(self.MODEL))
+
+    def test_the_two_answers_about_residency_agree(self) -> None:
+        # ``model_is_resident`` and the releasing functions used to
+        # disagree about the same model. Whatever the first calls
+        # resident, the second must be able to release.
+        self._seed(last_used=0.0)
+        self.assertEqual(
+            transcribe.model_is_resident(self.MODEL),
+            transcribe.release_model(self.MODEL),
+        )
+
+    def test_a_sweep_never_imports_the_optional_engine(self) -> None:
+        import sys
+
+        saved = sys.modules.pop("backend.transcribe_gigaam", None)
+        try:
+            transcribe._MODEL_IDLE_UNLOAD_SEC = 600
+            self.assertEqual(transcribe.release_idle_models(now=1e9), [])
+            self.assertNotIn("backend.transcribe_gigaam", sys.modules)
+        finally:
+            if saved is not None:
+                sys.modules["backend.transcribe_gigaam"] = saved
+
 if __name__ == "__main__":
     unittest.main()

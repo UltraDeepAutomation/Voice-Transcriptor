@@ -1158,5 +1158,63 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(cm.exception.detail, "could not delete preset")
 
 
+    def test_a_failed_new_save_releases_the_name_it_reserved(self):
+        # B-016: the claim marker is what reserves the NAME, and the
+        # rollback removed only the text file — which on this path was
+        # never created, because ``write_tmp_audio`` raises first. The
+        # marker survived, so the folder kept a file the sweeper never
+        # visits (the archive is registered only after a SUCCESSFUL
+        # save) and every retry of the same title was pushed to a
+        # timestamped name.
+        target = Path(self._tmp.name) / "recordings"
+        target.mkdir()
+
+        async def failing_writer(_tmp_audio: Path) -> None:
+            raise OSError("upload larger than MAX_UPLOAD_BYTES")
+
+        for _ in range(2):
+            with self.assertRaises(OSError):
+                asyncio.run(self.main._save_recording_audio_source(
+                    orig_name="lecture.wav",
+                    write_tmp_audio=failing_writer,
+                    archive_dir=str(target),
+                    title="lecture",
+                    source_text="source",
+                    transcript_text="transcript",
+                    provider="local",
+                    model="small",
+                    language="ru",
+                    recording_collection="",
+                    live_session_id="",
+                ))
+
+        self.assertEqual(
+            list(target.glob("*.claim")),
+            [],
+            "the failed save kept its name reservation",
+        )
+        self.assertEqual(list(target.glob("*.txt")), [])
+
+        # And the natural name is still available afterwards.
+        async def ok_writer(tmp_audio: Path) -> None:
+            tmp_audio.write_bytes(b"audio")
+
+        asyncio.run(self.main._save_recording_audio_source(
+            orig_name="lecture.wav",
+            write_tmp_audio=ok_writer,
+            archive_dir=str(target),
+            title="lecture",
+            source_text="source",
+            transcript_text="transcript",
+            provider="local",
+            model="small",
+            language="ru",
+            recording_collection="",
+            live_session_id="",
+        ))
+        saved = [p.name for p in target.glob("*.txt")]
+        self.assertEqual(saved, ["lecture.txt"], saved)
+
+
 if __name__ == "__main__":
     unittest.main()

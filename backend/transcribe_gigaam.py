@@ -110,6 +110,29 @@ def _load_model(model_id: str) -> Any:
         return model
 
 
+def release_gigaam(model_id: str) -> bool:
+    """Drop one GigaAM model from the resident cache.
+
+    The release point ``backend.transcribe`` needs. ``model_is_resident``
+    already reaches into this cache to answer "is it loaded", while both
+    releasing functions knew only about the whisper cache — so the
+    heaviest engine in the app (a ~1 GB torch model) was the one thing
+    the idle-unload window could never reclaim, and the deletion of a
+    model's weights left its instance serving transcriptions.
+    """
+    with _MODEL_LOCKS_GUARD:
+        dropped = _MODEL_CACHE.pop(model_id, None) is not None
+    if dropped:
+        logger.info("gigaam: released %s from cache", model_id)
+    return dropped
+
+
+def resident_gigaam_models() -> list:
+    """The GigaAM model ids currently held in memory."""
+    with _MODEL_LOCKS_GUARD:
+        return list(_MODEL_CACHE)
+
+
 def warm_gigaam(model_id: str) -> None:
     """Preload the engine weights without running inference.
 

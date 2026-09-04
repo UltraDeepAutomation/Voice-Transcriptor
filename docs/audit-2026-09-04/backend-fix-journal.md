@@ -323,3 +323,47 @@ OK
 **Не сделано:** —
 
 **Долг:** первая версия теста B-021 (до подмены `HOME`) один раз создала `~/.transcriptor/.encryption_key` на машине пользователя. Файл пустой смысловой нагрузки не несёт и ничем не читается, пока `TRANSCRIPTOR_DATA_DIR` доступен; удалить его может пользователь — агент чужие файлы не удаляет.
+
+---
+
+## Коммит 8 — файлы, ffmpeg и модели
+
+**Заголовок:** «ffmpeg no longer reads the channel Electron talks on, the heaviest model can finally be unloaded, and a failed save gives the name back»
+
+**ID:** B-014 (P1), B-015 (P1), B-016 (P1), B-017 (P1), B-037 (P2).
+
+**Файлы:** `backend/audio.py`, `backend/transcribe.py`, `backend/transcribe_gigaam.py`, `backend/storage.py`, `backend/main.py`, `backend/tests/test_audio.py`, `backend/tests/test_model_idle_unload.py`, `backend/tests/test_storage.py`, `backend/tests/test_recording_names.py`.
+
+**Верификация.** Новые тесты на коде ДО правки:
+```
+FAIL: test_every_ffmpeg_process_is_started_with_stdin_closed
+  None != -3 : ffmpeg inherited the backend's stdin
+FAIL: test_the_conversion_commands_carry_the_flag_too (fn='ensure_wav_16k')          '"-nostdin"' not found
+FAIL: test_an_idle_gigaam_model_is_released                 [] != ['gigaam-v3-rnnt']
+FAIL: test_release_model_evicts_gigaam_too                  False is not true
+FAIL: test_the_two_answers_about_residency_agree            True != False
+ERROR: test_the_in_middle_marker_is_swept_whatever_the_name (ImportError: TMP_ORPHAN_RE)
+ERROR: test_the_local_conversion_ceiling_is_named_once      (нет _LOCAL_CONVERT_TIMEOUT_SEC)
+FAIL: test_a_failed_new_save_releases_the_name_it_reserved
+  Lists differ: [PosixPath('…/lecture.txt.tmp-000000.claim')] != []
+```
+Полный набор:
+```
+Ran 704 tests in 38.028s
+OK
+```
+(692 → 704.)
+
+**Решения.**
+
+* **B-014.** *Выбрано:* `stdin=subprocess.DEVNULL` в единственном `Popen` — это закрывает все четыре команды и любую пятую. `-nostdin` добавлен и в две команды конверсии, чтобы форма была одинаковой у всех четырёх (её уже проверяют тесты для двух других).
+  *Отвергнуто:* только флаг в argv — он покрывает ffmpeg, но не общее правило «дочерний процесс не наследует наш stdio-канал».
+* **B-015.** *Выбрано:* точка освобождения `release_gigaam` в адаптере + `resident_gigaam_models()`; `transcribe.release_model` и `release_idle_models` диспетчеризуются по тому же префиксу, что уже использует `model_is_resident`. Использование gigaam отмечается в общем `_MODEL_LAST_USED` (в обеих ветках транскрипции и в `warm_model`), то есть окно простоя одно на оба движка.
+  *Важно:* освобождение gigaam выполняется ВНЕ `_MODEL_LOCK` — у чужого кэша свой замок, и брать один под другим значит завести дедлок.
+  *Отвергнуто:* импортировать `backend.transcribe_gigaam` в подметальщике — это отменило бы ленивый импорт torch ради вопроса «а есть ли что выгружать»; вместо этого `_gigaam_module()` смотрит в `sys.modules`, и тест это фиксирует.
+* **B-016.** *Выбрано:* `_release_recording_text_claim()` в обеих ветках отката. *Почему это не просто мусор:* архив регистрируется только после УСПЕШНОГО сохранения, поэтому подметальщик в эту папку никогда не заглянет, а имя маркера детерминировано — каждая следующая попытка того же заголовка уезжает на timestamp-имя. Тест проверяет обе стороны: два провала подряд не оставляют маркеров, и следующая успешная попытка получает естественное имя `lecture.txt`.
+* **B-017.** *Выбрано:* соглашение об имени временного файла (`TMP_ORPHAN_RE`) переехало в `backend/storage.py` — модуль, который его и порождает и чей докстринг объявляет его инвариантом; `main` импортирует, тест импортирует. Группа расширений стала `*` вместо `?`.
+  *Почему переезд, а не просто `?`→`*`:* правило было записано трижды (регулярка в `main`, литеральная копия в тесте, докстринг в `storage`), и разошлись именно копии. Тест `test_backend_main_reads_the_same_pattern_rather_than_a_copy` не даёт копии вернуться.
+* **B-037.** `_LOCAL_CONVERT_TIMEOUT_SEC = 300` рядом с `_REMOTE_COMPACT_TIMEOUT_SEC`; тест запрещает литерал в обеих функциях.
+
+**Не сделано:** вторая половина B-037 («локальные конверсии не принимают `cancel_event`») — это не дефект, а отсутствующая функция: у локального пути нет вызывающего, который умеет отменять. Записано в долг.

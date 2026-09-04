@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -50,6 +51,25 @@ logger = logging.getLogger(__name__)
 # accept ``Any`` because callers feed ``list`` (e.g. known_archive_dirs)
 # as well as ``dict`` — both serialise fine through ``json.dumps``.
 JSONData = Any
+
+
+# The tmp-name CONVENTION, owned here because this module owns the
+# atomic writers that produce it. ``backend.main`` has a second producer
+# (``_atomic_temp_path``, which inserts the marker BEFORE every suffix)
+# and the sweeper that deletes what a crashed writer left behind; all
+# three now read this one pattern instead of restating it.
+#
+# The hex portion is always 32 chars (``uuid4().hex``) — at least 6 is
+# required so a real file named "backup.tmp-x.wav" never matches. The
+# trailing extension groups repeat, because a target with more than one
+# dot ("Recovered 2026-09-04T19_37_12.123456.wav", which is what every
+# live-recovery promote produces) yields TWO of them; one optional group
+# matched single-suffix names only and left the rest to accumulate
+# forever. Anchored to ``$`` so a user file with ".tmp-" in the middle
+# is not matched.
+TMP_ORPHAN_RE = re.compile(
+    r"\.tmp-[0-9a-f]{6,}(?:\.[A-Za-z0-9]+)*$", re.IGNORECASE
+)
 
 
 def _tmp_path_for(target: Path) -> Path:

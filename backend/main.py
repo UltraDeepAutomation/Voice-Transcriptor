@@ -78,7 +78,13 @@ from backend.audio import (
     write_wav_from_pcm16_stream,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
-from backend.storage import atomic_promote_file, atomic_write_bytes, atomic_write_json, atomic_write_text
+from backend.storage import (
+    TMP_ORPHAN_RE,
+    atomic_promote_file,
+    atomic_write_bytes,
+    atomic_write_json,
+    atomic_write_text,
+)
 from backend.live import LiveSession
 from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
@@ -818,21 +824,17 @@ def _load_or_create_api_token() -> str:
 API_TOKEN = _load_or_create_api_token()
 
 
-# Match tmp files produced by every atomic writer in this module:
+# The tmp-name convention lives with the atomic writers that produce it
+# (``backend.storage.TMP_ORPHAN_RE``). Both producers are covered:
 #
-#   _atomic_write_text     → "recording.txt.tmp-<hex>"
-#   _atomic_temp_path      → "recording.tmp-<hex>.wav" / ".txt" / ".m4a"
-#   _write_upscale_preset  → "builtin_clean.tmp-<hex>.json"
-#   save_recording_with_audio → same shape as _atomic_temp_path
+#   storage._tmp_path_for   → "recording.txt.tmp-<hex>"
+#   _atomic_temp_path       → "recording.tmp-<hex>.wav" / ".txt" / ".m4a"
+#   _write_upscale_preset   → "builtin_clean.tmp-<hex>.json"
 #
-# The hex portion is always 32 chars (uuid4().hex) — require at least 6
-# so a real file named e.g. "backup.tmp-x.wav" never accidentally matches.
-# The optional trailing ``.<ext>`` catches the in-middle tmp pattern.
-# Anchored to ``$`` so a user file legitimately containing ".tmp-" in
-# the middle (unusual but legal) is not matched.
-_TMP_ORPHAN_RE = re.compile(
-    r"\.tmp-[0-9a-f]{6,}(?:\.[A-Za-z0-9]+)?$", re.IGNORECASE
-)
+# It used to be restated here with ONE optional extension group, which
+# does not match what ``_atomic_temp_path`` produces for a name with
+# more than one dot — see the pattern's own comment.
+_TMP_ORPHAN_RE = TMP_ORPHAN_RE
 
 
 def _sweep_orphan_tmp_files() -> None:
@@ -2683,6 +2685,19 @@ def _recording_text_claim_path(out: Path) -> Path:
     # a visible empty .txt. The suffix matches _TMP_ORPHAN_RE, so a process
     # crash before _write_recording_text_file is swept on next startup.
     return out.with_name(f"{out.name}.tmp-000000.claim")
+
+
+def _release_recording_text_claim(out: Path, context: str) -> None:
+    """Give back a name reservation a failed save is abandoning.
+
+    ``_write_recording_text_file`` releases it in its own ``finally``,
+    which covers every path that reaches it. A save that fails BEFORE
+    it — an oversized upload, a broken connection, a full disk while
+    writing the audio — never does, and the reservation is a real file
+    with a deterministic name, so it also redirects every later attempt
+    at the same title to a timestamped one.
+    """
+    _best_effort_unlink(_recording_text_claim_path(out), context=context)
 
 
 def _claim_recording_text_path(target_dir: Path, candidates: Iterable[str]) -> tuple[str, Path]:
@@ -7484,6 +7499,7 @@ def save_recording(
     except Exception:
         if claimed_new_text:
             _best_effort_unlink(out, context="recording save rollback")
+            _release_recording_text_claim(out, "recording save rollback")
         raise
     # Register only after durable user data exists. A failed save should
     # not pollute the archive registry with an empty or invalid target dir.
@@ -7607,6 +7623,19 @@ async def _save_recording_audio_source(
                 logger.warning("audio rollback restore failed; backup left at %s: %s", audio_backup, restore_err)
         if claimed_new_text:
             _best_effort_unlink(out_text, context="recording text save rollback")
+            # The CLAIM marker is what reserves the name; releasing only
+            # the text file leaves the reservation standing forever. On
+            # this path the text file may never have been created at all
+            # — ``write_tmp_audio`` raises before it — so the unlink
+            # above is a no-op and the marker was the whole rollback.
+            # Left behind it costs the user twice: an undeletable file in
+            # their recordings folder (the archive is only registered
+            # after a SUCCESSFUL save, so the sweeper never looks there),
+            # and every retry of the same title pushed to a timestamped
+            # name because ``_claim_recording_text_path`` sees the marker.
+            _release_recording_text_claim(
+                out_text, "recording text claim rollback"
+            )
         raise
     finally:
         _best_effort_unlink(tmp_audio, context="recording tmp audio cleanup")

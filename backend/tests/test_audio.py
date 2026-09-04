@@ -210,3 +210,82 @@ class PcmBytesPerSecondTests(unittest.TestCase):
             if re.search(r"2 \* LIVE_SAMPLE_RATE_HZ|2 \* max\(1, int\(", text):
                 offenders.append(path.name)
         self.assertEqual(offenders, [])
+
+
+class FfmpegStdinTests(unittest.TestCase):
+    """No ffmpeg this backend starts may read the parent's stdin (B-014).
+
+    ffmpeg reads its interactive console from stdin. Inherited, that is
+    the stdio channel Electron uses to talk to this backend, and a
+    backgrounded process reading an inherited terminal takes SIGTTIN on
+    POSIX. ``-nostdin`` was on the two remote-compaction commands and
+    missing from the two conversion commands every LOCAL transcription
+    runs — so the rule was stated by the tests above and applied to half
+    the callers.
+    """
+
+    def test_every_ffmpeg_process_is_started_with_stdin_closed(self):
+        from unittest import mock
+
+        import backend.audio as audio_mod
+
+        captured = {}
+
+        class _Proc:
+            stderr = io.StringIO("")
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        def _fake_popen(cmd, **kwargs):
+            captured.update(kwargs)
+            return _Proc()
+
+        with mock.patch.object(audio_mod.subprocess, "Popen", _fake_popen):
+            audio_mod._run_ffmpeg(["ffmpeg", "-i", "a", "b"], timeout_sec=1)
+
+        self.assertEqual(
+            captured.get("stdin"),
+            audio_mod.subprocess.DEVNULL,
+            "ffmpeg inherited the backend's stdin",
+        )
+
+    def test_the_conversion_commands_carry_the_flag_too(self):
+        # Belt and braces beside the Popen setting, and the form the two
+        # remote commands already assert.
+        import inspect
+
+        import backend.audio as audio_mod
+
+        for fn in (
+            audio_mod.ensure_wav_16k,
+            audio_mod.ensure_wav_16k_preserve_channels,
+        ):
+            with self.subTest(fn=fn.__name__):
+                self.assertIn('"-nostdin"', inspect.getsource(fn))
+
+
+class ConversionTimeoutTests(unittest.TestCase):
+    def test_the_local_conversion_ceiling_is_named_once(self):
+        # It was the literal 300 in two calls, beside a NAMED ceiling for
+        # the remote path — so changing one left the other behind.
+        import inspect
+
+        import backend.audio as audio_mod
+
+        self.assertEqual(audio_mod._LOCAL_CONVERT_TIMEOUT_SEC, 300)
+        for fn in (
+            audio_mod.ensure_wav_16k,
+            audio_mod.ensure_wav_16k_preserve_channels,
+        ):
+            with self.subTest(fn=fn.__name__):
+                src = inspect.getsource(fn)
+                self.assertIn("_LOCAL_CONVERT_TIMEOUT_SEC", src)
+                self.assertNotIn("timeout_sec=300", src)

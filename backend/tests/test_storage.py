@@ -221,24 +221,67 @@ class TestRotateBackup(unittest.TestCase):
 
 
 class TestTmpNameConvention(unittest.TestCase):
-    """`_sweep_orphan_tmp_files` in backend.main uses this regex:
-        r"\\.tmp-[0-9a-f]{6,}(?:\\.[A-Za-z0-9]+)?$"
-    to detect and clean up crashed writers' tmp files.
+    """Every tmp name this project produces is one the sweeper deletes.
 
-    If storage.py ever switches to a different tmp-naming scheme,
-    orphaned tmps accumulate and the housekeeper silently misses them.
-    This test pins the convention."""
+    ``_sweep_orphan_tmp_files`` in backend.main deletes what a crashed
+    writer left behind, and a name it does not recognise accumulates
+    forever in the user's recordings folder. This test used to restate
+    the pattern as a literal — a second copy of the rule, which is
+    exactly how the two drifted (B-017): the copy in main allowed ONE
+    trailing extension group, while ``_atomic_temp_path`` inserts the
+    marker before EVERY suffix and so produces two of them for any name
+    with more than one dot.
+    """
 
-    def test_tmp_name_matches_sweep_regex(self):
-        import re
-        sweep_re = re.compile(r"\.tmp-[0-9a-f]{6,}(?:\.[A-Za-z0-9]+)?$", re.IGNORECASE)
-        from backend.storage import _tmp_path_for
+    def test_tmp_name_matches_the_sweep_pattern(self):
+        from backend.storage import TMP_ORPHAN_RE, _tmp_path_for
         for target_name in ["config.json", "recording.txt", "binary.bin", "preset.json"]:
             tmp = _tmp_path_for(Path("/tmp") / target_name)
             self.assertTrue(
-                sweep_re.search(tmp.name),
-                f"tmp name {tmp.name!r} does not match sweep regex",
+                TMP_ORPHAN_RE.search(tmp.name),
+                f"tmp name {tmp.name!r} does not match the sweep pattern",
             )
+
+    def test_the_in_middle_marker_is_swept_whatever_the_name(self):
+        # The shape ``backend.main._atomic_temp_path`` produces. The
+        # third case is what EVERY live-recovery promote writes: the
+        # title carries ``datetime.now().isoformat()``, which always has
+        # microseconds and therefore always a second dot — so a promote
+        # interrupted mid-write left a partial WAV, up to 4 GB, among
+        # the user's recordings permanently.
+        from backend.storage import TMP_ORPHAN_RE
+        hex32 = "a" * 32
+        for name in (
+            f"rec.tmp-{hex32}.wav",
+            f"my.tmp-{hex32}.file.wav",
+            f"2026-09-04__Recovered 2026-09-04T19_37_12.tmp-{hex32}.123456.wav",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(TMP_ORPHAN_RE.search(name), name)
+
+    def test_a_user_file_that_merely_mentions_tmp_is_left_alone(self):
+        from backend.storage import TMP_ORPHAN_RE
+        for name in (
+            "notes about .tmp-files.txt",
+            "backup.tmp-x.wav",
+            "meeting.wav",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(TMP_ORPHAN_RE.search(name), name)
+
+    def test_backend_main_reads_the_same_pattern_rather_than_a_copy(self):
+        import re
+
+        from backend.storage import TMP_ORPHAN_RE
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "_TMP_ORPHAN_RE = re.compile(",
+            source,
+            "main.py restated the tmp-name pattern instead of importing it",
+        )
+        self.assertIsInstance(TMP_ORPHAN_RE, re.Pattern)
 
 
 if __name__ == "__main__":
