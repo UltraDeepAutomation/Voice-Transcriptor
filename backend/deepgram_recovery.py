@@ -549,15 +549,30 @@ def splice_recovered_words(
 
 @dataclass
 class RecoveryReport:
-    """What the recovery pass did, as it appears in ``stats.recovery``."""
+    """What the recovery pass did, as it appears in ``stats.recovery``.
+
+    ``as_dict`` is the WIRE SHAPE of ``stats.recovery`` — the one place
+    it is built. The renderer's stop trace reads ``spans_sec`` (how many
+    seconds of the recording were re-decoded) and ``ms`` (what that
+    cost); ``frontend/src/main.tsx`` names both as the contract it
+    implements. ``spans_sec`` is DERIVED from ``spans`` here rather than
+    carried alongside it, so the total and the list it totals cannot
+    drift apart. ``spans`` and ``words`` are the diagnostic detail the
+    log line and the tests read.
+    """
 
     spans: list[tuple[float, float]] = field(default_factory=list)
     ms: float = 0.0
     words: int = 0
 
+    def spans_sec(self) -> float:
+        """Total duration of the re-decoded spans, in seconds."""
+        return sum(max(0.0, end - start) for start, end in self.spans)
+
     def as_dict(self) -> dict:
         return {
             "spans": [[round(s, 3), round(e, 3)] for s, e in self.spans],
+            "spans_sec": round(self.spans_sec(), 3),
             "ms": round(self.ms, 1),
             "words": int(self.words),
         }
@@ -644,14 +659,17 @@ async def run_recovery(
         transcribe=transcribe,
     )
     segments, spliced = splice_recovered_words(segments, words)
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    total_span_sec = sum(end - start for start, end in spans)
+    report = RecoveryReport(
+        spans=list(spans),
+        ms=(time.perf_counter() - started) * 1000.0,
+        words=spliced,
+    )
     logger.info(
         "recovery: spans=%d total=%.2fs → words=%d in %.0fms",
-        len(spans),
-        total_span_sec,
-        spliced,
-        elapsed_ms,
+        len(report.spans),
+        report.spans_sec(),
+        report.words,
+        report.ms,
     )
 
     out = dict(payload)
@@ -671,9 +689,7 @@ async def run_recovery(
         sum(end - start for start, end in residual), 3
     )
     stats = dict(payload.get("stats") or {})
-    stats["recovery"] = RecoveryReport(
-        spans=list(spans), ms=elapsed_ms, words=spliced
-    ).as_dict()
+    stats["recovery"] = report.as_dict()
     out["stats"] = stats
     return out
 

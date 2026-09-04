@@ -32,6 +32,7 @@ from backend.deepgram_recovery import (
     RECOVERY_SOURCE,
     RECOVERY_SPAN_PAD_SEC,
     InterimEvidence,
+    RecoveryReport,
     covered_spans,
     pcm_span_wav,
     recover_spans,
@@ -481,6 +482,8 @@ class RunRecoveryEnvelopeTests(unittest.IsolatedAsyncioTestCase):
         report = out["stats"]["recovery"]
         self.assertEqual(report["words"], 1)
         self.assertEqual(report["spans"], [[5.2, 6.4]])
+        # The renderer reads spans_sec and ms, and nothing else here.
+        self.assertAlmostEqual(report["spans_sec"], 1.2, places=3)
         self.assertGreaterEqual(report["ms"], 0.0)
         # The recovery budget was not part of the drain's announcement,
         # so a second one has to carry it.
@@ -814,6 +817,49 @@ class RecoverySpoolReadTests(unittest.TestCase):
         recovery = {"pcm_path": pcm_path}
         with mock.patch.object(main, "MAX_RECOVERY_READ_BYTES", 1):
             self.assertEqual(main._recovery_spool_bytes(recovery), b"")
+
+
+class RecoveryReportWireShapeTests(unittest.TestCase):
+    """``stats.recovery`` is a contract, so its shape is pinned here.
+
+    ``frontend/src/main.tsx`` (``parseLiveFinalStats``) reads
+    ``spans_sec`` and ``ms`` off this dict and states in a comment that
+    those names are the contract it implements. A rename on this side
+    would not fail a single other test — the renderer would simply stop
+    showing the two numbers — so the names, types and derivation are
+    asserted directly.
+    """
+
+    def test_the_keys_and_types_are_the_ones_the_renderer_parses(self):
+        report = RecoveryReport(
+            spans=[(5.2, 6.4), (9.0, 10.5)], ms=812.34, words=7
+        )
+        wire = report.as_dict()
+        self.assertEqual(
+            sorted(wire), ["ms", "spans", "spans_sec", "words"]
+        )
+        self.assertEqual(wire["spans"], [[5.2, 6.4], [9.0, 10.5]])
+        self.assertIsInstance(wire["spans_sec"], float)
+        self.assertIsInstance(wire["ms"], float)
+        self.assertIsInstance(wire["words"], int)
+        self.assertEqual(wire["ms"], 812.3)
+        self.assertEqual(wire["words"], 7)
+
+    def test_spans_sec_is_the_total_of_the_spans_it_reports(self):
+        report = RecoveryReport(spans=[(5.2, 6.4), (9.0, 10.5)])
+        self.assertAlmostEqual(report.spans_sec(), 2.7, places=3)
+        self.assertAlmostEqual(report.as_dict()["spans_sec"], 2.7, places=3)
+
+    def test_no_spans_is_zero_seconds_rather_than_absent(self):
+        wire = RecoveryReport().as_dict()
+        self.assertEqual(wire["spans"], [])
+        self.assertEqual(wire["spans_sec"], 0.0)
+        self.assertEqual(wire["words"], 0)
+
+    def test_a_reversed_span_cannot_make_the_total_negative(self):
+        # Nothing produces one today; a non-negative total is what the
+        # renderer's parser accepts, so it must hold by construction.
+        self.assertEqual(RecoveryReport(spans=[(4.0, 3.0)]).spans_sec(), 0.0)
 
 
 if __name__ == "__main__":
