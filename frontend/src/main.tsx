@@ -12569,8 +12569,14 @@ const updateBtnEl = document.getElementById("updateCheckBtn") as HTMLButtonEleme
 
 function renderUpdateStatus(text: string, tone: "neutral" | "ok" | "new" | "error"): void {
   if (!updateStatusEl) return;
+  // Every piece of this element's state is written here — including the
+  // link class. It was added by the "update available" branch below and
+  // never removed by anything, so the underline styling outlived the
+  // link on the next check; ``textContent`` already drops the <a>, so
+  // the class was describing a child that no longer existed.
   updateStatusEl.textContent = text;
   updateStatusEl.dataset.tone = tone;
+  updateStatusEl.classList.remove("update-check-status-link");
 }
 
 async function runUpdateCheck(): Promise<void> {

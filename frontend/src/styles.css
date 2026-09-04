@@ -379,7 +379,7 @@ body.platform-darwin .sidebar {
 
 .screen-header-version {
   font-size: 12px;
-  color: var(--text-muted, #a0a0a0);
+  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
   opacity: 0.85;
 }
@@ -532,13 +532,13 @@ body.platform-darwin .sidebar {
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: var(--danger-text, #ef4444);
+  background: var(--danger-text);
   flex: none;
 }
 
 .record-toggle-btn.is-recording {
-  border-color: var(--danger-border, #ef4444);
-  color: var(--danger-text, #f87171);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
 }
 
 /* The pulse marks the one state where something is actively happening.
@@ -653,10 +653,10 @@ body.platform-darwin .sidebar {
 }
 
 .mic-pill.mic-pill-idle .mic-dot {
-  background: var(--net-neutral, #888);
+  background: var(--net-neutral);
 }
 .mic-pill.mic-pill-probing .mic-dot {
-  background: var(--net-neutral, #888);
+  background: var(--net-neutral);
   animation: mic-probe-pulse 1.1s ease-in-out infinite;
 }
 
@@ -1466,8 +1466,8 @@ textarea:focus-visible,
 }
 
 .toggle-inline.toggle-neutral input:checked {
-  background: var(--surface-3, #3a3a3a);
-  border-color: var(--text-2, #6b7280);
+  background: var(--surface-3);
+  border-color: var(--text-2);
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
@@ -2510,9 +2510,9 @@ textarea:focus-visible,
    cleared automatically on focus / input in the save-error handler. */
 .key-row input.has-error,
 .key-row input[aria-invalid="true"] {
-  border-color: var(--danger-border, #ef4444);
-  box-shadow: 0 0 0 1px var(--danger-border, #ef4444) inset;
-  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
+  border-color: var(--danger-border);
+  box-shadow: 0 0 0 1px var(--danger-border) inset;
+  background: var(--danger-bg);
 }
 
 /* Masked = "a key is stored", not "this control is dead".
@@ -2720,16 +2720,16 @@ textarea:focus-visible,
  * register the accelerator (already claimed by another app, malformed
  * string, OS reservation). Hover for the exact reason in `.title`. */
 .shortcut-btn.shortcut-conflict {
-  border-color: var(--status-error, #c54646);
-  box-shadow: 0 0 0 1px var(--status-error, #c54646) inset;
+  border-color: var(--status-error);
+  box-shadow: 0 0 0 1px var(--status-error) inset;
 }
 .shortcut-btn.shortcut-conflict .shortcut-keys {
-  color: var(--status-error, #c54646);
+  color: var(--status-error);
 }
 
 .shortcut-btn.shortcut-conflict .shortcut-key {
-  border-color: var(--status-error, #c54646);
-  color: var(--status-error, #c54646);
+  border-color: var(--status-error);
+  color: var(--status-error);
 }
 
 .shortcut-keys {
@@ -3481,7 +3481,7 @@ canvas {
 
 .boot-overlay-detail {
   font-size: 11px;
-  color: var(--text-3, #999);
+  color: var(--text-3);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   line-height: 1.5;
   padding: 10px 14px;
@@ -3601,7 +3601,7 @@ canvas {
   padding: 8px 12px;
   font-size: 11px;
   color: var(--text-2);
-  background: var(--surface-3, rgba(255,255,255,0.03));
+  background: var(--surface-3);
   border: 1px solid var(--surface-border);
   border-radius: var(--radius-xs);
   display: flex;
@@ -3611,7 +3611,7 @@ canvas {
 }
 
 .upload-result-meta-key {
-  color: var(--text-3, #777777);
+  color: var(--text-3);
   margin-right: 4px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -3628,7 +3628,7 @@ canvas {
    result pane and marks it as selected with a subtle ring. */
 .upload-queue-item.is-selected {
   border-color: var(--text-2);
-  background: var(--surface-3, rgba(255,255,255,0.04));
+  background: var(--surface-3);
   cursor: pointer;
 }
 .upload-queue-item {
@@ -3643,10 +3643,10 @@ canvas {
   justify-content: center;
   text-align: center;
   padding: 36px 24px;
-  border: 1.5px dashed var(--surface-3, #3a3a3a);
+  border: 1.5px dashed var(--surface-3);
   border-radius: var(--radius);
-  background: var(--surface-2, #1a1a1a);
-  color: var(--text-2, #a0a0a0);
+  background: var(--surface-2);
+  color: var(--text-2);
   cursor: pointer;
   transition: border-color 140ms ease, background-color 140ms ease;
   outline: none;
@@ -3655,23 +3655,23 @@ canvas {
 
 .upload-droplarge:hover,
 .upload-droplarge:focus-visible {
-  border-color: var(--text-2, #a0a0a0);
-  background: var(--surface-1, #202020);
-  color: var(--text-1, #e6e6e6);
+  border-color: var(--text-2);
+  background: var(--surface-1);
+  color: var(--text-1);
 }
 
 .upload-droplarge.drag {
-  border-color: var(--text-1, #e6e6e6);
+  border-color: var(--text-1);
   border-style: solid;
-  background: var(--surface-1, #242424);
-  color: var(--text-1, #e6e6e6);
+  background: var(--surface-1);
+  color: var(--text-1);
 }
 
 .upload-droplarge-icon {
   font-size: 48px;
   line-height: 1;
   margin-bottom: 16px;
-  color: var(--text-2, #a0a0a0);
+  color: var(--text-2);
   opacity: 0.85;
   font-weight: 700;
 }
@@ -3679,21 +3679,21 @@ canvas {
 .upload-droplarge-title {
   font-size: 16px;
   font-weight: 600;
-  color: var(--text-1, #f4f4f4);
+  color: var(--text-1);
   margin-bottom: 4px;
   letter-spacing: 0.01em;
 }
 
 .upload-droplarge-sub {
   font-size: 13px;
-  color: var(--text-2, #a0a0a0);
+  color: var(--text-2);
   margin-bottom: 16px;
   line-height: 1.4;
 }
 
 .upload-droplarge-formats {
   font-size: 11px;
-  color: var(--text-2, #777777);
+  color: var(--text-2);
   letter-spacing: 0.04em;
   font-variant-numeric: tabular-nums;
   margin-bottom: 14px;
@@ -3703,9 +3703,9 @@ canvas {
   margin-top: 12px;
   padding: 8px 14px;
   font-size: 12px;
-  color: var(--text-2, #a0a0a0);
-  background: var(--surface-3, rgba(255, 255, 255, 0.04));
-  border: 1px solid var(--surface-3, #2a2a2a);
+  color: var(--text-2);
+  background: var(--surface-3);
+  border: 1px solid var(--surface-3);
   border-radius: var(--radius-xs);
   max-width: 420px;
   line-height: 1.45;
@@ -3729,25 +3729,25 @@ canvas {
 }
 
 .upload-queue-item {
-  background: var(--surface-1, #1a1a1a);
-  border: 1px solid var(--surface-3, #2a2a2a);
+  background: var(--surface-1);
+  border: 1px solid var(--surface-3);
   border-radius: var(--radius-sm);
   padding: 10px 12px;
   transition: border-color 150ms ease;
 }
 
-.upload-queue-item--queued { border-color: var(--surface-3, #2a2a2a); }
+.upload-queue-item--queued { border-color: var(--surface-3); }
 .upload-queue-item--transcribing {
-  border-color: var(--text-2, #c4c4c4);
-  background: var(--surface-2, #252525);
+  border-color: var(--text-2);
+  background: var(--surface-2);
 }
-.upload-queue-item--done { border-color: var(--surface-3, #3a3a3a); }
+.upload-queue-item--done { border-color: var(--surface-3); }
 .upload-queue-item--error {
-  border-color: var(--danger-border, #6a2a2a);
-  background: var(--danger-bg, #2a1818);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
 }
 .upload-queue-item--cancelled {
-  border-color: var(--surface-3, #2a2a2a);
+  border-color: var(--surface-3);
   opacity: 0.65;
 }
 
@@ -3783,7 +3783,7 @@ canvas {
 .upload-queue-item-name {
   font-size: 13px;
   font-weight: 500;
-  color: var(--text-1, #e6e6e6);
+  color: var(--text-1);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3791,7 +3791,7 @@ canvas {
 
 .upload-queue-item-size {
   font-size: 11px;
-  color: var(--text-2, #777777);
+  color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
 
@@ -3807,8 +3807,8 @@ canvas {
   font-weight: 500;
   padding: 2px 8px;
   border-radius: var(--control-radius);
-  background: var(--surface-3, #2a2a2a);
-  color: var(--text-2, #a0a0a0);
+  background: var(--surface-3);
+  color: var(--text-2);
   white-space: nowrap;
 }
 
@@ -3816,7 +3816,7 @@ canvas {
   appearance: none;
   background: transparent;
   border: none;
-  color: var(--text-2, #777777);
+  color: var(--text-2);
   font-size: 18px;
   line-height: 1;
   width: 22px;
@@ -3831,15 +3831,15 @@ canvas {
 }
 .upload-queue-item-remove:hover,
 .upload-queue-item-remove:focus-visible {
-  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
-  color: var(--danger-text, #ff8080);
+  background: var(--danger-bg);
+  color: var(--danger-text);
   outline: none;
 }
 
 .upload-queue-item-progress {
   margin-top: 8px;
   height: 3px;
-  background: var(--surface-3, #2a2a2a);
+  background: var(--surface-3);
   border-radius: 2px;
   overflow: hidden;
 }
@@ -3849,7 +3849,7 @@ canvas {
   height: 100%;
   background: linear-gradient(90deg,
     transparent 0%,
-    var(--text-2, #a0a0a0) 50%,
+    var(--text-2) 50%,
     transparent 100%);
   animation: upload-progress-shift 1.4s linear infinite;
 }
@@ -3863,7 +3863,7 @@ canvas {
  */
 .upload-queue-item-progress-bar.is-determinate {
   animation: none;
-  background: var(--text-2, #a0a0a0);
+  background: var(--text-2);
   transition: width 120ms ease-out;
 }
 
@@ -3876,33 +3876,33 @@ canvas {
   .upload-queue-item-progress-bar {
     animation: none;
     width: 100%;
-    background: var(--text-2, #a0a0a0);
+    background: var(--text-2);
     opacity: 0.4;
   }
 }
 
 .upload-queue-item--transcribing .upload-queue-item-status {
-  background: var(--surface-3, #3a3a3a);
-  color: var(--text-1, #e6e6e6);
+  background: var(--surface-3);
+  color: var(--text-1);
 }
 .upload-queue-item--done .upload-queue-item-status {
-  background: var(--surface-3, #2a2a2a);
-  color: var(--text-1, #d4d4d4);
+  background: var(--surface-3);
+  color: var(--text-1);
 }
 .upload-queue-item--error .upload-queue-item-status {
-  background: var(--danger-bg-hover, #4a2020);
-  color: var(--danger-text, #ff8080);
+  background: var(--danger-bg-hover);
+  color: var(--danger-text);
 }
 .upload-queue-item--cancelled .upload-queue-item-status {
-  background: var(--surface-3, #2a2a2a);
-  color: var(--text-2, #a0a0a0);
+  background: var(--surface-3);
+  color: var(--text-2);
 }
 
 .upload-queue-item-stop {
   appearance: none;
   background: transparent;
-  border: 1px solid var(--surface-3, #3a3a3a);
-  color: var(--text-2, #a0a0a0);
+  border: 1px solid var(--surface-3);
+  color: var(--text-2);
   font-size: 11px;
   font-weight: 500;
   padding: 3px 10px;
@@ -3912,17 +3912,17 @@ canvas {
 }
 .upload-queue-item-stop:hover,
 .upload-queue-item-stop:focus-visible {
-  background: var(--danger-bg, rgba(239, 68, 68, 0.12));
-  color: var(--danger-text, #ff8080);
-  border-color: var(--danger-border, #6a2a2a);
+  background: var(--danger-bg);
+  color: var(--danger-text);
+  border-color: var(--danger-border);
   outline: none;
 }
 
 .upload-queue-item-retry {
   appearance: none;
-  background: var(--surface-2, #202020);
-  border: 1px solid var(--surface-3, #3a3a3a);
-  color: var(--text-1, #e6e6e6);
+  background: var(--surface-2);
+  border: 1px solid var(--surface-3);
+  color: var(--text-1);
   font-size: 11px;
   font-weight: 600;
   padding: 3px 10px;
@@ -3932,8 +3932,8 @@ canvas {
 }
 .upload-queue-item-retry:hover,
 .upload-queue-item-retry:focus-visible {
-  background: var(--surface-3, #2a2a2a);
-  border-color: var(--text-2, #777777);
+  background: var(--surface-3);
+  border-color: var(--text-2);
   outline: none;
 }
 .upload-queue-item-retry:disabled {
@@ -3945,8 +3945,8 @@ canvas {
   margin-top: 8px;
   font-size: 13px;
   line-height: 1.55;
-  color: var(--text-1, #e6e6e6);
-  background: var(--surface-2, #1a1a1a);
+  color: var(--text-1);
+  background: var(--surface-2);
   padding: 10px 12px;
   border-radius: var(--radius-xs);
   white-space: pre-wrap;
@@ -3958,7 +3958,7 @@ canvas {
 .upload-queue-item-error {
   margin-top: 8px;
   font-size: 12px;
-  color: var(--danger-text, #ff8080);
+  color: var(--danger-text);
   line-height: 1.5;
 }
 
@@ -3968,7 +3968,7 @@ canvas {
 .upload-queue-item-note {
   margin-top: 8px;
   font-size: 12px;
-  color: var(--text-2, #c4c4c4);
+  color: var(--text-2);
   line-height: 1.5;
 }
 
@@ -4003,13 +4003,13 @@ canvas {
 .upload-empty-state-title {
   font-size: 14px;
   font-weight: 600;
-  color: var(--text-1, #e6e6e6);
+  color: var(--text-1);
   letter-spacing: 0.01em;
 }
 
 .upload-empty-state-sub {
   font-size: 12px;
-  color: var(--text-2, #777777);
+  color: var(--text-2);
 }
 
 /* ── Settings → Local models ─────────────────────────────── */
@@ -4049,7 +4049,7 @@ canvas {
   grid-template-columns: subgrid;
   align-items: center;
   padding: 7px 10px; border-radius: var(--control-radius);
-  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+  background: var(--surface-2);
 }
 
 /* Engines without subgrid fall back to per-row tracks. Columns then
@@ -4068,17 +4068,14 @@ canvas {
 .model-row-empty {
   grid-column: 1 / -1;
   display: block;
-  color: var(--text-dim, #9aa);
-}
-.model-row.ready { opacity: 0.92; }
-.model-row-empty {
   background: transparent;
-  color: var(--text-dim, #9aa);
+  color: var(--text-2);
   font-size: 12.5px;
 }
+.model-row.ready { opacity: 0.92; }
 .model-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-size {
-  color: var(--text-dim, #9aa);
+  color: var(--text-2);
   font-variant-numeric: tabular-nums;
   text-align: right;
   white-space: nowrap;
@@ -4102,29 +4099,33 @@ canvas {
   padding: 5px 0;
 }
 .model-del:hover {
-  color: var(--danger-text, #f87171);
-  border-color: var(--danger-border, #ef4444);
+  color: var(--danger-text);
+  border-color: var(--danger-border);
 }
-.model-state.ok { color: var(--ok, #4ade80); }
-.model-state.err { color: var(--err, #f87171); }
-.settings-note { margin: 0; color: var(--text-dim, #9aa); font-size: 12.5px; }
+.model-state.ok { color: var(--net-online); }
+.model-state.err { color: var(--danger-text); }
+.settings-note { margin: 0; color: var(--text-2); font-size: 12.5px; }
 
 /* Download-confirm modal */
 .modal-overlay {
   position: fixed; inset: 0; z-index: 1000;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--overlay-backdrop);
 }
 .modal-card {
   width: min(420px, calc(100vw - 32px));
   padding: 18px 20px; border-radius: 14px;
-  background: var(--surface, #16181d); color: inherit;
+  background: var(--glass-modal-bg); color: inherit;
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
 }
 .modal-card h3 { margin: 0 0 8px; font-size: 15px; }
-.modal-card p { margin: 0 0 14px; color: var(--text-dim, #aab); }
+.modal-card p { margin: 0 0 14px; color: var(--text-2); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.btn-primary { background: var(--accent, #5b8cff) !important; color: #fff !important; }
+/* No .btn-primary override here. The one that used to stand on this
+   line was the file's only non-a11y !important, it referenced --accent
+   (a token this file never declares, so it painted the literal
+   #5b8cff), and it silenced the design-system rule above — drawing all
+   four primary buttons in a blue that is nowhere in the palette. */
 
 /* ── Custom audio player — app design tokens only ──────────────────
    Replaces the web-widget <audio controls>. Monochrome palette from
@@ -4205,3 +4206,50 @@ canvas {
   transition: transform 120ms ease;
 }
 .cp-seek::-webkit-slider-thumb:hover { transform: scale(1.15); }
+
+/* ── Update detection (Settings header) ────────────────────────────
+   Quiet inline status + link. These rules lived in `frontend/styles.css`,
+   a file nothing imports — the only stylesheet the bundle contains is
+   this one (`src/main.tsx` line 1), and `index.html` carries no
+   `<link rel="stylesheet">`. So every selector below was dead from the
+   day the feature landed, and `renderUpdateStatus` wrote a `data-tone`
+   attribute that had no reader: "an update is available" looked exactly
+   like "the check failed". */
+.screen-header-update {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.update-check-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.update-check-status {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.update-check-status[data-tone="ok"] {
+  color: var(--text-2);
+}
+
+/* The one tone that has to be noticed. `--net-online` is the palette's
+   existing "something good is true" green; the literal `#6ee7b7` that
+   stood here fell back through a `--accent` token this stylesheet has
+   never declared. */
+.update-check-status[data-tone="new"] {
+  color: var(--net-online);
+}
+
+.update-check-status[data-tone="error"] {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+.update-check-status-link a {
+  color: inherit;
+  text-decoration: underline;
+}

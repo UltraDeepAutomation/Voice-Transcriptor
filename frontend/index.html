@@ -15,12 +15,20 @@
       the bootstrap <script> (API token + runtime config) into this
       document at serve time.
     - connect-src stays same-origin so the renderer can only reach the
-      local backend over HTTP and the /ws/transcribe WebSocket.
+      local backend over HTTP and the /ws/transcribe WebSocket. 'self'
+      is what expresses that, including for the socket: CSP3 matches
+      ws:// against 'self' when the host and port are the page's own,
+      and the renderer builds its socket URL from ``location.host``
+      (``wsBase()`` in src/main.tsx), so the page's own origin IS the
+      one place the backend port is known. The scheme-sources ``ws:
+      wss:`` that used to stand here matched ANY host, which made the
+      sentence above false for the one channel CSP could still close
+      given that script-src must allow 'unsafe-inline'.
     - media-src/img-src allow blob: for recorded-audio playback and
       data: for inline icons.
   -->
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' ws: wss: https://api.github.com; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'" />
+    content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' https://api.github.com; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>Transcriptor</title>
   <!--
     CRITICAL: inline fallback styles for the boot overlay.
@@ -31,6 +39,19 @@
     no indication that the app is alive. The inline rules are
     intentionally minimal (no animations, no fancy gradients) — just
     enough to surface "Starting…" text on a dark background.
+
+    They are written on the SAME selectors as the design system, at the
+    same specificity (0-1-0), and they are declared first — so the
+    stylesheet overrides them the instant it arrives, which is the whole
+    contract of a fallback. They used to be written as ``#bootOverlay
+    .boot-overlay-card`` (1-1-0), which beats every rule in styles.css
+    unconditionally: the designed overlay — its 40x40 conic-gradient
+    spinner, its 40px/56px card, its translucent backdrop — never
+    rendered once, on any launch, and 100 lines of styles.css were dead.
+    There is also no spinner here on purpose: a fallback that animates
+    is a fallback that hides that it is the fallback, and the design
+    system's spinner has nothing to override it with at this
+    specificity.
   -->
   <style>
     html, body {
@@ -41,32 +62,32 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
         "Helvetica Neue", Arial, sans-serif;
     }
-    #bootOverlay {
+    .boot-overlay {
       position: fixed;
       inset: 0;
-      z-index: 99999;
+      z-index: 9999;
       display: flex;
       align-items: center;
       justify-content: center;
       background: #1a1a1a;
     }
-    #bootOverlay[hidden] { display: none; }
-    #bootOverlay .boot-overlay-card {
+    .boot-overlay[hidden] { display: none; }
+    .boot-overlay-card {
       max-width: 460px;
       padding: 24px 32px;
       text-align: center;
     }
-    #bootOverlay .boot-overlay-title {
+    .boot-overlay-title {
       font-size: 18px;
       font-weight: 600;
       margin-bottom: 8px;
     }
-    #bootOverlay .boot-overlay-status {
+    .boot-overlay-status {
       font-size: 14px;
       color: #a0a0a0;
       margin-bottom: 4px;
     }
-    #bootOverlay .boot-overlay-detail {
+    .boot-overlay-detail {
       font-size: 12px;
       color: #ff8080;
       margin-top: 12px;
@@ -77,8 +98,8 @@
       border-radius: 6px;
       padding: 8px 10px;
     }
-    #bootOverlay .boot-overlay-detail[hidden] { display: none; }
-    #bootOverlay .boot-overlay-retry {
+    .boot-overlay-detail[hidden] { display: none; }
+    .boot-overlay-retry {
       margin-top: 14px;
       padding: 8px 18px;
       font-size: 13px;
@@ -88,17 +109,7 @@
       border-radius: 6px;
       cursor: pointer;
     }
-    #bootOverlay .boot-overlay-retry[hidden] { display: none; }
-    #bootOverlay .boot-overlay-spinner {
-      width: 24px;
-      height: 24px;
-      margin: 0 auto 16px;
-      border: 2px solid rgba(255,255,255,0.15);
-      border-top-color: #c4c4c4;
-      border-radius: 50%;
-      animation: boot-spin 0.9s linear infinite;
-    }
-    @keyframes boot-spin { to { transform: rotate(360deg); } }
+    .boot-overlay-retry[hidden] { display: none; }
   </style>
 </head>
 
