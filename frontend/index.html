@@ -729,10 +729,18 @@
                   id="settingsAutoSendEnterToggle" /></label>
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
                   id="autoStopSilenceEnabled" /></label>
+              <!--
+                No min/max/value here: they are UI_TOKENS.autoStopSilence,
+                written in by applyAutoStopSilenceBounds() at boot. Typed
+                out in the markup they were the third of four copies of
+                the same three numbers, and — being <input type=number>
+                attributes, which Chromium does not enforce against typed
+                input — decorative besides.
+              -->
               <label class="field"><span class="lbl">Silence (sec)</span><input id="autoStopSilenceSeconds"
-                  type="number" min="1" max="120" step="1" value="2" /></label>
+                  type="number" step="1" /></label>
               <label class="field"><span class="lbl">Threshold (dBFS)</span><input id="autoStopSilenceDb" type="number"
-                  min="-80" max="-10" step="1" value="-42" /></label>
+                  step="1" /></label>
             </div>
           </div>
           <div class="card card-recordings">

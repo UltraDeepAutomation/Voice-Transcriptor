@@ -178,6 +178,13 @@ interface AppConfig {
       remote_model_deepgram?: string;
       shortcut_record?: string;
       shortcut_paste?: string;
+      /**
+       * Live-tab speaker diarization. Its two neighbours in the same
+       * popover (``auto_transcribe``, ``live_preview``) have always been
+       * persisted and its Upload twin (``upload_diarize``) has too; this
+       * one alone reset to the markup default on every launch.
+       */
+      diarize?: boolean;
       // Upload tab persistent state — provider/language/diarize were
       // previously DOM-only and reset to defaults on every app launch.
       // Mirrored into the same ``preferences.ui`` namespace as the
@@ -338,6 +345,18 @@ interface LiveSessionSnapshot {
   effectiveProvider: Provider;
   model: string;
   language: string;
+  /**
+   * Speaker diarization as it was at the START, snapshotted like the
+   * language and the model beside it.
+   *
+   * The recovery and final passes used to re-read the checkbox at the
+   * moment they ran, so a user who toggled it mid-recording had the
+   * live stream transcribed with one setting and the recovery pass with
+   * the other — two readings of one recording that the stop path then
+   * compares, one of them carrying speaker labels and a different
+   * paragraph separator (``hasDiarization`` in ``appendSegmentsToBuffer``).
+   */
+  diarize: boolean;
   assistLocalModel: string;
   finalLocalModel: string;
 }
@@ -1017,6 +1036,34 @@ const UI_TOKENS = {
   drain: {
     maxWaitMs: 450,
     pollStepMs: 30,
+  },
+  /**
+   * Auto-stop-on-silence: one product decision — "how many seconds
+   * below what level end a recording" — and one set of numbers for the
+   * three layers that used to each carry their own copy (the
+   * ``index.html`` input attributes, ``getAutoStopSilenceConfig``,
+   * ``loadCfg``, and ``desktop/main.js``). Four copies of three numbers
+   * and two ranges, with no cross-reference between them and nothing —
+   * no test, no type, and no backend validation, since ``config.py``
+   * has no ``ui`` branch at all — that would notice them diverging.
+   *
+   * 2 s: shorter cuts into an ordinary pause between phrases (the RMS
+   * EMA window is ~120 ms, see the capture tokens above); longer and
+   * the user concludes auto-stop is broken. −42 dBFS: between a typical
+   * room floor (−55…−48) and quiet speech (−35…−28) on the 2026-09-03
+   * recordings.
+   *
+   * The markup no longer carries these as attributes;
+   * ``applyAutoStopSilenceBounds`` writes them at boot from here.
+   */
+  autoStopSilence: {
+    defaultEnabled: false,
+    defaultSeconds: 2,
+    minSeconds: 1,
+    maxSeconds: 120,
+    defaultThresholdDb: -42,
+    minThresholdDb: -80,
+    maxThresholdDb: -10,
   },
 } as const;
 const ACCEPTED_AUDIO_VIDEO_EXTS = new Set<string>();
@@ -3165,13 +3212,59 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function clampAutoStopSeconds(raw: number): number {
+  const t = UI_TOKENS.autoStopSilence;
+  return clampNumber(
+    Number.isFinite(raw) ? Math.round(raw) : t.defaultSeconds,
+    t.minSeconds,
+    t.maxSeconds,
+  );
+}
+
+function clampAutoStopThresholdDb(raw: number): number {
+  const t = UI_TOKENS.autoStopSilence;
+  return clampNumber(
+    Number.isFinite(raw) ? Math.round(raw) : t.defaultThresholdDb,
+    t.minThresholdDb,
+    t.maxThresholdDb,
+  );
+}
+
 function getAutoStopSilenceConfig(): AutoStopSilenceConfig {
-  const enabled = !!($("autoStopSilenceEnabled") as HTMLInputElement).checked;
-  const secondsRaw = Number(($("autoStopSilenceSeconds") as HTMLInputElement).value);
-  const thresholdRaw = Number(($("autoStopSilenceDb") as HTMLInputElement).value);
-  const seconds = clampNumber(Number.isFinite(secondsRaw) ? Math.round(secondsRaw) : 2, 1, 120);
-  const thresholdDb = clampNumber(Number.isFinite(thresholdRaw) ? Math.round(thresholdRaw) : -42, -80, -10);
-  return { enabled, seconds, thresholdDb };
+  return {
+    enabled: !!($("autoStopSilenceEnabled") as HTMLInputElement).checked,
+    seconds: clampAutoStopSeconds(Number(($("autoStopSilenceSeconds") as HTMLInputElement).value)),
+    thresholdDb: clampAutoStopThresholdDb(Number(($("autoStopSilenceDb") as HTMLInputElement).value)),
+  };
+}
+
+/**
+ * Write the bounds and defaults into the markup at boot.
+ *
+ * The `min`/`max`/`value` attributes used to be typed into
+ * `index.html`, where they were the third copy of these numbers and,
+ * being `<input type=number>` attributes, decorative anyway: Chromium
+ * does not enforce them against typed input, so the clamp above was
+ * already the only thing bounding the value. They are still worth
+ * setting — the spinner arrows and the invalid-state styling read them
+ * — but from the token, not from a literal.
+ */
+function applyAutoStopSilenceBounds(): void {
+  const t = UI_TOKENS.autoStopSilence;
+  const seconds = document.getElementById("autoStopSilenceSeconds") as HTMLInputElement | null;
+  if (seconds) {
+    seconds.min = String(t.minSeconds);
+    seconds.max = String(t.maxSeconds);
+    seconds.value = String(t.defaultSeconds);
+  }
+  const db = document.getElementById("autoStopSilenceDb") as HTMLInputElement | null;
+  if (db) {
+    db.min = String(t.minThresholdDb);
+    db.max = String(t.maxThresholdDb);
+    db.value = String(t.defaultThresholdDb);
+  }
+  const enabled = document.getElementById("autoStopSilenceEnabled") as HTMLInputElement | null;
+  if (enabled) enabled.checked = t.defaultEnabled;
 }
 
 function keyInput(provider: KeyProvider): HTMLInputElement {
@@ -5413,6 +5506,18 @@ function readDeepgramDualSecondaryLanguage(): string {
   return value || DUAL_SECONDARY_LANGUAGE_DEFAULT;
 }
 
+/**
+ * The one reader of ``#diarizeCheck``.
+ *
+ * There were five, four of them a raw ``document.getElementById`` with a
+ * non-null cast — which is a ``TypeError`` in a handler the moment the
+ * markup and the renderer disagree, where the Upload twin
+ * (``#uploadDiarize``) has always used ``?.``.
+ */
+function readDiarizeEnabled(): boolean {
+  return !!(document.getElementById("diarizeCheck") as HTMLInputElement | null)?.checked;
+}
+
 function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"]>["ui"]> {
   const silence = getAutoStopSilenceConfig();
   return {
@@ -5439,6 +5544,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     // without the Upload section (defensive against future view splits).
     upload_language: ((document.getElementById("uploadLanguage") as HTMLSelectElement | null)?.value || "auto").trim(),
     upload_diarize: !!(document.getElementById("uploadDiarize") as HTMLInputElement | null)?.checked,
+    diarize: readDiarizeEnabled(),
   };
 }
 
@@ -6406,20 +6512,8 @@ async function loadCfg(): Promise<void> {
     const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
-    autoStopSecondsEl.value = String(
-      clampNumber(
-        Number.isFinite(Number(ui.auto_stop_silence_seconds)) ? Number(ui.auto_stop_silence_seconds) : 2,
-        1,
-        120
-      )
-    );
-    autoStopDbEl.value = String(
-      clampNumber(
-        Number.isFinite(Number(ui.auto_stop_silence_db)) ? Number(ui.auto_stop_silence_db) : -42,
-        -80,
-        -10
-      )
-    );
+    autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
+    autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
     upscaleToggle.checked = ui.upscale_enabled === true;
     setAutoSendEnterEnabled(ui.auto_send_enter === true);
@@ -6453,6 +6547,10 @@ async function loadCfg(): Promise<void> {
     const uploadDiarizeEl = document.getElementById("uploadDiarize") as HTMLInputElement | null;
     if (uploadDiarizeEl && typeof ui.upload_diarize === "boolean") {
       uploadDiarizeEl.checked = ui.upload_diarize;
+    }
+    const diarizeEl = document.getElementById("diarizeCheck") as HTMLInputElement | null;
+    if (diarizeEl && typeof ui.diarize === "boolean") {
+      diarizeEl.checked = ui.diarize;
     }
 
     // Load keyboard shortcuts. Defaults are platform-specific
@@ -8092,7 +8190,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
         const result = await remoteJobSync(audioFile, {
           provider: "deepgram",
           language: lang,
-          diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+          diarize: readDiarizeEnabled(),
           remoteModel: dgModel,
         });
         text = String(result.text || "").trim();
@@ -8341,6 +8439,13 @@ syncRecordingsStatsVisibility();
 
 const autoToggle = $("autoTranscribeToggle") as HTMLInputElement;
 autoToggle.addEventListener("change", () => {
+  queueUiPreferencesSave();
+});
+// The third toggle of the same popover. Its two neighbours have had a
+// listener, a `collectUiPreferences` field and an accessor since they
+// were written; this one had none of the three, so speaker diarization
+// was the only setting in the app that reset itself on every launch.
+document.getElementById("diarizeCheck")?.addEventListener("change", () => {
   queueUiPreferencesSave();
 });
 const livePreviewToggle = $("livePreviewToggle") as HTMLInputElement;
@@ -10249,6 +10354,7 @@ async function startLive(): Promise<void> {
     effectiveProvider: selectedEffectiveProvider,
     model: selectedModel,
     language: selectedLanguage,
+    diarize: readDiarizeEnabled(),
     assistLocalModel: sessionLocalModels.assistLocalModel,
     finalLocalModel: sessionLocalModels.finalLocalModel,
   };
@@ -10336,7 +10442,7 @@ async function startLive(): Promise<void> {
       session_id: activeLiveSessionId,
       archive_dir: activeLiveArchiveDir,
       recording_collection: RECORDING_COLLECTIONS.live,
-      diarize: (($("diarizeCheck") as HTMLInputElement).checked ? "true" : "false"),
+      diarize: readDiarizeEnabled() ? "true" : "false",
     });
     if (sessionWsMode === "deepgram-stream") {
       wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
@@ -10905,11 +11011,15 @@ async function stopLive(
         ? currentSessionModels.finalLocalModel
         : getRemoteModelValue(currentEffectiveProvider),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
+    diarize: readDiarizeEnabled(),
     assistLocalModel: currentSessionModels.assistLocalModel,
     finalLocalModel: currentSessionModels.finalLocalModel,
   };
   const providerValue = liveSnapshot.provider;
   const languageValue = liveSnapshot.language;
+  // Snapshotted, never re-read: the recovery passes below must decode the
+  // same recording with the same settings the live stream used.
+  const diarizeValue = liveSnapshot.diarize;
   const effectiveProvider = liveSnapshot.effectiveProvider;
   const deepgramReachabilityHint = effectiveProvider === "deepgram";
   const modelValue = liveSnapshot.model;
@@ -11881,7 +11991,7 @@ async function stopLive(
         body: JSON.stringify({
           provider: "deepgram",
           language: languageValue,
-          diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+          diarize: diarizeValue,
           ...remoteModelJsonFields("deepgram", getRemoteModelValue("deepgram")),
           archive_dir: persistedRecordingArchiveDir || "",
         }),
@@ -11938,7 +12048,7 @@ async function stopLive(
             const result = await remoteJobSync(audioFile, {
               provider: "deepgram",
               language: languageValue,
-              diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+              diarize: diarizeValue,
               remoteModel: getRemoteModelValue("deepgram"),
               providerReachabilityHint: deepgramReachabilityHint,
               signal,
@@ -12216,7 +12326,7 @@ async function stopLive(
           remoteApiPromise = remoteJobSync(finalAudioFile, {
             provider,
             language: languageValue,
-            diarize: (document.getElementById("diarizeCheck") as HTMLInputElement).checked,
+            diarize: diarizeValue,
             remoteModel: modelValue,
           });
         }
@@ -12638,6 +12748,12 @@ if (updateBtnEl) {
 })();
 
 applyBackendBootstrap();
+// Markup defaults for auto-stop-on-silence, from UI_TOKENS. Runs before
+// loadCfg replaces them with the stored configuration, and after every
+// module-level declaration — UI_TOKENS is a `const`, so this cannot sit
+// beside installAppearanceStateClasses() without hitting its temporal
+// dead zone.
+applyAutoStopSilenceBounds();
 
 void loadCfgOnce()
   .then(async () => {
