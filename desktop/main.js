@@ -6541,6 +6541,85 @@ function readDistInfoInventory(dir) {
 }
 
 /**
+ * The engine interpreter's `major.minor`, for evaluating PEP 508
+ * environment markers. Empty when it cannot be determined, which
+ * `evaluateEnvironmentMarker` treats as "cannot decide" rather than
+ * inventing an answer.
+ */
+async function resolvePythonVersion(python, repoRoot) {
+  try {
+    const res = await runCommand(
+      python,
+      ["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+      { cwd: repoRoot, timeoutMs: 8000, env: buildPythonEnv(python) },
+    );
+    const out = String(res.stdout || "").trim();
+    return res.ok && /^\d+\.\d+$/.test(out) ? out : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Remove ONE distribution from an engine-site directory: the files pip
+ * recorded for it, then the directories they leave empty, then the
+ * dist-info. Returns how many paths were actually removed, so a prune
+ * that found nothing can be logged as the warning it is instead of the
+ * success the old code always claimed.
+ */
+function pruneEngineSiteDistribution(siteDir, name, version) {
+  const candidates = [];
+  let recordText = "";
+  let distInfoDirName = "";
+  for (const spelling of new Set([name, String(name).replace(/-/g, "_")])) {
+    const dir = `${spelling}-${version}.dist-info`;
+    const recordPath = path.join(siteDir, dir, "RECORD");
+    try {
+      if (fs.existsSync(recordPath)) {
+        recordText = fs.readFileSync(recordPath, "utf8");
+        distInfoDirName = dir;
+        break;
+      }
+    } catch { /* fall through to the conventional layout */ }
+  }
+  if (recordText) {
+    const { paths, unsafe } = engineDeps.planDistributionRemoval(recordText, distInfoDirName);
+    if (unsafe.length > 0) {
+      appendMainLog(`[engine-policy] refused ${unsafe.length} out-of-tree path(s) in ${distInfoDirName}/RECORD`);
+    }
+    candidates.push(...paths);
+  } else {
+    appendMainLog(`[engine-policy] ${name} has no readable RECORD; falling back to the conventional layout`);
+    candidates.push(...engineDeps.guessDistributionPaths(name, version));
+  }
+
+  let removed = 0;
+  const touchedDirs = new Set();
+  for (const rel of candidates) {
+    const victim = path.join(siteDir, rel);
+    // Belt to the planner's braces: never step outside the site dir.
+    const relFromSite = path.relative(siteDir, victim);
+    if (relFromSite.startsWith("..") || path.isAbsolute(relFromSite)) continue;
+    try {
+      if (!fs.existsSync(victim)) continue;
+      fs.rmSync(victim, { recursive: true, force: true });
+      removed += 1;
+      const parent = path.dirname(victim);
+      if (parent !== siteDir) touchedDirs.add(parent);
+    } catch (e) {
+      appendMainLog(`[engine-policy] could not remove ${rel}: ${e?.message || e}`);
+    }
+  }
+  // Directories the files left behind, deepest first.
+  for (const dir of [...touchedDirs].sort((a, b) => b.length - a.length)) {
+    try {
+      if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+    } catch { /* a non-empty directory is not ours to remove */ }
+  }
+  return removed;
+}
+
+/**
  * Overlap policy enforcement (BUG-46): prune every engine-site copy of a
  * package the release-pinned bundle also ships, UNLESS the bundle copy
  * fails a requirement some engine distribution declares — then report a
@@ -6553,20 +6632,18 @@ async function reconcileEngineSiteWithBundle(siteDir, python, repoRoot, mode) {
   if (!bundleSite || !fs.existsSync(siteDir)) return { ok: true, conflicts: [] };
   const staged = readDistInfoInventory(siteDir);
   const bundle = readDistInfoInventory(bundleSite);
-  const needs = engineDeps.collectRequirementIndex(siteDir, fs);
+  // Markers are evaluated against the interpreter that will actually run
+  // the engine, not against this Electron process.
+  const markerEnv = engineDeps.defaultMarkerEnvironment({
+    python_version: await resolvePythonVersion(python, repoRoot),
+  });
+  const needs = engineDeps.collectRequirementIndex(siteDir, fs, markerEnv);
   const { prune, conflicts } = engineDeps.planEngineSitePrune({ staged, bundle, needs });
   for (const name of prune) {
-    // Dist-info inventory keys are import names; on disk the directory
-    // may use underscores. Remove both spellings defensively.
-    for (const spelling of new Set([name, name.replace(/-/g, "_")])) {
-      const distInfo = `${siteDir}/${spelling}-${staged[name]}.dist-info`;
-      try {
-        if (fs.existsSync(distInfo)) {
-          fs.rmSync(distInfo, { recursive: true, force: true });
-          appendMainLog(`[engine-policy] pruned duplicate ${name} (${staged[name]}) — bundle ${bundle[name]} satisfies all declared needs`);
-        }
-      } catch { /* non-fatal: shadowing risk logged below */ }
-    }
+    const removed = pruneEngineSiteDistribution(siteDir, name, staged[name]);
+    appendMainLog(removed > 0
+      ? `[engine-policy] pruned duplicate ${name} (${staged[name]}) — removed ${removed} path(s); bundle ${bundle[name]} satisfies all declared needs`
+      : `[engine-policy] WARN: ${name} (${staged[name]}) was planned for prune but nothing was removed from ${siteDir} — it may still shadow the bundle`);
   }
   if (conflicts.length > 0) {
     const report = conflicts.map((c) => `${c.name}: need ${c.required}, bundle has ${c.have}`).join("; ");
