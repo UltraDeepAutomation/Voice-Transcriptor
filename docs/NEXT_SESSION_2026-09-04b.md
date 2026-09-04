@@ -42,3 +42,11 @@ Ultra-Audit, бэкенд: `d590a4e` (P0: финал без слов — чте�
 
 ## 6. Долг (не делаем без решения пользователя / нельзя здесь)
 См. `BUGS_AUDIT_2026-09-03.md` «Реестр долга» + «Не сделано» в журналах: TransientType и явные key-up требуют нативного кода; Windows/Linux пути не проверены на железе; нотаризация не запускалась (нет notarytool здесь); `Alt+Left` на macOS.
+
+## 7. Статус на 2026-09-05 (обновление)
+
+Все три фикс-волны Ultra-Audit завершены и в `main` (бэкенд 15 коммитов → 803 теста; рендерер 10 → 327; desktop 13 → 255). Отчёты агентов дословно и соответствие id → задача: `docs/audit-2026-09-04/AGENT_REPORTS.md`; полные транскрипты — userData `evidence-2026-09-03/session-2026-09-04-ultra-audit/agent-transcripts/`.
+
+Идёт агент «швы между доменами» (первый коммит `52dab76`: одна схема конверта `final`, один конструктор, фикстура, ломающая сборку при расхождении сторон); остальное из его задания — дефолты dual-stream и факты бэкенда из bootstrap, половинки D-009/013/015/053, один эпилог `stopLive`, изоляция тестов от `HOME` — результат в `backend-fix-journal.md`, раздел «Швы (2026-09-05)».
+
+Дальше строго по §5 (пункты 4–6): сборщик отчёта `BUGSAUDIT-2026-09-04.md` §4–§7 из журналов; релиз 1.6.1 — CHANGELOG за все коммиты после `373ce84`, версия в обоих `package.json`, PROJECT_STRUCTURE (новые модули: `backend/async_tasks.py`, `backend/deepgram_language.py`, `backend/deepgram_recovery.py`, `backend/deepgram_envelope.py` если создан, `frontend/src/ui-copy.ts`, `frontend/src/button-feedback.ts`, `desktop/python-version.js`), реестр долга из трёх журналов; `./BUILD.command` (диск теперь свободен, 30 ГБ); перезапуск; проверка boot-лога и первых записей.
