@@ -89,6 +89,10 @@ const {
   recordingStatusPresentation,
 } = require("./recording-status");
 
+// SSOT for the interpreter version: `.python-version` at the repo root, the
+// same file prepare-runtime.sh builds the bundled runtime from and CI installs.
+const { readPythonVersion } = require("./python-version");
+
 // SSOT for how a child process's text output is produced and decoded —
 // the PowerShell UTF-8 prelude and the `cscript //U` UTF-16LE receipt.
 const { childStreamEncoding, stripBom, withUtf8OutputPrelude } = require("./child-io");
@@ -6991,8 +6995,8 @@ async function ensureBackendRuntime(python, repoRoot) {
   // into its site-packages at release build time. An import failure here
   // means the bundle is corrupted (AV quarantined a .pyd / .so, user
   // deleted a file, disk error). `pip install --user` would write to a
-  // dir OUTSIDE the app bundle (~/Library/Python/3.12/ or
-  // %APPDATA%\Python\Python312\), persist across uninstalls, and shadow
+  // dir OUTSIDE the app bundle (~/Library/Python/<x.y>/ or
+  // %APPDATA%\Python\Python<xy>\), persist across uninstalls, and shadow
   // the pinned versions on every future launch — a worse state than
   // the failure itself. Surface the error with the stderr so the user
   // can report it.
@@ -8274,11 +8278,20 @@ async function createWindow(options = {}) {
         `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
       );
     } else if (process.platform === "win32") {
+      // The version comes from .python-version, not from a literal typed
+      // here: a source checkout that is one minor version behind would
+      // otherwise be told to install the interpreter the build no longer
+      // uses. If the file cannot be read we name no version at all rather
+      // than guess one.
+      const py = readPythonVersion(getRepoRoot());
+      const pythonStep = py
+        ? `<li>Make sure Python ${escapeHtml(py.xy)} is installed: <code style="background:#333;padding:2px 6px;border-radius:4px">winget install Python.Python.${escapeHtml(py.xy)}</code></li>`
+        : `<li>Make sure the Python version named in <code style="background:#333;padding:2px 6px;border-radius:4px">.python-version</code> is installed.</li>`;
       recoveryHtml = (
         `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
         `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
         `<li>Close Transcriptor fully and reopen it.</li>` +
-        `<li>Make sure Python 3.12 is installed: <code style="background:#333;padding:2px 6px;border-radius:4px">winget install Python.Python.3.12</code></li>` +
+        pythonStep +
         `<li>If the problem persists, rebuild from the source checkout.</li>` +
         `</ol>` +
         `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`

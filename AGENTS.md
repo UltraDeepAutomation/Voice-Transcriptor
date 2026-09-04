@@ -10,14 +10,15 @@ repository.
 3. Do not delete logs unless the user explicitly asks for log deletion.
 4. Preserve SSOT boundaries. Product vision lives in `PRODUCT.md`; release
    environment variables live in `.env.example`; app version lives in
-   `desktop/package.json`.
+   `desktop/package.json`; the Python version lives in `.python-version`
+   and the Node version in `.nvmrc`.
 5. Before edits, check `git status` and `git worktree list`, then keep changes
    atomic and commit only verified code.
 
 ## Verification commands (run before every commit)
 
-Backend (Python 3.12; a local interpreter without the deps is fine to skip —
-CI runs these on every push):
+Backend (the interpreter version is `.python-version`; a local interpreter
+without the deps is fine to skip — CI runs these on every push):
 
 ```bash
 python3 -m unittest discover -s backend/tests

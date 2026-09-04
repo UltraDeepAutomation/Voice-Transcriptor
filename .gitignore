@@ -10,7 +10,11 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *.pyd
-.python-version
+# NOT .python-version: it is COMMITTED and is the SSOT for the interpreter
+# this product is built, shipped and tested against — the same role .nvmrc
+# plays for Node. desktop/scripts/prepare-runtime.sh, the CI workflow and
+# desktop/python-version.js all read it, which is what stops "Python 3.12"
+# from being retyped in nine places that can drift apart.
 .venv/
 venv/
 env/

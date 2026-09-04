@@ -413,3 +413,73 @@ Both "hypotheses" in the discovery report are therefore confirmed facts.
 **Not done in this commit:** nothing from this group.
 
 ---
+## Commit 9 — Python version SSOT
+
+**IDs:** D-069 (P2), D-068 (P2, the `.python-version` half).
+
+**Files:** `.python-version` (new, committed), `.gitignore`,
+`desktop/scripts/prepare-runtime.sh`, `.github/workflows/tests.yml`,
+`desktop/python-version.js` (new), `desktop/python-version.test.js` (new),
+`desktop/main.js`, `desktop/package.json`, `AGENTS.md`, `CONTRIBUTING.md`.
+
+**Re-verified on current code before fixing:** yes. `grep` over the tree at
+`1a12c3c` still found the version typed into `prepare-runtime.sh` six times
+(`PBS_PYVER="3.12.13"`, `cp312` ×3, `python3.12/site-packages` ×2,
+`--python-version 3.12`), `tests.yml:24`, `main.js` (the winget hint),
+`AGENTS.md:19`, `CONTRIBUTING.md:27` and `:137`, `NOTICE.md:13` —
+and `.gitignore:13` forbade the one file that could hold it.
+
+**Verification**
+- Every new assertion replayed against `git show HEAD:<file>` (pre-fix source):
+  ```
+  OLD prepare-runtime.sh reads .python-version: false
+  OLD prepare-runtime.sh retypes cp3NN: true
+  OLD prepare-runtime.sh retypes pythonX.Y/: true
+  OLD tests.yml uses python-version-file: false
+  OLD tests.yml pins a literal version: true
+  OLD main.js requires ./python-version: false
+  OLD main.js hardcodes winget Python.Python.3.12: true
+  ```
+  i.e. all six guards in `python-version.test.js` fail on the old tree.
+- The derivation reproduces the literals it replaces, run the way the script
+  runs it (`bash -c`, same `tr`/`case`/`%.*`/`//./` expressions):
+  ```
+  PBS_PYVER=3.12.13 PY_XY=3.12 PY_ABI_TAG=cp312
+  ```
+  — byte-identical to the removed `3.12.13` / `3.12` / `cp312`.
+- `bash -n desktop/scripts/prepare-runtime.sh` -> OK.
+- `packaging.test.js` catches the new module if it is left out of
+  `build.files` (observed by removing the entry):
+  `main.js -> ./python-version.js is MISSING from build.files` -> `fail 1`.
+- `npm --prefix desktop test` -> `tests 213 / pass 213 / fail 0` (was 208).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *Chosen:* `.python-version` holds the full `X.Y.Z`, and `X.Y` / `cpXY` are
+  DERIVED. The three shapes the build needs (tarball version, site-packages
+  path + pip `--python-version`, wheel ABI tag) are three renderings of one
+  fact, so only the fact is stored.
+- *Chosen:* the file is committed and `.gitignore` says why in place of the
+  old blanket `.python-version` line. A `.gitignore` entry that hides the
+  SSOT is how the duplication became necessary in the first place.
+- *Chosen:* `prepare-runtime.sh` **dies** on a missing or malformed file
+  rather than falling back to a literal. A fallback is a second source of
+  truth wearing a default's clothes. The same rule shapes
+  `parsePythonVersion`, which returns `null` instead of guessing, and
+  `main.js`, which then names no version at all instead of a wrong one.
+- *Chosen:* `log`/`warn`/`die` moved above their first call site in
+  `prepare-runtime.sh`. The version gate is the first thing that can fail, and
+  it sits above where `die()` used to be defined; leaving it there would have
+  turned a clear error into `die: command not found`.
+- *Chosen:* `.python-version` ships in `extraResources` so `getRepoRoot()`
+  resolves it in a packaged app the same way it already resolves
+  `requirements.txt`. *Rejected:* a constant in `main.js` guarded by a test —
+  that is a copy plus a tripwire, not one source.
+- *Chosen:* `NOTICE.md` keeps its literal `Python 3.12.13` (a redistribution
+  notice must spell the version out) and the test locks every
+  `Python X.Y.Z` it names to the SSOT.
+
+**Not done in this commit**
+- `desktop/engine-deps.js:52` and two `main.js` comments still say "3.12" while
+  narrating a past bug; the one path-shaped comment was generalised, the
+  historical ones are prose about what happened and are left as written.

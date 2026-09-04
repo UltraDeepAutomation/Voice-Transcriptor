@@ -27,9 +27,33 @@ RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 CACHE_DIR="${SCRIPT_DIR}/runtime/.cache"
 mkdir -p "${RUNTIME_DIR}" "${CACHE_DIR}"
 
+log()  { printf '\033[1;36m[prep]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[prep]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[prep]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# The interpreter version comes from ONE place: .python-version at the repo
+# root, the same role .nvmrc plays for Node. It used to be typed into nine
+# files (this script six times, the CI workflow, main.js, CONTRIBUTING.md,
+# AGENTS.md), so a minor bump needed nine synchronised edits and a missed one
+# either failed the build with "could not find site-packages" or, worse, left
+# CI testing an interpreter the product does not ship.
+PYTHON_VERSION_FILE="${ROOT_DIR}/.python-version"
+[ -f "${PYTHON_VERSION_FILE}" ] || die "missing ${PYTHON_VERSION_FILE}"
+PBS_PYVER="$(tr -d '[:space:]' < "${PYTHON_VERSION_FILE}")"
+case "${PBS_PYVER}" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) die ".python-version must hold a full X.Y.Z version, got \"${PBS_PYVER}\"" ;;
+esac
+# major.minor, for the site-packages path and the pip --python-version flag.
+PY_XY="${PBS_PYVER%.*}"
+# cp312 etc — the CPython ABI tag for that same interpreter.
+PY_ABI_TAG="cp${PY_XY//./}"
+
 # python-build-standalone tag (pinned so release builds are reproducible).
+# The SHA256s below are for THIS tag and THIS interpreter version; bumping
+# either without refreshing them fails the checksum gate, loudly, which is
+# the point.
 PBS_TAG="20260414"
-PBS_PYVER="3.12.13"
 
 # ffmpeg sources.
 FFMPEG_WIN_RELEASE="autobuild-2026-06-18-14-21"
@@ -44,10 +68,6 @@ FFMPEG_MAC_ARM64_SHA256="0878f3313311c2c1b2c818e7c955c0bd828c97b357fa86211b42a5c
 FFMPEG_LINUX_ASSET="ffmpeg-7.0.2-amd64-static.tar.xz"
 FFMPEG_LINUX_URL="https://johnvansickle.com/ffmpeg/releases/${FFMPEG_LINUX_ASSET}"
 FFMPEG_LINUX_SHA256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
-
-log()  { printf '\033[1;36m[prep]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[prep]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[prep]\033[0m %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
@@ -178,14 +198,14 @@ pip_runner_python() {
 # the bundled Python's own pip when we're on that native platform.
 # -----------------------------------------------------------------------------
 install_wheels() {
-  local out_dir="$1" python_tag="${2:-cp312}"
+  local out_dir="$1" python_tag="${2:-${PY_ABI_TAG}}"
   shift 2
   # All remaining args are --platform values that pip will union.
   local target_dir
   if [ -d "${out_dir}/python/Lib/site-packages" ]; then
     target_dir="${out_dir}/python/Lib/site-packages"
-  elif [ -d "${out_dir}/python/lib/python3.12/site-packages" ]; then
-    target_dir="${out_dir}/python/lib/python3.12/site-packages"
+  elif [ -d "${out_dir}/python/lib/python${PY_XY}/site-packages" ]; then
+    target_dir="${out_dir}/python/lib/python${PY_XY}/site-packages"
   else
     die "could not find site-packages in ${out_dir}/python"
   fi
@@ -202,7 +222,7 @@ install_wheels() {
     --disable-pip-version-check
     --no-compile
     --only-binary=:all:
-    --python-version 3.12
+    --python-version "${PY_XY}"
     --implementation cp
     --abi "${python_tag}"
     --target "${target_dir}"
@@ -320,7 +340,7 @@ build_win_x64() {
   local out_dir="${RUNTIME_DIR}/win-x64"
   log "=== Windows x64 ==="
   install_python "${out_dir}" "x86_64-pc-windows-msvc"
-  install_wheels "${out_dir}" "cp312" "win_amd64"
+  install_wheels "${out_dir}" "${PY_ABI_TAG}" "win_amd64"
   install_ffmpeg_win "${out_dir}"
   du -sh "${out_dir}" | awk '{print "size:", $1}'
 }
@@ -331,7 +351,7 @@ build_mac_arm64() {
   install_python "${out_dir}" "aarch64-apple-darwin"
   # Floor macOS 11 for our own deps, but onnxruntime universal2 wheel
   # requires tag 13_0 — union both so pip can pick from either.
-  install_wheels "${out_dir}" "cp312" \
+  install_wheels "${out_dir}" "${PY_ABI_TAG}" \
     "macosx_13_0_arm64" "macosx_12_0_arm64" "macosx_11_0_arm64"
   install_ffmpeg_mac "${out_dir}" "arm64"
   du -sh "${out_dir}" | awk '{print "size:", $1}'
@@ -343,7 +363,7 @@ build_linux_x64() {
   install_python "${out_dir}" "x86_64-unknown-linux-gnu"
   # Union modern and legacy manylinux tags so onnxruntime (2_28),
   # tokenizers (2_17 / manylinux2014), and everyone else get a match.
-  install_wheels "${out_dir}" "cp312" \
+  install_wheels "${out_dir}" "${PY_ABI_TAG}" \
     "manylinux_2_28_x86_64" "manylinux_2_17_x86_64" "manylinux2014_x86_64"
   install_ffmpeg_linux "${out_dir}"
   du -sh "${out_dir}" | awk '{print "size:", $1}'

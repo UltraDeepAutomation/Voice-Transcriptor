@@ -24,7 +24,7 @@
 
 - **Node.js** `>=22.12.0` (`.node-version` / `.nvmrc` — SSOT)
 - **npm** `>=10`
-- **Python 3.12+** + `pip` (для подготовки runtime)
+- **Python** версии из `.python-version` (SSOT — её же ставит CI и из неё собирается bundled runtime) + `pip`
 - **macOS**: Xcode Command Line Tools, `codesign`, `bash`
 - **Windows**: Git Bash / WSL / Linux/macOS хост (сборка Windows делается из Bash)
 - **Linux**: `xdotool`, `wmctrl`, `zenity` (для интеграции в AppImage)
@@ -134,7 +134,7 @@ frontend/      # Vanilla TypeScript + Vite UI
 | Типы frontend | `npm --prefix frontend run typecheck` |
 | Тесты frontend | `npm --prefix frontend test` |
 | Тесты desktop (хоткеи, упаковка) | `npm --prefix desktop test` |
-| Тесты бэкенда (Python 3.12) | `python -m unittest discover -s backend/tests -p "test_*.py"` — сначала `npm --prefix frontend ci`, иначе кросс-тесты live-coverage тихо скипаются (нужен node + tsc) |
+| Тесты бэкенда (интерпретатор из `.python-version`) | `python -m unittest discover -s backend/tests -p "test_*.py"` — сначала `npm --prefix frontend ci`, иначе кросс-тесты live-coverage тихо скипаются (нужен node + tsc) |
 | Сборка DMG (macOS arm64) | `npm --prefix desktop run dist:dir` |
 | Полная проверка как в CI | три команды выше + `npm --prefix frontend run build` |
 

@@ -1,6 +1,9 @@
 # Runs every suite the repo ships, on the same interpreters the product
-# uses: Node 22 LTS (>=22.12 per both package.json engines) and Python
-# 3.12 (the version bundled under desktop/runtime).
+# uses: Node 22 LTS (>=22.12 per both package.json engines) and the
+# interpreter named in .python-version — the same file
+# desktop/scripts/prepare-runtime.sh builds the bundled runtime from, so a
+# version bump cannot leave CI testing an interpreter the product does not
+# ship.
 #
 # The desktop job needs no `npm install` — its tests (accelerator,
 # packaging whitelist) are pure node:test modules with zero dependencies;
@@ -21,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
           cache: pip
       # Backend dependencies MUST be installed before discovery — without
       # this every module importing numpy/soundfile/fastapi fails to load
@@ -39,8 +42,9 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm --prefix frontend ci
-      # The shipped runtime interpreter is Python 3.12; CI matches it so
-      # asyncio-primitive construction semantics cannot drift again.
+      # CI runs the interpreter from .python-version — the one the bundled
+      # runtime is built with — so asyncio-primitive construction semantics
+      # cannot drift again.
       - run: python -m unittest discover -s backend/tests -p "test_*.py" -v
 
   frontend:
