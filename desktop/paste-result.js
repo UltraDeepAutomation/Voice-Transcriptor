@@ -17,16 +17,26 @@
 //
 // Every script this module understands prints its own outcome on
 // stdout as the LAST line of output:
-//   - Windows VBS (SendKeys "^v"):        "OK:vbs-paste"   / "ERR:activate" / (silent + non-zero exit)
+//   - Windows VBS (SendKeys "^v"):        "SENT:vbs-paste" then "OK:vbs-paste" / "ERR:activate" / (silent + non-zero exit)
 //   - Windows PowerShell SendKeys fallback: "OK:pwsh-paste" (SendKeys itself has no failure signal)
 //   - Linux (wtype/xdotool/ydotool):       nothing — exit code is the only signal these CLIs give
 //   - macOS AppleScript (robust_paste / menu-paste-primary / menu-paste):
 //       "OK:<method>[+activated][:verified|:unverified]" / "ERR:<reason>"
 //
+// The marker strings themselves are NOT retyped here: they come from
+// ./paste-protocol, the one place the scripts that print them and the
+// parsers that read them agree on.
+//
 // `ok` — the child process's own exit-code success, from runCommand —
 // is required in every branch: a script that never got to run (spawn
 // error, PowerShell parse error, timeout + SIGKILL) has no stdout worth
 // trusting, no matter what happens to be sitting in the buffer.
+
+const {
+  PASTE_OK_PREFIX,
+  PASTE_ERR_PREFIX,
+  PASTE_SENT_RECEIPT_RE,
+} = require("./paste-protocol");
 
 function outcomeOf(stdout) {
   return String(stdout == null ? "" : stdout).trim();
@@ -63,13 +73,40 @@ function lastLineOf(text) {
  */
 function pasteSentReceipt({ stdout, stderr } = {}) {
   const haystack = `${String(stdout == null ? "" : stdout)}\n${String(stderr == null ? "" : stderr)}`;
-  const m = /(^|[\r\n])(SENT:[A-Za-z0-9_.+-]+)/.exec(haystack);
+  const m = PASTE_SENT_RECEIPT_RE.exec(haystack);
   return m ? m[2] : "";
 }
 
 /** Windows VBS SendKeys paste (method: "vbs_paste"). */
 function isVbsPasteSuccess({ ok, stdout }) {
   return !!ok && outcomeOf(stdout).includes("OK:vbs-paste");
+}
+
+/**
+ * Full Windows VBS verdict, receipt included.
+ *
+ * The receipt matters most on this platform: cscript's launch can spend
+ * 1-3 s in Defender's real-time scan, so the per-attempt bound can kill
+ * the process in the window between `SendKeys "^v"` and the final Echo.
+ * Without reading the receipt that kill is indistinguishable from a kill
+ * before the keystroke — the ladder retries and the target gets the
+ * transcript twice, which is the very thing the receipt exists to stop.
+ * `sent` was previously hardcoded to false here and stderr was not even
+ * passed in.
+ */
+function parseVbsPasteOutcome({ ok, stdout, stderr }) {
+  const receipt = pasteSentReceipt({ stdout, stderr });
+  if (isVbsPasteSuccess({ ok, stdout })) {
+    return { success: true, verified: false, sent: !!receipt, reason: lastLineOf(stdout) || "OK:vbs-paste" };
+  }
+  if (receipt) {
+    // Cut short AFTER the paste was dispatched: the text is in the
+    // target, nothing verified it. A success that is not verified stops
+    // the retry and leaves the transcript on the clipboard, because the
+    // restore gate only opens for verified pastes.
+    return { success: true, verified: false, sent: true, reason: receipt };
+  }
+  return { success: false, verified: false, sent: false, reason: outcomeOf(stdout) };
 }
 
 /** Windows PowerShell SendKeys fallback (method: "pwsh_paste_fallback"). */
@@ -103,11 +140,11 @@ function parseMacPasteOutcome({ ok, stdout, stderr }) {
   // An explicit ERR: verdict is the script's own considered answer and
   // outranks any receipt — the script only logs a receipt after the
   // paste is out, and it never returns ERR: afterwards.
-  if (out.startsWith("ERR:")) {
+  if (out.startsWith(PASTE_ERR_PREFIX)) {
     return { success: false, verified: false, sent: false, reason: out };
   }
   const receipt = pasteSentReceipt({ stdout, stderr });
-  if (ok && out.startsWith("OK:")) {
+  if (ok && out.startsWith(PASTE_OK_PREFIX)) {
     const verified = /:verified$/.test(out);
     return { success: true, verified, sent: !!receipt, reason: out };
   }
@@ -132,7 +169,7 @@ function parseMacPasteOutcome({ ok, stdout, stderr }) {
 function evaluatePasteOutcome({ method, ok, stdout, stderr }) {
   switch (method) {
     case "vbs_paste":
-      return { success: isVbsPasteSuccess({ ok, stdout }), verified: false, sent: false, reason: outcomeOf(stdout) };
+      return parseVbsPasteOutcome({ ok, stdout, stderr });
     case "pwsh_paste_fallback":
       return { success: isPwshPasteFallbackSuccess({ ok, stdout }), verified: false, sent: false, reason: outcomeOf(stdout) };
     case "wtype":
@@ -152,6 +189,7 @@ module.exports = {
   lastLineOf,
   pasteSentReceipt,
   isVbsPasteSuccess,
+  parseVbsPasteOutcome,
   isPwshPasteFallbackSuccess,
   isLinuxPasteSuccess,
   parseMacPasteOutcome,

@@ -71,35 +71,22 @@ function escapeAppleScriptString(s) {
  */
 const AX_READ_TIMEOUT_SEC = 0.25;
 
-/**
- * Prefix of the progress markers the script writes with `log`, which
- * osascript flushes to stderr line by line as they happen (verified
- * against a live osascript: a marker logged before a 1 s delay arrives
- * ~1 s before the result on stdout). The parent times their arrival, so
- * the cost of the reads is measured without spending anything inside
- * the script to measure it — AppleScript has no sub-second clock that
- * does not cost a `do shell script`.
- *
- * Format: AXT:<label>:begin / AXT:<label>:end — parsed by
- * desktop/paste-verification-policy.js summarizeAxReadTrace.
- */
-const AX_TRACE_PREFIX = "AXT:";
-
-/**
- * Prefix of the "the paste is already out" receipt, logged the instant
- * after the Cmd+V keycode or the Edit > Paste click leaves and BEFORE
- * anything that can block — the verification read, or simply the return
- * trip. That ordering is the whole point: when the parent wall-clock
- * bound kills osascript, the receipt is what tells the ladder whether
- * the kill landed before or after the paste was delivered. Without it,
- * a kill during the verification read looked exactly like a kill before
- * the keystroke, the ladder retried, and the target got the transcript
- * TWICE. Handy paste_tx draws the same line: only a receipt that arrives
- * after chord injection counts as proof.
- *
- * Parsed by desktop/paste-result.js pasteSentReceipt.
- */
-const PASTE_SENT_PREFIX = "SENT:";
+// The markers this script PRINTS and the parsers READ are one fact, and
+// they live in ./paste-protocol. They used to be typed here and again in
+// paste-result.js's regex, paste-verification-policy.js's line matcher
+// and main.js's stream filter, with nothing resolving the copies:
+// renaming one here left every test green while the production parse
+// went blind — and going blind on the receipt means the ladder retries a
+// paste that already landed.
+//
+// The progress markers are written with `log`, which osascript flushes
+// to stderr line by line as they happen (verified against a live
+// osascript: a marker logged before a 1 s delay arrives ~1 s before the
+// result on stdout). The parent times their arrival, so the cost of the
+// AX reads is measured without spending anything inside the script to
+// measure it — AppleScript has no sub-second clock that does not cost a
+// `do shell script`.
+const { AX_TRACE_PREFIX, PASTE_SENT_PREFIX } = require("./paste-protocol");
 
 /** Sanitize a numeric interpolation before it reaches AppleScript. */
 function safeInt(value, max = 2 ** 31) {

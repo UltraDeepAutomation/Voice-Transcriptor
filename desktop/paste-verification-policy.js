@@ -155,7 +155,9 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
 // The parent timestamps their arrival (runCommand's onStreamLine) and
 // this function turns those timestamps into per-read durations for the
 // paste trace — the evidence for whether the 0.25 s bound is being hit.
-const AX_TRACE_LINE = /^AXT:([A-Za-z0-9_-]+):(begin|end)$/;
+// The marker itself comes from ./paste-protocol, the one place the
+// script that emits it and every parser that reads it agree on.
+const { AX_TRACE_LINE_RE: AX_TRACE_LINE } = require("./paste-protocol");
 
 /**
  * @param {Array<{line: string, ms: number}>} events lines with their

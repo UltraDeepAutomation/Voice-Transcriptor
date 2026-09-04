@@ -18,6 +18,10 @@ const { evaluatePasteOutcome } = require("./paste-result");
 // and non-verifying shape, and for escaping anything interpolated into
 // an AppleScript — unit-tested by desktop/paste-script.test.js.
 const { robustPasteScript, escapeAppleScriptString } = require("./paste-script");
+
+// SSOT for the paste wire protocol — the markers the paste scripts
+// print and every parser reads.
+const { AX_TRACE_PREFIX, PASTE_SENT_PREFIX } = require("./paste-protocol");
 // SSOT for "is it worth verifying a paste into THIS app" — the per-target
 // memory that stops paying for accessibility reads an app can never
 // answer (BUGS_AUDIT 2026-09-03 §6.6) — unit-tested by
@@ -61,6 +65,10 @@ const { createRecordingFinalSlot } = require("./recording-final-slot");
 // SSOT for "which system power events the app reacts to, and what each
 // one means" — subscribed exactly once from app.whenReady below.
 const { subscribePowerEvents } = require("./power-events");
+
+// SSOT for how a child process's text output is produced and decoded —
+// the PowerShell UTF-8 prelude and the `cscript //U` UTF-16LE receipt.
+const { childStreamEncoding, stripBom, withUtf8OutputPrelude } = require("./child-io");
 
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
@@ -4513,6 +4521,15 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         }
         vbsLines.push('WScript.Sleep 30');
         vbsLines.push('WshShell.SendKeys "^v"');
+        // The receipt, printed the instant the keystroke is out and
+        // BEFORE anything else the script does. cscript's launch can
+        // spend 1-3 s in Defender's real-time scan, so the per-attempt
+        // wall-clock bound can kill this process between SendKeys and
+        // the final Echo — indistinguishable, without a receipt, from a
+        // kill before the keystroke, which made the ladder retry and
+        // paste the transcript a second time. Same protocol the macOS
+        // script uses, from the same constant.
+        vbsLines.push(`WScript.Echo "${PASTE_SENT_PREFIX}vbs-paste"`);
         vbsLines.push('WScript.Echo "OK:vbs-paste"');
 
         // Write as UTF-16 LE with BOM. Windows cscript/wscript decode
@@ -4545,7 +4562,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         // Clean up temp file
         try { fs.unlinkSync(vbsPath); } catch { }
 
-        const vbsOutcome = evaluatePasteOutcome({ method: "vbs_paste", ok: check.ok, stdout: check.stdout });
+        const vbsOutcome = evaluatePasteOutcome({ method: "vbs_paste", ok: check.ok, stdout: check.stdout, stderr: check.stderr });
         if (vbsOutcome.success) {
           traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: vbsOutcome.reason, verified: vbsOutcome.verified });
           scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
@@ -4764,7 +4781,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     const axTraceEvents = [];
     const onStreamLine = verifyPaste
       ? (streamName, line, ms) => {
-        if (streamName === "stderr" && line.startsWith("AXT:")) axTraceEvents.push({ line, ms });
+        if (streamName === "stderr" && line.startsWith(AX_TRACE_PREFIX)) axTraceEvents.push({ line, ms });
       }
       : null;
     // 3200 ms is the budget for the paste itself. When the verification
@@ -5870,25 +5887,15 @@ function runCommand(cmd, args, options = {}) {
   // is the whole measurement. A partial trailing line is never
   // delivered: every progress marker ends in a newline.
   const onStreamLine = typeof options.onStreamLine === "function" ? options.onStreamLine : null;
-  // On Windows, PowerShell emits stdout in the system OEM code page
-  // (CP866/CP1251/CP932/…) by default. When we read it as UTF-8 the
-  // non-ASCII bytes become mojibake, breaking app-name detection for
-  // users whose window titles contain Cyrillic/CJK characters. Inject
-  // a prelude that forces [Console]::OutputEncoding to UTF-8 so the
-  // bytes we read back are decoded correctly.
-  let effectiveArgs = args;
-  const cmdLc = String(cmd || "").toLowerCase();
-  if (cmdLc === "powershell" || cmdLc === "pwsh") {
-    const cmdIdx = args.findIndex((a) => String(a || "").toLowerCase() === "-command");
-    if (cmdIdx >= 0 && cmdIdx + 1 < args.length) {
-      const script = args[cmdIdx + 1];
-      const prelude = "$OutputEncoding=[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;";
-      if (typeof script === "string" && !script.startsWith(prelude)) {
-        effectiveArgs = args.slice();
-        effectiveArgs[cmdIdx + 1] = prelude + script;
-      }
-    }
-  }
+  // How this child's text output is produced and how it must be read are
+  // ONE decision, derived from the command line in ./child-io: PowerShell
+  // is made to emit UTF-8 (its default is the system OEM code page, which
+  // turns Cyrillic/CJK window titles into mojibake), and a `cscript //U`
+  // invocation declares UTF-16LE output, which is read back as UTF-16LE.
+  // Reading //U output as UTF-8 is what made every successful Windows
+  // paste look like a failure and pasted the transcript twice.
+  const effectiveArgs = withUtf8OutputPrelude(cmd, args);
+  const streamEncoding = childStreamEncoding(cmd, effectiveArgs);
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -5955,11 +5962,11 @@ function runCommand(cmd, args, options = {}) {
     const untrackChild = () => trackedChildren.delete(child);
     child.once("close", untrackChild);
     child.once("error", untrackChild);
-    // Force UTF-8 decoding on the streams. This is the default on macOS
-    // and Linux, but explicit here so a platform quirk cannot silently
-    // switch the encoding.
-    try { child.stdout.setEncoding("utf8"); } catch { }
-    try { child.stderr.setEncoding("utf8"); } catch { }
+    // Decode by the encoding the command line declares (see ./child-io).
+    // Explicit so a platform quirk cannot silently switch it, and so a
+    // //U cscript call is read as the UTF-16LE it actually writes.
+    try { child.stdout.setEncoding(streamEncoding); } catch { }
+    try { child.stderr.setEncoding(streamEncoding); } catch { }
 
     const timer = setTimeout(() => {
       try {
@@ -5968,14 +5975,25 @@ function runCommand(cmd, args, options = {}) {
       settleOnce({ ok: false, code: -1, stdout: finalStdout(), stderr: `${finalStderr()}\nTimed out` });
     }, timeoutMs);
 
+    // A UTF-16LE stream (cscript //U) opens with a BOM, which survives
+    // decoding as U+FEFF and would otherwise sit in front of the first
+    // protocol marker. It can only appear in the first chunk.
+    const firstChunkSeen = { stdout: false, stderr: false };
+    const decodeChunk = (streamName, d) => {
+      const raw = d.toString();
+      if (firstChunkSeen[streamName]) return raw;
+      firstChunkSeen[streamName] = true;
+      return stripBom(raw);
+    };
+
     child.stdout.on("data", (d) => {
-      const chunk = d.toString();
+      const chunk = decodeChunk("stdout", d);
       stdout = appendBoundedOutput(stdout, chunk, "stdout");
       emitLines("stdout", chunk);
     });
 
     child.stderr.on("data", (d) => {
-      const chunk = d.toString();
+      const chunk = decodeChunk("stderr", d);
       stderr = appendBoundedOutput(stderr, chunk, "stderr");
       emitLines("stderr", chunk);
     });

@@ -6,11 +6,14 @@
 // goes through. Run: node --test desktop/  (or npm test in desktop/).
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const { StringDecoder } = require("node:string_decoder");
 
+const { childStreamEncoding, stripBom } = require("./child-io");
 const {
   lastLineOf,
   pasteSentReceipt,
   isVbsPasteSuccess,
+  parseVbsPasteOutcome,
   isPwshPasteFallbackSuccess,
   isLinuxPasteSuccess,
   parseMacPasteOutcome,
@@ -30,6 +33,33 @@ test("vbs: requires BOTH a zero exit code AND the OK:vbs-paste marker", () => {
 
 test("vbs: tolerates surrounding whitespace/newlines from cscript", () => {
   assert.equal(isVbsPasteSuccess({ ok: true, stdout: "\r\nOK:vbs-paste\r\n" }), true);
+});
+
+test("vbs: fed the bytes cscript //U actually writes, decoded the way runCommand decodes them", () => {
+  // This test used to hand the detector a hand-typed UTF-8 "OK:vbs-paste"
+  // — a shape the pipeline could not produce. cscript is launched with
+  // //U, so it writes UTF-16LE with a BOM; runCommand decoded every child
+  // stream as UTF-8, and the receipt arrived as "O\0K\0:\0v\0…". The
+  // detector said false for every SUCCESSFUL paste, the ladder fell
+  // through to the PowerShell fallback and sent a second Ctrl+V. Going
+  // through the real encoding decision is what keeps this test honest.
+  const wire = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from("OK:vbs-paste\r\n", "utf16le"),
+  ]);
+  const encoding = childStreamEncoding("cscript", ["//Nologo", "//B", "//U", "paste.vbs"]);
+  const stdout = stripBom(new StringDecoder(encoding).end(wire));
+
+  assert.equal(isVbsPasteSuccess({ ok: true, stdout }), true);
+  assert.equal(evaluatePasteOutcome({ method: "vbs_paste", ok: true, stdout }).success, true);
+
+  // And the failure marker survives the same round trip.
+  const errWire = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from("ERR:activate\r\n", "utf16le"),
+  ]);
+  const errOut = stripBom(new StringDecoder(encoding).end(errWire));
+  assert.equal(isVbsPasteSuccess({ ok: true, stdout: errOut }), false);
 });
 
 test("pwsh fallback: ok + any OK: marker succeeds", () => {
@@ -200,4 +230,66 @@ test("evaluatePasteOutcome dispatches mac methods through parseMacPasteOutcome",
 test("evaluatePasteOutcome falls back to ok-only for an unknown method", () => {
   assert.equal(evaluatePasteOutcome({ method: "something-new", ok: true, stdout: "garbage" }).success, true);
   assert.equal(evaluatePasteOutcome({ method: "something-new", ok: false, stdout: "" }).success, false);
+});
+
+test("vbs: a receipt after a wall-clock kill counts as pasted-but-unverified", () => {
+  // cscript's launch can spend 1-3 s in Defender's real-time scan, so the
+  // per-attempt bound can kill the process between SendKeys and the final
+  // Echo. `sent` used to be hardcoded false for this method and stderr was
+  // never even passed in, so that kill looked like a kill before the
+  // keystroke — the ladder retried and the target got the transcript twice.
+  const r = parseVbsPasteOutcome({
+    ok: false,
+    stdout: "SENT:vbs-paste",
+    stderr: "\nTimed out",
+  });
+  assert.equal(r.success, true, "retrying here would paste a second time");
+  assert.equal(r.sent, true);
+  assert.equal(r.verified, false, "nothing verified it — the clipboard must not be restored");
+  assert.equal(r.reason, "SENT:vbs-paste");
+});
+
+test("vbs: a completed paste reports the receipt it saw and the OK verdict", () => {
+  const r = parseVbsPasteOutcome({
+    ok: true,
+    stdout: "SENT:vbs-paste\r\nOK:vbs-paste\r\n",
+    stderr: "",
+  });
+  assert.equal(r.success, true);
+  assert.equal(r.sent, true);
+  assert.equal(r.reason, "OK:vbs-paste", "the verdict is the last line, not the receipt");
+  assert.deepEqual(
+    evaluatePasteOutcome({ method: "vbs_paste", ok: true, stdout: "SENT:vbs-paste\r\nOK:vbs-paste", stderr: "" }),
+    r,
+  );
+});
+
+test("vbs: no receipt and no OK is still a plain failure", () => {
+  const r = parseVbsPasteOutcome({ ok: true, stdout: "ERR:activate", stderr: "" });
+  assert.equal(r.success, false);
+  assert.equal(r.sent, false);
+  assert.equal(r.reason, "ERR:activate");
+});
+
+test("the paste protocol markers are defined once and shared by every reader", () => {
+  // Renaming a marker in the script used to leave every test green while
+  // the production parse went blind.
+  const protocol = require("./paste-protocol");
+  const script = require("./paste-script");
+  assert.equal(script.PASTE_SENT_PREFIX, protocol.PASTE_SENT_PREFIX);
+  assert.equal(script.AX_TRACE_PREFIX, protocol.AX_TRACE_PREFIX);
+
+  const fs = require("node:fs");
+  const path = require("node:path");
+  // Comments may name a marker; code may not re-declare one.
+  const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  for (const file of ["main.js", "paste-result.js", "paste-script.js", "paste-verification-policy.js"]) {
+    const source = stripComments(fs.readFileSync(path.join(__dirname, file), "utf8"));
+    const literals = source.match(/["'`]AXT:|["'`]SENT:/g) || [];
+    assert.deepEqual(
+      literals,
+      [],
+      `${file} must take the markers from ./paste-protocol, not retype them`,
+    );
+  }
 });
