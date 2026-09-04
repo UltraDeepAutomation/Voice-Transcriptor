@@ -64,6 +64,11 @@ import {
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
+import {
+  UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
+  decideUploadQueueRestore,
+  shouldDropLegacyUploadQueueSnapshot,
+} from "./upload-queue-restore";
 
 declare global {
   interface Window {
@@ -13134,23 +13139,48 @@ function readLegacyUploadQueueSnapshot(): Partial<UploadQueueStoragePayload> | n
 }
 
 async function restoreUploadQueueSnapshot(): Promise<void> {
+  let serverReadOk = false;
   try {
     const payload = await apiGet<UploadQueueStoragePayload>("/api/ui/upload-queue");
     applyUploadQueueSnapshot(payload);
+    serverReadOk = true;
   } catch (e) {
     console.warn("Upload queue backend snapshot restore failed", e);
   }
 
-  if (uploadQueue.length === 0) {
-    const legacy = readLegacyUploadQueueSnapshot();
-    if (legacy) {
-      applyUploadQueueSnapshot(legacy);
-    }
+  const legacy = uploadQueue.length === 0 ? readLegacyUploadQueueSnapshot() : null;
+  const decision = decideUploadQueueRestore({
+    serverReadOk,
+    queueEmptyAfterServer: uploadQueue.length === 0,
+    legacyAvailable: !!legacy,
+  });
+  console.log(
+    `[trace uploadQueue] restore reason=${decision.reason} ` +
+    `persist=${decision.persist ? 1 : 0} items=${uploadQueue.length}`,
+  );
+
+  if (!decision.markLoaded) {
+    // The queue on disk is unknown, so it stays untouched: the backend
+    // replaces the file wholesale on PUT and an empty write would destroy
+    // every completed upload's transcript. Leaving the latch down also keeps
+    // ``beginUploadQueueSnapshotRestore`` free to retry once the backend is up.
+    uploadQueue.splice(0, uploadQueue.length);
+    setStatus(UPLOAD_QUEUE_RESTORE_FAILED_STATUS, "warning");
+    return;
+  }
+
+  if (decision.adoptLegacy && legacy) {
+    applyUploadQueueSnapshot(legacy);
   }
 
   uploadQueueSnapshotLoaded = true;
-  await flushUploadQueueSnapshotNow();
-  if (uploadQueueLastSaveOk) {
+  if (decision.persist) {
+    await flushUploadQueueSnapshotNow();
+  }
+  if (shouldDropLegacyUploadQueueSnapshot({
+    persisted: decision.persist,
+    saveOk: uploadQueueLastSaveOk,
+  })) {
     try {
       localStorage.removeItem(LEGACY_UPLOAD_QUEUE_STORAGE_KEY);
     } catch (e) {
