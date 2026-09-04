@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, it, expect } from "vitest";
 
 import {
@@ -73,5 +76,30 @@ describe("resolveDualStreamPreference", () => {
     expect(
       resolveDualStreamPreference({ availableLanguages: [] }).secondaryLanguage,
     ).toBe(DUAL_SECONDARY_LANGUAGE_DEFAULT);
+  });
+});
+
+describe("the markup default agrees with the documented backend default (R-006)", () => {
+  // ``process.cwd()`` is the vitest root (frontend/); the jsdom
+  // environment gives ``import.meta.url`` an http origin, so it cannot
+  // be resolved to a file path here.
+  const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
+
+  /**
+   * A checkbox's markup default is not a display detail. There are two
+   * ways ``preferences.deepgram.dual_stream`` can be absent when the
+   * autosave debouncer fires: the key is missing from the config (which
+   * ``resolveDualStreamPreference`` already resolves to the documented
+   * default), or the config was never read and the DOM still shows the
+   * markup. The second path bypasses this module entirely and reads the
+   * checkbox, so the checkbox has to carry the same default — otherwise
+   * the first autosave persists "off" and turns a backend default off
+   * behind the user's back, which is the very failure this module's
+   * header describes.
+   */
+  it("#deepgramDualStreamCheck carries DUAL_STREAM_DEFAULT", () => {
+    const tag = /<input[^>]*id="deepgramDualStreamCheck"[^>]*>/.exec(html)?.[0];
+    expect(tag, "#deepgramDualStreamCheck is missing from index.html").toBeTruthy();
+    expect(/\bchecked\b/.test(String(tag))).toBe(DUAL_STREAM_DEFAULT);
   });
 });

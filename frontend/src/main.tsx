@@ -66,6 +66,7 @@ import {
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
+import { mayAutosaveUiPreferences } from "./settings-autosave";
 import {
   UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
   decideUploadQueueRestore,
@@ -1819,6 +1820,28 @@ let hasOpenrouterKey = false;
 let hasDeepgramKey = false;
 let uiPrefSaveTimer: number | null = null;
 let suppressUiPrefAutosave = false;
+/**
+ * Have the user's preferences ever been read from the backend?
+ *
+ * While they have not, the DOM shows MARKUP defaults, not the user's
+ * choices: an empty archive path, empty keyterms, an empty microphone
+ * picker, the platform shortcut defaults. Autosaving in that state does
+ * not save nothing — ``buildUiPreferencesSavePlan`` collects the WHOLE
+ * ``preferences`` block out of the DOM, and the backend's ``_deep_merge``
+ * treats a key that is present-but-empty as a value, not as an absence.
+ * So the first toggle the user touches after a backend that was still
+ * starting up would overwrite keyterms, the archive directory, the
+ * microphone, the upscale model and both hotkeys with defaults, silently
+ * and successfully.
+ *
+ * This is the same argument ``deepgram-dual.ts`` already makes for two
+ * fields ("absent means the documented default, never off"), applied to
+ * the whole set instead of to the two that happened to be noticed.
+ * ``suppressUiPrefAutosave`` cannot carry it: that flag is a re-entrancy
+ * guard around a load in progress and is cleared in ``finally``, which
+ * is exactly the branch a failed load takes.
+ */
+let uiPreferencesLoaded = false;
 let preferredMicId = "";
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
@@ -4666,6 +4689,10 @@ async function refreshNetworkState(): Promise<void> {
     // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
     // so later refreshes don't re-trigger work after the first success.
     hideBootOverlayOnce();
+    // A renderer that started before the backend did has its settings
+    // marked "never loaded", and stays that way — and refuses to save —
+    // until they are actually read. The backend is answering now.
+    void loadCfgOnce();
     // /api/network performs outbound probes, so it stays behind the same
     // token + rate-limit guard as the rest of the API.
     const netResp = await fetch("/api/network", { headers: authHeaders() });
@@ -6181,7 +6208,16 @@ function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSave
 }
 
 function queueUiPreferencesSave(): void {
-  if (suppressUiPrefAutosave) return;
+  if (!mayAutosaveUiPreferences({
+    loaded: uiPreferencesLoaded,
+    suppressed: suppressUiPrefAutosave,
+  })) {
+    // Never write preferences we never read. See ./settings-autosave.
+    if (!suppressUiPrefAutosave) {
+      console.warn("settings autosave suppressed: preferences have never been loaded");
+    }
+    return;
+  }
   uiPrefPendingSave = true;
   if (uiPrefSaveTimer) {
     clearTimeout(uiPrefSaveTimer);
@@ -6395,8 +6431,21 @@ async function loadCfg(): Promise<void> {
       publishShortcutUpdateToMain();
       shouldPersistShortcutMigration = true;
     }
+    // The DOM now reflects the backend, so — and only so — autosave may
+    // write it back.
+    uiPreferencesLoaded = true;
   } catch (configError) {
     console.warn("Initial config load failed, retrying backend preset catalog load", configError);
+    const msg = sanitizeUiErrorMessage(configError, "Settings could not be loaded.");
+    setSettingsArchiveStatus(
+      `Settings are not loaded (${msg}). Changes are not being saved — reopen Settings once the backend is ready.`,
+      "error",
+    );
+    showRecordSessionNotice(
+      `Settings could not be loaded: ${msg}. Your saved preferences are intact, but changes made now will not be saved.`,
+      "error",
+      9000,
+    );
     try {
       await loadUpscalePresets(pendingUpscalePresetId);
     } catch (presetError) {
@@ -6406,6 +6455,30 @@ async function loadCfg(): Promise<void> {
     suppressUiPrefAutosave = false;
     if (shouldPersistShortcutMigration) queueUiPreferencesSave();
   }
+}
+
+/**
+ * Load the configuration if it has never been loaded, at most once at a
+ * time.
+ *
+ * The startup call and the health poll both go through here. Without the
+ * retry, "we are not saving your settings" would be the permanent state
+ * of a session that merely started before the backend did — the ordinary
+ * case on a cold machine. Without the single-flight, the 10 s health poll
+ * would stack a fresh `GET /api/config` on top of the startup one that
+ * has not answered yet. It stops retrying the moment a load succeeds.
+ * (The boot overlay's Retry button needs no hook: it reloads the renderer
+ * outright.)
+ */
+let configLoadInFlight: Promise<void> | null = null;
+function loadCfgOnce(): Promise<void> {
+  if (uiPreferencesLoaded) return Promise.resolve();
+  if (!configLoadInFlight) {
+    configLoadInFlight = loadCfg().finally(() => {
+      configLoadInFlight = null;
+    });
+  }
+  return configLoadInFlight;
 }
 
 /**
@@ -12466,7 +12539,7 @@ if (updateBtnEl) {
 
 applyBackendBootstrap();
 
-void loadCfg()
+void loadCfgOnce()
   .then(async () => {
     await loadMics(false);
     scheduleLocalWarmup();
@@ -12749,7 +12822,13 @@ interface UploadQueueSnapshotItem {
 }
 
 interface UploadQueueStoragePayload {
-  version: 1;
+  /**
+   * Schema version. ``number``, not the literal ``1``: the server owns
+   * this value (``UPLOAD_QUEUE_STATE_VERSION``) and the renderer echoes
+   * back whatever it reported, so a backend that bumps it does not need
+   * a matching renderer edit to stop being contradicted.
+   */
+  version: number;
   hideFinished: boolean;
   items: UploadQueueSnapshotItem[];
 }
@@ -13119,7 +13198,12 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
 
 function uploadQueueSnapshotPayload(): UploadQueueStoragePayload {
   return {
-    version: 1,
+    // The server's own version, remembered by ``applyUploadQueueSnapshot``
+    // — the same SSOT the legacy-snapshot gate compares against. Sending a
+    // duplicated literal was a second source of the same truth that only
+    // stayed harmless because ``_normalize_upload_queue_state`` overwrites
+    // the field on the way in.
+    version: uploadQueueServerVersion,
     hideFinished: uploadHideFinished,
     items: uploadQueue
       .slice(0, uploadQueueMaxPersistedItems)

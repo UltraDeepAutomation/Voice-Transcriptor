@@ -677,7 +677,16 @@
               <div class="field-stack" id="deepgramDualStreamRow" hidden>
                 <label class="toggle-inline settings-toggle">
                   <span>Auto: two streams (multi + fixed language)</span>
-                  <input type="checkbox" id="deepgramDualStreamCheck" />
+                  <!--
+                    Checked to match the backend default (DUAL_STREAM_DEFAULT
+                    / config.py). An unchecked markup default is not a
+                    display detail: if the config load fails, the autosave
+                    would persist that "off" and turn the backend default
+                    off behind the user's back — the exact failure
+                    deepgram-dual.ts exists to prevent, through the other
+                    of the two ways a value can be absent.
+                  -->
+                  <input type="checkbox" id="deepgramDualStreamCheck" checked />
                 </label>
                 <label class="field">
                   <span class="lbl">Second language</span>
