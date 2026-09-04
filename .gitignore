@@ -30,7 +30,6 @@ node_modules/
 frontend/node_modules/
 desktop/node_modules/
 frontend/dist/
-desktop/dist/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -76,12 +75,18 @@ temp/
 # Catch every runtime/<anything>/ dir (new platforms are dropped in here by
 # the script), plus the download cache.
 desktop/runtime/
-!desktop/scripts/prepare-runtime.sh
 
 # electron-builder intermediate output
 desktop/dist/
 desktop/out/
-desktop/build/
+# `desktop/build/*` and not `desktop/build/`: git does not descend into an
+# excluded DIRECTORY, so a negation underneath one can never match.
+desktop/build/*
+# ...except the DMG background, which is a committed source asset that
+# package.json build.dmg.background points at. It survived only because git
+# was already tracking it; a regenerated or renamed one would not have shown
+# up in `git status` at all.
+!desktop/build/dmg-background.png
 *.exe
 *.AppImage
 *.blockmap
@@ -103,7 +108,9 @@ backend/.pytest_cache/
 # macOS metadata
 **/.DS_Store
 **/__MACOSX/
-.claude/
+# Local agent state, except the committed launch configuration.
+.claude/*
+!.claude/launch.json
 # Local agent/tool state — never part of a release checkout
 .mcode/
 # Per-version release staging folders (release-1.1.x/). Built

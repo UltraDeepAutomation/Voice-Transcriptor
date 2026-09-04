@@ -586,3 +586,105 @@ moves, the test says so instead of the runner silently becoming decoration.
   missing. On `macos-latest` it is present; making that a hard failure would
   trade a real guard for a runner-image assumption. Left as written.
 
+---
+## Commit 12 — packaging & release invariants
+
+**IDs:** D-060 (P2), D-063 (P2, recorded as debt), D-064 (P2), D-065 (P2),
+D-066 (P2), D-067 (P2), D-068 (P2, the remaining three defects), D-070 (P2),
+D-083 (P2).
+
+**Files:** `.gitignore`, `desktop/package.json`, `desktop/packaging.test.js`,
+`desktop/scripts/prepare-runtime.sh`, `desktop/scripts/notarize-dmg.sh`,
+`desktop/scripts/generate-dmg-background.py`.
+
+**Re-verified on current code before fixing:** yes, each by running the
+mechanism rather than reading it.
+
+**Verification**
+- D-067 / D-068, measured with `git check-ignore -v --no-index` on the
+  pre-fix file:
+  ```
+  .gitignore:84:desktop/build/   desktop/build/dmg-background.png   (tracked, and named by build.dmg.background)
+  .gitignore:106:.claude/        .claude/launch.json                (tracked)
+  .gitignore:79:!desktop/scripts/prepare-runtime.sh                 (a negation of nothing — desktop/runtime/ never covers desktop/scripts/)
+  desktop/dist/ listed twice, at :33 and :82
+  ```
+  After: both tracked files report unignored, `desktop/dist/x`,
+  `desktop/build/other.png` and `.claude/settings.local.json` still ignored.
+- D-066, from `app-builder-lib/out/fileMatcher.js` — `addPatterns(config[name])`
+  then `addPatterns(options.customBuildOptions[name])`, i.e. concatenation:
+  ```
+  OLD mac   duplicated destinations: ["requirements-gigaam.txt","ENABLE_GIGAAM"]
+  OLD win   duplicated destinations: ["requirements-gigaam.txt","ENABLE_GIGAAM"]
+  OLD linux duplicated destinations: ["requirements-gigaam.txt","ENABLE_GIGAAM"]
+  OLD mas   duplicated destinations: []
+  ```
+  (`mas` was never *missing* them — the top-level list covers it. Three copies
+  were dead weight, not a gap.) After: all four platforms report `[]`.
+- D-070: `OLD artifactName: undefined`. The five strings that reproduce
+  electron-builder's default expect `Transcriptor-<version>-arm64.dmg`; the
+  new template expands to exactly that, asserted against `notarize-dmg.sh`.
+- D-083: `OLD npm scripts running bash unguarded: dist, dist:dir, dist:adhoc,
+  dist:dir:adhoc, notarize:dmg, dist:mas, testflight:upload, dist:linux` —
+  eight of nine. Now the test enumerates `pkg.scripts` and requires the guard
+  on every one that shells out to bash.
+- D-060, both branches reproduced with a stubbed `notarytool`:
+  ```
+  OLD: error: Could not authenticate
+       script continued; log file contains: []
+  NEW: Could not fetch the notarization log for submission 1234:
+       error: Could not authenticate
+  ```
+  The old form left an empty log and a message indistinguishable from
+  "notarization was rejected for no stated reason".
+- D-064, two `ffmpeg.exe` in one extracted tree:
+  ```
+  OLD picked: BUILD-B     (last match the traversal reached)
+  NEW picked: BUILD-A     (first match, then stop — as mac and linux already do)
+  ```
+- D-065: the refactor is pixel-neutral. Both script versions were executed
+  against the same Pillow and fonts and their outputs compared:
+  ```
+  OLD script vs NEW script — difference bbox: None
+  ```
+  The derived geometry reproduces the removed literals exactly
+  (178+82+22 = 282, 482-82-22 = 378, head 378-22 = 356, ±14).
+- `bash -n` on both shell scripts, `ast.parse` on the Python -> OK.
+- `npm --prefix desktop test` -> `tests 220 / pass 220 / fail 0` (was 216).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+
+**Decisions**
+- *Chosen:* `desktop/build/*` with a negation, not `desktop/build/`. Git does
+  not descend into an excluded directory, so a negation under one can never
+  match — the committed background survived only because git already tracked
+  it, and a regenerated or renamed one would not have appeared in
+  `git status` at all.
+- *Chosen:* the bash guard goes on EVERY npm script that shells out to bash,
+  including the three macOS-only ones, and the test enumerates the scripts
+  rather than naming them. One rule beats a per-script judgement call, which
+  is how `dist:win` ended up the only guarded entry point.
+- *Chosen:* pin `artifactName` to the template the five existing strings
+  already assume, and assert the expansion against `notarize-dmg.sh`. A
+  default is not a contract; making it one costs one line and removes the
+  upstream-change failure mode without renaming anything.
+- *Chosen:* the DMG generator reads `build.dmg.contents` and derives the well
+  and arrow geometry from named offsets. *Rejected:* regenerating the
+  committed PNG — this machine's Pillow/font stack produces different text
+  antialiasing than the commit did (`committed PNG vs OLD script output —
+  difference bbox: (43, 41, 521, 152)`, entirely in the two text rows), so
+  regenerating would commit an unrelated visual change under a refactor.
+  Recorded as debt.
+- *Chosen:* the `ffmpeg.exe` search dies with the temp tree cleaned up. The
+  old code leaked the mktemp dir on the not-found path.
+
+**Not done in this commit**
+- **D-063** (the macOS ffmpeg URL carries no build identifier, so the
+  publisher can overwrite it in place): the pinned SHA256 keeps a substituted
+  binary out of a release, but the day the file changes every macOS release
+  build fails and the only repair is re-deriving the hash from an
+  unverifiable source. A versioned mirror is the fix and it is a hosting
+  decision. The trade-off is now written at the pin; recorded in "долг".
+- "Install for macOS Sonoma" in the generator names an OS release with no
+  source in the manifest (`build.mac.minimumSystemVersion` is not set).
+  Changing user-visible artwork copy is a product decision; recorded in "долг".
+

@@ -214,3 +214,78 @@ test("CI runs the desktop suite where its osacompile tests can execute", () => {
   assert.match(workflow, /^concurrency:$/m);
   assert.match(workflow, /cancel-in-progress: true/);
 });
+
+test("no extraResource is copied to the same destination twice", () => {
+  // app-builder-lib CONCATENATES build.<platform>.extraResources onto
+  // build.extraResources rather than replacing them
+  // (out/fileMatcher.js: addPatterns(config[name]) then
+  // addPatterns(options.customBuildOptions[name])), so
+  // ../requirements-gigaam.txt and ../ENABLE_GIGAAM were each copied to the
+  // same path twice on mac, win and linux, and all six had to be edited
+  // together to change one path.
+  for (const platform of ["mac", "mas", "win", "linux"]) {
+    const platformCfg = pkg.build[platform] || {};
+    const combined = [...pkg.build.extraResources, ...(platformCfg.extraResources || [])];
+    const destinations = combined.map((entry) => entry.to);
+    const duplicated = destinations.filter((to, i) => destinations.indexOf(to) !== i);
+    assert.deepEqual(duplicated, [], `${platform}: duplicate extraResources destinations`);
+  }
+});
+
+test("the artifact name is pinned, not inherited from electron-builder's default", () => {
+  // Five independent strings — BUILD.command, notarize-dmg.sh, sign-mas.js,
+  // INSTALL_ON_OTHER_MAC.command and docs/INSTALL_OTHER_MAC.md — reproduce
+  // electron-builder's DEFAULT artifact name. A default is not a contract:
+  // an upstream change to it breaks the release at "Built DMG not found".
+  assert.equal(pkg.build.artifactName, "${productName}-${version}-${arch}.${ext}");
+
+  // And the name those five strings expect must be what that template
+  // produces, for the arch the mac target ships.
+  const expanded = pkg.build.artifactName
+    .replace("${productName}", pkg.build.productName)
+    .replace("${version}", pkg.version)
+    .replace("${arch}", "arm64")
+    .replace("${ext}", "dmg");
+  assert.equal(expanded, `Transcriptor-${pkg.version}-arm64.dmg`);
+  const notarize = fs.readFileSync(path.join(__dirname, "scripts", "notarize-dmg.sh"), "utf8");
+  assert.ok(
+    notarize.includes("Transcriptor-${APP_VERSION}-arm64.dmg"),
+    "notarize-dmg.sh must look for the artifact the manifest now names",
+  );
+});
+
+test("every npm script that shells out to bash checks bash is there first", () => {
+  // require-bash.js was wired to dist:win only. On a Windows or minimal
+  // host every other release script died inside `bash` with the shell's own
+  // error instead of the one sentence that says what to install.
+  for (const [name, body] of Object.entries(pkg.scripts)) {
+    if (!/(^|&&\s*)bash\s/.test(body)) continue;
+    assert.match(
+      body,
+      /^node \.\/scripts\/require-bash\.js \S+ &&/,
+      `npm script "${name}" runs bash without the guard`,
+    );
+  }
+});
+
+test("the DMG artwork is drawn around the icon positions the manifest declares", () => {
+  // The generator carried the icon centres as literals (178 / 482), the same
+  // numbers build.dmg.contents declares. Moving an icon left the wells and
+  // the arrow behind it pointing where it used to be.
+  const generator = fs.readFileSync(
+    path.join(__dirname, "scripts", "generate-dmg-background.py"),
+    "utf8",
+  );
+  assert.match(generator, /metadata\["build"\]\["dmg"\]\["contents"\]/);
+  // The literal it used to carry was a tuple pairing each centre with its
+  // label; nothing may pair a number with those labels any more.
+  assert.ok(
+    !/\(\s*\d+\s*,\s*"(APP|APPLICATIONS)"/.test(generator),
+    "the generator still pairs a hardcoded x with a well label",
+  );
+  assert.match(generator, /def draw_install_wells\(\s*base[\s\S]*?columns: tuple/);
+  assert.match(generator, /draw_install_wells\(canvas, draw, dmg_icon_columns\(metadata\)\)/);
+  // ...and the asset it writes is the one package.json points electron-builder at.
+  assert.equal(pkg.build.dmg.background, "build/dmg-background.png");
+  assert.ok(fs.existsSync(path.join(__dirname, "build", "dmg-background.png")));
+});

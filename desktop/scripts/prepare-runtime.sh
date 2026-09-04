@@ -63,6 +63,13 @@ FFMPEG_WIN_SHA256="90582d696445953f154beac0f73180961fe8c079db1c50238f9f28b5f84df
 # macOS packaged runtime support is arm64-only. Intel packaging was
 # dropped before 1.1.25 and cannot use the current wheel-only runtime
 # graph because cryptography 49.0.0 publishes macOS arm64 wheels only.
+# NOTE: unlike the Windows and Linux sources, this filename carries no build
+# identifier — the publisher overwrites it in place. The pinned SHA256 below
+# keeps a substituted binary out of a release, but it also means that on the
+# day the file changes EVERY macOS release build fails on a checksum mismatch
+# and the only repair is to re-derive the hash by hand from an unverifiable
+# source. Recorded in the debt ledger (D-063); a versioned mirror is the real
+# fix and it is a hosting decision, not a code one.
 FFMPEG_MAC_ARM64_URL="https://www.osxexperts.net/ffmpeg71arm.zip"
 FFMPEG_MAC_ARM64_SHA256="0878f3313311c2c1b2c818e7c955c0bd828c97b357fa86211b42a5c36d01e36f"
 FFMPEG_LINUX_ASSET="ffmpeg-7.0.2-amd64-static.tar.xz"
@@ -255,9 +262,19 @@ install_ffmpeg_win() {
   local tmp
   tmp="$(mktemp -d)"
   unzip -q "${zip}" -d "${tmp}"
-  find "${tmp}" -name "ffmpeg.exe" -exec cp {} "${out_dir}/ffmpeg/bin/ffmpeg.exe" \;
+  # Take the FIRST match and stop, the way install_ffmpeg_mac and
+  # install_ffmpeg_linux already do. `find ... -exec cp {} dest \;` copies
+  # every match in turn, so with more than one ffmpeg.exe in the archive the
+  # bundled binary was whichever the traversal happened to reach last.
+  local found=""
+  while IFS= read -r -d '' f; do
+    found="$f"
+    break
+  done < <(find "${tmp}" -name "ffmpeg.exe" -type f -print0)
+  [ -n "${found}" ] || { remove_tree "${tmp}"; die "ffmpeg.exe not found in archive"; }
+  cp "${found}" "${out_dir}/ffmpeg/bin/ffmpeg.exe"
   remove_tree "${tmp}"
-  [ -f "${out_dir}/ffmpeg/bin/ffmpeg.exe" ] || die "ffmpeg.exe not found in archive"
+  [ -f "${out_dir}/ffmpeg/bin/ffmpeg.exe" ] || die "ffmpeg.exe was not installed"
   log "ffmpeg.exe installed"
 }
 
