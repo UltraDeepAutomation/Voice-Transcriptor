@@ -5,17 +5,35 @@
 # version bump cannot leave CI testing an interpreter the product does not
 # ship.
 #
-# The desktop job needs no `npm install` — its tests (accelerator,
-# packaging whitelist) are pure node:test modules with zero dependencies;
-# requiring "electron" would need it only if a future test imports an
-# entrypoint, and that failure mode is exactly what packaging.test.js
-# exists to describe.
+# The desktop job needs no `npm install` — its seventeen suites are pure
+# node:test modules with zero dependencies; requiring "electron" would
+# matter only if a future test imported an entrypoint, and that failure
+# mode is exactly what packaging.test.js exists to describe.
+#
+# It runs on macOS. Two of those suites — applescript.test.js and
+# paste-script.test.js — hand the AppleScript the product actually ships
+# to `osacompile`, and skip themselves anywhere else. On ubuntu-latest
+# they had therefore never run once: a stray backtick truncating the paste
+# template (the exact failure applescript.test.js was written for) would
+# have reached users with CI green, on the platform the product is
+# primarily shipped for.
 name: tests
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# Nothing in this workflow writes to the repository, so the job token says
+# so instead of inheriting whatever the repository default happens to be.
+permissions:
+  contents: read
+
+# A second push to the same ref cancels the first. Without this, superseded
+# runs keep a runner busy reporting on a commit nobody is waiting for.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
@@ -72,7 +90,8 @@ jobs:
       - run: npm run build
 
   desktop:
-    runs-on: ubuntu-latest
+    # macOS, so the two osacompile suites actually execute. See the header.
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: desktop
@@ -81,4 +100,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      # AGENTS.md names this a required check before every commit; CI had
+      # never run it. packaging.test.js reads main.js as TEXT, so nothing
+      # else in the suite parses these two files as modules.
+      - run: node --check main.js && node --check preload.js
       - run: npm test

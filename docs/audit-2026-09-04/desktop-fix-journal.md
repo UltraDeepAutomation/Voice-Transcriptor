@@ -534,3 +534,55 @@ and the two new packaging tests assert each of the three by its own text.
 
 **Not done in this commit:** nothing from this group.
 
+---
+## Commit 11 — CI runs every suite, on a platform that can run it
+
+**IDs:** D-027 (P1), D-071 (P2).
+
+**Files:** `.github/workflows/tests.yml`, `desktop/packaging.test.js`,
+`AGENTS.md`.
+
+**Re-verified on current code before fixing:** yes.
+
+**Verification (pre-fix workflow, replayed from `git show HEAD:`)**
+```
+OLD desktop job runs-on: ubuntu-latest
+OLD workflow declares permissions: false
+OLD workflow declares concurrency: false
+OLD desktop job runs node --check: false
+```
+The two suites that had never executed in CI, confirmed by name on this Mac:
+```
+darwin-gated cases that ran here: 2
+  ✔ every AppleScript in main.js compiles      (applescript.test.js)
+  ✔ both shapes compile                        (paste-script.test.js)
+```
+They are the only `process.platform !== "darwin"` gates in the tree, and the
+new test asserts exactly that list — so if the reason for the macOS runner
+moves, the test says so instead of the runner silently becoming decoration.
+- `npm --prefix desktop test` -> `tests 216 / pass 216 / fail 0` (was 215).
+- `node --check desktop/main.js && node --check desktop/preload.js` -> OK.
+- The workflow parses as YAML (`yaml.safe_load` -> `name, on, permissions,
+  concurrency, jobs`).
+
+**Decisions**
+- *Chosen:* move the desktop job to `macos-latest` rather than install an
+  AppleScript compiler on Linux (there is none) or drop the skip guard (the
+  tests would fail, not run). The suite takes ~2 s; the macOS minute
+  multiplier is the price of the only CI that can compile the shipped script.
+- *Chosen:* `node --check` as its own step, before `npm test`. AGENTS.md has
+  declared it a required check all along and CI had never run it;
+  `packaging.test.js` reads `main.js` as *text*, so nothing else in the suite
+  ever parses these two files as modules.
+- *Chosen:* `permissions: contents: read` at workflow level, not per job —
+  no job in this file writes anything, and a per-job list would be three
+  copies of one fact.
+- *Chosen:* `concurrency.group` is `${{ github.workflow }}-${{ github.ref }}`.
+  The WIP draft prefixed it with a literal `tests-` as well, which only
+  restates `github.workflow`.
+
+**Not done in this commit**
+- Both osacompile tests still `return` silently if `osacompile` itself is
+  missing. On `macos-latest` it is present; making that a hard failure would
+  trade a real guard for a runner-image assumption. Left as written.
+

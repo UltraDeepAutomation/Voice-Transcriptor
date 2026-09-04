@@ -45,9 +45,13 @@ npm --prefix frontend run build       # vite build (CI parity)
 Desktop:
 
 ```bash
-npm --prefix desktop test             # node --test (accelerator, packaging, engine-deps)
+npm --prefix desktop test             # node --test — every desktop suite
 node --check desktop/main.js && node --check desktop/preload.js
 ```
+
+The desktop job runs on macOS in CI so that the two suites which hand the
+shipped AppleScript to `osacompile` (`applescript.test.js`,
+`paste-script.test.js`) actually execute; they skip themselves elsewhere.
 
 A change is committable only when the suites covering it pass. Push `main`
 after committing — work left only on a local branch is considered lost.

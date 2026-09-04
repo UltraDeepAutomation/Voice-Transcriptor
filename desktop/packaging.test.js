@@ -183,3 +183,34 @@ test("one set of dependency pins: build, CI and the on-device repair all apply t
     assert.match(call, /constraintArgs/, `pip call without the lock: ${call}`);
   }
 });
+
+test("CI runs the desktop suite where its osacompile tests can execute", () => {
+  // applescript.test.js and paste-script.test.js hand the AppleScript the
+  // product ships to osacompile and skip themselves off darwin. On
+  // ubuntu-latest they had never run once, so the exact failure
+  // applescript.test.js was written for — a stray backtick truncating the
+  // paste template — would have reached users with CI green.
+  const workflow = fs.readFileSync(
+    path.join(__dirname, "..", ".github", "workflows", "tests.yml"),
+    "utf8",
+  );
+  const desktopJob = workflow.slice(workflow.indexOf("\n  desktop:"));
+  assert.match(desktopJob, /runs-on:\s*macos-latest/);
+
+  // ...and those two suites must still be the darwin-gated ones, or the
+  // reason for the macOS runner has quietly moved somewhere else.
+  const darwinGated = fs
+    .readdirSync(__dirname)
+    .filter((f) => f.endsWith(".test.js") && f !== path.basename(__filename))
+    .filter((f) => fs.readFileSync(path.join(__dirname, f), "utf8").includes('process.platform !== "darwin"'));
+  assert.deepEqual(darwinGated.sort(), ["applescript.test.js", "paste-script.test.js"]);
+
+  // AGENTS.md names this a required check before every commit, and CI had
+  // never run it.
+  assert.match(desktopJob, /node --check main\.js && node --check preload\.js/);
+
+  // The workflow states its token scope and cancels superseded runs.
+  assert.match(workflow, /^permissions:\n  contents: read$/m);
+  assert.match(workflow, /^concurrency:$/m);
+  assert.match(workflow, /cancel-in-progress: true/);
+});
