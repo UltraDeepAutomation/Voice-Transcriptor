@@ -30,3 +30,33 @@ describe("__transcriptorFinishedRecords depth", () => {
     expect(Number(desktopDepth)).toBe(Number(declared));
   });
 });
+
+/**
+ * The document.title bridge. Three messages, two processes, and until
+ * now four independent string literals on the renderer side alone.
+ */
+describe("the title bridge prefixes match desktop/main.js", () => {
+  const desktopMain = readFileSync(resolve(process.cwd(), "../desktop/main.js"), "utf8");
+
+  it("declares each prefix once in the renderer", () => {
+    const block = /TITLE_BRIDGE_PREFIX = \{([\s\S]*?)\} as const;/.exec(mainTsx)?.[1];
+    expect(block, "TITLE_BRIDGE_PREFIX not found").toBeTruthy();
+    const prefixes = Array.from(String(block).matchAll(/"(__app_[a-z_]+__)"/g)).map((m) => m[1]);
+    expect(prefixes.sort()).toEqual([
+      "__app_record_toggle__",
+      "__app_reveal_recording__",
+      "__app_shortcuts__",
+    ]);
+    for (const prefix of prefixes) {
+      // Once in the declaration, nowhere else: the three call sites go
+      // through postTitleBridgeMessage.
+      expect(mainTsx.split(`"${prefix}"`).length - 1, prefix).toBe(1);
+    }
+  });
+
+  it("is the same set the main process listens for", () => {
+    for (const prefix of ["__app_shortcuts__", "__app_record_toggle__", "__app_reveal_recording__"]) {
+      expect(desktopMain, prefix).toContain(prefix);
+    }
+  });
+});

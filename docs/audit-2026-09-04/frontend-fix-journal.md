@@ -1014,7 +1014,7 @@ $ git stash push src/update-check.ts && npx vitest run tests/update-check.test.t
 
 ---
 
-## Коммит `<E>` — History: мёртвые ветки, чужой текст в транскрипте и фантомная сессия
+## Коммит `90876fa` — History: мёртвые ветки, чужой текст в транскрипте и фантомная сессия
 
 **Заголовок:** History says what actually happened — a failed stats read is not an empty archive, an error is not a transcript, and re-transcribe no longer invents a session to guard itself with
 
@@ -1110,3 +1110,82 @@ every branch, not only the last one`: прежний механизм (регу�
 R-010, R-012, R-019, R-021, R/2, R/3, R/4, R/6) нет — весь этот код связан с
 DOM внутри непокрытого файла; проверено прогоном по коду. Чистая часть
 (`explainNetworkError`) специально вынесена и покрыта.
+
+---
+
+## Коммит `<F>` — P2: сообщения, которые называют неверную причину, и кнопки, которые ничего не делают
+
+**Заголовок:** Failures say what actually failed, a button that cannot work is not shown, and the title bridge is one idiom instead of three
+
+**Находки / строки индексов:** **C-010**, **C-011**, **U-007**, **U-013**
+(закрыт в `50e52f6`), **U-014** = `U/K-1` = `U/H-2` (мост через `document.title`),
+**U-015**, **U-023**, **R-015**, **S-01** (опции `#providerSelect` ×3).
+
+**Перепроверка на текущем коде.** Все открыты дословно.
+
+**Файлы:** `frontend/src/main.tsx`, `frontend/src/ui-copy.ts`,
+`frontend/src/styles.css`, `frontend/index.html`,
+`frontend/tests/renderer-main-contract.test.ts` (+2 теста).
+
+**Что сделано.**
+* **C-010.** «Model list unavailable — backend offline» называло причину,
+  которую никто не проверял: `apiGet` бросает и на отсутствующем токене, и на
+  HTTP-ошибке, а `catch` глотал причину целиком — в приложении, которое ставит
+  error-aware консоль ровно затем, чтобы причины выживали. Теперь причина
+  логируется и подставляется в текст.
+* **C-011.** Download и Engine install печатали сырое `e.message`
+  («Failed to fetch»), а Delete той же строки — через `sanitizeUiErrorMessage`
+  («The computer appears to be offline…»). Три действия одной строки говорят
+  теперь одним голосом.
+* **U-007.** `hostCanRevealFiles()` спрашивает `__transcriptorFilePathForFile`
+  (его ставит preload), а не `__transcriptorRevealRecording`, который рендерер
+  ставит себе сам на уровне модуля — гейт был всегда истинным, и «Reveal in
+  folder» показывалась в браузерном превью, молча ничего не делая. Гейт
+  применён во всех четырёх точках показа кнопки.
+* **U-014 / K-1 / H-2.** `TITLE_BRIDGE_PREFIX` (три префикса) +
+  `postTitleBridgeMessage`. Кроме дублирования это чинит гонку: при двух
+  сообщениях в одном тике второе захватывало сентинел первого как «настоящий
+  заголовок» и «восстанавливало» его — main.js читал бы reveal дважды. Теперь
+  настоящий заголовок запоминается один раз на серию. Сторона desktop
+  пришпилена тестом.
+* **U-015.** `.upload-queue-persistence` — «Only the newest N of M are saved for
+  the next launch». Снапшот молча резался, и элементы за границей вместе с
+  транскриптами исчезали на следующем запуске. History ровно этот факт
+  проговаривает (`windowStatusText`).
+* **U-023.** `hideBootOverlayOnce` уважает `dataset.state === "error"`: успешный
+  `/api/health` больше не закрывает уже показанную диагностику загрузки.
+* **R-015.** Ошибка медиаэлемента в viewer'е больше не вызывает тот же
+  `finish`, что `canplay`: `waitForRecordingViewerAudioReady` реджектится, и
+  ошибка доходит до `catch`, который прячет строку плеера. Раньше строка
+  появлялась, контролы были живыми, а нажатие Play не делало ничего.
+* **S-01.** `#providerSelect` в разметке пуст, как `#uploadProviderMirror` и
+  `#remoteModelSelect`. Четыре зашитые опции были третьей копией списка групп
+  **и** тем, с чем сравнивал guard идемпотентности (C-001), то есть написание
+  в разметке молча решало, пересобирать ли селект.
+
+**Верификация.**
+
+```
+$ npm --prefix frontend test
+ Test Files  26 passed (26)
+      Tests  327 passed (327)
+$ typecheck / lint / build — чисто, ✓ built
+```
+
+**Решения.**
+* U-015: отвергнуто «поднять лимит». Лимит задаёт бэкенд
+  (`runtime_limits.upload_queue_max_persisted_items`); задача рендерера —
+  не врать о нём.
+* U-023: отвергнуто «не показывать оверлей ошибки, если health прошёл».
+  Диагностика появляется только по явному `__setBackendBootError` от main.js,
+  то есть бэкенд действительно не стартовал; проходящий health — это следующая
+  попытка, а не отмена того, что случилось.
+* Мост заголовков: отвергнуто «завести полноценный IPC». Это правка preload и
+  main.js — чужой регион; здесь устранены три копии идиомы и гонка на стороне
+  рендерера, а совпадение префиксов закреплено тестом.
+
+**Не сделано (в этом коммите):**
+* **Строка 14 индекса SSOT региона F** (`frontend/package.json.version`) —
+  **нельзя здесь**: поле читает `desktop/packaging.test.js`, который держит две
+  версии равными. Удаление уронило бы чужой сьют. В долг: убрать поле и вместе
+  с ним ту половину теста.

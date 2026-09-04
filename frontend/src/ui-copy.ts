@@ -50,6 +50,9 @@ export const UI_COPY = {
      * markup and on the one the retry path constructs.
      */
     fileAccept: "audio/*,video/*",
+    /** Empty state while "Hide past" is on and everything is finished. */
+    hiddenPastTitle: "Past queues hidden",
+    hiddenPastSub: "Use Show past to reveal completed queue items.",
     /** Result-pane title while nothing is selected. */
     resultTitleEmpty: "Result",
     resultTitlePrefix: "Result · ",

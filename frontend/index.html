@@ -391,12 +391,15 @@
                          local-whisper both transcribe through wire
                          provider "local"). Options are re-rendered from
                          /api/health by renderTranscriptionSelectors(). -->
-                    <select id="providerSelect" aria-label="Transcription provider">
-                      <option value="local-whisper">Local Whisper</option>
-                      <option value="gigaam">GigaAM (Russian)</option>
-                      <option value="deepgram">Deepgram</option>
-                      <option value="openrouter">OpenRouter</option>
-                    </select>
+                    <!-- Empty, like #uploadProviderMirror and
+                         #remoteModelSelect: the four options typed here
+                         were a third copy of the group list (the other
+                         two being transcription-catalog.ts's labels and
+                         providerLabel), and they were also what the
+                         idempotence guard compared against, so the
+                         markup's spelling silently decided whether the
+                         select was rebuilt. -->
+                    <select id="providerSelect" aria-label="Transcription provider"></select>
                     <!-- Universal model select for the chosen provider
                          group: Whisper Tiny…Large-v3, GigaAM v3 models,
                          Deepgram or OpenRouter audio models. Rendered by

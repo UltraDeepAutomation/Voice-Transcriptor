@@ -936,6 +936,47 @@ function installAppearanceStateClasses(): void {
 
 installAppearanceStateClasses();
 
+/**
+ * The renderer → main-process bridge that rides on ``document.title``.
+ *
+ * Electron's ``page-title-updated`` is the one channel available to a
+ * renderer that has no preload IPC for these three messages: the main
+ * process reads the sentinel and ``preventDefault()``s the real title
+ * change. The idiom — save the title, write the sentinel, restore on the
+ * next tick — was copied three times with four literals spread over two
+ * processes, and two messages posted in one tick made the second capture
+ * the FIRST one's sentinel as the title to restore, leaving it on the
+ * document for main.js to read a second time.
+ *
+ * ``desktop/main.js`` holds the same three prefixes; the two sides are
+ * pinned by ``tests/renderer-main-contract.test.ts``.
+ */
+const TITLE_BRIDGE_PREFIX = {
+  shortcuts: "__app_shortcuts__",
+  recordToggle: "__app_record_toggle__",
+  revealRecording: "__app_reveal_recording__",
+} as const;
+
+/** The real document title, saved before the first sentinel of a burst. */
+let titleBridgeRestore = "";
+let titleBridgeRestoreTimer = 0;
+
+function postTitleBridgeMessage(prefix: string, payload = ""): void {
+  if (!titleBridgeRestoreTimer) {
+    titleBridgeRestore = document.title;
+  }
+  document.title = prefix + payload;
+  // main.js consumes the sentinel through page-title-updated and
+  // preventDefault()s the real title change. Restored defensively for
+  // browser dev preview and any future non-Electron surface — and once
+  // per burst, from the title that was there before the burst began.
+  window.clearTimeout(titleBridgeRestoreTimer);
+  titleBridgeRestoreTimer = window.setTimeout(() => {
+    titleBridgeRestoreTimer = 0;
+    document.title = titleBridgeRestore || "Transcriptor";
+  }, 0);
+}
+
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 // Backend-owned; injected in window.__TRANSCRIPTOR_BOOTSTRAP and refreshed
 // through /api/health. Until it arrives, the renderer falls back to the
@@ -1540,6 +1581,8 @@ type LocalModelRow = {
 
 let localModelsCache: LocalModelRow[] = [];
 let localModelsFetchFailed = false;
+/** Why the last local-model read failed, in the user's words. */
+let localModelsFetchError = "";
 /**
  * A model whose download was CONFIRMED and successfully started. When it
  * lands, ``refreshLocalModels`` applies it to the unified selection.
@@ -1582,8 +1625,13 @@ function renderLocalModels(): void {
     // automatically once real rows arrive.
     const placeholder = document.createElement("div");
     placeholder.className = "model-row model-row-empty";
+    // Not "backend offline": that named a cause nothing had checked.
+    // ``apiGet`` throws for a missing API token, an HTTP error and a
+    // refused connection alike, and the reason was swallowed by a
+    // bare ``catch`` — in an app that installs an error-aware console
+    // precisely so reasons survive.
     placeholder.textContent = localModelsFetchFailed
-      ? "Model list unavailable — backend offline"
+      ? `Model list unavailable — ${localModelsFetchError || "the backend did not answer"}`
       : "Loading models…";
     wrap.replaceChildren(placeholder);
     return;
@@ -1706,6 +1754,7 @@ async function refreshLocalModels(): Promise<void> {
     const js = await apiGet<{ ok: boolean; models: LocalModelRow[] }>("/api/models/local");
     localModelsCache = Array.isArray(js.models) ? js.models : [];
     localModelsFetchFailed = false;
+    localModelsFetchError = "";
     renderLocalModels();
     invalidateTranscriptionCatalog(); renderTranscriptionSelectors();
     void syncEngineInstallState();
@@ -1737,11 +1786,13 @@ async function refreshLocalModels(): Promise<void> {
       pendingModelSelection = null;
       invalidateTranscriptionCatalog(); renderTranscriptionSelectors();
     }
-  } catch {
+  } catch (e) {
     // BUG-31: surface the failure instead of leaving a blank table. A
     // populated cache is kept (stale rows beat a flickering empty
     // state); only the never-loaded case shows the placeholder.
+    console.warn("Local model list refresh failed", e);
     localModelsFetchFailed = true;
+    localModelsFetchError = sanitizeUiErrorMessage(e, "the backend did not answer");
     if (localModelsCache.length === 0) renderLocalModels();
   }
   ensureLocalModelsPolling();
@@ -1822,7 +1873,10 @@ async function requestModelDownload(id: string): Promise<boolean> {
     await refreshLocalModels();
     return true;
   } catch (e) {
-    setStatus(`Download failed for ${id}: ${e instanceof Error ? e.message : String(e)}`, "error");
+    // Through the same sanitiser the Delete action of this very row
+    // already used: offline, the two used to say "The computer appears
+    // to be offline…" and "Failed to fetch".
+    setStatus(`Download failed for ${id}: ${sanitizeUiErrorMessage(e, "Could not start the download.")}`, "error");
     // BUG-40: a failed request must not leave a pending pin behind — the
     // caller only arms auto-apply when this resolves truthy.
     return false;
@@ -1851,7 +1905,7 @@ async function requestEngineInstall(): Promise<void> {
       setStatus(`GigaAM engine install failed: ${why}`, "error");
     }
   } catch (e) {
-    setStatus(`Engine install failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+    setStatus(`Engine install failed: ${sanitizeUiErrorMessage(e, "Could not install the engine.")}`, "error");
   }
 }
 
@@ -2277,26 +2331,47 @@ function setRecordingViewerAudioRowVisible(visible: boolean, hydrating = false):
   row.setAttribute("aria-busy", visible && hydrating ? "true" : "false");
 }
 
+/**
+ * Wait until the viewer's player can say something about the file.
+ *
+ * Resolves "ready" for metadata, a timeout — which means "took too
+ * long, show the controls anyway" — and REJECTS on a media error. The
+ * error listener used to call the same ``finish`` as ``canplay``, so a
+ * file the decoder refused was reported as ready: the row appeared,
+ * the controls were live, and pressing play did nothing at all. The
+ * caller already has a catch that hides the row; this makes the error
+ * reach it.
+ */
 function waitForRecordingViewerAudioReady(player: HTMLAudioElement): Promise<void> {
   if (player.readyState >= HTMLMediaElement.HAVE_METADATA) return Promise.resolve();
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
     let timeoutId = 0;
-    const finish = () => {
+    const detach = (): void => {
+      window.clearTimeout(timeoutId);
+      player.removeEventListener("loadedmetadata", onReady);
+      player.removeEventListener("canplay", onReady);
+      player.removeEventListener("error", onError);
+    };
+    function onReady(): void {
       if (settled) return;
       settled = true;
-      window.clearTimeout(timeoutId);
-      player.removeEventListener("loadedmetadata", finish);
-      player.removeEventListener("canplay", finish);
-      player.removeEventListener("error", finish);
+      detach();
       resolve();
-    };
+    }
+    function onError(): void {
+      if (settled) return;
+      settled = true;
+      detach();
+      const code = player.error?.code ?? 0;
+      reject(new Error(`Audio for this recording could not be decoded (media error ${code}).`));
+    }
 
-    player.addEventListener("loadedmetadata", finish, { once: true });
-    player.addEventListener("canplay", finish, { once: true });
-    player.addEventListener("error", finish, { once: true });
-    timeoutId = window.setTimeout(finish, UI_TOKENS.recordings.viewerAudioReadyTimeoutMs);
+    player.addEventListener("loadedmetadata", onReady, { once: true });
+    player.addEventListener("canplay", onReady, { once: true });
+    player.addEventListener("error", onError, { once: true });
+    timeoutId = window.setTimeout(onReady, UI_TOKENS.recordings.viewerAudioReadyTimeoutMs);
   });
 }
 
@@ -5196,6 +5271,14 @@ function hideBootOverlayOnce(): void {
   if (!overlay) return;
   if (_bootOverlayHidden) return;
   if (overlay.hidden) return;
+  // A diagnosis on screen outranks a health probe that happened to
+  // succeed. ``__setBackendBootError`` re-shows the overlay in the
+  // error state and clears ``_bootOverlayHidden``; the very next
+  // ten-second network poll used to close it over the message, and the
+  // user was left with a working-looking app whose backend had failed
+  // to start for a reason they never got to read. The Retry button is
+  // the way out of the error state.
+  if (overlay.dataset.state === "error") return;
   _bootOverlayHidden = true;
   overlay.dataset.state = "success";
   const statusEl = document.getElementById("bootOverlayStatus");
@@ -5872,8 +5955,6 @@ const DEFAULT_SHORTCUTS = _isMacRenderer
 const LEGACY_SHORTCUTS = __SHORTCUT_DEFAULTS__.legacy;
 let currentShortcuts = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
-const SHORTCUT_BRIDGE_TITLE_PREFIX = "__app_shortcuts__";
-
 function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: ShortcutPair = currentShortcuts): void {
   const payload = encodeURIComponent(JSON.stringify({
     action,
@@ -5881,12 +5962,7 @@ function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: Shor
     paste: shortcuts.paste,
     nonce: `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
   }));
-  const prevTitle = document.title;
-  document.title = SHORTCUT_BRIDGE_TITLE_PREFIX + payload;
-  // main.js consumes the sentinel through page-title-updated and
-  // preventDefault()s the real title change. Restore defensively for
-  // browser dev preview and for any future non-Electron surface.
-  setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+  postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.shortcuts, payload);
 }
 
 function publishShortcutUpdateToMain(): void {
@@ -8206,7 +8282,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     // Hidden in plain-browser dev preview where the helper is undefined.
     const revealBtn = document.getElementById("recordingRevealBtn") as HTMLButtonElement | null;
     if (revealBtn) {
-      const hasReveal = typeof window.__transcriptorRevealRecording === "function";
+      const hasReveal = hostCanRevealFiles();
       revealBtn.hidden = !hasReveal;
       revealBtn.onclick = () => {
         const fn = window.__transcriptorRevealRecording;
@@ -13026,12 +13102,7 @@ async function stopLive(
 // event directly from the button would skip all of that and create a
 // second, weaker recording path.
 document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
-  const prevTitle = document.title;
-  document.title = "__app_record_toggle__" + Date.now();
-  // main.js consumes the sentinel through page-title-updated and
-  // preventDefault()s the real title change. Restored defensively for
-  // browser dev preview and any future non-Electron surface.
-  setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+  postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.recordToggle, String(Date.now()));
 });
 
 window.addEventListener("transcriptor-hotkey-toggle", () => {
@@ -13705,6 +13776,19 @@ function normalizeTranscriptRecordingName(name: string): string {
   return raw;
 }
 
+/**
+ * Whether the shell can actually reveal a file in the OS file manager.
+ *
+ * NOT ``typeof window.__transcriptorRevealRecording === "function"``:
+ * the renderer installs that itself, unconditionally, at module scope,
+ * so the check was always true and the "Reveal in folder" button showed
+ * in a plain browser preview and silently did nothing. The preload
+ * script is what proves a host is there.
+ */
+function hostCanRevealFiles(): boolean {
+  return typeof window.__transcriptorFilePathForFile === "function";
+}
+
 function installRevealRecordingBridge(): void {
   window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
     const safe = normalizeTranscriptRecordingName(name);
@@ -13712,10 +13796,7 @@ function installRevealRecordingBridge(): void {
     const payload = encodeURIComponent(
       JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
     );
-    const prevTitle = document.title;
-    document.title = "__app_reveal_recording__" + payload;
-    // main.js consumes the sentinel synchronously via page-title-updated.
-    setTimeout(() => { document.title = prevTitle || "Transcriptor"; }, 0);
+    postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.revealRecording, payload);
   };
 }
 
@@ -13730,13 +13811,14 @@ function uploadRevealTarget(item: UploadQueueItem | null | undefined): UploadRev
 
 function revealUploadItem(item: UploadQueueItem | null | undefined): boolean {
   const target = uploadRevealTarget(item);
-  if (!target || typeof window.__transcriptorRevealRecording !== "function") return false;
-  window.__transcriptorRevealRecording(target.name, target.archiveDir);
+  const reveal = window.__transcriptorRevealRecording;
+  if (!target || !reveal || !hostCanRevealFiles()) return false;
+  reveal(target.name, target.archiveDir);
   return true;
 }
 
 function createUploadRevealButton(item: UploadQueueItem): HTMLButtonElement | null {
-  if (!uploadRevealTarget(item)) return null;
+  if (!uploadRevealTarget(item) || !hostCanRevealFiles()) return null;
   const btn = document.createElement("button");
   btn.className = "btn btn-ghost upload-queue-item-action upload-queue-item-reveal";
   btn.type = "button";
@@ -14711,6 +14793,35 @@ async function retryUploadItem(id: string): Promise<void> {
   runUploadProcessor();
 }
 
+/**
+ * Say when the queue is longer than what will survive a restart.
+ *
+ * The snapshot is silently cut to ``uploadQueueMaxPersistedItems`` on
+ * the way out, so items past that point — transcripts included —
+ * disappear at the next launch with no warning. History states exactly
+ * this kind of fact rather than hiding it (``windowStatusText``: "a
+ * silently truncated list reads as data loss").
+ */
+function renderUploadPersistenceNote(): void {
+  const pane = document.getElementById("uploadQueuePane");
+  if (!pane) return;
+  const limit = uploadQueueMaxPersistedItems;
+  const total = uploadQueue.length;
+  let node = pane.querySelector<HTMLElement>(".upload-queue-persistence");
+  if (!Number.isFinite(limit) || total <= limit) {
+    node?.remove();
+    return;
+  }
+  const text = `Only the newest ${limit} of ${total} are saved for the next launch.`;
+  if (!node) {
+    node = document.createElement("div");
+    node.className = "upload-queue-persistence hint";
+    node.setAttribute("role", "status");
+    pane.insertBefore(node, pane.querySelector(".upload-queue-list"));
+  }
+  if (node.textContent !== text) node.textContent = text;
+}
+
 function renderUploadQueue(): void {
   const list = document.getElementById("uploadQueueList") as HTMLUListElement | null;
   const empty = document.getElementById("uploadEmptyState");
@@ -14721,6 +14832,7 @@ function renderUploadQueue(): void {
   const visibleItems = uploadHideFinished
     ? uploadQueue.filter((it) => !isUploadPastItem(it))
     : uploadQueue;
+  renderUploadPersistenceNote();
   if (uploadQueue.length === 0) {
     // The result pane is rendered at the END of this function, and this
     // branch returns before it — so after "Clear done" emptied the queue
@@ -14733,6 +14845,9 @@ function renderUploadQueue(): void {
     // re-assign the title and an innerHTML sub-line on every render,
     // which was the second copy of both strings.
     empty.hidden = false;
+    // Restore the default copy: the "Past queues hidden" branch below
+    // writes over these same two nodes.
+    applyStaticUiCopy(document);
     clearBtn.hidden = true;
     if (hideBtn) hideBtn.hidden = true;
     if (titleEl) titleEl.textContent = "Queue";
@@ -14754,9 +14869,10 @@ function renderUploadQueue(): void {
   if (visibleItems.length === 0) {
     const emptyTitle = empty.querySelector(".upload-empty-state-title");
     const emptySub = empty.querySelector(".upload-empty-state-sub");
-    if (emptyTitle) emptyTitle.textContent = "Past queues hidden";
-    if (emptySub) emptySub.textContent = "Use Show past to reveal completed queue items.";
+    if (emptyTitle) emptyTitle.textContent = UI_COPY.upload.hiddenPastTitle;
+    if (emptySub) emptySub.textContent = UI_COPY.upload.hiddenPastSub;
   }
+  renderUploadPersistenceNote();
   // Clear + rebuild. Queue length is bounded by user clicks (rarely
   // > 50); full re-render is fine and avoids stale-DOM state issues
   // (per-item refs, status class drift across status transitions).
@@ -14998,7 +15114,7 @@ function renderUploadResultPane(): void {
     }
     if (revealBtn) {
       const target = uploadRevealTarget(item);
-      revealBtn.hidden = !target;
+      revealBtn.hidden = !target || !hostCanRevealFiles();
       revealBtn.onclick = () => {
         revealUploadItem(item);
       };
