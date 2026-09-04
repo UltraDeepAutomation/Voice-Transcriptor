@@ -8577,6 +8577,7 @@ function releaseWarmCapture(reason: string): void {
   try { held.workletNode.disconnect(); } catch { /* already disconnected */ }
   try { held.src.disconnect(); } catch { /* already disconnected */ }
   try { held.stream.getTracks().forEach((t) => t.stop()); } catch { /* already stopped */ }
+  if (micTrackWatchersStream === held.stream) micTrackWatchersStream = null;
   void held.ac.close().catch(() => { /* already closing — nothing to release */ });
   console.log(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);
 }
@@ -8611,6 +8612,17 @@ function holdWarmCapture(): { hold: boolean; reason: string; deviceLabel: string
   if (!heldAc || !heldStream || !heldSrc || !heldNode) {
     return { hold: false, reason: "incomplete-graph", deviceLabel };
   }
+  // Per-session edges come off HERE, while ``src`` is still in the
+  // module slot: the teardown steps that follow all read that slot, and
+  // this function is about to empty it. The analyser and the pre-armed
+  // ScriptProcessor belong to the recording that is ending — left
+  // connected they would accumulate one dead node per warm session on a
+  // source node that now outlives them all. The worklet edge is the one
+  // that stays: it is what keeps filling the pre-roll ring.
+  if (analyser) {
+    try { heldSrc.disconnect(analyser); } catch { /* never connected */ }
+  }
+  teardownScriptProcessorCapture();
   try {
     heldNode.port.postMessage({ type: "arm", preRollMs: UI_TOKENS.capture.preRollMs });
   } catch (e) {
@@ -8697,6 +8709,57 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") releaseWarmCapture("window-hidden");
 });
 window.addEventListener("pagehide", () => releaseWarmCapture("pagehide"));
+
+/**
+ * The stream this session's device watchers are already attached to.
+ *
+ * A warm start hands the SAME ``MediaStream`` — and the same tracks — to
+ * the next recording, so attaching per session would stack one pair of
+ * mute/unmute listeners per press onto a track that now lives for as
+ * long as the hold chain does. The watchers are therefore attached once
+ * per stream and read the live session state when they fire, rather than
+ * closing over the token of the session that installed them.
+ */
+let micTrackWatchersStream: MediaStream | null = null;
+
+/**
+ * Watch the capture device for the failures that make a recording
+ * silently worthless.
+ *
+ * Device disconnect mid-recording: when AirPods/USB mic disconnect, the
+ * audio track fires ``ended`` but nothing used to listen. The recording
+ * continued in silence until the user pressed Stop, and the transcript
+ * was missing everything after the disconnect. Auto-stopping on
+ * ``ended`` gives a clean transcript up to the disconnect point and a
+ * visible status. ``mute``/``unmute`` are watched for the same reason:
+ * a session where the OS-level input is muted mid-recording (common with
+ * USB headsets / AirPods) would otherwise produce a zero-signal WAV and
+ * a "No speech captured" message that names the wrong cause.
+ */
+function attachMicTrackWatchers(target: MediaStream): void {
+  if (micTrackWatchersStream === target) return;
+  micTrackWatchersStream = target;
+  for (const track of target.getAudioTracks()) {
+    track.addEventListener("ended", () => {
+      if (!isRecording) return;
+      console.warn("Audio track ended (device disconnect) — auto-stopping");
+      micHealth.observe({ kind: "track-ended" });
+      patchCurrentRecordingSummary(
+        { status: "Microphone disconnected. Saving what was captured.", tone: "warning" },
+        activeUiSessionToken,
+      );
+      void stopLive(shouldAutoTranscribe());
+    }, { once: true });
+    track.addEventListener("mute", () => {
+      if (!isRecording) return;
+      micHealth.observe({ kind: "track-muted", muted: true });
+    });
+    track.addEventListener("unmute", () => {
+      if (!isRecording) return;
+      micHealth.observe({ kind: "track-muted", muted: false });
+    });
+  }
+}
 
 /**
  * The capture worklet's single message handler.
@@ -10138,6 +10201,11 @@ async function startLive(): Promise<void> {
       await loadMics(false);
       markStartPhase("loadMics");
       throwIfStartCancelled();
+      // Re-read rather than reuse ``selectedDeviceId``: ``loadMics``
+      // repopulates the picker and can change its value (a device that
+      // disappeared, a default that resolved), and the request has to
+      // carry what the picker says NOW. The warm check above necessarily
+      // runs before that, on what the picker said before.
       const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
       // Bounded and retried — see acquireMicStream. The old code awaited a
       // bare getUserMedia, so a busy input device hung the start outright.
@@ -10162,19 +10230,8 @@ async function startLive(): Promise<void> {
     if (initialTracks.some((t) => t.muted)) {
       micHealth.observe({ kind: "track-muted", muted: true });
     }
-    // Device disconnect mid-recording: when AirPods/USB mic disconnect,
-    // the audio track fires ``ended`` but nothing in the old code
-    // listened for it. The recording would continue in silence until
-    // the user manually pressed Stop — and the transcript would be
-    // missing everything after the disconnect. We now auto-stop on
-    // track ended so the user gets a clean transcript up to the
-    // disconnect point and a visible "Mic disconnected" status.
-    // We also listen for ``mute``/``unmute`` so a session where the
-    // user mutes the OS-level input mid-recording (common with USB
-    // headsets / AirPods) does not silently produce a zero-signal
-    // WAV — the UI flips to a "Mic muted" warning and the post-stop
-    // recovery surfaces the right message instead of "No speech
-    // captured".
+    // Device watchers — see ``attachMicTrackWatchers``. A warm start
+    // finds them already installed on this stream and adds nothing.
     attachMicTrackWatchers(stream);
     if (!warm) {
       // Close whatever still occupies the slot before overwriting it.
@@ -10307,38 +10364,32 @@ async function startLive(): Promise<void> {
     }, Math.max(2000, PIPELINE_FAILSAFE_MS));
 
     let workletCaptureStarted = false;
-    if (ac.audioWorklet && typeof AudioWorkletNode === "function") {
+    if (workletNode) {
+      // Warm start: this node has been connected to the source and
+      // filling its pre-roll ring since the last Stop. Nothing is built
+      // — the module is loaded, the node exists, the edge is live — so
+      // the whole of the ~310 ms §4.7 measured is skipped. The ``start``
+      // message hands the ring over (it arrives ahead of every live
+      // frame, MessagePort order) and switches delivery back on.
+      workletNode.port.onmessage = handleWorkletMessage;
+      workletNode.port.postMessage({ type: "start" });
+      markStartPhase("warmWorkletStart");
+      workletCaptureStarted = true;
+    } else if (sessionAc.audioWorklet && typeof AudioWorkletNode === "function") {
       try {
-        await ac.audioWorklet.addModule(new URL("./pcm-worklet.js", import.meta.url).href);
+        await sessionAc.audioWorklet.addModule(new URL("./pcm-worklet.js", import.meta.url).href);
         markStartPhase("workletModule");
         throwIfStartCancelled();
-        workletNode = new AudioWorkletNode(ac, "pcm-capture-processor", {
+        workletNode = new AudioWorkletNode(sessionAc, "pcm-capture-processor", {
           numberOfInputs: 1,
           numberOfOutputs: 0,
           channelCount: 1,
         });
-
-        workletNode.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-          const msg = ev.data as unknown;
-          if (msg instanceof Float32Array) {
-            // The worklet works. Whatever the pre-armed fallback has
-            // captured is this same audio; committing both would double
-            // every sample, so it goes away here and now (§4.5).
-            disarmPreArmedFallback();
-            pushCapturedFrame(msg);
-            return;
-          }
-          if (msg && typeof msg === "object" && "type" in msg) {
-            const data = msg as { type?: unknown; token?: unknown };
-            if (data.type === "flush-ack") {
-              const token = String(data.token || "");
-              const resolve = pendingWorkletFlushes.get(token);
-              if (resolve) resolve();
-            }
-          }
-        };
-
-        src.connect(workletNode);
+        // One handler for both paths (see ``handleWorkletMessage``): a
+        // cold node delivers from construction and never sends a
+        // pre-roll message, a warm one sends exactly one.
+        workletNode.port.onmessage = handleWorkletMessage;
+        sessionSrc.connect(workletNode);
         markStartPhase("captureConnected");
         workletCaptureStarted = true;
       } catch (e) {
@@ -10349,9 +10400,9 @@ async function startLive(): Promise<void> {
 
     if (!workletCaptureStarted) {
       const fallbackStarted = startScriptProcessorCapture(
-        ac,
-        src,
-        ac.audioWorklet ? "AudioWorklet init failed" : "AudioWorklet API unavailable",
+        sessionAc,
+        sessionSrc,
+        sessionAc.audioWorklet ? "AudioWorklet init failed" : "AudioWorklet API unavailable",
         false,
       );
       markStartPhase("scriptProcessorCapture");
@@ -10363,7 +10414,7 @@ async function startLive(): Promise<void> {
       // fallback alongside it, held back: it captures from now — there
       // is no window in which nothing is capturing — and its own first
       // buffer decides which of the two is the capture path (§4.5).
-      startScriptProcessorCapture(ac, src, "pre-armed alongside AudioWorklet", true);
+      startScriptProcessorCapture(sessionAc, sessionSrc, "pre-armed alongside AudioWorklet", true);
       markStartPhase("scriptProcessorPreArmed");
     }
 
@@ -10936,6 +10987,17 @@ async function stopLive(
       console.warn(`live teardown step failed: ${step}`, e);
     }
   };
+  // §4.7: the graph outlives the recording when it may. This runs
+  // BEFORE the disconnect chain and, on a "yes", empties every module
+  // slot it takes ownership of — so each step below finds a null and
+  // does nothing, and the mic, context and armed worklet stay alive for
+  // the next press. On a "no" nothing moves and the teardown releases
+  // everything exactly as it always did.
+  const warmHold = holdWarmCapture();
+  console.log(
+    `[trace stopLive] warm hold=${warmHold.hold ? 1 : 0} reason=${warmHold.reason} ` +
+    `ttlMs=${UI_TOKENS.capture.warmHoldMs} device="${warmHold.deviceLabel}"`,
+  );
   tearDown("workletNode.disconnect", () => {
     detachWorkletCapture("live teardown");
   });
