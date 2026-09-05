@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The app opened strangely: often no running dot under the Dock icon, a window that showed, hid and showed again at launch, and a window that vanished the moment the recording capsule appeared.** The support log said it plainly — `[main-window] event=show/hide … lastReveal=ensure-window-visible revealProtection=…` eight times inside 200 ms at boot. Nine mechanisms were fighting over the window, each added to fix the previous one's symptom: a reveal single-flight promise, an 80 ms reveal-request timer, a 2.5 s "reveal protection" dwell, an "expected hide" dwell, an app-level un-hide dance, a `shouldRevealMainWindowForActivate` heuristic that weighed four window flags, an auto-hide when the capsule appeared, an auto-hide when a stop was driven from the main process, and a macOS `close` handler that hid the window instead of closing it. All nine are deleted, not disabled. What replaces them is a table in `desktop/window-lifecycle.js` — pure decisions, no Electron — that main.js consults from one function, logging exactly one `[main-window]` line per transition with its reason.
+
+  The behaviour that table encodes is now a stated contract, the same on macOS, Windows and Linux:
+
+  - While the process runs, the Dock shows the running indicator. Regular activation policy, set once, in one place; no accessory mode, no dock hiding, no `LSUIElement`.
+  - Clicking the app — Dock, Finder, `open -a`, tray, a second launch — shows and focuses the window filling the display's work area. Not a macOS full-screen space, which would take the window away from the capsule and from the app being dictated into. Bounds are remembered and restored only once the user has resized or moved the window themselves; dragging it back to full size gives the default back.
+  - The yellow button is a plain native minimise and the app keeps working: hotkeys, capsule, backend. A Dock click restores it.
+  - The red button and `Cmd+W` quit, on every platform. "Closed" means "not running", and the existing `before-quit` path stops the backend child, the capsule and the tray.
+  - Nothing else moves the window. The recording capsule neither hides it, focuses away from it nor reorders it: a `focusable: false` panel shown with `showInactive()`, and the one activate it can still produce on macOS is answered with "do nothing".
+
+  Beyond the 17 tests over the decision table and the saved-bounds clamp, the suite now asserts at the source level what must not come back — no dock hiding, no app- or window-level hide, no reveal or protection crutches, exactly one activation-policy call, `window-all-closed` quitting with no platform branch, no `LSUIElement` in the build config, and every lifecycle event main.js reports being one the table defines (and every event the table defines having a caller). Desktop suite 270 → 287.
+
 ## [1.6.3] - 2026-09-05
 
 The stale-macOS-permission failure, root cause first: the build that installs the app was breaking the permission, and the app could neither say so nor repair it. Suites: desktop 270 (was 256), frontend 375, all green.

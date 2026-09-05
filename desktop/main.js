@@ -16,6 +16,16 @@ const { migrateShortcutPair } = require("./shortcut-migration");
 // tell where the join is — see desktop/linux-wm-class.js.
 const { parseLinuxWmClass } = require("./linux-wm-class");
 const { formatConsoleMirrorLine, createConsoleMirrorLimiter } = require("./renderer-console");
+// SSOT for every main-window transition: what to do on activate, close,
+// minimise, quit, second-instance and capsule-shown, and where the window
+// goes when it is shown. Pure decisions — see desktop/window-lifecycle.js.
+const {
+  WINDOW_LIFECYCLE_EVENTS,
+  WINDOW_LIFECYCLE_ACTIONS,
+  decideWindowAction,
+  decideMainWindowBounds,
+  normalizeStoredWindowState,
+} = require("./window-lifecycle");
 // SSOT for "did this paste attempt actually succeed, and is it verified
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
 // 2026-09-03 §6.1/§6.4/§6.6) — unit-tested by desktop/paste-result.test.js.
@@ -348,24 +358,23 @@ let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
 let mainLogFilePath = "";
 let traceCounter = 0;
-let mainWindowRevealInFlight = null;
-let mainWindowRevealRequestTimer = null;
-// Timestamps of the two ways the user can ask for the window, cleared
-// when focus lands. Their distance to the focus event is the latency the
-// user actually perceives.
-let mainWindowActivateRequestedAt = 0;
-let mainWindowRevealRequestedAt = 0;
-let mainWindowLastShowAt = 0;
-let mainWindowLastHideAt = 0;
-let mainWindowLastRevealReason = "";
-let mainWindowExpectedHideUntil = 0;
-let mainWindowExpectedHideReason = "";
-let mainWindowRevealProtectionUntil = 0;
-let mainWindowRevealProtectionReason = "";
-let macDockPresenceRequested = false;
-let macDockPresenceEnsured = false;
-const MAIN_WINDOW_EXPECTED_HIDE_DWELL_MS = 2500;
-const MAIN_WINDOW_REVEAL_PROTECTION_MS = 2500;
+// When the user last asked for the window, cleared when focus lands. The
+// distance to the focus event is the latency the user actually perceives.
+let mainWindowShowRequestedAt = 0;
+// Saved geometry, and whether the user has earned it. Until the user
+// moves or resizes the window themselves it stays null and the window
+// opens filling the work area — see desktop/window-lifecycle.js.
+let mainWindowStoredState = { userSized: false, bounds: null };
+// The geometry the app itself last wrote, so our own `setBounds` is not
+// mistaken for the user resizing the window.
+let mainWindowLastAppliedBounds = null;
+const MAIN_WINDOW_STATE_FILE = "window-state.json";
+// SSOT for the window's floor. The layout below 1140×700 collapses the
+// transcript column into the settings rail; the numbers are the
+// BrowserWindow's minWidth/minHeight AND the clamp the saved-bounds
+// decision applies before restoring a remembered size.
+const MAIN_WINDOW_MIN_WIDTH = 1140;
+const MAIN_WINDOW_MIN_HEIGHT = 700;
 const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
 const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 
@@ -500,8 +509,7 @@ if (!singleInstanceLock) {
 }
 
 app.on("second-instance", () => {
-  ensureMacDockPresence("second-instance");
-  requestMainWindowReveal("second-instance");
+  applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.secondInstance);
 });
 
 // Rotate main.log when it exceeds this size. Prior code appended
@@ -792,192 +800,264 @@ function traceEnd(ctx, status = "done", details = {}) {
   );
 }
 
-async function ensureWindowVisible(options = {}) {
-  if (mainWindowRevealInFlight) {
-    try {
-      await mainWindowRevealInFlight;
-    } catch { }
-    return;
-  }
-  let promise;
-  promise = ensureWindowVisibleInner(options).finally(() => {
-    if (mainWindowRevealInFlight === promise) {
-      mainWindowRevealInFlight = null;
-    }
-  });
-  mainWindowRevealInFlight = promise;
-  return promise;
-}
-
-async function ensureWindowVisibleInner(options = {}) {
-  const force = !!options.force;
-  const reason = normalizeLifecycleReason(options.reason || "ensure-window-visible");
-  if (!force && recordingStopInFlight) return;
-  ensureMacDockPresence(reason);
-  if (!win || win.isDestroyed()) {
-    await createWindow({ showWindow: true, revealReason: reason });
-    return;
-  }
-  if (backend === null) {
-    await startBackend();
-  }
-  await waitForMainWindowLoadBeforeReveal(reason);
-  await revealMainWindowWhenReady(reason, { forceShow: options.forceShow === true });
-}
+// ── Main-window lifecycle ─────────────────────────────────────────────
+//
+// One entry point. Every show / quit / do-nothing decision comes from
+// desktop/window-lifecycle.js and is executed here; nothing else in this
+// file is allowed to show, hide, focus or reorder the main window.
+//
+// What used to live here — a reveal single-flight promise, an 80 ms
+// reveal-request timer, a "reveal protection" dwell, an "expected hide"
+// dwell, an app-level un-hide dance, a four-flag activate heuristic
+// and a Dock-presence state machine — is gone. Between them they wrote
+// the `[main-window] event=show/hide … lastReveal=ensure-window-visible
+// revealProtection=…` flap the user reported: eight transitions inside
+// 200 ms at boot.
 
 function normalizeLifecycleReason(reason = "") {
   return String(reason || "unknown").trim() || "unknown";
 }
 
-function isMacAppHidden() {
-  if (process.platform !== "darwin" || typeof app.isHidden !== "function") return false;
+function mainWindowSnapshot() {
+  if (!win || win.isDestroyed()) return "window=missing";
   try {
-    return !!app.isHidden();
+    return `visible=${win.isVisible()} focused=${win.isFocused()} minimized=${win.isMinimized()}`;
   } catch {
-    return false;
+    return "window=unreadable";
   }
 }
 
-function mainWindowLifecycleSnapshot() {
-  const parts = [`appHidden=${isMacAppHidden()}`];
-  if (win && !win.isDestroyed()) {
-    parts.push(`visible=${win.isVisible()}`);
-    parts.push(`focused=${win.isFocused()}`);
-    parts.push(`minimized=${win.isMinimized()}`);
-  } else {
-    parts.push("window=missing");
-  }
-  if (mainWindowLastRevealReason) parts.push(`lastReveal=${mainWindowLastRevealReason}`);
-  if (mainWindowLastShowAt) parts.push(`lastShowAgoMs=${Date.now() - mainWindowLastShowAt}`);
-  if (mainWindowLastHideAt) parts.push(`lastHideAgoMs=${Date.now() - mainWindowLastHideAt}`);
-  if (mainWindowExpectedHideUntil > Date.now()) {
-    parts.push(`expectedHide=${mainWindowExpectedHideReason || "unknown"}`);
-  }
-  if (mainWindowRevealProtectionUntil > Date.now()) {
-    parts.push(`revealProtection=${mainWindowRevealProtectionReason || "unknown"}`);
-  }
-  return parts.join(" ");
-}
-
-function markMainWindowExpectedHide(reason = "") {
-  mainWindowExpectedHideReason = normalizeLifecycleReason(reason);
-  mainWindowExpectedHideUntil = Date.now() + MAIN_WINDOW_EXPECTED_HIDE_DWELL_MS;
-}
-
-function markMainWindowRevealProtection(reason = "") {
-  mainWindowRevealProtectionReason = normalizeLifecycleReason(reason);
-  mainWindowRevealProtectionUntil = Date.now() + MAIN_WINDOW_REVEAL_PROTECTION_MS;
-}
-
-function showMacAppForWindowReveal(reason = "") {
-  if (process.platform !== "darwin") return false;
-  const label = normalizeLifecycleReason(reason);
-  if (!isMacAppHidden()) return false;
-  try {
-    app.show();
-    appendMainLog(`[main-window-reveal] app-show reason=${label}`);
-    return true;
-  } catch (e) {
-    appendMainLog(`[main-window-reveal] app-show failed reason=${label}: ${e?.message || e}`);
-    return false;
-  }
-}
-
-function requestMainWindowReveal(reason = "", options = {}) {
-  const label = normalizeLifecycleReason(reason || options.reason || "user-request");
-  const delayMs = process.platform === "darwin" ? 80 : 0;
-  if (mainWindowRevealRequestTimer) {
-    clearTimeout(mainWindowRevealRequestTimer);
-    mainWindowRevealRequestTimer = null;
-  }
-  mainWindowRevealRequestedAt = Date.now();
-  appendMainLog(`[main-window-reveal-request] reason=${label} ${mainWindowLifecycleSnapshot()}`);
-  mainWindowRevealRequestTimer = setTimeout(() => {
-    mainWindowRevealRequestTimer = null;
-    if (isQuitting) return;
-    ensureWindowVisible({
-      manual: options.manual !== false,
-      force: options.force !== false,
-      reason: label,
-    }).catch((e) => {
-      appendMainLog(`[main-window-reveal-request] failed reason=${label}: ${e?.message || e}`);
-    });
-  }, delayMs);
-  try { mainWindowRevealRequestTimer.unref?.(); } catch { }
-}
-
-function hideMainWindow(reason = "") {
-  if (!win || win.isDestroyed() || !win.isVisible()) return false;
-  const label = normalizeLifecycleReason(reason);
-  try {
-    markMainWindowExpectedHide(label);
-    mainWindowLastHideAt = Date.now();
-    win.hide();
-    appendMainLog(`[main-window-hide] reason=${label}`);
-    return true;
-  } catch (e) {
-    appendMainLog(`[main-window-hide] failed reason=${label}: ${e?.message || e}`);
-    return false;
-  }
-}
-
-function shouldRevealMainWindowForActivate(hasVisibleWindows = false) {
-  if (isQuitting) return false;
-  if (!win || win.isDestroyed()) return true;
-  try {
-    if (win.isMinimized()) return true;
-    if (!win.isVisible()) return true;
-    // Visible is not the same as frontmost. A window can be on screen
-    // and behind another application, and "activate" is the user
-    // explicitly asking for this app — so an unfocused window is a
-    // reveal even though every other test says it is already showing.
-    //
-    // Rare, and measured rather than assumed: across 157 activates that
-    // skipped the reveal, 156 were already focused and the skip was
-    // right. This closes the one that was not, and cannot affect the
-    // other 156.
-    if (!win.isFocused()) return true;
-  } catch {
-    return true;
-  }
-  if (isMacAppHidden()) return true;
-  if (!hasVisibleWindows) return true;
-  return false;
-}
-
-function ensureMacDockPresence(reason = "") {
+/**
+ * Rule 1: while the process runs, the Dock shows the running indicator.
+ *
+ * `regular` is the policy a bundled app with no `LSUIElement` already
+ * starts in. Setting it once, explicitly, is this file's standing
+ * assertion that nothing here ever moves to `accessory` — and there is
+ * deliberately no dock-hiding call anywhere in the app to match it.
+ */
+function applyMacDockPolicy() {
   if (process.platform !== "darwin") return;
-  const label = String(reason || "unknown").trim() || "unknown";
-  if (macDockPresenceEnsured || macDockPresenceRequested) return;
-  macDockPresenceRequested = true;
   try {
     app.setActivationPolicy("regular");
+    appendMainLog("[main-window] dock=regular");
   } catch (e) {
-    macDockPresenceRequested = false;
-    appendMainLog(`[dock] activation-policy failed reason=${label}: ${e?.message || e}`);
+    appendMainLog(`[main-window] dock policy failed: ${e?.message || e}`);
+  }
+}
+
+function mainWindowStatePath() {
+  const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+  return path.join(dataDir, MAIN_WINDOW_STATE_FILE);
+}
+
+function loadMainWindowState() {
+  try {
+    mainWindowStoredState = normalizeStoredWindowState(
+      JSON.parse(fs.readFileSync(mainWindowStatePath(), "utf8")),
+    );
+  } catch {
+    // No file, a truncated write, or a hand-edit. All of them mean the
+    // same thing: open maximised.
+    mainWindowStoredState = { userSized: false, bounds: null };
+  }
+  return mainWindowStoredState;
+}
+
+function saveMainWindowState(reason) {
+  const file = mainWindowStatePath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(mainWindowStoredState), "utf8");
+  } catch (e) {
+    appendMainLog(`[main-window] bounds save failed reason=${reason}: ${e?.message || e}`);
+  }
+}
+
+function sameWindowRect(a, b) {
+  return !!a && !!b
+    && a.x === b.x && a.y === b.y
+    && a.width === b.width && a.height === b.height;
+}
+
+/**
+ * The user dragged or resized the window, so from now on the app opens
+ * where they left it instead of filling the work area.
+ *
+ * The app's own `setBounds` also raises `resized`/`moved` on some
+ * platforms, so the guard is the geometry itself rather than a timer:
+ * bounds identical to the ones we just applied are ours, not theirs.
+ */
+function noteMainWindowUserGeometry(kind) {
+  if (!win || win.isDestroyed()) return;
+  let bounds;
+  try {
+    bounds = win.getBounds();
+  } catch {
     return;
   }
-  if (!app.dock) return;
+  if (sameWindowRect(bounds, mainWindowLastAppliedBounds)) return;
+  // Filling the work area IS the default, so a window dragged or zoomed
+  // back to it gives up its remembered geometry instead of pinning the
+  // default as if it were a choice. It also absorbs the case where the
+  // OS rounds our own `setBounds` by a pixel.
+  let workArea = null;
   try {
-    const result = app.dock.show();
-    if (result && typeof result.catch === "function") {
-      result
-        .then(() => {
-          macDockPresenceEnsured = true;
-          appendMainLog(`[dock] presence ensured reason=${label}`);
-        })
-        .catch((e) => {
-          macDockPresenceRequested = false;
-          appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
-        });
+    workArea = screen.getDisplayMatching(bounds).workArea;
+  } catch { }
+  if (workArea && sameWindowRect(bounds, workArea)) {
+    if (!mainWindowStoredState.userSized) return;
+    mainWindowStoredState = { userSized: false, bounds: null };
+    saveMainWindowState(kind);
+    appendMainLog(`[main-window] bounds back to default reason=${kind}`);
+    return;
+  }
+  mainWindowStoredState = {
+    userSized: true,
+    bounds: {
+      x: Math.round(bounds.x),
+      y: Math.round(bounds.y),
+      width: Math.round(bounds.width),
+      height: Math.round(bounds.height),
+    },
+  };
+  saveMainWindowState(kind);
+  appendMainLog(
+    `[main-window] bounds remembered reason=${kind} ` +
+    `${mainWindowStoredState.bounds.width}x${mainWindowStoredState.bounds.height}`,
+  );
+}
+
+/**
+ * Rule 2: shown means maximised — the display's work area, which is what
+ * the native zoom button does — unless the user has taken the window's
+ * geometry into their own hands.
+ *
+ * Never `setFullScreen(true)`: a macOS full-screen space would put the
+ * window on its own desktop, away from the recording capsule and from
+ * the app the user is dictating into. A window the user themselves put
+ * into full screen is left exactly as it is.
+ */
+function applyMainWindowBounds(reason) {
+  if (!win || win.isDestroyed()) return;
+  const label = normalizeLifecycleReason(reason);
+  try {
+    if (win.isFullScreen()) return;
+  } catch { }
+  let workArea;
+  try {
+    workArea = screen.getDisplayMatching(win.getBounds()).workArea;
+  } catch {
+    try {
+      workArea = screen.getPrimaryDisplay().workArea;
+    } catch (e) {
+      appendMainLog(`[main-window] work area unavailable reason=${label}: ${e?.message || e}`);
       return;
     }
-    macDockPresenceEnsured = true;
-    appendMainLog(`[dock] presence ensured reason=${label}`);
-  } catch (e) {
-    macDockPresenceRequested = false;
-    appendMainLog(`[dock] show failed reason=${label}: ${e?.message || e}`);
   }
+  let decided;
+  try {
+    decided = decideMainWindowBounds({
+      workArea,
+      savedBounds: mainWindowStoredState.userSized ? mainWindowStoredState.bounds : null,
+      minWidth: MAIN_WINDOW_MIN_WIDTH,
+      minHeight: MAIN_WINDOW_MIN_HEIGHT,
+    });
+  } catch (e) {
+    appendMainLog(`[main-window] bounds decision failed reason=${label}: ${e?.message || e}`);
+    return;
+  }
+  try {
+    if (sameWindowRect(win.getBounds(), decided.bounds)) {
+      mainWindowLastAppliedBounds = { ...decided.bounds };
+      return;
+    }
+    mainWindowLastAppliedBounds = { ...decided.bounds };
+    win.setBounds(decided.bounds);
+  } catch (e) {
+    appendMainLog(`[main-window] setBounds failed reason=${label}: ${e?.message || e}`);
+  }
+}
+
+/**
+ * The one place that makes the main window visible. Synchronous, so the
+ * whole transition happens inside a single turn of the event loop and
+ * cannot interleave with another.
+ */
+function presentMainWindow(reason) {
+  if (!win || win.isDestroyed()) return;
+  const label = normalizeLifecycleReason(reason);
+  try {
+    if (win.isMinimized()) win.restore();
+    applyMainWindowBounds(label);
+    if (!win.isVisible()) win.show();
+    // macOS raises the app itself for a Dock click, but a tray click or
+    // a second launch arrives while some other app is frontmost, and
+    // `BrowserWindow.focus()` alone cannot come forward from there.
+    if (process.platform === "darwin") {
+      try { app.focus({ steal: true }); } catch { }
+    }
+    win.focus();
+  } catch (e) {
+    appendMainLog(`[main-window] present failed reason=${label}: ${e?.message || e}`);
+  }
+}
+
+async function showMainWindow(reason) {
+  const label = normalizeLifecycleReason(reason);
+  if (!win || win.isDestroyed()) {
+    await createWindow({ showWindow: true, revealReason: label });
+    return;
+  }
+  if (backend === null) {
+    await startBackend();
+  }
+  // The window exists but its first load may still be in flight (the app
+  // shows nothing until the backend answers /api/health). Showing a blank
+  // frame and then repainting it is the flash this waits out — it is a
+  // one-shot on the initial load, not a retry loop.
+  await waitForMainWindowInitialLoad(label);
+  presentMainWindow(label);
+}
+
+/**
+ * Report a lifecycle event and carry out whatever the table says.
+ * Exactly one `[main-window]` line per transition, carrying the reason.
+ *
+ * @param {string} event one of WINDOW_LIFECYCLE_EVENTS
+ * @param {{capsuleInteraction?: boolean}} [context]
+ */
+function applyWindowLifecycleEvent(event, context = {}) {
+  const decision = decideWindowAction(event, {
+    quitting: isQuitting,
+    capsuleInteraction: context.capsuleInteraction === true,
+  });
+  appendMainLog(
+    `[main-window] event=${event} action=${decision.action} ` +
+    `reason=${decision.reason} ${mainWindowSnapshot()}`,
+  );
+  if (decision.action === WINDOW_LIFECYCLE_ACTIONS.show) {
+    mainWindowShowRequestedAt = Date.now();
+    return showMainWindow(decision.reason).catch((e) => {
+      appendMainLog(`[main-window] show failed reason=${decision.reason}: ${e?.message || e}`);
+    });
+  }
+  if (decision.action === WINDOW_LIFECYCLE_ACTIONS.quit) {
+    quitApp(decision.reason);
+  }
+  return Promise.resolve();
+}
+
+/**
+ * The one call site that asks Electron to start a normal shutdown.
+ * `before-quit` (registered once, below) does the actual teardown —
+ * this only starts it, so there is exactly one place in the app that
+ * decides "we are quitting now": the lifecycle table's `quit` action
+ * above, and the paste-capability self-heal relaunch below, both go
+ * through here instead of each calling `app.quit()` on its own.
+ */
+function quitApp(reason = "") {
+  appendMainLog(`[main-window] quit requested reason=${normalizeLifecycleReason(reason)}`);
+  app.quit();
 }
 
 function getRepoRoot() {
@@ -1866,7 +1946,9 @@ async function ensureRecordingStatusCapsuleWindow() {
     }
     if (raw === "__recording_capsule_stop__") {
       recordingStopInFlight = true;
-      hideMainWindow("recording-capsule-stop");
+      // The capsule stops the recording. It does NOT touch the main
+      // window — it used to hide it here, which is how pressing stop
+      // could make the app vanish.
       guardedStopFromRecordingStatus("capsule-click");
       return;
     }
@@ -1950,7 +2032,14 @@ async function updateRecordingStatusCapsule(patch = {}) {
       true,
     );
     if (!capsuleWindow.isVisible()) {
+      // `showInactive` on a `focusable: false` window: the capsule
+      // appears without taking focus, without activating the app and
+      // without reordering the main window. The lifecycle table is asked
+      // anyway, so "the capsule appeared" is a transition on the record
+      // and its answer — do nothing to the main window — is stated in
+      // one place rather than assumed here.
       capsuleWindow.showInactive();
+      applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.capsuleShown);
       appendMainLog(
         `[recording-capsule] visible status="${status}" ms=${Date.now() - requestedAt} ` +
         `create=${recordingStatusCapsuleLastCreateMs}ms`,
@@ -2253,6 +2342,10 @@ async function isRendererRecording() {
 
 async function ensureBackgroundWindow() {
   if (win && !win.isDestroyed() && win.webContents) return;
+  // Losing the window now means the app is on its way out (rule 4:
+  // closing it quits) or the renderer died. Neither is a moment to build
+  // a new one during teardown.
+  if (isQuitting) return;
   await createWindow({ showWindow: false });
 }
 
@@ -2583,7 +2676,11 @@ function guardedStopFromRecordingStatus(reason) {
 async function stopRecordingFromMainProcess() {
   await ensureBackgroundWindow();
   if (!win || win.isDestroyed() || !win.webContents) return;
-  hideMainWindow("stop-recording-main-process");
+  // Stopping a recording is not a window operation. This used to hide
+  // the main window so the paste target stayed frontmost; the paste
+  // ladder captures and re-activates its target itself
+  // (activateCapturedPasteTarget), so the hide bought nothing and cost
+  // the user their window.
 
   try {
     const snapshot = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
@@ -4161,7 +4258,7 @@ function reportPastePermissionFailure(plan, reason = "") {
         // before-quit handler.
         appendMainLog("[paste-capability] self-heal relaunch requested by user");
         app.relaunch();
-        app.quit();
+        quitApp("self-heal-relaunch");
         return;
       }
       if (plan.service === TCC_SERVICE.AUTOMATION) {
@@ -7865,7 +7962,7 @@ function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
   return promise;
 }
 
-async function waitForMainWindowLoadBeforeReveal(reason = "") {
+async function waitForMainWindowInitialLoad(reason = "") {
   const pending = mainWindowInitialLoadPromise;
   if (!pending) return;
   const label = normalizeLifecycleReason(reason);
@@ -7873,42 +7970,17 @@ async function waitForMainWindowLoadBeforeReveal(reason = "") {
   try {
     await pending;
   } catch (e) {
-    appendMainLog(`[main-window-reveal] pending-load failed reason=${label}: ${e?.message || e}`);
+    appendMainLog(`[main-window] pending-load failed reason=${label}: ${e?.message || e}`);
   }
   const waitedMs = Date.now() - startedAt;
   if (waitedMs > 50) {
-    appendMainLog(`[main-window-reveal] waited-for-load reason=${label} ms=${waitedMs}`);
-  }
-}
-
-async function revealMainWindowWhenReady(reason = "", options = {}) {
-  const label = normalizeLifecycleReason(reason);
-  await waitForMainWindowLoadBeforeReveal(label);
-  if (!win || win.isDestroyed()) return;
-  const forceShow = !!options.forceShow;
-  markMainWindowRevealProtection(label);
-  mainWindowLastRevealReason = label;
-  const appWasHidden = showMacAppForWindowReveal(label);
-  if (win.isMinimized()) {
-    win.restore();
-    appendMainLog(`[main-window-reveal] restored reason=${label}`);
-  }
-  if (forceShow || !win.isVisible()) {
-    win.show();
-    appendMainLog(`[main-window-reveal] shown reason=${label}${forceShow ? " force=1" : ""}`);
-  }
-  if (appWasHidden || !win.isFocused()) {
-    win.focus();
-    appendMainLog(`[main-window-reveal] focused reason=${label} ${mainWindowLifecycleSnapshot()}`);
-  } else {
-    appendMainLog(`[main-window-reveal] already-focused reason=${label} ${mainWindowLifecycleSnapshot()}`);
+    appendMainLog(`[main-window] waited-for-load reason=${label} ms=${waitedMs}`);
   }
 }
 
 async function createWindow(options = {}) {
   const showWindow = options.showWindow !== false;
   const revealReason = normalizeLifecycleReason(options.revealReason || "create-window-loaded");
-  ensureMacDockPresence(showWindow ? "create-window-visible" : "create-window-hidden");
 
   // Idempotency guard: if we already own a live BrowserWindow, reuse
   // it instead of spawning a second one. Creating a second window
@@ -7919,7 +7991,8 @@ async function createWindow(options = {}) {
   // so a future caller cannot silently trip the leak.
   if (win && !win.isDestroyed()) {
     if (showWindow) {
-      await revealMainWindowWhenReady("create-window-existing");
+      await waitForMainWindowInitialLoad("create-window-existing");
+      presentMainWindow("create-window-existing");
     }
     return;
   }
@@ -7932,11 +8005,31 @@ async function createWindow(options = {}) {
   const appIconPath = process.platform === "win32"
     ? path.join(__dirname, "icon.ico")
     : path.join(__dirname, "icon.png");
+  // Rule 2: the window opens filling the work area unless the user has
+  // resized or moved it themselves; `decideMainWindowBounds` is the SSOT
+  // for that, and it runs here so the very first frame is already the
+  // right size — no create-then-resize flash.
+  loadMainWindowState();
+  let initialBounds;
+  try {
+    initialBounds = decideMainWindowBounds({
+      workArea: screen.getPrimaryDisplay().workArea,
+      savedBounds: mainWindowStoredState.userSized ? mainWindowStoredState.bounds : null,
+      minWidth: MAIN_WINDOW_MIN_WIDTH,
+      minHeight: MAIN_WINDOW_MIN_HEIGHT,
+    }).bounds;
+  } catch (e) {
+    appendMainLog(`[main-window] initial bounds unavailable: ${e?.message || e}`);
+    initialBounds = { x: undefined, y: undefined, width: 1420, height: 780 };
+  }
+  mainWindowLastAppliedBounds = Number.isFinite(initialBounds.x) ? { ...initialBounds } : null;
   win = new BrowserWindow({
-    width: 1420,
-    height: 780,
-    minWidth: 1140,
-    minHeight: 700,
+    x: initialBounds.x,
+    y: initialBounds.y,
+    width: initialBounds.width,
+    height: initialBounds.height,
+    minWidth: MAIN_WINDOW_MIN_WIDTH,
+    minHeight: MAIN_WINDOW_MIN_HEIGHT,
     backgroundColor: "#1a1a1a",
     title: "Transcriptor",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
@@ -8509,44 +8602,39 @@ async function createWindow(options = {}) {
     }
   });
 
-  win.on("close", (event) => {
-    // Keep renderer warm on macOS so global-hotkey actions are instant and
-    // don't steal focus by re-creating window each time.
-    if (process.platform === "darwin" && !isQuitting) {
-      event.preventDefault();
-      if (shortcutCaptureAbortHandler) {
-        shortcutCaptureAbortHandler("window-hide");
-      }
-      ensureMacDockPresence("main-window-close-hide");
-      hideMainWindow("macos-close-button");
-      return;
+  win.on("close", () => {
+    // Rule 4, every platform: the red button and Cmd+W mean "not
+    // running". macOS used to preventDefault and hide instead, which is
+    // how the user ended up with an app that was closed and running at
+    // the same time. `before-quit` stops the backend child, the capsule
+    // and the tray.
+    if (shortcutCaptureAbortHandler) {
+      shortcutCaptureAbortHandler("window-close");
     }
+    applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.mainWindowClose);
   });
-  win.on("show", () => {
-    mainWindowLastShowAt = Date.now();
-    appendMainLog(`[main-window] event=show ${mainWindowLifecycleSnapshot()}`);
+  win.on("minimize", () => {
+    // Rule 3: the OS did it and the app keeps running. Recorded so the
+    // log distinguishes "the user minimised" from "something hid it".
+    applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.mainWindowMinimize);
   });
   win.on("hide", () => {
-    mainWindowLastHideAt = Date.now();
-    appendMainLog(`[main-window] event=hide ${mainWindowLifecycleSnapshot()}`);
+    // Nothing in this process hides the main window any more, so a hide
+    // is the user's own Cmd+H / Hide Others. Kept as the canary: if this
+    // line ever appears without one of those, something grew a new
+    // visibility crutch.
+    appendMainLog(`[main-window] event=hide reason=os-initiated ${mainWindowSnapshot()}`);
   });
   win.on("focus", () => {
     // How long the user waited between asking for the app and having it.
     // "The window does not come forward immediately" was a report with
-    // nothing in the log to confirm or refute it: activate and focus
-    // were both recorded, but the interval between them never was, so
-    // there was no way to tell app latency from reaction time.
-    const askedAt = Math.max(mainWindowActivateRequestedAt, mainWindowRevealRequestedAt);
-    const waitedMs = askedAt > 0 ? Date.now() - askedAt : -1;
-    mainWindowActivateRequestedAt = 0;
-    mainWindowRevealRequestedAt = 0;
-    appendMainLog(
-      `[main-window] event=focus waited_ms=${waitedMs} ${mainWindowLifecycleSnapshot()}`,
-    );
+    // nothing in the log to confirm or refute it.
+    const waitedMs = mainWindowShowRequestedAt > 0 ? Date.now() - mainWindowShowRequestedAt : -1;
+    mainWindowShowRequestedAt = 0;
+    appendMainLog(`[main-window] event=focus waited_ms=${waitedMs} ${mainWindowSnapshot()}`);
   });
-  win.on("blur", () => {
-    appendMainLog(`[main-window] event=blur ${mainWindowLifecycleSnapshot()}`);
-  });
+  win.on("resized", () => noteMainWindowUserGeometry("resized"));
+  win.on("moved", () => noteMainWindowUserGeometry("moved"));
 
   win.on("closed", () => {
     // Drop webContents listeners explicitly before releasing the ref
@@ -8621,7 +8709,7 @@ async function createWindow(options = {}) {
     // very first time the user sees a window — no transition flash,
     // no "starting up" UI, just the ready app.
     if (showWindow) {
-      await revealMainWindowWhenReady(revealReason);
+      presentMainWindow(revealReason);
     }
   } catch (err) {
     const stderrTail = (backendStderrTail || "").trim();
@@ -8698,7 +8786,7 @@ async function createWindow(options = {}) {
     `)}`
     );
     if (showWindow && win && !win.isDestroyed()) {
-      await revealMainWindowWhenReady("create-window-error");
+      presentMainWindow("create-window-error");
     }
     let recoveryAttempt = 0;
     const updateRecoveryStatus = async (text, healthy = false) => {
@@ -8749,11 +8837,8 @@ async function createWindow(options = {}) {
 }
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
-  } else {
-    ensureMacDockPresence("window-all-closed");
-  }
+  // Every platform, macOS included. "Closed" means "not running".
+  applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.allWindowsClosed);
 });
 
 // Focus regain is the moment the user comes back from System Settings,
@@ -8764,30 +8849,14 @@ app.on("browser-window-focus", () => {
   ensurePasteCapabilityFresh("focus").catch(() => { });
 });
 
-app.on("activate", (_event, hasVisibleWindows) => {
-  mainWindowActivateRequestedAt = Date.now();
-  ensureMacDockPresence("activate");
-  const shouldReveal = shouldRevealMainWindowForActivate(!!hasVisibleWindows);
-  appendMainLog(`[app-activate] hasVisibleWindows=${!!hasVisibleWindows} shouldReveal=${shouldReveal ? 1 : 0} ${mainWindowLifecycleSnapshot()}`);
-  if (shouldSuppressActivateForRecordingStatusCapsule()) {
-    appendMainLog("[recording-capsule] suppressed main-window activate from capsule interaction");
-    return;
-  }
-  if (!shouldReveal) {
-    appendMainLog(`[app-activate] native-visible-window-kept ${mainWindowLifecycleSnapshot()}`);
-    return;
-  }
-  requestMainWindowReveal("app-activate");
+app.on("activate", () => {
+  // Rule 2. No `hasVisibleWindows` heuristic and no four-flag inspection:
+  // an activate is the user asking for the window, and the answer is
+  // always the same one.
+  applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.appActivate, {
+    capsuleInteraction: shouldSuppressActivateForRecordingStatusCapsule(),
+  });
 });
-
-if (process.platform === "darwin") {
-  app.on("hide", () => {
-    appendMainLog(`[app-hide] ${mainWindowLifecycleSnapshot()}`);
-  });
-  app.on("show", () => {
-    appendMainLog(`[app-show] ${mainWindowLifecycleSnapshot()}`);
-  });
-}
 
 /**
  * Robust backend termination — used from every exit path so the
@@ -8955,10 +9024,6 @@ app.on("before-quit", () => {
   if (renderRecoveryTimer) {
     clearTimeout(renderRecoveryTimer);
     renderRecoveryTimer = null;
-  }
-  if (mainWindowRevealRequestTimer) {
-    clearTimeout(mainWindowRevealRequestTimer);
-    mainWindowRevealRequestTimer = null;
   }
   // Same reasoning: a capsule teardown scheduled seconds before quit
   // must not fire against a window Electron is already tearing down.
@@ -9146,9 +9211,8 @@ app.whenReady().then(async () => {
   });
 
   lastTranscriptText = loadLastTranscriptFromDisk();
-  if (process.platform === "darwin") {
-    ensureMacDockPresence("ready");
-  }
+  // The one and only Dock statement of the whole process.
+  applyMacDockPolicy();
   // macOS-only: read Accessibility permission once at boot. Users who
   // recorded successfully, then revoked the permission via System
   // Settings, would otherwise see the hotkey become a silent no-op —
@@ -9235,7 +9299,7 @@ app.whenReady().then(async () => {
     {
       label: "Open Transcriptor",
       click: () => {
-        requestMainWindowReveal("tray-menu-open");
+        applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.trayOpen);
       }
     },
     { type: "separator" },
@@ -9245,7 +9309,7 @@ app.whenReady().then(async () => {
     }
   ]);
   tray.on("click", () => {
-    requestMainWindowReveal("tray-click");
+    applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.trayOpen);
   });
   tray.on("right-click", () => {
     tray?.popUpContextMenu(trayMenu);
@@ -9602,7 +9666,7 @@ app.whenReady().then(async () => {
   // actually needs them.
   refreshMacAccessibilityTrustState();
   await startBackend();
-  await ensureWindowVisible();
+  await applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.startup);
 }).catch((err) => {
   // The whenReady chain has many awaits — startBackend, permission
   // probes, accessibility checks, and any one of

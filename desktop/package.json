@@ -60,6 +60,7 @@
       "shortcut-migration.js",
       "linux-wm-class.js",
       "python-version.js",
+      "window-lifecycle.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",
