@@ -668,7 +668,13 @@ declare global {
      * grant was invisible until a dictation silently went nowhere.
      */
     __transcriptorPasteCapability?: {
-      getStatus: () => Promise<{ state: string; title: string; fix: string }>;
+      getStatus: () => Promise<{ state: string; title: string; fix: string; repairable?: boolean }>;
+      /**
+       * Drop the stale TCC row and re-probe (main runs `tccutil reset`
+       * for both services and answers with the new state). Offered only
+       * while ``repairable`` is true.
+       */
+      repair: () => Promise<{ ok?: boolean; status?: string; state?: string; title?: string; fix?: string }>;
     };
     /**
      * Recording-output bridge (Electron preload → main). Absent in
@@ -3599,6 +3605,7 @@ function setSettingsArchiveStatus(message: string, tone: UiTone = "neutral"): vo
  */
 async function refreshPasteCapabilityNote(): Promise<void> {
   const el = document.getElementById("pasteCapabilityNote");
+  const button = document.getElementById("pasteCapabilityRepair") as HTMLButtonElement | null;
   if (!el) return;
   try {
     const status = await window.__transcriptorPasteCapability?.getStatus();
@@ -3606,8 +3613,46 @@ async function refreshPasteCapabilityNote(): Promise<void> {
     const title = String(status?.title || "").trim();
     el.textContent = fix ? `${title} ${fix}` : "";
     el.hidden = !fix;
+    if (button) {
+      // Offered only when there is a TCC row to drop: a bundle replaced
+      // under the running process is repaired by a relaunch, which the
+      // note already says.
+      button.hidden = !fix || !status?.repairable;
+      button.disabled = false;
+    }
   } catch (e) {
     console.debug("paste-capability status unavailable", e);
+  }
+}
+
+/**
+ * "Repair permissions": ask main to drop the stale TCC grant so macOS
+ * asks again. Everything about WHICH services and HOW lives in the main
+ * process (desktop/paste-capability.js); this reports the outcome and
+ * re-reads the note, which is the same status the button was shown by.
+ */
+async function repairPastePermissions(): Promise<void> {
+  const button = document.getElementById("pasteCapabilityRepair") as HTMLButtonElement | null;
+  const el = document.getElementById("pasteCapabilityNote");
+  if (!button || !window.__transcriptorPasteCapability?.repair) return;
+  button.disabled = true;
+  const previousLabel = button.textContent;
+  button.textContent = "Repairing…";
+  let repaired = false;
+  try {
+    const result = await window.__transcriptorPasteCapability.repair();
+    repaired = !!result?.ok;
+  } catch (e) {
+    console.debug("paste-capability repair failed", e);
+  }
+  button.textContent = previousLabel || "Repair permissions";
+  button.disabled = false;
+  // The note is re-read first, so what the user ends up looking at is
+  // the state main just measured — not a claim this function made.
+  await refreshPasteCapabilityNote();
+  if (repaired && el && el.hidden) {
+    el.textContent = "Permissions repaired. macOS will ask again the next time Transcriptor pastes.";
+    el.hidden = false;
   }
 }
 
@@ -13424,6 +13469,9 @@ void refreshNetworkState();
 // is never more than one focus away from what main already knows.
 void refreshPasteCapabilityNote();
 window.addEventListener("focus", () => { void refreshPasteCapabilityNote(); });
+document
+  .getElementById("pasteCapabilityRepair")
+  ?.addEventListener("click", () => { void repairPastePermissions(); });
 // Network-state poll. The Online/Offline pill lives in the topbar, so
 // this runs on every view — but not while the window is hidden: the
 // /api/network probe plus the /api/health round-trip is wasted work

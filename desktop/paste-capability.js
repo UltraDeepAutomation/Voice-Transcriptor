@@ -236,7 +236,12 @@ function classifyPastePermissionFailure(reason) {
     r.includes("not authorized") ||
     r.includes("not permitted") ||
     r.includes("system events got an error") ||
-    r.includes("-1743")
+    r.includes("-1743") ||
+    // Our own vocabulary for "macOS refused the Apple Event", so a state
+    // this module produced (applyPasteOutcome's `paste-denied-automation`)
+    // routes through the same classifier as the macOS text that caused it
+    // and cannot be sent to the wrong Privacy pane on the way back out.
+    r.includes("automation")
   ) {
     return PASTE_PERMISSION_ROUTE.AUTOMATION;
   }
@@ -264,6 +269,17 @@ function applyPasteOutcome(prev, outcome = {}) {
   if (outcome.ok) return transition(base, PASTE_CAPABILITY.ACTIVE, "paste-succeeded", at);
   const kind = classifyPasteFailure(outcome.reason);
   if (kind === "permission") {
+    // WHICH permission was refused decides which state this is, because
+    // the two states mean different things to the user. `untrusted` is
+    // "nothing was ever granted — go and grant it". An Automation
+    // refusal (-1743) is the opposite: System Settings shows the row as
+    // ON and macOS still refuses, which is `broken` — the stale grant
+    // this module exists for. Collapsing both into `untrusted` is what
+    // told a user whose Automation row was already on to go and switch
+    // on a permission that was on (main.log 2026-09-05T11:00:00Z).
+    if (classifyPastePermissionFailure(outcome.reason) === PASTE_PERMISSION_ROUTE.AUTOMATION) {
+      return transition(base, PASTE_CAPABILITY.BROKEN, "paste-denied-automation", at);
+    }
     return transition(base, PASTE_CAPABILITY.UNTRUSTED, "paste-denied", at);
   }
   if (kind === "silent") {
@@ -322,26 +338,346 @@ function mustProbeBeforePaste(cap) {
   return !shouldAttemptPaste(cap);
 }
 
+// ── Repairing a grant macOS believes it has already given ──────────────
+//
+// The state machine above can SEE a dead grant. This section decides
+// what to do about one, because "tell the user to switch on a permission
+// that is already switched on" is not a remedy.
+//
+// Two different diseases produce the identical symptom — the app is
+// listed and ON in Privacy & Security, and macOS refuses anyway:
+//
+//  1. STALE csreq. TCC stores a grant against a bundle id AND the code
+//     signing requirement the app satisfied when the grant was made. A
+//     rebuild under a different certificate (or an ad-hoc signature)
+//     leaves the row visible and matching nothing. The remedy is to drop
+//     the row so macOS asks again: `tccutil reset <service> <bundle id>`,
+//     which needs no admin for the user's own TCC store.
+//
+//  2. The RUNNING COPY is no longer the copy on disk. Installing a new
+//     build over /Applications/Transcriptor.app while the old one runs
+//     replaces the bundle under a live process; from that moment macOS
+//     stops validating that process's identity and every Apple Event it
+//     sends comes back errAEEventNotPermitted (-1743). This is what
+//     main.log recorded on 2026-09-05: the bundle was re-signed at
+//     10:56Z, the process that had been running since 2026-09-04T22:47Z
+//     probed OK at 10:58:53Z, then failed every Apple Event from
+//     10:59:59Z on — and the very next launch of the very same bundle
+//     probed `active` again at 11:00:51Z.
+//
+// Telling those apart matters, because a reset is the WRONG move for the
+// second one: the grant on file is valid for the copy on disk, the
+// running process cannot be rescued by any TCC change, and resetting
+// would throw away a working grant to no purpose. Only a relaunch fixes
+// it. Which is why `detectBundleReplacement` is consulted first.
+//
+// Everything here stays pure — which service, whether to reset, whether
+// this boot has already tried, what to say — and desktop/main.js runs
+// the one shell command behind `permissionRepairCommand`.
+
 /**
- * The user-facing half. `fix` is the literal sequence of clicks that
- * repairs the state — for `broken` that is remove-and-re-add, because a
- * stale row cannot be repaired by toggling it.
+ * The macOS TCC services the paste path depends on, under the names
+ * `tccutil` knows them by. `AppleEvents` is the service System Settings
+ * presents as "Automation"; there is no `tccutil` service called
+ * "Automation" and asking for one is a silent no-op.
  */
-function pasteCapabilityMessage(state) {
-  const s = typeof state === "string" ? state : state?.state;
-  if (s === PASTE_CAPABILITY.BROKEN) {
+const TCC_SERVICE = Object.freeze({
+  AUTOMATION: "AppleEvents",
+  ACCESSIBILITY: "Accessibility",
+});
+
+/** Both services, in the order the "Repair permissions" action tries them. */
+const PERMISSION_REPAIR_SERVICES = Object.freeze([
+  TCC_SERVICE.ACCESSIBILITY,
+  TCC_SERVICE.AUTOMATION,
+]);
+
+/** What to DO about a permission failure. One verb per outcome. */
+const PERMISSION_REPAIR = Object.freeze({
+  /** Nothing this module can repair — or nothing left to try this boot. */
+  NONE: "none",
+  /** Drop the grant so macOS asks again: `tccutil reset <service> <id>`. */
+  RESET: "reset",
+  /** The running copy is not the copy on disk; only a restart fixes it. */
+  RELAUNCH: "relaunch",
+  /** Say it, once, with the pane and the exact clicks. */
+  REPORT: "report",
+});
+
+/** `tccutil` is a local database write; a second is already suspicious. */
+const TCC_RESET_TIMEOUT_MS = 5000;
+
+/**
+ * Slack between "the bundle was written" and "the process started"
+ * before a rewrite counts as having happened UNDER the running process.
+ * An install writes the bundle and launches it seconds later, so the
+ * normal case is a negative difference; this only guards the boundary.
+ */
+const BUNDLE_REPLACEMENT_TOLERANCE_MS = 2000;
+
+/**
+ * Was the app bundle replaced while this process was running?
+ *
+ * Two independent witnesses, either of which is conclusive:
+ *   - the version in the bundle's Info.plist is not the version this
+ *     process is running (a new build was installed over it), and
+ *   - the executable on disk was written after this process started.
+ *
+ * @returns {{replaced: boolean, evidence: string}}
+ */
+function detectBundleReplacement({
+  runningVersion = "",
+  bundleVersion = "",
+  bundleMtimeMs = 0,
+  processStartedAtMs = 0,
+  toleranceMs = BUNDLE_REPLACEMENT_TOLERANCE_MS,
+} = {}) {
+  const running = String(runningVersion || "").trim();
+  const onDisk = String(bundleVersion || "").trim();
+  if (running && onDisk && running !== onDisk) {
+    return { replaced: true, evidence: `version-mismatch:running=${running},disk=${onDisk}` };
+  }
+  const mtime = Number(bundleMtimeMs) || 0;
+  const started = Number(processStartedAtMs) || 0;
+  const tolerance = Math.max(0, Number(toleranceMs) || 0);
+  if (mtime > 0 && started > 0 && mtime - started > tolerance) {
     return {
-      title: "Auto-paste is blocked by a stale Accessibility permission",
-      fix: "System Settings → Privacy & Security → Accessibility: remove and re-add Transcriptor.",
+      replaced: true,
+      evidence: `rewritten-after-launch:+${Math.round((mtime - started) / 1000)}s`,
     };
   }
+  return { replaced: false, evidence: "" };
+}
+
+/**
+ * Which TCC service a failure text is about — the SAME classifier the
+ * dialog and the status line use, mapped onto `tccutil`'s vocabulary.
+ * Empty when the text names no permission.
+ */
+function tccServiceForPasteFailure(reason) {
+  const route = classifyPastePermissionFailure(reason);
+  if (route === PASTE_PERMISSION_ROUTE.AUTOMATION) return TCC_SERVICE.AUTOMATION;
+  if (route === PASTE_PERMISSION_ROUTE.ACCESSIBILITY) return TCC_SERVICE.ACCESSIBILITY;
+  return "";
+}
+
+/**
+ * The most specific failure text available.
+ *
+ * When the capability preflight refuses a paste, the ladder's reason is
+ * `paste-capability-<state>` — which says the preflight refused and
+ * nothing about WHY. The capability's own reason carries the macOS error
+ * that decided it (`stale-grant:… (-1743)`), and that is the text the
+ * service classifier needs. Preferring it here is what keeps an
+ * Automation refusal from being repaired as an Accessibility one.
+ */
+function preferSpecificFailureReason(ladderReason, capabilityReason) {
+  const ladder = String(ladderReason || "");
+  const capability = String(capabilityReason || "").trim();
+  if (capability && /paste-capability-/i.test(ladder)) return capability;
+  return ladder;
+}
+
+/**
+ * The whole self-heal decision.
+ *
+ * @param {object}  input
+ * @param {string}  input.platform        process.platform
+ * @param {object|string} input.state     capability state (or its name)
+ * @param {string}  input.reason          the most specific failure text
+ * @param {boolean|null} input.trusted    AXIsProcessTrusted, or null
+ * @param {boolean} input.bundleReplaced  detectBundleReplacement().replaced
+ * @param {string[]} input.resetServices  services already reset this boot
+ * @param {boolean} input.reported        has this boot already said it
+ * @returns {{action: string, service: string, why: string}}
+ */
+function planPermissionRepair({
+  platform = "darwin",
+  state = "",
+  reason = "",
+  trusted = null,
+  bundleReplaced = false,
+  resetServices = [],
+  reported = false,
+} = {}) {
+  const none = (why, service = "") => ({ action: PERMISSION_REPAIR.NONE, service, why });
+  if (platform !== "darwin") return none("not-darwin");
+  const capState = typeof state === "string" ? state : state?.state || "";
+  const service = tccServiceForPasteFailure(reason);
+  if (
+    !service &&
+    capState !== PASTE_CAPABILITY.BROKEN &&
+    capState !== PASTE_CAPABILITY.UNTRUSTED
+  ) {
+    return none("not-a-permission-failure");
+  }
+  if (bundleReplaced) {
+    // No TCC change can help a process whose bundle was swapped under
+    // it, and a reset here would drop a grant that is valid for the copy
+    // on disk. Say the one thing that works.
+    if (reported) return none("already-reported", service);
+    return { action: PERMISSION_REPAIR.RELAUNCH, service, why: "bundle-replaced" };
+  }
+  if (trusted === false) {
+    // Nothing was ever granted. Resetting an absent row changes nothing;
+    // the remedy is the system's own permission prompt, which the
+    // ordinary prompt path raises. Not this module's job.
+    return none("not-trusted");
+  }
+  if (!service) {
+    // Broken, trusted, and the failure named no permission — a probe
+    // that timed out, say. That is not evidence of a dead grant, and
+    // resetting on it would revoke a working permission because the
+    // machine was busy. Report it and let the user decide.
+    if (reported) return none("already-reported");
+    return { action: PERMISSION_REPAIR.REPORT, service: "", why: "no-named-service" };
+  }
+  const alreadyReset = new Set((resetServices || []).map((s) => String(s || "")));
+  if (!alreadyReset.has(service)) {
+    return { action: PERMISSION_REPAIR.RESET, service, why: "granted-but-refused" };
+  }
+  // Reset once, still refused: this is no longer something the app can
+  // fix on the user's behalf.
+  if (reported) return none("already-reported", service);
+  return { action: PERMISSION_REPAIR.REPORT, service, why: "reset-did-not-help" };
+}
+
+/**
+ * The one shell command the self-heal runs, built here so no caller can
+ * assemble a different one — and so the bundle id it targets is checked
+ * before it reaches a process argument list. The id comes from the
+ * running bundle (desktop/package.json `build.appId` is its source, see
+ * desktop/packaging.test.js); there is no default and no second literal.
+ */
+function permissionRepairCommand(service, bundleId) {
+  const svc = String(service || "").trim();
+  if (svc !== TCC_SERVICE.AUTOMATION && svc !== TCC_SERVICE.ACCESSIBILITY) {
+    throw new Error(
+      `permissionRepairCommand: unknown TCC service "${svc}" — expected ` +
+        `${TCC_SERVICE.ACCESSIBILITY} or ${TCC_SERVICE.AUTOMATION}.`,
+    );
+  }
+  const id = String(bundleId || "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+    throw new Error(
+      `permissionRepairCommand: refusing to reset TCC for an implausible bundle id "${id}".`,
+    );
+  }
+  return { cmd: "tccutil", args: ["reset", svc, id], timeoutMs: TCC_RESET_TIMEOUT_MS };
+}
+
+/**
+ * The single writer of remediation prose. Both the dialog and the
+ * renderer note read it, so the app cannot name two different fixes for
+ * one failure — which is exactly what it used to do: every `broken`
+ * state, including an Automation refusal, was described as a stale
+ * ACCESSIBILITY row and sent the user to the wrong pane.
+ *
+ * @returns {{title: string, fix: string}}
+ */
+function permissionRepairMessage({ action = "", service = "" } = {}) {
+  if (action === PERMISSION_REPAIR.RELAUNCH) {
+    return {
+      title: "Transcriptor was replaced while it was running",
+      fix:
+        "Quit and reopen Transcriptor. macOS stops trusting a running copy once its " +
+        "files have been replaced by a new build, and no permission change repairs it.",
+    };
+  }
+  if (service === TCC_SERVICE.AUTOMATION) {
+    return {
+      title: "Auto-paste is blocked by a stale Automation permission",
+      fix:
+        "System Settings → Privacy & Security → Automation: switch Transcriptor → " +
+        "System Events off and on again. If it is already on, use Repair permissions " +
+        "in Transcriptor's Settings, then quit and reopen Transcriptor.",
+    };
+  }
+  if (service === TCC_SERVICE.ACCESSIBILITY) {
+    return {
+      title: "Auto-paste is blocked by a stale Accessibility permission",
+      fix:
+        "System Settings → Privacy & Security → Accessibility: remove and re-add " +
+        "Transcriptor. If it is already on, use Repair permissions in Transcriptor's " +
+        "Settings, then quit and reopen Transcriptor.",
+    };
+  }
+  return {
+    title: "Auto-paste could not reach macOS",
+    fix:
+      "Use Repair permissions in Transcriptor's Settings, then quit and reopen " +
+      "Transcriptor. If it keeps happening, check Privacy & Security → Accessibility " +
+      "and → Automation.",
+  };
+}
+
+/**
+ * The user-facing half of a capability verdict. `fix` is the literal
+ * sequence of clicks that repairs the state, routed by the SAME
+ * classifier the self-heal uses — pass the state OBJECT (or a `reason`)
+ * and an Automation refusal is described as one.
+ *
+ * @param {object|string} state
+ * @param {object} [context]
+ * @param {string} [context.reason]          overrides state.reason
+ * @param {boolean} [context.bundleReplaced] the running copy is stale
+ */
+function pasteCapabilityMessage(state, context = {}) {
+  const s = typeof state === "string" ? state : state?.state;
+  if (s !== PASTE_CAPABILITY.BROKEN && s !== PASTE_CAPABILITY.UNTRUSTED) {
+    return { title: "", fix: "" };
+  }
+  if (context.bundleReplaced) {
+    return permissionRepairMessage({ action: PERMISSION_REPAIR.RELAUNCH });
+  }
   if (s === PASTE_CAPABILITY.UNTRUSTED) {
+    // Nothing was ever granted — the only state where "add it and switch
+    // it on" is true.
     return {
       title: "Auto-paste needs Accessibility permission",
       fix: "System Settings → Privacy & Security → Accessibility: add Transcriptor and switch it on.",
     };
   }
-  return { title: "", fix: "" };
+  const reason = context.reason !== undefined
+    ? context.reason
+    : (typeof state === "object" ? state?.reason : "");
+  const service = tccServiceForPasteFailure(reason) || TCC_SERVICE.ACCESSIBILITY;
+  return permissionRepairMessage({ action: PERMISSION_REPAIR.REPORT, service });
+}
+
+// ── Who macOS thinks we are ────────────────────────────────────────────
+//
+// TCC keys every grant by bundle id, so the self-heal has to name one —
+// and naming it twice is how an app ends up resetting a row that belongs
+// to nothing. The authority at runtime is the Info.plist of the bundle
+// actually running (electron-builder writes it from `build.appId` in
+// desktop/package.json, which packaging.test.js holds every other copy
+// to). Parsing it is pure, so it is tested here rather than discovered
+// in production.
+
+/**
+ * Read one string value out of an XML Info.plist.
+ *
+ * Deliberately narrow: `<key>K</key>` followed by `<string>V</string>`.
+ * electron-builder writes XML plists, and this is only ever pointed at
+ * the app's own Info.plist. A binary plist or an unexpected shape
+ * returns "" and the caller falls back rather than guessing.
+ */
+function infoPlistString(text, key) {
+  const source = String(text || "");
+  const wanted = String(key || "");
+  if (!source || !wanted) return "";
+  const escaped = wanted.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = new RegExp(`<key>\\s*${escaped}\\s*</key>\\s*<string>([\\s\\S]*?)</string>`).exec(source);
+  return m ? m[1].trim() : "";
+}
+
+/** `{ bundleId, version }` from an app's Info.plist text. */
+function parseBundleIdentity(text) {
+  return {
+    bundleId: infoPlistString(text, "CFBundleIdentifier"),
+    version: infoPlistString(text, "CFBundleShortVersionString"),
+  };
 }
 
 // ── Retry / timeout budget ─────────────────────────────────────────────
@@ -760,6 +1096,19 @@ module.exports = {
   shouldProbe,
   mustProbeBeforePaste,
   pasteCapabilityMessage,
+  TCC_SERVICE,
+  TCC_RESET_TIMEOUT_MS,
+  PERMISSION_REPAIR,
+  PERMISSION_REPAIR_SERVICES,
+  BUNDLE_REPLACEMENT_TOLERANCE_MS,
+  detectBundleReplacement,
+  tccServiceForPasteFailure,
+  preferSpecificFailureReason,
+  planPermissionRepair,
+  permissionRepairCommand,
+  permissionRepairMessage,
+  infoPlistString,
+  parseBundleIdentity,
   PASTE_BUDGET,
   PASTE_MAX_ATTEMPTS,
   PASTE_POST_STOP_DEADLINE_MS,

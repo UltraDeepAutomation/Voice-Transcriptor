@@ -27,6 +27,17 @@ const {
   shouldProbe,
   mustProbeBeforePaste,
   pasteCapabilityMessage,
+  TCC_SERVICE,
+  PERMISSION_REPAIR,
+  PERMISSION_REPAIR_SERVICES,
+  detectBundleReplacement,
+  tccServiceForPasteFailure,
+  preferSpecificFailureReason,
+  planPermissionRepair,
+  permissionRepairCommand,
+  permissionRepairMessage,
+  infoPlistString,
+  parseBundleIdentity,
   PASTE_BUDGET,
   PASTE_MAX_ATTEMPTS,
   PASTE_POST_STOP_DEADLINE_MS,
@@ -112,12 +123,25 @@ test("a successful paste is the strongest liveness evidence — it promotes any 
   }
 });
 
-test("a permission-shaped failure drops straight to untrusted", () => {
+test("a permission-shaped failure lands in the state that matches WHICH permission", () => {
   const active = applyProbeResult(initialPasteCapability(0), { platform: "darwin", trusted: true, probeOk: true, now: 0 });
-  for (const reason of ["ERR:no-accessibility", "System Events got an error: … not authorized (-1743)"]) {
-    const next = applyPasteOutcome(active, { ok: false, reason, now: 5 });
-    assert.equal(next.state, PASTE_CAPABILITY.UNTRUSTED, reason);
-  }
+  // No Accessibility grant at all: nothing to repair, everything to ask for.
+  const ax = applyPasteOutcome(active, { ok: false, reason: "ERR:no-accessibility", now: 5 });
+  assert.equal(ax.state, PASTE_CAPABILITY.UNTRUSTED);
+  // An Automation refusal is the opposite claim: the row IS on and macOS
+  // refuses anyway. Calling that "untrusted" is what told a user with the
+  // grant switched on to go and switch it on.
+  const automation = applyPasteOutcome(active, {
+    ok: false,
+    reason: "System Events got an error: … not authorized to send Apple events (-1743)",
+    now: 5,
+  });
+  assert.equal(automation.state, PASTE_CAPABILITY.BROKEN);
+  assert.equal(
+    classifyPastePermissionFailure(automation.reason),
+    PASTE_PERMISSION_ROUTE.AUTOMATION,
+    "the state's own reason must still route to the pane that can fix it",
+  );
 });
 
 test("one silent failure is a loaded machine; two in a row is a stale grant", () => {
@@ -213,6 +237,223 @@ test("broken tells the user to REMOVE and re-add — toggling a stale row does n
   assert.doesNotMatch(untrusted.fix, /remove and re-add/i);
   assert.equal(pasteCapabilityMessage(PASTE_CAPABILITY.ACTIVE).fix, "");
   assert.equal(pasteCapabilityMessage(PASTE_CAPABILITY.UNKNOWN).fix, "");
+});
+
+test("the message names the pane the ACTUAL failure lives in", () => {
+  // The regression this exists for: every `broken` state was described
+  // as a stale Accessibility row, so a -1743 (Automation) refusal sent
+  // the user to a pane where nothing was wrong — main.log 2026-09-05.
+  const automation = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin",
+    trusted: true,
+    probeOk: false,
+    probeReason: "40:85: execution error: Not authorized to send Apple events to System Events. (-1743)",
+    now: 1,
+  });
+  const msg = pasteCapabilityMessage(automation);
+  assert.match(msg.title, /Automation/);
+  assert.match(msg.fix, /Privacy & Security → Automation/);
+  assert.doesNotMatch(msg.fix, /Privacy & Security → Accessibility/);
+  // And a replaced bundle is neither pane's problem.
+  const replaced = pasteCapabilityMessage(automation, { bundleReplaced: true });
+  assert.match(replaced.fix, /Quit and reopen/i);
+});
+
+// ── self-heal: repairing a grant macOS believes it has given ───────────
+
+test("the service comes from the error text, in tccutil's vocabulary", () => {
+  assert.equal(
+    tccServiceForPasteFailure("127:132: execution error: Not authorized to send Apple events to System Events. (-1743)"),
+    TCC_SERVICE.AUTOMATION,
+  );
+  assert.equal(tccServiceForPasteFailure("ERR:no-accessibility"), TCC_SERVICE.ACCESSIBILITY);
+  assert.equal(tccServiceForPasteFailure("no-target"), "");
+  // System Settings says "Automation"; tccutil only knows "AppleEvents",
+  // and asking it for a service it does not know resets nothing at all.
+  assert.equal(TCC_SERVICE.AUTOMATION, "AppleEvents");
+});
+
+test("the ladder's own vocabulary never outranks the macOS error underneath it", () => {
+  // `paste-capability-broken` says the preflight refused and nothing
+  // about why; the capability's reason carries the -1743 that decided it.
+  const specific = preferSpecificFailureReason(
+    "paste-capability-broken",
+    "stale-grant:40:85: execution error: Not authorized to send Apple events to System Events. (-1743)",
+  );
+  assert.equal(tccServiceForPasteFailure(specific), TCC_SERVICE.AUTOMATION);
+  // A reason that is already specific is left alone.
+  assert.equal(preferSpecificFailureReason("ERR:no-accessibility", "stale-grant:x"), "ERR:no-accessibility");
+});
+
+test("a bundle replaced under the running process is detected, and by either witness", () => {
+  const started = 1_000_000;
+  assert.equal(
+    detectBundleReplacement({
+      runningVersion: "1.6.2",
+      bundleVersion: "1.6.2",
+      bundleMtimeMs: started - 60_000,
+      processStartedAtMs: started,
+    }).replaced,
+    false,
+    "the normal case: installed, then launched",
+  );
+  assert.equal(
+    detectBundleReplacement({
+      runningVersion: "1.6.2",
+      bundleVersion: "1.6.3",
+      bundleMtimeMs: 0,
+      processStartedAtMs: started,
+    }).replaced,
+    true,
+    "a new version on disk is conclusive on its own",
+  );
+  const byMtime = detectBundleReplacement({
+    runningVersion: "1.6.2",
+    bundleVersion: "1.6.2",
+    bundleMtimeMs: started + 600_000,
+    processStartedAtMs: started,
+  });
+  assert.equal(byMtime.replaced, true, "a re-signed bundle keeps the version but not the mtime");
+  assert.match(byMtime.evidence, /rewritten-after-launch/);
+  // A same-second write must not be read as a swap.
+  assert.equal(
+    detectBundleReplacement({
+      bundleMtimeMs: started + 500,
+      processStartedAtMs: started,
+    }).replaced,
+    false,
+  );
+});
+
+test("a replaced bundle is told to relaunch, never reset — a reset cannot help it", () => {
+  const plan = planPermissionRepair({
+    state: PASTE_CAPABILITY.BROKEN,
+    reason: "stale-grant:… Not authorized to send Apple events to System Events. (-1743)",
+    trusted: true,
+    bundleReplaced: true,
+  });
+  assert.equal(plan.action, PERMISSION_REPAIR.RELAUNCH);
+  assert.equal(plan.why, "bundle-replaced");
+  // Said once per boot, not once per paste.
+  const again = planPermissionRepair({
+    state: PASTE_CAPABILITY.BROKEN,
+    reason: "stale-grant:… (-1743)",
+    trusted: true,
+    bundleReplaced: true,
+    reported: true,
+  });
+  assert.equal(again.action, PERMISSION_REPAIR.NONE);
+});
+
+test("a grant that is on and refuses is reset ONCE per boot, then reported", () => {
+  const input = {
+    state: PASTE_CAPABILITY.BROKEN,
+    reason: "stale-grant:… Not authorized to send Apple events to System Events. (-1743)",
+    trusted: true,
+  };
+  const first = planPermissionRepair(input);
+  assert.equal(first.action, PERMISSION_REPAIR.RESET);
+  assert.equal(first.service, TCC_SERVICE.AUTOMATION);
+  const second = planPermissionRepair({ ...input, resetServices: [TCC_SERVICE.AUTOMATION] });
+  assert.equal(second.action, PERMISSION_REPAIR.REPORT, "one reset is a repair; two is a loop");
+  assert.equal(second.why, "reset-did-not-help");
+  const third = planPermissionRepair({
+    ...input,
+    resetServices: [TCC_SERVICE.AUTOMATION],
+    reported: true,
+  });
+  assert.equal(third.action, PERMISSION_REPAIR.NONE);
+  // The other service is still repairable — resets are per service.
+  const ax = planPermissionRepair({
+    ...input,
+    reason: "ERR:no-accessibility",
+    resetServices: [TCC_SERVICE.AUTOMATION],
+  });
+  assert.equal(ax.action, PERMISSION_REPAIR.RESET);
+  assert.equal(ax.service, TCC_SERVICE.ACCESSIBILITY);
+});
+
+test("the self-heal keeps its hands off what it cannot know", () => {
+  // Never granted: the system prompt is the remedy, not a reset of a row
+  // that does not exist.
+  assert.equal(
+    planPermissionRepair({ state: PASTE_CAPABILITY.UNTRUSTED, reason: "not-trusted", trusted: false }).action,
+    PERMISSION_REPAIR.NONE,
+  );
+  // Trusted, broken, and the failure named no permission (a probe that
+  // timed out on a loaded machine): reporting is honest, resetting would
+  // revoke a working grant because the Mac was busy.
+  const vague = planPermissionRepair({
+    state: PASTE_CAPABILITY.BROKEN,
+    reason: "stale-grant:Timed out",
+    trusted: true,
+  });
+  assert.equal(vague.action, PERMISSION_REPAIR.REPORT);
+  assert.equal(vague.service, "");
+  // Nothing to repair at all.
+  assert.equal(
+    planPermissionRepair({ state: PASTE_CAPABILITY.ACTIVE, reason: "no-target", trusted: true }).action,
+    PERMISSION_REPAIR.NONE,
+  );
+  // Windows and Linux have no TCC to reset.
+  assert.equal(
+    planPermissionRepair({ platform: "win32", state: PASTE_CAPABILITY.BROKEN, reason: "(-1743)" }).action,
+    PERMISSION_REPAIR.NONE,
+  );
+});
+
+test("the reset command is built here, and refuses anything that is not a bundle id", () => {
+  const cmd = permissionRepairCommand(TCC_SERVICE.AUTOMATION, "local.transcriptor.app");
+  assert.equal(cmd.cmd, "tccutil");
+  assert.deepEqual(cmd.args, ["reset", "AppleEvents", "local.transcriptor.app"]);
+  assert.ok(cmd.timeoutMs > 0 && cmd.timeoutMs <= 5000);
+  for (const bad of ["", "  ", "local.transcriptor.app; rm -rf /", "-all", "com.example/../x"]) {
+    assert.throws(() => permissionRepairCommand(TCC_SERVICE.AUTOMATION, bad), /implausible bundle id/, bad);
+  }
+  assert.throws(() => permissionRepairCommand("Automation", "local.transcriptor.app"), /unknown TCC service/);
+});
+
+test("remediation prose has ONE writer, shared by the dialog and the note", () => {
+  const relaunch = permissionRepairMessage({ action: PERMISSION_REPAIR.RELAUNCH });
+  assert.match(relaunch.fix, /Quit and reopen/i);
+  const automation = permissionRepairMessage({
+    action: PERMISSION_REPAIR.REPORT,
+    service: TCC_SERVICE.AUTOMATION,
+  });
+  assert.deepEqual(
+    pasteCapabilityMessage(
+      { state: PASTE_CAPABILITY.BROKEN, reason: "… (-1743)" },
+    ),
+    automation,
+    "the note and the dialog must not be able to name two different fixes",
+  );
+  assert.equal(
+    PERMISSION_REPAIR_SERVICES.length,
+    2,
+    "the Settings action repairs both services",
+  );
+});
+
+test("the bundle id the reset targets is read from the running bundle", () => {
+  const plist = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    "<plist version=\"1.0\"><dict>",
+    "<key>CFBundleIdentifier</key><string>local.transcriptor.app</string>",
+    "<key>CFBundleShortVersionString</key><string>1.6.3</string>",
+    "</dict></plist>",
+  ].join("\n");
+  assert.deepEqual(parseBundleIdentity(plist), {
+    bundleId: "local.transcriptor.app",
+    version: "1.6.3",
+  });
+  // The manifest is where that value comes from (packaging.test.js holds
+  // every other copy to it), so the two must agree.
+  assert.equal(
+    parseBundleIdentity(plist).bundleId,
+    require("./package.json").build.appId,
+  );
+  assert.deepEqual(parseBundleIdentity("bplist00  "), { bundleId: "", version: "" });
+  assert.equal(infoPlistString("", "CFBundleIdentifier"), "");
 });
 
 test("the probe is the same mechanism the paste uses, and it is bounded", () => {

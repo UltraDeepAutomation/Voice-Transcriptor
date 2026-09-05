@@ -780,6 +780,19 @@
                 flashes a stale claim.
               -->
               <div class="settings-save-status settings-save-status-warning" id="pasteCapabilityNote" hidden></div>
+              <!--
+                The one action behind that note. macOS keys a permission
+                grant to the code signature that asked for it, so a
+                rebuilt app can be listed and switched ON in Privacy &
+                Security and refused anyway; this asks main to drop the
+                stale grant (tccutil reset) so macOS asks again. Shown
+                only while the note reports something with a TCC row to
+                repair — a bundle replaced under the running process is
+                fixed by the relaunch the note names, not by a reset.
+              -->
+              <div class="btn-row">
+                <button class="btn btn-ghost" id="pasteCapabilityRepair" type="button" hidden>Repair permissions</button>
+              </div>
             </div>
           </div>
         </div>

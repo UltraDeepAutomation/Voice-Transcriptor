@@ -67,6 +67,22 @@ test("paste-capability:get-status is invoked by the renderer bridge and handled 
   );
 });
 
+test("permissions:repair is invoked by the renderer bridge and handled by main", () => {
+  // The stale-grant repair the app performs on its own behalf, exposed
+  // as an explicit action: `tccutil reset <service> <bundle id>` drops a
+  // TCC row whose code signing requirement no longer matches this build.
+  // The renderer asks for a repair; it never names a service, a bundle
+  // id or a command.
+  assert.match(preloadSource, /repair: \(\) => ipcRenderer\.invoke\("permissions:repair"\)/);
+  assert.match(mainSource, /ipcMain\.handle\("permissions:repair"/);
+  // The bridge takes no arguments at all — no service, no bundle id —
+  // and the command itself is built by the capability module behind one
+  // function in main, so a renderer cannot ask for a reset of anything
+  // but this app's own grants.
+  assert.match(mainSource, /permissionRepairCommand\(service, bundleId\)/);
+  assert.match(mainSource, /runCommand\(command\.cmd, command\.args\.slice\(\)/);
+});
+
 test("main subscribes the power events at app scope, not inside another handler", () => {
   // Both power handlers once lived physically inside
   // restoreShortcutsAfterCaptureAbort — a function that returns early

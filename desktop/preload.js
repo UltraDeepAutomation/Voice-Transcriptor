@@ -21,13 +21,22 @@ contextBridge.exposeInMainWorld("__transcriptorEngine", {
 
 // Accessibility/paste-capability bridge (D-009). Same invoke-only shape
 // as the engine bridge above: `getStatus()` resolves
-// `{ state, title, fix }` — `state` is one of "unknown" / "untrusted" /
-// "active" / "broken" (desktop/paste-capability.js), and `title`/`fix`
-// are non-empty exactly when there is something the user can act on
-// (empty for "active"/"unknown", so an idle renderer badge can hide on
-// an empty `fix` without inspecting `state` itself).
+// `{ state, repairable, title, fix }` — `state` is one of "unknown" /
+// "untrusted" / "active" / "broken" (desktop/paste-capability.js), and
+// `title`/`fix` are non-empty exactly when there is something the user
+// can act on (empty for "active"/"unknown", so an idle renderer badge
+// can hide on an empty `fix` without inspecting `state` itself).
+//
+// `repair()` is the one action behind that note: macOS keys a permission
+// grant to the code signature that asked for it, so a rebuild can leave
+// the row switched on in System Settings and refused in practice. Main
+// drops the row (`tccutil reset`) so macOS asks again, re-probes, and
+// resolves the new state in the same shape. The renderer names no
+// service, no bundle id and no command — it asks for a repair and is
+// told what the state became.
 contextBridge.exposeInMainWorld("__transcriptorPasteCapability", {
   getStatus: () => ipcRenderer.invoke("paste-capability:get-status"),
+  repair: () => ipcRenderer.invoke("permissions:repair"),
 });
 
 // Transcript hand-off bridge (BUGS_AUDIT_2026-09-03 §6.7/§6.8).

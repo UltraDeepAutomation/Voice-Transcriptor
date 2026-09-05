@@ -70,6 +70,15 @@ const {
   shouldProbe,
   mustProbeBeforePaste,
   pasteCapabilityMessage,
+  TCC_SERVICE,
+  PERMISSION_REPAIR,
+  PERMISSION_REPAIR_SERVICES,
+  detectBundleReplacement,
+  preferSpecificFailureReason,
+  planPermissionRepair,
+  permissionRepairCommand,
+  permissionRepairMessage,
+  parseBundleIdentity,
   pasteBudgetFor,
   pasteAttemptDelayMs,
   pasteMethodTimeoutMs,
@@ -3895,8 +3904,91 @@ let pasteCapabilityProbeInFlight = null;
  * would mean touching the renderer for a message the existing one can
  * carry.
  */
+// ── The identity macOS grants permissions to ───────────────────────────
+//
+// TCC keys every grant by bundle id plus the code signing requirement
+// the app satisfied when the grant was made, so the self-heal below has
+// to name the bundle id — and the running bundle's Info.plist is the
+// only authority on what that is (electron-builder writes it from
+// `build.appId` in desktop/package.json, which desktop/packaging.test.js
+// holds every other copy in the repo to). Unpackaged runs read the
+// manifest directly: there is no bundle, and no TCC row to reset either.
+//
+// The same read answers the second question this file needs: is the
+// bundle on disk still the bundle this process was launched from? See
+// detectBundleReplacement in ./paste-capability for why that decides
+// whether a reset can help at all.
+const PROCESS_STARTED_AT_MS = Date.now() - Math.round(process.uptime() * 1000);
+/** The verdict is re-derived at most this often; a swap can happen any time. */
+const MAC_BUNDLE_FACTS_TTL_MS = 5000;
+let macBundleFactsCache = null;
+
+function macBundleFacts() {
+  const now = Date.now();
+  if (macBundleFactsCache && now - macBundleFactsCache.at < MAC_BUNDLE_FACTS_TTL_MS) {
+    return macBundleFactsCache;
+  }
+  const runningVersion = (() => {
+    try { return String(app.getVersion() || ""); } catch { return ""; }
+  })();
+  const facts = {
+    at: now,
+    bundleId: "",
+    runningVersion,
+    bundleVersion: "",
+    bundleMtimeMs: 0,
+    replaced: false,
+    evidence: "",
+  };
+  if (process.platform !== "darwin" || !app.isPackaged) {
+    try {
+      facts.bundleId = String(require("./package.json")?.build?.appId || "");
+    } catch { }
+    macBundleFactsCache = facts;
+    return facts;
+  }
+  try {
+    // process.resourcesPath = <bundle>/Contents/Resources
+    const contents = path.dirname(process.resourcesPath || "");
+    const plistPath = path.join(contents, "Info.plist");
+    const identity = parseBundleIdentity(fs.readFileSync(plistPath, "utf8"));
+    facts.bundleId = identity.bundleId;
+    facts.bundleVersion = identity.version;
+    let mtimeMs = 0;
+    for (const candidate of [plistPath, app.getPath("exe")]) {
+      try { mtimeMs = Math.max(mtimeMs, fs.statSync(candidate).mtimeMs || 0); } catch { }
+    }
+    facts.bundleMtimeMs = mtimeMs;
+  } catch (e) {
+    appendMainLog(`[paste-capability] bundle-facts unreadable: ${compactLogText(String(e?.message || e), 120)}`);
+  }
+  if (!facts.bundleId) {
+    try { facts.bundleId = String(require("./package.json")?.build?.appId || ""); } catch { }
+  }
+  const replacement = detectBundleReplacement({
+    runningVersion: facts.runningVersion,
+    bundleVersion: facts.bundleVersion,
+    bundleMtimeMs: facts.bundleMtimeMs,
+    processStartedAtMs: PROCESS_STARTED_AT_MS,
+  });
+  facts.replaced = replacement.replaced;
+  facts.evidence = replacement.evidence;
+  macBundleFactsCache = facts;
+  return facts;
+}
+
+/** The message context every describer of the capability shares. */
+function pasteCapabilityMessageContext() {
+  if (process.platform !== "darwin") return {};
+  try {
+    return { bundleReplaced: macBundleFacts().replaced };
+  } catch {
+    return {};
+  }
+}
+
 function pasteCapabilityStatusText() {
-  const message = pasteCapabilityMessage(pasteCapability.state);
+  const message = pasteCapabilityMessage(pasteCapability, pasteCapabilityMessageContext());
   if (!message.fix) return "";
   return `In Clipboard · ${message.title}. ${message.fix}`;
 }
@@ -3911,7 +4003,8 @@ function logPasteCapability(context) {
     return;
   }
   appendMainLog(
-    `[paste-capability] WARN: ${line} fix="${pasteCapabilityMessage(pasteCapability.state).fix}"`
+    `[paste-capability] WARN: ${line} ` +
+    `fix="${pasteCapabilityMessage(pasteCapability, pasteCapabilityMessageContext()).fix}"`
   );
 }
 
@@ -3980,11 +4073,215 @@ async function probePasteCapability(cause = "manual") {
   }
 }
 
+// ── Self-heal ──────────────────────────────────────────────────────────
+//
+// A probe that says "broken" used to end at a log line and a status
+// string telling the user to re-add a permission that was already there.
+// The two things that actually repair it are a TCC reset (for a grant
+// whose code signing requirement no longer matches this build) and a
+// relaunch (for a process whose bundle was replaced under it) — see the
+// section head in ./paste-capability, which owns every decision below.
+// This half owns the side effects: one `tccutil` child, one re-probe,
+// one dialog per boot.
+const permissionRepairState = {
+  /** Services this boot has already reset. At most one attempt each. */
+  resets: new Set(),
+  /** Has this boot already said it? Once per boot, never once per paste. */
+  reported: false,
+  inFlight: null,
+};
+
+/**
+ * The one place a `tccutil` process is spawned. The command — including
+ * the bundle id it targets and the refusal to run against anything that
+ * is not one — is built by ./paste-capability.
+ */
+async function runPermissionReset(service, bundleId) {
+  const command = permissionRepairCommand(service, bundleId);
+  const res = await runCommand(command.cmd, command.args.slice(), { timeoutMs: command.timeoutMs });
+  return {
+    ok: !!res.ok,
+    detail: compactLogText(String(res.stderr || res.stdout || "").trim(), 120),
+  };
+}
+
+/** Reset ONE service, then re-probe, then say so in one line. */
+async function resetPermissionAndReprobe(service, bundleId, cause) {
+  permissionRepairState.resets.add(service);
+  let reset = "failed";
+  let detail = "";
+  try {
+    const res = await runPermissionReset(service, bundleId);
+    reset = res.ok ? "ok" : "failed";
+    detail = res.detail;
+  } catch (e) {
+    detail = compactLogText(String(e?.message || e), 120);
+  }
+  const capability = await probePasteCapability(`${cause}-after-reset`);
+  appendMainLog(
+    `[paste-capability] self-heal service=${service} reset=${reset} re-probe=${capability.state}` +
+    (detail ? ` detail="${detail}"` : "")
+  );
+  return { service, reset, capability };
+}
+
+/**
+ * Tell the user — once per boot, with the pane and the exact clicks the
+ * failure in front of us needs. Scheduled, never awaited by a paste: the
+ * transcript is already on the clipboard and must not wait for a click.
+ */
+function reportPastePermissionFailure(plan, reason = "") {
+  permissionRepairState.reported = true;
+  // The generic prompt path shares this throttle, so it cannot pile a
+  // second dialog on top of this one.
+  macPastePermissionPromptAt = Date.now();
+  const message = permissionRepairMessage(plan);
+  appendMainLog(
+    `[paste-capability] self-heal report action=${plan.action} ` +
+    `service=${plan.service || "-"} why=${plan.why}`
+  );
+  const relaunch = plan.action === PERMISSION_REPAIR.RELAUNCH;
+  const cleanReason = compactLogText(String(reason || "").trim(), 300);
+  dialog
+    .showMessageBox({
+      type: "warning",
+      buttons: relaunch ? ["Restart Transcriptor", "Later"] : ["Open Privacy Settings", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+      title: "Grant macOS Permissions",
+      message: message.title,
+      detail: cleanReason ? `${message.fix}\n\nmacOS response:\n${cleanReason}` : message.fix,
+    })
+    .then((res) => {
+      if (res.response !== 0) return;
+      if (relaunch) {
+        // Relaunching the SAME bundle path is the whole remedy: the copy
+        // on disk is valid, only this process's identity is not. `quit`
+        // rather than `exit` so the backend child is still killed by the
+        // before-quit handler.
+        appendMainLog("[paste-capability] self-heal relaunch requested by user");
+        app.relaunch();
+        app.quit();
+        return;
+      }
+      if (plan.service === TCC_SERVICE.AUTOMATION) {
+        openPrivacyAutomationSettings();
+        return;
+      }
+      openPrivacyAccessibilitySettings();
+    })
+    .catch((e) => {
+      appendMainLog(`[paste-capability] self-heal report failed: ${compactLogText(String(e?.message || e), 120)}`);
+    });
+}
+
+/**
+ * Decide and run the repair for the failure we are looking at.
+ *
+ * Awaits only what is bounded and automatic (one `tccutil`, one probe);
+ * the dialog is scheduled. `handled` means the caller must NOT raise its
+ * own permission dialog — either this repaired the state, or it has
+ * already said everything there is to say this boot.
+ */
+async function maybeRepairPastePermissions({ cause = "auto", reason = "" } = {}) {
+  if (process.platform !== "darwin") return { capability: pasteCapability, handled: false };
+  if (permissionRepairState.inFlight) return permissionRepairState.inFlight;
+  permissionRepairState.inFlight = (async () => {
+    const facts = macBundleFacts();
+    const specific = preferSpecificFailureReason(reason, pasteCapability.reason);
+    const plan = planPermissionRepair({
+      platform: "darwin",
+      state: pasteCapability,
+      reason: specific,
+      trusted: refreshMacAccessibilityTrustState() === true,
+      bundleReplaced: facts.replaced,
+      resetServices: [...permissionRepairState.resets],
+      reported: permissionRepairState.reported,
+    });
+    if (plan.action === PERMISSION_REPAIR.NONE) {
+      if (plan.why !== "not-a-permission-failure") {
+        appendMainLog(
+          `[paste-capability] self-heal skipped why=${plan.why} service=${plan.service || "-"}`
+        );
+      }
+      return { capability: pasteCapability, handled: plan.why === "already-reported", plan };
+    }
+    if (plan.action === PERMISSION_REPAIR.RESET && facts.bundleId) {
+      const outcome = await resetPermissionAndReprobe(plan.service, facts.bundleId, cause);
+      if (shouldAttemptPaste(outcome.capability)) {
+        return { capability: outcome.capability, handled: true, plan };
+      }
+      reportPastePermissionFailure({ ...plan, action: PERMISSION_REPAIR.REPORT, why: "reset-did-not-help" }, specific);
+      return { capability: pasteCapability, handled: true, plan };
+    }
+    if (plan.action === PERMISSION_REPAIR.RESET) {
+      appendMainLog("[paste-capability] self-heal skipped why=no-bundle-id");
+      return { capability: pasteCapability, handled: false, plan };
+    }
+    if (facts.replaced) {
+      appendMainLog(`[paste-capability] bundle replaced under the running process (${facts.evidence})`);
+    }
+    reportPastePermissionFailure(plan, specific);
+    return { capability: pasteCapability, handled: true, plan };
+  })();
+  try {
+    return await permissionRepairState.inFlight;
+  } finally {
+    permissionRepairState.inFlight = null;
+  }
+}
+
+/**
+ * Probe, and repair what the probe found. Every background caller goes
+ * through here; only the reset's own re-probe calls the bare probe, so a
+ * repair can never recurse into itself.
+ */
+async function probeAndRepairPasteCapability(cause = "manual") {
+  const capability = await probePasteCapability(cause);
+  if (process.platform !== "darwin") return capability;
+  if (shouldAttemptPaste(capability)) return capability;
+  const repaired = await maybeRepairPastePermissions({ cause, reason: capability.reason });
+  return repaired.capability || pasteCapability;
+}
+
 /** Probe only if the cached verdict is stale (see shouldProbe). */
 async function ensurePasteCapabilityFresh(cause = "focus") {
   if (process.platform !== "darwin") return pasteCapability;
   if (!shouldProbe(pasteCapability, Date.now())) return pasteCapability;
-  return probePasteCapability(cause);
+  return probeAndRepairPasteCapability(cause);
+}
+
+/**
+ * The "Repair permissions" action (Settings → the paste-capability
+ * note). The user asked for it explicitly, so it repairs BOTH services
+ * rather than the one a failure named, and it is not bound by the
+ * once-per-boot rule the automatic path is.
+ */
+async function repairPastePermissionsOnRequest() {
+  if (process.platform !== "darwin") {
+    return { ok: false, status: "unsupported", state: pasteCapability.state, title: "", fix: "" };
+  }
+  const facts = macBundleFacts();
+  if (!facts.bundleId) {
+    appendMainLog("[paste-capability] repair requested but no bundle id is readable");
+    return { ok: false, status: "no-bundle-id", state: pasteCapability.state, title: "", fix: "" };
+  }
+  const services = [];
+  for (const service of PERMISSION_REPAIR_SERVICES) {
+    const outcome = await resetPermissionAndReprobe(service, facts.bundleId, "repair-request");
+    services.push({ service, reset: outcome.reset });
+  }
+  const capability = await probePasteCapability("repair-request-final");
+  const context = pasteCapabilityMessageContext();
+  const message = pasteCapabilityMessage(capability, context);
+  return {
+    ok: shouldAttemptPaste(capability),
+    status: "repaired",
+    services,
+    state: capability.state,
+    bundleReplaced: !!context.bundleReplaced,
+    ...message,
+  };
 }
 
 /**
@@ -4000,9 +4297,13 @@ async function ensurePasteCapabilityFresh(cause = "focus") {
  */
 async function ensurePasteCapabilityForPaste() {
   if (process.platform !== "darwin") return pasteCapability;
-  if (mustProbeBeforePaste(pasteCapability)) return probePasteCapability("pre-paste");
+  // The blocking case is also the one where a repair can still rescue
+  // THIS paste: the cached verdict refuses it, so the alternative is a
+  // ladder of Apple Events that all fail. The repair is bounded (one
+  // tccutil, one probe) and happens at most once per boot per service.
+  if (mustProbeBeforePaste(pasteCapability)) return probeAndRepairPasteCapability("pre-paste");
   if (shouldProbe(pasteCapability, Date.now())) {
-    probePasteCapability("pre-paste-stale").catch(() => { });
+    probeAndRepairPasteCapability("pre-paste-stale").catch(() => { });
   }
   return pasteCapability;
 }
@@ -4032,6 +4333,15 @@ function notePasteOutcome({ ok, reason } = {}) {
 
 async function promptMacPastePermissions(reason = "") {
   if (process.platform !== "darwin") return;
+  // Repair before asking a human to. This is the funnel every paste
+  // failure arrives in, so it is the one place that can guarantee the
+  // user is asked ONCE, about the permission that actually failed, and
+  // only after the app has tried what it can do on its own behalf.
+  const repair = await maybeRepairPastePermissions({ cause: "paste-failure", reason }).catch((e) => {
+    appendMainLog(`[paste-capability] self-heal failed: ${compactLogText(String(e?.message || e), 120)}`);
+    return { handled: false };
+  });
+  if (repair.handled) return;
   const now = Date.now();
   if (now - macPastePermissionPromptAt < MAC_PASTE_PERMISSION_PROMPT_THROTTLE_MS) {
     appendMainLog(`[permissions] paste prompt throttled reason="${compactLogText(reason, 120)}"`);
@@ -8773,7 +9083,33 @@ app.whenReady().then(async () => {
   // probe so the badge is never a beat behind the first recording.
   ipcMain.handle("paste-capability:get-status", async () => {
     const cap = await ensurePasteCapabilityFresh("renderer-query");
-    return { state: cap.state, ...pasteCapabilityMessage(cap.state) };
+    const context = pasteCapabilityMessageContext();
+    return {
+      state: cap.state,
+      // The renderer's "Repair permissions" button is offered only where
+      // there is a TCC row to repair. A bundle replaced under the running
+      // process is not one: the fix is the relaunch the note names.
+      repairable: process.platform === "darwin" && !context.bundleReplaced,
+      ...pasteCapabilityMessage(cap, context),
+    };
+  });
+
+  // "Repair permissions" (Settings, next to the note above). The stale
+  // grant this app's capability probe detects is repairable without
+  // System Settings at all — `tccutil reset <service> <bundle id>` drops
+  // the row whose code signing requirement no longer matches this build,
+  // and macOS asks again on the next Apple Event. Main owns the command
+  // (desktop/paste-capability.js builds it, including the refusal to run
+  // it against anything that is not this app's own bundle id); the
+  // renderer owns nothing but the click.
+  ipcMain.handle("permissions:repair", async () => {
+    try {
+      return await repairPastePermissionsOnRequest();
+    } catch (e) {
+      const error = compactLogText(String(e?.message || e), 160);
+      appendMainLog(`[paste-capability] repair handler error: ${error}`);
+      return { ok: false, status: "error", error, state: pasteCapability.state, title: "", fix: "" };
+    }
   });
 
   // Transcript hand-off from the renderer (BUGS_AUDIT §6.7). Registered
@@ -8835,7 +9171,7 @@ app.whenReady().then(async () => {
     // ends with a paste that silently goes nowhere. It is skipped
     // entirely when Accessibility is not granted (see
     // probePasteCapability), so a fresh install spawns nothing.
-    probePasteCapability("boot").catch(() => { });
+    probeAndRepairPasteCapability("boot").catch(() => { });
   }
   if (process.platform === "darwin") {
     // Resolve microphone TCC up front. Recording can be started from the
