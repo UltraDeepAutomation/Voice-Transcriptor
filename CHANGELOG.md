@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-09-05
+
+Two renderer fixes reported the same day as 1.6.1 shipped. Suites: frontend 375 (was 363), all green.
+
+### Fixed
+
+- **The Live view carried a second copy of the Auto/dual-stream trade-off explanation, under the recording controls the user reads on every session.** Settings › API Keys already states the same trade-off next to the controls it governs (`deepgramDualStreamNote`, written from the shared `dualStreamTradeOffText`); the paragraph under the MIC/LANG/REC row (`#languageAutoHint` / `#languageAutoDualHint`) was clutter, not a second fact, and is gone (`e3b0cae`). `syncAutoLanguageUi` keeps only the Auto-dependent show/hide of the dual-stream row.
+
+- **The live preview showed a whole transcript twice after a stop, while the delivered transcript showed it once.** Session `681a3df6` pasted a clean single reading (the TRANSCRIBE pane reads the backend's `final` envelope verbatim) while LIVE PREVIEW repeated the same speech — the envelope's segments were appended onto a buffer that already held the same speech from the incremental `segments`/`interim` stream, and their timings didn't line up closely enough for the segment-level dedup to see the overlap. Fixed with one rule instead of a better dedup: once a session's stop envelope has resolved, the preview shows it verbatim, never unioned with the reading it replaces (`composeLivePreviewText`, `0b31bd8`).
+
 ## [1.6.1] - 2026-09-05
 
 The 2026-09-04 Ultra-Audit (`BUGSAUDIT-2026-09-04.md`, 270 numbered findings across backend, renderer and desktop) plus the cross-domain seams that closed the day after. Suites on the released revision: backend 819, frontend 363, desktop 256, all green.
