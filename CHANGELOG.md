@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-09-05
+
+The stale-macOS-permission failure, root cause first: the build that installs the app was breaking the permission, and the app could neither say so nor repair it. Suites: desktop 270 (was 256), frontend 375, all green.
+
+### Fixed
+
+- **Auto-paste stopped working after an install, and the app told the user to switch on a permission that was already on.** `main.log` at `2026-09-05T11:00:00Z`: three paste attempts and the menu fallback all refused with `Not authorized to send Apple events to System Events. (-1743)` while Privacy & Security → Automation showed Transcriptor → System Events as ON. The cause was not a stale grant at all — the bundle had been re-signed into `/Applications` at `10:56Z` under a process running since `2026-09-04T22:47Z`. That process probed fine at `10:58:53Z`, refused every Apple Event from `10:59:59Z`, and the very next launch of the same bundle probed `active` again at `11:00:51Z`: macOS stops validating a running process whose bundle has been replaced under it, and only a relaunch repairs that. `BUILD.command` now quits Transcriptor before it replaces the bundle and reopens it with `open -a` afterwards (`8c7c327`), so the window in which this can happen is gone.
+
+- **The app described every dead grant as a stale Accessibility row, whichever permission had actually failed.** `pasteCapabilityMessage` hard-coded "Privacy & Security → Accessibility: remove and re-add", and an Automation refusal was folded into `untrusted` — "add Transcriptor and switch it on" — so the one instruction the user got was about the wrong pane and the wrong problem, once per paste. A `-1743` is now the `broken` state it is, described by the pane it belongs to, by the same classifier that routes the dialog (`efe59b4`).
+
+- **A grant that macOS refuses is now repaired instead of reported.** The capability owner tells the two diseases apart — a bundle replaced under the running process (relaunch; a TCC reset would throw away a grant that is valid for the copy on disk) versus a grant whose code signing requirement no longer matches this build (`tccutil reset <service> <bundle id>`, once per boot per service, then a re-probe, logged as `[paste-capability] self-heal service=… reset=… re-probe=…`). Only if the repair fails does a dialog appear, once per boot rather than once per paste. Settings carries the same repair as a button next to the capability note, over an invoke-only `permissions:repair` bridge: the renderer names no service, no bundle id and no command.
+
+### Changed
+
+- **An ad-hoc build can no longer become the copy in `/Applications`.** macOS keys a permission grant to the bundle id *and* the code signing requirement that earned it; an ad-hoc signature's requirement is a cdhash of one exact build, so every rebuild silently invalidates every grant while System Settings goes on showing them. `codesign --verify --deep --strict`, which the install already ran, accepts ad-hoc signatures — the install now also requires a designated requirement of the form `identifier "<bundle id>" and certificate …` and refuses anything else. `BUILD.command`'s header states why the signing identity must stay constant across builds.
+
 ## [1.6.2] - 2026-09-05
 
 Two renderer fixes reported the same day as 1.6.1 shipped. Suites: frontend 375 (was 363), all green.
