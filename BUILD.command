@@ -70,6 +70,23 @@ cleanup_stale_install_backups "$HOME/Applications"
 #  Default when nothing is set: the internal identity below, which is what
 #  this repository's own machine has. It is named here, once, instead of
 #  being embedded in the signing code.
+#
+#  THE IDENTITY MUST STAY THE SAME ACROSS BUILDS.
+#  macOS stores every permission the user grants — Accessibility,
+#  Automation, Microphone — against the bundle id AND the code signing
+#  requirement the app satisfied when the grant was made (TCC's `csreq`).
+#  Rebuild under a different certificate, or ad-hoc, and the grant no
+#  longer matches: System Settings goes on showing Transcriptor as
+#  allowed while macOS refuses it for real — Apple Events come back
+#  "Not authorized to send Apple events to System Events. (-1743)" and
+#  auto-paste silently stops working, with nothing on screen to explain
+#  it. The user's only remedy is `tccutil reset <service> <bundle id>`
+#  and a fresh prompt, which is what the app's own "Repair permissions"
+#  action does (desktop/paste-capability.js).
+#  The install below therefore refuses any bundle whose designated
+#  requirement is not `identifier "<bundle id>" and certificate …` — an
+#  ad-hoc build, whose requirement is a cdhash of that one build, can be
+#  run but never installed over the copy the user has granted.
 INTERNAL_SIGNING_IDENTITY="AntigravityTelegramDev"
 if [ "${TRANSCRIPTOR_ALLOW_ADHOC_SIGN:-}" != "1" ]; then
   export TRANSCRIPTOR_SIGNING_IDENTITY="${TRANSCRIPTOR_SIGNING_IDENTITY:-$INTERNAL_SIGNING_IDENTITY}"
@@ -228,6 +245,53 @@ create_release_package() {
 
 create_release_package
 
+# ---------------------------------------------------------------------------
+#  Never replace a bundle under a running process
+# ---------------------------------------------------------------------------
+#  Installing over /Applications/Transcriptor.app while that app is
+#  running swaps the bundle out from under a live process. From that
+#  moment macOS stops validating the process's code identity and refuses
+#  every Apple Event it sends with -1743, so auto-paste dies for the rest
+#  of that session while System Settings still shows the Automation grant
+#  as ON. Observed on 2026-09-05: the bundle was re-signed at 17:56 local,
+#  the still-running 1.6.1 process pasted fine at 17:58 and failed every
+#  paste from 17:59 on; the very next launch of the very same bundle
+#  worked. So: quit first, install, and put it back the way it was.
+#
+#  RELAUNCHING: `open -a` and nothing else. `open` hands the launch to
+#  LaunchServices, so the app is its own responsible process and TCC
+#  matches its own bundle id. A binary started straight from this shell
+#  (…/Contents/MacOS/Transcriptor &) would inherit THIS terminal as its
+#  responsible process, and every permission prompt and grant would be
+#  attributed to the terminal instead of to Transcriptor. Evidence that
+#  `open -a` is correct here: the 11:00:51Z boot in main.log, launched
+#  that way from an agent shell, probed System Events successfully on the
+#  first try (`[paste-capability] state=active cause=boot`).
+APP_WAS_RUNNING=0
+
+quit_running_app() {
+  local target_app="$1"
+  local waited=0
+  pgrep -f "$target_app/Contents/MacOS/" >/dev/null 2>&1 || return 0
+  APP_WAS_RUNNING=1
+  echo "Quitting the running Transcriptor before replacing its bundle…"
+  osascript -e 'tell application "Transcriptor" to quit' >/dev/null 2>&1 || true
+  while [ "$waited" -lt 20 ]; do
+    pgrep -f "$target_app/Contents/MacOS/" >/dev/null 2>&1 || return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "Transcriptor is still running after 20s; quit it and re-run ./BUILD.command." >&2
+  exit 1
+}
+
+relaunch_app_if_it_was_running() {
+  local target_app="$1"
+  [ "$APP_WAS_RUNNING" = "1" ] || return 0
+  echo "Reopening $target_app"
+  open -a "$target_app"
+}
+
 install_app_bundle() {
   local target_app="$1"
   local target_root
@@ -254,6 +318,16 @@ install_app_bundle() {
     cleanup_tmp_app
     return 1
   fi
+  # `codesign --verify` accepts an ad-hoc signature, so it cannot answer
+  # the question that matters for an INSTALL: will the permissions this
+  # user has already granted still apply to the bundle we are about to
+  # put in their /Applications? See the header, and
+  # desktop/scripts/check-designated-requirement.js.
+  if ! node "$SCRIPT_DIR/desktop/scripts/check-designated-requirement.js" "$tmp_app"; then
+    cleanup_tmp_app
+    return 1
+  fi
+  quit_running_app "$target_app"
   if [ -e "$target_app" ]; then
     mv "$target_app" "$backup_app"
   fi
@@ -310,3 +384,5 @@ LEGACY_USER_APP="$HOME/Applications/Transcriptor.app"
 if [ -d "$LEGACY_USER_APP" ] && [ "$LEGACY_USER_APP" != "$PRIMARY_APP" ]; then
   retire_duplicate_app_bundle "$LEGACY_USER_APP" "$PRIMARY_APP"
 fi
+
+relaunch_app_if_it_was_running "$PRIMARY_APP"

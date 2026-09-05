@@ -185,6 +185,64 @@ function resolveSigningPlan(env = process.env) {
   };
 }
 
+// ── Why the identity may not drift between builds ──────────────────────
+//
+// macOS stores every permission the user grants — Accessibility,
+// Automation, Microphone — against the bundle id AND the code signing
+// requirement the app satisfied when the grant was made. A build signed
+// with a different certificate, or ad-hoc, does not satisfy the old
+// requirement: the row stays visible and switched ON in System Settings
+// while macOS refuses the app for real (Apple Events come back
+// errAEEventNotPermitted, -1743). The user cannot see the difference and
+// the app cannot repair it without dropping the grant.
+//
+// An ad-hoc signature is the worst case, because it has no certificate
+// at all: its designated requirement is a bare cdhash of THIS build, so
+// every rebuild is a new identity and every grant dies with the build
+// that earned it. That is why an ad-hoc bundle must never be installed
+// over a real one — see the install guard in BUILD.command.
+
+/** The designated requirement a grant can survive a rebuild under. */
+function stableDesignatedRequirementPattern(bundleId) {
+  const id = String(bundleId || "").trim();
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`identifier\\s+(?:"${escaped}"|${escaped})\\s+and\\s+certificate\\b`, "i");
+}
+
+/**
+ * Does this bundle's designated requirement bind its grants to a name
+ * that survives a rebuild?
+ *
+ * @param {string} requirementText  output of `codesign -d --requirements -`
+ * @param {string} bundleId
+ * @returns {{ok: boolean, reason: string}}
+ */
+function designatedRequirementIsStable(requirementText, bundleId) {
+  const text = String(requirementText || "");
+  const id = String(bundleId || "").trim();
+  if (!id) return { ok: false, reason: "no bundle id to check the requirement against" };
+  const line = text.split(/\r?\n/).find((l) => /designated\s*=>/.test(l)) || "";
+  if (!line) {
+    return { ok: false, reason: "no designated requirement in the codesign output" };
+  }
+  if (stableDesignatedRequirementPattern(id).test(line)) return { ok: true, reason: "" };
+  if (/cdhash/i.test(line)) {
+    return {
+      ok: false,
+      reason:
+        "the bundle is signed ad-hoc: its designated requirement is a cdhash of this " +
+        "exact build, so every macOS permission the user grants dies with it " +
+        `(${line.trim()})`,
+    };
+  }
+  return {
+    ok: false,
+    reason:
+      `the designated requirement does not bind identifier "${id}" to a certificate, ` +
+      `so permissions granted to it will not survive a rebuild (${line.trim()})`,
+  };
+}
+
 /**
  * The self-signed variant of an entitlements filename declared in
  * package.json: `entitlements.mac.plist` ->
@@ -478,6 +536,7 @@ module.exports = {
   REQUIRED_USAGE_DESCRIPTION_KEYS,
   assertNoBundledBytecode,
   classifyMacho,
+  designatedRequirementIsStable,
   hardenAppTransportSecurity,
   hasCertificateIdentity,
   hasSigningIdentity,
@@ -491,5 +550,6 @@ module.exports = {
   runtimeSignArgs,
   selfSignedEntitlementsPath,
   shouldIgnoreOsxSignPath,
+  stableDesignatedRequirementPattern,
   walkTree,
 };

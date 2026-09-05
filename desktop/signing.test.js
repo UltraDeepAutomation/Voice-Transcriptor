@@ -20,6 +20,7 @@ const path = require("node:path");
 
 const {
   REQUIRED_USAGE_DESCRIPTION_KEYS,
+  designatedRequirementIsStable,
   isDeveloperIdIdentity,
   resolveSigningPlan,
   runtimeSignArgs,
@@ -191,6 +192,60 @@ test("no signing identity is hardcoded in the build hooks any more", () => {
       `${file} must not carry a built-in default signing identity`,
     );
   }
+});
+
+// ── The signature the user's permissions are keyed to ──────────────────
+
+test("an installable build's designated requirement binds the bundle id to a certificate", () => {
+  const appId = packageJson.build.appId;
+  // What a build signed with the internal (or any) certificate produces,
+  // and the only shape a TCC grant survives a rebuild under.
+  const stable =
+    `designated => identifier "${appId}" and certificate leaf = H"d1f9138d0b7df1fed158a1bde6ef079979a85498"`;
+  assert.equal(designatedRequirementIsStable(stable, appId).ok, true);
+  // codesign prints the identifier unquoted when it needs no quoting.
+  assert.equal(
+    designatedRequirementIsStable(`designated => identifier ${appId} and certificate leaf = H"ab"`, appId).ok,
+    true,
+  );
+  // An ad-hoc bundle: a cdhash of THIS build, so every rebuild is a new
+  // identity and every permission the user granted dies with it — while
+  // System Settings goes on showing the app as granted.
+  const adhoc = designatedRequirementIsStable('designated => cdhash H"1122334455"', appId);
+  assert.equal(adhoc.ok, false);
+  assert.match(adhoc.reason, /ad-hoc/);
+  // Someone else's bundle id is not this app's grant.
+  assert.equal(
+    designatedRequirementIsStable(`designated => identifier "com.example.other" and certificate leaf = H"ab"`, appId).ok,
+    false,
+  );
+  assert.equal(designatedRequirementIsStable("", appId).ok, false);
+  assert.equal(designatedRequirementIsStable("designated => anchor apple", appId).ok, false);
+});
+
+test("the install path refuses an ad-hoc bundle, and says why", () => {
+  // TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 is a legitimate mode for a throwaway
+  // local build — and a permission-destroying one for the copy in
+  // /Applications, which is what BUILD.command installs. The guard is a
+  // check on the artifact, not on the environment, so it also catches a
+  // bundle that lost its signature some other way.
+  const adhocPlan = resolveSigningPlan({ TRANSCRIPTOR_ALLOW_ADHOC_SIGN: "1" });
+  assert.equal(adhocPlan.identity, "-", "ad-hoc signing produces no certificate to bind to");
+  const build = fs.readFileSync(path.join(__dirname, "..", "BUILD.command"), "utf8");
+  assert.match(
+    build,
+    /check-designated-requirement\.js/,
+    "BUILD.command must verify the requirement before replacing an installed app",
+  );
+  const guard = fs.readFileSync(path.join(__dirname, "scripts", "check-designated-requirement.js"), "utf8");
+  assert.match(guard, /designatedRequirementIsStable/, "the guard must use the tested decision, not its own regex");
+  assert.match(guard, /process\.exit\(1\)/, "the guard must fail the install, not merely warn");
+});
+
+test("BUILD.command explains why the signing identity may not drift", () => {
+  const build = fs.readFileSync(path.join(__dirname, "..", "BUILD.command"), "utf8");
+  assert.match(build, /TCC/, "the header must name the reason: TCC grants are keyed to the signature");
+  assert.match(build, /-1743/, "…and the symptom a drifting identity produces");
 });
 
 test("no updater metadata is published: the app has no updater", () => {
