@@ -146,6 +146,15 @@ Whisper thread counts, cache paths and more. The full list is in
   without a Team ID, so macOS ties the grant to the exact binary and a
   reinstall can leave it stale while still reporting "granted".
 - **Port 8321 is busy**: Electron picks another one by itself.
+- **The app window**: while the process runs the Dock always shows the running
+  indicator. Clicking the Dock icon (or `open -a`, or the tray) opens the window
+  filling the desktop — if you resized or moved it yourself, it comes back the
+  way you left it. The yellow button minimises and the app keeps working:
+  hotkeys, the recording capsule and the backend stay alive, and a Dock click
+  brings the window back. The red button and `Cmd+W` quit: closed means not
+  running, and the backend child and the capsule stop with the app. Nothing else
+  hides or reorders the window — the recording capsule is a separate panel that
+  never takes focus.
 
 ## Documentation
 

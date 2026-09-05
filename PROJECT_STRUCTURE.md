@@ -140,6 +140,7 @@ desktop/
 ├── python-version.js               # interpreter version reader: the ONE file that declares it is .python-version (pure, node --test)
 ├── shortcut-migration.js           # retired-hotkey migration rule SSOT, shared with the renderer (pure, node --test)
 ├── linux-wm-class.js               # WM_CLASS split from `wmctrl -lpGx` for Linux window activation (pure, node --test)
+├── window-lifecycle.js             # main-window lifecycle SSOT: activate/close/minimise/quit/second-instance/capsule decisions and where the window opens (pure, node --test)
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)
 ├── package.json                    # electron-builder config and desktop scripts
