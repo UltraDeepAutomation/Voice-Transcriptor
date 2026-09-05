@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 import {
+  composeLivePreviewText,
   joinTranscriptSegments,
   richerTranscript,
 } from "../src/transcript-merge";
@@ -46,6 +47,45 @@ describe("transcript-merge — live-preview helpers", () => {
     });
     it("equal word counts do NOT win when the candidate is a different reading", () => {
       expect(richerTranscript("один два", "одинx дваy")).toBe("один два");
+    });
+  });
+
+  /**
+   * B-041 (2026-09-05): a session's LIVE PREVIEW pane showed its whole
+   * transcript twice after a stop ("Всё, другие агенты … проблем. Все,
+   * другие агенты … проблем.") while the TRANSCRIBE pane — which only
+   * ever reads the backend's ``final`` envelope verbatim — showed it
+   * once. The envelope's segments had been appended onto a buffer that
+   * already held the same speech from the incremental
+   * ``segments``/``interim`` stream; their timings didn't line up
+   * closely enough for the segment-level dedup to recognise the overlap.
+   * The fix is not a better dedup: once a session's envelope has
+   * resolved, it is the ONE text the preview shows, full stop — nothing
+   * is unioned with it.
+   */
+  describe("composeLivePreviewText — the live preview's ONE rule once an envelope resolves", () => {
+    it("committed finals text T, envelope text T → preview is T once (not T twice)", () => {
+      const T = "Все, другие агенты вроде как починили наш транскриптор.";
+      expect(composeLivePreviewText(T, T)).toBe(T);
+    });
+
+    it("no envelope yet (null) → shows the committed/interim reading as-is", () => {
+      expect(composeLivePreviewText("начало фразы", null)).toBe("начало фразы");
+      expect(composeLivePreviewText("начало фразы", undefined)).toBe("начало фразы");
+    });
+
+    it("envelope resolved, even with FEWER words than the committed/interim reading → envelope wins outright", () => {
+      const committedAndInterim = "начало фразы и самый конец с лишним хвостом";
+      const envelopeText = "начало фразы и конец";
+      expect(composeLivePreviewText(committedAndInterim, envelopeText)).toBe(envelopeText);
+    });
+
+    it("envelope resolved with NO speech (empty string, not missing) → preview clears, does not fall back", () => {
+      expect(composeLivePreviewText("частично услышанный текст", "")).toBe("");
+    });
+
+    it("normalizes whitespace the same way the rest of this module does", () => {
+      expect(composeLivePreviewText("", "  два   слова  ")).toBe("два слова");
     });
   });
 });

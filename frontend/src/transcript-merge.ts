@@ -14,15 +14,20 @@
  * out of that reconciliation, and it is gone rather than merely
  * unused.
  *
- * The two functions that remain are read by the preview only:
+ * The functions that remain are read by the preview only:
  *
- *   ``joinTranscriptSegments`` — the committed finals, as one string;
- *   ``richerTranscript``       — the preview's monotonic display floor,
- *                                so a Deepgram interim that resets at an
- *                                utterance boundary cannot make the pane
- *                                visibly lose words the user just saw.
+ *   ``joinTranscriptSegments``   — the committed finals, as one string;
+ *   ``richerTranscript``         — the preview's monotonic display floor,
+ *                                  so a Deepgram interim that resets at
+ *                                  an utterance boundary cannot make the
+ *                                  pane visibly lose words the user just
+ *                                  saw;
+ *   ``composeLivePreviewText``   — the ONE rule for what the preview
+ *                                  shows once a session's stop envelope
+ *                                  has resolved (see its own doc comment
+ *                                  — B-041, 2026-09-05).
  *
- * Neither one can reach the delivered text.
+ * None of them can reach the delivered text.
  *
  * Pure: no DOM, no state. Unit-tested in tests/transcript-merge.test.ts
  */
@@ -61,4 +66,43 @@ export function richerTranscript(currentText: string, candidateText: string): st
     }
   }
   return current;
+}
+
+/**
+ * The live preview's ONE rule for what to show (B-041, 2026-09-05).
+ *
+ * Before a session's stop envelope has resolved, the preview shows the
+ * committed-plus-interim reading of the session — the ``richerTranscript``
+ * floor over ``getVisibleLivePreviewText()``. Once the envelope
+ * resolves, the envelope IS the text: verbatim, never unioned with the
+ * committed/interim reading it replaces.
+ *
+ * A session (2026-09-05, ~05:5x local) showed why "union" is wrong even
+ * though it sounds safer: the WS ``final`` message's segments are the
+ * backend's own re-merge of the whole recording (Deepgram finals + its
+ * word-level splice + the dual-stream merge), not a delta to append.
+ * Their timings don't line up with the segments the renderer already
+ * buffered from mid-session ``segments``/``interim`` events, so the
+ * epsilon-based segment dedup (``mergeTranscriptSegments``) cannot tell
+ * the two readings are the same speech — the LIVE PREVIEW pane showed
+ * the whole transcript twice while the TRANSCRIBE pane, which only ever
+ * reads ``envelope.text`` verbatim (see ``stopLive`` in main.tsx),
+ * showed it once. The fix is not a better dedup: a resolved envelope is
+ * the ONE authoritative reading of the session from that point on, and
+ * nothing else contributes to the display again.
+ *
+ * ``envelopeText`` is ``null``/``undefined`` exactly while no envelope
+ * has resolved for the session — never as a stand-in for "resolved but
+ * empty". An envelope that resolved with NO speech is not "missing": it
+ * is the backend's own verdict, and it wins outright over stale
+ * committed/interim text exactly like a non-empty one does.
+ */
+export function composeLivePreviewText(
+  committedAndInterim: string,
+  envelopeText: string | null | undefined,
+): string {
+  if (envelopeText === null || envelopeText === undefined) {
+    return normalizeTranscriptWhitespace(committedAndInterim);
+  }
+  return normalizeTranscriptWhitespace(envelopeText);
 }

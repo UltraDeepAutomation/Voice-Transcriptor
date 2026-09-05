@@ -82,6 +82,7 @@ import {
   normalizeTranscriptWhitespace,
 } from "./text-match";
 import {
+  composeLivePreviewText,
   joinTranscriptSegments,
   richerTranscript,
 } from "./transcript-merge";
@@ -10486,12 +10487,29 @@ function scheduleLiveOutputRender(): void {
       }
       return;
     }
-    // Monotonic display floor: Deepgram interims reset at utterance
-    // boundaries and can transiently drop words the user already saw.
-    // The preview never regresses — it only grows (the final transcript
-    // remains the authoritative text; this is the live evidence pane).
+    // B-041 / ONE rule (see ./transcript-merge's composeLivePreviewText):
+    // once THIS session's stop envelope has resolved, it is the text —
+    // verbatim, not unioned with the committed/interim reading it
+    // replaces. Checked before the monotonic floor below on purpose: a
+    // resolved envelope can legitimately read as fewer words than the
+    // floor (its own dedup differs from the incremental reading's), and
+    // the floor's job — never regress a still-updating hypothesis — has
+    // nothing to arbitrate once there is nothing left to update.
+    //
+    // ``envelopeMissing`` (not a bare null check) is what decides
+    // "resolved": ws.onclose resolves the slot with a synthetic
+    // error/empty envelope the moment an unclean close is seen, which
+    // can happen mid-recording while streaming keeps going on committed
+    // text alone (see the ``error`` case above) — treating that as an
+    // authoritative empty transcript would blank the preview out from
+    // under an active recording. stopLive draws the same line via the
+    // same predicate for what it delivers.
+    const sessionEnvelope = liveFinalSlots.get(activeUiSessionToken)?.envelope || null;
+    const resolvedEnvelopeText = envelopeMissing(sessionEnvelope) ? null : (sessionEnvelope?.text ?? null);
     const candidate = getVisibleLivePreviewText();
-    const text = richerTranscript(livePreviewFloorText, candidate);
+    const text = resolvedEnvelopeText !== null
+      ? composeLivePreviewText(candidate, resolvedEnvelopeText)
+      : richerTranscript(livePreviewFloorText, candidate);
     livePreviewFloorText = text;
     if (el.textContent !== text) {
       el.textContent = text;

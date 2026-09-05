@@ -374,3 +374,44 @@ describe("Live topbar carries no Auto/dual-stream hint (2026-09-05)", () => {
     expect(body).not.toContain("languageAutoDualHint");
   });
 });
+
+/**
+ * B-041 (2026-09-05): the LIVE PREVIEW pane doubled a whole transcript
+ * after a stop while the TRANSCRIBE pane (envelope.text, delivered
+ * verbatim — see the F/7 describe block above) showed it once. Root
+ * cause: the envelope's segments were appended onto a buffer that
+ * already held the same speech from the incremental
+ * segments/interim stream, and their timings didn't line up closely
+ * enough for the segment-level dedup to see the overlap. Fixed with ONE
+ * rule, pure-function-tested in transcript-merge.test.ts
+ * (composeLivePreviewText): once a session's envelope has resolved, the
+ * preview shows it verbatim, never unioned with the incremental
+ * reading. This pins the WIRING — that scheduleLiveOutputRender actually
+ * calls that rule instead of always taking the pre-envelope floor path.
+ */
+describe("the live preview defers to a resolved envelope, verbatim (B-041)", () => {
+  const fnBlock = /function scheduleLiveOutputRender\(\): void \{([\s\S]*?)\nfunction syncLiveOutputFromState/.exec(mainTsx)?.[1];
+
+  it("the boundary markers used to isolate scheduleLiveOutputRender's body are still present", () => {
+    expect(fnBlock, "scheduleLiveOutputRender (or its end marker) not found in main.tsx").toBeTruthy();
+  });
+
+  it("reads the ACTIVE session's slot and treats an errored/absent envelope as not-yet-resolved (envelopeMissing), not a bare null check", () => {
+    const body = String(fnBlock);
+    expect(body).toContain("liveFinalSlots.get(activeUiSessionToken)");
+    expect(body).toMatch(/envelopeMissing\(sessionEnvelope\)/);
+  });
+
+  it("a resolved envelope goes through composeLivePreviewText, bypassing the pre-envelope richerTranscript floor", () => {
+    const body = String(fnBlock);
+    const composeCall = body.indexOf("composeLivePreviewText(candidate, resolvedEnvelopeText)");
+    const floorCall = body.indexOf("richerTranscript(livePreviewFloorText, candidate)");
+    expect(composeCall, "composeLivePreviewText call not found").toBeGreaterThanOrEqual(0);
+    expect(floorCall, "richerTranscript floor call not found").toBeGreaterThan(composeCall);
+    // Both branches must be reachable from ONE ternary keyed on whether
+    // the envelope resolved — not two independent unconditional writes
+    // to the displayed text.
+    const ternaryCondition = body.slice(0, composeCall).slice(-80);
+    expect(ternaryCondition).toMatch(/resolvedEnvelopeText\s*!==\s*null\s*\n?\s*\?\s*$/);
+  });
+});
