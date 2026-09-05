@@ -704,15 +704,6 @@ body.platform-darwin .sidebar {
   -webkit-app-region: no-drag;
 }
 
-/* Full-width sibling of .topbar-row, not a column inside it — the row
-   is a max-content grid, so a sentence squeezed into the 92px LANG
-   column would overflow or force the row wider than the window. */
-.topbar-hint {
-  margin: var(--space-2) 0 0;
-  max-width: 60ch;
-  -webkit-app-region: no-drag;
-}
-
 .context-chip {
   display: inline-flex;
   align-items: center;

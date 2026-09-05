@@ -333,27 +333,6 @@
               </button>
             </div>
           </div>
-          <!--
-            Measured 2026-09-03 (BUGS_AUDIT_2026-09-03.md §1): Auto maps
-            to Deepgram's language=multi, which on Russian dictation
-            silently dropped whole clauses and was non-deterministic run
-            to run; a fixed language (e.g. RU) kept every clause. The
-            trade-off is that a fixed language transliterates English
-            product names, which Key terms (Nova-3, Settings > API Keys)
-            exists to fix. #language is rendered in this one place only
-            — this paragraph is the single source of the hint text.
-            Placed as a full-width sibling of .topbar-row (not inside
-            it) because .topbar-row is a max-content grid — a sentence
-            squeezed into the 92px LANG column would either overflow or
-            force the whole row wider than the window.
-          -->
-          <p class="hint topbar-hint" id="languageAutoHint">
-            Auto uses Deepgram's multi-language mode; measured
-            2026-09-03 it can drop phrases around language switches,
-            while a fixed language keeps that language but garbles the
-            others. Add names under Key terms — they reduce drops in
-            both modes.<span id="languageAutoDualHint"></span>
-          </p>
         </div>
 
         <div class="split">

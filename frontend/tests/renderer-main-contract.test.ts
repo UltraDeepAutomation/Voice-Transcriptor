@@ -335,3 +335,42 @@ describe("the renderer runs the SAME shortcut migration rule as desktop/main.js 
     expect(custom.record).toBe("F11");
   });
 });
+
+/**
+ * 2026-09-05 (user request): the Live view carried a paragraph under the
+ * MIC/LANG/REC row (``#languageAutoHint`` with its ``#languageAutoDualHint``
+ * span) explaining the Auto/dual-stream trade-off. Settings › API Keys
+ * already explains the same trade-off next to the controls it governs
+ * (``deepgramDualStreamNote``, written from ``dualStreamTradeOffText``) —
+ * a second copy under the recording controls was clutter, not a second
+ * fact. Removed entirely from the Live view; Settings keeps its one note
+ * and the Auto-dependent show/hide of the dual-stream row.
+ */
+describe("Live topbar carries no Auto/dual-stream hint (2026-09-05)", () => {
+  const recordViewMatch = /<section class="view" data-view="record">[\s\S]*?<div class="split">/.exec(html);
+
+  it("the Live (record) view's markup is still found in one piece — the boundary this test relies on", () => {
+    expect(recordViewMatch, "record view section not found in index.html").toBeTruthy();
+  });
+
+  it("the Live topbar has no #languageAutoHint / #languageAutoDualHint element", () => {
+    const recordViewHtml = String(recordViewMatch?.[0] || "");
+    expect(recordViewHtml).not.toMatch(/id="languageAutoHint"/);
+    expect(recordViewHtml).not.toMatch(/id="languageAutoDualHint"/);
+    expect(recordViewHtml).not.toMatch(/topbar-hint/);
+  });
+
+  it("Settings keeps its own dual-stream note, wired to the shared trade-off text", () => {
+    expect(html).toMatch(/id="deepgramDualStreamNote"/);
+    expect(mainTsx).toContain('dualNote.textContent = dualStreamTradeOffText()');
+  });
+
+  it("syncAutoLanguageUi still toggles the dual-stream row's visibility from #language, with no hint element left to touch", () => {
+    const fnBlock = /function syncAutoLanguageUi\(\): void \{([\s\S]*?)\n\}/.exec(mainTsx)?.[1];
+    expect(fnBlock, "syncAutoLanguageUi not found").toBeTruthy();
+    const body = String(fnBlock);
+    expect(body).toContain('document.getElementById("deepgramDualStreamRow")');
+    expect(body).not.toContain("languageAutoHint");
+    expect(body).not.toContain("languageAutoDualHint");
+  });
+});

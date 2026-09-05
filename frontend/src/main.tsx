@@ -9085,41 +9085,24 @@ function fillDualSecondaryLanguageOptions(): void {
 /**
  * Everything the live LANG selection decides outside the select itself.
  *
- * #languageAutoHint (frontend/index.html) explains that Auto maps to
- * Deepgram's multi-language mode and what that costs
- * (BUGS_AUDIT_2026-09-03.md §1). Dual-stream Auto — the second,
- * monolingual Nova-3 stream merged into the first by word timestamps —
- * is the answer to that cost, and it applies to Auto and nothing else: a
- * fixed language has no second stream to add. So its two controls live
- * or die by the same condition as the hint, and the hint says which way
- * they are set.
+ * Dual-stream Auto — the second, monolingual Nova-3 stream merged into
+ * the first by word timestamps (BUGS_AUDIT_2026-09-03.md §1) — is the
+ * cost/benefit trade-off Settings › API Keys explains next to its own
+ * controls (``deepgramDualStreamNote``, written from
+ * ``dualStreamTradeOffText``). It applies to Auto and nothing else: a
+ * fixed language has no second stream to add. So its row lives or dies
+ * by that one condition, decided here.
  *
- * ONE function decides all of it (it was ``syncLanguageAutoHint`` while
- * the hint was all there was), so a load and a change can never disagree
- * about what Auto means on screen.
+ * The Live view used to carry a second copy of the trade-off explanation
+ * under the MIC/LANG/REC row (``#languageAutoHint`` /
+ * ``#languageAutoDualHint``) — removed 2026-09-05 (user request): one
+ * explanation, in Settings next to the controls it explains, is enough.
  */
 function syncAutoLanguageUi(): void {
   const lang = (($("language") as HTMLSelectElement).value || "auto").trim().toLowerCase();
   const isAuto = lang === "auto";
-  const hint = document.getElementById("languageAutoHint");
-  if (hint) hint.hidden = !isAuto;
   const dualRow = document.getElementById("deepgramDualStreamRow");
   if (dualRow) dualRow.hidden = !isAuto;
-  const dualHint = document.getElementById("languageAutoDualHint");
-  if (dualHint) {
-    if (!isAuto) {
-      dualHint.textContent = "";
-    } else if (readDeepgramDualStream()) {
-      const secondary = readDeepgramDualSecondaryLanguage().toUpperCase();
-      dualHint.textContent =
-        ` Two-stream Auto is ON: ${dualStreamTradeOffText(secondary)}` +
-        " (Settings › API Keys).";
-    } else {
-      dualHint.textContent =
-        " Two-stream Auto is off — one multilingual stream only" +
-        " (Settings › API Keys).";
-    }
-  }
 }
 
 ($("language") as HTMLSelectElement).addEventListener("change", () => {
@@ -9127,14 +9110,13 @@ function syncAutoLanguageUi(): void {
   queueUiPreferencesSave();
 });
 // Both dual-stream controls persist through the same debounced
-// ``/api/config`` save as Key terms, and both change what the Auto hint
-// says — so both re-run the one decision above.
+// ``/api/config`` save as Key terms. Neither changes whether the row
+// itself belongs on screen — only #language's own value does — so
+// there is nothing here for syncAutoLanguageUi to re-decide.
 dualStreamCheckbox()?.addEventListener("change", () => {
-  syncAutoLanguageUi();
   queueUiPreferencesSave();
 });
 dualSecondaryLanguageSelect()?.addEventListener("change", () => {
-  syncAutoLanguageUi();
   queueUiPreferencesSave();
 });
 ($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
